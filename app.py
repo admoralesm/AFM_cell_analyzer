@@ -15,8 +15,19 @@ import os
 from pathlib import Path
 
 from lulevich_model import LulevichModel
-from video_processor import VideoProcessor
-from google_drive import GoogleDriveManager
+
+# Video processing is optional
+try:
+    from video_processor import VideoProcessor
+    video_available = True
+except ImportError:
+    video_available = False
+
+# Google Drive is optional
+try:
+    from google_drive import GoogleDriveManager
+except ImportError:
+    GoogleDriveManager = None
 
 # Page config
 st.set_page_config(
@@ -126,9 +137,13 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Google Drive")
 
-    drive_enabled = st.checkbox("Enable Google Drive Storage", value=False)
-    if drive_enabled:
-        st.info("📌 To enable Google Drive storage: Add your Google service account credentials to Streamlit secrets.")
+    if GoogleDriveManager is not None:
+        drive_enabled = st.checkbox("Enable Google Drive Storage", value=False)
+        if drive_enabled:
+            st.info("📌 To enable Google Drive storage: Add your Google service account credentials to Streamlit secrets.")
+    else:
+        drive_enabled = False
+        st.info("ℹ️ Google Drive integration not available in cloud deployment")
 
 # Main content
 tabs = st.tabs(["📊 Analysis", "📈 Visualization", "💾 Results", "ℹ️ About"])
@@ -186,7 +201,7 @@ with tabs[0]:  # Analysis tab
                 st.markdown("---")
 
                 # Video processing
-                if video_file is not None and analysis_type != "Quick Analysis":
+                if video_file is not None and analysis_type != "Quick Analysis" and video_available:
                     st.markdown("#### Video Analysis")
                     with st.spinner("Processing video..."):
                         try:
@@ -304,10 +319,10 @@ with tabs[0]:  # Analysis tab
                         eps_min = 0.02
                         st.info(f"Using optimized range: ε ∈ [{eps_min:.4f}, {eps_max:.4f}]")
 
-                    membrane = model.fit_membrane_elasticity(eps_min=eps_min, eps_max=eps_max)
+                    membrane = model.fit_membrane_elasticity(epsilon_min=eps_min, epsilon_max=eps_max)
 
                     progress.progress(75)
-                    cytoskeleton = model.fit_cytoskeleton_elasticity(eps_min=0.05, eps_max=min(0.3, rupture['epsilon']*0.9))
+                    cytoskeleton = model.fit_cytoskeleton_elasticity(epsilon_min=0.05, epsilon_max=min(0.3, rupture['epsilon']*0.9))
 
                     progress.progress(100)
 
@@ -533,7 +548,7 @@ with tabs[2]:  # Results tab
 
         with col3:
             # Markdown summary
-            if drive_enabled:
+            if drive_enabled and GoogleDriveManager is not None:
                 gd = GoogleDriveManager()
                 md_summary = gd.get_summary_markdown(results, "C2C12_Sample")
                 st.download_button(
@@ -545,7 +560,7 @@ with tabs[2]:  # Results tab
                 )
 
         # Google Drive upload
-        if drive_enabled:
+        if drive_enabled and GoogleDriveManager is not None:
             st.markdown("---")
             st.markdown("### Upload to Google Drive")
 
@@ -559,6 +574,8 @@ with tabs[2]:  # Results tab
                     st.write(f"Saved as: {filepath}")
                 else:
                     st.error("❌ Google Drive setup failed. Check your credentials.")
+        elif drive_enabled and GoogleDriveManager is None:
+            st.warning("⚠️ Google Drive integration not available in cloud deployment")
 
     else:
         st.info("👈 Run analysis first to view results")
