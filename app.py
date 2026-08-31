@@ -42,6 +42,14 @@ except Exception as exc:  # pragma: no cover - depends on local install
     SHEETS_IMPORT_ERROR = str(exc)
 
 try:
+    import video_analysis as va
+
+    VIDEO_IMPORT_ERROR = None if va.available() else "OpenCV is not installed"
+except Exception as exc:  # pragma: no cover
+    va = None
+    VIDEO_IMPORT_ERROR = str(exc)
+
+try:
     from igor_parser import IgorParser
     from baseline_correction import BaselineCorrector
 
@@ -113,7 +121,10 @@ DEFAULTS = {
     "line_width": 3,
     "plot_height": 520,
     "show_grid": False,
-    "font_size": 16,
+    "axis_title_size": 28,
+    "tick_size": 22,
+    "axis_width": 4,
+    "bold_axes": True,
     "log_scale": False,
     "show_components": True,
     "show_fit_window": True,
@@ -125,6 +136,11 @@ DEFAULTS = {
     "poisson_membrane": 0.50,
     "poisson_interior": 0.50,
     # fitting
+    "fit_mode": "Simultaneous (one window)",
+    "sequential_order": "interior-first",
+    "refine_iterations": 3,
+    "lock_range": False,
+    "range_presets": {},
     "range_mode": "Auto (detected)",
     "fit_terms": "Membrane + interior",
     "weighting": "uniform",
@@ -135,6 +151,19 @@ DEFAULTS = {
     "cell_height_um": 8.09,
     "spring_constant": 0.0,
     "video_link": "",
+    # video
+    "video_path": None,
+    "video_info": None,
+    "video_name": None,
+    "video_track": None,
+    "video_contact_frame": 0,
+    "video_end_frame": 0,
+    "video_roi": (0.0, 0.0, 1.0, 1.0),
+    "video_roi_x": (0.0, 1.0),
+    "video_roi_y": (0.0, 1.0),
+    "video_sensitivity": 1.0,
+    "video_strip_lines": True,
+    "video_show_panel": True,
     # data / results
     "data": None,
     "results": None,
@@ -167,7 +196,10 @@ def current_style(force_N=None) -> PlotStyle:
         line_width=st.session_state["line_width"],
         height=st.session_state["plot_height"],
         show_grid=st.session_state["show_grid"],
-        font_size=st.session_state["font_size"],
+        axis_title_size=st.session_state["axis_title_size"],
+        tick_size=st.session_state["tick_size"],
+        axis_width=st.session_state["axis_width"],
+        bold_axes=st.session_state["bold_axes"],
         log_scale=st.session_state["log_scale"],
         show_components=st.session_state["show_components"],
         show_fit_window=st.session_state["show_fit_window"],
@@ -190,6 +222,53 @@ def load_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
             continue
     buffer.seek(0)
     return pd.read_csv(buffer)
+
+
+@st.cache_data(show_spinner=False)
+def cached_frame(path, signature, index):
+    """`signature` (size + mtime) busts the cache when the file is replaced."""
+    return va.read_frame(path, index)
+
+
+@st.cache_data(show_spinner=False)
+def cached_detection(path, signature, index, roi, sensitivity, strip_lines):
+    frame = va.read_frame(path, index)
+    if frame is None:
+        return None, None
+    det = va.detect_cell(
+        frame, roi=roi, sensitivity=sensitivity, strip_lines=strip_lines
+    )
+    return frame, det
+
+
+@st.cache_data(show_spinner="Tracking the cell through the video…")
+def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, start, end):
+    track = va.track_cell(
+        path,
+        n_samples=n_samples,
+        roi=roi,
+        sensitivity=sensitivity,
+        start=start,
+        end=end,
+    )
+    # Detections hold OpenCV contours; drop them so the cached value stays small.
+    return {k: v for k, v in track.items() if k != "detections"}
+
+
+def video_signature():
+    path = st.session_state.get("video_path")
+    if not path or not os.path.exists(path):
+        return None
+    stat = os.stat(path)
+    return (stat.st_size, int(stat.st_mtime))
+
+
+def png_bytes(image_rgb):
+    """Encode an RGB array as PNG for download."""
+    import cv2
+
+    ok, buffer = cv2.imencode(".png", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+    return buffer.tobytes() if ok else b""
 
 
 def guess_column(columns, keywords, fallback_index):
@@ -284,17 +363,43 @@ with st.sidebar:
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
     with st.expander("📈 Fitting", expanded=True):
-        st.selectbox(
-            "Model terms",
-            ["Membrane + interior", "Membrane only (ε³)", "Interior only (ε³ᐟ²)"],
-            key="fit_terms",
-        )
         st.radio(
-            "Fit window",
-            ["Auto (detected)", "Manual"],
-            key="range_mode",
-            horizontal=True,
+            "Strategy",
+            ["Simultaneous (one window)", "Sequential (separate windows)"],
+            key="fit_mode",
+            help="Simultaneous solves for Eₘ and Eᵢ together on one window. "
+            "Sequential measures Eᵢ on a low-ε window where the ε³ᐟ² term "
+            "dominates, then Eₘ on a separate high-ε window where ε³ takes over.",
         )
+        if st.session_state["fit_mode"] == "Sequential (separate windows)":
+            st.selectbox(
+                "Measure first",
+                ["interior-first", "membrane-first"],
+                key="sequential_order",
+                help="Which modulus is fitted on its own window before the other "
+                "is held fixed. interior-first matches the physics.",
+            )
+            st.slider(
+                "Refinement passes",
+                1,
+                8,
+                key="refine_iterations",
+                help="One pass is biased: the first window has no knowledge of the "
+                "other term and absorbs it. Repeating the pair of fits removes that. "
+                "3 is usually converged; 1 gives the plain one-pass result.",
+            )
+        else:
+            st.selectbox(
+                "Model terms",
+                ["Membrane + interior", "Membrane only (ε³)", "Interior only (ε³ᐟ²)"],
+                key="fit_terms",
+            )
+            st.radio(
+                "Fit window",
+                ["Auto (detected)", "Manual"],
+                key="range_mode",
+                horizontal=True,
+            )
         st.selectbox(
             "Weighting",
             ["uniform", "relative"],
@@ -326,11 +431,19 @@ with st.sidebar:
         st.slider("Marker size", 2, 14, key="marker_size")
         st.slider("Line width", 1, 8, key="line_width")
         st.slider("Plot height (px)", 320, 900, step=20, key="plot_height")
-        st.slider("Font size", 10, 24, key="font_size")
+        st.slider("Axis title size", 12, 44, key="axis_title_size")
+        st.slider("Tick label size", 10, 36, key="tick_size")
+        st.slider("Axis line thickness", 1, 8, key="axis_width")
+        st.checkbox("Bold axis titles and ticks", key="bold_axes")
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
         st.checkbox("Show model components", key="show_components")
         st.checkbox("Shade the fit window", key="show_fit_window")
+        st.checkbox(
+            "Show the video frame beside the plot",
+            key="video_show_panel",
+            help="Only appears once a video is loaded in the Compression video tab.",
+        )
 
     with st.expander("🗄️ Google Sheets database"):
         if SHEETS_IMPORT_ERROR:
@@ -373,9 +486,10 @@ with head_left:
 with head_right:
     st.markdown("<div style='text-align:right;color:#6b7785'>v6.0</div>", unsafe_allow_html=True)
 
-tab_analysis, tab_igor, tab_db, tab_results, tab_export = st.tabs(
+tab_analysis, tab_video, tab_igor, tab_db, tab_results, tab_export = st.tabs(
     [
         "📊 Force curve analysis",
+        "🎥 Compression video",
         "🔧 Create curve (Igor)",
         "📋 Database",
         "📈 Results",
@@ -481,7 +595,7 @@ with tab_analysis:
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Points", f"{epsilon.size:,}")
-        c2.metric("ε range", f"{epsilon.min():.3f} – {epsilon.max():.3f}")
+        c2.metric("ε range", f"{epsilon.min():.3f} to {epsilon.max():.3f}")
         c3.metric("Peak force", f"{float(peak_display):.4g} {unit_label}")
         c4.metric("Dropped rows", data["n_dropped"])
         if data["n_dropped"]:
@@ -514,8 +628,69 @@ with tab_analysis:
         eps_lo_data = float(max(epsilon.min(), 0.0))
         eps_hi_data = float(epsilon.max())
         step = max((eps_hi_data - eps_lo_data) / 200.0, 1e-4)
+        sequential = st.session_state["fit_mode"] == "Sequential (separate windows)"
 
-        if st.session_state["range_mode"] == "Auto (detected)":
+        def clamp_range(pair, fallback):
+            """Keep a stored range inside the current curve's bounds."""
+            try:
+                lo, hi = float(pair[0]), float(pair[1])
+            except (TypeError, ValueError, IndexError):
+                return fallback
+            lo = float(np.clip(lo, eps_lo_data, eps_hi_data))
+            hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
+            return (lo, hi) if lo < hi else fallback
+
+        interior_range = membrane_range = None
+
+        if sequential:
+            suggestion = model.suggest_sequential_windows()
+            st.caption(suggestion["note"])
+            default_int = clamp_range(
+                suggestion["interior_range"], (eps_lo_data, (eps_lo_data + eps_hi_data) / 2)
+            )
+            default_mem = clamp_range(
+                suggestion["membrane_range"], ((eps_lo_data + eps_hi_data) / 2, eps_hi_data)
+            )
+            st.session_state["interior_range"] = clamp_range(
+                st.session_state.get("interior_range"), default_int
+            )
+            st.session_state["membrane_range"] = clamp_range(
+                st.session_state.get("membrane_range"), default_mem
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                interior_range = st.slider(
+                    "Cytoskeleton window (low ε, fits Eᵢ)",
+                    min_value=eps_lo_data,
+                    max_value=eps_hi_data,
+                    step=step,
+                    key="interior_range",
+                    help="Where the Hertzian ε³ᐟ² term dominates.",
+                )
+                st.caption(
+                    f"{int(((epsilon >= interior_range[0]) & (epsilon <= interior_range[1])).sum())} points"
+                )
+            with c2:
+                membrane_range = st.slider(
+                    "Membrane window (high ε, fits Eₘ)",
+                    min_value=eps_lo_data,
+                    max_value=eps_hi_data,
+                    step=step,
+                    key="membrane_range",
+                    help="Where the balloon ε³ term dominates.",
+                )
+                st.caption(
+                    f"{int(((epsilon >= membrane_range[0]) & (epsilon <= membrane_range[1])).sum())} points"
+                )
+            if st.button("↺ Use suggested split", **STRETCH):
+                st.session_state["interior_range"] = default_int
+                st.session_state["membrane_range"] = default_mem
+                st.rerun()
+            fit_lo = min(interior_range[0], membrane_range[0])
+            fit_hi = max(interior_range[1], membrane_range[1])
+
+        elif st.session_state["range_mode"] == "Auto (detected)" and not st.session_state["lock_range"]:
             fit_lo = float(np.clip(auto_range["elastic_epsilon_min"], eps_lo_data, eps_hi_data))
             fit_hi = float(np.clip(auto_range["elastic_epsilon_max"], eps_lo_data, eps_hi_data))
             st.success(
@@ -525,12 +700,16 @@ with tab_analysis:
             )
             hint("Switch to **Manual** in the sidebar to drag the window yourself.")
         else:
-            default = (
-                float(np.clip(auto_range["elastic_epsilon_min"], eps_lo_data, eps_hi_data)),
-                float(np.clip(auto_range["elastic_epsilon_max"], eps_lo_data, eps_hi_data)),
+            default = clamp_range(
+                (auto_range["elastic_epsilon_min"], auto_range["elastic_epsilon_max"]),
+                (eps_lo_data, eps_hi_data),
             )
+            # A locked range survives new uploads; an unlocked one is only
+            # reset when it no longer fits inside the current curve.
             stored = st.session_state.get("manual_range")
-            if not stored or not (eps_lo_data <= stored[0] < stored[1] <= eps_hi_data):
+            if st.session_state["lock_range"] and stored:
+                st.session_state["manual_range"] = clamp_range(stored, default)
+            elif not stored or not (eps_lo_data <= stored[0] < stored[1] <= eps_hi_data):
                 st.session_state["manual_range"] = default
             fit_lo, fit_hi = st.slider(
                 "Fitting range in ε",
@@ -546,6 +725,119 @@ with tab_analysis:
             cols[1].metric("Suggested ε min", f"{auto_range['elastic_epsilon_min']:.3f}")
             cols[2].metric("Suggested ε max", f"{auto_range['elastic_epsilon_max']:.3f}")
 
+        # ------------------------------------------------- saved presets ---
+        with st.expander("💾 Saved ranges", expanded=False):
+            st.checkbox(
+                "Lock this range (keep it when a new curve is loaded)",
+                key="lock_range",
+            )
+            p1, p2 = st.columns([2, 1])
+            with p1:
+                preset_name = st.text_input(
+                    "Preset name",
+                    placeholder="e.g. C2C12 standard",
+                    key="preset_name",
+                    label_visibility="collapsed",
+                )
+            with p2:
+                if st.button("Save current", **STRETCH):
+                    name = (preset_name or "").strip()
+                    if not name:
+                        st.warning("Give the preset a name first.")
+                    else:
+                        st.session_state["range_presets"][name] = {
+                            "mode": "sequential" if sequential else "simultaneous",
+                            "range": [float(fit_lo), float(fit_hi)],
+                            "interior_range": [float(x) for x in interior_range]
+                            if interior_range
+                            else None,
+                            "membrane_range": [float(x) for x in membrane_range]
+                            if membrane_range
+                            else None,
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                        }
+                        st.success(f"Saved “{name}”.")
+
+            presets = st.session_state["range_presets"]
+            if presets:
+                a1, a2, a3 = st.columns([2, 1, 1])
+                with a1:
+                    chosen = st.selectbox(
+                        "Preset", list(presets.keys()), key="preset_choice",
+                        label_visibility="collapsed",
+                    )
+                with a2:
+                    if st.button("Apply", **STRETCH):
+                        preset = presets[chosen]
+                        if preset["mode"] == "sequential" and preset["interior_range"]:
+                            st.session_state["fit_mode"] = "Sequential (separate windows)"
+                            st.session_state["interior_range"] = clamp_range(
+                                preset["interior_range"], (eps_lo_data, eps_hi_data)
+                            )
+                            st.session_state["membrane_range"] = clamp_range(
+                                preset["membrane_range"], (eps_lo_data, eps_hi_data)
+                            )
+                        else:
+                            st.session_state["fit_mode"] = "Simultaneous (one window)"
+                            st.session_state["range_mode"] = "Manual"
+                            st.session_state["manual_range"] = clamp_range(
+                                preset["range"], (eps_lo_data, eps_hi_data)
+                            )
+                        st.session_state["lock_range"] = True
+                        st.rerun()
+                with a3:
+                    if st.button("Delete", **STRETCH):
+                        presets.pop(chosen, None)
+                        st.rerun()
+
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "preset": name,
+                                "mode": p["mode"],
+                                "ε window": f"{p['range'][0]:.3f} to {p['range'][1]:.3f}",
+                                "cytoskeleton": f"{p['interior_range'][0]:.3f} to {p['interior_range'][1]:.3f}"
+                                if p.get("interior_range")
+                                else "—",
+                                "membrane": f"{p['membrane_range'][0]:.3f} to {p['membrane_range'][1]:.3f}"
+                                if p.get("membrane_range")
+                                else "—",
+                                "saved": p["saved_at"],
+                            }
+                            for name, p in presets.items()
+                        ]
+                    ),
+                    hide_index=True,
+                    **STRETCH,
+                )
+
+            e1, e2 = st.columns(2)
+            with e1:
+                st.download_button(
+                    "📥 Export presets",
+                    data=json.dumps(presets, indent=2),
+                    file_name="afm_range_presets.json",
+                    mime="application/json",
+                    disabled=not presets,
+                    **STRETCH,
+                )
+            with e2:
+                imported = st.file_uploader(
+                    "Import presets (.json)", type=["json"], key="preset_upload"
+                )
+                if imported is not None:
+                    try:
+                        incoming = json.loads(imported.getvalue().decode("utf-8"))
+                        st.session_state["range_presets"].update(incoming)
+                        st.success(f"Imported {len(incoming)} preset(s).")
+                    except Exception as exc:
+                        st.error(f"Could not read that preset file: {exc}")
+            hint(
+                "Presets live in this browser session. Export them to a file to keep "
+                "them between visits or share them with the rest of the lab."
+            )
+
         # ----------------------------------------------------------- fit ---
         section("4 · Fit")
         run = st.session_state["live_fit"] or st.button(
@@ -554,13 +846,23 @@ with tab_analysis:
 
         fit = None
         if run:
-            fit = model.fit(
-                epsilon_min=fit_lo,
-                epsilon_max=fit_hi,
-                terms=selected_terms(),
-                fit_offset=st.session_state["fit_offset"],
-                weighting=st.session_state["weighting"],
-            )
+            if sequential:
+                fit = model.fit_sequential(
+                    interior_range=interior_range,
+                    membrane_range=membrane_range,
+                    weighting=st.session_state["weighting"],
+                    fit_offset=st.session_state["fit_offset"],
+                    order=st.session_state["sequential_order"],
+                    refine_iterations=st.session_state["refine_iterations"],
+                )
+            else:
+                fit = model.fit(
+                    epsilon_min=fit_lo,
+                    epsilon_max=fit_hi,
+                    terms=selected_terms(),
+                    fit_offset=st.session_state["fit_offset"],
+                    weighting=st.session_state["weighting"],
+                )
 
         if fit is None:
             st.info("Press **Fit curve**, or turn on live refitting in the sidebar.")
@@ -585,6 +887,16 @@ with tab_analysis:
                 "membrane_N": membrane,
                 "interior_N": interior,
                 "fit": fit,
+                "fit_windows": (
+                    [
+                        {"range": tuple(interior_range), "label": "cytoskeleton (Eᵢ)",
+                         "color": "#9467bd"},
+                        {"range": tuple(membrane_range), "label": "membrane (Eₘ)",
+                         "color": "#2ca02c"},
+                    ]
+                    if sequential
+                    else [{"range": (fit_lo, fit_hi), "label": "fit window"}]
+                ),
                 "source": data["source"],
                 "timestamp": datetime.now(),
             }
@@ -609,23 +921,99 @@ with tab_analysis:
             for message in fit["warnings"]:
                 st.warning(message)
 
-            st.plotly_chart(
-                force_curve_figure(
-                    epsilon,
-                    force_N,
-                    style,
-                    title=st.session_state["cell_name"] or "Force vs relative deformation",
-                    fit_force_N=fitted,
-                    membrane_N=membrane,
-                    interior_N=interior,
-                    fit_window=(fit_lo, fit_hi),
-                    rupture_epsilon=rupture.get("epsilon")
-                    if rupture.get("method") == "force-drop"
-                    else None,
-                ),
-                **STRETCH,
-                key="main_fit_plot",
+            # A loaded video gets a panel beside the plot showing the cell at
+            # whichever point on the curve is selected.
+            video_ready = (
+                not VIDEO_IMPORT_ERROR
+                and st.session_state.get("video_path")
+                and st.session_state.get("video_info")
+                and os.path.exists(st.session_state["video_path"])
+                and st.session_state["video_show_panel"]
             )
+
+            highlight = None
+            selected_eps = None
+            if video_ready:
+                eps_lo_sel = float(max(epsilon.min(), 0.0))
+                eps_hi_sel = float(epsilon.max())
+                selected_eps = st.slider(
+                    "Show the cell at ε =",
+                    min_value=eps_lo_sel,
+                    max_value=eps_hi_sel,
+                    value=float(np.clip(fit_hi, eps_lo_sel, eps_hi_sel)),
+                    step=max((eps_hi_sel - eps_lo_sel) / 200.0, 1e-4),
+                    key="video_sync_eps",
+                )
+                nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
+                highlight = (float(epsilon[nearest]), float(force_N[nearest]))
+
+            plot_col, video_col = st.columns([3, 1.15]) if video_ready else (st.container(), None)
+
+            with plot_col:
+                st.plotly_chart(
+                    force_curve_figure(
+                        epsilon,
+                        force_N,
+                        style,
+                        title=st.session_state["cell_name"] or "Force vs relative deformation",
+                        fit_force_N=fitted,
+                        membrane_N=membrane,
+                        interior_N=interior,
+                        fit_window=st.session_state["results"]["fit_windows"],
+                        rupture_epsilon=rupture.get("epsilon")
+                        if rupture.get("method") == "force-drop"
+                        else None,
+                        highlight=highlight,
+                    ),
+                    **STRETCH,
+                    key="main_fit_plot",
+                )
+
+            if video_ready and video_col is not None:
+                with video_col:
+                    vpath = st.session_state["video_path"]
+                    vinfo = st.session_state["video_info"]
+                    frame_index = va.frame_for_epsilon(
+                        selected_eps,
+                        st.session_state["video_contact_frame"],
+                        st.session_state["video_end_frame"] or (vinfo["n_frames"] - 1),
+                        float(epsilon.max()),
+                    )
+                    vframe, vdet = cached_detection(
+                        vpath,
+                        video_signature(),
+                        int(frame_index),
+                        st.session_state["video_roi"],
+                        float(st.session_state["video_sensitivity"]),
+                        bool(st.session_state["video_strip_lines"]),
+                    )
+                    if vframe is None:
+                        st.info("Frame unavailable.")
+                    else:
+                        force_here, unit_here = from_newtons(highlight[1], style.force_unit)
+                        shot = va.annotate(
+                            vframe, vdet, label=f"ε = {highlight[0]:.3f}"
+                        )
+                        st.image(
+                            va.crop(shot, vdet) if vdet and vdet.get("found") else shot,
+                            caption=f"Frame {frame_index} · ε = {highlight[0]:.3f} · "
+                            f"F = {float(force_here):.3g} {unit_here}",
+                            **STRETCH,
+                        )
+                        if vdet and vdet.get("found"):
+                            st.caption(f"Cell height {vdet['height_px']:.0f} px")
+                        else:
+                            st.caption("No cell detected in this frame.")
+                        st.download_button(
+                            "📷 Save screenshot",
+                            data=png_bytes(shot),
+                            file_name=(
+                                f"{st.session_state['cell_name'] or 'cell'}"
+                                f"_eps{highlight[0]:.3f}.png"
+                            ),
+                            mime="image/png",
+                            **STRETCH,
+                        )
 
             with st.expander("🔍 Fit diagnostics"):
                 d1, d2, d3 = st.columns(3)
@@ -635,19 +1023,27 @@ with tab_analysis:
                     if np.isfinite(fit["membrane_fraction_at_max"])
                     else "n/a",
                 )
-                d2.metric(
-                    "Condition number",
-                    f"{fit['condition_number']:.1f}"
-                    if np.isfinite(fit["condition_number"])
-                    else "n/a",
-                    help="How separable ε³ and ε³ᐟ² are over this window. "
-                    "Above ~30 the split between Eₘ and Eᵢ is unreliable.",
-                )
-                d3.metric(
-                    "Eₘ/Eᵢ correlation",
-                    f"{fit['corr_Em_Ei']:+.2f}" if np.isfinite(fit["corr_Em_Ei"]) else "n/a",
-                    help="Near −1 means the two terms are trading off against each other.",
-                )
+                if fit.get("mode") == "sequential":
+                    d2.metric(
+                        "Refinement passes run",
+                        fit["n_iterations"],
+                        help="Stops early once both moduli move by less than 0.1 %.",
+                    )
+                    d3.metric("Order", fit["order"])
+                else:
+                    d2.metric(
+                        "Condition number",
+                        f"{fit['condition_number']:.1f}"
+                        if np.isfinite(fit["condition_number"])
+                        else "n/a",
+                        help="How separable ε³ and ε³ᐟ² are over this window. "
+                        "Above ~30 the split between Eₘ and Eᵢ is unreliable.",
+                    )
+                    d3.metric(
+                        "Eₘ/Eᵢ correlation",
+                        f"{fit['corr_Em_Ei']:+.2f}" if np.isfinite(fit["corr_Em_Ei"]) else "n/a",
+                        help="Near −1 means the two terms are trading off against each other.",
+                    )
 
                 mask = fit["mask"]
                 st.plotly_chart(
@@ -656,43 +1052,76 @@ with tab_analysis:
                     key="residual_plot",
                 )
 
-                st.markdown("**How much does the answer depend on the window?**")
-                sens = model.range_sensitivity(
-                    fit_lo,
-                    fit_hi,
-                    terms=selected_terms(),
-                    fit_offset=st.session_state["fit_offset"],
-                    weighting=st.session_state["weighting"],
-                )
-                s1, s2 = st.columns(2)
-                s1.metric(
-                    "Eₘ spread",
-                    f"{100 * sens['Em_relative_spread']:.1f} %"
-                    if np.isfinite(sens["Em_relative_spread"])
-                    else "n/a",
-                )
-                s2.metric(
-                    "Eᵢ spread",
-                    f"{100 * sens['Ei_relative_spread']:.1f} %"
-                    if np.isfinite(sens["Ei_relative_spread"])
-                    else "n/a",
-                )
-                st.caption(
-                    "Range of each modulus across shrinking upper bounds, as a fraction "
-                    "of its mean. Under ~10 % the fit is robust; much more means the "
-                    "curve does not constrain the two terms separately."
-                )
-                figure = sensitivity_figure(sens["trials"], style)
-                if figure is not None:
-                    st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
-                if sens["trials"]:
-                    st.dataframe(
-                        pd.DataFrame(sens["trials"]).round(
-                            {"epsilon_max": 3, "Em_MPa": 4, "Ei_kPa": 4, "r_squared": 4}
-                        ),
-                        **STRETCH,
-                        hide_index=True,
+                if fit.get("mode") == "sequential":
+                    st.markdown("**Convergence of the two stages**")
+                    st.caption(
+                        "Pass 1 is the plain one-pass sequential fit. Each later pass "
+                        "subtracts the other term's current estimate before refitting, "
+                        "which removes the bias the first pass carries."
                     )
+                    st.dataframe(
+                        pd.DataFrame(fit["iterations"]).round(
+                            {"Em_MPa": 4, "Ei_kPa": 4}
+                        ),
+                        hide_index=True,
+                        **STRETCH,
+                    )
+                    stage_rows = []
+                    for label, stage in (
+                        ("stage 1", fit["stages"]["first"]),
+                        ("stage 2", fit["stages"]["second"]),
+                    ):
+                        stage_rows.append(
+                            {
+                                "stage": label,
+                                "term": ", ".join(stage["terms"]),
+                                "ε window": f"{stage['epsilon_range'][0]:.3f} to {stage['epsilon_range'][1]:.3f}",
+                                "points": stage["n_points"],
+                                "R² (window)": round(float(stage["r_squared"]), 4),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(stage_rows), hide_index=True, **STRETCH)
+                    sens = None
+                else:
+                    st.markdown("**How much does the answer depend on the window?**")
+                    sens = model.range_sensitivity(
+                        fit_lo,
+                        fit_hi,
+                        terms=selected_terms(),
+                        fit_offset=st.session_state["fit_offset"],
+                        weighting=st.session_state["weighting"],
+                    )
+
+                if sens is not None:
+                    s1, s2 = st.columns(2)
+                    s1.metric(
+                        "Eₘ spread",
+                        f"{100 * sens['Em_relative_spread']:.1f} %"
+                        if np.isfinite(sens["Em_relative_spread"])
+                        else "n/a",
+                    )
+                    s2.metric(
+                        "Eᵢ spread",
+                        f"{100 * sens['Ei_relative_spread']:.1f} %"
+                        if np.isfinite(sens["Ei_relative_spread"])
+                        else "n/a",
+                    )
+                    st.caption(
+                        "Range of each modulus across shrinking upper bounds, as a "
+                        "fraction of its mean. Under ~10 % the fit is robust; much more "
+                        "means the curve does not constrain the two terms separately."
+                    )
+                    figure = sensitivity_figure(sens["trials"], style)
+                    if figure is not None:
+                        st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
+                    if sens["trials"]:
+                        st.dataframe(
+                            pd.DataFrame(sens["trials"]).round(
+                                {"epsilon_max": 3, "Em_MPa": 4, "Ei_kPa": 4, "r_squared": 4}
+                            ),
+                            hide_index=True,
+                            **STRETCH,
+                        )
 
                 st.markdown("**Geometry prefactors actually used**")
                 st.code(
@@ -706,13 +1135,15 @@ with tab_analysis:
             section("5 · Save")
             c1, c2 = st.columns([2, 1])
             with c1:
-                st.text_input(
-                    "Google Drive video link (optional)",
-                    placeholder="https://drive.google.com/file/d/...",
-                    key="video_link",
-                )
+                if st.session_state["video_link"]:
+                    st.caption(f"Video link on record: {st.session_state['video_link']}")
+                else:
+                    st.caption(
+                        "No video linked. Add one in the **Compression video** tab to "
+                        "store it with this cell."
+                    )
             with c2:
-                st.markdown("<div style='height:1.8rem'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
                 disabled = not (st.session_state["db_enabled"] and st.session_state["gs_manager"])
                 if st.button(
                     "💾 Save to database",
@@ -748,7 +1179,267 @@ with tab_analysis:
                         (st.success if ok else st.warning)(msg)
 
 
-# =================================================== TAB 2: Igor generator ==
+# ==================================================== TAB 2: video analysis ==
+
+with tab_video:
+    section("Compression video")
+
+    if VIDEO_IMPORT_ERROR:
+        st.error(
+            f"Video analysis unavailable: {VIDEO_IMPORT_ERROR}. "
+            f"Add `opencv-python-headless` to requirements.txt."
+        )
+    else:
+        st.markdown(
+            "Load the compression video to put a picture of the cell next to the "
+            "curve, and to derive deformation from the cell's own shape as a check "
+            "on the contact point and cell height."
+        )
+
+        src1, src2 = st.columns([1, 1])
+        with src1:
+            uploaded_video = st.file_uploader(
+                "Upload video", type=["mp4", "avi", "mov", "wmv", "mkv"], key="video_file"
+            )
+        with src2:
+            st.text_input(
+                "…or a Google Drive link",
+                placeholder="https://drive.google.com/file/d/...",
+                key="video_link",
+                help="Only works for files shared with 'anyone with the link'.",
+            )
+            if st.button("⬇️ Fetch from Drive", **STRETCH):
+                try:
+                    with st.spinner("Downloading…"):
+                        dest = os.path.join(tempfile.gettempdir(), "afm_drive_video.mp4")
+                        va.download_drive_video(st.session_state["video_link"], dest)
+                    st.session_state["video_path"] = dest
+                    st.session_state["video_name"] = "Google Drive video"
+                    st.session_state["video_info"] = va.probe(dest)
+                    st.session_state["video_track"] = None
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"{exc}")
+
+        if uploaded_video is not None and st.session_state["video_name"] != uploaded_video.name:
+            path = os.path.join(tempfile.gettempdir(), f"afm_video_{uploaded_video.name}")
+            with open(path, "wb") as handle:
+                handle.write(uploaded_video.getvalue())
+            st.session_state["video_path"] = path
+            st.session_state["video_name"] = uploaded_video.name
+            st.session_state["video_track"] = None
+            try:
+                st.session_state["video_info"] = va.probe(path)
+            except Exception as exc:
+                st.session_state["video_info"] = None
+                st.error(f"Could not open that video: {exc}")
+
+        info = st.session_state.get("video_info")
+        path = st.session_state.get("video_path")
+
+        if not (info and path and os.path.exists(path)):
+            st.info("No video loaded yet.")
+        else:
+            signature = video_signature()
+            n_frames = int(info["n_frames"])
+            last = max(0, n_frames - 1)
+
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Frames", f"{n_frames:,}")
+            v2.metric("FPS", f"{info['fps']:.1f}" if info["fps"] else "n/a")
+            v3.metric("Size", f"{info['width']}×{info['height']}")
+            v4.metric(
+                "Duration",
+                f"{info['duration_s']:.1f} s" if np.isfinite(info["duration_s"]) else "n/a",
+            )
+
+            # ------------------------------------------------ detection setup
+            section("Detection")
+            d1, d2 = st.columns([1, 1])
+            with d1:
+                st.slider(
+                    "Edge sensitivity",
+                    0.3,
+                    3.0,
+                    step=0.1,
+                    key="video_sensitivity",
+                    help="Raise it if the cell is faint; lower it if background "
+                    "texture is being picked up instead.",
+                )
+                st.checkbox(
+                    "Ignore long horizontal structures",
+                    key="video_strip_lines",
+                    help="Removes the substrate line and the cantilever, which "
+                    "otherwise merge with the cell into one shapeless blob.",
+                )
+            with d2:
+                st.caption("Search region (fraction of the frame)")
+                rx = st.slider("Horizontal", 0.0, 1.0, step=0.01, key="video_roi_x")
+                ry = st.slider("Vertical", 0.0, 1.0, step=0.01, key="video_roi_y")
+                st.session_state["video_roi"] = (rx[0], ry[0], rx[1], ry[1])
+
+            roi = st.session_state["video_roi"]
+            # Widget state must be clamped to this video before the widgets are
+            # built, or a shorter clip than the previous one raises.
+            st.session_state.setdefault("video_preview_frame", last // 2)
+            st.session_state["video_preview_frame"] = int(
+                np.clip(st.session_state["video_preview_frame"], 0, last)
+            )
+            st.session_state["video_contact_frame"] = int(
+                np.clip(st.session_state["video_contact_frame"], 0, last)
+            )
+            if not st.session_state["video_end_frame"]:
+                st.session_state["video_end_frame"] = last
+            st.session_state["video_end_frame"] = int(
+                np.clip(st.session_state["video_end_frame"], 0, last)
+            )
+
+            preview_frame = st.slider("Preview frame", 0, last, key="video_preview_frame")
+            frame, det = cached_detection(
+                path,
+                signature,
+                int(preview_frame),
+                roi,
+                float(st.session_state["video_sensitivity"]),
+                bool(st.session_state["video_strip_lines"]),
+            )
+
+            p1, p2 = st.columns([2, 1])
+            with p1:
+                if frame is None:
+                    st.error("Could not read that frame.")
+                else:
+                    label = (
+                        f"h = {det['height_px']:.0f} px" if det and det.get("found") else "not found"
+                    )
+                    st.image(
+                        va.annotate(frame, det, label=label),
+                        caption=f"Frame {preview_frame}",
+                        **STRETCH,
+                    )
+            with p2:
+                if det and det.get("found"):
+                    st.success("Cell detected")
+                    st.metric("Height", f"{det['height_px']:.0f} px")
+                    st.metric("Width", f"{det['width_px']:.0f} px")
+                    st.caption(
+                        f"circularity {det['circularity']:.2f} · "
+                        f"solidity {det['solidity']:.2f}"
+                    )
+                    st.download_button(
+                        "📷 Save this frame",
+                        data=png_bytes(va.annotate(frame, det, label=label)),
+                        file_name=f"frame_{preview_frame}.png",
+                        mime="image/png",
+                        **STRETCH,
+                    )
+                elif det:
+                    st.warning(f"No cell found: {det.get('reason', 'unknown')}")
+                    st.caption(
+                        "Try narrowing the search region to exclude the cantilever, "
+                        "or adjusting the edge sensitivity."
+                    )
+
+            # ------------------------------------------------ curve alignment
+            section("Line the video up with the curve")
+            st.caption(
+                "Mark the frame where the cantilever first touches the cell and the "
+                "frame at the end of the ramp. Deformation is then assumed to grow "
+                "linearly with frame number between them, which holds for a "
+                "constant-speed approach."
+            )
+            a1, a2 = st.columns(2)
+            with a1:
+                contact_frame = st.number_input(
+                    "Contact frame (ε = 0)", 0, last, key="video_contact_frame"
+                )
+            with a2:
+                end_frame = st.number_input(
+                    "End-of-ramp frame", 0, last, key="video_end_frame"
+                )
+
+            if st.button("🔬 Track the cell through the video", type="primary", **STRETCH):
+                try:
+                    st.session_state["video_track"] = cached_track(
+                        path,
+                        signature,
+                        60,
+                        roi,
+                        float(st.session_state["video_sensitivity"]),
+                        bool(st.session_state["video_strip_lines"]),
+                        int(contact_frame),
+                        int(end_frame),
+                    )
+                except Exception as exc:
+                    st.error(f"Tracking failed: {exc}")
+
+            track = st.session_state.get("video_track")
+            if track:
+                found = int(np.sum(track["found"]))
+                total = len(track["frames"])
+                eps_video, h_ref = va.deformation_from_track(track, reference="max")
+
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Frames with a cell", f"{found}/{total}")
+                t2.metric("Reference height", f"{h_ref:.0f} px" if np.isfinite(h_ref) else "n/a")
+                t3.metric(
+                    "Max deformation seen",
+                    f"{np.nanmax(eps_video):.3f}" if np.isfinite(eps_video).any() else "n/a",
+                )
+
+                if found < total * 0.5:
+                    st.warning(
+                        "The cell was found in fewer than half the sampled frames. "
+                        "Narrow the search region or adjust the sensitivity before "
+                        "trusting the comparison below."
+                    )
+
+                data_now = st.session_state.get("data")
+                if data_now is not None and np.isfinite(eps_video).any():
+                    eps_curve_at_frames = np.array(
+                        [
+                            va.epsilon_for_frame(
+                                f, contact_frame, end_frame, float(np.nanmax(data_now["epsilon"]))
+                            )
+                            for f in track["frames"]
+                        ]
+                    )
+                    scale, r2 = va.align_scale(eps_video, eps_curve_at_frames)
+
+                    st.markdown("**Video deformation vs the curve's deformation axis**")
+                    comparison = pd.DataFrame(
+                        {
+                            "frame": track["frames"],
+                            "ε from video": eps_video,
+                            "ε from curve": eps_curve_at_frames,
+                        }
+                    ).dropna()
+                    st.line_chart(comparison.set_index("frame"), height=280)
+
+                    c1, c2 = st.columns(2)
+                    c1.metric(
+                        "Scale factor",
+                        f"{scale:.3f}" if np.isfinite(scale) else "n/a",
+                        help="Video deformation divided by curve deformation. 1.0 means "
+                        "they agree.",
+                    )
+                    c2.metric("Agreement R²", f"{r2:.3f}" if np.isfinite(r2) else "n/a")
+
+                    if np.isfinite(scale) and abs(scale - 1.0) > 0.15:
+                        suggested = st.session_state["cell_height_um"] * scale
+                        st.warning(
+                            f"The video says the cell deformed {scale:.2f}× as much as the "
+                            f"curve's ε axis claims. The usual cause is the cell height: "
+                            f"{st.session_state['cell_height_um']:.2f} μm would need to be "
+                            f"about {suggested:.2f} μm for the two to agree. A wrong contact "
+                            f"point does the same thing."
+                        )
+                    elif np.isfinite(scale):
+                        st.success(
+                            "Video and force curve agree on how much the cell deformed."
+                        )
+
+# =================================================== TAB 3: Igor generator ==
 
 with tab_igor:
     section("Build a force curve from Igor .ibw files")
