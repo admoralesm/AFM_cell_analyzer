@@ -378,6 +378,28 @@ def sensitivity_figure(trials, style: PlotStyle, title="Sensitivity to fit windo
 # ------------------------------------------------------------- schematic
 
 
+def _spring_path(x_center, y_bottom, y_top, width, n_coils=6):
+    """Zigzag points for a drawn spring between two heights."""
+    n = max(2, int(n_coils)) * 2
+    ys = np.linspace(y_bottom, y_top, n + 3)
+    xs = [x_center]
+    for i in range(1, n + 2):
+        xs.append(x_center + (width / 2 if i % 2 else -width / 2))
+    xs.append(x_center)
+    return list(xs[: len(ys)]), list(ys)
+
+
+def _add_spring(fig, x_center, y_bottom, y_top, width, color, line_width, n_coils=6):
+    xs, ys = _spring_path(x_center, y_bottom, y_top, width, n_coils)
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color=color, width=line_width),
+            hoverinfo="skip", showlegend=False,
+        )
+    )
+
+
 def cell_schematic(
     style: PlotStyle,
     epsilon=0.0,
@@ -391,6 +413,8 @@ def cell_schematic(
     En_kPa=None,
     show_nucleus=True,
     height=None,
+    coupling="parallel",
+    shares=None,
 ):
     """
     A small side-on diagram of what is being modelled.
@@ -400,6 +424,13 @@ def cell_schematic(
     ratio implied by the geometry settings, so a wrong cell height or radius
     is visible as a shape that does not look like the cell in the video.
     Volume is held roughly constant as it flattens, which is why it widens.
+
+    ``coupling`` changes the arrangement, because that is the whole point of
+    the setting: in parallel the cytoskeleton spring sits inside the membrane
+    balloon and both are squashed together, while in series the elements are
+    stacked between the plates and each takes its own slice of the squash.
+    ``shares`` maps element name to its fraction of the total deformation and
+    is used to size the stacked elements.
     """
     epsilon = float(np.clip(epsilon, 0.0, 0.95))
     h = cell_height_um * (1.0 - epsilon)
@@ -423,23 +454,62 @@ def cell_schematic(
         fillcolor="#566573", line=dict(width=0),
     )
 
-    # Cytoskeleton body.
-    fig.add_shape(
-        type="circle", x0=-r, x1=r, y0=0, y1=h,
-        fillcolor="rgba(214,234,248,0.95)",
-        line=dict(color="#1f77b4", width=max(3, membrane_thickness_nm * 0.9)),
-    )
+    membrane_line = max(3, membrane_thickness_nm * 0.9)
 
-    if show_nucleus:
-        nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.8)
-        nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.8)
+    if coupling == "series":
+        # Stacked between the plates: each element takes its own slice of the
+        # total squash, sized by its share of the deformation.
+        weights = shares or {}
+        # Bottom to top: membrane against the substrate, then the nucleus, then
+        # the cytoplasm the cantilever presses on. Series is order-independent
+        # mechanically; this order just matches the physical picture.
+        order = [("membrane", "#1f77b4")]
+        if show_nucleus:
+            order.append(("nucleus", "#8e44ad"))
+        order.append(("interior", "#e67e22"))
+        total = sum(max(weights.get(k, 1.0 / len(order)), 0.02) for k, _ in order)
+        y = 0.0
+        for name, color in order:
+            slice_h = h * max(weights.get(name, 1.0 / len(order)), 0.02) / total
+            if name == "membrane":
+                fig.add_shape(
+                    type="rect", x0=-r * 0.9, x1=r * 0.9, y0=y, y1=y + slice_h,
+                    fillcolor="rgba(214,234,248,0.95)",
+                    line=dict(color="#1f77b4", width=membrane_line),
+                )
+            elif name == "interior":
+                _add_spring(fig, 0.0, y, y + slice_h, r * 0.85, color, 4, n_coils=5)
+            else:
+                nr = min(nucleus_radius_um, r * 0.75)
+                fig.add_shape(
+                    type="circle", x0=-nr, x1=nr, y0=y, y1=y + slice_h,
+                    fillcolor="rgba(155,89,182,0.75)"
+                    if nucleus_engaged
+                    else "rgba(155,89,182,0.35)",
+                    line=dict(color="#8e44ad", width=2),
+                )
+            y += slice_h
+    else:
+        # The membrane balloon, with the cytoskeleton spring inside it.
         fig.add_shape(
-            type="circle",
-            x0=-nr, x1=nr,
-            y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
-            fillcolor="rgba(155,89,182,0.75)" if nucleus_engaged else "rgba(155,89,182,0.35)",
-            line=dict(color="#8e44ad", width=2),
+            type="circle", x0=-r, x1=r, y0=0, y1=h,
+            fillcolor="rgba(214,234,248,0.95)",
+            line=dict(color="#1f77b4", width=membrane_line),
+            layer="below",
         )
+        _add_spring(fig, -r * 0.45, h * 0.14, h * 0.86, r * 0.32, "#e67e22", 3, n_coils=5)
+        _add_spring(fig, r * 0.45, h * 0.14, h * 0.86, r * 0.32, "#e67e22", 3, n_coils=5)
+
+        if show_nucleus:
+            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.55)
+            nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.7)
+            fig.add_shape(
+                type="circle",
+                x0=-nr, x1=nr,
+                y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
+                fillcolor="rgba(155,89,182,0.75)" if nucleus_engaged else "rgba(155,89,182,0.35)",
+                line=dict(color="#8e44ad", width=2),
+            )
 
     # Height marker.
     fig.add_annotation(
@@ -490,7 +560,10 @@ def cell_schematic(
         height=height or max(300, int(style.height * 0.66)),
         margin=dict(l=6, r=6, t=28, b=6),
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
-        title=dict(text="<b>What is being fitted</b>",
+        title=dict(text="<b>%s</b>" % (
+            "Stacked in series" if coupling == "series"
+            else "Spring inside the balloon" if coupling == "parallel"
+            else "Hybrid load path"),
                    font=dict(size=max(12, style.tick_size - 4), color="black"), x=0.5,
                    xanchor="center"),
     )
