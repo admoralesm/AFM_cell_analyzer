@@ -627,8 +627,10 @@ with tabs[1]:
 
                     with col2:
                         st.markdown("#### Mechanical Properties")
-                        st.write(f"**Em (Membrane)**: {cell_row.get(\"Young's Modulus (Em, MPa)\", 'N/A')} MPa")
-                        st.write(f"**Ei (Cytoskeleton)**: {cell_row.get(\"Young's Modulus (Ei, kPa)\", 'N/A')} kPa")
+                        em_val = cell_row.get("Young's Modulus (Em, MPa)", "N/A")
+                        ei_val = cell_row.get("Young's Modulus (Ei, kPa)", "N/A")
+                        st.write(f"**Em (Membrane)**: {em_val} MPa")
+                        st.write(f"**Ei (Cytoskeleton)**: {ei_val} kPa")
                         st.write(f"**Fit Quality (R²)**: {cell_row.get('Fit Quality (R²)', 'N/A')}")
                         st.write(f"**Force Curve**: {cell_row.get('Force Curve Created', 'No')}")
 
