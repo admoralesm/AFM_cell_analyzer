@@ -381,31 +381,71 @@ with tabs[0]:
 
         st.markdown("---")
 
-        # ========== SECTION 5: Analyze ==========
+        # ========== SECTION 5: Analyze with Control Panel ==========
         st.markdown('<div class="section-header">Analysis</div>', unsafe_allow_html=True)
 
-        if st.button("🚀 Analyze Force Curve", type="primary", use_container_width=True):
+        # Create two columns: left for plot, right for controls
+        col_plot, col_controls = st.columns([3, 1])
+
+        with col_controls:
+            st.markdown("### Analysis Panel")
+            st.markdown("**Fitting Range (ε)**")
+
+            # Manual range sliders
+            manual_eps_min = st.slider(
+                "Min ε",
+                min_value=0.0,
+                max_value=0.3,
+                value=0.01,
+                step=0.01,
+                key="manual_eps_min"
+            )
+
+            manual_eps_max = st.slider(
+                "Max ε",
+                min_value=0.05,
+                max_value=0.5,
+                value=0.2,
+                step=0.01,
+                key="manual_eps_max"
+            )
+
+            st.markdown("---")
+
+            analyze_button = st.button("🚀 Analyze", type="primary", use_container_width=True)
+
+        with col_plot:
+            pass  # Placeholder for now
+
+        if analyze_button:
             if not cell_name:
                 st.error("❌ Cell Name is required")
             elif cell_height is None or cell_height <= 0:
                 st.error("❌ Cell Height is required (μm). Please enter a valid value and press Enter to update.")
             else:
-                with st.spinner("Analyzing..."):
+                with st.spinner("Analyzing... (this may take a few seconds)"):
                     try:
                         # Lulevich model fitting
                         # Convert force from nN to N for the model
                         force_N_analysis = force / 1e9
                         model = LulevichModel(force_N_analysis, relative_def, cell_height)
 
-                        if fitting_mode == "Manual Range":
-                            fit_results_membrane = model.fit_membrane_elasticity(epsilon_max=eps_max, epsilon_min=eps_min)
-                            fit_results_cyto = model.fit_cytoskeleton_elasticity(epsilon_max=eps_max, epsilon_min=eps_min)
-                        else:
+                        # Use manual ranges from the control panel
+                        fit_results_membrane = model.fit_membrane_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
+                        fit_results_cyto = model.fit_cytoskeleton_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
+
+                        # Check for errors
+                        if fit_results_membrane.get('success', False) == False or fit_results_membrane.get('Em_MPa', 0) == 0:
+                            st.warning("⚠️ Membrane fit failed with current range. Trying auto-detect...")
                             auto_range = model.auto_detect_elastic_range()
                             fit_results_membrane = model.fit_membrane_elasticity(
                                 epsilon_max=auto_range['elastic_epsilon_max'],
                                 epsilon_min=auto_range['elastic_epsilon_min']
                             )
+
+                        if fit_results_cyto.get('success', False) == False or fit_results_cyto.get('Ei_kPa', 0) == 0:
+                            st.warning("⚠️ Cytoskeleton fit failed with current range. Trying auto-detect...")
+                            auto_range = model.auto_detect_elastic_range()
                             fit_results_cyto = model.fit_cytoskeleton_elasticity(
                                 epsilon_max=auto_range['elastic_epsilon_max'],
                                 epsilon_min=auto_range['elastic_epsilon_min']
