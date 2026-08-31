@@ -425,31 +425,26 @@ with tabs[0]:
             else:
                 with st.spinner("Analyzing... (this may take a few seconds)"):
                     try:
-                        # Lulevich model fitting
+                        # Lulevich model fitting (two-term combined model)
                         # Convert force from nN to N for the model
                         force_N_analysis = force / 1e9
                         model = LulevichModel(force_N_analysis, relative_def, cell_height)
 
-                        # Use manual ranges from the control panel
-                        fit_results_membrane = model.fit_membrane_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
-                        fit_results_cyto = model.fit_cytoskeleton_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
+                        # Use combined two-term fit (membrane + cytoskeleton simultaneously)
+                        fit_results = model.fit_combined_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
 
-                        # Check for errors
-                        if fit_results_membrane.get('success', False) == False or fit_results_membrane.get('Em_MPa', 0) == 0:
-                            st.warning("⚠️ Membrane fit failed with current range. Trying auto-detect...")
+                        # Check for errors and fallback to auto-detect if needed
+                        if fit_results.get('success', False) == False or fit_results.get('Em_MPa', 0) == 0:
+                            st.info("ℹ️ Trying auto-detected range...")
                             auto_range = model.auto_detect_elastic_range()
-                            fit_results_membrane = model.fit_membrane_elasticity(
+                            fit_results = model.fit_combined_elasticity(
                                 epsilon_max=auto_range['elastic_epsilon_max'],
                                 epsilon_min=auto_range['elastic_epsilon_min']
                             )
 
-                        if fit_results_cyto.get('success', False) == False or fit_results_cyto.get('Ei_kPa', 0) == 0:
-                            st.warning("⚠️ Cytoskeleton fit failed with current range. Trying auto-detect...")
-                            auto_range = model.auto_detect_elastic_range()
-                            fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                epsilon_max=auto_range['elastic_epsilon_max'],
-                                epsilon_min=auto_range['elastic_epsilon_min']
-                            )
+                        # Extract results
+                        fit_results_membrane = {'Em_MPa': fit_results.get('Em_MPa', 0), 'r_squared': fit_results.get('r_squared', 0)}
+                        fit_results_cyto = {'Ei_kPa': fit_results.get('Ei_kPa', 0), 'r_squared': fit_results.get('r_squared', 0)}
 
                         # Store results
                         st.session_state.results = {
