@@ -408,12 +408,12 @@ with tabs[0]:
                         else:
                             auto_range = model.auto_detect_elastic_range()
                             fit_results_membrane = model.fit_membrane_elasticity(
-                                epsilon_min=auto_range['epsilon_min'],
-                                epsilon_max=auto_range['epsilon_max']
+                                epsilon_min=auto_range['elastic_epsilon_min'],
+                                epsilon_max=auto_range['elastic_epsilon_max']
                             )
                             fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                epsilon_min=auto_range['epsilon_min'],
-                                epsilon_max=auto_range['epsilon_max']
+                                epsilon_min=auto_range['elastic_epsilon_min'],
+                                epsilon_max=auto_range['elastic_epsilon_max']
                             )
 
                         # Store results
