@@ -17,7 +17,7 @@ from baseline_correction import BaselineCorrector, calculate_relative_deformatio
 from google_sheets_manager import GoogleSheetsManager, initialize_sheets_manager
 
 # ========== HELPER FUNCTION: Publication-Quality Plot ==========
-def create_publication_plot(relative_def, force_N, title="Force vs Relative Deformation", force_unit="pN"):
+def create_publication_plot(relative_def, force_N, title="Force vs Relative Deformation", force_unit="pN", line_color="#000000", line_width=4):
     """
     Create publication-quality Nature-style plot
 
@@ -31,6 +31,10 @@ def create_publication_plot(relative_def, force_N, title="Force vs Relative Defo
         Plot title
     force_unit : str
         Force unit: 'N', 'μN', 'nN', 'pN'
+    line_color : str
+        Line color (hex code)
+    line_width : int
+        Line width in pixels
 
     Returns:
     --------
@@ -56,21 +60,21 @@ def create_publication_plot(relative_def, force_N, title="Force vs Relative Defo
         y=force_converted,
         mode='lines+markers',
         name='Force Curve',
-        line=dict(color='#000000', width=4),
-        marker=dict(size=8, color='#000000', line=dict(width=2, color='#000000')),
+        line=dict(color=line_color, width=line_width),
+        marker=dict(size=8, color=line_color, line=dict(width=2, color=line_color)),
         hovertemplate='<b>ε:</b> %{x:.4f}<br><b>F:</b> %{y:.3f} ' + unit_label + '<extra></extra>'
     ))
 
     # Nature journal style formatting
     fig.update_layout(
-        title=title,
+        title=dict(text=title, font=dict(size=22, color='black')),
         xaxis_title='Relative Deformation (ε)',
         yaxis_title=f'Force ({unit_label})',
         plot_bgcolor='white',
         paper_bgcolor='white',
         hovermode='x unified',
         height=600,
-        margin=dict(l=100, r=50, t=80, b=100)
+        margin=dict(l=100, r=50, t=100, b=100)
     )
 
     # Update axes with thick lines and no grid
@@ -81,8 +85,8 @@ def create_publication_plot(relative_def, force_N, title="Force vs Relative Defo
         showgrid=False,
         zeroline=False,
         mirror=True,
-        title_font=dict(size=16, color='black'),
-        tickfont=dict(size=13, color='black')
+        title_font=dict(size=20, color='black'),
+        tickfont=dict(size=16, color='black')
     )
 
     fig.update_yaxes(
@@ -92,8 +96,8 @@ def create_publication_plot(relative_def, force_N, title="Force vs Relative Defo
         showgrid=False,
         zeroline=False,
         mirror=True,
-        title_font=dict(size=16, color='black'),
-        tickfont=dict(size=13, color='black')
+        title_font=dict(size=20, color='black'),
+        tickfont=dict(size=16, color='black')
     )
 
     return fig
@@ -330,21 +334,35 @@ with tabs[0]:
 
     # ========== SECTION 4: Plot Preview ==========
     if force_curve_file is not None and relative_def is not None and force is not None:
-        st.markdown('<div class="section-header">Plot Preview</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Plot Preview & Customization</div>', unsafe_allow_html=True)
 
-        # Force unit selector
-        col1, col2, col3 = st.columns([2, 1, 1])
+        # Plot customization controls
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.markdown("**Display Force Units:**")
-        with col2:
             force_unit_preview = st.selectbox(
                 "Force Unit",
                 ["pN", "nN", "μN", "N"],
                 label_visibility="collapsed",
                 key="force_unit_preview"
             )
+        with col2:
+            line_color_preview = st.color_picker(
+                "Line Color",
+                value="#000000",
+                label_visibility="collapsed",
+                key="line_color_preview"
+            )
         with col3:
-            st.empty()
+            line_width_preview = st.slider(
+                "Line Width",
+                min_value=1,
+                max_value=8,
+                value=4,
+                label_visibility="collapsed",
+                key="line_width_preview"
+            )
+        with col4:
+            st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize plot</p>", unsafe_allow_html=True)
 
         # Convert force to N for the plotting function (force is currently in original units)
         # Assuming input force is in nN (from CSV)
@@ -354,7 +372,9 @@ with tabs[0]:
             relative_def,
             force_N,
             title="Force vs Relative Deformation",
-            force_unit=force_unit_preview
+            force_unit=force_unit_preview,
+            line_color=line_color_preview,
+            line_width=line_width_preview
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -366,11 +386,15 @@ with tabs[0]:
         if st.button("🚀 Analyze Force Curve", type="primary", use_container_width=True):
             if not cell_name:
                 st.error("❌ Cell Name is required")
+            elif cell_height is None or cell_height <= 0:
+                st.error("❌ Cell Height is required (μm). Please enter a valid value and press Enter to update.")
             else:
                 with st.spinner("Analyzing..."):
                     try:
                         # Lulevich model fitting
-                        model = LulevichModel(force, relative_def)
+                        # Convert force from nN to N for the model
+                        force_N_analysis = force / 1e9
+                        model = LulevichModel(force_N_analysis, relative_def, cell_height)
 
                         if fitting_mode == "Manual Range":
                             fit_results_membrane = model.fit_membrane_elasticity(
@@ -442,9 +466,9 @@ with tabs[0]:
                             st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei']:.2f} kPa")
                             st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r2', 0):.4f}")
 
-                        # Plot with unit selector
+                        # Plot with unit selector and customization
                         st.markdown("---")
-                        col1, col2, col3 = st.columns([2, 1, 1])
+                        col1, col2, col3, col4, col5 = st.columns(5)
                         with col1:
                             st.markdown("**Display Force Units:**")
                         with col2:
@@ -455,7 +479,23 @@ with tabs[0]:
                                 key="force_unit_results"
                             )
                         with col3:
-                            st.empty()
+                            line_color_results = st.color_picker(
+                                "Line Color",
+                                value="#000000",
+                                label_visibility="collapsed",
+                                key="line_color_results"
+                            )
+                        with col4:
+                            line_width_results = st.slider(
+                                "Line Width",
+                                min_value=1,
+                                max_value=8,
+                                value=4,
+                                label_visibility="collapsed",
+                                key="line_width_results"
+                            )
+                        with col5:
+                            st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize</p>", unsafe_allow_html=True)
 
                         # Convert force to N
                         force_N_results = force / 1e9
@@ -464,7 +504,9 @@ with tabs[0]:
                             relative_def,
                             force_N_results,
                             title="Force vs Relative Deformation",
-                            force_unit=force_unit_results
+                            force_unit=force_unit_results,
+                            line_color=line_color_results,
+                            line_width=line_width_results
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -612,8 +654,8 @@ with tabs[0]:
                         st.markdown("### Generated Data Preview")
                         st.dataframe(df_output.head(20), use_container_width=True)
 
-                        # Plot with unit selector
-                        col1, col2, col3 = st.columns([2, 1, 1])
+                        # Plot with unit selector and customization
+                        col1, col2, col3, col4, col5 = st.columns(5)
                         with col1:
                             st.markdown("**Display Force Units:**")
                         with col2:
@@ -624,7 +666,23 @@ with tabs[0]:
                                 key="force_unit_generated"
                             )
                         with col3:
-                            st.empty()
+                            line_color_generated = st.color_picker(
+                                "Line Color",
+                                value="#000000",
+                                label_visibility="collapsed",
+                                key="line_color_generated"
+                            )
+                        with col4:
+                            line_width_generated = st.slider(
+                                "Line Width",
+                                min_value=1,
+                                max_value=8,
+                                value=4,
+                                label_visibility="collapsed",
+                                key="line_width_generated"
+                            )
+                        with col5:
+                            st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize</p>", unsafe_allow_html=True)
 
                         # Convert force to N (currently in pN)
                         force_N_generated = force_generated / 1e12
@@ -633,7 +691,9 @@ with tabs[0]:
                             relative_def_generated,
                             force_N_generated,
                             title="Generated Force vs Relative Deformation",
-                            force_unit=force_unit_generated
+                            force_unit=force_unit_generated,
+                            line_color=line_color_generated,
+                            line_width=line_width_generated
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -711,8 +771,8 @@ with tabs[2]:
 
         st.markdown("---")
 
-        # Force unit selector for results tab
-        col1, col2, col3 = st.columns([2, 1, 1])
+        # Force unit selector and plot customization for results tab
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.markdown("**Display Force Units:**")
         with col2:
@@ -723,7 +783,23 @@ with tabs[2]:
                 key="force_unit_tab3"
             )
         with col3:
-            st.empty()
+            line_color_tab3 = st.color_picker(
+                "Line Color",
+                value="#000000",
+                label_visibility="collapsed",
+                key="line_color_tab3"
+            )
+        with col4:
+            line_width_tab3 = st.slider(
+                "Line Width",
+                min_value=1,
+                max_value=8,
+                value=4,
+                label_visibility="collapsed",
+                key="line_width_tab3"
+            )
+        with col5:
+            st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize</p>", unsafe_allow_html=True)
 
         # Convert force to N
         force_N_tab3 = results['force'] / 1e9
@@ -732,7 +808,9 @@ with tabs[2]:
             results['relative_def'],
             force_N_tab3,
             title="Force vs Relative Deformation",
-            force_unit=force_unit_tab3
+            force_unit=force_unit_tab3,
+            line_color=line_color_tab3,
+            line_width=line_width_tab3
         )
         st.plotly_chart(fig, use_container_width=True)
 
