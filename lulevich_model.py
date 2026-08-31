@@ -398,6 +398,118 @@ class LulevichModel:
 
         return self.results['rupture']
 
+    def combined_model(self, epsilon, Em, Ei):
+        """
+        Combined Lulevich model: membrane (cubic) + cytoskeleton (Hertzian)
+
+        F_total = (2π Em h R0 ε³) / (1 - νm) + (√2 Ei R0^(1/2) ε^(3/2)) / (3(1 - νi²))
+
+        Parameters:
+        -----------
+        epsilon : float or array
+            Relative deformation
+        Em : float
+            Membrane Young's modulus (Pa)
+        Ei : float
+            Cytoskeleton Young's modulus (Pa)
+
+        Returns:
+        --------
+        Total force in Newtons
+        """
+        membrane_term = self.balloon_model_cubic(epsilon, Em)
+        cytoskeleton_term = self.hertzian_contact_model(epsilon, Ei)
+        return membrane_term + cytoskeleton_term
+
+    def fit_combined_elasticity(self, epsilon_max=0.3, epsilon_min=0.01):
+        """
+        Fit COMBINED membrane + cytoskeleton model (two-term Lulevich fit).
+        This is the proper two-parameter fit that extracts both Em and Ei simultaneously.
+
+        Parameters:
+        -----------
+        epsilon_max : float
+            Upper limit for fitting (default 0.3)
+        epsilon_min : float
+            Lower limit for fitting (default 0.01)
+
+        Returns:
+        --------
+        dict with fitting results for both Em and Ei
+        """
+        # Select data in fitting range
+        mask = (self.epsilon >= epsilon_min) & (self.epsilon <= epsilon_max)
+        eps_fit = self.epsilon[mask]
+        force_fit = self.force[mask]
+
+        if len(eps_fit) < 4:  # Need at least 4 points for 2 parameters
+            return {'success': False, 'error': 'Not enough data points for 2-parameter fit', 'Em_MPa': 0, 'Ei_kPa': 0}
+
+        try:
+            # Estimate initial guesses
+            p0_Em = self._estimate_initial_guess_membrane(eps_fit, force_fit)
+            p0_Ei = self._estimate_initial_guess_cyto(eps_fit, force_fit)
+
+            # Try fitting with bounds
+            try:
+                popt, pcov = curve_fit(
+                    self.combined_model,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_Em, p0_Ei],
+                    bounds=([1e3, 1], [1e9, 1e9]),  # Em: 1kPa-1GPa, Ei: 1Pa-1GPa
+                    maxfev=5000
+                )
+                Em, Ei = popt[0], popt[1]
+            except:
+                # Try without bounds
+                popt, pcov = curve_fit(
+                    self.combined_model,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_Em, p0_Ei],
+                    maxfev=5000
+                )
+                Em, Ei = popt[0], popt[1]
+
+            # Ensure reasonable values
+            if Em <= 0 or Ei <= 0:
+                return {'success': False, 'error': 'Fitting resulted in non-positive moduli', 'Em_MPa': 0, 'Ei_kPa': 0}
+
+            # Calculate residuals and R²
+            force_pred = self.combined_model(eps_fit, Em, Ei)
+            residuals = force_fit - force_pred
+            ss_res = np.sum(residuals**2)
+            ss_tot = np.sum((force_fit - np.mean(force_fit))**2)
+
+            if ss_tot > 0:
+                r_squared = 1 - (ss_res / ss_tot)
+            else:
+                r_squared = 0
+
+            # Calculate bending constant
+            Km = (Em * self.h_membrane**3) / (12 * (1 - self.poisson_ratio**2))
+            Km_kT = Km / (1.38e-23 * 300)
+
+            self.results['combined'] = {
+                'Em': Em,
+                'Em_MPa': Em / 1e6,
+                'Ei': Ei,
+                'Ei_kPa': Ei / 1e3,
+                'Km': Km,
+                'Km_kT': Km_kT,
+                'epsilon_range': [epsilon_min, epsilon_max],
+                'r_squared': r_squared,
+                'n_points': len(eps_fit),
+                'residual_std': np.std(residuals),
+                'success': True
+            }
+
+            return self.results['combined']
+
+        except Exception as e:
+            return {'success': False, 'error': str(e), 'Em_MPa': 0, 'Ei_kPa': 0}
+
     def get_summary(self):
         """
         Get summary of all analysis results.
