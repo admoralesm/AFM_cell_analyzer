@@ -204,6 +204,7 @@ class LulevichModel:
         fit_offset=False,
         weighting="uniform",
         enforce_positive=True,
+        fixed=None,
     ):
         """
         Bounded linear least-squares fit of the Lulevich model.
@@ -227,6 +228,12 @@ class LulevichModel:
             Constrain the moduli to be >= 0. Negative moduli are unphysical;
             hitting the zero bound means that term is not supported by the
             data, which is reported rather than treated as a failure.
+        fixed : dict, optional
+            Moduli to hold at a known value instead of fitting, e.g.
+            ``{"Ei": 800.0}``. The corresponding term is subtracted from the
+            force before fitting and added back into the reported model. This
+            is what the sequential (two-stage) workflow uses to carry Ei from
+            the low-deformation window into the membrane fit.
 
         Returns
         -------
@@ -234,7 +241,25 @@ class LulevichModel:
             Fit results, diagnostics, and uncertainties. ``success`` is False
             only when the input data is unusable (too few points, degenerate).
         """
-        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        fixed = dict(fixed or {})
+        # A term that is held fixed is not a free parameter.
+        free_terms = tuple(
+            t for t in terms if not (t == "membrane" and "Em" in fixed)
+            and not (t == "interior" and "Ei" in fixed)
+        )
+
+        eps, force_all, mask = self._select(epsilon_min, epsilon_max)
+        force = force_all.copy()
+        # Remove the known contributions so the remaining fit is on the residual.
+        if "Em" in fixed:
+            force = force - self.balloon_model_cubic(eps, fixed["Em"])
+        if "Ei" in fixed:
+            force = force - self.hertzian_contact_model(eps, fixed["Ei"])
+
+        if not free_terms:
+            return self._failure("Every requested term is held fixed; nothing to fit.")
+
+        terms = free_terms
         n_params = len(terms) + (1 if fit_offset else 0)
 
         if eps.size < n_params + 1:
@@ -272,16 +297,17 @@ class LulevichModel:
         params = sol.x / col_norm
         p = dict(zip(names, params))
 
-        Em = float(p.get("Em", 0.0))
-        Ei = float(p.get("Ei", 0.0))
+        Em = float(p.get("Em", fixed.get("Em", 0.0)))
+        Ei = float(p.get("Ei", fixed.get("Ei", 0.0)))
         F0 = float(p.get("F0", 0.0))
 
-        # Predictions and goodness of fit (unweighted, so R^2 is comparable
-        # across weighting choices).
-        pred = X @ params
-        residuals = force - pred
+        # Goodness of fit is always measured against the ORIGINAL force with
+        # the complete model, so a staged fit is scored on the same footing as
+        # a simultaneous one.
+        pred = self.combined_model(eps, Em, Ei, F0)
+        residuals = force_all - pred
         ss_res = float(np.sum(residuals ** 2))
-        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        ss_tot = float(np.sum((force_all - force_all.mean()) ** 2))
         r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
         dof = max(eps.size - n_params, 1)
         adj_r2 = (
@@ -326,6 +352,7 @@ class LulevichModel:
             "epsilon_range": [float(epsilon_min), float(epsilon_max)],
             "epsilon_used": [float(eps.min()), float(eps.max())],
             "terms": list(terms),
+            "fixed": {k: float(v) for k, v in fixed.items()},
             "weighting": weighting,
             "fit_offset": bool(fit_offset),
             "condition_number": cond,
@@ -419,6 +446,238 @@ class LulevichModel:
             "r_squared": float("nan"),
             "warnings": [],
         }
+
+    # ------------------------------------------------------ sequential fit
+
+    def fit_sequential(
+        self,
+        interior_range=(0.01, 0.10),
+        membrane_range=(0.15, 0.30),
+        weighting="uniform",
+        fit_offset=False,
+        order="interior-first",
+        refine_iterations=3,
+    ):
+        """
+        Two-stage fit on two separate deformation windows.
+
+        The physical justification is the exponents: at small e the Hertzian
+        term (e^1.5) dominates, at large e the membrane term (e^3) takes over.
+        So the interior modulus is measured where the membrane contributes
+        least, then held fixed while the membrane modulus is measured where it
+        dominates. This avoids asking one window to separate two nearly
+        collinear basis functions, which is what makes the simultaneous fit
+        sensitive to the range.
+
+        Parameters
+        ----------
+        interior_range : (float, float)
+            Low-deformation window used for Ei.
+        membrane_range : (float, float)
+            High-deformation window used for Em.
+        order : {"interior-first", "membrane-first"}
+            Which modulus is measured on its own window first. The default
+            matches the physics; "membrane-first" is available for curves
+            where the high-e region is the cleaner one.
+        refine_iterations : int
+            A single pass is biased: the first stage has no knowledge of the
+            other term, so it absorbs whatever that term contributes inside
+            its own window. Repeating the pair of fits, each time subtracting
+            the other term's current estimate, removes most of that bias
+            (this is backfitting). 1 = plain one-pass sequential fit;
+            3 is usually converged. The per-iteration values are returned in
+            ``iterations`` so the convergence is visible.
+
+        Returns
+        -------
+        dict
+            Same shape as :meth:`fit`, with an extra ``stages`` entry holding
+            the two individual fits. ``r_squared`` is measured over the union
+            of the two windows using the complete two-term model.
+        """
+        interior_range = (float(interior_range[0]), float(interior_range[1]))
+        membrane_range = (float(membrane_range[0]), float(membrane_range[1]))
+
+        if order == "membrane-first":
+            first_terms, first_range, first_key = ("membrane",), membrane_range, "Em"
+            second_terms, second_range, second_key = ("interior",), interior_range, "Ei"
+        else:
+            first_terms, first_range, first_key = ("interior",), interior_range, "Ei"
+            second_terms, second_range, second_key = ("membrane",), membrane_range, "Em"
+
+        stage1 = stage2 = None
+        estimates = {"Em": 0.0, "Ei": 0.0}
+        history = []
+
+        for iteration in range(max(1, int(refine_iterations))):
+            # Stage 1: measure the first modulus on its own window, removing
+            # the other term's current estimate (zero on the first pass).
+            carry = {second_key: estimates[second_key]} if iteration > 0 else None
+            stage1 = self.fit(
+                first_range[0],
+                first_range[1],
+                terms=first_terms,
+                weighting=weighting,
+                fit_offset=fit_offset,
+                fixed=carry,
+            )
+            if not stage1.get("success"):
+                return self._failure(f"Stage 1 ({first_terms[0]} window): {stage1['error']}")
+            estimates[first_key] = stage1[first_key]
+
+            # Stage 2: the other modulus on its window, holding stage 1 fixed.
+            stage2 = self.fit(
+                second_range[0],
+                second_range[1],
+                terms=second_terms,
+                weighting=weighting,
+                fit_offset=fit_offset,
+                fixed={first_key: estimates[first_key]},
+            )
+            if not stage2.get("success"):
+                return self._failure(f"Stage 2 ({second_terms[0]} window): {stage2['error']}")
+            estimates[second_key] = stage2[second_key]
+
+            history.append(
+                {
+                    "iteration": iteration + 1,
+                    "Em_MPa": estimates["Em"] / 1e6,
+                    "Ei_kPa": estimates["Ei"] / 1e3,
+                }
+            )
+            # Stop once both moduli move by less than 0.1 %.
+            if len(history) > 1:
+                prev, now = history[-2], history[-1]
+                moved = max(
+                    abs(now["Em_MPa"] - prev["Em_MPa"]) / max(abs(now["Em_MPa"]), 1e-12),
+                    abs(now["Ei_kPa"] - prev["Ei_kPa"]) / max(abs(now["Ei_kPa"]), 1e-12),
+                )
+                if moved < 1e-3:
+                    break
+
+        Em, Ei = estimates["Em"], estimates["Ei"]
+        F0 = stage2.get("force_offset", 0.0)
+
+        # Score the joint model over both windows together.
+        union = stage1["mask"] | stage2["mask"]
+        eps_u, force_u = self.epsilon[union], self.force[union]
+        pred_u = self.combined_model(eps_u, Em, Ei, F0)
+        res_u = force_u - pred_u
+        ss_res = float(np.sum(res_u ** 2))
+        ss_tot = float(np.sum((force_u - force_u.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        e_top = float(eps_u.max()) if eps_u.size else 0.0
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        membrane_fraction = f_mem / (f_mem + f_int) if (f_mem + f_int) > 0 else float("nan")
+
+        warnings_list = []
+        if interior_range[1] > membrane_range[0]:
+            warnings_list.append(
+                f"The two windows overlap between e = {membrane_range[0]:.3f} and "
+                f"{interior_range[1]:.3f}. Separate them so each modulus is measured "
+                f"where its own term dominates."
+            )
+        if Ei <= 0:
+            warnings_list.append(
+                "Ei came out zero on the low-e window. Lower its start, or check "
+                "the contact point."
+            )
+        if Em <= 0:
+            warnings_list.append(
+                "Em came out zero on the high-e window. The residual after removing "
+                "the Hertzian term has no cubic content there."
+            )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Joint R2 = {r_squared:.3f} across both windows. The staged result "
+                f"does not describe the whole curve; try different windows or the "
+                f"simultaneous fit."
+            )
+        warnings_list.extend(w for w in stage1["warnings"] if "collinear" not in w)
+
+        Km = Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2))
+
+        out = {
+            "success": True,
+            "mode": "sequential",
+            "order": order,
+            "Em": Em,
+            "Ei": Ei,
+            "Em_MPa": Em / 1e6,
+            "Ei_kPa": Ei / 1e3,
+            "Em_std": stage2.get("Em_std", float("nan")) if "membrane" in second_terms else stage1.get("Em_std", float("nan")),
+            "Ei_std": stage1.get("Ei_std", float("nan")) if "interior" in first_terms else stage2.get("Ei_std", float("nan")),
+            "force_offset": F0,
+            "Km": Km,
+            "Km_kT": Km / (K_BOLTZMANN * 300.0),
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps_u.size)) if eps_u.size else float("nan"),
+            "residual_std": float(np.std(res_u)) if res_u.size else float("nan"),
+            "n_points": int(eps_u.size),
+            "epsilon_range": [
+                float(min(interior_range[0], membrane_range[0])),
+                float(max(interior_range[1], membrane_range[1])),
+            ],
+            "interior_range": list(interior_range),
+            "membrane_range": list(membrane_range),
+            "terms": ["membrane", "interior"],
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": membrane_fraction,
+            "R0": self.R0,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "mask": union,
+            "stages": {"first": stage1, "second": stage2},
+            "iterations": history,
+            "n_iterations": len(history),
+            "warnings": warnings_list,
+        }
+        out["Em_MPa_std"] = out["Em_std"] / 1e6
+        out["Ei_kPa_std"] = out["Ei_std"] / 1e3
+        self.results["sequential"] = out
+        return out
+
+    def suggest_sequential_windows(self, crossover_fraction=0.5):
+        """
+        Propose a low-e window for Ei and a high-e window for Em by splitting
+        the usable range at the point where the two terms would contribute
+        equally under a provisional simultaneous fit.
+        """
+        auto = self.auto_detect_elastic_range()
+        lo, hi = auto["elastic_epsilon_min"], auto["elastic_epsilon_max"]
+
+        provisional = self.fit(lo, hi)
+        crossover = None
+        if provisional.get("success") and provisional["Em"] > 0 and provisional["Ei"] > 0:
+            # Am*Em*e^3 == Ai*Ei*e^1.5  ->  e^1.5 = Ai*Ei / (Am*Em)
+            ratio = (self.Ai * provisional["Ei"]) / (self.Am * provisional["Em"])
+            if ratio > 0:
+                crossover = float(ratio ** (2.0 / 3.0))
+
+        if crossover is None or not (lo < crossover < hi):
+            crossover = lo + crossover_fraction * (hi - lo)
+
+        gap = 0.05 * (hi - lo)
+        interior = (float(lo), float(max(lo + 1e-3, crossover - gap)))
+        membrane = (float(min(hi - 1e-3, crossover + gap)), float(hi))
+        out = {
+            "interior_range": interior,
+            "membrane_range": membrane,
+            "crossover": float(crossover),
+            "note": (
+                f"Below e = {crossover:.3f} the Hertzian term dominates, above it the "
+                f"membrane term does."
+            ),
+        }
+        self.results["sequential_suggestion"] = out
+        return out
 
     # --------------------------------------------- backwards-compatible API
 
