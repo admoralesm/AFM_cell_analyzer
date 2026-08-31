@@ -9,15 +9,26 @@ Langmuir 22(19), 8151-8155.
 
 Physical model
 --------------
-Total force during whole-cell compression is the sum of a membrane
-(balloon) term and an interior/cytoskeleton (Hertzian) term:
+Total force during whole-cell compression is a sum of a membrane (balloon)
+term, an interior/cytoskeleton (Hertzian) term, and optionally a nucleus
+term that only engages once the cell has been squashed onto it:
 
-    F(e) = Am * Em * e^3  +  Ai * Ei * e^(3/2)
+    F(e) = Am * Em * e^3  +  Ai * Ei * e^(3/2)  +  An * En * <e - e0>^(3/2)
 
 with the geometry prefactors
 
     Am = 2 * pi * h_m * R0 / (1 - nu_m)
     Ai = sqrt(2) * R0^(1/2) * h0^(3/2) / (3 * (1 - nu_i^2))
+    An = sqrt(2) * Rn^(1/2) * h0^(3/2) / (3 * (1 - nu_n^2))
+
+<x> is x for x > 0 and zero otherwise, so the nucleus contributes nothing
+below the onset deformation e0. That offset is the only thing separating the
+nucleus term from the cytoskeleton term, which carries the same 3/2 exponent:
+without it the two are identical in shape and their moduli trade off freely.
+
+What the membrane term actually measures is the product Em * h_m. Em is that
+divided by whatever bilayer thickness is assumed, so it scales inversely with
+that assumption and the areal modulus Em * h_m is reported alongside it.
 
 where
     e    = relative deformation, delta / h0  (dimensionless)
@@ -41,11 +52,20 @@ earlier versions and both silently destroy the result:
 
 Fitting
 -------
-F is LINEAR in Em and Ei. There is no need for a non-linear optimiser, an
+F is LINEAR in Em, Ei and En. There is no need for a non-linear optimiser, an
 initial guess, or a convergence check: the fit is a bounded linear least
 squares problem with a closed-form normal-equation solution. This makes the
 result deterministic, guess-independent, and impossible to "fail to
 converge". Uncertainties come from the analytic covariance matrix.
+
+The onset e0 is the single exception, the only non-linear parameter. It is a
+bounded scalar, so :meth:`scan_nucleus_onset` sweeps it on a grid where each
+trial is one exact linear solve, and reports whether the R2 peak is sharp
+enough for the data to have located it at all.
+
+Terms can also be fitted in stages on separate windows (:meth:`fit_staged`),
+each stage subtracting the current estimates of the terms it is not solving
+for and the whole sequence repeating until it settles.
 """
 
 from __future__ import annotations
@@ -63,7 +83,7 @@ K_BOLTZMANN = 1.380649e-23
 
 
 class LulevichModel:
-    """Two-term Lulevich fit for single-cell compression curves."""
+    """Lulevich fit for single-cell compression curves."""
 
     # ------------------------------------------------------------------ init
 
@@ -77,6 +97,11 @@ class LulevichModel:
         poisson_membrane=0.5,
         poisson_interior=0.5,
         radius_from_height=0.55,
+        nucleus_radius=None,
+        nucleus_from_radius=0.35,
+        poisson_nucleus=0.5,
+        nucleus_onset=0.15,
+        expected_ranges=None,
     ):
         """
         Parameters
@@ -95,6 +120,21 @@ class LulevichModel:
             Poisson ratios; 0.5 (incompressible) for living cells.
         radius_from_height : float
             Aspect factor used when ``cell_radius`` is not given.
+        nucleus_radius : float, optional
+            Nucleus radius in metres. Defaults to ``nucleus_from_radius * R0``.
+        nucleus_from_radius : float
+            Nucleus radius as a fraction of the cell radius.
+        poisson_nucleus : float
+            Poisson ratio of the nucleus.
+        nucleus_onset : float
+            Relative deformation at which the plates begin to feel the nucleus.
+            Below it the nucleus term is exactly zero. See
+            :meth:`scan_nucleus_onset` to find it from the data.
+        expected_ranges : dict, optional
+            Plausibility bands in pascals used only for warnings, e.g.
+            ``{"Em": (5e5, 1e7), "Ei": (3e2, 1e4), "En": (1e3, 5e4)}``. Set
+            these per cell type so an out-of-range result is flagged against
+            something meaningful rather than a generic 1 kPa to 1 GPa window.
         """
         force = np.asarray(force, dtype=float).ravel()
         epsilon = np.asarray(relative_deformation, dtype=float).ravel()
@@ -133,6 +173,21 @@ class LulevichModel:
         if self.R0 <= 0:
             raise ValueError("cell_radius must be positive")
 
+        self.nu_n = float(poisson_nucleus)
+        self.R_nucleus = (
+            float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
+        )
+        self.nucleus_onset = float(nucleus_onset)
+        self.expected_ranges = {
+            "Em": PLAUSIBLE_EM_PA,
+            "Ei": PLAUSIBLE_EI_PA,
+            "En": (1e1, 1e7),
+        }
+        if expected_ranges:
+            self.expected_ranges.update(
+                {k: (float(v[0]), float(v[1])) for k, v in expected_ranges.items() if v}
+            )
+
         self.results = {}
 
     @classmethod
@@ -160,6 +215,30 @@ class LulevichModel:
             / (3.0 * (1.0 - self.nu_i ** 2))
         )
 
+    @property
+    def An(self):
+        """Nucleus prefactor: F_nucleus = An * En * <e - e_onset>^1.5  [N/Pa]."""
+        return (
+            np.sqrt(2.0)
+            * np.sqrt(self.R_nucleus)
+            * self.cell_height ** 1.5
+            / (3.0 * (1.0 - self.nu_n ** 2))
+        )
+
+    def nucleus_model(self, epsilon, En, onset=None):
+        """
+        Nucleus term, force in newtons.
+
+        The nucleus carries no load until the cytoplasm above it has been
+        squashed away, so the term is exactly zero below ``onset`` and rises as
+        a Hertzian contact in the excess deformation beyond it. That offset is
+        what keeps this term distinguishable from the cytoskeleton term, which
+        has the same 3/2 exponent but starts at zero deformation.
+        """
+        onset = self.nucleus_onset if onset is None else float(onset)
+        excess = np.clip(np.asarray(epsilon, dtype=float) - onset, 0.0, None)
+        return self.An * En * excess ** 1.5
+
     def balloon_model_cubic(self, epsilon, Em):
         """Membrane (balloon) term, force in newtons."""
         return self.Am * Em * np.asarray(epsilon, dtype=float) ** 3
@@ -169,13 +248,16 @@ class LulevichModel:
         eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, None)
         return self.Ai * Ei * eps ** 1.5
 
-    def combined_model(self, epsilon, Em, Ei, force_offset=0.0):
-        """Full two-term model, force in newtons."""
-        return (
+    def combined_model(self, epsilon, Em, Ei, force_offset=0.0, En=0.0, onset=None):
+        """Full model, force in newtons. ``En=0`` gives the two-term Lulevich fit."""
+        total = (
             self.balloon_model_cubic(epsilon, Em)
             + self.hertzian_contact_model(epsilon, Ei)
             + force_offset
         )
+        if En:
+            total = total + self.nucleus_model(epsilon, En, onset)
+        return total
 
     # ---------------------------------------------------------------- fitting
 
@@ -191,6 +273,11 @@ class LulevichModel:
         if "interior" in terms:
             cols.append(self.Ai * np.clip(eps, 0.0, None) ** 1.5)
             names.append("Ei")
+        if "nucleus" in terms:
+            cols.append(
+                self.An * np.clip(eps - self.nucleus_onset, 0.0, None) ** 1.5
+            )
+            names.append("En")
         if fit_offset:
             cols.append(np.ones_like(eps))
             names.append("F0")
@@ -243,10 +330,8 @@ class LulevichModel:
         """
         fixed = dict(fixed or {})
         # A term that is held fixed is not a free parameter.
-        free_terms = tuple(
-            t for t in terms if not (t == "membrane" and "Em" in fixed)
-            and not (t == "interior" and "Ei" in fixed)
-        )
+        _fixed_key = {"membrane": "Em", "interior": "Ei", "nucleus": "En"}
+        free_terms = tuple(t for t in terms if _fixed_key.get(t) not in fixed)
 
         eps, force_all, mask = self._select(epsilon_min, epsilon_max)
         force = force_all.copy()
@@ -255,6 +340,8 @@ class LulevichModel:
             force = force - self.balloon_model_cubic(eps, fixed["Em"])
         if "Ei" in fixed:
             force = force - self.hertzian_contact_model(eps, fixed["Ei"])
+        if "En" in fixed:
+            force = force - self.nucleus_model(eps, fixed["En"])
 
         if not free_terms:
             return self._failure("Every requested term is held fixed; nothing to fit.")
@@ -299,12 +386,13 @@ class LulevichModel:
 
         Em = float(p.get("Em", fixed.get("Em", 0.0)))
         Ei = float(p.get("Ei", fixed.get("Ei", 0.0)))
+        En = float(p.get("En", fixed.get("En", 0.0)))
         F0 = float(p.get("F0", 0.0))
 
         # Goodness of fit is always measured against the ORIGINAL force with
         # the complete model, so a staged fit is scored on the same footing as
         # a simultaneous one.
-        pred = self.combined_model(eps, Em, Ei, F0)
+        pred = self.combined_model(eps, Em, Ei, F0, En=En)
         residuals = force_all - pred
         ss_res = float(np.sum(residuals ** 2))
         ss_tot = float(np.sum((force_all - force_all.mean()) ** 2))
@@ -322,21 +410,34 @@ class LulevichModel:
 
         # How much of the force at the top of the window each term explains.
         e_top = eps.max()
-        f_mem = self.balloon_model_cubic(e_top, Em)
-        f_int = self.hertzian_contact_model(e_top, Ei)
-        f_tot = f_mem + f_int
-        membrane_fraction = float(f_mem / f_tot) if f_tot > 0 else float("nan")
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        f_nuc = float(self.nucleus_model(e_top, En)) if En else 0.0
+        f_tot = f_mem + f_int + f_nuc
+        membrane_fraction = f_mem / f_tot if f_tot > 0 else float("nan")
+        interior_fraction = f_int / f_tot if f_tot > 0 else float("nan")
+        nucleus_fraction = f_nuc / f_tot if f_tot > 0 else float("nan")
 
         Km = Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2))
 
-        warnings_list = self._warnings(Em, Ei, names, cond, r_squared, eps.size, membrane_fraction)
+        warnings_list = self._warnings(
+            Em, Ei, names, cond, r_squared, eps.size, membrane_fraction, En=En
+        )
 
         out = {
             "success": True,
             "Em": Em,
             "Ei": Ei,
+            "En": En,
             "Em_MPa": Em / 1e6,
             "Ei_kPa": Ei / 1e3,
+            "En_kPa": En / 1e3,
+            "En_std": std_err.get("En", float("nan")),
+            "En_kPa_std": std_err.get("En", float("nan")) / 1e3,
+            "nucleus_onset": self.nucleus_onset,
+            "R_nucleus": self.R_nucleus,
+            "An": self.An,
+            "membrane_areal_modulus": Em * self.h_membrane,
             "Em_std": std_err.get("Em", float("nan")),
             "Ei_std": std_err.get("Ei", float("nan")),
             "Em_MPa_std": std_err.get("Em", float("nan")) / 1e6,
@@ -358,6 +459,8 @@ class LulevichModel:
             "condition_number": cond,
             "corr_Em_Ei": corr_EmEi,
             "membrane_fraction_at_max": membrane_fraction,
+            "interior_fraction_at_max": interior_fraction,
+            "nucleus_fraction_at_max": nucleus_fraction,
             "R0": self.R0,
             "cell_height": self.cell_height,
             "Am": self.Am,
@@ -390,8 +493,14 @@ class LulevichModel:
             pass
         return std_err, corr, cond
 
-    def _warnings(self, Em, Ei, names, cond, r2, n_points, membrane_fraction):
+    def _warnings(self, Em, Ei, names, cond, r2, n_points, membrane_fraction, En=0.0):
         w = []
+        if "En" in names and En <= 0:
+            w.append(
+                "En collapsed to zero: past the onset deformation the data shows no "
+                "extra stiffening, so this curve gives no evidence of the nucleus. "
+                "Either it was never engaged, or the onset is set too high."
+            )
         if "Em" in names and Em <= 0:
             w.append(
                 "Em collapsed to zero: over this e-window the data is fully "
@@ -409,16 +518,21 @@ class LulevichModel:
                 f"(condition number {cond:.0f}). The SUM is well determined but "
                 f"the Em/Ei split is not; widen the range or fix one term."
             )
-        if Em > 0 and not (PLAUSIBLE_EM_PA[0] <= Em <= PLAUSIBLE_EM_PA[1]):
-            w.append(
-                f"Em = {Em/1e6:.3g} MPa is outside the usual 0.001-1000 MPa "
-                f"range. Check cell height, radius and force units."
-            )
-        if Ei > 0 and not (PLAUSIBLE_EI_PA[0] <= Ei <= PLAUSIBLE_EI_PA[1]):
-            w.append(
-                f"Ei = {Ei/1e3:.3g} kPa is outside the usual 0.001-10000 kPa "
-                f"range. Check cell height, radius and force units."
-            )
+        for value, key, unit, scale in (
+            (Em, "Em", "MPa", 1e6),
+            (Ei, "Ei", "kPa", 1e3),
+            (En, "En", "kPa", 1e3),
+        ):
+            if key not in names:
+                continue
+            lo, hi = self.expected_ranges[key]
+            if value > 0 and not (lo <= value <= hi):
+                w.append(
+                    f"{key} = {value/scale:.3g} {unit} is outside the expected "
+                    f"{lo/scale:.3g} to {hi/scale:.3g} {unit} for this cell type. "
+                    f"Check the cell height, radius and force units before "
+                    f"trusting it."
+                )
         if np.isfinite(r2) and r2 < 0.9:
             w.append(
                 f"R2 = {r2:.3f}. The two-term model does not describe this "
@@ -446,6 +560,288 @@ class LulevichModel:
             "r_squared": float("nan"),
             "warnings": [],
         }
+
+    # ------------------------------------------------------- staged fitting
+
+    TERM_KEY = {"membrane": "Em", "interior": "Ei", "nucleus": "En"}
+    TERM_LABEL = {"membrane": "membrane", "interior": "cytoskeleton", "nucleus": "nucleus"}
+
+    def fit_staged(
+        self,
+        stages,
+        weighting="uniform",
+        fit_offset=False,
+        refine_iterations=3,
+        seed_parallel=True,
+    ):
+        """
+        Fit groups of terms in sequence, each on its own deformation window.
+
+        This is the general form of the series workflow. Each stage names the
+        terms it solves for and the window it solves them on; every other term
+        is held at its current estimate and subtracted first. Stages run in
+        order, and the whole sequence repeats so that early stages get the
+        benefit of what the later ones learned.
+
+        Parameters
+        ----------
+        stages : list of dict
+            ``[{"terms": ("membrane",), "range": (0.20, 0.35)},
+               {"terms": ("interior", "nucleus"), "range": (0.01, 0.15)}]``
+        refine_iterations : int
+            Passes over the whole sequence. Later passes let early stages
+            benefit from what the later ones found. 3 is normally converged.
+        seed_parallel : bool
+            Start from a parallel fit over the union of all windows. Without a
+            seed the first stage has nothing to subtract, so it absorbs the
+            whole force; the non-negativity constraint then pins the later
+            stages at zero and the sequence has no way back. Seeding removes
+            that trap. Turn it off only to see the unseeded staged behaviour.
+
+        Returns
+        -------
+        dict
+            Same shape as :meth:`fit`, plus ``stages``, ``iterations`` and a
+            joint ``r_squared`` over the union of all windows.
+        """
+        stages = [
+            {"terms": tuple(st["terms"]), "range": (float(st["range"][0]), float(st["range"][1]))}
+            for st in stages
+            if st.get("terms")
+        ]
+        if not stages:
+            return self._failure("No stages defined.")
+
+        estimates = {"Em": 0.0, "Ei": 0.0, "En": 0.0}
+        all_terms = [t for st in stages for t in st["terms"]]
+        history, stage_results = [], []
+
+        seed = None
+        if seed_parallel and len(stages) > 1:
+            union_lo = min(st["range"][0] for st in stages)
+            union_hi = max(st["range"][1] for st in stages)
+            seed = self.fit(
+                union_lo,
+                union_hi,
+                terms=tuple(dict.fromkeys(all_terms)),
+                weighting=weighting,
+                fit_offset=fit_offset,
+            )
+            if seed.get("success"):
+                for term in all_terms:
+                    key = self.TERM_KEY[term]
+                    estimates[key] = seed[key]
+            else:
+                seed = None
+
+        for iteration in range(max(1, int(refine_iterations))):
+            stage_results = []
+            for st in stages:
+                keys_here = {self.TERM_KEY[t] for t in st["terms"]}
+                # Hold every other term of the model at its current value.
+                carry = {
+                    self.TERM_KEY[t]: estimates[self.TERM_KEY[t]]
+                    for t in all_terms
+                    if self.TERM_KEY[t] not in keys_here
+                }
+                result = self.fit(
+                    st["range"][0],
+                    st["range"][1],
+                    terms=st["terms"],
+                    weighting=weighting,
+                    fit_offset=fit_offset,
+                    fixed=carry or None,
+                )
+                if not result.get("success"):
+                    labels = ", ".join(self.TERM_LABEL[t] for t in st["terms"])
+                    return self._failure(f"Stage '{labels}': {result['error']}")
+                for t in st["terms"]:
+                    estimates[self.TERM_KEY[t]] = result[self.TERM_KEY[t]]
+                stage_results.append(result)
+
+            history.append(
+                {
+                    "iteration": iteration + 1,
+                    "Em_MPa": estimates["Em"] / 1e6,
+                    "Ei_kPa": estimates["Ei"] / 1e3,
+                    "En_kPa": estimates["En"] / 1e3,
+                }
+            )
+            if len(history) > 1:
+                prev, now = history[-2], history[-1]
+                moved = max(
+                    abs(now[k] - prev[k]) / max(abs(now[k]), 1e-12)
+                    for k in ("Em_MPa", "Ei_kPa", "En_kPa")
+                )
+                if moved < 1e-3:
+                    break
+
+        Em, Ei, En = estimates["Em"], estimates["Ei"], estimates["En"]
+        F0 = stage_results[-1].get("force_offset", 0.0)
+
+        union = np.zeros(self.epsilon.shape, dtype=bool)
+        for result in stage_results:
+            union |= result["mask"]
+        eps_u, force_u = self.epsilon[union], self.force[union]
+        pred_u = self.combined_model(eps_u, Em, Ei, F0, En=En)
+        residual = force_u - pred_u
+        ss_res = float(np.sum(residual ** 2))
+        ss_tot = float(np.sum((force_u - force_u.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        e_top = float(eps_u.max()) if eps_u.size else 0.0
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        f_nuc = float(self.nucleus_model(e_top, En)) if En else 0.0
+        f_tot = f_mem + f_int + f_nuc
+
+        warnings_list = self._staged_warnings(stages, estimates, r_squared)
+
+        out = {
+            "success": True,
+            "mode": "staged",
+            "Em": Em,
+            "Ei": Ei,
+            "En": En,
+            "Em_MPa": Em / 1e6,
+            "Ei_kPa": Ei / 1e3,
+            "En_kPa": En / 1e3,
+            "Em_std": float("nan"),
+            "Ei_std": float("nan"),
+            "En_std": float("nan"),
+            "force_offset": F0,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps_u.size)) if eps_u.size else float("nan"),
+            "residual_std": float(np.std(residual)) if residual.size else float("nan"),
+            "n_points": int(eps_u.size),
+            "epsilon_range": [
+                float(min(st["range"][0] for st in stages)),
+                float(max(st["range"][1] for st in stages)),
+            ],
+            "stage_plan": stages,
+            "terms": all_terms,
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": f_mem / f_tot if f_tot > 0 else float("nan"),
+            "interior_fraction_at_max": f_int / f_tot if f_tot > 0 else float("nan"),
+            "nucleus_fraction_at_max": f_nuc / f_tot if f_tot > 0 else float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0,
+            "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "An": self.An,
+            "mask": union,
+            "stages": stage_results,
+            "iterations": history,
+            "n_iterations": len(history),
+            "seeded": seed is not None,
+            "warnings": warnings_list,
+        }
+        for key in ("Em", "Ei", "En"):
+            unit = 1e6 if key == "Em" else 1e3
+            suffix = "MPa" if key == "Em" else "kPa"
+            out[f"{key}_{suffix}_std"] = out[f"{key}_std"] / unit
+        self.results["staged"] = out
+        return out
+
+    def _staged_warnings(self, stages, estimates, r_squared):
+        warnings_list = []
+        for i, first in enumerate(stages):
+            for second in stages[i + 1 :]:
+                lo = max(first["range"][0], second["range"][0])
+                hi = min(first["range"][1], second["range"][1])
+                if lo < hi:
+                    a = "/".join(self.TERM_LABEL[t] for t in first["terms"])
+                    b = "/".join(self.TERM_LABEL[t] for t in second["terms"])
+                    warnings_list.append(
+                        f"The '{a}' and '{b}' windows overlap between e = {lo:.3f} and "
+                        f"{hi:.3f}. Separate them so each stage measures where its own "
+                        f"terms dominate."
+                    )
+        for term, key in self.TERM_KEY.items():
+            if any(term in st["terms"] for st in stages) and estimates[key] <= 0:
+                warnings_list.append(
+                    f"The {self.TERM_LABEL[term]} modulus came out zero: its window "
+                    f"holds no signal of that term's shape once the others are removed."
+                )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Joint R2 = {r_squared:.3f} across all windows. The staged result does "
+                f"not describe the whole curve; try different windows or fit in parallel."
+            )
+        return warnings_list
+
+    def scan_nucleus_onset(self, epsilon_min, epsilon_max, terms=("membrane", "interior", "nucleus"),
+                           n_trials=25, weighting="uniform", fit_offset=False):
+        """
+        Find the onset deformation that best explains the data.
+
+        The onset is the only non-linear parameter in the model, and it is a
+        single bounded scalar, so a scan over a grid is both exhaustive and
+        cheap: each trial is one exact linear solve. Returns the best onset,
+        its fit, and the whole R2 curve so a flat maximum (meaning the data
+        does not really locate the nucleus) is visible rather than hidden.
+        """
+        original = self.nucleus_onset
+        lo = epsilon_min + 0.15 * (epsilon_max - epsilon_min)
+        hi = epsilon_min + 0.85 * (epsilon_max - epsilon_min)
+        trials = []
+        best = None
+        try:
+            for onset in np.linspace(lo, hi, max(3, int(n_trials))):
+                self.nucleus_onset = float(onset)
+                result = self.fit(
+                    epsilon_min, epsilon_max, terms=terms,
+                    weighting=weighting, fit_offset=fit_offset,
+                )
+                if not result.get("success"):
+                    continue
+                trials.append(
+                    {
+                        "onset": float(onset),
+                        "r_squared": float(result["r_squared"]),
+                        "Em_MPa": result["Em_MPa"],
+                        "Ei_kPa": result["Ei_kPa"],
+                        "En_kPa": result["En_kPa"],
+                    }
+                )
+                if best is None or result["r_squared"] > best["r_squared"]:
+                    best = {"onset": float(onset), "r_squared": float(result["r_squared"])}
+        finally:
+            self.nucleus_onset = original
+
+        if best is None:
+            return {"success": False, "error": "No usable fit across the onset scan.",
+                    "trials": trials}
+
+        r2_values = np.array([t["r_squared"] for t in trials], dtype=float)
+        spread = float(np.nanmax(r2_values) - np.nanmin(r2_values)) if r2_values.size else 0.0
+        # Judge the spread against the residual that is left at the optimum,
+        # not against an absolute number: on a clean curve the whole scan sits
+        # within a thousandth of 1.0 and an absolute threshold would call a
+        # sharply located onset "undetermined".
+        headroom = max(1.0 - best["r_squared"], 1e-12)
+        significance = spread / headroom
+        out = {
+            "success": True,
+            "best_onset": best["onset"],
+            "best_r_squared": best["r_squared"],
+            "trials": trials,
+            "r_squared_spread": spread,
+            "significance": float(significance),
+            "well_determined": bool(significance > 1.0),
+        }
+        self.results["nucleus_onset_scan"] = out
+        return out
 
     # ------------------------------------------------------ sequential fit
 
@@ -629,6 +1025,8 @@ class LulevichModel:
             "condition_number": float("nan"),
             "corr_Em_Ei": float("nan"),
             "membrane_fraction_at_max": membrane_fraction,
+            "interior_fraction_at_max": interior_fraction,
+            "nucleus_fraction_at_max": nucleus_fraction,
             "R0": self.R0,
             "cell_height": self.cell_height,
             "Am": self.Am,
