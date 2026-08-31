@@ -24,6 +24,7 @@ from plot_utils import (
     INPUT_FORCE_UNITS,
     PlotStyle,
     autoscale_unit,
+    cell_schematic,
     force_curve_figure,
     from_newtons,
     residual_figure,
@@ -102,6 +103,18 @@ def _stretch_kwargs():
 STRETCH = _stretch_kwargs()
 
 
+def _supports_selection():
+    """Chart selection events (drag to set a window) arrived in Streamlit 1.35."""
+    try:
+        major, minor = (int(part) for part in st.__version__.split(".")[:2])
+    except Exception:
+        return False
+    return (major, minor) >= (1, 35)
+
+
+SUPPORTS_SELECTION = _supports_selection()
+
+
 def section(text: str):
     st.markdown(f'<div class="section">{text}</div>', unsafe_allow_html=True)
 
@@ -128,6 +141,8 @@ DEFAULTS = {
     "log_scale": False,
     "show_components": True,
     "show_fit_window": True,
+    "show_schematic": True,
+    "plot_width": 2.4,
     # geometry / model
     "radius_mode": "From height",
     "radius_aspect": 0.55,
@@ -135,14 +150,27 @@ DEFAULTS = {
     "membrane_thickness_nm": 4.0,
     "poisson_membrane": 0.50,
     "poisson_interior": 0.50,
+    # cell type
+    "cell_type": "Myoblast (C2C12)",
+    "nucleus_fraction": 0.35,
+    "nucleus_radius_um": 1.55,
+    "nucleus_radius_mode": "From cell radius",
+    "poisson_nucleus": 0.50,
+    "nucleus_onset": 0.20,
+    "onset_mode": "Scan for best",
+    "_scanned_onset": None,
     # fitting
-    "fit_mode": "Simultaneous (one window)",
-    "sequential_order": "interior-first",
+    "strategy": "Parallel (all at once)",
+    "use_membrane": True,
+    "use_interior": True,
+    "use_nucleus": False,
+    "stage_of_membrane": 2,
+    "stage_of_interior": 1,
+    "stage_of_nucleus": 3,
     "refine_iterations": 3,
-    "lock_range": False,
+    "seed_parallel": True,
     "range_presets": {},
-    "range_mode": "Auto (detected)",
-    "fit_terms": "Membrane + interior",
+    "drag_target": "(off)",
     "weighting": "uniform",
     "fit_offset": False,
     "live_fit": True,
@@ -177,7 +205,10 @@ if st.session_state.pop("_reset_requested", False):
     for key, value in DEFAULTS.items():
         if key not in ("data", "results", "gs_manager"):
             st.session_state[key] = value
-    st.session_state.pop("manual_range", None)
+    for stale in [k for k in st.session_state.keys()
+                  if k.startswith(("window_", "celltype_window_", "stage_of_"))]:
+        del st.session_state[stale]
+    st.session_state.pop("_applied_cell_type", None)
 
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -286,6 +317,10 @@ def build_model(epsilon, force_N) -> LulevichModel:
         radius_m = float(st.session_state["cell_radius_um"]) * 1e-6
     else:
         radius_m = height_m * float(st.session_state["radius_aspect"])
+    if st.session_state["nucleus_radius_mode"] == "Manual":
+        nucleus_m = float(st.session_state["nucleus_radius_um"]) * 1e-6
+    else:
+        nucleus_m = radius_m * float(st.session_state["nucleus_fraction"])
     return LulevichModel(
         force_N,
         epsilon,
@@ -294,15 +329,203 @@ def build_model(epsilon, force_N) -> LulevichModel:
         membrane_thickness=float(st.session_state["membrane_thickness_nm"]) * 1e-9,
         poisson_membrane=float(st.session_state["poisson_membrane"]),
         poisson_interior=float(st.session_state["poisson_interior"]),
+        nucleus_radius=nucleus_m,
+        poisson_nucleus=float(st.session_state["poisson_nucleus"]),
+        nucleus_onset=float(st.session_state["nucleus_onset"]),
+        expected_ranges=CELL_TYPES.get(st.session_state["cell_type"], {}).get("expected"),
     )
 
 
-def selected_terms():
-    return {
-        "Membrane + interior": ("membrane", "interior"),
-        "Membrane only (ε³)": ("membrane",),
-        "Interior only (ε³ᐟ²)": ("interior",),
-    }[st.session_state["fit_terms"]]
+# ============================================================ cell presets ==
+
+TERM_LABELS = {
+    "membrane": "membrane (Eₘ)",
+    "interior": "cytoskeleton (E_c)",
+    "nucleus": "nucleus (Eₙ)",
+}
+TERM_ORDER = ("membrane", "interior", "nucleus")
+STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
+
+# Starting points, not literature constants. They set the geometry, the
+# plausibility bands used for warnings, and the initial fit windows for a
+# cell type. Edit them for your own line and save the result as a preset.
+CELL_TYPES = {
+    "Myoblast (C2C12)": {
+        "cell_height_um": 8.0,
+        "radius_aspect": 0.55,
+        "nucleus_fraction": 0.35,
+        "membrane_thickness_nm": 4.0,
+        "nucleus_onset": 0.20,
+        # expected bands in pascals
+        "expected": {"Em": (2e5, 2e7), "Ei": (2e2, 1e4), "En": (1e3, 5e4)},
+        "windows": {"membrane": (0.18, 0.32), "interior": (0.01, 0.12),
+                    "nucleus": (0.24, 0.40)},
+    },
+    "Cardiomyocyte": {
+        "cell_height_um": 12.0,
+        "radius_aspect": 0.60,
+        "nucleus_fraction": 0.32,
+        "membrane_thickness_nm": 4.5,
+        "nucleus_onset": 0.18,
+        "expected": {"Em": (5e5, 5e7), "Ei": (1e3, 1e5), "En": (2e3, 2e5)},
+        "windows": {"membrane": (0.15, 0.30), "interior": (0.01, 0.10),
+                    "nucleus": (0.22, 0.38)},
+    },
+    "Custom": {
+        "cell_height_um": 8.09,
+        "radius_aspect": 0.55,
+        "nucleus_fraction": 0.35,
+        "membrane_thickness_nm": 4.0,
+        "nucleus_onset": 0.15,
+        "expected": {"Em": (1e3, 1e9), "Ei": (1e0, 1e7), "En": (1e1, 1e7)},
+        "windows": {"membrane": (0.15, 0.30), "interior": (0.01, 0.12),
+                    "nucleus": (0.22, 0.40)},
+    },
+}
+
+
+def apply_cell_type(name):
+    """Copy a cell type's defaults into the settings."""
+    preset = CELL_TYPES.get(name)
+    if not preset:
+        return
+    for key in (
+        "cell_height_um",
+        "radius_aspect",
+        "nucleus_fraction",
+        "membrane_thickness_nm",
+        "nucleus_onset",
+    ):
+        st.session_state[key] = preset[key]
+    for term, window in preset["windows"].items():
+        st.session_state[f"celltype_window_{term}"] = tuple(window)
+    for key in list(st.session_state.keys()):
+        if key.startswith("window_"):
+            del st.session_state[key]
+
+
+def active_terms():
+    """Terms currently switched on, always in membrane -> nucleus order."""
+    return tuple(t for t in TERM_ORDER if st.session_state.get(f"use_{t}", False))
+
+
+def stage_groups(terms):
+    """Group the active terms by the stage number assigned to each."""
+    grouped = {}
+    for term in terms:
+        stage = int(st.session_state.get(f"stage_of_{term}", 1))
+        grouped.setdefault(stage, []).append(term)
+    return [(stage, tuple(grouped[stage])) for stage in sorted(grouped)]
+
+
+def default_window_for(terms, auto_window, lo, hi):
+    """Starting window for a stage, from the cell type where one is defined."""
+    spans = []
+    for term in terms:
+        window = st.session_state.get(f"celltype_window_{term}")
+        if window:
+            spans.append(tuple(window))
+    if spans:
+        window = (min(s[0] for s in spans), max(s[1] for s in spans))
+    else:
+        window = auto_window
+    lo_w = float(np.clip(window[0], lo, hi))
+    hi_w = float(np.clip(window[1], lo, hi))
+    return (lo_w, hi_w) if lo_w < hi_w else auto_window
+
+
+def apply_suggested_windows(model, terms, auto_window):
+    """Split the usable region at the crossover between the fitted terms."""
+    suggestion = model.suggest_sequential_windows()
+    mapping = {
+        "interior": suggestion["interior_range"],
+        "membrane": suggestion["membrane_range"],
+        "nucleus": (
+            float(min(suggestion["membrane_range"][0] + 0.05, auto_window[1])),
+            float(auto_window[1]),
+        ),
+    }
+    for stage_no, stage_terms in stage_groups(terms):
+        spans = [mapping[t] for t in stage_terms if t in mapping]
+        if spans:
+            st.session_state[f"window_stage_{stage_no}"] = (
+                float(min(s[0] for s in spans)),
+                float(max(s[1] for s in spans)),
+            )
+
+
+def apply_preset(preset, lo, hi):
+    """Restore a saved set of windows, terms and stage assignments."""
+    st.session_state["strategy"] = preset.get("strategy", st.session_state["strategy"])
+    if preset.get("cell_type") in CELL_TYPES:
+        st.session_state["cell_type"] = preset["cell_type"]
+    for term in TERM_ORDER:
+        st.session_state[f"use_{term}"] = term in preset.get("terms", [])
+    for term, stage in (preset.get("stage_of") or {}).items():
+        st.session_state[f"stage_of_{term}"] = int(stage)
+    if preset.get("nucleus_onset") is not None:
+        st.session_state["nucleus_onset"] = float(preset["nucleus_onset"])
+
+    stages = preset.get("stages", [])
+    if st.session_state["strategy"] == "Series (stage by stage)":
+        for i, stage in enumerate(stages, start=1):
+            window = (
+                float(np.clip(stage["range"][0], lo, hi)),
+                float(np.clip(stage["range"][1], lo, hi)),
+            )
+            if window[0] < window[1]:
+                st.session_state[f"window_stage_{i}"] = window
+    elif stages:
+        window = (
+            float(np.clip(stages[0]["range"][0], lo, hi)),
+            float(np.clip(stages[0]["range"][1], lo, hi)),
+        )
+        if window[0] < window[1]:
+            st.session_state["window_parallel"] = window
+
+
+def plot_selection_kwargs():
+    """
+    Enable box selection on the chart where Streamlit supports it.
+
+    Selection events arrived in 1.35; on anything older the chart is rendered
+    normally and the sliders remain the only way to set a window.
+    """
+    if not SUPPORTS_SELECTION or st.session_state.get("drag_target", "(off)") == "(off)":
+        return {}
+    return {"on_select": "rerun", "selection_mode": "box"}
+
+
+def apply_plot_drag(chart_key, lo, hi):
+    """Turn a box selection on the chart into the chosen window."""
+    target = st.session_state.get("drag_target", "(off)")
+    if not SUPPORTS_SELECTION or target == "(off)":
+        return
+    event = st.session_state.get(chart_key)
+    boxes = ((event or {}).get("selection") or {}).get("box") or []
+    if not boxes:
+        return
+    xs = boxes[0].get("x") or []
+    if len(xs) < 2:
+        return
+    window = (
+        float(np.clip(min(xs), lo, hi)),
+        float(np.clip(max(xs), lo, hi)),
+    )
+    if window[1] - window[0] < 1e-6:
+        return
+
+    if target == "Fitting window":
+        key = "window_parallel"
+    else:
+        try:
+            key = f"window_stage_{int(target.split(':')[0].split()[-1])}"
+        except (ValueError, IndexError):
+            return
+    if st.session_state.get(key) != window:
+        st.session_state[key] = window
+        st.rerun()
+
 
 
 # ================================================================ sidebar ==
@@ -310,6 +533,18 @@ def selected_terms():
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
     hint("These apply everywhere in the app.")
+
+    previous_type = st.session_state.get("_applied_cell_type")
+    st.selectbox(
+        "Cell type",
+        list(CELL_TYPES.keys()),
+        key="cell_type",
+        help="Sets geometry, bilayer thickness, the plausibility bands used for "
+        "warnings, and the starting fit windows. Everything stays editable.",
+    )
+    if previous_type != st.session_state["cell_type"]:
+        apply_cell_type(st.session_state["cell_type"])
+        st.session_state["_applied_cell_type"] = st.session_state["cell_type"]
 
     with st.expander("📐 Cell geometry", expanded=True):
         st.number_input(
@@ -352,54 +587,94 @@ with st.sidebar:
 
     with st.expander("🧬 Model constants"):
         st.number_input(
-            "Membrane thickness hₘ (nm)",
+            "Lipid bilayer thickness hₘ (nm)",
             min_value=0.5,
             max_value=100.0,
-            step=0.5,
+            step=0.1,
             key="membrane_thickness_nm",
+            help="A lipid bilayer is about 4 to 5 nm. The ε³ term measures the "
+            "product Eₘ·hₘ, so Eₘ scales inversely with whatever you assume here: "
+            "assume 8 nm instead of 4 and Eₘ halves, with the data unchanged. The "
+            "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
         st.slider("Poisson ratio, membrane νₘ", 0.0, 0.5, step=0.01, key="poisson_membrane")
-        st.slider("Poisson ratio, interior νᵢ", 0.0, 0.5, step=0.01, key="poisson_interior")
+        st.slider("Poisson ratio, cytoskeleton ν_c", 0.0, 0.5, step=0.01, key="poisson_interior")
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
+    with st.expander("🟣 Nucleus"):
+        st.radio(
+            "Nucleus radius",
+            ["From cell radius", "Manual"],
+            key="nucleus_radius_mode",
+            horizontal=True,
+        )
+        if st.session_state["nucleus_radius_mode"] == "From cell radius":
+            st.slider(
+                "R_nucleus / R₀", 0.10, 0.90, step=0.01, key="nucleus_fraction"
+            )
+        else:
+            st.number_input(
+                "Nucleus radius (μm)", min_value=0.1, max_value=50.0, step=0.05,
+                format="%.2f", key="nucleus_radius_um",
+            )
+        st.slider("Poisson ratio, nucleus νₙ", 0.0, 0.5, step=0.01, key="poisson_nucleus")
+        st.radio(
+            "Onset deformation ε₀",
+            ["Scan for best", "Set manually"],
+            key="onset_mode",
+            help="The deformation at which the plates start to feel the nucleus. "
+            "Below it the nucleus term is exactly zero, which is what keeps it "
+            "distinguishable from the cytoskeleton term.",
+        )
+        st.slider("ε₀", 0.0, 0.6, step=0.01, key="nucleus_onset")
+        if st.session_state["onset_mode"] == "Scan for best":
+            found = st.session_state.get("_scanned_onset")
+            st.caption(
+                f"The slider is ignored while scanning. Last scan found "
+                f"ε₀ = {found:.3f}." if found is not None
+                else "The slider is ignored while scanning; the fit finds ε₀ itself."
+            )
+
     with st.expander("📈 Fitting", expanded=True):
+        st.markdown("**Terms in the model**")
+        st.checkbox("Membrane, Eₘ · ε³", key="use_membrane")
+        st.checkbox("Cytoskeleton, E_c · ε³ᐟ²", key="use_interior")
+        st.checkbox("Nucleus, Eₙ · ⟨ε−ε₀⟩³ᐟ²", key="use_nucleus")
+
         st.radio(
             "Strategy",
-            ["Simultaneous (one window)", "Sequential (separate windows)"],
-            key="fit_mode",
-            help="Simultaneous solves for Eₘ and Eᵢ together on one window. "
-            "Sequential measures Eᵢ on a low-ε window where the ε³ᐟ² term "
-            "dominates, then Eₘ on a separate high-ε window where ε³ takes over.",
+            ["Parallel (all at once)", "Series (stage by stage)"],
+            key="strategy",
+            help="Parallel solves for every modulus together on one window. "
+            "Series measures each group on its own window, which is the better "
+            "choice when the moduli come out correlated in parallel.",
         )
-        if st.session_state["fit_mode"] == "Sequential (separate windows)":
-            st.selectbox(
-                "Measure first",
-                ["interior-first", "membrane-first"],
-                key="sequential_order",
-                help="Which modulus is fitted on its own window before the other "
-                "is held fixed. interior-first matches the physics.",
-            )
+
+        if st.session_state["strategy"] == "Series (stage by stage)":
+            st.caption("Which stage fits which term (same number = fitted together)")
+            for term in TERM_ORDER:
+                if st.session_state.get(f"use_{term}"):
+                    st.selectbox(
+                        TERM_LABELS[term],
+                        [1, 2, 3],
+                        key=f"stage_of_{term}",
+                    )
             st.slider(
                 "Refinement passes",
                 1,
                 8,
                 key="refine_iterations",
-                help="One pass is biased: the first window has no knowledge of the "
-                "other term and absorbs it. Repeating the pair of fits removes that. "
-                "3 is usually converged; 1 gives the plain one-pass result.",
+                help="Each pass refits every stage with the other terms subtracted "
+                "at their current values. 3 is normally converged.",
             )
-        else:
-            st.selectbox(
-                "Model terms",
-                ["Membrane + interior", "Membrane only (ε³)", "Interior only (ε³ᐟ²)"],
-                key="fit_terms",
+            st.checkbox(
+                "Seed from a parallel fit",
+                key="seed_parallel",
+                help="Without a seed the first stage has nothing to subtract and "
+                "absorbs the whole force, which pins the later stages at zero with "
+                "no way back. Leave on unless you want to see that behaviour.",
             )
-            st.radio(
-                "Fit window",
-                ["Auto (detected)", "Manual"],
-                key="range_mode",
-                horizontal=True,
-            )
+
         st.selectbox(
             "Weighting",
             ["uniform", "relative"],
@@ -431,6 +706,15 @@ with st.sidebar:
         st.slider("Marker size", 2, 14, key="marker_size")
         st.slider("Line width", 1, 8, key="line_width")
         st.slider("Plot height (px)", 320, 900, step=20, key="plot_height")
+        st.slider(
+            "Plot width",
+            1.0,
+            4.0,
+            step=0.1,
+            key="plot_width",
+            help="Width of the chart relative to the panels beside it. Lower it "
+            "if the plot feels too wide for the page.",
+        )
         st.slider("Axis title size", 12, 44, key="axis_title_size")
         st.slider("Tick label size", 10, 36, key="tick_size")
         st.slider("Axis line thickness", 1, 8, key="axis_width")
@@ -438,7 +722,13 @@ with st.sidebar:
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
         st.checkbox("Show model components", key="show_components")
-        st.checkbox("Shade the fit window", key="show_fit_window")
+        st.checkbox("Shade the fit windows", key="show_fit_window")
+        st.checkbox(
+            "Show the cell diagram beside the plot",
+            key="show_schematic",
+            help="A side-on sketch of the membrane, cytoskeleton and nucleus at "
+            "the deformation you select.",
+        )
         st.checkbox(
             "Show the video frame beside the plot",
             key="video_show_panel",
@@ -618,9 +908,8 @@ with tab_analysis:
                 f"{int((epsilon < 0).sum())} points have ε < 0 (pre-contact). They are "
                 "kept for the plot but excluded from any fit window starting at ε ≥ 0."
             )
-
         # ---------------------------------------------------- fit window ---
-        section("3 · Fit window")
+        section("3 · Fit windows")
         model = build_model(epsilon, force_N)
         auto_range = model.auto_detect_elastic_range()
         rupture = model.results.get("rupture", {})
@@ -628,10 +917,13 @@ with tab_analysis:
         eps_lo_data = float(max(epsilon.min(), 0.0))
         eps_hi_data = float(epsilon.max())
         step = max((eps_hi_data - eps_lo_data) / 200.0, 1e-4)
-        sequential = st.session_state["fit_mode"] == "Sequential (separate windows)"
+        auto_window = (
+            float(np.clip(auto_range["elastic_epsilon_min"], eps_lo_data, eps_hi_data)),
+            float(np.clip(auto_range["elastic_epsilon_max"], eps_lo_data, eps_hi_data)),
+        )
 
         def clamp_range(pair, fallback):
-            """Keep a stored range inside the current curve's bounds."""
+            """Keep a stored window inside the current curve's bounds."""
             try:
                 lo, hi = float(pair[0]), float(pair[1])
             except (TypeError, ValueError, IndexError):
@@ -640,97 +932,86 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
-        interior_range = membrane_range = None
+        active = active_terms()
+        series = st.session_state["strategy"] == "Series (stage by stage)"
 
-        if sequential:
-            suggestion = model.suggest_sequential_windows()
-            st.caption(suggestion["note"])
-            default_int = clamp_range(
-                suggestion["interior_range"], (eps_lo_data, (eps_lo_data + eps_hi_data) / 2)
-            )
-            default_mem = clamp_range(
-                suggestion["membrane_range"], ((eps_lo_data + eps_hi_data) / 2, eps_hi_data)
-            )
-            st.session_state["interior_range"] = clamp_range(
-                st.session_state.get("interior_range"), default_int
-            )
-            st.session_state["membrane_range"] = clamp_range(
-                st.session_state.get("membrane_range"), default_mem
-            )
+        st.caption(
+            f"Auto-detected usable region: ε ∈ [{auto_window[0]:.3f}, {auto_window[1]:.3f}] "
+            f"({auto_range['n_points']} points) · rupture: {auto_range['rupture_method']}"
+        )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                interior_range = st.slider(
-                    "Cytoskeleton window (low ε, fits Eᵢ)",
+        # Windows are stored per stage and only ever clamped, never silently
+        # replaced, so a window you chose survives the next upload.
+        stage_plan = []
+        if series:
+            groups = stage_groups(active)
+            if not groups:
+                st.warning("Select at least one term in the sidebar.")
+            for stage_no, terms in groups:
+                key = f"window_stage_{stage_no}"
+                default = default_window_for(terms, auto_window, eps_lo_data, eps_hi_data)
+                st.session_state[key] = clamp_range(st.session_state.get(key), default)
+                label = " + ".join(TERM_LABELS[t] for t in terms)
+                lo, hi = st.slider(
+                    f"Stage {stage_no}: {label}",
                     min_value=eps_lo_data,
                     max_value=eps_hi_data,
                     step=step,
-                    key="interior_range",
-                    help="Where the Hertzian ε³ᐟ² term dominates.",
+                    key=key,
                 )
-                st.caption(
-                    f"{int(((epsilon >= interior_range[0]) & (epsilon <= interior_range[1])).sum())} points"
-                )
-            with c2:
-                membrane_range = st.slider(
-                    "Membrane window (high ε, fits Eₘ)",
-                    min_value=eps_lo_data,
-                    max_value=eps_hi_data,
-                    step=step,
-                    key="membrane_range",
-                    help="Where the balloon ε³ term dominates.",
-                )
-                st.caption(
-                    f"{int(((epsilon >= membrane_range[0]) & (epsilon <= membrane_range[1])).sum())} points"
-                )
-            if st.button("↺ Use suggested split", **STRETCH):
-                st.session_state["interior_range"] = default_int
-                st.session_state["membrane_range"] = default_mem
-                st.rerun()
-            fit_lo = min(interior_range[0], membrane_range[0])
-            fit_hi = max(interior_range[1], membrane_range[1])
-
-        elif st.session_state["range_mode"] == "Auto (detected)" and not st.session_state["lock_range"]:
-            fit_lo = float(np.clip(auto_range["elastic_epsilon_min"], eps_lo_data, eps_hi_data))
-            fit_hi = float(np.clip(auto_range["elastic_epsilon_max"], eps_lo_data, eps_hi_data))
-            st.success(
-                f"Auto window: ε ∈ [{fit_lo:.3f}, {fit_hi:.3f}] "
-                f"({auto_range['n_points']} points) · "
-                f"rupture detection: {auto_range['rupture_method']}"
-            )
-            hint("Switch to **Manual** in the sidebar to drag the window yourself.")
+                n_in = int(((epsilon >= lo) & (epsilon <= hi)).sum())
+                st.caption(f"{n_in} points in this window")
+                stage_plan.append({"terms": terms, "range": (lo, hi)})
+            fit_lo = min((s["range"][0] for s in stage_plan), default=eps_lo_data)
+            fit_hi = max((s["range"][1] for s in stage_plan), default=eps_hi_data)
         else:
-            default = clamp_range(
-                (auto_range["elastic_epsilon_min"], auto_range["elastic_epsilon_max"]),
-                (eps_lo_data, eps_hi_data),
+            st.session_state["window_parallel"] = clamp_range(
+                st.session_state.get("window_parallel"), auto_window
             )
-            # A locked range survives new uploads; an unlocked one is only
-            # reset when it no longer fits inside the current curve.
-            stored = st.session_state.get("manual_range")
-            if st.session_state["lock_range"] and stored:
-                st.session_state["manual_range"] = clamp_range(stored, default)
-            elif not stored or not (eps_lo_data <= stored[0] < stored[1] <= eps_hi_data):
-                st.session_state["manual_range"] = default
             fit_lo, fit_hi = st.slider(
-                "Fitting range in ε",
+                "Fitting window in ε (all terms together)",
                 min_value=eps_lo_data,
                 max_value=eps_hi_data,
                 step=step,
-                key="manual_range",
-                help="Bounded by your actual data, not a fixed 0–0.5.",
+                key="window_parallel",
             )
             n_in = int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())
-            cols = st.columns(3)
-            cols[0].metric("Points in window", n_in)
-            cols[1].metric("Suggested ε min", f"{auto_range['elastic_epsilon_min']:.3f}")
-            cols[2].metric("Suggested ε max", f"{auto_range['elastic_epsilon_max']:.3f}")
+            st.caption(f"{n_in} points in this window")
+            stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
+
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            if st.button("↺ Reset to auto-detected", **STRETCH):
+                for key in list(st.session_state.keys()):
+                    if key.startswith("window_"):
+                        del st.session_state[key]
+                st.rerun()
+        with w2:
+            drag_targets = ["(off)"] + [
+                (f"Stage {n}: " + " + ".join(TERM_LABELS[t] for t in terms))
+                for n, terms in (stage_groups(active) if series else [])
+            ]
+            if not series:
+                drag_targets = ["(off)", "Fitting window"]
+            st.selectbox(
+                "Drag on the plot to set",
+                drag_targets,
+                key="drag_target",
+                help="Pick a window, then box-select across the chart below to set "
+                "its ε limits from the drag.",
+            )
+        with w3:
+            st.caption(
+                "Suggested split"
+                if series
+                else "Everything is fitted on one window"
+            )
+            if series and st.button("↺ Suggested split", **STRETCH):
+                apply_suggested_windows(model, active, auto_window)
+                st.rerun()
 
         # ------------------------------------------------- saved presets ---
-        with st.expander("💾 Saved ranges", expanded=False):
-            st.checkbox(
-                "Lock this range (keep it when a new curve is loaded)",
-                key="lock_range",
-            )
+        with st.expander("💾 Saved windows", expanded=False):
             p1, p2 = st.columns([2, 1])
             with p1:
                 preset_name = st.text_input(
@@ -746,14 +1027,15 @@ with tab_analysis:
                         st.warning("Give the preset a name first.")
                     else:
                         st.session_state["range_presets"][name] = {
-                            "mode": "sequential" if sequential else "simultaneous",
-                            "range": [float(fit_lo), float(fit_hi)],
-                            "interior_range": [float(x) for x in interior_range]
-                            if interior_range
-                            else None,
-                            "membrane_range": [float(x) for x in membrane_range]
-                            if membrane_range
-                            else None,
+                            "strategy": st.session_state["strategy"],
+                            "cell_type": st.session_state["cell_type"],
+                            "terms": list(active),
+                            "stages": [
+                                {"terms": list(s["terms"]), "range": list(s["range"])}
+                                for s in stage_plan
+                            ],
+                            "stage_of": {t: st.session_state[f"stage_of_{t}"] for t in active},
+                            "nucleus_onset": st.session_state["nucleus_onset"],
                             "saved_at": datetime.now().isoformat(timespec="seconds"),
                         }
                         st.success(f"Saved “{name}”.")
@@ -768,22 +1050,7 @@ with tab_analysis:
                     )
                 with a2:
                     if st.button("Apply", **STRETCH):
-                        preset = presets[chosen]
-                        if preset["mode"] == "sequential" and preset["interior_range"]:
-                            st.session_state["fit_mode"] = "Sequential (separate windows)"
-                            st.session_state["interior_range"] = clamp_range(
-                                preset["interior_range"], (eps_lo_data, eps_hi_data)
-                            )
-                            st.session_state["membrane_range"] = clamp_range(
-                                preset["membrane_range"], (eps_lo_data, eps_hi_data)
-                            )
-                        else:
-                            st.session_state["fit_mode"] = "Simultaneous (one window)"
-                            st.session_state["range_mode"] = "Manual"
-                            st.session_state["manual_range"] = clamp_range(
-                                preset["range"], (eps_lo_data, eps_hi_data)
-                            )
-                        st.session_state["lock_range"] = True
+                        apply_preset(presets[chosen], eps_lo_data, eps_hi_data)
                         st.rerun()
                 with a3:
                     if st.button("Delete", **STRETCH):
@@ -795,17 +1062,16 @@ with tab_analysis:
                         [
                             {
                                 "preset": name,
-                                "mode": p["mode"],
-                                "ε window": f"{p['range'][0]:.3f} to {p['range'][1]:.3f}",
-                                "cytoskeleton": f"{p['interior_range'][0]:.3f} to {p['interior_range'][1]:.3f}"
-                                if p.get("interior_range")
-                                else "—",
-                                "membrane": f"{p['membrane_range'][0]:.3f} to {p['membrane_range'][1]:.3f}"
-                                if p.get("membrane_range")
-                                else "—",
-                                "saved": p["saved_at"],
+                                "strategy": pre.get("strategy", "?"),
+                                "cell type": pre.get("cell_type", "?"),
+                                "windows": " | ".join(
+                                    " + ".join(TERM_LABELS.get(t, t) for t in st_["terms"])
+                                    + f" {st_['range'][0]:.3f} to {st_['range'][1]:.3f}"
+                                    for st_ in pre.get("stages", [])
+                                ),
+                                "saved": pre.get("saved_at", ""),
                             }
-                            for name, p in presets.items()
+                            for name, pre in presets.items()
                         ]
                     ),
                     hide_index=True,
@@ -817,7 +1083,7 @@ with tab_analysis:
                 st.download_button(
                     "📥 Export presets",
                     data=json.dumps(presets, indent=2),
-                    file_name="afm_range_presets.json",
+                    file_name="afm_fit_windows.json",
                     mime="application/json",
                     disabled=not presets,
                     **STRETCH,
@@ -840,26 +1106,56 @@ with tab_analysis:
 
         # ----------------------------------------------------------- fit ---
         section("4 · Fit")
-        run = st.session_state["live_fit"] or st.button(
-            "🚀 Fit curve", type="primary"
-        )
+
+        if "nucleus" in active and st.session_state["onset_mode"] == "Scan for best":
+            scan = model.scan_nucleus_onset(
+                fit_lo,
+                fit_hi,
+                terms=active,
+                weighting=st.session_state["weighting"],
+                fit_offset=st.session_state["fit_offset"],
+            )
+            if scan.get("success"):
+                # Set it on the model only. Writing back to the slider's key
+                # would raise, because the widget has already been built this
+                # run; the scanned value is kept separately for display.
+                model.nucleus_onset = scan["best_onset"]
+                st.session_state["_scanned_onset"] = float(scan["best_onset"])
+                if scan["well_determined"]:
+                    st.success(
+                        f"Best nucleus onset ε₀ = {scan['best_onset']:.3f} "
+                        f"(R² = {scan['best_r_squared']:.4f})"
+                    )
+                else:
+                    st.warning(
+                        f"The onset scan is flat: every ε₀ between "
+                        f"{scan['trials'][0]['onset']:.3f} and "
+                        f"{scan['trials'][-1]['onset']:.3f} fits about equally well, so "
+                        f"this curve does not locate the nucleus. Treat Eₙ as "
+                        f"unidentified rather than measured."
+                    )
+        else:
+            scan = None
+
+        run = st.session_state["live_fit"] or st.button("🚀 Fit curve", type="primary")
 
         fit = None
         if run:
-            if sequential:
-                fit = model.fit_sequential(
-                    interior_range=interior_range,
-                    membrane_range=membrane_range,
+            if not active:
+                st.warning("Select at least one term in the sidebar.")
+            elif series and len(stage_plan) > 1:
+                fit = model.fit_staged(
+                    stage_plan,
                     weighting=st.session_state["weighting"],
                     fit_offset=st.session_state["fit_offset"],
-                    order=st.session_state["sequential_order"],
                     refine_iterations=st.session_state["refine_iterations"],
+                    seed_parallel=st.session_state["seed_parallel"],
                 )
             else:
                 fit = model.fit(
                     epsilon_min=fit_lo,
                     epsilon_max=fit_hi,
-                    terms=selected_terms(),
+                    terms=active,
                     fit_offset=st.session_state["fit_offset"],
                     weighting=st.session_state["weighting"],
                 )
@@ -869,14 +1165,26 @@ with tab_analysis:
         elif not fit.get("success"):
             st.error(fit.get("error", "Fit failed."))
         else:
+            En_value = fit.get("En", 0.0)
             fitted = model.combined_model(
-                epsilon, fit["Em"], fit["Ei"], fit.get("force_offset", 0.0)
+                epsilon, fit["Em"], fit["Ei"], fit.get("force_offset", 0.0), En=En_value
             )
             membrane = model.balloon_model_cubic(epsilon, fit["Em"])
             interior = model.hertzian_contact_model(epsilon, fit["Ei"])
+            nucleus = model.nucleus_model(epsilon, En_value) if En_value else None
+
+            windows_for_plot = [
+                {
+                    "range": tuple(s["range"]),
+                    "label": " + ".join(TERM_LABELS[t] for t in s["terms"]),
+                    "color": STAGE_COLORS[i % len(STAGE_COLORS)],
+                }
+                for i, s in enumerate(stage_plan)
+            ]
 
             st.session_state["results"] = {
                 "cell_name": st.session_state["cell_name"],
+                "cell_type": st.session_state["cell_type"],
                 "date_acquired": str(date_acquired),
                 "cell_height_um": st.session_state["cell_height_um"],
                 "spring_constant": st.session_state["spring_constant"],
@@ -886,43 +1194,56 @@ with tab_analysis:
                 "fitted_N": fitted,
                 "membrane_N": membrane,
                 "interior_N": interior,
+                "nucleus_N": nucleus,
                 "fit": fit,
-                "fit_windows": (
-                    [
-                        {"range": tuple(interior_range), "label": "cytoskeleton (Eᵢ)",
-                         "color": "#9467bd"},
-                        {"range": tuple(membrane_range), "label": "membrane (Eₘ)",
-                         "color": "#2ca02c"},
-                    ]
-                    if sequential
-                    else [{"range": (fit_lo, fit_hi), "label": "fit window"}]
-                ),
+                "fit_windows": windows_for_plot,
                 "source": data["source"],
                 "timestamp": datetime.now(),
             }
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(
+            metric_cols = st.columns(3 + (1 if "nucleus" in active else 0) + 1)
+            metric_cols[0].metric(
                 "Eₘ membrane",
                 f"{fit['Em_MPa']:.3g} MPa",
-                delta=f"± {fit['Em_MPa_std']:.2g}" if np.isfinite(fit["Em_MPa_std"]) else None,
+                delta=f"± {fit['Em_MPa_std']:.2g}"
+                if np.isfinite(fit.get("Em_MPa_std", np.nan))
+                else None,
                 delta_color="off",
             )
-            m2.metric(
-                "Eᵢ interior",
+            metric_cols[1].metric(
+                "E_c cytoskeleton",
                 f"{fit['Ei_kPa']:.3g} kPa",
-                delta=f"± {fit['Ei_kPa_std']:.2g}" if np.isfinite(fit["Ei_kPa_std"]) else None,
+                delta=f"± {fit['Ei_kPa_std']:.2g}"
+                if np.isfinite(fit.get("Ei_kPa_std", np.nan))
+                else None,
                 delta_color="off",
             )
-            m3.metric("R²", f"{fit['r_squared']:.4f}")
+            index = 2
+            if "nucleus" in active:
+                metric_cols[index].metric(
+                    "Eₙ nucleus",
+                    f"{fit.get('En_kPa', 0.0):.3g} kPa",
+                    delta=f"onset ε₀ = {model.nucleus_onset:.3f}",
+                    delta_color="off",
+                )
+                index += 1
+            metric_cols[index].metric("R²", f"{fit['r_squared']:.4f}")
             rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
-            m4.metric("RMSE", f"{float(rmse_disp):.3g} {rmse_unit}")
+            metric_cols[index + 1].metric("RMSE", f"{float(rmse_disp):.3g} {rmse_unit}")
+
+            st.caption(
+                f"Membrane areal modulus Eₘ·h = "
+                f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.4g} mN/m, which is what "
+                f"the ε³ term actually determines. Eₘ itself is that divided by the "
+                f"assumed bilayer thickness of "
+                f"{st.session_state['membrane_thickness_nm']:.1f} nm, so halving the "
+                f"thickness doubles Eₘ while the measurement is unchanged."
+            )
 
             for message in fit["warnings"]:
                 st.warning(message)
 
-            # A loaded video gets a panel beside the plot showing the cell at
-            # whichever point on the curve is selected.
+            # ------------------------------------------------ plot + panel
             video_ready = (
                 not VIDEO_IMPORT_ERROR
                 and st.session_state.get("video_path")
@@ -930,24 +1251,32 @@ with tab_analysis:
                 and os.path.exists(st.session_state["video_path"])
                 and st.session_state["video_show_panel"]
             )
+            show_schematic = st.session_state["show_schematic"]
 
-            highlight = None
-            selected_eps = None
-            if video_ready:
-                eps_lo_sel = float(max(epsilon.min(), 0.0))
-                eps_hi_sel = float(epsilon.max())
+            selected_eps = float(np.clip(fit_hi, eps_lo_data, eps_hi_data))
+            if video_ready or show_schematic:
                 selected_eps = st.slider(
                     "Show the cell at ε =",
-                    min_value=eps_lo_sel,
-                    max_value=eps_hi_sel,
-                    value=float(np.clip(fit_hi, eps_lo_sel, eps_hi_sel)),
-                    step=max((eps_hi_sel - eps_lo_sel) / 200.0, 1e-4),
-                    key="video_sync_eps",
+                    min_value=eps_lo_data,
+                    max_value=eps_hi_data,
+                    step=step,
+                    key="sync_eps",
                 )
-                nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
-                highlight = (float(epsilon[nearest]), float(force_N[nearest]))
+            nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
+            highlight = (float(epsilon[nearest]), float(force_N[nearest]))
 
-            plot_col, video_col = st.columns([3, 1.15]) if video_ready else (st.container(), None)
+            side_panels = int(bool(video_ready)) + int(bool(show_schematic))
+            plot_weight = float(st.session_state["plot_width"])
+            if side_panels:
+                widths = [plot_weight] + [1.0] * side_panels
+                columns = st.columns(widths)
+                plot_col = columns[0]
+                panel_cols = columns[1:]
+            else:
+                # Even with no side panel, keep the chart from spanning the
+                # whole page; the spare column is left empty on purpose.
+                plot_col, spare = st.columns([plot_weight, max(0.01, 4.0 - plot_weight)])
+                panel_cols = []
 
             with plot_col:
                 st.plotly_chart(
@@ -959,19 +1288,43 @@ with tab_analysis:
                         fit_force_N=fitted,
                         membrane_N=membrane,
                         interior_N=interior,
-                        fit_window=st.session_state["results"]["fit_windows"],
+                        nucleus_N=nucleus,
+                        fit_window=windows_for_plot,
                         rupture_epsilon=rupture.get("epsilon")
                         if rupture.get("method") == "force-drop"
                         else None,
-                        highlight=highlight,
+                        highlight=highlight if (video_ready or show_schematic) else None,
                     ),
-                    **STRETCH,
                     key="main_fit_plot",
+                    **plot_selection_kwargs(),
+                    **STRETCH,
                 )
+                apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
 
-            if video_ready and video_col is not None:
-                with video_col:
-                    vpath = st.session_state["video_path"]
+            panel_index = 0
+            if show_schematic and panel_index < len(panel_cols):
+                with panel_cols[panel_index]:
+                    st.plotly_chart(
+                        cell_schematic(
+                            style,
+                            epsilon=selected_eps,
+                            cell_height_um=st.session_state["cell_height_um"],
+                            cell_radius_um=fit["R0"] * 1e6,
+                            nucleus_radius_um=fit.get("R_nucleus", fit["R0"] * 0.35) * 1e6,
+                            membrane_thickness_nm=st.session_state["membrane_thickness_nm"],
+                            nucleus_onset=model.nucleus_onset if "nucleus" in active else None,
+                            Em_MPa=fit["Em_MPa"],
+                            Ei_kPa=fit["Ei_kPa"],
+                            En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                            show_nucleus="nucleus" in active,
+                        ),
+                        key="schematic_plot",
+                        **STRETCH,
+                    )
+                panel_index += 1
+
+            if video_ready and panel_index < len(panel_cols):
+                with panel_cols[panel_index]:
                     vinfo = st.session_state["video_info"]
                     frame_index = va.frame_for_epsilon(
                         selected_eps,
@@ -980,7 +1333,7 @@ with tab_analysis:
                         float(epsilon.max()),
                     )
                     vframe, vdet = cached_detection(
-                        vpath,
+                        st.session_state["video_path"],
                         video_signature(),
                         int(frame_index),
                         st.session_state["video_roi"],
@@ -991,22 +1344,18 @@ with tab_analysis:
                         st.info("Frame unavailable.")
                     else:
                         force_here, unit_here = from_newtons(highlight[1], style.force_unit)
-                        shot = va.annotate(
-                            vframe, vdet, label=f"ε = {highlight[0]:.3f}"
-                        )
+                        snap = va.annotate(vframe, vdet, label=f"ε = {highlight[0]:.3f}")
                         st.image(
-                            va.crop(shot, vdet) if vdet and vdet.get("found") else shot,
+                            va.crop(snap, vdet) if vdet and vdet.get("found") else snap,
                             caption=f"Frame {frame_index} · ε = {highlight[0]:.3f} · "
                             f"F = {float(force_here):.3g} {unit_here}",
                             **STRETCH,
                         )
                         if vdet and vdet.get("found"):
                             st.caption(f"Cell height {vdet['height_px']:.0f} px")
-                        else:
-                            st.caption("No cell detected in this frame.")
                         st.download_button(
                             "📷 Save screenshot",
-                            data=png_bytes(shot),
+                            data=png_bytes(snap),
                             file_name=(
                                 f"{st.session_state['cell_name'] or 'cell'}"
                                 f"_eps{highlight[0]:.3f}.png"
@@ -1015,84 +1364,97 @@ with tab_analysis:
                             **STRETCH,
                         )
 
+            # ------------------------------------------------- diagnostics
             with st.expander("🔍 Fit diagnostics"):
-                d1, d2, d3 = st.columns(3)
-                d1.metric(
+                share_cols = st.columns(4)
+                share_cols[0].metric(
                     "Membrane share at ε_max",
                     f"{100 * fit['membrane_fraction_at_max']:.1f} %"
-                    if np.isfinite(fit["membrane_fraction_at_max"])
+                    if np.isfinite(fit.get("membrane_fraction_at_max", np.nan))
                     else "n/a",
                 )
-                if fit.get("mode") == "sequential":
-                    d2.metric(
-                        "Refinement passes run",
-                        fit["n_iterations"],
-                        help="Stops early once both moduli move by less than 0.1 %.",
-                    )
-                    d3.metric("Order", fit["order"])
+                share_cols[1].metric(
+                    "Cytoskeleton share",
+                    f"{100 * fit['interior_fraction_at_max']:.1f} %"
+                    if np.isfinite(fit.get("interior_fraction_at_max", np.nan))
+                    else "n/a",
+                )
+                share_cols[2].metric(
+                    "Nucleus share",
+                    f"{100 * fit['nucleus_fraction_at_max']:.1f} %"
+                    if np.isfinite(fit.get("nucleus_fraction_at_max", np.nan))
+                    else "n/a",
+                )
+                if fit.get("mode") == "staged":
+                    share_cols[3].metric("Refinement passes", fit["n_iterations"])
                 else:
-                    d2.metric(
+                    share_cols[3].metric(
                         "Condition number",
                         f"{fit['condition_number']:.1f}"
-                        if np.isfinite(fit["condition_number"])
+                        if np.isfinite(fit.get("condition_number", np.nan))
                         else "n/a",
-                        help="How separable ε³ and ε³ᐟ² are over this window. "
-                        "Above ~30 the split between Eₘ and Eᵢ is unreliable.",
-                    )
-                    d3.metric(
-                        "Eₘ/Eᵢ correlation",
-                        f"{fit['corr_Em_Ei']:+.2f}" if np.isfinite(fit["corr_Em_Ei"]) else "n/a",
-                        help="Near −1 means the two terms are trading off against each other.",
+                        help="How separable the terms are over this window. Above ~30 "
+                        "the split between them is unreliable even though their sum "
+                        "is well determined.",
                     )
 
                 mask = fit["mask"]
                 st.plotly_chart(
                     residual_figure(epsilon[mask], (force_N - fitted)[mask], style),
-                    **STRETCH,
                     key="residual_plot",
+                    **STRETCH,
                 )
 
-                if fit.get("mode") == "sequential":
-                    st.markdown("**Convergence of the two stages**")
+                if fit.get("mode") == "staged":
+                    st.markdown("**Convergence across passes**")
                     st.caption(
-                        "Pass 1 is the plain one-pass sequential fit. Each later pass "
-                        "subtracts the other term's current estimate before refitting, "
-                        "which removes the bias the first pass carries."
+                        "Each pass refits every stage with the other terms held at "
+                        "their current values. "
+                        + (
+                            "The sequence started from a parallel fit over the whole "
+                            "region, which stops the first stage from absorbing the "
+                            "force that belongs to the later ones."
+                            if fit.get("seeded")
+                            else "Seeding is off, so pass 1 is the plain unseeded "
+                            "staged result."
+                        )
                     )
                     st.dataframe(
                         pd.DataFrame(fit["iterations"]).round(
-                            {"Em_MPa": 4, "Ei_kPa": 4}
+                            {"Em_MPa": 4, "Ei_kPa": 4, "En_kPa": 4}
                         ),
                         hide_index=True,
                         **STRETCH,
                     )
-                    stage_rows = []
-                    for label, stage in (
-                        ("stage 1", fit["stages"]["first"]),
-                        ("stage 2", fit["stages"]["second"]),
-                    ):
-                        stage_rows.append(
-                            {
-                                "stage": label,
-                                "term": ", ".join(stage["terms"]),
-                                "ε window": f"{stage['epsilon_range'][0]:.3f} to {stage['epsilon_range'][1]:.3f}",
-                                "points": stage["n_points"],
-                                "R² (window)": round(float(stage["r_squared"]), 4),
-                            }
-                        )
-                    st.dataframe(pd.DataFrame(stage_rows), hide_index=True, **STRETCH)
-                    sens = None
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "stage": i + 1,
+                                    "terms": ", ".join(
+                                        TERM_LABELS[t] for t in plan["terms"]
+                                    ),
+                                    "ε window": f"{plan['range'][0]:.3f} to {plan['range'][1]:.3f}",
+                                    "points": res["n_points"],
+                                    "R² in window": round(float(res["r_squared"]), 4),
+                                }
+                                for i, (plan, res) in enumerate(
+                                    zip(fit["stage_plan"], fit["stages"])
+                                )
+                            ]
+                        ),
+                        hide_index=True,
+                        **STRETCH,
+                    )
                 else:
                     st.markdown("**How much does the answer depend on the window?**")
                     sens = model.range_sensitivity(
                         fit_lo,
                         fit_hi,
-                        terms=selected_terms(),
+                        terms=active,
                         fit_offset=st.session_state["fit_offset"],
                         weighting=st.session_state["weighting"],
                     )
-
-                if sens is not None:
                     s1, s2 = st.columns(2)
                     s1.metric(
                         "Eₘ spread",
@@ -1101,34 +1463,41 @@ with tab_analysis:
                         else "n/a",
                     )
                     s2.metric(
-                        "Eᵢ spread",
+                        "E_c spread",
                         f"{100 * sens['Ei_relative_spread']:.1f} %"
                         if np.isfinite(sens["Ei_relative_spread"])
                         else "n/a",
                     )
                     st.caption(
                         "Range of each modulus across shrinking upper bounds, as a "
-                        "fraction of its mean. Under ~10 % the fit is robust; much more "
-                        "means the curve does not constrain the two terms separately."
+                        "fraction of its mean. Under ~10 % the fit is robust; much "
+                        "more means the curve does not constrain the terms separately."
                     )
                     figure = sensitivity_figure(sens["trials"], style)
                     if figure is not None:
                         st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
-                    if sens["trials"]:
-                        st.dataframe(
-                            pd.DataFrame(sens["trials"]).round(
-                                {"epsilon_max": 3, "Em_MPa": 4, "Ei_kPa": 4, "r_squared": 4}
-                            ),
-                            hide_index=True,
-                            **STRETCH,
-                        )
+
+                if scan and scan.get("success"):
+                    st.markdown("**Nucleus onset scan**")
+                    st.caption(
+                        "R² against the assumed onset. A sharp peak means the curve "
+                        "locates the nucleus; a flat line means it does not."
+                    )
+                    st.line_chart(
+                        pd.DataFrame(scan["trials"]).set_index("onset")[["r_squared"]],
+                        height=240,
+                    )
 
                 st.markdown("**Geometry prefactors actually used**")
                 st.code(
-                    f"h0 = {fit['cell_height'] * 1e6:.3f} μm\n"
-                    f"R0 = {fit['R0'] * 1e6:.3f} μm\n"
-                    f"Am = {fit['Am']:.4e} N/Pa   (F_membrane = Am·Em·ε³)\n"
-                    f"Ai = {fit['Ai']:.4e} N/Pa   (F_interior = Ai·Ei·ε³ᐟ²)",
+                    f"h0 = {fit['cell_height'] * 1e6:.3f} um\n"
+                    f"R0 = {fit['R0'] * 1e6:.3f} um\n"
+                    f"R_nucleus = {fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
+                    f"h_membrane = {st.session_state['membrane_thickness_nm']:.2f} nm\n"
+                    f"Am = {fit['Am']:.4e} N/Pa   (F_membrane = Am*Em*eps^3)\n"
+                    f"Ai = {fit['Ai']:.4e} N/Pa   (F_cyto = Ai*Ec*eps^1.5)\n"
+                    f"An = {fit.get('An', float('nan')):.4e} N/Pa   "
+                    f"(F_nucleus = An*En*<eps-eps0>^1.5)",
                     language="text",
                 )
 
