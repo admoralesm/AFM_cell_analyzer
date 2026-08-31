@@ -56,55 +56,44 @@ def create_publication_plot(relative_def, force_N, title="Force vs Relative Defo
         y=force_converted,
         mode='lines+markers',
         name='Force Curve',
-        line=dict(
-            color='#000000',  # Black line
-            width=4  # Thick line
-        ),
-        marker=dict(
-            size=8,
-            color='#000000',
-            line=dict(width=2, color='#000000')
-        ),
+        line=dict(color='#000000', width=4),
+        marker=dict(size=8, color='#000000', line=dict(width=2, color='#000000')),
         hovertemplate='<b>ε:</b> %{x:.4f}<br><b>F:</b> %{y:.3f} ' + unit_label + '<extra></extra>'
     ))
 
     # Nature journal style formatting
     fig.update_layout(
-        title={
-            'text': title,
-            'font': {'size': 18, 'family': 'Arial, sans-serif', 'color': '#000000'},
-            'x': 0.5,
-            'xanchor': 'center'
-        },
-        xaxis=dict(
-            title='Relative Deformation (ε)',
-            titlefont=dict(size=16, family='Arial, sans-serif', color='#000000'),
-            tickfont=dict(size=14, family='Arial, sans-serif', color='#000000'),
-            showline=True,
-            linewidth=3,  # Thick axis
-            linecolor='#000000',
-            showgrid=False,
-            zeroline=False,
-            mirror=True  # Show axis on all sides
-        ),
-        yaxis=dict(
-            title=f'Force ({unit_label})',
-            titlefont=dict(size=16, family='Arial, sans-serif', color='#000000'),
-            tickfont=dict(size=14, family='Arial, sans-serif', color='#000000'),
-            showline=True,
-            linewidth=3,  # Thick axis
-            linecolor='#000000',
-            showgrid=False,
-            zeroline=False,
-            mirror=True  # Show axis on all sides
-        ),
-        plot_bgcolor='#FFFFFF',
-        paper_bgcolor='#FFFFFF',
+        title=title,
+        xaxis_title='Relative Deformation (ε)',
+        yaxis_title=f'Force ({unit_label})',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
         hovermode='x unified',
         height=600,
-        width=900,
-        margin=dict(l=100, r=50, t=80, b=100),
-        font=dict(family='Arial, sans-serif', color='#000000')
+        margin=dict(l=100, r=50, t=80, b=100)
+    )
+
+    # Update axes with thick lines and no grid
+    fig.update_xaxes(
+        showline=True,
+        linewidth=3,
+        linecolor='black',
+        showgrid=False,
+        zeroline=False,
+        mirror=True,
+        title_font=dict(size=16, color='black'),
+        tickfont=dict(size=13, color='black')
+    )
+
+    fig.update_yaxes(
+        showline=True,
+        linewidth=3,
+        linecolor='black',
+        showgrid=False,
+        zeroline=False,
+        mirror=True,
+        title_font=dict(size=16, color='black'),
+        tickfont=dict(size=13, color='black')
     )
 
     return fig
