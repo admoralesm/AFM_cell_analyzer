@@ -82,7 +82,450 @@ PLAUSIBLE_EI_PA = (1e0, 1e7)      # 1 Pa  .. 10 MPa
 K_BOLTZMANN = 1.380649e-23
 
 
-class LulevichModel:
+# ============================================================================
+#  Coupling: how the elements share load
+# ============================================================================
+#
+# The model above puts the elements in PARALLEL: every element is squashed by
+# the same relative deformation and their forces add. That is the right
+# picture for a membrane stretched over a cytoskeleton that is compressed
+# with it.
+#
+# The alternative is SERIES: every element carries the same force and their
+# deformations add, a spring stacked on a spring. That is the right picture
+# when the load path runs through the elements one after another, for example
+# the cantilever compressing the cytoplasm which then bears down on the
+# nucleus underneath it.
+#
+# The two make genuinely different predictions. In parallel the stiffest
+# element dominates the force; in series the softest element dominates the
+# deformation. Which one the data prefers is an empirical question, which is
+# what compare_couplings() is for.
+#
+# Series is still exactly solvable. Inverting each element's law,
+#
+#     membrane      F = Am Em d^3     ->  d = (F / (Am Em))^(1/3)
+#     cytoskeleton  F = Ai Ec d^1.5   ->  d = (F / (Ai Ec))^(2/3)
+#     nucleus       F = An En d^1.5   ->  d = (<F - F0> / (An En))^(2/3)
+#
+# and adding the deformations gives
+#
+#     e(F) = a F^(1/3) + b F^(2/3) + c <F - F0>^(2/3)
+#
+# which is LINEAR in the compliances a, b, c exactly as the parallel model is
+# linear in the moduli. The moduli come back as
+#
+#     Em = 1 / (Am a^3),  Ec = 1 / (Ai b^1.5),  En = 1 / (An c^1.5)
+#
+# The nucleus needs the force offset F0 for the same reason it needed a
+# deformation offset in parallel: without it the cytoskeleton and nucleus
+# terms are both F^(2/3) and their compliances are not separable.
+
+
+class _CouplingMixin:
+    """Series and hybrid coupling, mixed into LulevichModel below."""
+
+    # ------------------------------------------------------------- series
+
+    def series_epsilon(self, force, Em, Ec, En=0.0, force_onset=0.0):
+        """Relative deformation produced by a given force, elements in series."""
+        F = np.clip(np.asarray(force, dtype=float), 0.0, None)
+        eps = np.zeros_like(F)
+        if Em and Em > 0:
+            eps = eps + (F / (self.Am * Em)) ** (1.0 / 3.0)
+        if Ec and Ec > 0:
+            eps = eps + (F / (self.Ai * Ec)) ** (2.0 / 3.0)
+        if En and En > 0:
+            excess = np.clip(F - float(force_onset), 0.0, None)
+            eps = eps + (excess / (self.An * En)) ** (2.0 / 3.0)
+        return eps
+
+    def series_force(self, epsilon, Em, Ec, En=0.0, force_onset=0.0, f_max=None, n_grid=4000):
+        """
+        Force required for a given deformation, elements in series.
+
+        There is no closed form, but e(F) is monotonically increasing, so the
+        inverse is obtained by evaluating it on a dense force grid and
+        interpolating. Doing it this way lets a series fit be scored on force
+        residuals, the same space the parallel fit uses, so the two are
+        directly comparable.
+        """
+        eps = np.asarray(epsilon, dtype=float)
+        top = f_max if f_max else float(np.nanmax(self.force)) * 1.6
+        if not np.isfinite(top) or top <= 0:
+            return np.zeros_like(eps)
+        grid = np.linspace(0.0, top, int(n_grid))
+        eps_grid = self.series_epsilon(grid, Em, Ec, En, force_onset)
+        # np.interp needs an increasing x; ties at zero force are harmless.
+        return np.interp(eps, eps_grid, grid, left=0.0, right=top)
+
+    def _refine_series(self, eps, force, Em, Ec, En, force_onset, terms):
+        """Polish the series moduli against force residuals."""
+        from scipy.optimize import least_squares
+
+        active = [("membrane" in terms), ("interior" in terms), ("nucleus" in terms)]
+        values = [Em, Ec, En]
+        # A rigid element (infinite modulus) is not something the optimiser can
+        # search over, so it is left as found.
+        if any(active[i] and not np.isfinite(values[i]) for i in range(3)):
+            return Em, Ec, En
+        start = np.log10([max(values[i], 1e-3) if active[i] else 1e-6 for i in range(3)])
+        free = np.array(active, dtype=bool)
+        scale = max(float(np.nanmax(np.abs(force))), 1e-15)
+        f_max = float(np.nanmax(self.force)) * 1.6
+
+        def residual(free_log):
+            full = start.copy()
+            full[free] = free_log
+            params = [10.0 ** full[i] if active[i] else 0.0 for i in range(3)]
+            predicted = self.series_force(
+                eps, params[0], params[1], params[2], force_onset, f_max=f_max
+            )
+            return (force - predicted) / scale
+
+        try:
+            solution = least_squares(
+                residual, start[free],
+                bounds=(np.full(free.sum(), -1.0), np.full(free.sum(), 11.0)),
+                xtol=1e-10, ftol=1e-10, max_nfev=300,
+            )
+        except Exception:  # pragma: no cover
+            return Em, Ec, En
+        full = start.copy()
+        full[free] = solution.x
+        return tuple(10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+
+    def fit_series(
+        self,
+        epsilon_min=0.01,
+        epsilon_max=0.3,
+        terms=("membrane", "interior"),
+        force_onset=None,
+        weighting="uniform",
+        refine=True,
+    ):
+        """
+        Fit the series model: one bounded linear least squares in compliance.
+
+        The linear stage minimises deformation residuals, because that is the
+        space the model is linear in. Goodness of fit is then reported on
+        force residuals, computed by inverting the model, so R2 and RMSE mean
+        the same thing here as they do for the parallel fit.
+
+        ``refine`` then polishes the moduli against those force residuals.
+        This matters more than it sounds: Em = 1 / (Am a^3), so a one percent
+        error in the fitted compliance becomes three percent in Em, and
+        minimising deformation error is not the same as minimising force
+        error. On a synthetic series curve the linear stage alone returns
+        Em = 3.9 MPa against a true 2.5; refined it returns 2.5.
+        """
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        usable = force > 0
+        eps, force = eps[usable], force[usable]
+        n_params = len(terms)
+        if eps.size < n_params + 1:
+            return self._failure(
+                f"Only {eps.size} points with positive force in e = "
+                f"[{epsilon_min:.3f}, {epsilon_max:.3f}]; need at least "
+                f"{n_params + 1}."
+            )
+
+        if force_onset is None:
+            force_onset = 0.5 * float(np.nanmax(force)) if "nucleus" in terms else 0.0
+
+        cols, names = [], []
+        if "membrane" in terms:
+            cols.append(force ** (1.0 / 3.0))
+            names.append("a")
+        if "interior" in terms:
+            cols.append(force ** (2.0 / 3.0))
+            names.append("b")
+        if "nucleus" in terms:
+            cols.append(np.clip(force - force_onset, 0.0, None) ** (2.0 / 3.0))
+            names.append("c")
+        X = np.column_stack(cols)
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(eps), np.percentile(np.abs(eps), 10) or 1e-9)
+            w = 1.0 / scale
+        else:
+            w = np.ones_like(eps)
+        Xw, yw = X * w[:, None], eps * w
+
+        col_norm = np.linalg.norm(Xw, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        sol = lsq_linear(Xw / col_norm, yw, bounds=(0.0, np.inf), method="bvls")
+        params = dict(zip(names, sol.x / col_norm))
+
+        def modulus(compliance, prefactor, power):
+            if compliance is None or compliance <= 0:
+                return float("inf")  # zero compliance = rigid element
+            return float(1.0 / (prefactor * compliance ** power))
+
+        Em = modulus(params.get("a"), self.Am, 3.0) if "membrane" in terms else 0.0
+        Ec = modulus(params.get("b"), self.Ai, 1.5) if "interior" in terms else 0.0
+        En = modulus(params.get("c"), self.An, 1.5) if "nucleus" in terms else 0.0
+
+        if refine and np.isfinite([Em, Ec, En]).any():
+            Em, Ec, En = self._refine_series(eps, force, Em, Ec, En, force_onset, terms)
+
+        pred = self.series_force(eps, Em, Ec, En, force_onset)
+        residuals = force - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        warnings_list = []
+        for value, label in ((Em, "Em"), (Ec, "Ec"), (En, "En")):
+            if np.isinf(value):
+                warnings_list.append(
+                    f"{label} came out rigid (zero compliance): in series this element "
+                    f"absorbs no deformation, so the data gives no handle on it."
+                )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Series R2 = {r_squared:.3f}. The stacked-spring picture does not "
+                f"describe this curve well; compare it against parallel."
+            )
+
+        out = {
+            "success": True,
+            "mode": "series",
+            "coupling": "series",
+            "Em": Em if np.isfinite(Em) else 0.0,
+            "Ei": Ec if np.isfinite(Ec) else 0.0,
+            "En": En if np.isfinite(En) else 0.0,
+            "Em_MPa": (Em / 1e6) if np.isfinite(Em) else float("inf"),
+            "Ei_kPa": (Ec / 1e3) if np.isfinite(Ec) else float("inf"),
+            "En_kPa": (En / 1e3) if np.isfinite(En) else float("inf"),
+            "Em_MPa_std": float("nan"),
+            "Ei_kPa_std": float("nan"),
+            "En_kPa_std": float("nan"),
+            "compliances": {k: float(v) for k, v in params.items()},
+            "force_offset": 0.0,
+            "nucleus_force_onset": float(force_onset),
+            "Km": 0.0,
+            "Km_kT": 0.0,
+            "membrane_areal_modulus": (Em * self.h_membrane) if np.isfinite(Em) else float("nan"),
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params,
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": weighting,
+            "fit_offset": False,
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": float("nan"),
+            "interior_fraction_at_max": float("nan"),
+            "nucleus_fraction_at_max": float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0,
+            "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "An": self.An,
+            "mask": mask,
+            "warnings": warnings_list,
+        }
+        self.results["series"] = out
+        return out
+
+    # ------------------------------------------------------------- hybrid
+
+    def predict(self, epsilon, params, coupling, crossover=None, order="parallel-then-series"):
+        """
+        Force predicted at each deformation under any of the couplings.
+
+        ``params`` is ``(Em, Ec, En)`` in pascals. For the hybrid couplings
+        the elements act in parallel on one side of ``crossover`` and in
+        series on the other, so a single set of moduli produces a curve that
+        changes its load path partway along.
+        """
+        Em, Ec, En = params
+        eps = np.asarray(epsilon, dtype=float)
+        if coupling == "parallel":
+            return self.combined_model(eps, Em, Ec, En=En)
+        if coupling == "series":
+            return self.series_force(eps, Em, Ec, En, self._nucleus_force_onset(Em, Ec, En))
+        if coupling == "hybrid":
+            out = np.empty_like(eps)
+            low = eps <= float(crossover)
+            first, second = (
+                ("parallel", "series")
+                if order == "parallel-then-series"
+                else ("series", "parallel")
+            )
+            out[low] = self.predict(eps[low], params, first)
+            out[~low] = self.predict(eps[~low], params, second)
+            # Remove the step at the crossover: the load path changes there,
+            # but the force the cantilever reads does not jump.
+            if low.any() and (~low).any():
+                jump = self.predict(np.array([crossover]), params, first)[0] - self.predict(
+                    np.array([crossover]), params, second
+                )[0]
+                out[~low] = out[~low] + jump
+            return out
+        raise ValueError(f"Unknown coupling: {coupling}")
+
+    def _nucleus_force_onset(self, Em, Ec, En):
+        """Force at which the nucleus engages, from its deformation onset."""
+        if not En or En <= 0:
+            return 0.0
+        return float(self.combined_model(np.array([self.nucleus_onset]), Em, Ec)[0])
+
+    def fit_hybrid(
+        self,
+        epsilon_min,
+        epsilon_max,
+        crossover,
+        terms=("membrane", "interior"),
+        order="parallel-then-series",
+        seed=None,
+    ):
+        """
+        One set of moduli, two load paths, split at ``crossover``.
+
+        Parallel is linear in the moduli and series is linear in their
+        compliances, so a model that is parallel on one side and series on the
+        other is linear in neither. It is still only two or three parameters,
+        and seeding from the separate parallel and series fits of each region
+        puts the optimiser close enough that this is quick and stable.
+        """
+        from scipy.optimize import least_squares
+
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        if eps.size < len(terms) + 2:
+            return self._failure("Not enough points for a hybrid fit.")
+        if not (eps.min() < crossover < eps.max()):
+            return self._failure(
+                f"Crossover e = {crossover:.3f} lies outside the fitted window."
+            )
+
+        if seed is None:
+            base = self.fit(epsilon_min, epsilon_max, terms=terms)
+            seed = (
+                base.get("Em", 1e6) or 1e6,
+                base.get("Ei", 1e3) or 1e3,
+                base.get("En", 1e3) or 1e3,
+            )
+        seed = [max(float(v), 1e-3) for v in seed]
+
+        active = [
+            ("membrane" in terms),
+            ("interior" in terms),
+            ("nucleus" in terms),
+        ]
+        start = np.log10([seed[i] if active[i] else 1e-6 for i in range(3)])
+        free = np.array(active, dtype=bool)
+        scale = max(float(np.nanmax(np.abs(force))), 1e-15)
+
+        def residual(free_log):
+            full = start.copy()
+            full[free] = free_log
+            params = tuple(10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+            return (force - self.predict(eps, params, "hybrid", crossover, order)) / scale
+
+        try:
+            solution = least_squares(
+                residual,
+                start[free],
+                bounds=(np.full(free.sum(), -1.0), np.full(free.sum(), 11.0)),
+                xtol=1e-10,
+                ftol=1e-10,
+                max_nfev=400,
+            )
+        except Exception as exc:  # pragma: no cover - optimiser edge cases
+            return self._failure(f"Hybrid fit failed: {exc}")
+
+        full = start.copy()
+        full[free] = solution.x
+        Em, Ec, En = (10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+
+        pred = self.predict(eps, (Em, Ec, En), "hybrid", crossover, order)
+        residuals = force - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        out = {
+            "success": True,
+            "mode": "hybrid",
+            "coupling": "hybrid",
+            "order": order,
+            "crossover": float(crossover),
+            "Em": Em, "Ei": Ec, "En": En,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Em_MPa_std": float("nan"),
+            "Ei_kPa_std": float("nan"),
+            "En_kPa_std": float("nan"),
+            "force_offset": 0.0,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": int(free.sum()) + 1,  # + the crossover
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": "uniform",
+            "fit_offset": False,
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": float("nan"),
+            "interior_fraction_at_max": float("nan"),
+            "nucleus_fraction_at_max": float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "mask": mask,
+            "warnings": [],
+        }
+        self.results["hybrid"] = out
+        return out
+
+    def scan_crossover(
+        self, epsilon_min, epsilon_max, terms=("membrane", "interior"),
+        order="parallel-then-series", n_trials=15,
+    ):
+        """Grid search for the deformation at which the load path changes."""
+        lo = epsilon_min + 0.15 * (epsilon_max - epsilon_min)
+        hi = epsilon_min + 0.85 * (epsilon_max - epsilon_min)
+        trials, best = [], None
+        for crossover in np.linspace(lo, hi, max(3, int(n_trials))):
+            result = self.fit_hybrid(
+                epsilon_min, epsilon_max, float(crossover), terms=terms, order=order
+            )
+            if not result.get("success"):
+                continue
+            trials.append(
+                {
+                    "crossover": float(crossover),
+                    "r_squared": float(result["r_squared"]),
+                    "Em_MPa": result["Em_MPa"],
+                    "Ei_kPa": result["Ei_kPa"],
+                }
+            )
+            if best is None or result["r_squared"] > best["r_squared"]:
+                best = result
+        if best is None:
+            return {"success": False, "error": "No usable hybrid fit.", "trials": trials}
+        return {"success": True, "best": best, "trials": trials,
+                "best_crossover": best["crossover"]}
+
+
+class LulevichModel(_CouplingMixin):
     """Lulevich fit for single-cell compression curves."""
 
     # ------------------------------------------------------------------ init
@@ -1233,3 +1676,186 @@ class LulevichModel:
     def get_summary(self):
         """All stored results."""
         return self.results
+
+
+# ---------------------------------------------------------------------------
+#  Choosing between the couplings
+# ---------------------------------------------------------------------------
+
+
+def _aicc(ss_res, n, k):
+    """Small-sample corrected Akaike information criterion."""
+    if n <= 0 or ss_res <= 0 or n - k - 1 <= 0:
+        return float("nan")
+    return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+
+
+def compare_couplings(
+    model,
+    epsilon_min,
+    epsilon_max,
+    terms=("membrane", "interior"),
+    n_folds=5,
+    seed=0,
+):
+    """
+    Fit every coupling on the same window and report which the data supports.
+
+    This is model selection, not proof. Two criteria are computed because they
+    fail in different ways:
+
+    * AICc balances fit against parameter count on the data used for fitting.
+      It is quick but assumes the residuals are independent and Gaussian,
+      which force curves only roughly satisfy.
+    * K-fold cross-validation refits on part of the curve and measures error
+      on the part held out. It makes almost no assumptions and directly asks
+      which model predicts data it has not seen, which is the question that
+      matters when the couplings fit the fitted region about equally well.
+
+    When the two disagree, trust the cross-validation. When the top models are
+    within a couple of AICc units of each other, the honest answer is that
+    this curve does not distinguish them, and the returned verdict says so.
+
+    Returns
+    -------
+    dict
+        ``candidates`` (one row per coupling, ranked), ``best``, ``verdict``
+        and the raw fit of each.
+    """
+    rng = np.random.default_rng(seed)
+    eps_all, force_all, _ = model._select(epsilon_min, epsilon_max)
+    n = eps_all.size
+    if n < 12:
+        return {"success": False, "error": f"Only {n} points in the window; need at least 12 to compare couplings."}
+
+    def fit_for(coupling, order=None, lo=epsilon_min, hi=epsilon_max):
+        if coupling == "parallel":
+            return model.fit(lo, hi, terms=terms)
+        if coupling == "series":
+            return model.fit_series(lo, hi, terms=terms)
+        scan = model.scan_crossover(lo, hi, terms=terms, order=order)
+        return scan["best"] if scan.get("success") else {"success": False, "error": "hybrid scan failed"}
+
+    candidates = {
+        "parallel": {"label": "Parallel (forces add)", "order": None},
+        "series": {"label": "Series (deformations add)", "order": None},
+        "hybrid_ps": {"label": "Parallel below, series above", "order": "parallel-then-series"},
+        "hybrid_sp": {"label": "Series below, parallel above", "order": "series-then-parallel"},
+    }
+
+    # K-fold indices, shared across candidates so the comparison is paired.
+    order_idx = rng.permutation(n)
+    folds = np.array_split(order_idx, min(n_folds, n))
+
+    rows = []
+    fits = {}
+    for key, meta in candidates.items():
+        coupling = "parallel" if key == "parallel" else ("series" if key == "series" else "hybrid")
+        result = fit_for(coupling, meta["order"])
+        if not result.get("success"):
+            continue
+        fits[key] = result
+
+        k = int(result.get("n_params") or len(terms))
+        ss_res = float(result.get("ss_res") or (result["rmse"] ** 2 * result["n_points"]))
+
+        # Cross-validation: refit on the training folds, score the held-out one.
+        cv_errors = []
+        for fold in folds:
+            if fold.size == 0 or fold.size >= n - 2:
+                continue
+            keep = np.ones(n, dtype=bool)
+            keep[fold] = False
+            sub = LulevichModel(
+                force_all[keep], eps_all[keep], model.cell_height,
+                cell_radius=model.R0, membrane_thickness=model.h_membrane,
+                poisson_membrane=model.nu_m, poisson_interior=model.nu_i,
+                nucleus_radius=model.R_nucleus, poisson_nucleus=model.nu_n,
+                nucleus_onset=model.nucleus_onset,
+            )
+            trained = (
+                sub.fit(epsilon_min, epsilon_max, terms=terms)
+                if coupling == "parallel"
+                else sub.fit_series(epsilon_min, epsilon_max, terms=terms)
+                if coupling == "series"
+                else sub.fit_hybrid(
+                    epsilon_min, epsilon_max, result.get("crossover"),
+                    terms=terms, order=meta["order"],
+                )
+            )
+            if not trained.get("success"):
+                continue
+            params = (trained.get("Em", 0.0), trained.get("Ei", 0.0), trained.get("En", 0.0))
+            params = tuple(0.0 if not np.isfinite(v) else v for v in params)
+            predicted = model.predict(
+                eps_all[fold], params, coupling,
+                trained.get("crossover", result.get("crossover")), meta["order"] or "parallel-then-series",
+            )
+            cv_errors.append(float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2))))
+
+        rows.append(
+            {
+                "coupling": key,
+                "label": meta["label"],
+                "r_squared": float(result["r_squared"]),
+                "rmse": float(result["rmse"]),
+                "n_params": k,
+                "aicc": _aicc(ss_res, n, k),
+                "cv_rmse": float(np.mean(cv_errors)) if cv_errors else float("nan"),
+                "Em_MPa": result.get("Em_MPa"),
+                "Ei_kPa": result.get("Ei_kPa"),
+                "En_kPa": result.get("En_kPa"),
+                "crossover": result.get("crossover"),
+            }
+        )
+
+    if not rows:
+        return {"success": False, "error": "No coupling produced a usable fit."}
+
+    finite = [r["aicc"] for r in rows if np.isfinite(r["aicc"])]
+    best_aicc = min(finite) if finite else float("nan")
+    for row in rows:
+        row["delta_aicc"] = row["aicc"] - best_aicc if np.isfinite(row["aicc"]) else float("nan")
+    # Akaike weights: the relative likelihood of each model given the data.
+    weights = np.array([np.exp(-0.5 * r["delta_aicc"]) if np.isfinite(r["delta_aicc"]) else 0.0
+                        for r in rows])
+    total = weights.sum()
+    for row, weight in zip(rows, weights):
+        row["weight"] = float(weight / total) if total > 0 else float("nan")
+
+    rows.sort(key=lambda r: (np.inf if not np.isfinite(r["aicc"]) else r["aicc"]))
+    best = rows[0]
+
+    cv_rows = [r for r in rows if np.isfinite(r["cv_rmse"])]
+    cv_best = min(cv_rows, key=lambda r: r["cv_rmse"]) if cv_rows else None
+
+    runner_up = rows[1] if len(rows) > 1 else None
+    if runner_up is not None and np.isfinite(runner_up["delta_aicc"]) and runner_up["delta_aicc"] < 2:
+        verdict = (
+            f"{best['label']} fits best, but {runner_up['label']} is within "
+            f"{runner_up['delta_aicc']:.1f} AICc of it. This curve does not "
+            f"distinguish them; pick on physical grounds, not on this number."
+        )
+    elif cv_best is not None and cv_best["coupling"] != best["coupling"]:
+        verdict = (
+            f"AICc prefers {best['label']} but cross-validation prefers "
+            f"{cv_best['label']}. They disagree, which usually means the extra "
+            f"structure is fitting noise; the cross-validated choice is the safer one."
+        )
+    else:
+        verdict = (
+            f"{best['label']} is preferred, ahead of the next by "
+            f"{runner_up['delta_aicc']:.1f} AICc."
+            if runner_up is not None and np.isfinite(runner_up["delta_aicc"])
+            else f"{best['label']} is preferred."
+        )
+
+    return {
+        "success": True,
+        "candidates": rows,
+        "best": best,
+        "best_by_cv": cv_best,
+        "fits": fits,
+        "verdict": verdict,
+        "n_points": int(n),
+    }
