@@ -497,18 +497,28 @@ def cell_schematic(
             line=dict(color="#1f77b4", width=membrane_line),
             layer="below",
         )
-        _add_spring(fig, -r * 0.45, h * 0.14, h * 0.86, r * 0.32, "#e67e22", 3, n_coils=5)
-        _add_spring(fig, r * 0.45, h * 0.14, h * 0.86, r * 0.32, "#e67e22", 3, n_coils=5)
+        # Cytoskeleton springs flanking the middle.
+        _add_spring(fig, -r * 0.52, h * 0.14, h * 0.86, r * 0.30, "#e67e22", 3, n_coils=5)
+        _add_spring(fig, r * 0.52, h * 0.14, h * 0.86, r * 0.30, "#e67e22", 3, n_coils=5)
 
         if show_nucleus:
-            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.55)
-            nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.7)
+            # The nucleus is drawn as a spring too. It is a third elastic
+            # element loaded in parallel with the others, so a spring is the
+            # honest picture; the outline behind it just says where it sits.
+            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.42)
+            nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.72)
             fig.add_shape(
                 type="circle",
                 x0=-nr, x1=nr,
                 y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
-                fillcolor="rgba(155,89,182,0.75)" if nucleus_engaged else "rgba(155,89,182,0.35)",
-                line=dict(color="#8e44ad", width=2),
+                fillcolor="rgba(155,89,182,0.30)" if nucleus_engaged else "rgba(155,89,182,0.12)",
+                line=dict(color="#8e44ad", width=2, dash="dot"),
+                layer="below",
+            )
+            _add_spring(
+                fig, 0.0, h * 0.16, h * 0.84, min(nr * 1.3, r * 0.42),
+                "#8e44ad" if nucleus_engaged else "rgba(142,68,173,0.35)",
+                3, n_coils=5,
             )
 
     # Height marker.
