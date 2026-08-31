@@ -16,6 +16,99 @@ from igor_parser import IgorParser
 from baseline_correction import BaselineCorrector, calculate_relative_deformation
 from google_sheets_manager import GoogleSheetsManager, initialize_sheets_manager
 
+# ========== HELPER FUNCTION: Publication-Quality Plot ==========
+def create_publication_plot(relative_def, force_N, title="Force vs Relative Deformation", force_unit="pN"):
+    """
+    Create publication-quality Nature-style plot
+
+    Parameters:
+    -----------
+    relative_def : array
+        Relative deformation values
+    force_N : array
+        Force values in Newtons
+    title : str
+        Plot title
+    force_unit : str
+        Force unit: 'N', 'μN', 'nN', 'pN'
+
+    Returns:
+    --------
+    plotly figure object
+    """
+
+    # Convert force to selected unit
+    unit_conversions = {
+        'N': (1, 'N'),
+        'μN': (1e6, 'μN'),
+        'nN': (1e9, 'nN'),
+        'pN': (1e12, 'pN')
+    }
+
+    conversion_factor, unit_label = unit_conversions.get(force_unit, (1e12, 'pN'))
+    force_converted = force_N * conversion_factor
+
+    # Create figure with publication-quality settings
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=relative_def,
+        y=force_converted,
+        mode='lines+markers',
+        name='Force Curve',
+        line=dict(
+            color='#000000',  # Black line
+            width=4  # Thick line
+        ),
+        marker=dict(
+            size=8,
+            color='#000000',
+            line=dict(width=2, color='#000000')
+        ),
+        hovertemplate='<b>ε:</b> %{x:.4f}<br><b>F:</b> %{y:.3f} ' + unit_label + '<extra></extra>'
+    ))
+
+    # Nature journal style formatting
+    fig.update_layout(
+        title={
+            'text': title,
+            'font': {'size': 18, 'family': 'Arial, sans-serif', 'color': '#000000'},
+            'x': 0.5,
+            'xanchor': 'center'
+        },
+        xaxis=dict(
+            title='Relative Deformation (ε)',
+            titlefont=dict(size=16, family='Arial, sans-serif', color='#000000'),
+            tickfont=dict(size=14, family='Arial, sans-serif', color='#000000'),
+            showline=True,
+            linewidth=3,  # Thick axis
+            linecolor='#000000',
+            showgrid=False,
+            zeroline=False,
+            mirror=True  # Show axis on all sides
+        ),
+        yaxis=dict(
+            title=f'Force ({unit_label})',
+            titlefont=dict(size=16, family='Arial, sans-serif', color='#000000'),
+            tickfont=dict(size=14, family='Arial, sans-serif', color='#000000'),
+            showline=True,
+            linewidth=3,  # Thick axis
+            linecolor='#000000',
+            showgrid=False,
+            zeroline=False,
+            mirror=True  # Show axis on all sides
+        ),
+        plot_bgcolor='#FFFFFF',
+        paper_bgcolor='#FFFFFF',
+        hovermode='x unified',
+        height=600,
+        width=900,
+        margin=dict(l=100, r=50, t=80, b=100),
+        font=dict(family='Arial, sans-serif', color='#000000')
+    )
+
+    return fig
+
 # Page config
 st.set_page_config(
     page_title="AFM Cell Analyzer",
@@ -250,21 +343,29 @@ with tabs[0]:
     if force_curve_file is not None and relative_def is not None and force is not None:
         st.markdown('<div class="section-header">Plot Preview</div>', unsafe_allow_html=True)
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=relative_def,
-            y=force,
-            mode='lines+markers',
-            name='Force Curve',
-            line=dict(color='#1f77b4', width=2),
-            marker=dict(size=6)
-        ))
-        fig.update_layout(
+        # Force unit selector
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.markdown("**Display Force Units:**")
+        with col2:
+            force_unit_preview = st.selectbox(
+                "Force Unit",
+                ["pN", "nN", "μN", "N"],
+                label_visibility="collapsed",
+                key="force_unit_preview"
+            )
+        with col3:
+            st.empty()
+
+        # Convert force to N for the plotting function (force is currently in original units)
+        # Assuming input force is in nN (from CSV)
+        force_N = force / 1e9  # Convert nN to N
+
+        fig = create_publication_plot(
+            relative_def,
+            force_N,
             title="Force vs Relative Deformation",
-            xaxis_title="Relative Deformation (ε)",
-            yaxis_title="Force (nN)",
-            hovermode='x unified',
-            height=400
+            force_unit=force_unit_preview
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -340,7 +441,7 @@ with tabs[0]:
 
                         # Display results
                         st.markdown("---")
-                        st.markdown("### Results")
+                        st.markdown("### Analysis Results")
 
                         col1, col2 = st.columns(2)
 
@@ -351,6 +452,32 @@ with tabs[0]:
                         with col2:
                             st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei']:.2f} kPa")
                             st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r2', 0):.4f}")
+
+                        # Plot with unit selector
+                        st.markdown("---")
+                        col1, col2, col3 = st.columns([2, 1, 1])
+                        with col1:
+                            st.markdown("**Display Force Units:**")
+                        with col2:
+                            force_unit_results = st.selectbox(
+                                "Force Unit",
+                                ["pN", "nN", "μN", "N"],
+                                label_visibility="collapsed",
+                                key="force_unit_results"
+                            )
+                        with col3:
+                            st.empty()
+
+                        # Convert force to N
+                        force_N_results = force / 1e9
+
+                        fig = create_publication_plot(
+                            relative_def,
+                            force_N_results,
+                            title="Force vs Relative Deformation",
+                            force_unit=force_unit_results
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
                     except Exception as e:
                         st.error(f"❌ Analysis Error: {str(e)}")
@@ -496,19 +623,28 @@ with tabs[0]:
                         st.markdown("### Generated Data Preview")
                         st.dataframe(df_output.head(20), use_container_width=True)
 
-                        # Plot
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=relative_def_generated,
-                            y=force_generated / 1e3,
-                            mode='lines+markers',
-                            name='Generated Force Curve'
-                        ))
-                        fig.update_layout(
+                        # Plot with unit selector
+                        col1, col2, col3 = st.columns([2, 1, 1])
+                        with col1:
+                            st.markdown("**Display Force Units:**")
+                        with col2:
+                            force_unit_generated = st.selectbox(
+                                "Force Unit",
+                                ["pN", "nN", "μN", "N"],
+                                label_visibility="collapsed",
+                                key="force_unit_generated"
+                            )
+                        with col3:
+                            st.empty()
+
+                        # Convert force to N (currently in pN)
+                        force_N_generated = force_generated / 1e12
+
+                        fig = create_publication_plot(
+                            relative_def_generated,
+                            force_N_generated,
                             title="Generated Force vs Relative Deformation",
-                            xaxis_title="Relative Deformation (ε)",
-                            yaxis_title="Force (nN)",
-                            hovermode='x unified'
+                            force_unit=force_unit_generated
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -586,19 +722,28 @@ with tabs[2]:
 
         st.markdown("---")
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=results['relative_def'],
-            y=results['force'],
-            mode='lines+markers',
-            name='Force vs Relative Deformation'
-        ))
-        fig.update_layout(
+        # Force unit selector for results tab
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            st.markdown("**Display Force Units:**")
+        with col2:
+            force_unit_tab3 = st.selectbox(
+                "Force Unit",
+                ["pN", "nN", "μN", "N"],
+                label_visibility="collapsed",
+                key="force_unit_tab3"
+            )
+        with col3:
+            st.empty()
+
+        # Convert force to N
+        force_N_tab3 = results['force'] / 1e9
+
+        fig = create_publication_plot(
+            results['relative_def'],
+            force_N_tab3,
             title="Force vs Relative Deformation",
-            xaxis_title="Relative Deformation (ε)",
-            yaxis_title="Force (nN)",
-            hovermode='x unified',
-            height=500
+            force_unit=force_unit_tab3
         )
         st.plotly_chart(fig, use_container_width=True)
 
