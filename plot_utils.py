@@ -61,23 +61,42 @@ class PlotStyle:
     force_unit: str = "nN"
     data_color: str = "#1f77b4"
     fit_color: str = "#d62728"
-    marker_size: int = 6
-    line_width: int = 3
-    height: int = 520
+    marker_size: int = 7
+    line_width: int = 4
+    height: int = 560
     show_grid: bool = False
-    axis_width: int = 2
-    font_size: int = 16
-    title_size: int = 20
+    axis_width: int = 4
+    axis_title_size: int = 28
+    tick_size: int = 22
+    title_size: int = 24
+    bold_axes: bool = True
     log_scale: bool = False
     show_fit_window: bool = True
     show_components: bool = True
     template: str = "publication"
 
+    # Legacy alias: older call sites used a single `font_size`.
+    @property
+    def font_size(self):
+        return self.tick_size
+
     def as_dict(self):
         return asdict(self)
 
 
+# Plotly's `weight` font attribute is recent; a black font family gives bold
+# tick labels on every version.
+BOLD_FAMILY = "Arial Black, Arial Bold, Helvetica, sans-serif"
+REGULAR_FAMILY = "Arial, Helvetica, sans-serif"
+
+
+def _bold(text, enabled=True):
+    """Plotly renders a small HTML subset in titles."""
+    return f"<b>{text}</b>" if enabled else text
+
+
 def _style_axes(fig, style: PlotStyle, x_title, y_title, log_x=False, log_y=False):
+    family = BOLD_FAMILY if style.bold_axes else REGULAR_FAMILY
     common = dict(
         showline=True,
         linewidth=style.axis_width,
@@ -85,32 +104,50 @@ def _style_axes(fig, style: PlotStyle, x_title, y_title, log_x=False, log_y=Fals
         mirror=True,
         showgrid=style.show_grid,
         gridcolor="#e6e6e6",
+        gridwidth=1,
         zeroline=False,
         ticks="outside",
         tickwidth=style.axis_width,
-        ticklen=6,
-        title_font=dict(size=style.font_size + 3, color="black"),
-        tickfont=dict(size=style.font_size, color="black"),
+        ticklen=max(8, style.axis_width * 3),
+        tickcolor="black",
+        title_font=dict(size=style.axis_title_size, color="black", family=family),
+        tickfont=dict(size=style.tick_size, color="black", family=family),
+        automargin=True,
     )
-    fig.update_xaxes(title_text=x_title, type="log" if log_x else "linear", **common)
-    fig.update_yaxes(title_text=y_title, type="log" if log_y else "linear", **common)
+    fig.update_xaxes(
+        title_text=_bold(x_title, style.bold_axes),
+        type="log" if log_x else "linear",
+        **common,
+    )
+    fig.update_yaxes(
+        title_text=_bold(y_title, style.bold_axes),
+        type="log" if log_y else "linear",
+        **common,
+    )
 
 
 def _base_layout(fig, style: PlotStyle, title):
+    # Bigger fonts need proportionally bigger margins or the axis titles clip.
+    side = 60 + int(2.6 * style.axis_title_size)
+    bottom = 50 + int(2.4 * style.axis_title_size)
     fig.update_layout(
-        title=dict(text=title, font=dict(size=style.title_size, color="black"), x=0.02),
+        title=dict(
+            text=_bold(title, style.bold_axes),
+            font=dict(size=style.title_size, color="black", family=REGULAR_FAMILY),
+            x=0.02,
+        ),
         plot_bgcolor="white",
         paper_bgcolor="white",
         hovermode="closest",
         height=style.height,
-        margin=dict(l=90, r=40, t=70, b=80),
+        margin=dict(l=side, r=40, t=max(70, style.title_size * 3), b=bottom),
         legend=dict(
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="black",
             borderwidth=1,
             x=0.02,
             y=0.98,
-            font=dict(size=style.font_size - 2),
+            font=dict(size=max(11, style.tick_size - 6), family=REGULAR_FAMILY),
         ),
     )
 
@@ -126,6 +163,7 @@ def force_curve_figure(
     interior_N=None,
     fit_window=None,
     rupture_epsilon=None,
+    highlight=None,
 ):
     """
     One figure for both preview and results.
@@ -204,18 +242,49 @@ def force_curve_figure(
                 )
 
     if fit_window is not None and style.show_fit_window and not log_mode:
-        lo, hi = fit_window
-        fig.add_vrect(
-            x0=lo,
-            x1=hi,
-            fillcolor="#2ca02c",
-            opacity=0.10,
-            layer="below",
-            line_width=0,
-            annotation_text="fit window",
-            annotation_position="top left",
-            annotation_font_size=style.font_size - 3,
+        # Accept a single (lo, hi) or a list of windows, each optionally
+        # carrying its own label and colour, so the sequential fit can show
+        # the cytoskeleton and membrane windows separately.
+        windows = fit_window
+        if len(windows) == 2 and np.isscalar(windows[0]):
+            windows = [{"range": tuple(fit_window), "label": "fit window"}]
+        for i, win in enumerate(windows):
+            if not isinstance(win, dict):
+                win = {"range": tuple(win)}
+            lo, hi = win["range"]
+            fig.add_vrect(
+                x0=lo,
+                x1=hi,
+                fillcolor=win.get("color", ("#2ca02c", "#9467bd")[i % 2]),
+                opacity=win.get("opacity", 0.12),
+                layer="below",
+                line_width=0,
+                annotation_text=win.get("label", "fit window"),
+                annotation_position="bottom left",
+                annotation_font_size=max(10, style.tick_size - 6),
+            )
+
+    if highlight is not None:
+        # The point on the curve that the displayed video frame corresponds to.
+        hx, hy_N = highlight
+        hy, _ = from_newtons(hy_N, style.force_unit)
+        fig.add_trace(
+            go.Scatter(
+                x=[hx],
+                y=[float(hy)],
+                mode="markers",
+                name="video frame",
+                marker=dict(
+                    size=style.marker_size + 12,
+                    color="rgba(255,165,0,0.9)",
+                    symbol="circle-open",
+                    line=dict(width=4, color="#ff7f0e"),
+                ),
+                hovertemplate="ε = %{x:.4f}<br>F = %{y:.4g}<extra>video frame</extra>",
+            )
         )
+        if not log_mode:
+            fig.add_vline(x=hx, line=dict(color="#ff7f0e", width=2, dash="dot"))
 
     if rupture_epsilon is not None and not log_mode:
         fig.add_vline(
