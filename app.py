@@ -16,8 +16,64 @@ from igor_parser import IgorParser
 from baseline_correction import BaselineCorrector, calculate_relative_deformation
 from google_sheets_manager import GoogleSheetsManager, initialize_sheets_manager
 
+# ========== HELPER FUNCTION: Plot with Fitted Curve ==========
+def create_fitted_plot(relative_def, force_N, fitted_force_N, epsilon_min, epsilon_max, title="Force vs Relative Deformation", force_unit="μN", line_color="#000000", line_width=4):
+    """Create plot showing data and fitted curve overlay"""
+
+    unit_conversions = {
+        'N': (1, 'N'),
+        'μN': (1e6, 'μN'),
+        'nN': (1e9, 'nN'),
+        'pN': (1e12, 'pN')
+    }
+
+    conversion_factor, unit_label = unit_conversions.get(force_unit, (1e6, 'μN'))
+    force_converted = force_N * conversion_factor
+    fitted_converted = fitted_force_N * conversion_factor
+
+    fig = go.Figure()
+
+    # Data points
+    fig.add_trace(go.Scatter(
+        x=relative_def,
+        y=force_converted,
+        mode='markers',
+        name='Experimental Data',
+        marker=dict(size=6, color='lightblue', line=dict(width=1.5, color=line_color)),
+        hovertemplate='<b>ε:</b> %{x:.4f}<br><b>F:</b> %{y:.3f} ' + unit_label + '<extra></extra>'
+    ))
+
+    # Fitted curve
+    fig.add_trace(go.Scatter(
+        x=relative_def,
+        y=fitted_converted,
+        mode='lines',
+        name='Lulevich Fit',
+        line=dict(color=line_color, width=line_width),
+        hovertemplate='<b>ε:</b> %{x:.4f}<br><b>F(fit):</b> %{y:.3f} ' + unit_label + '<extra></extra>'
+    ))
+
+    # Highlight fitting range
+    fig.add_vrect(x0=epsilon_min, x1=epsilon_max, fillcolor="green", opacity=0.1, layer="below", line_width=0)
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=22, color='black')),
+        xaxis_title='Relative Deformation (ε)',
+        yaxis_title=f'Force ({unit_label})',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        hovermode='x unified',
+        height=600,
+        margin=dict(l=100, r=50, t=100, b=100)
+    )
+
+    fig.update_xaxes(showline=True, linewidth=3, linecolor='black', showgrid=False, zeroline=False, mirror=True, title_font=dict(size=20), tickfont=dict(size=16))
+    fig.update_yaxes(showline=True, linewidth=3, linecolor='black', showgrid=False, zeroline=False, mirror=True, title_font=dict(size=20), tickfont=dict(size=16))
+
+    return fig
+
 # ========== HELPER FUNCTION: Publication-Quality Plot ==========
-def create_publication_plot(relative_def, force_N, title="Force vs Relative Deformation", force_unit="pN", line_color="#000000", line_width=4):
+def create_publication_plot(relative_def, force_N, title="Force vs Relative Deformation", force_unit="μN", line_color="#000000", line_width=4):
     """
     Create publication-quality Nature-style plot
 
@@ -161,13 +217,43 @@ with st.sidebar:
 
     gs_manager = None
     if enable_database:
-        if st.button("🔗 Connect to Google Sheets"):
+        if st.button("🔗 Connect to Google Sheets", use_container_width=True):
             gs_manager = initialize_sheets_manager()
             if gs_manager:
                 st.session_state.gs_manager = gs_manager
-                st.success("✅ Connected!")
+                st.success("✅ Connected to Google Sheets!")
+                st.info(f"📊 Sheet URL: {gs_manager.get_spreadsheet_url()}")
+            else:
+                st.error("❌ Connection failed. See setup instructions below.")
         else:
             gs_manager = st.session_state.gs_manager
+
+        # Setup instructions
+        with st.expander("📋 Setup Instructions"):
+            st.markdown("""
+            **To enable Google Sheets storage:**
+
+            1. Create a Google Cloud project
+            2. Create a Service Account and download JSON key
+            3. Share your Google Sheet with the service account email
+            4. Add credentials to `.streamlit/secrets.toml`:
+            ```toml
+            [google_sheets_credentials]
+            type = "service_account"
+            project_id = "your-project-id"
+            private_key_id = "..."
+            private_key = "..."
+            client_email = "..."
+            client_id = "..."
+            auth_uri = "https://accounts.google.com/o/oauth2/auth"
+            token_uri = "https://oauth2.googleapis.com/token"
+            auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+            client_x509_cert_url = "..."
+            ```
+            5. Restart Streamlit app
+            """)
+    else:
+        gs_manager = None
 
     st.markdown("---")
     st.markdown("### Analysis Settings")
@@ -248,12 +334,20 @@ with tabs[0]:
 
     st.markdown("**Expected format:** CSV or Excel with columns:")
     st.markdown("- **Relative Deformation (ε)** or similar")
-    st.markdown("- **Force (nN)** or similar")
+    st.markdown("- **Force** (specify units below)")
 
     force_curve_file = st.file_uploader(
         "Select force curve file (.csv or .xlsx)",
         type=['csv', 'xlsx'],
         key="force_curve_file"
+    )
+
+    # Force unit specification
+    input_force_unit = st.selectbox(
+        "Force units in your CSV file",
+        ["nN (nanoNewtons)", "pN (picoNewtons)", "μN (microNewtons)", "N (Newtons)"],
+        index=0,
+        help="What units are the force values in your file?"
     )
 
     current_data = None
@@ -291,7 +385,17 @@ with tabs[0]:
 
             # Extract data
             relative_def = df_loaded[eps_col].values.astype(float)
-            force = df_loaded[force_col].values.astype(float)
+            force_raw = df_loaded[force_col].values.astype(float)
+
+            # Convert to nanoNewtons for internal calculations
+            unit_conversion_to_nN = {
+                "nN (nanoNewtons)": 1,
+                "pN (picoNewtons)": 1e-3,
+                "μN (microNewtons)": 1e3,
+                "N (Newtons)": 1e9
+            }
+            conversion_factor = unit_conversion_to_nN.get(input_force_unit, 1)
+            force = force_raw * conversion_factor  # Now in nanoNewtons
 
             current_data = {
                 'relative_def': relative_def,
@@ -302,6 +406,7 @@ with tabs[0]:
             }
 
             st.session_state.current_data = current_data
+            st.info(f"ℹ️ Force data converted to nanoNewtons for analysis")
 
         except Exception as e:
             st.error(f"❌ File Error: {str(e)}")
@@ -365,8 +470,7 @@ with tabs[0]:
         with col4:
             st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize plot</p>", unsafe_allow_html=True)
 
-        # Convert force to N for the plotting function (force is currently in original units)
-        # Assuming input force is in nN (from CSV)
+        # Convert force to N for the plotting function (force is currently in nN)
         force_N = force / 1e9  # Convert nN to N
 
         fig = create_publication_plot(
@@ -381,168 +485,192 @@ with tabs[0]:
 
         st.markdown("---")
 
-        # ========== SECTION 5: Analyze with Control Panel ==========
-        st.markdown('<div class="section-header">Analysis</div>', unsafe_allow_html=True)
+        # ========== SECTION 5: Fitting Analysis with Side Panel ==========
+        st.markdown('<div class="section-header">Fitting Analysis</div>', unsafe_allow_html=True)
 
-        # Create two columns: left for plot, right for controls
-        col_plot, col_controls = st.columns([3, 1])
+        # Create left-right layout: Controls on left, Results on right
+        left_col, right_col = st.columns([1, 2])
 
-        with col_controls:
-            st.markdown("### Analysis Panel")
-            st.markdown("**Fitting Range (ε)**")
+        with left_col:
+            st.markdown("### Analysis Controls")
 
-            # Manual range sliders
+            # Manual epsilon range
+            st.markdown("**Elastic Fitting Range (ε):**")
             manual_eps_min = st.slider(
-                "Min ε",
-                min_value=0.0,
-                max_value=0.3,
-                value=0.01,
-                step=0.01,
-                key="manual_eps_min"
+                "Minimum ε",
+                0.0, 0.3, 0.01, 0.01,
+                key="manual_eps_min",
+                help="Lower bound for elastic region"
             )
 
             manual_eps_max = st.slider(
-                "Max ε",
-                min_value=0.05,
-                max_value=0.5,
-                value=0.2,
-                step=0.01,
-                key="manual_eps_max"
+                "Maximum ε",
+                0.05, 0.5, 0.2, 0.01,
+                key="manual_eps_max",
+                help="Upper bound for elastic region"
             )
 
             st.markdown("---")
 
-            analyze_button = st.button("🚀 Analyze", type="primary", use_container_width=True)
+            # Fit button
+            analyze_button = st.button(
+                "🚀 Fit Curve",
+                type="primary",
+                use_container_width=True,
+                key="analyze_btn"
+            )
 
-        with col_plot:
-            pass  # Placeholder for now
+        with right_col:
+            if analyze_button:
+                if not cell_name:
+                    st.error("❌ Cell Name is required")
+                elif cell_height is None or cell_height <= 0:
+                    st.error("❌ Cell Height is required (μm). Please enter a valid value and press Enter to update.")
+                else:
+                    with st.spinner("🔄 Analyzing... (fitting the Lulevich model)"):
+                        try:
+                            # Lulevich model fitting (two-term combined model)
+                            # Convert force from nN to N for the model
+                            force_N_analysis = force / 1e9
+                            model = LulevichModel(force_N_analysis, relative_def, cell_height)
 
-        if analyze_button:
-            if not cell_name:
-                st.error("❌ Cell Name is required")
-            elif cell_height is None or cell_height <= 0:
-                st.error("❌ Cell Height is required (μm). Please enter a valid value and press Enter to update.")
-            else:
-                with st.spinner("Analyzing... (this may take a few seconds)"):
-                    try:
-                        # Lulevich model fitting (two-term combined model)
-                        # Convert force from nN to N for the model
-                        force_N_analysis = force / 1e9
-                        model = LulevichModel(force_N_analysis, relative_def, cell_height)
-
-                        # Use combined two-term fit (membrane + cytoskeleton simultaneously)
-                        fit_results = model.fit_combined_elasticity(epsilon_max=manual_eps_max, epsilon_min=manual_eps_min)
-
-                        # Check for errors and fallback to auto-detect if needed
-                        if fit_results.get('success', False) == False or fit_results.get('Em_MPa', 0) == 0:
-                            st.info("ℹ️ Trying auto-detected range...")
-                            auto_range = model.auto_detect_elastic_range()
+                            # Use combined two-term fit (membrane + cytoskeleton simultaneously)
                             fit_results = model.fit_combined_elasticity(
-                                epsilon_max=auto_range['elastic_epsilon_max'],
-                                epsilon_min=auto_range['elastic_epsilon_min']
+                                epsilon_max=manual_eps_max,
+                                epsilon_min=manual_eps_min
                             )
 
-                        # Extract results
-                        fit_results_membrane = {'Em_MPa': fit_results.get('Em_MPa', 0), 'r_squared': fit_results.get('r_squared', 0)}
-                        fit_results_cyto = {'Ei_kPa': fit_results.get('Ei_kPa', 0), 'r_squared': fit_results.get('r_squared', 0)}
+                            # Check for errors and fallback to auto-detect if needed
+                            if not fit_results.get('success', False) or fit_results.get('Em_MPa', 0) == 0:
+                                st.warning("ℹ️ Manual range didn't produce good fit. Trying auto-detected range...")
+                                auto_range = model.auto_detect_elastic_range()
+                                fit_results = model.fit_combined_elasticity(
+                                    epsilon_max=auto_range['elastic_epsilon_max'],
+                                    epsilon_min=auto_range['elastic_epsilon_min']
+                                )
+                                if fit_results.get('success', False):
+                                    st.info(f"✅ Auto-detected range: ε = [{auto_range['elastic_epsilon_min']:.4f}, {auto_range['elastic_epsilon_max']:.4f}]")
 
-                        # Store results
-                        st.session_state.results = {
-                            'cell_name': cell_name,
-                            'date_acquired': str(date_acquired),
-                            'cell_height': cell_height,
-                            'Em': fit_results_membrane['Em_MPa'],
-                            'Ei': fit_results_cyto['Ei_kPa'],
-                            'r2_membrane': fit_results_membrane.get('r_squared', 0),
-                            'r2_cyto': fit_results_cyto.get('r_squared', 0),
-                            'force': force,
-                            'relative_def': relative_def,
-                            'spring_constant': spring_constant,
-                            'video_link': video_link,
-                            'timestamp': datetime.now()
-                        }
+                            # Verify results
+                            if fit_results.get('success', False) and fit_results.get('Em_MPa', 0) > 0 and fit_results.get('Ei_kPa', 0) > 0:
+                                # Extract results
+                                Em_result = fit_results.get('Em_MPa', 0)
+                                Ei_result = fit_results.get('Ei_kPa', 0)
+                                r2_result = fit_results.get('r_squared', 0)
 
-                        st.success("✅ Analysis Complete!")
+                                # Generate fitted force curve using Em and Ei in Pa (from the results dict)
+                                fitted_force = model.combined_model(
+                                    relative_def,
+                                    fit_results.get('Em', 1e6),  # Use Em in Pa
+                                    fit_results.get('Ei', 1e3)   # Use Ei in Pa
+                                )
 
-                        # Save to database
-                        if enable_database and gs_manager:
-                            cell_data = {
-                                'cell_id': cell_name,
-                                'date_analyzed': date_acquired.strftime("%Y-%m-%d"),
-                                'cell_height': cell_height,
-                                'cantilever_constant': f"{spring_constant} N/m" if spring_constant > 0 else "N/A",
-                                'Em': round(fit_results_membrane['Em_MPa'], 4),
-                                'Ei': round(fit_results_cyto['Ei_kPa'], 4),
-                                'video_link': video_link,
-                                'force_curve_created': 'Yes',
-                                'fit_quality': round(fit_results_membrane.get('r_squared', 0), 4),
-                                'notes': 'Force curve analysis',
-                                'analysis_status': 'Complete'
-                            }
-                            success, msg = gs_manager.append_cell_data(cell_data)
-                            st.info(msg)
+                                # Store results in session state
+                                st.session_state.results = {
+                                    'cell_name': cell_name,
+                                    'date_acquired': str(date_acquired),
+                                    'cell_height': cell_height,
+                                    'Em': Em_result,
+                                    'Ei': Ei_result,
+                                    'r2': r2_result,
+                                    'force': force,
+                                    'relative_def': relative_def,
+                                    'fitted_force': fitted_force,
+                                    'epsilon_min': manual_eps_min,
+                                    'epsilon_max': manual_eps_max,
+                                    'spring_constant': spring_constant,
+                                    'video_link': video_link,
+                                    'timestamp': datetime.now()
+                                }
 
-                        # Display results
-                        st.markdown("---")
-                        st.markdown("### Analysis Results")
+                                st.success(f"✅ Fitting Complete! Em={Em_result:.2f} MPa, Ei={Ei_result:.2f} kPa, R²={r2_result:.4f}")
 
-                        col1, col2 = st.columns(2)
+                                # Save to database if enabled
+                                if enable_database and gs_manager:
+                                    cell_data = {
+                                        'cell_id': cell_name,
+                                        'date_analyzed': date_acquired.strftime("%Y-%m-%d"),
+                                        'cell_height': cell_height,
+                                        'cantilever_constant': f"{spring_constant} N/m" if spring_constant > 0 else "N/A",
+                                        'Em': round(Em_result, 4),
+                                        'Ei': round(Ei_result, 4),
+                                        'video_link': video_link,
+                                        'force_curve_created': 'Yes',
+                                        'fit_quality': round(r2_result, 4),
+                                        'notes': 'Force curve analysis',
+                                        'analysis_status': 'Complete'
+                                    }
+                                    success, msg = gs_manager.append_cell_data(cell_data)
+                                    if success:
+                                        st.success(msg)
+                                    else:
+                                        st.warning(f"Could not save to database: {msg}")
 
-                        with col1:
-                            st.metric("Em (Membrane)", f"{fit_results_membrane['Em_MPa']:.2f} MPa")
-                            st.metric("R² (Membrane)", f"{fit_results_membrane.get('r_squared', 0):.4f}")
+                            else:
+                                error_msg = fit_results.get('error', 'Unknown error during fitting')
+                                st.error(f"❌ Fitting failed: {error_msg}")
+                                st.info("💡 Try adjusting the epsilon range or check your data quality")
 
-                        with col2:
-                            st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei_kPa']:.2f} kPa")
-                            st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r_squared', 0):.4f}")
+                        except Exception as e:
+                            st.error(f"❌ Analysis Error: {str(e)}")
+                            st.info("💡 Check that Cell Height is set and data is properly formatted")
 
-                        # Plot with unit selector and customization
-                        st.markdown("---")
-                        col1, col2, col3, col4, col5 = st.columns(5)
-                        with col1:
-                            st.markdown("**Display Force Units:**")
-                        with col2:
-                            force_unit_results = st.selectbox(
-                                "Force Unit",
-                                ["μN", "pN", "nN", "N"],
-                                index=0,
-                                label_visibility="collapsed",
-                                key="force_unit_results"
-                            )
-                        with col3:
-                            line_color_results = st.color_picker(
-                                "Line Color",
-                                value="#000000",
-                                label_visibility="collapsed",
-                                key="line_color_results"
-                            )
-                        with col4:
-                            line_width_results = st.slider(
-                                "Line Width",
-                                min_value=1,
-                                max_value=8,
-                                value=4,
-                                label_visibility="collapsed",
-                                key="line_width_results"
-                            )
-                        with col5:
-                            st.markdown("<p style='text-align: center; color: gray; margin-top: 8px;'>Customize</p>", unsafe_allow_html=True)
+        # Display stored results if available
+        if st.session_state.results is not None:
+            st.markdown("---")
+            st.markdown("### ✅ Fitting Results Summary")
 
-                        # Convert force to N
-                        force_N_results = force / 1e9
+            # Results metrics in columns
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
+                st.metric(
+                    "Em (Membrane)",
+                    f"{st.session_state.results['Em']:.2f} MPa",
+                    delta="Young's Modulus"
+                )
+            with metric_col2:
+                st.metric(
+                    "Ei (Cytoskeleton)",
+                    f"{st.session_state.results['Ei']:.2f} kPa",
+                    delta="Cytoskeleton Stiffness"
+                )
+            with metric_col3:
+                st.metric(
+                    "R² Goodness of Fit",
+                    f"{st.session_state.results['r2']:.4f}",
+                    delta="Model Quality (0-1)"
+                )
 
-                        fig = create_publication_plot(
-                            relative_def,
-                            force_N_results,
-                            title="Force vs Relative Deformation",
-                            force_unit=force_unit_results,
-                            line_color=line_color_results,
-                            line_width=line_width_results
-                        )
-                        st.plotly_chart(fig, use_container_width=True, key="analysis_results_plot")
+            # Fitted plot display
+            st.markdown("---")
+            st.markdown("### Fitted Curve Overlay")
 
-                    except Exception as e:
-                        st.error(f"❌ Analysis Error: {str(e)}")
+            plot_col1, plot_col2 = st.columns([3, 1])
+            with plot_col1:
+                st.markdown("**Experimental data (points) + Lulevich fit (curve)**")
+            with plot_col2:
+                force_unit_results = st.selectbox(
+                    "Force Unit",
+                    ["μN", "pN", "nN", "N"],
+                    index=0,
+                    label_visibility="collapsed",
+                    key="force_unit_results"
+                )
+
+            # Create fitted plot
+            force_N_results = st.session_state.results['force'] / 1e9
+            fitted_force_N = st.session_state.results['fitted_force']
+
+            fig = create_fitted_plot(
+                st.session_state.results['relative_def'],
+                force_N_results,
+                fitted_force_N,
+                st.session_state.results['epsilon_min'],
+                st.session_state.results['epsilon_max'],
+                title="Data + Lulevich Fit",
+                force_unit=force_unit_results
+            )
+            st.plotly_chart(fig, use_container_width=True, key="analysis_results_plot")
 
     # ========== SECTION 6: Create Force Curve from Igor ==========
     st.markdown("---")
