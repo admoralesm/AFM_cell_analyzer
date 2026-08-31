@@ -1,7 +1,6 @@
 """
-AFM Cell Analyzer v4 - Force Curve Focused
-Primary: Upload pre-processed force curves
-Secondary: Generate force curves from Igor files
+AFM Cell Analyzer v5 - Reorganized Workflow
+Force curve analysis with plot preview before analysis
 """
 
 import streamlit as st
@@ -34,23 +33,12 @@ st.markdown("""
         font-weight: bold;
         margin-bottom: 0.5em;
     }
-    .success-box {
-        background-color: #d4edda;
-        padding: 1em;
-        border-radius: 5px;
-        border-left: 4px solid #28a745;
-    }
-    .info-box {
-        background-color: #d1ecf1;
-        padding: 1em;
-        border-radius: 5px;
-        border-left: 4px solid #17a2b8;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        padding: 1em;
-        border-radius: 5px;
-        border-left: 4px solid #ffc107;
+    .section-header {
+        color: #2ca02c;
+        font-size: 1.3em;
+        font-weight: bold;
+        margin-top: 1.5em;
+        margin-bottom: 0.8em;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -60,15 +48,15 @@ if 'results' not in st.session_state:
     st.session_state.results = None
 if 'gs_manager' not in st.session_state:
     st.session_state.gs_manager = None
-if 'generated_force_curve' not in st.session_state:
-    st.session_state.generated_force_curve = None
+if 'current_data' not in st.session_state:
+    st.session_state.current_data = None
 
 # Main header
 col1, col2 = st.columns([3, 1])
 with col1:
     st.markdown('<div class="main-header">🔬 AFM Cell Analyzer</div>', unsafe_allow_html=True)
 with col2:
-    st.markdown("**v4.0** - Force Curve Analysis")
+    st.markdown("**v5.0**")
 
 st.markdown("---")
 
@@ -98,16 +86,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Analysis Settings")
 
-    # Cell height (for context only, not always needed)
-    cell_height_default = st.number_input(
-        "Default Cell Height (μm)",
-        min_value=1.0,
-        max_value=50.0,
-        value=8.09,
-        step=0.1,
-        help="Reference cell height"
-    )
-
     # Spring constant (OPTIONAL)
     spring_constant_default = st.number_input(
         "Default Spring Constant (N/m)",
@@ -115,7 +93,7 @@ with st.sidebar:
         max_value=100.0,
         value=0.0,
         step=0.001,
-        help="Optional: Spring constant for model (0 = not used)"
+        help="Optional: Spring constant (0 = not used)"
     )
 
     st.markdown("---")
@@ -138,60 +116,53 @@ with st.sidebar:
 
 # Main tabs
 tabs = st.tabs([
-    "📊 Analyze Force Curve",
-    "🔧 Generate Force Curve (Igor)",
+    "📊 Force Curve Analysis",
+    "🔧 Create Force Curve (Igor)",
     "📋 Database Browser",
     "📈 Results",
     "💾 Export"
 ])
 
-# ==================== TAB 1: Analyze Force Curve ====================
+# ==================== TAB 1: Force Curve Analysis ====================
 with tabs[0]:
-    st.markdown("## Analyze Force vs Relative Deformation Curve")
+    st.markdown("## Force vs Relative Deformation Curve")
+    st.markdown("---")
 
-    st.info("Upload a pre-processed force vs. relative deformation file (CSV or Excel)")
+    # ========== SECTION 1: Cell Information ==========
+    st.markdown('<div class="section-header">Cell Information</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown("### Cell Information")
-
         cell_name = st.text_input(
             "Cell Name/ID *",
             placeholder="e.g., C2C12_001",
-            help="Required: Unique identifier for this cell"
-        )
-
-        date_acquired = st.date_input(
-            "Date Acquired *",
-            value=datetime.now().date(),
-            help="Date when the measurement was taken"
+            help="Unique identifier for this cell"
         )
 
     with col2:
-        st.markdown("### Analysis Metadata")
-
-        video_link = st.text_input(
-            "Google Drive Video Link (optional)",
-            placeholder="https://drive.google.com/file/d/...",
-            help="Link to compression video"
+        date_acquired = st.date_input(
+            "Date Acquired *",
+            value=datetime.now().date()
         )
 
-        spring_constant = st.number_input(
-            "Spring Constant (N/m) (optional)",
-            min_value=0.0,
-            max_value=100.0,
-            value=spring_constant_default,
-            step=0.001,
-            help="Spring constant for model (0 = not used)"
+    with col3:
+        cell_height = st.number_input(
+            "Cell Height (μm) *",
+            min_value=1.0,
+            max_value=50.0,
+            value=8.09,
+            step=0.1
         )
 
     st.markdown("---")
-    st.markdown("### Upload Force Curve File")
 
-    st.markdown("**Expected format:** CSV or Excel with columns for:")
-    st.markdown("- **Relative Deformation (ε)** - dimensionless compression")
-    st.markdown("- **Force (nN)** - force in nanonewtons")
+    # ========== SECTION 2: Upload Force Curve ==========
+    st.markdown('<div class="section-header">Upload Force vs Relative Deformation File</div>', unsafe_allow_html=True)
+
+    st.markdown("**Expected format:** CSV or Excel with columns:")
+    st.markdown("- **Relative Deformation (ε)** or similar")
+    st.markdown("- **Force (nN)** or similar")
 
     force_curve_file = st.file_uploader(
         "Select force curve file (.csv or .xlsx)",
@@ -199,166 +170,211 @@ with tabs[0]:
         key="force_curve_file"
     )
 
+    current_data = None
+    df_loaded = None
+    relative_def = None
+    force = None
+
     if force_curve_file is not None:
         try:
             # Load file
             if force_curve_file.name.endswith('.csv'):
-                df = pd.read_csv(force_curve_file)
+                df_loaded = pd.read_csv(force_curve_file)
             else:
-                df = pd.read_excel(force_curve_file)
+                df_loaded = pd.read_excel(force_curve_file)
 
-            st.success(f"✅ Loaded {len(df)} data points")
-            st.dataframe(df.head(10), use_container_width=True)
+            st.success(f"✅ Loaded {len(df_loaded)} data points")
 
             # Column selection
-            col_names = df.columns.tolist()
+            col_names = df_loaded.columns.tolist()
             col1, col2 = st.columns(2)
 
             with col1:
                 eps_col = st.selectbox(
                     "Relative Deformation Column",
                     col_names,
-                    help="Column containing ε values"
+                    help="Select the column containing ε values"
                 )
 
             with col2:
                 force_col = st.selectbox(
                     "Force Column",
                     col_names,
-                    help="Column containing force values (nN)"
+                    help="Select the column containing force values"
                 )
 
-            st.markdown("---")
+            # Extract data
+            relative_def = df_loaded[eps_col].values.astype(float)
+            force = df_loaded[force_col].values.astype(float)
 
-            if st.button("🚀 Analyze Force Curve", type="primary", use_container_width=True):
-                if not cell_name:
-                    st.error("❌ Cell Name is required")
-                else:
-                    with st.spinner("Analyzing..."):
-                        try:
-                            # Extract data
-                            relative_def = df[eps_col].values.astype(float)
-                            force = df[force_col].values.astype(float)
+            current_data = {
+                'relative_def': relative_def,
+                'force': force,
+                'cell_name': cell_name,
+                'date_acquired': str(date_acquired),
+                'cell_height': cell_height
+            }
 
-                            # Lulevich model fitting
-                            model = LulevichModel(force, relative_def)
-
-                            if fitting_mode == "Manual Range":
-                                fit_results_membrane = model.fit_membrane_elasticity(
-                                    epsilon_min=eps_min,
-                                    epsilon_max=eps_max
-                                )
-                                fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                    epsilon_min=eps_min,
-                                    epsilon_max=eps_max
-                                )
-                            else:
-                                auto_range = model.auto_detect_elastic_range()
-                                fit_results_membrane = model.fit_membrane_elasticity(
-                                    epsilon_min=auto_range['epsilon_min'],
-                                    epsilon_max=auto_range['epsilon_max']
-                                )
-                                fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                    epsilon_min=auto_range['epsilon_min'],
-                                    epsilon_max=auto_range['epsilon_max']
-                                )
-
-                            # Store results
-                            st.session_state.results = {
-                                'cell_name': cell_name,
-                                'date_acquired': str(date_acquired),
-                                'Em': fit_results_membrane['Em'],
-                                'Ei': fit_results_cyto['Ei'],
-                                'r2_membrane': fit_results_membrane.get('r2', 0),
-                                'r2_cyto': fit_results_cyto.get('r2', 0),
-                                'force': force,
-                                'relative_def': relative_def,
-                                'spring_constant': spring_constant,
-                                'video_link': video_link,
-                                'timestamp': datetime.now()
-                            }
-
-                            st.success("✅ Analysis Complete!")
-
-                            # Save to database
-                            if enable_database and gs_manager:
-                                cell_data = {
-                                    'cell_id': cell_name,
-                                    'date_analyzed': date_acquired.strftime("%Y-%m-%d"),
-                                    'cell_height': 'N/A',
-                                    'cantilever_constant': 'N/A',
-                                    'Em': round(fit_results_membrane['Em'], 4),
-                                    'Ei': round(fit_results_cyto['Ei'], 4),
-                                    'video_link': video_link,
-                                    'force_curve_created': 'Yes',
-                                    'fit_quality': round(fit_results_membrane.get('r2', 0), 4),
-                                    'notes': f'Spring constant: {spring_constant} N/m',
-                                    'analysis_status': 'Complete'
-                                }
-                                success, msg = gs_manager.append_cell_data(cell_data)
-                                st.info(msg)
-
-                            # Display results
-                            st.markdown("---")
-                            st.markdown("### Analysis Results")
-
-                            col1, col2 = st.columns(2)
-
-                            with col1:
-                                st.metric("Em (Membrane)", f"{fit_results_membrane['Em']:.2f} MPa")
-                                st.metric("R² (Membrane)", f"{fit_results_membrane.get('r2', 0):.4f}")
-
-                            with col2:
-                                st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei']:.2f} kPa")
-                                st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r2', 0):.4f}")
-
-                            # Force curve plot
-                            st.markdown("---")
-                            st.markdown("### Force vs Relative Deformation")
-
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=relative_def,
-                                y=force,
-                                mode='lines+markers',
-                                name='Measurement',
-                                line=dict(color='#1f77b4', width=2),
-                                marker=dict(size=5)
-                            ))
-                            fig.update_layout(
-                                title="Force vs Relative Deformation",
-                                xaxis_title="Relative Deformation (ε)",
-                                yaxis_title="Force (nN)",
-                                hovermode='x unified',
-                                height=500
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                        except Exception as e:
-                            st.error(f"❌ Analysis Error: {str(e)}")
+            st.session_state.current_data = current_data
 
         except Exception as e:
             st.error(f"❌ File Error: {str(e)}")
 
-# ==================== TAB 2: Generate Force Curve from Igor ====================
-with tabs[1]:
-    st.markdown("## Generate Force Curve from Igor Files")
+    st.markdown("---")
 
-    st.info("Create a force vs. relative deformation file from Igor binary data. Upload two files: one from the surface (baseline) and one from the cell (compression).")
+    # ========== SECTION 3: Metadata ==========
+    st.markdown('<div class="section-header">Metadata</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### File 1: Surface Reference")
+        video_link = st.text_input(
+            "Google Drive Video Link (optional)",
+            placeholder="https://drive.google.com/file/d/...",
+            help="Link to compression video"
+        )
+
+    with col2:
+        spring_constant = st.number_input(
+            "Spring Constant (N/m) (optional)",
+            min_value=0.0,
+            max_value=100.0,
+            value=spring_constant_default,
+            step=0.001,
+            help="Spring constant (0 = not used)"
+        )
+
+    st.markdown("---")
+
+    # ========== SECTION 4: Plot Preview ==========
+    if force_curve_file is not None and relative_def is not None and force is not None:
+        st.markdown('<div class="section-header">Plot Preview</div>', unsafe_allow_html=True)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=relative_def,
+            y=force,
+            mode='lines+markers',
+            name='Force Curve',
+            line=dict(color='#1f77b4', width=2),
+            marker=dict(size=6)
+        ))
+        fig.update_layout(
+            title="Force vs Relative Deformation",
+            xaxis_title="Relative Deformation (ε)",
+            yaxis_title="Force (nN)",
+            hovermode='x unified',
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+
+        # ========== SECTION 5: Analyze ==========
+        st.markdown('<div class="section-header">Analysis</div>', unsafe_allow_html=True)
+
+        if st.button("🚀 Analyze Force Curve", type="primary", use_container_width=True):
+            if not cell_name:
+                st.error("❌ Cell Name is required")
+            else:
+                with st.spinner("Analyzing..."):
+                    try:
+                        # Lulevich model fitting
+                        model = LulevichModel(force, relative_def)
+
+                        if fitting_mode == "Manual Range":
+                            fit_results_membrane = model.fit_membrane_elasticity(
+                                epsilon_min=eps_min,
+                                epsilon_max=eps_max
+                            )
+                            fit_results_cyto = model.fit_cytoskeleton_elasticity(
+                                epsilon_min=eps_min,
+                                epsilon_max=eps_max
+                            )
+                        else:
+                            auto_range = model.auto_detect_elastic_range()
+                            fit_results_membrane = model.fit_membrane_elasticity(
+                                epsilon_min=auto_range['epsilon_min'],
+                                epsilon_max=auto_range['epsilon_max']
+                            )
+                            fit_results_cyto = model.fit_cytoskeleton_elasticity(
+                                epsilon_min=auto_range['epsilon_min'],
+                                epsilon_max=auto_range['epsilon_max']
+                            )
+
+                        # Store results
+                        st.session_state.results = {
+                            'cell_name': cell_name,
+                            'date_acquired': str(date_acquired),
+                            'cell_height': cell_height,
+                            'Em': fit_results_membrane['Em'],
+                            'Ei': fit_results_cyto['Ei'],
+                            'r2_membrane': fit_results_membrane.get('r2', 0),
+                            'r2_cyto': fit_results_cyto.get('r2', 0),
+                            'force': force,
+                            'relative_def': relative_def,
+                            'spring_constant': spring_constant,
+                            'video_link': video_link,
+                            'timestamp': datetime.now()
+                        }
+
+                        st.success("✅ Analysis Complete!")
+
+                        # Save to database
+                        if enable_database and gs_manager:
+                            cell_data = {
+                                'cell_id': cell_name,
+                                'date_analyzed': date_acquired.strftime("%Y-%m-%d"),
+                                'cell_height': cell_height,
+                                'cantilever_constant': f"{spring_constant} N/m" if spring_constant > 0 else "N/A",
+                                'Em': round(fit_results_membrane['Em'], 4),
+                                'Ei': round(fit_results_cyto['Ei'], 4),
+                                'video_link': video_link,
+                                'force_curve_created': 'Yes',
+                                'fit_quality': round(fit_results_membrane.get('r2', 0), 4),
+                                'notes': 'Force curve analysis',
+                                'analysis_status': 'Complete'
+                            }
+                            success, msg = gs_manager.append_cell_data(cell_data)
+                            st.info(msg)
+
+                        # Display results
+                        st.markdown("---")
+                        st.markdown("### Results")
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.metric("Em (Membrane)", f"{fit_results_membrane['Em']:.2f} MPa")
+                            st.metric("R² (Membrane)", f"{fit_results_membrane.get('r2', 0):.4f}")
+
+                        with col2:
+                            st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei']:.2f} kPa")
+                            st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r2', 0):.4f}")
+
+                    except Exception as e:
+                        st.error(f"❌ Analysis Error: {str(e)}")
+
+    # ========== SECTION 6: Create Force Curve from Igor ==========
+    st.markdown("---")
+    st.markdown("---")
+    st.markdown('<div class="section-header">Create Force vs Relative Deformation from Igor Files</div>', unsafe_allow_html=True)
+
+    st.info("Upload two Igor files (surface reference + cell compression) to generate a force curve CSV file that you can upload above.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**File 1: Surface Reference**")
         igor_surface = st.file_uploader(
             "Select surface Igor file (.ibw)",
             type=['ibw'],
             key="igor_surface",
-            help="Surface/baseline measurement for reference"
+            help="Surface/baseline measurement"
         )
 
     with col2:
-        st.markdown("### File 2: Cell Compression")
+        st.markdown("**File 2: Cell Compression**")
         igor_cell = st.file_uploader(
             "Select cell Igor file (.ibw)",
             type=['ibw'],
@@ -382,8 +398,7 @@ with tabs[1]:
                     data_surface = result['data']
 
                     if data_surface is not None:
-                        st.success(f"✅ Loaded {len(data_surface)} points")
-                        st.write(f"Range: {data_surface.min():.2e} to {data_surface.max():.2e}")
+                        st.success(f"✅ {len(data_surface)} points")
                     else:
                         st.error("❌ Could not extract data")
                         data_surface = None
@@ -406,8 +421,7 @@ with tabs[1]:
                     data_cell = result['data']
 
                     if data_cell is not None:
-                        st.success(f"✅ Loaded {len(data_cell)} points")
-                        st.write(f"Range: {data_cell.min():.2e} to {data_cell.max():.2e}")
+                        st.success(f"✅ {len(data_cell)} points")
                     else:
                         st.error("❌ Could not extract data")
                         data_cell = None
@@ -419,7 +433,6 @@ with tabs[1]:
 
         if data_surface is not None and data_cell is not None:
             st.markdown("---")
-            st.markdown("### Generation Parameters")
 
             col1, col2 = st.columns(2)
 
@@ -434,46 +447,40 @@ with tabs[1]:
                 )
 
             with col2:
-                cell_height = st.number_input(
+                cell_height_igor = st.number_input(
                     "Cell Height (μm)",
                     min_value=1.0,
                     max_value=50.0,
-                    value=cell_height_default,
+                    value=8.09,
                     step=0.1
                 )
 
             st.markdown("---")
 
-            if st.button("⚙️ Generate Force Curve", type="primary", use_container_width=True):
+            if st.button("⚙️ Generate Force Curve from Igor", type="secondary", use_container_width=True):
                 with st.spinner("Generating..."):
                     try:
-                        # Use cell data for analysis
+                        # Baseline correction
                         baseline_corrector = BaselineCorrector(data_cell, np.arange(len(data_cell)))
                         baseline_info = baseline_corrector.auto_detect_baseline(method='flat')
                         deflection_corrected = baseline_corrector.correct_baseline()
 
                         # Calculate force
-                        force = deflection_corrected * cantilever_constant * 1e9  # Convert to pN
+                        force_generated = deflection_corrected * cantilever_constant * 1e9  # Convert to pN
 
                         # Estimate contact point
                         contact_idx = baseline_corrector.estimate_contact_point(deflection_corrected)
 
                         # Calculate relative deformation
                         z_position = np.arange(len(data_cell))
-                        relative_def = calculate_relative_deformation(z_position, contact_idx, cell_height)
-
-                        # Store generated curve
-                        st.session_state.generated_force_curve = {
-                            'relative_def': relative_def,
-                            'force': force
-                        }
+                        relative_def_generated = calculate_relative_deformation(z_position, contact_idx, cell_height_igor)
 
                         st.success("✅ Force Curve Generated!")
 
                         # Create download file
                         df_output = pd.DataFrame({
-                            'Relative Deformation': relative_def,
-                            'Force (nN)': force / 1e3  # Convert pN to nN
+                            'Relative Deformation': relative_def_generated,
+                            'Force (nN)': force_generated / 1e3  # Convert pN to nN
                         })
 
                         csv = df_output.to_csv(index=False)
@@ -481,11 +488,10 @@ with tabs[1]:
                         st.download_button(
                             label="📥 Download Force Curve (CSV)",
                             data=csv,
-                            file_name="force_curve.csv",
+                            file_name="force_curve_generated.csv",
                             mime="text/csv"
                         )
 
-                        # Preview
                         st.markdown("---")
                         st.markdown("### Generated Data Preview")
                         st.dataframe(df_output.head(20), use_container_width=True)
@@ -493,8 +499,8 @@ with tabs[1]:
                         # Plot
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(
-                            x=relative_def,
-                            y=force / 1e3,
+                            x=relative_def_generated,
+                            y=force_generated / 1e3,
                             mode='lines+markers',
                             name='Generated Force Curve'
                         ))
@@ -506,13 +512,13 @@ with tabs[1]:
                         )
                         st.plotly_chart(fig, use_container_width=True)
 
-                        st.info("💡 Download the CSV file and upload it to Tab 1 to analyze")
+                        st.info("💡 Download the CSV above and upload it in the 'Upload Force vs Relative Deformation File' section above")
 
                     except Exception as e:
                         st.error(f"❌ Generation Error: {str(e)}")
 
-# ==================== TAB 3: Database Browser ====================
-with tabs[2]:
+# ==================== TAB 2: Database Browser ====================
+with tabs[1]:
     st.markdown("## Database Browser")
 
     if gs_manager is None or not enable_database:
@@ -556,21 +562,22 @@ with tabs[2]:
             with col4:
                 st.metric("With Videos", stats.get('cells_with_video', 0))
 
-# ==================== TAB 4: Results ====================
-with tabs[3]:
+# ==================== TAB 3: Results ====================
+with tabs[2]:
     st.markdown("## Analysis Results")
 
     if st.session_state.results is None:
-        st.info("📊 No results yet. Complete an analysis in Tab 1.")
+        st.info("📊 No results yet. Complete an analysis above.")
     else:
         results = st.session_state.results
 
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### Cell & Acquisition")
+            st.markdown("### Cell Information")
             st.write(f"**Cell:** {results['cell_name']}")
             st.write(f"**Date:** {results['date_acquired']}")
+            st.write(f"**Height:** {results['cell_height']} μm")
 
         with col2:
             st.markdown("### Mechanical Properties")
@@ -595,8 +602,8 @@ with tabs[3]:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-# ==================== TAB 5: Export ====================
-with tabs[4]:
+# ==================== TAB 4: Export ====================
+with tabs[3]:
     st.markdown("## Export Data")
 
     if gs_manager is None or not enable_database:
@@ -627,4 +634,4 @@ with tabs[4]:
                     )
 
         st.markdown("---")
-        st.success("✅ Exports include all cells with complete metadata")
+        st.success("✅ All cells with complete metadata included")
