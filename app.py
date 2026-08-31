@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from lulevich_model import LulevichModel
+from lulevich_model import LulevichModel, compare_couplings
 from plot_utils import (
     FORCE_UNITS,
     INPUT_FORCE_UNITS,
@@ -127,7 +127,7 @@ def hint(text: str):
 
 DEFAULTS = {
     # display
-    "force_unit": "auto",
+    "force_unit": "N",
     "data_color": "#1f77b4",
     "fit_color": "#d62728",
     "marker_size": 6,
@@ -160,7 +160,10 @@ DEFAULTS = {
     "onset_mode": "Scan for best",
     "_scanned_onset": None,
     # fitting
-    "strategy": "Parallel (all at once)",
+    "coupling": "Parallel (forces add)",
+    "procedure": "All at once",
+    "crossover_mode": "Scan for best",
+    "crossover": 0.18,
     "use_membrane": True,
     "use_interior": True,
     "use_nucleus": False,
@@ -344,6 +347,31 @@ TERM_LABELS = {
     "nucleus": "nucleus (Eₙ)",
 }
 TERM_ORDER = ("membrane", "interior", "nucleus")
+
+# How the elements share the load. These are physics, not fitting procedure:
+# parallel and series here describe the spring network, while "All at once"
+# and "Stage by stage" describe how the fit is carried out.
+COUPLINGS = {
+    "Parallel (forces add)":
+        "Every element is squashed by the same amount; their forces add. The "
+        "stiffest element dominates.",
+    "Series (deformations add)":
+        "Every element carries the same force; their deformations add, a spring "
+        "stacked on a spring. The softest element dominates.",
+    "Hybrid: parallel below, series above":
+        "Parallel up to a crossover deformation, then the load path stacks.",
+    "Hybrid: series below, parallel above":
+        "Stacked at small deformation, sharing the squash once compressed.",
+    "Auto (let the data choose)":
+        "Fits all four and ranks them by AICc and cross-validation.",
+}
+COUPLING_KEYS = {
+    "Parallel (forces add)": "parallel",
+    "Series (deformations add)": "series",
+    "Hybrid: parallel below, series above": "hybrid_ps",
+    "Hybrid: series below, parallel above": "hybrid_sp",
+    "Auto (let the data choose)": "auto",
+}
 STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 
 # Starting points, not literature constants. They set the geometry, the
@@ -418,18 +446,6 @@ def stage_groups(terms):
     return [(stage, tuple(grouped[stage])) for stage in sorted(grouped)]
 
 
-def window_key(stage_no, terms):
-    """
-    Storage key for a stage's window.
-
-    Keyed by which terms the stage holds, not just its number, so moving a
-    term to a different stage gives that stage a sensible fresh default
-    instead of inheriting a window chosen for different physics. Going back
-    to an earlier arrangement restores the window you had for it.
-    """
-    return "window_s%d_%s" % (stage_no, "_".join(sorted(terms)))
-
-
 def default_window_for(terms, auto_window, lo, hi):
     """Starting window for a stage, from the cell type where one is defined."""
     spans = []
@@ -446,29 +462,12 @@ def default_window_for(terms, auto_window, lo, hi):
     return (lo_w, hi_w) if lo_w < hi_w else auto_window
 
 
-def apply_suggested_windows(model, terms, auto_window):
-    """Split the usable region at the crossover between the fitted terms."""
-    suggestion = model.suggest_sequential_windows()
-    mapping = {
-        "interior": suggestion["interior_range"],
-        "membrane": suggestion["membrane_range"],
-        "nucleus": (
-            float(min(suggestion["membrane_range"][0] + 0.05, auto_window[1])),
-            float(auto_window[1]),
-        ),
-    }
-    for stage_no, stage_terms in stage_groups(terms):
-        spans = [mapping[t] for t in stage_terms if t in mapping]
-        if spans:
-            st.session_state[window_key(stage_no, stage_terms)] = (
-                float(min(s[0] for s in spans)),
-                float(max(s[1] for s in spans)),
-            )
-
-
 def apply_preset(preset, lo, hi):
     """Restore a saved set of windows, terms and stage assignments."""
-    st.session_state["strategy"] = preset.get("strategy", st.session_state["strategy"])
+    if preset.get("coupling") in COUPLINGS:
+        st.session_state["coupling"] = preset["coupling"]
+    if preset.get("procedure") in ("All at once", "Stage by stage"):
+        st.session_state["procedure"] = preset["procedure"]
     if preset.get("cell_type") in CELL_TYPES:
         st.session_state["cell_type"] = preset["cell_type"]
     for term in TERM_ORDER:
@@ -478,22 +477,23 @@ def apply_preset(preset, lo, hi):
     if preset.get("nucleus_onset") is not None:
         st.session_state["nucleus_onset"] = float(preset["nucleus_onset"])
 
-    stages = preset.get("stages", [])
-    if st.session_state["strategy"] == "Series (stage by stage)":
-        for i, stage in enumerate(stages, start=1):
-            window = (
-                float(np.clip(stage["range"][0], lo, hi)),
-                float(np.clip(stage["range"][1], lo, hi)),
-            )
-            if window[0] < window[1]:
-                st.session_state[window_key(i, tuple(stage["terms"]))] = window
-    elif stages:
-        window = (
-            float(np.clip(stages[0]["range"][0], lo, hi)),
-            float(np.clip(stages[0]["range"][1], lo, hi)),
+    for term, window in (preset.get("term_windows") or {}).items():
+        clamped = (
+            float(np.clip(window[0], lo, hi)),
+            float(np.clip(window[1], lo, hi)),
         )
-        if window[0] < window[1]:
-            st.session_state["window_parallel"] = window
+        if clamped[0] < clamped[1]:
+            st.session_state[f"window_term_{term}"] = clamped
+    combined = preset.get("combined_window")
+    if combined:
+        clamped = (
+            float(np.clip(combined[0], lo, hi)),
+            float(np.clip(combined[1], lo, hi)),
+        )
+        if clamped[0] < clamped[1]:
+            st.session_state["window_combined"] = clamped
+    if preset.get("crossover") is not None:
+        st.session_state["crossover"] = float(preset["crossover"])
 
 
 def plot_selection_kwargs():
@@ -527,12 +527,9 @@ def apply_plot_drag(chart_key, lo, hi):
     if window[1] - window[0] < 1e-6:
         return
 
-    if target == "Fitting window":
-        key = "window_parallel"
-    else:
-        key = (st.session_state.get("_drag_keys") or {}).get(target)
-        if not key:
-            return
+    key = (st.session_state.get("_drag_keys") or {}).get(target)
+    if not key:
+        return
     if st.session_state.get(key) != window:
         st.session_state[key] = window
         st.rerun()
@@ -884,58 +881,7 @@ with tab_analysis:
                 f"{int((epsilon < 0).sum())} points have ε < 0 (pre-contact). They are "
                 "kept for the plot but excluded from any fit window starting at ε ≥ 0."
             )
-        # ---------------------------------------------------- fit window ---
-        section("3 · Model and fit windows")
-
-        term_col, strategy_col = st.columns([1, 1.25])
-        with term_col:
-            st.markdown("**Terms in the model**")
-            st.checkbox("Membrane · Eₘ ε³", key="use_membrane")
-            st.checkbox("Cytoskeleton · Ec ε³ᐟ²", key="use_interior")
-            st.checkbox("Nucleus · Eₙ ⟨ε−ε₀⟩³ᐟ²", key="use_nucleus")
-        with strategy_col:
-            st.markdown("**How to fit them**")
-            st.radio(
-                "Strategy",
-                ["Parallel (all at once)", "Series (stage by stage)"],
-                key="strategy",
-                label_visibility="collapsed",
-                help="Parallel solves for every modulus together on one window. "
-                "Series measures each group on its own window, which is the better "
-                "choice when the moduli come out correlated in parallel.",
-            )
-            if st.session_state["strategy"] == "Series (stage by stage)":
-                st.caption("Stage each term is fitted in. Same number = fitted together.")
-                stage_cols = st.columns(3)
-                slot = 0
-                for term in TERM_ORDER:
-                    if st.session_state.get(f"use_{term}"):
-                        with stage_cols[slot % 3]:
-                            st.selectbox(
-                                TERM_LABELS[term], [1, 2, 3], key=f"stage_of_{term}"
-                            )
-                        slot += 1
-                r1, r2 = st.columns([2, 1.4])
-                with r1:
-                    st.slider(
-                        "Refinement passes",
-                        1, 8,
-                        key="refine_iterations",
-                        help="Each pass refits every stage with the other terms "
-                        "subtracted at their current values. 3 is normally converged.",
-                    )
-                with r2:
-                    st.checkbox(
-                        "Seed from parallel",
-                        key="seed_parallel",
-                        help="Without a seed the first stage has nothing to subtract "
-                        "and absorbs the whole force, which pins the later stages at "
-                        "zero with no way back.",
-                    )
-            else:
-                st.caption(
-                    "All selected terms are solved together on a single window."
-                )
+        # ---------------------------------------------------- fit window ---        section("3 · Model and fit windows")
 
         model = build_model(epsilon, force_N)
         auto_range = model.auto_detect_elastic_range()
@@ -959,87 +905,192 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
-        active = active_terms()
-        series = st.session_state["strategy"] == "Series (stage by stage)"
+        term_col, model_col = st.columns([1, 1.4])
+        with term_col:
+            st.markdown("**Elements**")
+            st.checkbox("Membrane · Eₘ", key="use_membrane")
+            st.checkbox("Cytoskeleton · Ec", key="use_interior")
+            st.checkbox("Nucleus · Eₙ", key="use_nucleus")
+        with model_col:
+            st.markdown("**How the elements share the load**")
+            st.radio(
+                "Coupling",
+                list(COUPLINGS.keys()),
+                key="coupling",
+                label_visibility="collapsed",
+                help="Parallel: every element is squashed by the same amount and "
+                "their forces add, so the stiffest one dominates. Series: every "
+                "element carries the same force and their deformations add, a "
+                "spring stacked on a spring, so the softest one dominates. Hybrid "
+                "switches between the two at a crossover deformation. Auto fits "
+                "all of them and reports which the data supports.",
+            )
+            st.caption(COUPLINGS[st.session_state["coupling"]])
 
+        active = active_terms()
+        coupling = COUPLING_KEYS[st.session_state["coupling"]]
+
+        if coupling in ("hybrid_ps", "hybrid_sp"):
+            h1, h2 = st.columns([1, 2])
+            with h1:
+                st.radio(
+                    "Crossover ε",
+                    ["Scan for best", "Set manually"],
+                    key="crossover_mode",
+                    horizontal=True,
+                )
+            with h2:
+                st.slider(
+                    "ε at which the load path changes",
+                    0.0, 1.0, step=0.01, key="crossover",
+                    disabled=st.session_state["crossover_mode"] == "Scan for best",
+                )
+
+        # Stage-by-stage only makes sense for the parallel coupling: the series
+        # fit is a single exact linear solve over the whole window, so there is
+        # nothing for stages to buy, and the hybrid is one joint optimisation.
+        staged_available = coupling == "parallel"
+        if staged_available:
+            proc_col, stage_col = st.columns([1, 2])
+            with proc_col:
+                st.radio(
+                    "Fitting procedure",
+                    ["All at once", "Stage by stage"],
+                    key="procedure",
+                    help="All at once solves for every modulus together on the "
+                    "combined window. Stage by stage measures each group on its "
+                    "own window, which helps when the moduli come out correlated.",
+                )
+            staged = st.session_state["procedure"] == "Stage by stage"
+            if staged:
+                with stage_col:
+                    st.caption("Stage each element is fitted in. Same number = fitted together.")
+                    stage_cols = st.columns(3)
+                    slot = 0
+                    for term in TERM_ORDER:
+                        if st.session_state.get(f"use_{term}"):
+                            with stage_cols[slot % 3]:
+                                st.selectbox(
+                                    TERM_LABELS[term], [1, 2, 3], key=f"stage_of_{term}"
+                                )
+                            slot += 1
+                    r1, r2 = st.columns([2, 1.4])
+                    with r1:
+                        st.slider("Refinement passes", 1, 8, key="refine_iterations")
+                    with r2:
+                        st.checkbox("Seed from all-at-once", key="seed_parallel")
+        else:
+            staged = False
+            st.caption(
+                "Stage-by-stage fitting applies to parallel coupling. The series "
+                "fit is one exact solve over the whole window and the hybrid is a "
+                "single joint optimisation, so neither is split into stages."
+            )
+
+        # ------------------------------------------------------- windows ---
+        st.markdown("**Deformation windows**")
         st.caption(
-            f"Auto-detected usable region: ε ∈ [{auto_window[0]:.3f}, {auto_window[1]:.3f}] "
-            f"({auto_range['n_points']} points) · rupture: {auto_range['rupture_method']}"
+            f"Auto-detected usable region: ε ∈ [{auto_window[0]:.3f}, "
+            f"{auto_window[1]:.3f}] ({auto_range['n_points']} points) · "
+            f"rupture: {auto_range['rupture_method']}"
         )
 
-        # Windows are stored per stage and only ever clamped, never silently
-        # replaced, so a window you chose survives the next upload.
-        stage_plan = []
-        if series:
-            groups = stage_groups(active)
-            if not groups:
-                st.warning("Select at least one term in the sidebar.")
-            for stage_no, terms in groups:
-                key = window_key(stage_no, terms)
-                default = default_window_for(terms, auto_window, eps_lo_data, eps_hi_data)
-                st.session_state[key] = clamp_range(st.session_state.get(key), default)
-                label = " + ".join(TERM_LABELS[t] for t in terms)
+        # Every window is always on screen: the combined one, and one per
+        # element. Which of them the fit uses depends on the procedure, and the
+        # caption under each says so, but none of them is ever hidden.
+        st.session_state["window_combined"] = clamp_range(
+            st.session_state.get("window_combined"), auto_window
+        )
+        combined_lo, combined_hi = st.slider(
+            "Combined window (all elements together)",
+            min_value=eps_lo_data, max_value=eps_hi_data, step=step,
+            key="window_combined",
+        )
+        n_combined = int(((epsilon >= combined_lo) & (epsilon <= combined_hi)).sum())
+        st.caption(
+            f"{n_combined} points · "
+            + ("used for this fit" if not staged else "not used while fitting stage by stage")
+        )
+
+        term_windows = {}
+        window_cols = st.columns(max(1, len(active))) if active else [st]
+        for i, term in enumerate(active):
+            key = f"window_term_{term}"
+            st.session_state[key] = clamp_range(
+                st.session_state.get(key),
+                default_window_for((term,), auto_window, eps_lo_data, eps_hi_data),
+            )
+            with window_cols[i % len(window_cols)]:
                 lo, hi = st.slider(
-                    f"Stage {stage_no}: {label}",
-                    min_value=eps_lo_data,
-                    max_value=eps_hi_data,
-                    step=step,
+                    TERM_LABELS[term],
+                    min_value=eps_lo_data, max_value=eps_hi_data, step=step,
                     key=key,
                 )
-                n_in = int(((epsilon >= lo) & (epsilon <= hi)).sum())
-                st.caption(f"{n_in} points in this window")
-                stage_plan.append({"terms": terms, "range": (lo, hi)})
-            fit_lo = min((s["range"][0] for s in stage_plan), default=eps_lo_data)
-            fit_hi = max((s["range"][1] for s in stage_plan), default=eps_hi_data)
+                term_windows[term] = (lo, hi)
+                st.caption(f"{int(((epsilon >= lo) & (epsilon <= hi)).sum())} points")
+
+        # A stage's window is the span of the windows of the elements in it.
+        stage_plan = []
+        if staged:
+            for stage_no, terms in stage_groups(active):
+                spans = [term_windows[t] for t in terms if t in term_windows]
+                if not spans:
+                    continue
+                stage_plan.append(
+                    {
+                        "terms": terms,
+                        "range": (min(s[0] for s in spans), max(s[1] for s in spans)),
+                    }
+                )
+            fit_lo = min((s["range"][0] for s in stage_plan), default=combined_lo)
+            fit_hi = max((s["range"][1] for s in stage_plan), default=combined_hi)
+            st.caption(
+                "Stages: "
+                + " · ".join(
+                    " + ".join(TERM_LABELS[t] for t in s["terms"])
+                    + f" over {s['range'][0]:.3f} to {s['range'][1]:.3f}"
+                    for s in stage_plan
+                )
+            )
         else:
-            st.session_state["window_parallel"] = clamp_range(
-                st.session_state.get("window_parallel"), auto_window
-            )
-            fit_lo, fit_hi = st.slider(
-                "Fitting window in ε (all terms together)",
-                min_value=eps_lo_data,
-                max_value=eps_hi_data,
-                step=step,
-                key="window_parallel",
-            )
-            n_in = int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())
-            st.caption(f"{n_in} points in this window")
+            fit_lo, fit_hi = combined_lo, combined_hi
             stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
 
         w1, w2, w3 = st.columns(3)
         with w1:
-            if st.button("↺ Reset to auto-detected", **STRETCH):
-                for key in list(st.session_state.keys()):
-                    if key.startswith("window_"):
-                        del st.session_state[key]
+            if st.button("↺ Reset every window to auto", **STRETCH):
+                for key in [k for k in st.session_state if k.startswith("window_")]:
+                    del st.session_state[key]
                 st.rerun()
         with w2:
-            drag_targets = ["(off)"] + [
-                (f"Stage {n}: " + " + ".join(TERM_LABELS[t] for t in terms))
-                for n, terms in (stage_groups(active) if series else [])
-            ]
-            st.session_state["_drag_keys"] = {
-                (f"Stage {n}: " + " + ".join(TERM_LABELS[t] for t in terms)): window_key(n, terms)
-                for n, terms in (stage_groups(active) if series else [])
-            }
-            if not series:
-                drag_targets = ["(off)", "Fitting window"]
+            if st.button("↺ Suggested split per element", **STRETCH):
+                suggestion = model.suggest_sequential_windows()
+                mapping = {
+                    "interior": suggestion["interior_range"],
+                    "membrane": suggestion["membrane_range"],
+                    "nucleus": (
+                        float(min(suggestion["membrane_range"][0] + 0.05, auto_window[1])),
+                        float(auto_window[1]),
+                    ),
+                }
+                for term, window in mapping.items():
+                    st.session_state[f"window_term_{term}"] = clamp_range(
+                        window, auto_window
+                    )
+                st.rerun()
+        with w3:
+            targets = ["(off)", "Combined window"] + [TERM_LABELS[t] for t in active]
+            st.session_state["_drag_keys"] = {"Combined window": "window_combined"}
+            st.session_state["_drag_keys"].update(
+                {TERM_LABELS[t]: f"window_term_{t}" for t in active}
+            )
             st.selectbox(
                 "Drag on the plot to set",
-                drag_targets,
+                targets,
                 key="drag_target",
-                help="Pick a window, then box-select across the chart below to set "
-                "its ε limits from the drag.",
+                help="Pick a window, then box-select across the chart to set its "
+                "ε limits from the drag.",
             )
-        with w3:
-            st.caption(
-                "Suggested split"
-                if series
-                else "Everything is fitted on one window"
-            )
-            if series and st.button("↺ Suggested split", **STRETCH):
-                apply_suggested_windows(model, active, auto_window)
-                st.rerun()
 
         # ------------------------------------------------- saved presets ---
         with st.expander("💾 Saved windows", expanded=False):
@@ -1058,7 +1109,14 @@ with tab_analysis:
                         st.warning("Give the preset a name first.")
                     else:
                         st.session_state["range_presets"][name] = {
-                            "strategy": st.session_state["strategy"],
+                            "coupling": st.session_state["coupling"],
+                            "procedure": st.session_state["procedure"],
+                            "combined_window": [float(combined_lo), float(combined_hi)],
+                            "term_windows": {
+                                t: [float(w[0]), float(w[1])]
+                                for t, w in term_windows.items()
+                            },
+                            "crossover": float(st.session_state["crossover"]),
                             "cell_type": st.session_state["cell_type"],
                             "terms": list(active),
                             "stages": [
@@ -1093,7 +1151,7 @@ with tab_analysis:
                         [
                             {
                                 "preset": name,
-                                "strategy": pre.get("strategy", "?"),
+                                "coupling": pre.get("coupling", "?"),
                                 "cell type": pre.get("cell_type", "?"),
                                 "windows": " | ".join(
                                     " + ".join(TERM_LABELS.get(t, t) for t in st_["terms"])
@@ -1138,11 +1196,13 @@ with tab_analysis:
         # ----------------------------------------------------------- fit ---
         section("4 · Fit")
 
-        if "nucleus" in active and st.session_state["onset_mode"] == "Scan for best":
+        if (
+            "nucleus" in active
+            and coupling == "parallel"
+            and st.session_state["onset_mode"] == "Scan for best"
+        ):
             scan = model.scan_nucleus_onset(
-                fit_lo,
-                fit_hi,
-                terms=active,
+                fit_lo, fit_hi, terms=active,
                 weighting=st.session_state["weighting"],
                 fit_offset=st.session_state["fit_offset"],
             )
@@ -1171,10 +1231,49 @@ with tab_analysis:
         run = st.session_state["live_fit"] or st.button("🚀 Fit curve", type="primary")
 
         fit = None
-        if run:
-            if not active:
-                st.warning("Select at least one term in the sidebar.")
-            elif series and len(stage_plan) > 1:
+        comparison = None
+        if run and not active:
+            st.warning("Select at least one element above.")
+        elif run:
+            if coupling == "auto":
+                with st.spinner("Fitting every coupling and comparing…"):
+                    comparison = compare_couplings(
+                        model, fit_lo, fit_hi, terms=active
+                    )
+                if comparison.get("success"):
+                    winner = comparison["best"]["coupling"]
+                    fit = comparison["fits"][winner]
+                    st.session_state["_auto_choice"] = winner
+                else:
+                    st.error(comparison.get("error", "Could not compare couplings."))
+            elif coupling == "series":
+                fit = model.fit_series(
+                    fit_lo, fit_hi, terms=active,
+                    weighting=st.session_state["weighting"],
+                )
+            elif coupling in ("hybrid_ps", "hybrid_sp"):
+                order = (
+                    "parallel-then-series" if coupling == "hybrid_ps"
+                    else "series-then-parallel"
+                )
+                if st.session_state["crossover_mode"] == "Scan for best":
+                    scan_x = model.scan_crossover(fit_lo, fit_hi, terms=active, order=order)
+                    if scan_x.get("success"):
+                        fit = scan_x["best"]
+                        st.success(
+                            f"Best crossover ε = {scan_x['best_crossover']:.3f} "
+                            f"(R² = {fit['r_squared']:.4f})"
+                        )
+                    else:
+                        st.error(scan_x.get("error", "Hybrid scan failed."))
+                else:
+                    crossover = float(
+                        np.clip(st.session_state["crossover"], fit_lo + 1e-4, fit_hi - 1e-4)
+                    )
+                    fit = model.fit_hybrid(
+                        fit_lo, fit_hi, crossover, terms=active, order=order
+                    )
+            elif staged and len(stage_plan) > 1:
                 fit = model.fit_staged(
                     stage_plan,
                     weighting=st.session_state["weighting"],
@@ -1184,12 +1283,41 @@ with tab_analysis:
                 )
             else:
                 fit = model.fit(
-                    epsilon_min=fit_lo,
-                    epsilon_max=fit_hi,
-                    terms=active,
+                    epsilon_min=fit_lo, epsilon_max=fit_hi, terms=active,
                     fit_offset=st.session_state["fit_offset"],
                     weighting=st.session_state["weighting"],
                 )
+
+        if comparison and comparison.get("success"):
+            st.info(comparison["verdict"])
+            table = pd.DataFrame(
+                [
+                    {
+                        "coupling": row["label"],
+                        "R²": round(row["r_squared"], 5),
+                        "ΔAICc": round(row["delta_aicc"], 1),
+                        "weight": round(row["weight"], 3),
+                        "CV RMSE": f"{row['cv_rmse']:.3g}",
+                        "params": row["n_params"],
+                        "Eₘ (MPa)": (
+                            f"{row['Em_MPa']:.4g}" if row.get("Em_MPa") is not None else "—"
+                        ),
+                        "Ec (kPa)": (
+                            f"{row['Ei_kPa']:.4g}" if row.get("Ei_kPa") is not None else "—"
+                        ),
+                    }
+                    for row in comparison["candidates"]
+                ]
+            )
+            st.dataframe(table, hide_index=True, **STRETCH)
+            st.caption(
+                "ΔAICc is the penalty against the best model; a gap under 2 means "
+                "the curve cannot tell them apart. Weight is the relative "
+                "likelihood of each. CV RMSE is the error on points held out of "
+                "the fit, which is the criterion to trust when the two disagree. "
+                "Note that a wrong coupling can still reach R² > 0.99 with badly "
+                "wrong moduli, which is exactly why this table exists."
+            )
 
         if fit is None:
             st.info("Press **Fit curve**, or turn on live refitting in the sidebar.")
@@ -1197,12 +1325,48 @@ with tab_analysis:
             st.error(fit.get("error", "Fit failed."))
         else:
             En_value = fit.get("En", 0.0)
-            fitted = model.combined_model(
-                epsilon, fit["Em"], fit["Ei"], fit.get("force_offset", 0.0), En=En_value
-            )
-            membrane = model.balloon_model_cubic(epsilon, fit["Em"])
-            interior = model.hertzian_contact_model(epsilon, fit["Ei"])
-            nucleus = model.nucleus_model(epsilon, En_value) if En_value else None
+            fitted_coupling = fit.get("coupling", "parallel")
+            params = (fit.get("Em", 0.0), fit.get("Ei", 0.0), En_value)
+            params = tuple(0.0 if not np.isfinite(v) else v for v in params)
+
+            if fitted_coupling == "parallel":
+                fitted = model.combined_model(
+                    epsilon, params[0], params[1],
+                    fit.get("force_offset", 0.0), En=params[2],
+                )
+                # In parallel the elements share the deformation, so each one's
+                # force is a separate curve that adds up to the total.
+                membrane = model.balloon_model_cubic(epsilon, params[0])
+                interior = model.hertzian_contact_model(epsilon, params[1])
+                nucleus = model.nucleus_model(epsilon, params[2]) if params[2] else None
+            else:
+                base_coupling = "series" if fitted_coupling == "series" else "hybrid"
+                fitted = model.predict(
+                    epsilon, params, base_coupling,
+                    fit.get("crossover"),
+                    fit.get("order", "parallel-then-series"),
+                )
+                # In series every element carries the whole force, so there are
+                # no separate force curves to draw; what differs between them is
+                # how much of the deformation each one takes.
+                membrane = interior = nucleus = None
+
+            deformation_shares = None
+            if fitted_coupling in ("series", "hybrid"):
+                peak = float(np.nanmax(np.abs(force_N))) if force_N.size else 0.0
+                pieces = {}
+                if params[0] > 0:
+                    pieces["membrane"] = (peak / (model.Am * params[0])) ** (1.0 / 3.0)
+                if params[1] > 0:
+                    pieces["interior"] = (peak / (model.Ai * params[1])) ** (2.0 / 3.0)
+                if params[2] > 0:
+                    onset = fit.get("nucleus_force_onset", 0.0)
+                    pieces["nucleus"] = (
+                        max(peak - onset, 0.0) / (model.An * params[2])
+                    ) ** (2.0 / 3.0)
+                total = sum(pieces.values())
+                if total > 0:
+                    deformation_shares = {k: v / total for k, v in pieces.items()}
 
             windows_for_plot = [
                 {
@@ -1271,6 +1435,14 @@ with tab_analysis:
                 f"thickness doubles Eₘ while the measurement is unchanged."
             )
 
+            if fitted_coupling != "parallel" and st.session_state["show_components"]:
+                st.caption(
+                    "Element curves are not drawn for series or hybrid coupling: "
+                    "every element carries the same force there, so they would be "
+                    "three copies of the total. The deformation share each one "
+                    "takes is in the diagram beside the plot."
+                )
+
             for message in fit["warnings"]:
                 st.warning(message)
 
@@ -1338,6 +1510,12 @@ with tab_analysis:
                     st.plotly_chart(
                         cell_schematic(
                             style,
+                            coupling=(
+                                "series" if fitted_coupling == "series"
+                                else "hybrid" if fitted_coupling == "hybrid"
+                                else "parallel"
+                            ),
+                            shares=deformation_shares,
                             epsilon=selected_eps,
                             cell_height_um=st.session_state["cell_height_um"],
                             cell_radius_um=fit["R0"] * 1e6,
@@ -2129,17 +2307,19 @@ with tab_export:
             "Em_MPa_std": fit["Em_MPa_std"],
             "Ei_kPa": fit["Ei_kPa"],
             "Ei_kPa_std": fit["Ei_kPa_std"],
-            "force_offset_N": fit["force_offset"],
+            "coupling": fit.get("coupling", "parallel"),
+            "crossover": fit.get("crossover"),
+            "force_offset_N": fit.get("force_offset", 0.0),
             "r_squared": fit["r_squared"],
-            "adj_r_squared": fit["adj_r_squared"],
+            "adj_r_squared": fit.get("adj_r_squared", float("nan")),
             "rmse_N": fit["rmse"],
             "epsilon_min": fit["epsilon_range"][0],
             "epsilon_max": fit["epsilon_range"][1],
             "n_points": fit["n_points"],
             "weighting": fit["weighting"],
-            "fit_offset_enabled": fit["fit_offset"],
-            "condition_number": fit["condition_number"],
-            "membrane_fraction_at_max": fit["membrane_fraction_at_max"],
+            "fit_offset_enabled": fit.get("fit_offset", False),
+            "condition_number": fit.get("condition_number", float("nan")),
+            "membrane_fraction_at_max": fit.get("membrane_fraction_at_max", float("nan")),
             "warnings": fit["warnings"],
             "source": results["source"],
             "analysed_at": results["timestamp"].isoformat(),
