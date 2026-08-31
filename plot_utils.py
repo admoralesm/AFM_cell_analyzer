@@ -161,6 +161,7 @@ def force_curve_figure(
     fit_force_N=None,
     membrane_N=None,
     interior_N=None,
+    nucleus_N=None,
     fit_window=None,
     rupture_epsilon=None,
     highlight=None,
@@ -221,9 +222,10 @@ def force_curve_figure(
         if style.show_components:
             for comp, label, dash, color in (
                 (membrane_N, "Membrane term (ε³)", "dash", "#2ca02c"),
-                (interior_N, "Interior term (ε³ᐟ²)", "dot", "#9467bd"),
+                (interior_N, "Cytoskeleton term (ε³ᐟ²)", "dot", "#9467bd"),
+                (nucleus_N, "Nucleus term (⟨ε−ε₀⟩³ᐟ²)", "dashdot", "#e377c2"),
             ):
-                if comp is None:
+                if comp is None or not np.any(np.asarray(comp)):
                     continue
                 cy, _ = from_newtons(comp, style.force_unit)
                 cx = np.asarray(fit_epsilon if fit_epsilon is not None else epsilon, dtype=float)
@@ -370,4 +372,126 @@ def sensitivity_figure(trials, style: PlotStyle, title="Sensitivity to fit windo
     )
     _style_axes(fig, style, "Upper bound of fit window, ε_max", "Em (MPa)")
     fig.update_yaxes(mirror=False)
+    return fig
+
+
+# ------------------------------------------------------------- schematic
+
+
+def cell_schematic(
+    style: PlotStyle,
+    epsilon=0.0,
+    cell_height_um=8.0,
+    cell_radius_um=4.4,
+    nucleus_radius_um=1.5,
+    membrane_thickness_nm=4.0,
+    nucleus_onset=None,
+    Em_MPa=None,
+    Ei_kPa=None,
+    En_kPa=None,
+    show_nucleus=True,
+    height=None,
+):
+    """
+    A small side-on diagram of what is being modelled.
+
+    Draws the cantilever, the cell squashed to the current deformation, and
+    the parts the three terms describe. The cell is drawn to the real aspect
+    ratio implied by the geometry settings, so a wrong cell height or radius
+    is visible as a shape that does not look like the cell in the video.
+    Volume is held roughly constant as it flattens, which is why it widens.
+    """
+    epsilon = float(np.clip(epsilon, 0.0, 0.95))
+    h = cell_height_um * (1.0 - epsilon)
+    # Constant volume for an oblate shape: R grows as 1/sqrt(1 - eps).
+    r = cell_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3))
+    nucleus_engaged = nucleus_onset is not None and epsilon >= nucleus_onset
+
+    # Keep the drawing filling the panel: the axes are aspect-locked, so an
+    # over-wide x range shrinks the cell into the middle of a lot of white.
+    span = max(cell_radius_um * 1.7, r * 1.35)
+    fig = go.Figure()
+
+    # Substrate.
+    fig.add_shape(
+        type="rect", x0=-span, x1=span, y0=-cell_height_um * 0.16, y1=0,
+        fillcolor="#7f8c8d", line=dict(width=0), layer="below",
+    )
+    # Cantilever, resting on top of the cell.
+    fig.add_shape(
+        type="rect", x0=-span * 0.75, x1=span * 0.75, y0=h, y1=h + cell_height_um * 0.13,
+        fillcolor="#566573", line=dict(width=0),
+    )
+
+    # Cytoskeleton body.
+    fig.add_shape(
+        type="circle", x0=-r, x1=r, y0=0, y1=h,
+        fillcolor="rgba(214,234,248,0.95)",
+        line=dict(color="#1f77b4", width=max(3, membrane_thickness_nm * 0.9)),
+    )
+
+    if show_nucleus:
+        nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.8)
+        nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.8)
+        fig.add_shape(
+            type="circle",
+            x0=-nr, x1=nr,
+            y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
+            fillcolor="rgba(155,89,182,0.75)" if nucleus_engaged else "rgba(155,89,182,0.35)",
+            line=dict(color="#8e44ad", width=2),
+        )
+
+    # Height marker.
+    fig.add_annotation(
+        x=r * 1.28, y=h / 2, ax=r * 1.28, ay=h,
+        xref="x", yref="y", axref="x", ayref="y",
+        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#2c3e50",
+        text="",
+    )
+    fig.add_annotation(
+        x=r * 1.28, y=h / 2, ax=r * 1.28, ay=0,
+        xref="x", yref="y", axref="x", ayref="y",
+        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#2c3e50",
+        text="",
+    )
+    fig.add_annotation(
+        x=r * 1.34, y=h / 2, text=f"<b>{h:.1f} µm</b>", showarrow=False,
+        xanchor="left", font=dict(size=max(10, style.tick_size - 6), color="#2c3e50"),
+    )
+
+    labels = []
+    if Em_MPa is not None:
+        labels.append(f"<b>Membrane</b>  E<sub>m</sub> = {Em_MPa:.3g} MPa")
+    if Ei_kPa is not None:
+        labels.append(f"<b>Cytoskeleton</b>  E<sub>c</sub> = {Ei_kPa:.3g} kPa")
+    if show_nucleus and En_kPa is not None:
+        state = "engaged" if nucleus_engaged else "not engaged"
+        labels.append(f"<b>Nucleus</b>  E<sub>n</sub> = {En_kPa:.3g} kPa ({state})")
+    caption = f"ε = {epsilon:.3f}"
+    if labels:
+        caption += "<br>" + "<br>".join(labels)
+
+    fig.add_annotation(
+        x=0, y=-cell_height_um * 0.24, text=caption, showarrow=False,
+        xanchor="center", yanchor="top", align="center",
+        font=dict(size=max(10, style.tick_size - 7), color="#2c3e50"),
+    )
+
+    fig.update_xaxes(
+        visible=False, range=[-span, span * 1.45],
+        scaleanchor="y", scaleratio=1, fixedrange=True,
+    )
+    fig.update_yaxes(
+        visible=False,
+        range=[-cell_height_um * 0.80, cell_height_um * 1.10],
+        fixedrange=True,
+    )
+    fig.update_layout(
+        height=height or max(300, int(style.height * 0.66)),
+        margin=dict(l=6, r=6, t=28, b=6),
+        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+        title=dict(text="<b>What is being fitted</b>",
+                   font=dict(size=max(12, style.tick_size - 4), color="black"), x=0.5,
+                   xanchor="center"),
+    )
     return fig
