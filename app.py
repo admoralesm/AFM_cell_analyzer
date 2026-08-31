@@ -340,7 +340,7 @@ def build_model(epsilon, force_N) -> LulevichModel:
 
 TERM_LABELS = {
     "membrane": "membrane (Eₘ)",
-    "interior": "cytoskeleton (E_c)",
+    "interior": "cytoskeleton (Ec)",
     "nucleus": "nucleus (Eₙ)",
 }
 TERM_ORDER = ("membrane", "interior", "nucleus")
@@ -418,6 +418,18 @@ def stage_groups(terms):
     return [(stage, tuple(grouped[stage])) for stage in sorted(grouped)]
 
 
+def window_key(stage_no, terms):
+    """
+    Storage key for a stage's window.
+
+    Keyed by which terms the stage holds, not just its number, so moving a
+    term to a different stage gives that stage a sensible fresh default
+    instead of inheriting a window chosen for different physics. Going back
+    to an earlier arrangement restores the window you had for it.
+    """
+    return "window_s%d_%s" % (stage_no, "_".join(sorted(terms)))
+
+
 def default_window_for(terms, auto_window, lo, hi):
     """Starting window for a stage, from the cell type where one is defined."""
     spans = []
@@ -448,7 +460,7 @@ def apply_suggested_windows(model, terms, auto_window):
     for stage_no, stage_terms in stage_groups(terms):
         spans = [mapping[t] for t in stage_terms if t in mapping]
         if spans:
-            st.session_state[f"window_stage_{stage_no}"] = (
+            st.session_state[window_key(stage_no, stage_terms)] = (
                 float(min(s[0] for s in spans)),
                 float(max(s[1] for s in spans)),
             )
@@ -474,7 +486,7 @@ def apply_preset(preset, lo, hi):
                 float(np.clip(stage["range"][1], lo, hi)),
             )
             if window[0] < window[1]:
-                st.session_state[f"window_stage_{i}"] = window
+                st.session_state[window_key(i, tuple(stage["terms"]))] = window
     elif stages:
         window = (
             float(np.clip(stages[0]["range"][0], lo, hi)),
@@ -518,9 +530,8 @@ def apply_plot_drag(chart_key, lo, hi):
     if target == "Fitting window":
         key = "window_parallel"
     else:
-        try:
-            key = f"window_stage_{int(target.split(':')[0].split()[-1])}"
-        except (ValueError, IndexError):
+        key = (st.session_state.get("_drag_keys") or {}).get(target)
+        if not key:
             return
     if st.session_state.get(key) != window:
         st.session_state[key] = window
@@ -598,7 +609,7 @@ with st.sidebar:
             "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
         st.slider("Poisson ratio, membrane νₘ", 0.0, 0.5, step=0.01, key="poisson_membrane")
-        st.slider("Poisson ratio, cytoskeleton ν_c", 0.0, 0.5, step=0.01, key="poisson_interior")
+        st.slider("Poisson ratio, cytoskeleton νc", 0.0, 0.5, step=0.01, key="poisson_interior")
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
     with st.expander("🟣 Nucleus"):
@@ -636,45 +647,10 @@ with st.sidebar:
             )
 
     with st.expander("📈 Fitting", expanded=True):
-        st.markdown("**Terms in the model**")
-        st.checkbox("Membrane, Eₘ · ε³", key="use_membrane")
-        st.checkbox("Cytoskeleton, E_c · ε³ᐟ²", key="use_interior")
-        st.checkbox("Nucleus, Eₙ · ⟨ε−ε₀⟩³ᐟ²", key="use_nucleus")
-
-        st.radio(
-            "Strategy",
-            ["Parallel (all at once)", "Series (stage by stage)"],
-            key="strategy",
-            help="Parallel solves for every modulus together on one window. "
-            "Series measures each group on its own window, which is the better "
-            "choice when the moduli come out correlated in parallel.",
+        hint(
+            "Which terms to fit, parallel or series, and the ε windows are all set "
+            "in the main panel under **Model and fit windows**."
         )
-
-        if st.session_state["strategy"] == "Series (stage by stage)":
-            st.caption("Which stage fits which term (same number = fitted together)")
-            for term in TERM_ORDER:
-                if st.session_state.get(f"use_{term}"):
-                    st.selectbox(
-                        TERM_LABELS[term],
-                        [1, 2, 3],
-                        key=f"stage_of_{term}",
-                    )
-            st.slider(
-                "Refinement passes",
-                1,
-                8,
-                key="refine_iterations",
-                help="Each pass refits every stage with the other terms subtracted "
-                "at their current values. 3 is normally converged.",
-            )
-            st.checkbox(
-                "Seed from a parallel fit",
-                key="seed_parallel",
-                help="Without a seed the first stage has nothing to subtract and "
-                "absorbs the whole force, which pins the later stages at zero with "
-                "no way back. Leave on unless you want to see that behaviour.",
-            )
-
         st.selectbox(
             "Weighting",
             ["uniform", "relative"],
@@ -909,7 +885,58 @@ with tab_analysis:
                 "kept for the plot but excluded from any fit window starting at ε ≥ 0."
             )
         # ---------------------------------------------------- fit window ---
-        section("3 · Fit windows")
+        section("3 · Model and fit windows")
+
+        term_col, strategy_col = st.columns([1, 1.25])
+        with term_col:
+            st.markdown("**Terms in the model**")
+            st.checkbox("Membrane · Eₘ ε³", key="use_membrane")
+            st.checkbox("Cytoskeleton · Ec ε³ᐟ²", key="use_interior")
+            st.checkbox("Nucleus · Eₙ ⟨ε−ε₀⟩³ᐟ²", key="use_nucleus")
+        with strategy_col:
+            st.markdown("**How to fit them**")
+            st.radio(
+                "Strategy",
+                ["Parallel (all at once)", "Series (stage by stage)"],
+                key="strategy",
+                label_visibility="collapsed",
+                help="Parallel solves for every modulus together on one window. "
+                "Series measures each group on its own window, which is the better "
+                "choice when the moduli come out correlated in parallel.",
+            )
+            if st.session_state["strategy"] == "Series (stage by stage)":
+                st.caption("Stage each term is fitted in. Same number = fitted together.")
+                stage_cols = st.columns(3)
+                slot = 0
+                for term in TERM_ORDER:
+                    if st.session_state.get(f"use_{term}"):
+                        with stage_cols[slot % 3]:
+                            st.selectbox(
+                                TERM_LABELS[term], [1, 2, 3], key=f"stage_of_{term}"
+                            )
+                        slot += 1
+                r1, r2 = st.columns([2, 1.4])
+                with r1:
+                    st.slider(
+                        "Refinement passes",
+                        1, 8,
+                        key="refine_iterations",
+                        help="Each pass refits every stage with the other terms "
+                        "subtracted at their current values. 3 is normally converged.",
+                    )
+                with r2:
+                    st.checkbox(
+                        "Seed from parallel",
+                        key="seed_parallel",
+                        help="Without a seed the first stage has nothing to subtract "
+                        "and absorbs the whole force, which pins the later stages at "
+                        "zero with no way back.",
+                    )
+            else:
+                st.caption(
+                    "All selected terms are solved together on a single window."
+                )
+
         model = build_model(epsilon, force_N)
         auto_range = model.auto_detect_elastic_range()
         rupture = model.results.get("rupture", {})
@@ -948,7 +975,7 @@ with tab_analysis:
             if not groups:
                 st.warning("Select at least one term in the sidebar.")
             for stage_no, terms in groups:
-                key = f"window_stage_{stage_no}"
+                key = window_key(stage_no, terms)
                 default = default_window_for(terms, auto_window, eps_lo_data, eps_hi_data)
                 st.session_state[key] = clamp_range(st.session_state.get(key), default)
                 label = " + ".join(TERM_LABELS[t] for t in terms)
@@ -991,6 +1018,10 @@ with tab_analysis:
                 (f"Stage {n}: " + " + ".join(TERM_LABELS[t] for t in terms))
                 for n, terms in (stage_groups(active) if series else [])
             ]
+            st.session_state["_drag_keys"] = {
+                (f"Stage {n}: " + " + ".join(TERM_LABELS[t] for t in terms)): window_key(n, terms)
+                for n, terms in (stage_groups(active) if series else [])
+            }
             if not series:
                 drag_targets = ["(off)", "Fitting window"]
             st.selectbox(
@@ -1211,7 +1242,7 @@ with tab_analysis:
                 delta_color="off",
             )
             metric_cols[1].metric(
-                "E_c cytoskeleton",
+                "Ec cytoskeleton",
                 f"{fit['Ei_kPa']:.3g} kPa",
                 delta=f"± {fit['Ei_kPa_std']:.2g}"
                 if np.isfinite(fit.get("Ei_kPa_std", np.nan))
@@ -1463,7 +1494,7 @@ with tab_analysis:
                         else "n/a",
                     )
                     s2.metric(
-                        "E_c spread",
+                        "Ec spread",
                         f"{100 * sens['Ei_relative_spread']:.1f} %"
                         if np.isfinite(sens["Ei_relative_spread"])
                         else "n/a",
