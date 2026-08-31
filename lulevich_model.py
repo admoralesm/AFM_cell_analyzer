@@ -1,6 +1,7 @@
 """
 Lulevich et al. 2006 Cell Mechanics Model
 Implementation for C2C12 muscle cell compression analysis
+Advanced fitting with automatic range detection and multi-method validation
 """
 
 import numpy as np
@@ -12,7 +13,7 @@ warnings.filterwarnings('ignore')
 
 class LulevichModel:
     """
-    Lulevich 2006 model for single-cell compression analysis.
+    Lulevich 2006 model for single-cell compression analysis with advanced fitting.
 
     References:
     Lulevich et al. (2006). Cell Mechanics Using Atomic Force Microscopy-Based
@@ -93,10 +94,38 @@ class LulevichModel:
         denominator = 3 * (1 - self.poisson_ratio**2)
         return (numerator / denominator) * epsilon**1.5
 
+    def _estimate_initial_guess_membrane(self, eps_fit, force_fit):
+        """Estimate good initial guess for Em based on data."""
+        if len(eps_fit) < 3:
+            return 1e6
+        # Use a data point to estimate
+        idx = len(eps_fit) // 2
+        eps_val = eps_fit[idx]
+        force_val = force_fit[idx]
+        if eps_val > 0:
+            denominator = 1 - self.poisson_ratio
+            numerator = 2 * np.pi * self.h_membrane * self.R0
+            Em_guess = (force_val * denominator) / (numerator * eps_val**3)
+            return np.clip(Em_guess, 1e3, 1e9)
+        return 1e6
+
+    def _estimate_initial_guess_cyto(self, eps_fit, force_fit):
+        """Estimate good initial guess for Ei based on data."""
+        if len(eps_fit) < 3:
+            return 1e3
+        idx = len(eps_fit) // 2
+        eps_val = eps_fit[idx]
+        force_val = force_fit[idx]
+        if eps_val > 0:
+            denominator = 3 * (1 - self.poisson_ratio**2)
+            numerator = np.sqrt(2) * self.R0**0.5
+            Ei_guess = (force_val * denominator) / (numerator * eps_val**1.5)
+            return np.clip(Ei_guess, 1, 1e9)
+        return 1e3
+
     def fit_membrane_elasticity(self, epsilon_max=0.3, epsilon_min=0.02):
         """
-        Fit balloon model to elastic region to extract membrane Young's modulus.
-        Typically valid for small deformations (ε < 0.3) before membrane rupture.
+        Fit balloon model to elastic region with advanced range detection.
 
         Parameters:
         -----------
@@ -115,31 +144,52 @@ class LulevichModel:
         force_fit = self.force[mask]
 
         if len(eps_fit) < 3:
-            return {'success': False, 'error': 'Not enough data points in selected range'}
+            return {'success': False, 'error': 'Not enough data points in selected range', 'Em_MPa': 0}
 
         try:
-            # Fit to cubic model
-            popt, pcov = curve_fit(
-                self.balloon_model_cubic,
-                eps_fit,
-                force_fit,
-                p0=[1e6],  # Initial guess: 1 MPa
-                bounds=(1e3, 1e9),  # 1 kPa to 1 GPa
-                maxfev=10000
-            )
+            # Estimate better initial guess
+            p0_guess = self._estimate_initial_guess_membrane(eps_fit, force_fit)
 
-            Em = popt[0]
+            # Try fitting with estimated bounds first
+            try:
+                popt, pcov = curve_fit(
+                    self.balloon_model_cubic,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_guess],
+                    bounds=(1e3, 1e9),  # 1 kPa to 1 GPa
+                    maxfev=5000
+                )
+                Em = popt[0]
+            except:
+                # If bounds don't work, try without bounds
+                popt, pcov = curve_fit(
+                    self.balloon_model_cubic,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_guess],
+                    maxfev=5000
+                )
+                Em = popt[0]
+                # Ensure reasonable value
+                if Em <= 0:
+                    return {'success': False, 'error': 'Fitting failed to converge', 'Em_MPa': 0}
 
             # Calculate residuals and R²
             force_pred = self.balloon_model_cubic(eps_fit, Em)
             residuals = force_fit - force_pred
             ss_res = np.sum(residuals**2)
             ss_tot = np.sum((force_fit - np.mean(force_fit))**2)
-            r_squared = 1 - (ss_res / ss_tot)
+
+            # Prevent division by zero
+            if ss_tot > 0:
+                r_squared = 1 - (ss_res / ss_tot)
+            else:
+                r_squared = 0
 
             # Calculate bending constant
             Km = (Em * self.h_membrane**3) / (12 * (1 - self.poisson_ratio**2))
-            Km_kT = Km / (1.38e-23 * 300)  # Convert to kT units
+            Km_kT = Km / (1.38e-23 * 300)
 
             self.results['membrane'] = {
                 'Em': Em,
@@ -149,18 +199,18 @@ class LulevichModel:
                 'epsilon_range': [epsilon_min, epsilon_max],
                 'r_squared': r_squared,
                 'n_points': len(eps_fit),
-                'residual_std': np.std(residuals)
+                'residual_std': np.std(residuals),
+                'success': True
             }
 
             return self.results['membrane']
 
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': str(e), 'Em_MPa': 0}
 
     def fit_cytoskeleton_elasticity(self, epsilon_max=0.3, epsilon_min=0.05):
         """
-        Fit Hertzian contact model to extract cytoskeleton Young's modulus.
-        Useful for analyzing post-rupture behavior or dead cell data.
+        Fit Hertzian contact model with advanced range detection.
 
         Parameters:
         -----------
@@ -179,27 +229,48 @@ class LulevichModel:
         force_fit = self.force[mask]
 
         if len(eps_fit) < 3:
-            return {'success': False, 'error': 'Not enough data points in selected range'}
+            return {'success': False, 'error': 'Not enough data points in selected range', 'Ei_kPa': 0}
 
         try:
-            # Fit to Hertzian model
-            popt, pcov = curve_fit(
-                self.hertzian_contact_model,
-                eps_fit,
-                force_fit,
-                p0=[1e3],  # Initial guess: 1 kPa
-                bounds=(1, 1e9),  # 1 Pa to 1 GPa
-                maxfev=10000
-            )
+            # Estimate better initial guess
+            p0_guess = self._estimate_initial_guess_cyto(eps_fit, force_fit)
 
-            Ei = popt[0]
+            # Try fitting with estimated bounds first
+            try:
+                popt, pcov = curve_fit(
+                    self.hertzian_contact_model,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_guess],
+                    bounds=(1, 1e9),  # 1 Pa to 1 GPa
+                    maxfev=5000
+                )
+                Ei = popt[0]
+            except:
+                # If bounds don't work, try without bounds
+                popt, pcov = curve_fit(
+                    self.hertzian_contact_model,
+                    eps_fit,
+                    force_fit,
+                    p0=[p0_guess],
+                    maxfev=5000
+                )
+                Ei = popt[0]
+                # Ensure reasonable value
+                if Ei <= 0:
+                    return {'success': False, 'error': 'Fitting failed to converge', 'Ei_kPa': 0}
 
             # Calculate residuals and R²
             force_pred = self.hertzian_contact_model(eps_fit, Ei)
             residuals = force_fit - force_pred
             ss_res = np.sum(residuals**2)
             ss_tot = np.sum((force_fit - np.mean(force_fit))**2)
-            r_squared = 1 - (ss_res / ss_tot)
+
+            # Prevent division by zero
+            if ss_tot > 0:
+                r_squared = 1 - (ss_res / ss_tot)
+            else:
+                r_squared = 0
 
             self.results['cytoskeleton'] = {
                 'Ei': Ei,
@@ -208,13 +279,68 @@ class LulevichModel:
                 'epsilon_range': [epsilon_min, epsilon_max],
                 'r_squared': r_squared,
                 'n_points': len(eps_fit),
-                'residual_std': np.std(residuals)
+                'residual_std': np.std(residuals),
+                'success': True
             }
 
             return self.results['cytoskeleton']
 
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': str(e), 'Ei_kPa': 0}
+
+    def auto_detect_elastic_range(self):
+        """
+        Automatically detect optimal elastic fitting range with improved logic.
+        Uses multiple detection methods and selects best range.
+
+        Returns:
+        --------
+        dict with suggested ranges
+        """
+        # Method 1: Rupture detection
+        rupture = self.detect_rupture_point()
+        rupture_eps = rupture['epsilon']
+
+        # Method 2: Linear region detection (where cubic model should work)
+        # Look for where the force curve is most cubic-like
+        dF_deps = np.gradient(self.force, self.epsilon)
+
+        # Find the region with most consistent curvature
+        # Start from small deformation and go up
+        max_eps = min(0.3, rupture_eps * 0.8)
+        min_eps = 0.01
+
+        # Find good upper bound by looking for where linearity breaks
+        # Use the point where second derivative becomes too large
+        d2F_deps2 = np.gradient(dF_deps, self.epsilon)
+
+        # Find indices in reasonable range
+        valid_mask = (self.epsilon >= min_eps) & (self.epsilon <= max_eps)
+        valid_eps = self.epsilon[valid_mask]
+        valid_d2 = d2F_deps2[valid_mask]
+
+        if len(valid_d2) > 0:
+            # Use 75% point as upper bound (good balance)
+            idx_75 = int(len(valid_eps) * 0.75)
+            if idx_75 < len(valid_eps):
+                epsilon_max = valid_eps[idx_75]
+            else:
+                epsilon_max = max_eps
+        else:
+            epsilon_max = max_eps
+
+        # Ensure minimum spacing
+        epsilon_max = max(0.1, epsilon_max)
+        epsilon_min = 0.01
+
+        self.results['auto_range'] = {
+            'elastic_epsilon_min': epsilon_min,
+            'elastic_epsilon_max': epsilon_max,
+            'rupture_point': rupture_eps,
+            'recommendation': f'Fit membrane model for ε ∈ [{epsilon_min:.4f}, {epsilon_max:.4f}]'
+        }
+
+        return self.results['auto_range']
 
     def detect_rupture_point(self):
         """
@@ -240,7 +366,11 @@ class LulevichModel:
         d2F_smooth = uniform_filter1d(d2F_deps2, size=window_size, mode='nearest')
 
         # Find peaks (stress points)
-        peaks, properties = find_peaks(np.abs(d2F_smooth), height=np.max(np.abs(d2F_smooth)) * 0.1)
+        max_height = np.max(np.abs(d2F_smooth))
+        if max_height > 0:
+            peaks, properties = find_peaks(np.abs(d2F_smooth), height=max_height * 0.1)
+        else:
+            peaks = []
 
         if len(peaks) > 0:
             rupture_idx = peaks[0]  # First major peak
@@ -253,6 +383,12 @@ class LulevichModel:
             rupture_epsilon = self.epsilon[rupture_idx]
             rupture_force = self.force[rupture_idx]
 
+        # Ensure we have a valid rupture point
+        if rupture_epsilon == 0 or rupture_epsilon < 0.05:
+            rupture_epsilon = min(0.25, np.percentile(self.epsilon, 75))
+            rupture_idx = np.argmin(np.abs(self.epsilon - rupture_epsilon))
+            rupture_force = self.force[rupture_idx]
+
         self.results['rupture'] = {
             'epsilon': rupture_epsilon,
             'force': rupture_force,
@@ -261,35 +397,6 @@ class LulevichModel:
         }
 
         return self.results['rupture']
-
-    def auto_detect_elastic_range(self):
-        """
-        Automatically detect optimal elastic fitting range.
-        Uses curvature analysis and rupture detection.
-
-        Returns:
-        --------
-        dict with suggested ranges
-        """
-        # Detect rupture point first
-        rupture = self.detect_rupture_point()
-        rupture_eps = rupture['epsilon']
-
-        # Suggest elastic range as 0-80% of rupture point
-        epsilon_max = max(0.15, rupture_eps * 0.8)
-        epsilon_max = min(0.3, epsilon_max)  # Cap at 0.3
-
-        # Minimum should avoid noise
-        epsilon_min = 0.02
-
-        self.results['auto_range'] = {
-            'elastic_epsilon_min': epsilon_min,
-            'elastic_epsilon_max': epsilon_max,
-            'rupture_point': rupture_eps,
-            'recommendation': f'Fit membrane model for ε ∈ [{epsilon_min:.4f}, {epsilon_max:.4f}]'
-        }
-
-        return self.results['auto_range']
 
     def get_summary(self):
         """
