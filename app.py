@@ -398,22 +398,22 @@ with tabs[0]:
 
                         if fitting_mode == "Manual Range":
                             fit_results_membrane = model.fit_membrane_elasticity(
-                                epsilon_min=eps_min,
-                                epsilon_max=eps_max
+                                epsilon_max=eps_max,
+                                epsilon_min=eps_min
                             )
                             fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                epsilon_min=eps_min,
-                                epsilon_max=eps_max
+                                epsilon_max=eps_max,
+                                epsilon_min=eps_min
                             )
                         else:
                             auto_range = model.auto_detect_elastic_range()
                             fit_results_membrane = model.fit_membrane_elasticity(
-                                epsilon_min=auto_range['elastic_epsilon_min'],
-                                epsilon_max=auto_range['elastic_epsilon_max']
+                                epsilon_max=auto_range['elastic_epsilon_max'],
+                                epsilon_min=auto_range['elastic_epsilon_min']
                             )
                             fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                epsilon_min=auto_range['elastic_epsilon_min'],
-                                epsilon_max=auto_range['elastic_epsilon_max']
+                                epsilon_max=auto_range['elastic_epsilon_max'],
+                                epsilon_min=auto_range['elastic_epsilon_min']
                             )
 
                         # Store results
@@ -421,10 +421,10 @@ with tabs[0]:
                             'cell_name': cell_name,
                             'date_acquired': str(date_acquired),
                             'cell_height': cell_height,
-                            'Em': fit_results_membrane['Em'],
-                            'Ei': fit_results_cyto['Ei'],
-                            'r2_membrane': fit_results_membrane.get('r2', 0),
-                            'r2_cyto': fit_results_cyto.get('r2', 0),
+                            'Em': fit_results_membrane['Em_MPa'],
+                            'Ei': fit_results_cyto['Ei_kPa'],
+                            'r2_membrane': fit_results_membrane.get('r_squared', 0),
+                            'r2_cyto': fit_results_cyto.get('r_squared', 0),
                             'force': force,
                             'relative_def': relative_def,
                             'spring_constant': spring_constant,
@@ -441,11 +441,11 @@ with tabs[0]:
                                 'date_analyzed': date_acquired.strftime("%Y-%m-%d"),
                                 'cell_height': cell_height,
                                 'cantilever_constant': f"{spring_constant} N/m" if spring_constant > 0 else "N/A",
-                                'Em': round(fit_results_membrane['Em'], 4),
-                                'Ei': round(fit_results_cyto['Ei'], 4),
+                                'Em': round(fit_results_membrane['Em_MPa'], 4),
+                                'Ei': round(fit_results_cyto['Ei_kPa'], 4),
                                 'video_link': video_link,
                                 'force_curve_created': 'Yes',
-                                'fit_quality': round(fit_results_membrane.get('r2', 0), 4),
+                                'fit_quality': round(fit_results_membrane.get('r_squared', 0), 4),
                                 'notes': 'Force curve analysis',
                                 'analysis_status': 'Complete'
                             }
@@ -459,12 +459,12 @@ with tabs[0]:
                         col1, col2 = st.columns(2)
 
                         with col1:
-                            st.metric("Em (Membrane)", f"{fit_results_membrane['Em']:.2f} MPa")
-                            st.metric("R² (Membrane)", f"{fit_results_membrane.get('r2', 0):.4f}")
+                            st.metric("Em (Membrane)", f"{fit_results_membrane['Em_MPa']:.2f} MPa")
+                            st.metric("R² (Membrane)", f"{fit_results_membrane.get('r_squared', 0):.4f}")
 
                         with col2:
-                            st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei']:.2f} kPa")
-                            st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r2', 0):.4f}")
+                            st.metric("Ei (Cytoskeleton)", f"{fit_results_cyto['Ei_kPa']:.2f} kPa")
+                            st.metric("R² (Cytoskeleton)", f"{fit_results_cyto.get('r_squared', 0):.4f}")
 
                         # Plot with unit selector and customization
                         st.markdown("---")
