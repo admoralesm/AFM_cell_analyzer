@@ -341,7 +341,8 @@ with tabs[0]:
         with col1:
             force_unit_preview = st.selectbox(
                 "Force Unit",
-                ["pN", "nN", "μN", "N"],
+                ["μN", "pN", "nN", "N"],
+                index=0,
                 label_visibility="collapsed",
                 key="force_unit_preview"
             )
@@ -376,7 +377,7 @@ with tabs[0]:
             line_color=line_color_preview,
             line_width=line_width_preview
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="preview_plot")
 
         st.markdown("---")
 
@@ -468,7 +469,8 @@ with tabs[0]:
                         with col2:
                             force_unit_results = st.selectbox(
                                 "Force Unit",
-                                ["pN", "nN", "μN", "N"],
+                                ["μN", "pN", "nN", "N"],
+                                index=0,
                                 label_visibility="collapsed",
                                 key="force_unit_results"
                             )
@@ -502,7 +504,7 @@ with tabs[0]:
                             line_color=line_color_results,
                             line_width=line_width_results
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="analysis_results_plot")
 
                     except Exception as e:
                         st.error(f"❌ Analysis Error: {str(e)}")
@@ -655,7 +657,8 @@ with tabs[0]:
                         with col2:
                             force_unit_generated = st.selectbox(
                                 "Force Unit",
-                                ["pN", "nN", "μN", "N"],
+                                ["μN", "pN", "nN", "N"],
+                                index=0,
                                 label_visibility="collapsed",
                                 key="force_unit_generated"
                             )
@@ -689,7 +692,7 @@ with tabs[0]:
                             line_color=line_color_generated,
                             line_width=line_width_generated
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="igor_generated_plot")
 
                         st.info("💡 Download the CSV above and upload it in the 'Upload Force vs Relative Deformation File' section above")
 
@@ -772,7 +775,8 @@ with tabs[2]:
         with col2:
             force_unit_tab3 = st.selectbox(
                 "Force Unit",
-                ["pN", "nN", "μN", "N"],
+                ["μN", "pN", "nN", "N"],
+                index=0,
                 label_visibility="collapsed",
                 key="force_unit_tab3"
             )
@@ -806,7 +810,7 @@ with tabs[2]:
             line_color=line_color_tab3,
             line_width=line_width_tab3
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="tab3_results_plot")
 
 # ==================== TAB 4: Export ====================
 with tabs[3]:
