@@ -202,6 +202,16 @@ DEFAULTS = {
     "db_enabled": False,
 }
 
+# Streamlit refuses a write to a widget's key once that widget has been built
+# this run. Buttons further down the page therefore stage their changes here
+# and rerun, and this block applies them before anything is drawn.
+if st.session_state.pop("_pending_clear_windows", False):
+    for _stale in [k for k in st.session_state if k.startswith("window_")]:
+        del st.session_state[_stale]
+
+for _key, _value in (st.session_state.pop("_pending_settings", None) or {}).items():
+    st.session_state[_key] = _value
+
 if st.session_state.pop("_reset_requested", False):
     # Widget-backed keys can only be reassigned before their widget is built,
     # so the reset button sets a flag and the actual reset happens here.
@@ -463,37 +473,43 @@ def default_window_for(terms, auto_window, lo, hi):
 
 
 def apply_preset(preset, lo, hi):
-    """Restore a saved set of windows, terms and stage assignments."""
+    """
+    Stage a saved set of windows and settings.
+
+    Everything is staged rather than written directly: this runs from a button
+    below the widgets it changes, and Streamlit rejects a write to a widget key
+    after that widget exists. The caller reruns and the staged values are
+    applied at the top of the next run.
+    """
+    pending = {}
     if preset.get("coupling") in COUPLINGS:
-        st.session_state["coupling"] = preset["coupling"]
+        pending["coupling"] = preset["coupling"]
     if preset.get("procedure") in ("All at once", "Stage by stage"):
-        st.session_state["procedure"] = preset["procedure"]
-    if preset.get("cell_type") in CELL_TYPES:
-        st.session_state["cell_type"] = preset["cell_type"]
+        pending["procedure"] = preset["procedure"]
     for term in TERM_ORDER:
-        st.session_state[f"use_{term}"] = term in preset.get("terms", [])
+        pending[f"use_{term}"] = term in preset.get("terms", [])
     for term, stage in (preset.get("stage_of") or {}).items():
-        st.session_state[f"stage_of_{term}"] = int(stage)
+        pending[f"stage_of_{term}"] = int(stage)
     if preset.get("nucleus_onset") is not None:
-        st.session_state["nucleus_onset"] = float(preset["nucleus_onset"])
+        pending["nucleus_onset"] = float(preset["nucleus_onset"])
+    if preset.get("crossover") is not None:
+        pending["crossover"] = float(preset["crossover"])
+
+    def clamped(window):
+        low = float(np.clip(window[0], lo, hi))
+        high = float(np.clip(window[1], lo, hi))
+        return (low, high) if low < high else None
 
     for term, window in (preset.get("term_windows") or {}).items():
-        clamped = (
-            float(np.clip(window[0], lo, hi)),
-            float(np.clip(window[1], lo, hi)),
-        )
-        if clamped[0] < clamped[1]:
-            st.session_state[f"window_term_{term}"] = clamped
-    combined = preset.get("combined_window")
-    if combined:
-        clamped = (
-            float(np.clip(combined[0], lo, hi)),
-            float(np.clip(combined[1], lo, hi)),
-        )
-        if clamped[0] < clamped[1]:
-            st.session_state["window_combined"] = clamped
-    if preset.get("crossover") is not None:
-        st.session_state["crossover"] = float(preset["crossover"])
+        value = clamped(window)
+        if value:
+            pending[f"window_term_{term}"] = value
+    if preset.get("combined_window"):
+        value = clamped(preset["combined_window"])
+        if value:
+            pending["window_combined"] = value
+
+    st.session_state["_pending_settings"] = pending
 
 
 def plot_selection_kwargs():
@@ -531,7 +547,7 @@ def apply_plot_drag(chart_key, lo, hi):
     if not key:
         return
     if st.session_state.get(key) != window:
-        st.session_state[key] = window
+        st.session_state["_pending_settings"] = {key: window}
         st.rerun()
 
 
@@ -1059,8 +1075,7 @@ with tab_analysis:
         w1, w2, w3 = st.columns(3)
         with w1:
             if st.button("↺ Reset every window to auto", **STRETCH):
-                for key in [k for k in st.session_state if k.startswith("window_")]:
-                    del st.session_state[key]
+                st.session_state["_pending_clear_windows"] = True
                 st.rerun()
         with w2:
             if st.button("↺ Suggested split per element", **STRETCH):
@@ -1073,10 +1088,10 @@ with tab_analysis:
                         float(auto_window[1]),
                     ),
                 }
-                for term, window in mapping.items():
-                    st.session_state[f"window_term_{term}"] = clamp_range(
-                        window, auto_window
-                    )
+                st.session_state["_pending_settings"] = {
+                    f"window_term_{term}": clamp_range(window, auto_window)
+                    for term, window in mapping.items()
+                }
                 st.rerun()
         with w3:
             targets = ["(off)", "Combined window"] + [TERM_LABELS[t] for t in active]
