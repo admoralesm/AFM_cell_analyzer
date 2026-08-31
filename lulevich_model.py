@@ -93,7 +93,7 @@ class LulevichModel:
         denominator = 3 * (1 - self.poisson_ratio**2)
         return (numerator / denominator) * epsilon**1.5
 
-    def fit_membrane_elasticity(self, epsilon_max=0.3, eps_min=0.02):
+    def fit_membrane_elasticity(self, epsilon_max=0.3, epsilon_min=0.02):
         """
         Fit balloon model to elastic region to extract membrane Young's modulus.
         Typically valid for small deformations (ε < 0.3) before membrane rupture.
@@ -157,7 +157,7 @@ class LulevichModel:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-    def fit_cytoskeleton_elasticity(self, epsilon_max=0.3, eps_min=0.05):
+    def fit_cytoskeleton_elasticity(self, epsilon_max=0.3, epsilon_min=0.05):
         """
         Fit Hertzian contact model to extract cytoskeleton Young's modulus.
         Useful for analyzing post-rupture behavior or dead cell data.
@@ -237,12 +237,10 @@ class LulevichModel:
             window_size += 1
 
         from scipy.ndimage import uniform_filter1d
-        d2F_smooth = uniform_filter1d(
-            d2F_deps2, size=window_size, mode='nearest')
+        d2F_smooth = uniform_filter1d(d2F_deps2, size=window_size, mode='nearest')
 
         # Find peaks (stress points)
-        peaks, properties = find_peaks(
-            np.abs(d2F_smooth), height=np.max(np.abs(d2F_smooth)) * 0.1)
+        peaks, properties = find_peaks(np.abs(d2F_smooth), height=np.max(np.abs(d2F_smooth)) * 0.1)
 
         if len(peaks) > 0:
             rupture_idx = peaks[0]  # First major peak
