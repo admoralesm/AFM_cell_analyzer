@@ -397,14 +397,8 @@ with tabs[0]:
                         model = LulevichModel(force_N_analysis, relative_def, cell_height)
 
                         if fitting_mode == "Manual Range":
-                            fit_results_membrane = model.fit_membrane_elasticity(
-                                epsilon_max=eps_max,
-                                epsilon_min=eps_min
-                            )
-                            fit_results_cyto = model.fit_cytoskeleton_elasticity(
-                                epsilon_max=eps_max,
-                                epsilon_min=eps_min
-                            )
+                            fit_results_membrane = model.fit_membrane_elasticity(epsilon_max=eps_max, epsilon_min=eps_min)
+                            fit_results_cyto = model.fit_cytoskeleton_elasticity(epsilon_max=eps_max, epsilon_min=eps_min)
                         else:
                             auto_range = model.auto_detect_elastic_range()
                             fit_results_membrane = model.fit_membrane_elasticity(
