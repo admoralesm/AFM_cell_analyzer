@@ -259,6 +259,9 @@ DEFAULTS = {
     "onset_mode": "Scan for best",
     "_scanned_onset": None,
     # fitting
+    # Guided by default: most people opening this want a number, not a
+    # spring network. Everything is still one expander away.
+    "ui_mode": "Guided · plain language",
     "model_kind": "Segmented (membrane → cytoskeleton → nucleus)",
     "segment_break_1": 0.15,
     "segment_break_2": 0.40,
@@ -539,6 +542,157 @@ def show_fit_maths(fit, model):
         "assumed membrane thickness, so it moves with that assumption while "
         "the measurement does not."
     )
+
+
+def open_panel(title, guided, expanded=False):
+    """
+    Start a section: a collapsed expander in Guided mode, a heading otherwise.
+
+    Entered and exited by hand rather than with a `with` block, so the long
+    bodies of these sections keep their current indentation. Streamlit
+    containers support the context-manager protocol either way.
+    """
+    if guided:
+        panel = st.expander(title, expanded=expanded)
+        panel.__enter__()
+        return panel
+    section(title)
+    panel = st.container()
+    panel.__enter__()
+    return panel
+
+
+def close_panel(panel):
+    panel.__exit__(None, None, None)
+
+
+def stiffness_in_words(value_pa):
+    """
+    An everyday comparison for a modulus.
+
+    Someone who does not work in mechanics has no feel for a pascal. The
+    comparisons are order-of-magnitude only and hedged as such, because a
+    cell is not a rubber band and the point is scale, not identity.
+    """
+    if not np.isfinite(value_pa) or value_pa <= 0:
+        return "not measurable from this curve"
+    if value_pa < 3e2:
+        return "softer than loose jelly"
+    if value_pa < 3e3:
+        return "about as soft as a set jelly"
+    if value_pa < 3e4:
+        return "about as firm as a gummy sweet"
+    if value_pa < 3e5:
+        return "about as firm as a soft eraser"
+    if value_pa < 5e6:
+        return "about as firm as a rubber band"
+    return "stiffer than rubber, which is unusual for a cell"
+
+
+def quality_in_words(r_squared):
+    """What R² means, without saying R²."""
+    if not np.isfinite(r_squared):
+        return "could not be judged"
+    if r_squared > 0.995:
+        return "the line goes through the points almost exactly"
+    if r_squared > 0.98:
+        return "the line follows the points closely"
+    if r_squared > 0.9:
+        return "the line follows the general shape but misses in places"
+    return "the line does not really follow the data; something is wrong"
+
+
+def plain_language_summary(fit, model):
+    """
+    What the fit says, for someone who does not know cell mechanics.
+
+    Written as the story of the compression rather than as a table of
+    parameters: what resists first, what takes over, what joins last, and
+    how stiff each of those turned out to be.
+    """
+    if not (fit and fit.get("success")):
+        return
+
+    terms = set(fit.get("terms") or ())
+    e1, e2 = fit.get("break_1"), fit.get("break_2")
+    segmented = fit.get("coupling") == "segmented"
+
+    st.markdown("#### What this cell did as it was squashed")
+
+    if segmented and e1 is not None and e2 is not None:
+        held = fit.get("membrane") != "continue"
+        early_cyto = fit.get("cyto_start") == "zero"
+        story = []
+        story.append(
+            f"**Up to {e1 * 100:.0f} %** of the way down, "
+            + ("the outer membrane and the cytoskeleton resist together."
+               if early_cyto else
+               "only the outer membrane resists, stretching like a balloon "
+               "being pressed.")
+        )
+        story.append(
+            f"**From {e1 * 100:.0f} % to {e2 * 100:.0f} %**, "
+            + ("the membrane keeps stiffening and the cytoskeleton adds to it."
+               if not held else
+               "the membrane stops adding force and the cytoskeleton, the "
+               "scaffolding inside the cell, takes over.")
+        )
+        if "nucleus" in terms and fit.get("En_kPa", 0.0) > 0:
+            story.append(
+                f"**Past {e2 * 100:.0f} %**, the plates reach the nucleus and it "
+                f"starts pushing back as well."
+            )
+        else:
+            story.append(
+                f"**Past {e2 * 100:.0f} %**, nothing new joins in: this curve "
+                f"shows no sign of the nucleus being reached."
+            )
+        for line in story:
+            st.markdown(f"- {line}")
+    else:
+        st.markdown(
+            "- Every part of the cell resists together across the whole "
+            "squash, which is what this model assumes."
+        )
+
+    st.markdown("#### How stiff each part turned out to be")
+    rows = []
+    for label, everyday, key, pa_factor, unit, term in (
+        ("Outer membrane", "the skin around the cell",
+         "Em_MPa", 1e6, "MPa", "membrane"),
+        ("Cytoskeleton", "the scaffolding filling the cell",
+         "Ei_kPa", 1e3, "kPa", "interior"),
+        ("Nucleus", "the dense body at the centre",
+         "En_kPa", 1e3, "kPa", "nucleus"),
+    ):
+        used = term in terms
+        value = float(fit.get(key, 0.0)) if used else 0.0
+        rows.append(
+            {
+                "Part of the cell": label,
+                "What it is": everyday,
+                "Stiffness": f"{value:.3g} {unit}" if used else f"0 {unit}",
+                "Roughly": (
+                    "not included in this model" if not used
+                    else "the data did not need it" if value <= 0
+                    else stiffness_in_words(value * pa_factor)
+                ),
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+
+    st.markdown(
+        f"**Does the model match the measurement?** "
+        f"{quality_in_words(float(fit.get('r_squared', float('nan'))))} "
+        f"(R² = {fit.get('r_squared', float('nan')):.4f})."
+    )
+    if float(fit.get("r_squared", 0.0)) < 0.9:
+        st.warning(
+            "A poor match usually means the cell height or the contact point "
+            "is wrong, or the curve was squashed far enough to damage the "
+            "cell. Check the cell height in section 1 before trusting these "
+            "numbers."
+        )
 
 
 def plot_option_controls():
@@ -1890,6 +2044,74 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
+        st.radio(
+            "How much do you want to see?",
+            ["Guided · plain language", "Full control · every setting"],
+            key="ui_mode", horizontal=True,
+            help="Guided hides the mechanics behind expanders and gives you "
+            "one button and an answer in words. Full control lays every "
+            "setting out on the page. Both do exactly the same fitting.",
+        )
+        guided = st.session_state["ui_mode"].startswith("Guided")
+
+        if guided:
+            st.markdown("#### Analyse this cell")
+            st.caption(
+                "One press works out which parts of the cell resist the "
+                "squash, where each one takes over, and how stiff each is. "
+                "Nothing below needs touching unless you want to."
+            )
+            g1, g2 = st.columns([1, 2])
+            with g1:
+                if st.button("🔬 Work it out for me", type="primary", **STRETCH):
+                    with st.spinner(
+                        "Trying every way the parts of the cell can share the "
+                        "load, and keeping the one that predicts best…"
+                    ):
+                        found = model.search_compositions(
+                            0.0, eps_hi_data,
+                            weighting=st.session_state["weighting"],
+                        )
+                    st.session_state["composition_search"] = found
+                    if found.get("success"):
+                        best = found["best"]
+                        labels = {
+                            (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
+                            for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
+                        }
+                        m_label, c_label = labels[
+                            (best["membrane"], best["cyto_start"])
+                        ]
+                        st.session_state["_pending_settings"] = {
+                            "segment_break_1": round(float(best["break_1"]), 3),
+                            "segment_break_2": round(float(best["break_2"]), 3),
+                            "membrane_after_break": m_label,
+                            "cyto_starts_at": c_label,
+                            "use_nucleus": bool(best["use_nucleus"]),
+                            "use_membrane": True,
+                            "use_interior": True,
+                            "model_kind": (
+                                "Segmented (membrane → cytoskeleton → nucleus)"
+                            ),
+                            "window_end": round(float(eps_hi_data), 4),
+                        }
+                        st.rerun()
+                    else:
+                        st.error(found.get("error", "Could not analyse this curve."))
+            with g2:
+                previous = st.session_state.get("composition_search")
+                if previous and previous.get("success"):
+                    st.success(previous["verdict"])
+                else:
+                    st.info(
+                        "Press the button and the results appear below the plot."
+                    )
+            st.divider()
+
+        model_panel = open_panel(
+            "⚙️ Which parts of the cell, and how they share the load", guided
+        )
+
         element_col, model_col = st.columns([1, 1.5])
         with model_col:
             st.markdown("**2 · How they share the load**")
@@ -1947,9 +2169,13 @@ with tab_analysis:
         else:
             membrane_mode, cyto_mode = "freeze", "break"
 
+        close_panel(model_panel)
+
         # ---------------------------------------------------- exploration ---
         if segmented:
-            section("4 · Explore the curve")
+            explore_panel = open_panel("🔬 Explore the curve", guided)
+            if not guided:
+                section("4 · Explore the curve")
             e1_col, e2_col = st.columns([1, 2])
             with e1_col:
                 if st.button("🔬 Find the segments", type="secondary", **STRETCH):
@@ -2029,8 +2255,13 @@ with tab_analysis:
                     **STRETCH,
                 )
 
+        if segmented:
+            close_panel(explore_panel)
+
         # --------------------------------------------------------- ranges ---
-        section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
+        range_panel = open_panel("📏 Where each part takes over", guided)
+        if not guided:
+            section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
         st.caption(
             f"Data spans ε = {eps_lo_data:.3f} to {eps_hi_data:.3f}. "
             f"Auto-detected usable region: {auto_window[0]:.3f} to "
@@ -2508,7 +2739,11 @@ with tab_analysis:
             )
 
         # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
-        section("6 · Fit" if segmented else "5 · Fit")
+        close_panel(range_panel)
+
+        fit_panel = open_panel("🚀 Fitting options", guided)
+        if not guided:
+            section("6 · Fit" if segmented else "5 · Fit")
 
         scan = None
         if (
@@ -2617,6 +2852,8 @@ with tab_analysis:
                     fit_offset=st.session_state["fit_offset"],
                     weighting=st.session_state["weighting"],
                 )
+
+        close_panel(fit_panel)
 
         # The video and database section below runs whether or not there is a
         # fit, so the names it reads have to exist either way.
@@ -2793,6 +3030,11 @@ with tab_analysis:
                 "source": data["source"],
                 "timestamp": datetime.now(),
             }
+
+            if guided:
+                plain_language_summary(fit, model)
+                st.divider()
+                st.markdown("#### The numbers")
 
             # All three moduli, always. A term that was not in the model reads
             # 0 and says so, rather than disappearing: a blank column in a
@@ -3343,8 +3585,27 @@ with tab_analysis:
                     (st.success if ok else st.error)(message)
                 except Exception as exc:
                     st.error(f"Could not write the row: {exc}")
+            if st.button(
+                "📈 Also save the curve as a tab",
+                disabled=bool(sheet_blockers), **STRETCH,
+            ):
+                try:
+                    ok, message, url = sheet_manager.save_curve(
+                        st.session_state["cell_name"].strip(),
+                        epsilon, force_N, fitted,
+                    )
+                    if ok:
+                        st.success(message)
+                        if url:
+                            st.caption(f"[Open the curve tab]({url})")
+                    else:
+                        st.error(message)
+                except Exception as exc:
+                    st.error(f"Could not save the curve: {exc}")
             st.caption(
-                "One row per cell: the moduli, the boundaries and R². "
+                "The row is the summary; the curve tab is every measured "
+                "point, force against relative deformation, in the same "
+                "spreadsheet. Somewhere to keep curves until Box is ready."
                 if not sheet_blockers
                 else "To enable: " + ", then ".join(sheet_blockers) + "."
             )
