@@ -361,6 +361,105 @@ def case_companion_file_guard():
     check("**kwargs passes everything through", len(passthrough) == 2)
 
 
+def case_fit_survives_a_rerun():
+    print("the fit survives a rerun with live refitting off")
+    app = start()
+    # Fit once, then take live refitting away, as uploading a video does.
+    check("a fit exists to begin with",
+          app.session_state["_last_fit"] is not None)
+    app.session_state["live_fit"] = False
+    app.run()
+    if not no_exception(app, "rerun with live refitting off"):
+        return
+    check("the fit is still there after a rerun",
+          app.session_state["_last_fit"] is not None)
+
+    # The database section must still be on the page, which is what actually
+    # vanished before: it lived inside the fit-succeeded branch.
+    uploader_labels = [u.label for u in app.get("file_uploader")]
+    check("the video uploader is still on the page",
+          any("compression video" in (l or "").lower() for l in uploader_labels),
+          str(uploader_labels))
+    check("the send button is still on the page",
+          button_by_label(app, "Send to database") is not None)
+
+
+def case_database_section_without_a_fit():
+    print("the database section is reachable before any fit")
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
+    app.run()
+    eps, force = synthetic()
+    load(app, eps, force)
+    app.session_state["live_fit"] = False
+    app.run()
+    if not no_exception(app, "no fit yet"):
+        return
+    check("no fit has been made", app.session_state["_last_fit"] is None)
+    uploader_labels = [u.label for u in app.get("file_uploader")]
+    check("the video uploader is reachable with no fit",
+          any("compression video" in (l or "").lower() for l in uploader_labels),
+          str(uploader_labels))
+    send = button_by_label(app, "Send to database")
+    check("the send button is shown with no fit", send is not None)
+    if send is not None:
+        check("and it is disabled until there is a fit", send.disabled is True)
+
+
+class FakeStore:
+    """Stands in for Box so the send path can be exercised for real."""
+
+    last = {}
+
+    def save_cell(self, record, curve_csv=None, thumbnail_png=None,
+                  video_bytes=None, video_name=None):
+        FakeStore.last = {
+            "record": record, "curve": curve_csv, "thumb": thumbnail_png,
+            "video": video_bytes, "video_name": video_name,
+        }
+        return {"cell_id": record["cell_id"], "video_url": ""}
+
+    def load_index(self):
+        return pd.DataFrame(columns=["cell_id", "date", "Em_MPa", "Ec_kPa"])
+
+    def check(self):
+        return {"ok": True, "detail": "fake store"}
+
+    def auth_method(self):
+        return "fake"
+
+
+def case_send_without_a_video():
+    print("a cell can be sent with no video at all")
+    FakeStore.last = {}
+    app = start(box_store=FakeStore(), cell_name="cell-01")
+    check("no video is loaded", not app.session_state["video_path"])
+
+    send = button_by_label(app, "Send to database")
+    check("send button present", send is not None)
+    if send is None:
+        return
+    check("send button is enabled with a fit and no video", send.disabled is False)
+
+    send.click().run()
+    if not no_exception(app, "send with no video"):
+        return
+    check("no error was shown", not app.error, str([e.value for e in app.error]))
+    check("a success message was shown",
+          any("cell-01" in (m.value or "") for m in app.success),
+          str([m.value for m in app.success]))
+
+    saved = FakeStore.last
+    check("the cell reached the store", bool(saved))
+    check("no video bytes were sent", saved.get("video") is None)
+    check("no morphology frame was sent", saved.get("thumb") is None)
+    check("the curve went anyway", bool(saved.get("curve")))
+    check("the moduli went anyway",
+          "Em_MPa" in (saved.get("record") or {})
+          and "Ec_kPa" in (saved.get("record") or {}))
+    check("the fitted column is in the curve csv",
+          "fit_N" in (saved.get("curve") or ""))
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -499,6 +598,9 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_fit_survives_a_rerun,
+        case_database_section_without_a_fit,
+        case_send_without_a_video,
         case_fit_stops_at_the_end_of_the_range,
         case_plot_clutter_toggles,
         case_preset_round_trip,
