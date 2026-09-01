@@ -78,6 +78,7 @@ class PlotStyle:
     show_video_marker: bool = True
     show_rupture_marker: bool = True
     show_schematic_moduli: bool = True
+    show_legend: bool = True
     template: str = "publication"
 
     # Legacy alias: older call sites used a single `font_size`.
@@ -146,6 +147,7 @@ def _base_layout(fig, style: PlotStyle, title):
         hovermode="closest",
         height=style.height,
         margin=dict(l=side, r=40, t=max(70, style.title_size * 3), b=bottom),
+        showlegend=style.show_legend,
         legend=dict(
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="black",
