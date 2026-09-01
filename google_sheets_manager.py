@@ -322,6 +322,89 @@ class GoogleSheetsManager:
         kept = f" {len(rows)} row(s) kept." if rows else ""
         return True, f"Columns are now in the app's order.{kept}"
 
+    CURVE_PREFIX = "curve_"
+
+    def save_curve(self, cell_id, epsilon, force_N, fitted_N=None):
+        """
+        Store one force curve as its own tab in the same spreadsheet.
+
+        A service account owns nothing in Drive: its storage quota is zero
+        bytes, so it cannot create a file there however the folder is shared.
+        It can write into a spreadsheet somebody else owns, though, and a few
+        hundred rows is nothing to a sheet. So the curve lives as a tab beside
+        the summary until Box is available for the real archive.
+
+        Returns
+        -------
+        (success, message, url) : the url points at the tab itself.
+        """
+        if not self.spreadsheet:
+            return False, "Not connected to a spreadsheet.", ""
+
+        safe = "".join(
+            ch if (ch.isalnum() or ch in " -_") else "_" for ch in str(cell_id)
+        ).strip() or "cell"
+        # Google caps sheet titles at 100 characters.
+        title = (self.CURVE_PREFIX + safe)[:100]
+
+        rows = [["relative_deformation", "force_N"]
+                + (["fit_N"] if fitted_N is not None else [])]
+        for index in range(len(epsilon)):
+            row = [float(epsilon[index]), float(force_N[index])]
+            if fitted_N is not None:
+                value = float(fitted_N[index])
+                row.append("" if value != value else value)   # NaN outside the fit
+            rows.append(row)
+
+        try:
+            try:
+                worksheet = self.spreadsheet.worksheet(title)
+                # Refitting the same cell should replace its curve, not add a
+                # second tab with the same name plus a suffix.
+                worksheet.clear()
+            except gspread.WorksheetNotFound:
+                worksheet = self.spreadsheet.add_worksheet(
+                    title=title, rows=max(len(rows) + 10, 100), cols=4
+                )
+            worksheet.update(values=rows, range_name=f"A1:C{len(rows)}")
+        except Exception as exc:
+            return False, f"Could not write the curve: {exc}", ""
+
+        url = ""
+        try:
+            url = f"{self.spreadsheet.url}#gid={worksheet.id}"
+        except Exception:
+            pass
+        return True, f"Curve saved as the tab “{title}” ({len(rows) - 1} points).", url
+
+    def list_curve_tabs(self):
+        """Names of the curve tabs already in this spreadsheet."""
+        try:
+            return [
+                ws.title for ws in self.spreadsheet.worksheets()
+                if ws.title.startswith(self.CURVE_PREFIX)
+            ]
+        except Exception:
+            return []
+
+    def load_curve(self, cell_id):
+        """Read one stored curve back as a DataFrame, or None."""
+        safe = "".join(
+            ch if (ch.isalnum() or ch in " -_") else "_" for ch in str(cell_id)
+        ).strip()
+        title = (self.CURVE_PREFIX + safe)[:100]
+        try:
+            worksheet = self.spreadsheet.worksheet(title)
+            values = worksheet.get_all_values()
+        except Exception:
+            return None
+        if len(values) < 2:
+            return None
+        frame = pd.DataFrame(values[1:], columns=values[0])
+        for column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame
+
     def append_cell_data(self, cell_data: Dict) -> Tuple[bool, str]:
         """
         Append a new cell analysis to the database
