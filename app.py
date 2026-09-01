@@ -167,6 +167,8 @@ DEFAULTS = {
     "use_membrane": True,
     "use_interior": True,
     "use_nucleus": False,
+    "regime_mode": False,
+    "regime_split": 0.40,
     "stage_of_membrane": 2,
     "stage_of_interior": 1,
     "stage_of_nucleus": 3,
@@ -193,6 +195,13 @@ DEFAULTS = {
     "video_roi_x": (0.0, 1.0),
     "video_roi_y": (0.0, 1.0),
     "video_sensitivity": 1.0,
+    "video_clahe": 0.0,
+    "video_gamma": 1.0,
+    "video_brightness": 0,
+    "video_contrast": 1.0,
+    "video_cell_side": "anywhere",
+    "video_reject_dark": True,
+    "video_find_nucleus": True,
     "video_strip_lines": True,
     "video_show_panel": True,
     # data / results
@@ -200,6 +209,7 @@ DEFAULTS = {
     "results": None,
     "gs_manager": None,
     "db_enabled": False,
+    "sheet_id": "",
 }
 
 # Streamlit refuses a write to a widget's key once that widget has been built
@@ -275,18 +285,31 @@ def cached_frame(path, signature, index):
 
 
 @st.cache_data(show_spinner=False)
-def cached_detection(path, signature, index, roi, sensitivity, strip_lines):
+def cached_detection(
+    path, signature, index, roi, sensitivity, strip_lines,
+    enhance=None, cell_side="anywhere", reject_dark=True, find_nucleus=False,
+):
+    """Read one frame, enhance it, and find the probe, cell and nucleus."""
     frame = va.read_frame(path, index)
     if frame is None:
-        return None, None
+        return None, None, None, None
+    if enhance:
+        frame = va.enhance_frame(frame, **enhance)
+    probe_box = None
+    if reject_dark or cell_side != "anywhere":
+        found = va.detect_probe(frame)
+        probe_box = found if found.get("found") else None
     det = va.detect_cell(
-        frame, roi=roi, sensitivity=sensitivity, strip_lines=strip_lines
+        frame, roi=roi, sensitivity=sensitivity, strip_lines=strip_lines,
+        probe=probe_box, cell_side=cell_side, reject_dark=reject_dark,
     )
-    return frame, det
+    nucleus = va.detect_nucleus(frame, det) if (find_nucleus and det.get("found")) else None
+    return frame, det, nucleus, probe_box
 
 
 @st.cache_data(show_spinner="Tracking the cell through the video…")
-def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, start, end):
+def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, start, end,
+                 enhance=None, cell_side="anywhere", reject_dark=True, find_nucleus=False):
     track = va.track_cell(
         path,
         n_samples=n_samples,
@@ -294,9 +317,30 @@ def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, star
         sensitivity=sensitivity,
         start=start,
         end=end,
+        enhance=enhance,
+        cell_side=cell_side,
+        reject_dark=reject_dark,
+        track_nucleus=find_nucleus,
     )
     # Detections hold OpenCV contours; drop them so the cached value stays small.
     return {k: v for k, v in track.items() if k != "detections"}
+
+
+def enhancement():
+    """Frame adjustments as a hashable tuple-backed dict, or None if untouched."""
+    settings = {
+        "clahe_clip": float(st.session_state["video_clahe"]),
+        "gamma": float(st.session_state["video_gamma"]),
+        "brightness": int(st.session_state["video_brightness"]),
+        "contrast": float(st.session_state["video_contrast"]),
+    }
+    untouched = (
+        settings["clahe_clip"] == 0.0
+        and settings["gamma"] == 1.0
+        and settings["brightness"] == 0
+        and settings["contrast"] == 1.0
+    )
+    return None if untouched else settings
 
 
 def video_signature():
@@ -323,7 +367,7 @@ def guess_column(columns, keywords, fallback_index):
     return min(fallback_index, len(columns) - 1)
 
 
-def build_model(epsilon, force_N) -> LulevichModel:
+def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
     """Construct the model from the current geometry settings. Metres, always."""
     height_m = float(st.session_state["cell_height_um"]) * 1e-6
     if st.session_state["radius_mode"] == "Manual":
@@ -346,6 +390,7 @@ def build_model(epsilon, force_N) -> LulevichModel:
         poisson_nucleus=float(st.session_state["poisson_nucleus"]),
         nucleus_onset=float(st.session_state["nucleus_onset"]),
         expected_ranges=CELL_TYPES.get(st.session_state["cell_type"], {}).get("expected"),
+        active_windows=active_windows,
     )
 
 
@@ -731,20 +776,40 @@ with st.sidebar:
         else:
             st.checkbox("Enable database", key="db_enabled")
             if st.session_state["db_enabled"]:
+                st.text_input(
+                    "Spreadsheet ID or URL",
+                    key="sheet_id",
+                    placeholder="1AbC…  or the full /spreadsheets/d/… link",
+                    help="The sheet must already exist in YOUR Drive and be shared "
+                    "with the service account as an Editor. A service account has "
+                    "no Drive storage of its own, so it cannot create one.",
+                )
                 if st.button("🔗 Connect", **STRETCH):
-                    manager = initialize_sheets_manager()
+                    manager = initialize_sheets_manager(
+                        spreadsheet_id=st.session_state["sheet_id"] or None
+                    )
                     st.session_state["gs_manager"] = manager
                     if manager:
                         st.success("Connected.")
-                    else:
-                        st.error("Connection failed. Check credentials below.")
                 if st.session_state["gs_manager"]:
                     st.caption("Connected ✓")
-                st.caption(
-                    "Needs a service-account key in `.streamlit/secrets.toml` under "
-                    "`[google_sheets_credentials]`, and the sheet shared with that "
-                    "service-account email."
-                )
+                    url = st.session_state["gs_manager"].get_spreadsheet_url()
+                    if url:
+                        st.caption(f"[Open the sheet]({url})")
+                with st.expander("Setting this up"):
+                    st.markdown(
+                        "1. In Google Cloud, create a service account and download "
+                        "its JSON key. Enable the Sheets and Drive APIs.\n"
+                        "2. Put the key in `.streamlit/secrets.toml` under "
+                        "`[google_sheets_credentials]`.\n"
+                        "3. Create a blank Sheet in your own Drive, then share it "
+                        "with the service account's `client_email` as an **Editor**. "
+                        "This step is the one that is usually missed, and skipping "
+                        "it produces a 403 about Drive storage quota, which sounds "
+                        "like a different problem than it is.\n"
+                        "4. Paste the sheet id above, or set it in secrets:\n\n"
+                        "```toml\n[google_sheets]\nspreadsheet_id = \"...\"\n```"
+                    )
 
     st.divider()
     if st.button("↩️ Reset settings to defaults", **STRETCH):
@@ -927,6 +992,14 @@ with tab_analysis:
             st.checkbox("Membrane · Eₘ", key="use_membrane")
             st.checkbox("Cytoskeleton · Ec", key="use_interior")
             st.checkbox("Nucleus · Eₙ", key="use_nucleus")
+            st.checkbox(
+                "Each element acts only in its own window",
+                key="regime_mode",
+                help="Off: every selected element carries load across the whole "
+                "curve. On: an element contributes only inside its own window, so "
+                "the curve can be membrane + cytoskeleton up to some deformation "
+                "and cytoskeleton + nucleus beyond it.",
+            )
         with model_col:
             st.markdown("**How the elements share the load**")
             st.radio(
@@ -1072,12 +1145,59 @@ with tab_analysis:
             fit_lo, fit_hi = combined_lo, combined_hi
             stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
 
+        if st.session_state["regime_mode"] and term_windows:
+            # The model had to exist before the sliders could be drawn (the
+            # auto-detected region comes from it), so rebuild it now that the
+            # windows are known.
+            model = build_model(epsilon, force_N, active_windows=term_windows)
+            # In regime mode the nucleus window start IS the deformation at
+            # which the nucleus starts carrying load, so the onset follows it.
+            # Leaving the two to disagree silently changes the shape of the
+            # nucleus term and quietly spoils the fit.
+            nucleus_window = term_windows.get("nucleus")
+            if nucleus_window and abs(model.nucleus_onset - nucleus_window[0]) > 1e-6:
+                model.nucleus_onset = float(nucleus_window[0])
+                st.caption(
+                    f"Nucleus onset ε₀ set to {nucleus_window[0]:.3f} to match the "
+                    f"start of its window."
+                )
+            st.caption(
+                "Regime mode: "
+                + " · ".join(
+                    f"{TERM_LABELS[t]} acts on {w[0]:.3f} to {w[1]:.3f}"
+                    for t, w in term_windows.items()
+                )
+            )
+
         w1, w2, w3 = st.columns(3)
         with w1:
             if st.button("↺ Reset every window to auto", **STRETCH):
                 st.session_state["_pending_clear_windows"] = True
                 st.rerun()
         with w2:
+            if st.button("⚙️ Two-regime preset", **STRETCH,
+                         help="Membrane + cytoskeleton below the split, "
+                              "cytoskeleton + nucleus above it."):
+                split = float(np.clip(st.session_state["regime_split"],
+                                      eps_lo_data + 1e-3, eps_hi_data - 1e-3))
+                st.session_state["_pending_settings"] = {
+                    "use_membrane": True,
+                    "use_interior": True,
+                    "use_nucleus": True,
+                    "regime_mode": True,
+                    "coupling": "Parallel (forces add)",
+                    "nucleus_onset": split,
+                    "onset_mode": "Set manually",
+                    "window_term_membrane": (eps_lo_data, split),
+                    "window_term_interior": (eps_lo_data, eps_hi_data),
+                    "window_term_nucleus": (split, eps_hi_data),
+                    "window_combined": (eps_lo_data, eps_hi_data),
+                }
+                st.rerun()
+            st.number_input(
+                "Split ε", min_value=0.05, max_value=0.95, step=0.01,
+                key="regime_split", label_visibility="collapsed",
+            )
             if st.button("↺ Suggested split per element", **STRETCH):
                 suggestion = model.suggest_sequential_windows()
                 mapping = {
@@ -1556,19 +1676,26 @@ with tab_analysis:
                         st.session_state["video_end_frame"] or (vinfo["n_frames"] - 1),
                         float(epsilon.max()),
                     )
-                    vframe, vdet = cached_detection(
+                    vframe, vdet, vnuc, vprobe = cached_detection(
                         st.session_state["video_path"],
                         video_signature(),
                         int(frame_index),
                         st.session_state["video_roi"],
                         float(st.session_state["video_sensitivity"]),
                         bool(st.session_state["video_strip_lines"]),
+                        enhancement(),
+                        st.session_state["video_cell_side"],
+                        bool(st.session_state["video_reject_dark"]),
+                        bool(st.session_state["video_find_nucleus"]),
                     )
                     if vframe is None:
                         st.info("Frame unavailable.")
                     else:
                         force_here, unit_here = from_newtons(highlight[1], style.force_unit)
-                        snap = va.annotate(vframe, vdet, label=f"ε = {highlight[0]:.3f}")
+                        snap = va.annotate(
+                            vframe, vdet, label=f"ε = {highlight[0]:.3f}",
+                            nucleus=vnuc, probe=vprobe,
+                        )
                         st.image(
                             va.crop(snap, vdet) if vdet and vdet.get("found") else snap,
                             caption=f"Frame {frame_index} · ε = {highlight[0]:.3f} · "
@@ -1796,18 +1923,25 @@ with tab_video:
             )
         with src2:
             st.text_input(
-                "…or a Google Drive link",
-                placeholder="https://drive.google.com/file/d/...",
+                "…or a Google Drive / Box link",
+                placeholder="https://app.box.com/s/…  or  https://drive.google.com/file/d/…",
                 key="video_link",
-                help="Only works for files shared with 'anyone with the link'.",
+                help="Box links need either public sharing or an access token in "
+                "secrets under [box]. Drive links must be shared with anyone "
+                "who has the link.",
             )
-            if st.button("⬇️ Fetch from Drive", **STRETCH):
+            if st.button("⬇️ Fetch from link", **STRETCH):
                 try:
+                    token = None
+                    try:
+                        token = st.secrets.get("box", {}).get("access_token")
+                    except Exception:
+                        token = None
                     with st.spinner("Downloading…"):
-                        dest = os.path.join(tempfile.gettempdir(), "afm_drive_video.mp4")
-                        va.download_drive_video(st.session_state["video_link"], dest)
+                        dest = os.path.join(tempfile.gettempdir(), "afm_linked_video.mp4")
+                        va.fetch_video(st.session_state["video_link"], dest, box_token=token)
                     st.session_state["video_path"] = dest
-                    st.session_state["video_name"] = "Google Drive video"
+                    st.session_state["video_name"] = "linked video"
                     st.session_state["video_info"] = va.probe(dest)
                     st.session_state["video_track"] = None
                     st.rerun()
@@ -1848,24 +1982,42 @@ with tab_video:
 
             # ------------------------------------------------ detection setup
             section("Detection")
-            d1, d2 = st.columns([1, 1])
+            d1, d2, d3 = st.columns(3)
             with d1:
+                st.markdown("**Image**")
                 st.slider(
-                    "Edge sensitivity",
-                    0.3,
-                    3.0,
-                    step=0.1,
-                    key="video_sensitivity",
-                    help="Raise it if the cell is faint; lower it if background "
-                    "texture is being picked up instead.",
+                    "Local contrast (CLAHE)", 0.0, 6.0, step=0.5, key="video_clahe",
+                    help="Brings out a faint cell without blowing out the bright "
+                    "field. 0 leaves the frame alone.",
+                )
+                st.slider("Gamma", 0.3, 3.0, step=0.05, key="video_gamma",
+                          help="Above 1 lifts the dark end, where a cell in the "
+                          "probe's shadow lives.")
+                st.slider("Brightness", -80, 80, step=2, key="video_brightness")
+                st.slider("Contrast", 0.4, 3.0, step=0.05, key="video_contrast")
+            with d2:
+                st.markdown("**Finding the cell**")
+                st.slider(
+                    "Edge sensitivity", 0.3, 3.0, step=0.1, key="video_sensitivity",
                 )
                 st.checkbox(
-                    "Ignore long horizontal structures",
-                    key="video_strip_lines",
-                    help="Removes the substrate line and the cantilever, which "
-                    "otherwise merge with the cell into one shapeless blob.",
+                    "Ignore long horizontal structures", key="video_strip_lines",
+                    help="Removes the substrate line and the cantilever body.",
                 )
-            with d2:
+                st.checkbox(
+                    "Ignore very dark objects (the probe)", key="video_reject_dark",
+                    help="The cantilever is close to black. This paints it out "
+                    "before segmenting, so it stops being picked as the cell.",
+                )
+                st.selectbox(
+                    "The cell sits …",
+                    ["anywhere", "right", "left", "above", "below"],
+                    key="video_cell_side",
+                    help="… relative to the probe. Set this and the probe is "
+                    "located first, then only that side is searched.",
+                )
+                st.checkbox("Also find the nucleus", key="video_find_nucleus")
+            with d3:
                 st.caption("Search region (fraction of the frame)")
                 rx = st.slider("Horizontal", 0.0, 1.0, step=0.01, key="video_roi_x")
                 ry = st.slider("Vertical", 0.0, 1.0, step=0.01, key="video_roi_y")
@@ -1888,13 +2040,17 @@ with tab_video:
             )
 
             preview_frame = st.slider("Preview frame", 0, last, key="video_preview_frame")
-            frame, det = cached_detection(
+            frame, det, nucleus, probe_box = cached_detection(
                 path,
                 signature,
                 int(preview_frame),
                 roi,
                 float(st.session_state["video_sensitivity"]),
                 bool(st.session_state["video_strip_lines"]),
+                enhancement(),
+                st.session_state["video_cell_side"],
+                bool(st.session_state["video_reject_dark"]),
+                bool(st.session_state["video_find_nucleus"]),
             )
 
             p1, p2 = st.columns([2, 1])
@@ -1903,25 +2059,45 @@ with tab_video:
                     st.error("Could not read that frame.")
                 else:
                     label = (
-                        f"h = {det['height_px']:.0f} px" if det and det.get("found") else "not found"
+                        f"h = {det['height_px']:.0f} px"
+                        if det and det.get("found")
+                        else "cell not found"
                     )
                     st.image(
-                        va.annotate(frame, det, label=label),
-                        caption=f"Frame {preview_frame}",
+                        va.annotate(frame, det, label=label, nucleus=nucleus,
+                                    probe=probe_box),
+                        caption=f"Frame {preview_frame} · red = cell, purple = "
+                        f"nucleus, grey = probe",
                         **STRETCH,
                     )
             with p2:
                 if det and det.get("found"):
                     st.success("Cell detected")
-                    st.metric("Height", f"{det['height_px']:.0f} px")
-                    st.metric("Width", f"{det['width_px']:.0f} px")
+                    st.metric("Cell height", f"{det['height_px']:.0f} px")
+                    st.metric("Cell width", f"{det['width_px']:.0f} px")
                     st.caption(
                         f"circularity {det['circularity']:.2f} · "
                         f"solidity {det['solidity']:.2f}"
                     )
+                    if det.get("rejected_dark") or det.get("rejected_side"):
+                        st.caption(
+                            f"rejected {det.get('rejected_dark', 0)} dark and "
+                            f"{det.get('rejected_side', 0)} wrong-side candidates"
+                        )
+                    if nucleus and nucleus.get("found"):
+                        st.metric("Nucleus height", f"{nucleus['height_px']:.0f} px")
+                        st.caption(
+                            f"{100 * nucleus['area_fraction_of_cell']:.0f} % of the "
+                            f"cell box · circularity {nucleus['circularity']:.2f}"
+                        )
+                    elif st.session_state["video_find_nucleus"]:
+                        st.caption(f"Nucleus: {nucleus.get('reason', 'not found')}")
                     st.download_button(
                         "📷 Save this frame",
-                        data=png_bytes(va.annotate(frame, det, label=label)),
+                        data=png_bytes(
+                            va.annotate(frame, det, label=label, nucleus=nucleus,
+                                        probe=probe_box)
+                        ),
                         file_name=f"frame_{preview_frame}.png",
                         mime="image/png",
                         **STRETCH,
@@ -1929,9 +2105,11 @@ with tab_video:
                 elif det:
                     st.warning(f"No cell found: {det.get('reason', 'unknown')}")
                     st.caption(
-                        "Try narrowing the search region to exclude the cantilever, "
-                        "or adjusting the edge sensitivity."
+                        "Try raising the local contrast, narrowing the search "
+                        "region, or setting which side of the probe the cell is on."
                     )
+                if probe_box and probe_box.get("found"):
+                    st.caption(f"Probe found at x = {probe_box['bbox'][0]}")
 
             # ------------------------------------------------ curve alignment
             section("Line the video up with the curve")
@@ -1962,6 +2140,10 @@ with tab_video:
                         bool(st.session_state["video_strip_lines"]),
                         int(contact_frame),
                         int(end_frame),
+                        enhancement(),
+                        st.session_state["video_cell_side"],
+                        bool(st.session_state["video_reject_dark"]),
+                        bool(st.session_state["video_find_nucleus"]),
                     )
                 except Exception as exc:
                     st.error(f"Tracking failed: {exc}")
