@@ -229,7 +229,10 @@ DEFAULTS = {
     "log_scale": False,
     "show_components": True,
     "show_fit_window": True,
+    "show_video_marker": True,
+    "show_rupture_marker": True,
     "show_schematic": True,
+    "show_schematic_moduli": True,
     "plot_width": 2.4,
     # geometry / model
     "radius_mode": "From height",
@@ -258,6 +261,8 @@ DEFAULTS = {
     "cyto_starts_at": "at ε₁",
     "highlight_segment": "(none)",
     "composition_search": None,
+    # The segmented model always starts at zero, so only the far end is set.
+    "window_end": 0.60,
     "procedure": "All at once",
     "crossover_mode": "Scan for best",
     "crossover": 0.18,
@@ -366,6 +371,9 @@ def current_style(force_N=None) -> PlotStyle:
         log_scale=st.session_state["log_scale"],
         show_components=st.session_state["show_components"],
         show_fit_window=st.session_state["show_fit_window"],
+        show_video_marker=st.session_state["show_video_marker"],
+        show_rupture_marker=st.session_state["show_rupture_marker"],
+        show_schematic_moduli=st.session_state["show_schematic_moduli"],
     )
 
 
@@ -767,8 +775,11 @@ def apply_plot_drag(chart_key, lo, hi):
     key = (st.session_state.get("_drag_keys") or {}).get(target)
     if not key:
         return
-    if st.session_state.get(key) != window:
-        st.session_state["_pending_settings"] = {key: window}
+    # "window_end" is a single number, not a pair: the segmented range always
+    # starts at zero, so a drag can only move where it ends.
+    value = window[1] if key == "window_end" else window
+    if st.session_state.get(key) != value:
+        st.session_state["_pending_settings"] = {key: value}
         st.rerun()
 
 
@@ -1148,16 +1159,38 @@ with st.sidebar:
         st.checkbox("Bold axis titles and ticks", key="bold_axes")
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
-        st.checkbox("Show model components", key="show_components")
-        st.checkbox("Shade the fit windows", key="show_fit_window")
+        st.markdown("**What is drawn on the curve**")
+        st.caption("Turn these off for a clean plot to put in a figure.")
+        st.checkbox("Model components", key="show_components")
         st.checkbox(
-            "Show the cell diagram beside the plot",
+            "Shaded segment bands", key="show_fit_window",
+            help="The coloured blocks behind the curve marking each segment. "
+            "This also hides the highlighted segment.",
+        )
+        st.checkbox(
+            "Video frame marker", key="show_video_marker",
+            help="The orange ring and dotted line showing where on the curve "
+            "the displayed video frame sits.",
+        )
+        st.checkbox(
+            "Rupture marker", key="show_rupture_marker",
+            help="The dash-dotted line where the force drops.",
+        )
+
+        st.markdown("**Panels beside the curve**")
+        st.checkbox(
+            "Cell diagram",
             key="show_schematic",
             help="A side-on sketch of the membrane, cytoskeleton and nucleus at "
             "the deformation you select.",
         )
         st.checkbox(
-            "Show the video frame beside the plot",
+            "Moduli under the diagram", key="show_schematic_moduli",
+            help="The Eₘ, E_c and Eₙ values printed under the cell diagram. The "
+            "same numbers are in the results table.",
+        )
+        st.checkbox(
+            "Video frame",
             key="video_show_panel",
             help="Only appears once a video is loaded in the Compression video tab.",
         )
@@ -1596,16 +1629,36 @@ with tab_analysis:
             f"rupture: {auto_range['rupture_method']}"
         )
 
-        st.session_state["window_combined"] = clamp_range(
-            st.session_state.get("window_combined"),
-            (eps_lo_data, eps_hi_data) if segmented else auto_window,
-        )
-        fit_lo, fit_hi = st.slider(
-            "Fitted range",
-            min_value=eps_lo_data, max_value=eps_hi_data, step=step,
-            key="window_combined",
-            help="The stretch of the curve the fit is measured on.",
-        )
+        if segmented:
+            # The segmented model starts at first contact by definition: the
+            # membrane term is ε³ measured from ε = 0, so a range that starts
+            # anywhere else is fitting a curve the model does not describe.
+            # Only the far end is yours to choose.
+            fit_lo = 0.0
+            st.session_state["window_end"] = float(
+                np.clip(
+                    st.session_state.get("window_end", eps_hi_data),
+                    max(step, 0.0), eps_hi_data,
+                )
+            )
+            fit_hi = st.slider(
+                "Fit up to ε =",
+                min_value=float(step), max_value=eps_hi_data, step=step,
+                key="window_end",
+                help="The range always starts at zero. This sets where it ends, "
+                "and the fitted curve is drawn only over that range.",
+            )
+            st.session_state["window_combined"] = (fit_lo, fit_hi)
+        else:
+            st.session_state["window_combined"] = clamp_range(
+                st.session_state.get("window_combined"), auto_window,
+            )
+            fit_lo, fit_hi = st.slider(
+                "Fitted range",
+                min_value=eps_lo_data, max_value=eps_hi_data, step=step,
+                key="window_combined",
+                help="The stretch of the curve the fit is measured on.",
+            )
         st.caption(f"{int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())} points")
 
         term_windows = {}
@@ -1885,10 +1938,13 @@ with tab_analysis:
                 st.session_state["_pending_clear_windows"] = True
                 st.rerun()
         with r2:
-            targets = ["(off)", "Fitted range"] + [
+            range_label = "End of the range" if segmented else "Fitted range"
+            targets = ["(off)", range_label] + [
                 TERM_LABELS[t] for t in (active if staged else [])
             ]
-            st.session_state["_drag_keys"] = {"Fitted range": "window_combined"}
+            st.session_state["_drag_keys"] = {
+                range_label: "window_end" if segmented else "window_combined"
+            }
             st.session_state["_drag_keys"].update(
                 {TERM_LABELS[t]: f"window_term_{t}" for t in (active if staged else [])}
             )
@@ -2188,6 +2244,27 @@ with tab_analysis:
                 # no separate force curves to draw; what differs between them is
                 # how much of the deformation each one takes.
                 membrane = interior = nucleus = None
+
+            # The model is only claimed over the range it was fitted on.
+            # Drawn past that it is extrapolation, and a power law far outside
+            # its window flattens into a line that looks like a result. NaN
+            # outside the window makes plotly stop the line at the last
+            # fitted point instead.
+            # Use the range the fit actually recorded, not the sliders, so a
+            # slider moved after the fit cannot punch NaNs into the residuals.
+            drawn_lo, drawn_hi = fit.get("epsilon_range", (fit_lo, fit_hi))
+
+            def clip_to_window(values):
+                if values is None:
+                    return None
+                out = np.array(values, dtype=float, copy=True)
+                out[(epsilon < drawn_lo) | (epsilon > drawn_hi)] = np.nan
+                return out
+
+            fitted = clip_to_window(fitted)
+            membrane = clip_to_window(membrane)
+            interior = clip_to_window(interior)
+            nucleus = clip_to_window(nucleus)
 
             deformation_shares = None
             if fitted_coupling in ("series", "hybrid"):
