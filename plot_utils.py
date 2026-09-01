@@ -642,6 +642,14 @@ def cell_schematic(
             f"<i>({WORD[state['nucleus']]})</i>"
         )
     caption = f"ε = {epsilon:.3f}"
+    if break_1 is not None and break_2 is not None and coupling == "parallel":
+        # Worth saying outright, because "segmented" sounds like the elements
+        # take turns in a line. They do not: every element is squashed by the
+        # same ε and their forces add. Segmenting decides when each one
+        # switches on, not how the load travels.
+        caption += (
+            "<br><i>Same squash on each, forces add. Not stacked.</i>"
+        )
     if labels:
         caption += "<br>" + "<br>".join(labels)
 
@@ -669,9 +677,9 @@ def cell_schematic(
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
         title=dict(text="<b>%s</b>" % (
             stage_name if stage_name
-            else "Stacked in series" if coupling == "series"
-            else "Spring inside the balloon" if coupling == "parallel"
-            else "Hybrid load path"),
+            else "Stacked in a line: same force, squashes add" if coupling == "series"
+            else "Side by side: same squash, forces add" if coupling == "parallel"
+            else "Load path changes partway"),
                    font=dict(size=max(12, style.tick_size - 4), color="black"), x=0.5,
                    xanchor="center"),
     )
