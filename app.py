@@ -321,6 +321,9 @@ DEFAULTS = {
     "video_brightness": 0,
     "video_contrast": 1.0,
     "video_cell_side": "anywhere",
+    # In phase contrast the cell is usually the clear, bright object; saying
+    # so stops a dark patch of debris winning on shape alone.
+    "video_appearance": "clear",
     "video_reject_dark": True,
     "video_find_nucleus": True,
     "video_strip_lines": True,
@@ -459,6 +462,7 @@ def cached_frame(path, signature, index):
 def cached_detection(
     path, signature, index, roi, sensitivity, strip_lines,
     enhance=None, cell_side="anywhere", reject_dark=True, find_nucleus=False,
+    appearance="either",
 ):
     """Read one frame, enhance it, and find the probe, cell and nucleus."""
     frame = va.read_frame(path, index)
@@ -473,6 +477,7 @@ def cached_detection(
     det = va.detect_cell(
         frame, roi=roi, sensitivity=sensitivity, strip_lines=strip_lines,
         probe=probe_box, cell_side=cell_side, reject_dark=reject_dark,
+        appearance=appearance,
     )
     nucleus = va.detect_nucleus(frame, det) if (find_nucleus and det.get("found")) else None
     return frame, det, nucleus, probe_box
@@ -480,7 +485,8 @@ def cached_detection(
 
 @st.cache_data(show_spinner="Tracking the cell through the video…")
 def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, start, end,
-                 enhance=None, cell_side="anywhere", reject_dark=True, find_nucleus=False):
+                 enhance=None, cell_side="anywhere", reject_dark=True,
+                 find_nucleus=False, appearance="either"):
     track = va.track_cell(
         path,
         n_samples=n_samples,
@@ -492,6 +498,7 @@ def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, star
         cell_side=cell_side,
         reject_dark=reject_dark,
         track_nucleus=find_nucleus,
+        appearance=appearance,
     )
     # Detections hold OpenCV contours; drop them so the cached value stays small.
     return {k: v for k, v in track.items() if k != "detections"}
@@ -881,6 +888,7 @@ def morphology_frame_png():
             st.session_state["video_cell_side"],
             bool(st.session_state["video_reject_dark"]),
             bool(st.session_state["video_find_nucleus"]),
+            st.session_state["video_appearance"],
         )
         if frame is None:
             return None
@@ -890,8 +898,14 @@ def morphology_frame_png():
         return None
 
 
-def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model, stage_plan):
-    """Package this analysis and write it into the cell's Box folder."""
+def cell_record(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
+    """
+    The record and the curve, built once.
+
+    Box and the download both go through here, so the file you keep on disk
+    is the same record the database holds rather than a near-copy that drifts
+    from it.
+    """
     curve = pd.DataFrame(
         {
             "relative_deformation": epsilon,
@@ -942,6 +956,14 @@ def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model,
                 video_bytes = handle.read()
             video_name = os.path.basename(path) or "video.mp4"
 
+    return record, curve, video_bytes, video_name
+
+
+def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model, stage_plan):
+    """Package this analysis and write it into the cell's Box folder."""
+    record, curve, video_bytes, video_name = cell_record(
+        fit, epsilon, force_N, fitted, date_acquired, stage_plan
+    )
     return store.save_cell(
         record,
         curve_csv=curve,
@@ -949,6 +971,25 @@ def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model,
         video_bytes=video_bytes,
         video_name=video_name,
     )
+
+
+def cell_bundle_zip(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
+    """The same record as Box, as a zip the browser can download."""
+    import zipfile
+
+    record, curve, video_bytes, video_name = cell_record(
+        fit, epsilon, force_N, fitted, date_acquired, stage_plan
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("record.json", json.dumps(record, indent=2, default=str))
+        archive.writestr("curve.csv", curve)
+        frame = morphology_frame_png()
+        if frame:
+            archive.writestr("morphology.png", frame)
+        if video_bytes:
+            archive.writestr(video_name, video_bytes)
+    return buffer.getvalue()
 
 
 def model_from_record(record, curve):
@@ -1007,6 +1048,8 @@ def refit_stored_cell(store, cell_id, settings):
             e2=float(settings.get("segment_break_2", 0.40)),
             membrane=membrane,
             cyto_start=cyto_start,
+            use_membrane="membrane" in terms,
+            use_interior="interior" in terms,
             use_nucleus="nucleus" in terms,
             weighting=settings.get("weighting", "uniform"),
         )
@@ -2215,6 +2258,8 @@ with tab_analysis:
                         fit_lo, fit_hi, e1=break_1, e2=break_2,
                         membrane=membrane_mode,
                         cyto_start=cyto_mode,
+                        use_membrane="membrane" in active,
+                        use_interior="interior" in active,
                         use_nucleus="nucleus" in active,
                         weighting=st.session_state["weighting"],
                     )
@@ -2442,35 +2487,43 @@ with tab_analysis:
                 "timestamp": datetime.now(),
             }
 
-            metric_cols = st.columns(3 + (1 if "nucleus" in active else 0) + 1)
-            metric_cols[0].metric(
-                "Eₘ membrane",
-                f"{fit['Em_MPa']:.3g} MPa",
-                delta=f"± {fit['Em_MPa_std']:.2g}"
-                if np.isfinite(fit.get("Em_MPa_std", np.nan))
-                else None,
-                delta_color="off",
-            )
-            metric_cols[1].metric(
-                "Ec cytoskeleton",
-                f"{fit['Ei_kPa']:.3g} kPa",
-                delta=f"± {fit['Ei_kPa_std']:.2g}"
-                if np.isfinite(fit.get("Ei_kPa_std", np.nan))
-                else None,
-                delta_color="off",
-            )
-            index = 2
-            if "nucleus" in active:
-                metric_cols[index].metric(
-                    "Eₙ nucleus",
-                    f"{fit.get('En_kPa', 0.0):.3g} kPa",
-                    delta=f"onset ε₀ = {model.nucleus_onset:.3f}",
+            # All three moduli, always. A term that was not in the model reads
+            # 0 and says so, rather than disappearing: a blank column in a
+            # results table is ambiguous between "zero" and "not measured",
+            # and the two mean very different things when you pool cells.
+            fitted_terms = set(fit.get("terms") or active)
+            metric_cols = st.columns(5)
+            for slot, (label, value, unit, term) in enumerate(
+                (
+                    ("Eₘ membrane", fit.get("Em_MPa", 0.0), "MPa", "membrane"),
+                    ("Ec cytoskeleton", fit.get("Ei_kPa", 0.0), "kPa", "interior"),
+                    ("Eₙ nucleus", fit.get("En_kPa", 0.0), "kPa", "nucleus"),
+                )
+            ):
+                used = term in fitted_terms
+                std = fit.get(
+                    {"membrane": "Em_MPa_std", "interior": "Ei_kPa_std",
+                     "nucleus": "En_kPa_std"}[term], float("nan")
+                )
+                if not used:
+                    note = "not in this model"
+                elif value <= 0:
+                    note = "came out at zero"
+                elif np.isfinite(std):
+                    note = f"± {std:.2g}"
+                elif term == "nucleus":
+                    note = f"engages at ε = {fit.get('break_2', model.nucleus_onset):.3f}"
+                else:
+                    note = " "
+                metric_cols[slot].metric(
+                    label,
+                    f"{0.0 if not used else value:.3g} {unit}",
+                    delta=note,
                     delta_color="off",
                 )
-                index += 1
-            metric_cols[index].metric("R²", f"{fit['r_squared']:.4f}")
+            metric_cols[3].metric("R²", f"{fit['r_squared']:.4f}")
             rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
-            metric_cols[index + 1].metric("RMSE", f"{float(rmse_disp):.3g} {rmse_unit}")
+            metric_cols[4].metric("RMSE", f"{float(rmse_disp):.3g} {rmse_unit}")
 
             st.caption(
                 f"Membrane areal modulus Eₘ·h = "
@@ -2480,6 +2533,76 @@ with tab_analysis:
                 f"{st.session_state['membrane_thickness_nm']:.1f} nm, so halving the "
                 f"thickness doubles Eₘ while the measurement is unchanged."
             )
+
+            if fitted_coupling == "segmented" and fitted is not None:
+                # What each element is doing in each stretch, and how much of
+                # the force it carries there. This is the question the moduli
+                # alone do not answer: a modulus says how stiff, not how much
+                # of the load that stiffness actually took.
+                st.markdown("**How the three share the load, range by range**")
+                e1, e2 = fit["break_1"], fit["break_2"]
+                membrane_mode_fit = fit.get("membrane", "freeze")
+                cyto_mode_fit = fit.get("cyto_start", "break")
+
+                def state_words(term, lo, hi):
+                    if term == "membrane":
+                        if hi <= e1 or membrane_mode_fit == "continue":
+                            return "loading"
+                        return "holding"
+                    if term == "interior":
+                        if cyto_mode_fit == "zero" or lo >= e1:
+                            return "loading"
+                        return "not yet"
+                    return "loading" if lo >= e2 else "not yet"
+
+                rows = []
+                for name, lo, hi in (
+                    ("1", fit["epsilon_range"][0], e1),
+                    ("2", e1, e2),
+                    ("3", e2, fit["epsilon_range"][1]),
+                ):
+                    inside = (epsilon >= lo) & (epsilon <= hi)
+                    if not inside.any() or hi <= lo:
+                        continue
+                    share = {}
+                    for term, curve in (
+                        ("membrane", membrane), ("interior", interior),
+                        ("nucleus", nucleus),
+                    ):
+                        if curve is None:
+                            share[term] = 0.0
+                            continue
+                        at_top = float(np.nan_to_num(curve[inside][-1]))
+                        share[term] = max(at_top, 0.0)
+                    total = sum(share.values()) or 1.0
+                    row = {
+                        "range": f"{lo:.3f} to {hi:.3f}",
+                        "points": int(inside.sum()),
+                    }
+                    for term, label in (
+                        ("membrane", "membrane"), ("interior", "cytoskeleton"),
+                        ("nucleus", "nucleus"),
+                    ):
+                        word = state_words(term, lo, hi)
+                        if term not in fitted_terms:
+                            row[label] = "not in model"
+                        elif word == "not yet":
+                            row[label] = "0 %  not yet"
+                        else:
+                            row[label] = f"{100 * share[term] / total:.0f} %  {word}"
+                    rows.append(row)
+
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+                    st.caption(
+                        "Percentages are each element's share of the total force at "
+                        "the top of that range, so they show who is carrying the "
+                        "cell by the end of each stretch. “Holding” means the "
+                        "element adds no further force but keeps what it had "
+                        "reached, so its share falls while its force does not. A "
+                        "term switched off in the model reads “not in model” rather "
+                        "than zero, because those are different statements."
+                    )
 
             if fitted_coupling != "parallel" and st.session_state["show_components"]:
                 st.caption(
@@ -2616,6 +2739,7 @@ with tab_analysis:
                         st.session_state["video_cell_side"],
                         bool(st.session_state["video_reject_dark"]),
                         bool(st.session_state["video_find_nucleus"]),
+                        st.session_state["video_appearance"],
                     )
                     if vframe is None:
                         st.info("Frame unavailable.")
@@ -2828,60 +2952,87 @@ with tab_analysis:
                 st.caption("No video loaded for this cell.")
 
         have_fit = bool(fit and fit.get("success"))
+        named = bool(st.session_state["cell_name"].strip())
 
-        c1, c2 = st.columns([2, 1])
+        # Say what is blocking the send, in the order you would fix it. A
+        # greyed-out button with no explanation is the same as a broken one.
+        blockers = []
+        if not named:
+            blockers.append("give the cell a name in section 1")
+        if not have_fit:
+            blockers.append("fit the curve above")
+        if not ready:
+            blockers.append("connect to Box in the sidebar")
+
+        st.checkbox(
+            "Also upload the video file itself",
+            key="upload_video_with_cell",
+            help="Off sends the cell without the video; the record, curve "
+            "and fit go either way. On also copies the video into the "
+            "cell's Box folder so it can be opened from the database.",
+        )
+
+        will_send = ["the record, the curve and the fit"]
+        if st.session_state.get("video_path") and os.path.exists(
+            st.session_state["video_path"]
+        ):
+            if st.session_state["upload_video_with_cell"]:
+                will_send.append("the video file")
+            if not VIDEO_IMPORT_ERROR:
+                will_send.append("a morphology frame")
+        st.caption(
+            "Either destination sends " + ", ".join(will_send)
+            + ". The video is optional: a cell can be sent with none at all."
+        )
+
+        c1, c2 = st.columns(2)
         with c1:
-            if not ready:
-                st.caption(
-                    "Not connected to Box. Open **Box database** in the sidebar "
-                    "to connect, and the button here will send this cell."
-                )
-            elif not have_fit:
-                st.caption(
-                    "Fit the curve above and the button here will send this cell. "
-                    "A video is not needed either way."
-                )
-            else:
-                bits = ["curve and fit"]
-                if st.session_state.get("video_path") and os.path.exists(
-                    st.session_state["video_path"]
-                ):
-                    bits.append("video" if st.session_state["upload_video_with_cell"]
-                                else "a link to the video")
-                    if not VIDEO_IMPORT_ERROR:
-                        bits.append("a morphology frame")
-                st.caption("Will send: " + ", ".join(bits) + ".")
-            st.checkbox(
-                "Also upload the video file itself",
-                key="upload_video_with_cell",
-                help="Off sends the cell without the video; the record, curve "
-                "and fit go either way. On also copies the video into the "
-                "cell's Box folder so it can be opened from the database.",
-            )
+            box_blockers = [b for b in blockers]
+            if st.button(
+                "📤 Send to Box", type="primary",
+                disabled=bool(box_blockers), **STRETCH,
+            ):
+                try:
+                    with st.spinner("Uploading to Box…"):
+                        saved = send_cell_to_box(
+                            store, fit, epsilon, force_N, fitted,
+                            date_acquired, model, stage_plan,
+                        )
+                    st.success(
+                        f"Saved **{saved['cell_id']}** to Box."
+                        + (f" [Open the video]({saved['video_url']})"
+                           if saved.get("video_url") else "")
+                    )
+                    st.session_state["box_index"] = None
+                except Exception as exc:
+                    st.error(f"Could not save: {exc}")
             st.caption(
-                "The video is optional. A cell can be sent with no video at all."
+                "Ready to send." if not box_blockers
+                else "To enable: " + ", then ".join(box_blockers) + "."
             )
         with c2:
-            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
-            if st.button("📤 Send to database", type="primary",
-                         disabled=not (ready and have_fit), **STRETCH):
-                if not st.session_state["cell_name"]:
-                    st.error("Give the cell a name first.")
-                else:
-                    try:
-                        with st.spinner("Uploading to Box…"):
-                            saved = send_cell_to_box(
-                                store, fit, epsilon, force_N, fitted,
-                                date_acquired, model, stage_plan,
-                            )
-                        st.success(
-                            f"Saved **{saved['cell_id']}** to Box."
-                            + (f" [Open the video]({saved['video_url']})"
-                               if saved.get("video_url") else "")
-                        )
-                        st.session_state["box_index"] = None
-                    except Exception as exc:
-                        st.error(f"Could not save: {exc}")
+            # Box needs credentials that take a while to obtain. This does
+            # not, and it writes exactly the same record, so the analysis is
+            # never stuck inside the app waiting on an administrator.
+            download_blockers = [b for b in blockers if "Box" not in b]
+            if download_blockers:
+                st.button("⬇️ Download this cell", disabled=True, **STRETCH)
+            else:
+                st.download_button(
+                    "⬇️ Download this cell",
+                    data=cell_bundle_zip(
+                        fit, epsilon, force_N, fitted, date_acquired, stage_plan
+                    ),
+                    file_name=f"{st.session_state['cell_name'].strip()}.zip",
+                    mime="application/zip",
+                    **STRETCH,
+                )
+            st.caption(
+                "A zip with record.json, curve.csv and the frame. Same record "
+                "as Box, no account needed."
+                if not download_blockers
+                else "To enable: " + ", then ".join(download_blockers) + "."
+            )
 
 
 # ==================================================== TAB 2: video analysis ==
@@ -2995,6 +3146,16 @@ with tab_video:
                     "before segmenting, so it stops being picked as the cell.",
                 )
                 st.selectbox(
+                    "The cell looks …",
+                    ["clear", "dark", "either"],
+                    key="video_appearance",
+                    help="… compared with the background. In phase contrast "
+                    "the cell is usually the clear, bright object, and saying so "
+                    "stops a dark patch of debris of similar shape being picked "
+                    "instead. Choose “either” if the cell matches the background "
+                    "and shows only as an outline.",
+                )
+                st.selectbox(
                     "The cell sits …",
                     ["anywhere", "right", "left", "above", "below"],
                     key="video_cell_side",
@@ -3036,6 +3197,7 @@ with tab_video:
                 st.session_state["video_cell_side"],
                 bool(st.session_state["video_reject_dark"]),
                 bool(st.session_state["video_find_nucleus"]),
+                st.session_state["video_appearance"],
             )
 
             p1, p2 = st.columns([2, 1])
@@ -3129,6 +3291,7 @@ with tab_video:
                         st.session_state["video_cell_side"],
                         bool(st.session_state["video_reject_dark"]),
                         bool(st.session_state["video_find_nucleus"]),
+                        st.session_state["video_appearance"],
                     )
                 except Exception as exc:
                     st.error(f"Tracking failed: {exc}")
