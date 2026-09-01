@@ -553,6 +553,150 @@ def case_download_when_box_is_absent():
     check("there is a fit to package", fit is not None)
 
 
+class FakeWorksheet:
+    """A worksheet that records what would be written to the real sheet."""
+
+    def __init__(self, header):
+        self.header = list(header)
+        self.rows = []
+        self.updates = []
+
+    def row_values(self, index):
+        return list(self.header) if index == 1 else []
+
+    def update(self, values=None, range_name=None, **kwargs):
+        self.header = list(values[0])
+        self.updates.append(list(values[0]))
+
+    def append_row(self, row, **kwargs):
+        self.rows.append(list(row))
+
+    def insert_row(self, row, index):
+        self.header = list(row)
+
+
+def case_sheet_row_matches_the_header():
+    print("the sheet row is built from the sheet's own header")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    # The user's real sheet, as it stands today: no nucleus column.
+    existing = [
+        "Cell ID", "Date Analyzed", "Cell Height (μm)",
+        "Cantilever Constant (pN/nm)", "Young's Modulus (Em, MPa)",
+        "Young's Modulus (Ei, kPa)", "Video Link", "Force Curve Created",
+        "Fit Quality (R²)", "Notes", "Analysis Status", "Timestamp",
+    ]
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet = FakeWorksheet(existing)
+    manager.worksheet = sheet
+
+    ok, message = manager.append_cell_data({
+        "cell_id": "cell-01", "Em": 0.605, "Ei": 1.196, "En": 3.027,
+        "break_1": 0.151, "break_2": 0.403, "fit_quality": 0.9997,
+        "cell_height": 8.0, "notes": "test",
+    })
+    check("the write succeeded", ok, message)
+    check("the header was extended, not rebuilt",
+          sheet.header[:12] == existing, str(sheet.header[:12]))
+    check("a nucleus column was added",
+          "Young's Modulus (En, kPa)" in sheet.header, str(sheet.header))
+    for wanted in ("ε₁ membrane hands over", "ε₂ nucleus engages"):
+        check(f"{wanted} column added", wanted in sheet.header)
+
+    check("exactly one row was written", len(sheet.rows) == 1)
+    written = dict(zip(sheet.header, sheet.rows[0]))
+    check("cell id in the right column", written["Cell ID"] == "cell-01")
+    check("Em in the Em column",
+          abs(float(written["Young's Modulus (Em, MPa)"]) - 0.605) < 1e-6)
+    check("En in the new nucleus column",
+          abs(float(written["Young's Modulus (En, kPa)"]) - 3.027) < 1e-6)
+    check("ε₂ written", abs(float(written["ε₂ nucleus engages"]) - 0.403) < 1e-6)
+    check("row length matches the header", len(sheet.rows[0]) == len(sheet.header))
+
+    # A sheet whose columns someone has reordered must still be written
+    # correctly, which is the whole point of going by name.
+    shuffled = list(reversed(existing))
+    manager2 = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet2 = FakeWorksheet(shuffled)
+    manager2.worksheet = sheet2
+    manager2.append_cell_data({"cell_id": "cell-02", "Em": 1.5})
+    written2 = dict(zip(sheet2.header, sheet2.rows[0]))
+    check("reordered header still gets the right cell id",
+          written2["Cell ID"] == "cell-02")
+    check("reordered header still gets Em in the Em column",
+          abs(float(written2["Young's Modulus (Em, MPa)"]) - 1.5) < 1e-6)
+
+
+def case_fit_line_and_heights_toggle():
+    print("the fitted curve and the component heights each have a switch")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+
+    def build(**flags):
+        style = plot_utils.PlotStyle(force_unit="N", show_components=True, **flags)
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=fitted,
+            membrane_N=mb * fit["Em"], interior_N=cb * fit["Ei"],
+            nucleus_N=nb * fit["En"],
+        )
+
+    on = build()
+    check("the model line is drawn by default",
+          any(t.name == "Model" for t in on.data))
+    check("no height labels by default", len(on.layout.annotations) == 0)
+
+    off = build(show_fit_line=False)
+    check("switching the fit off removes the model line",
+          not any(t.name == "Model" for t in off.data))
+    check("the data is still there",
+          any(t.name == "Experimental data" for t in off.data))
+
+    labelled = build(show_component_heights=True)
+    texts = [a.text for a in labelled.layout.annotations]
+    check("a height label per component plus the total",
+          len(texts) == 4, str(texts))
+    check("the labels carry the force unit",
+          all("N" in (t or "") for t in texts), str(texts))
+
+
+def case_range_table_shows_zero_moduli():
+    print("each range lists the moduli active there, zero where not reached")
+    app = start()
+    if not no_exception(app, "range table"):
+        return
+    frames = app.get("dataframe")
+    target = None
+    for frame in frames:
+        columns = list(getattr(frame.value, "columns", []))
+        if "range" in columns and "membrane" in columns:
+            target = frame.value
+    check("the range table is on the page", target is not None)
+    if target is None:
+        return
+    for column in ("E membrane", "E cytoskeleton", "E nucleus"):
+        check(f"{column} column present", column in target.columns,
+              str(list(target.columns)))
+    first = target.iloc[0]
+    check("the first range carries only the membrane",
+          first["E cytoskeleton"].startswith("0")
+          and first["E nucleus"].startswith("0"),
+          f"{first['E cytoskeleton']!r} {first['E nucleus']!r}")
+    check("and the membrane is non-zero there",
+          not first["E membrane"].startswith("0 "), str(first["E membrane"]))
+    last = target.iloc[-1]
+    check("the last range carries the nucleus",
+          not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -691,6 +835,9 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_sheet_row_matches_the_header,
+        case_fit_line_and_heights_toggle,
+        case_range_table_shows_zero_moduli,
         case_all_three_moduli_always_reported,
         case_load_share_table,
         case_download_when_box_is_absent,
