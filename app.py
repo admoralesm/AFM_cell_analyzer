@@ -43,6 +43,17 @@ except Exception as exc:  # pragma: no cover - depends on local install
     SHEETS_IMPORT_ERROR = str(exc)
 
 try:
+    import box_store
+    from box_store import BoxStore, BoxError
+
+    BOX_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
+    box_store = None
+    BoxStore = None
+    BoxError = Exception
+    BOX_IMPORT_ERROR = str(exc)
+
+try:
     import video_analysis as va
 
     VIDEO_IMPORT_ERROR = None if va.available() else "OpenCV is not installed"
@@ -183,6 +194,16 @@ DEFAULTS = {
     "cell_name": "",
     "cell_height_um": 8.09,
     "spring_constant": 0.0,
+    "invols_nm_per_V": 50.0,
+    "operator": "",
+    "cell_notes": "",
+    "box_root_folder": "",
+    "box_store": None,
+    "box_index": None,
+    "db_selection": [],
+    "upload_video_with_cell": True,
+    "db_search": "",
+    "db_view": "Gallery",
     "video_link": "",
     # video
     "video_path": None,
@@ -276,6 +297,15 @@ def load_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
             continue
     buffer.seek(0)
     return pd.read_csv(buffer)
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def cached_thumbnail(root_folder, file_id):
+    """Thumbnails are small and re-requested on every rerun, so cache them."""
+    store = st.session_state.get("box_store")
+    if store is None:
+        return None
+    return store.thumbnail_bytes(file_id)
 
 
 @st.cache_data(show_spinner=False)
@@ -441,8 +471,10 @@ CELL_TYPES = {
         "nucleus_onset": 0.20,
         # expected bands in pascals
         "expected": {"Em": (2e5, 2e7), "Ei": (2e2, 1e4), "En": (1e3, 5e4)},
-        "windows": {"membrane": (0.18, 0.32), "interior": (0.01, 0.12),
-                    "nucleus": (0.24, 0.40)},
+        # The membrane carries load from the very start of the compression, so
+        # its window opens at zero rather than partway along.
+        "windows": {"membrane": (0.0, 0.40), "interior": (0.0, 0.40),
+                    "nucleus": (0.40, 1.0)},
     },
     "Cardiomyocyte": {
         "cell_height_um": 12.0,
@@ -451,8 +483,8 @@ CELL_TYPES = {
         "membrane_thickness_nm": 4.5,
         "nucleus_onset": 0.18,
         "expected": {"Em": (5e5, 5e7), "Ei": (1e3, 1e5), "En": (2e3, 2e5)},
-        "windows": {"membrane": (0.15, 0.30), "interior": (0.01, 0.10),
-                    "nucleus": (0.22, 0.38)},
+        "windows": {"membrane": (0.0, 0.35), "interior": (0.0, 0.35),
+                    "nucleus": (0.35, 1.0)},
     },
     "Custom": {
         "cell_height_um": 8.09,
@@ -461,8 +493,8 @@ CELL_TYPES = {
         "membrane_thickness_nm": 4.0,
         "nucleus_onset": 0.15,
         "expected": {"Em": (1e3, 1e9), "Ei": (1e0, 1e7), "En": (1e1, 1e7)},
-        "windows": {"membrane": (0.15, 0.30), "interior": (0.01, 0.12),
-                    "nucleus": (0.22, 0.40)},
+        "windows": {"membrane": (0.0, 0.40), "interior": (0.0, 0.40),
+                    "nucleus": (0.40, 1.0)},
     },
 }
 
@@ -594,6 +626,215 @@ def apply_plot_drag(chart_key, lo, hi):
     if st.session_state.get(key) != window:
         st.session_state["_pending_settings"] = {key: window}
         st.rerun()
+
+
+
+# ======================================================== the Box database ==
+
+
+def current_fit_settings():
+    """Everything needed to reproduce the fit currently configured."""
+    return {
+        "coupling": st.session_state["coupling"],
+        "procedure": st.session_state["procedure"],
+        "terms": list(active_terms()),
+        "regime_mode": bool(st.session_state["regime_mode"]),
+        "weighting": st.session_state["weighting"],
+        "fit_offset": bool(st.session_state["fit_offset"]),
+        "refine_iterations": int(st.session_state["refine_iterations"]),
+        "nucleus_onset": float(st.session_state["nucleus_onset"]),
+        "cell_type": st.session_state["cell_type"],
+        "radius_aspect": float(st.session_state["radius_aspect"]),
+        "nucleus_fraction": float(st.session_state["nucleus_fraction"]),
+        "membrane_thickness_nm": float(st.session_state["membrane_thickness_nm"]),
+        "poisson_membrane": float(st.session_state["poisson_membrane"]),
+        "poisson_interior": float(st.session_state["poisson_interior"]),
+        "term_windows": {
+            term: list(st.session_state.get(f"window_term_{term}", (0.0, 1.0)))
+            for term in TERM_ORDER
+        },
+        "combined_window": list(st.session_state.get("window_combined", (0.0, 1.0))),
+    }
+
+
+def morphology_frame_png():
+    """A single frame showing the cell, for the database gallery."""
+    if VIDEO_IMPORT_ERROR or not st.session_state.get("video_path"):
+        return None
+    path = st.session_state["video_path"]
+    if not os.path.exists(path):
+        return None
+    try:
+        index = int(st.session_state.get("video_preview_frame", 0))
+        frame, det, nucleus, probe_box = cached_detection(
+            path, video_signature(), index,
+            st.session_state["video_roi"],
+            float(st.session_state["video_sensitivity"]),
+            bool(st.session_state["video_strip_lines"]),
+            enhancement(),
+            st.session_state["video_cell_side"],
+            bool(st.session_state["video_reject_dark"]),
+            bool(st.session_state["video_find_nucleus"]),
+        )
+        if frame is None:
+            return None
+        annotated = va.annotate(frame, det, nucleus=nucleus, probe=probe_box)
+        return png_bytes(va.crop(annotated, det) if det and det.get("found") else annotated)
+    except Exception:
+        return None
+
+
+def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model, stage_plan):
+    """Package this analysis and write it into the cell's Box folder."""
+    curve = pd.DataFrame(
+        {
+            "relative_deformation": epsilon,
+            "force_N": force_N,
+            "fit_N": fitted,
+        }
+    ).to_csv(index=False)
+
+    record = {
+        "cell_id": st.session_state["cell_name"],
+        "date": str(date_acquired),
+        "cell_type": st.session_state["cell_type"],
+        "cell_height_um": float(st.session_state["cell_height_um"]),
+        "spring_constant_N_per_m": float(st.session_state["spring_constant"]),
+        "invols_nm_per_V": float(st.session_state["invols_nm_per_V"]),
+        "operator": st.session_state["operator"],
+        "notes": st.session_state["cell_notes"],
+        "coupling": fit.get("coupling", "parallel"),
+        "procedure": st.session_state["procedure"],
+        "Em_MPa": float(fit.get("Em_MPa", 0.0)),
+        "Ec_kPa": float(fit.get("Ei_kPa", 0.0)),
+        "En_kPa": float(fit.get("En_kPa", 0.0)),
+        "r_squared": float(fit.get("r_squared", float("nan"))),
+        "rmse_N": float(fit.get("rmse", float("nan"))),
+        "epsilon_min": float(fit["epsilon_range"][0]),
+        "epsilon_max": float(fit["epsilon_range"][1]),
+        "n_points": int(fit.get("n_points", 0)),
+        "R0_um": float(fit.get("R0", 0.0)) * 1e6,
+        "membrane_areal_modulus_mN_per_m": float(
+            fit.get("membrane_areal_modulus", 0.0)
+        ) * 1e3,
+        "settings": current_fit_settings(),
+        "stage_plan": [
+            {"terms": list(stage["terms"]), "range": list(stage["range"])}
+            for stage in stage_plan
+        ],
+        "warnings": list(fit.get("warnings", [])),
+        "source_file": st.session_state["data"].get("source", ""),
+        "video_url": st.session_state.get("video_link", ""),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    video_bytes, video_name = None, "video.mp4"
+    if st.session_state.get("upload_video_with_cell") and st.session_state.get("video_path"):
+        path = st.session_state["video_path"]
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                video_bytes = handle.read()
+            video_name = os.path.basename(path) or "video.mp4"
+
+    return store.save_cell(
+        record,
+        curve_csv=curve,
+        thumbnail_png=morphology_frame_png(),
+        video_bytes=video_bytes,
+        video_name=video_name,
+    )
+
+
+def model_from_record(record, curve):
+    """Rebuild a model from a stored record, using that cell's own geometry."""
+    settings = record.get("settings") or {}
+    height_m = float(record.get("cell_height_um", 8.0)) * 1e-6
+    radius_m = height_m * float(settings.get("radius_aspect", 0.55))
+    windows = settings.get("term_windows") if settings.get("regime_mode") else None
+    return LulevichModel(
+        curve["force_N"].to_numpy(dtype=float),
+        curve["relative_deformation"].to_numpy(dtype=float),
+        cell_height=height_m,
+        cell_radius=radius_m,
+        membrane_thickness=float(settings.get("membrane_thickness_nm", 4.0)) * 1e-9,
+        poisson_membrane=float(settings.get("poisson_membrane", 0.5)),
+        poisson_interior=float(settings.get("poisson_interior", 0.5)),
+        nucleus_radius=radius_m * float(settings.get("nucleus_fraction", 0.35)),
+        nucleus_onset=float(settings.get("nucleus_onset", 0.2)),
+        active_windows={k: tuple(v) for k, v in (windows or {}).items()} or None,
+    )
+
+
+def refit_stored_cell(store, cell_id, settings):
+    """
+    Refit one stored cell with a given set of settings and save the result.
+
+    The cell's own geometry is kept: height, spring constant and the rest were
+    measured for that cell and are not something a batch should overwrite. Only
+    the fitting choices come from the settings passed in.
+    """
+    record = store.load_cell(cell_id)
+    if not record or not record.get("curve_csv"):
+        raise BoxError(f"{cell_id}: no stored curve to refit.")
+    curve = pd.read_csv(io.StringIO(record["curve_csv"]))
+
+    merged = dict(record.get("settings") or {})
+    merged.update(settings)
+    record["settings"] = merged
+    model = model_from_record(record, curve)
+
+    terms = tuple(settings.get("terms") or ("membrane", "interior"))
+    lo, hi = settings.get("combined_window", [0.02, 0.4])
+    coupling = COUPLING_KEYS.get(settings.get("coupling", ""), "parallel")
+
+    if coupling == "series":
+        fit = model.fit_series(lo, hi, terms=terms, weighting=settings.get("weighting", "uniform"))
+    elif coupling in ("hybrid_ps", "hybrid_sp"):
+        order = "parallel-then-series" if coupling == "hybrid_ps" else "series-then-parallel"
+        scan = model.scan_crossover(lo, hi, terms=terms, order=order)
+        if not scan.get("success"):
+            raise BoxError(f"{cell_id}: hybrid fit failed.")
+        fit = scan["best"]
+    elif coupling == "auto":
+        comparison = compare_couplings(model, lo, hi, terms=terms)
+        if not comparison.get("success"):
+            raise BoxError(f"{cell_id}: {comparison.get('error')}")
+        fit = comparison["fits"][comparison["best"]["coupling"]]
+    elif settings.get("procedure") == "Stage by stage":
+        windows = settings.get("term_windows", {})
+        plan = [
+            {"terms": (term,), "range": tuple(windows.get(term, (lo, hi)))}
+            for term in terms
+        ]
+        fit = model.fit_staged(
+            plan, weighting=settings.get("weighting", "uniform"),
+            refine_iterations=int(settings.get("refine_iterations", 3)),
+        )
+    else:
+        fit = model.fit(lo, hi, terms=terms,
+                        weighting=settings.get("weighting", "uniform"),
+                        fit_offset=bool(settings.get("fit_offset", False)))
+
+    if not fit.get("success"):
+        raise BoxError(f"{cell_id}: {fit.get('error', 'fit failed')}")
+
+    record.update(
+        {
+            "coupling": fit.get("coupling", "parallel"),
+            "procedure": settings.get("procedure", record.get("procedure", "")),
+            "Em_MPa": float(fit.get("Em_MPa", 0.0)),
+            "Ec_kPa": float(fit.get("Ei_kPa", 0.0)),
+            "En_kPa": float(fit.get("En_kPa", 0.0)),
+            "r_squared": float(fit.get("r_squared", float("nan"))),
+            "epsilon_min": float(fit["epsilon_range"][0]),
+            "epsilon_max": float(fit["epsilon_range"][1]),
+            "n_points": int(fit.get("n_points", 0)),
+            "refit_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    record.pop("curve_csv", None)
+    store.save_cell(record)
+    return record
 
 
 
@@ -769,7 +1010,59 @@ with st.sidebar:
             help="Only appears once a video is loaded in the Compression video tab.",
         )
 
-    with st.expander("🗄️ Google Sheets database"):
+    with st.expander("📦 Box database", expanded=False):
+        if BOX_IMPORT_ERROR:
+            st.error(f"Box module unavailable: {BOX_IMPORT_ERROR}")
+        else:
+            st.text_input(
+                "Root folder ID",
+                key="box_root_folder",
+                placeholder="0 for All Files, or the id from the folder URL",
+                help="Open the folder in Box; the id is the number at the end of "
+                "the URL. Everything is stored under it as cells/<cell name>/.",
+            )
+            if st.button("🔌 Connect to Box", **STRETCH):
+                try:
+                    store = box_store.store_from_secrets(
+                        st, st.session_state["box_root_folder"] or None
+                    )
+                    if store is None:
+                        st.error(
+                            "No [box] section in secrets. See the setup notes below."
+                        )
+                    else:
+                        info = store.check()
+                        st.session_state["box_store"] = store
+                        st.session_state["box_index"] = None
+                        st.success(
+                            f"Connected as {info['login']} · folder "
+                            f"“{info['folder_name']}” · {info['auth_method']}"
+                        )
+                except Exception as exc:
+                    st.session_state["box_store"] = None
+                    st.error(str(exc))
+            if st.session_state.get("box_store"):
+                st.caption("Connected ✓")
+            with st.expander("Setting up Box"):
+                st.markdown(
+                    "Create an app at **developer.box.com**, then put its "
+                    "credentials in `.streamlit/secrets.toml`:\n\n"
+                    "```toml\n[box]\nclient_id = \"...\"\n"
+                    "client_secret = \"...\"\nenterprise_id = \"...\"\n"
+                    "root_folder_id = \"0\"\n```\n\n"
+                    "**Client Credentials Grant** is the one to ask for: its tokens "
+                    "renew themselves, so nothing expires mid-session. On a UC Davis "
+                    "account a Box admin has to authorise the app once, from Admin "
+                    "Console → Enterprise Settings → Platform Apps.\n\n"
+                    "To try it before that approval comes through, generate a "
+                    "**developer token** in the console and use "
+                    "`developer_token = \"...\"` instead. It works for 60 minutes.\n\n"
+                    "With client credentials the app acts as its own service user, "
+                    "not as you, so share the target folder with that user or point "
+                    "`root_folder_id` at a folder it owns."
+                )
+
+    with st.expander("🗄️ Google Sheets (optional mirror)"):
         if SHEETS_IMPORT_ERROR:
             st.info("Database module unavailable in this environment.")
             st.caption(SHEETS_IMPORT_ERROR)
@@ -846,7 +1139,7 @@ tab_analysis, tab_video, tab_igor, tab_db, tab_results, tab_export = st.tabs(
 
 with tab_analysis:
     section("1 · Cell information")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.text_input("Cell name / ID", placeholder="C2C12_001", key="cell_name")
     with c2:
@@ -855,13 +1148,26 @@ with tab_analysis:
         )
     with c3:
         st.number_input(
-            "Spring constant (N/m, optional)",
-            min_value=0.0,
-            max_value=100.0,
-            step=0.001,
-            format="%.3f",
+            "Spring constant k (N/m)",
+            min_value=0.0, max_value=100.0, step=0.001, format="%.4f",
             key="spring_constant",
+            help="Cantilever stiffness. Recorded with the cell; the force curve "
+            "you upload is assumed to already be in force units.",
         )
+    with c4:
+        st.number_input(
+            "InvOLS (nm/V)",
+            min_value=0.0, max_value=1000.0, step=0.1, format="%.2f",
+            key="invols_nm_per_V",
+            help="Deflection sensitivity from the calibration ramp. Recorded so "
+            "the numbers can be traced back to the calibration they came from.",
+        )
+    c5, c6 = st.columns([1, 3])
+    with c5:
+        st.text_input("Operator", placeholder="initials", key="operator")
+    with c6:
+        st.text_input("Notes", placeholder="passage, treatment, anything worth keeping",
+                      key="cell_notes")
     hint(
         f"Cell height h₀ = {st.session_state['cell_height_um']:.2f} μm — set it in the "
         "sidebar under **Cell geometry**, it directly scales both moduli."
@@ -1852,51 +2158,54 @@ with tab_analysis:
                     language="text",
                 )
 
-            section("5 · Save")
+            section("5 · Send to database")
+            store = st.session_state.get("box_store")
+            ready = store is not None
             c1, c2 = st.columns([2, 1])
             with c1:
-                if st.session_state["video_link"]:
-                    st.caption(f"Video link on record: {st.session_state['video_link']}")
-                else:
+                if not ready:
                     st.caption(
-                        "No video linked. Add one in the **Compression video** tab to "
-                        "store it with this cell."
+                        "Not connected to Box. Open **Box database** in the sidebar "
+                        "to connect, and the button here will send this cell."
                     )
+                else:
+                    bits = []
+                    bits.append("curve and fit")
+                    if st.session_state.get("video_path") and os.path.exists(
+                        st.session_state["video_path"]
+                    ):
+                        bits.append("video")
+                        if not VIDEO_IMPORT_ERROR:
+                            bits.append("a morphology frame")
+                    st.caption("Will send: " + ", ".join(bits) + ".")
+                st.checkbox(
+                    "Upload the video file too",
+                    key="upload_video_with_cell",
+                    help="Off keeps the record small; the video stays only on your "
+                    "machine. On stores it in the cell's Box folder so it can be "
+                    "opened from the database later.",
+                )
             with c2:
                 st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
-                disabled = not (st.session_state["db_enabled"] and st.session_state["gs_manager"])
-                if st.button(
-                    "💾 Save to database",
-                    **STRETCH,
-                    disabled=disabled,
-                    help="Enable and connect the database in the sidebar first."
-                    if disabled
-                    else None,
-                ):
+                if st.button("📤 Send to database", type="primary", disabled=not ready,
+                             **STRETCH):
                     if not st.session_state["cell_name"]:
                         st.error("Give the cell a name first.")
                     else:
-                        ok, msg = st.session_state["gs_manager"].append_cell_data(
-                            {
-                                "cell_id": st.session_state["cell_name"],
-                                "date_analyzed": str(date_acquired),
-                                "cell_height": st.session_state["cell_height_um"],
-                                "cantilever_constant": (
-                                    f"{st.session_state['spring_constant']} N/m"
-                                    if st.session_state["spring_constant"] > 0
-                                    else "N/A"
-                                ),
-                                "Em": round(fit["Em_MPa"], 6),
-                                "Ei": round(fit["Ei_kPa"], 6),
-                                "video_link": st.session_state["video_link"],
-                                "force_curve_created": "Yes",
-                                "fit_quality": round(float(fit["r_squared"]), 4),
-                                "notes": f"ε ∈ [{fit_lo:.3f}, {fit_hi:.3f}], "
-                                f"{fit['n_points']} pts, {fit['weighting']} weighting",
-                                "analysis_status": "Complete",
-                            }
-                        )
-                        (st.success if ok else st.warning)(msg)
+                        try:
+                            with st.spinner("Uploading to Box…"):
+                                saved = send_cell_to_box(
+                                    store, fit, epsilon, force_N, fitted,
+                                    date_acquired, model, stage_plan,
+                                )
+                            st.success(
+                                f"Saved **{saved['cell_id']}** to Box."
+                                + (f" [Open the video]({saved['video_url']})"
+                                   if saved.get("video_url") else "")
+                            )
+                            st.session_state["box_index"] = None
+                        except Exception as exc:
+                            st.error(f"Could not save: {exc}")
 
 
 # ==================================================== TAB 2: video analysis ==
@@ -2393,37 +2702,261 @@ with tab_igor:
 # ======================================================== TAB 3: database ==
 
 with tab_db:
-    section("Database browser")
-    manager = st.session_state.get("gs_manager")
-    if not (st.session_state["db_enabled"] and manager):
-        st.info("Enable and connect the Google Sheets database in the sidebar.")
-    else:
-        df_all = manager.get_all_cells()
-        if df_all.empty:
-            st.info("No cells stored yet.")
-        else:
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                search = st.text_input("Search cell ID", placeholder="C2C12_001")
-            with c2:
-                limit = st.number_input(
-                    "Rows", min_value=5, max_value=max(5, len(df_all)), value=min(25, len(df_all))
-                )
-            shown = manager.search_cells(search) if search else df_all
-            st.dataframe(shown.head(int(limit)), hide_index=True, **STRETCH)
+    section("Cell database")
+    store = st.session_state.get("box_store")
 
-            stats = manager.get_statistics()
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Total cells", stats.get("total_cells", 0))
-            s2.metric(
-                "Mean Eₘ",
-                f"{stats.get('avg_em', 0):.3g} MPa" if stats.get("avg_em", 0) else "n/a",
+    if BOX_IMPORT_ERROR:
+        st.error(f"Box module unavailable: {BOX_IMPORT_ERROR}")
+    elif store is None:
+        st.info(
+            "Not connected. Open **Box database** in the sidebar and connect, then "
+            "every cell you send appears here."
+        )
+    else:
+        head1, head2, head3 = st.columns([1, 1, 2])
+        with head1:
+            if st.button("🔄 Refresh", **STRETCH):
+                st.session_state["box_index"] = None
+        with head2:
+            if st.button("🛠️ Rebuild index", **STRETCH,
+                         help="Reads every cell's record.json and writes a fresh "
+                              "index. Slower, but it recovers a stale or damaged one."):
+                progress = st.progress(0.0, text="Reading cells…")
+                try:
+                    st.session_state["box_index"] = store.rebuild_index(
+                        progress=lambda n, total, name: progress.progress(
+                            n / max(total, 1), text=f"{n}/{total}  {name}"
+                        )
+                    )
+                    progress.empty()
+                    st.success("Index rebuilt.")
+                except Exception as exc:
+                    progress.empty()
+                    st.error(str(exc))
+
+        if st.session_state.get("box_index") is None:
+            try:
+                with st.spinner("Loading the index…"):
+                    st.session_state["box_index"] = store.load_index()
+            except Exception as exc:
+                st.error(str(exc))
+                st.session_state["box_index"] = pd.DataFrame()
+
+        index = st.session_state.get("box_index")
+        if index is None or index.empty:
+            st.info("No cells stored yet. Fit a curve and press **Send to database**.")
+        else:
+            with head3:
+                search = st.text_input(
+                    "Filter", placeholder="cell name, operator, date or cell type",
+                    key="db_search", label_visibility="collapsed",
+                )
+            shown = index
+            if search:
+                needle = search.lower()
+                mask = index.apply(
+                    lambda row: needle in " ".join(str(v).lower() for v in row.values),
+                    axis=1,
+                )
+                shown = index[mask]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cells", len(index))
+            m2.metric("Shown", len(shown))
+            for column, label, target in (
+                ("Em_MPa", "Median Eₘ", m3), ("Ec_kPa", "Median Ec", m4)
+            ):
+                values = pd.to_numeric(shown.get(column), errors="coerce").dropna()
+                values = values[values > 0]
+                unit = "MPa" if column == "Em_MPa" else "kPa"
+                target.metric(
+                    label, f"{values.median():.3g} {unit}" if len(values) else "n/a"
+                )
+
+            view = st.radio(
+                "View", ["Gallery", "Table"], horizontal=True, key="db_view",
+                label_visibility="collapsed",
             )
-            s3.metric(
-                "Mean Eᵢ",
-                f"{stats.get('avg_ei', 0):.3g} kPa" if stats.get("avg_ei", 0) else "n/a",
-            )
-            s4.metric("With video", stats.get("cells_with_video", 0))
+
+            if view == "Gallery":
+                st.caption(
+                    "Tick the cells you want to work on, then use the batch tools "
+                    "below the gallery."
+                )
+                selected = []
+                per_row = 4
+                rows = list(shown.itertuples(index=False))
+                for start in range(0, len(rows), per_row):
+                    columns = st.columns(per_row)
+                    for column, row in zip(columns, rows[start : start + per_row]):
+                        record = row._asdict()
+                        cell_id = str(record.get("cell_id", ""))
+                        with column:
+                            thumb_id = record.get("thumbnail_file_id")
+                            image = None
+                            if thumb_id and str(thumb_id) not in ("", "nan"):
+                                image = cached_thumbnail(
+                                    st.session_state["box_root_folder"], str(thumb_id)
+                                )
+                            if image:
+                                st.image(image, **STRETCH)
+                            else:
+                                st.markdown(
+                                    "<div style='height:110px;border:1px dashed #c7d0d8;"
+                                    "border-radius:6px;display:flex;align-items:center;"
+                                    "justify-content:center;color:#9aa7b2;font-size:0.8rem'>"
+                                    "no frame</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            st.markdown(f"**{cell_id}**")
+                            em = pd.to_numeric(record.get("Em_MPa"), errors="coerce")
+                            ec = pd.to_numeric(record.get("Ec_kPa"), errors="coerce")
+                            r2 = pd.to_numeric(record.get("r_squared"), errors="coerce")
+                            st.caption(
+                                f"Eₘ {em:.3g} MPa · Ec {ec:.3g} kPa"
+                                if pd.notna(em) and pd.notna(ec)
+                                else "not fitted"
+                            )
+                            st.caption(
+                                f"R² {r2:.4f} · {record.get('date', '')}"
+                                if pd.notna(r2) else str(record.get("date", ""))
+                            )
+                            url = str(record.get("video_url") or "")
+                            if url and url != "nan":
+                                st.markdown(f"[▶ video]({url})")
+                            if st.checkbox("select", key=f"db_pick_{cell_id}"):
+                                selected.append(cell_id)
+                        # A little breathing room between rows.
+                    st.markdown(
+                        "<div style='height:0.6rem'></div>", unsafe_allow_html=True
+                    )
+            else:
+                numeric = ["Em_MPa", "Ec_kPa", "En_kPa", "r_squared",
+                           "epsilon_min", "epsilon_max", "cell_height_um"]
+                table = shown.copy()
+                for column in numeric:
+                    if column in table.columns:
+                        table[column] = pd.to_numeric(table[column], errors="coerce")
+                st.dataframe(
+                    table.round(
+                        {c: 4 for c in numeric if c in table.columns}
+                    ),
+                    hide_index=True,
+                    **STRETCH,
+                )
+                picks = st.multiselect(
+                    "Select cells for the batch tools",
+                    list(shown["cell_id"].astype(str)),
+                    key="db_table_picks",
+                )
+                selected = list(picks)
+
+            st.divider()
+            section("Batch tools")
+            if not selected:
+                st.caption("Select one or more cells above.")
+            else:
+                st.caption(f"{len(selected)} selected: " + ", ".join(selected[:8])
+                           + (" …" if len(selected) > 8 else ""))
+
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("🔁 Refit selected with current settings",
+                             disabled=not selected, **STRETCH):
+                    settings = current_fit_settings()
+                    progress = st.progress(0.0, text="Refitting…")
+                    done, failed = [], []
+                    for n, cell_id in enumerate(selected, start=1):
+                        progress.progress(n / len(selected), text=f"{cell_id} ({n}/{len(selected)})")
+                        try:
+                            done.append(refit_stored_cell(store, cell_id, settings))
+                        except Exception as exc:
+                            failed.append(f"{cell_id}: {exc}")
+                    progress.empty()
+                    st.session_state["box_index"] = None
+                    if done:
+                        st.success(f"Refitted {len(done)} cell(s).")
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "cell": r["cell_id"],
+                                        "Eₘ (MPa)": round(r["Em_MPa"], 4),
+                                        "Ec (kPa)": round(r["Ec_kPa"], 4),
+                                        "Eₙ (kPa)": round(r["En_kPa"], 4),
+                                        "R²": round(r["r_squared"], 4),
+                                    }
+                                    for r in done
+                                ]
+                            ),
+                            hide_index=True,
+                            **STRETCH,
+                        )
+                    for message in failed:
+                        st.warning(message)
+                    st.caption(
+                        "Each cell keeps its own geometry: height, spring constant "
+                        "and radius were measured for that cell and a batch does not "
+                        "overwrite them. Only the fitting choices are applied."
+                    )
+            with b2:
+                one = selected[0] if selected else None
+                if st.button(f"✏️ Re-open {one}" if one else "✏️ Re-open selected",
+                             disabled=len(selected) != 1, **STRETCH,
+                             help="Loads the stored curve back into the analysis tab "
+                                  "so you can change its windows and send it again."):
+                    try:
+                        record = store.load_cell(one)
+                        if not record or not record.get("curve_csv"):
+                            st.error(f"{one} has no stored curve.")
+                        else:
+                            curve = pd.read_csv(io.StringIO(record["curve_csv"]))
+                            pending = {
+                                "cell_name": record.get("cell_id", one),
+                                "cell_height_um": float(record.get("cell_height_um", 8.0)),
+                                "spring_constant": float(
+                                    record.get("spring_constant_N_per_m", 0.0)
+                                ),
+                                "invols_nm_per_V": float(
+                                    record.get("invols_nm_per_V", 50.0)
+                                ),
+                                "operator": record.get("operator", ""),
+                                "cell_notes": record.get("notes", ""),
+                            }
+                            settings = record.get("settings") or {}
+                            for key in ("coupling", "procedure", "weighting",
+                                        "cell_type", "nucleus_onset", "regime_mode"):
+                                if settings.get(key) is not None:
+                                    pending[key] = settings[key]
+                            for term, window in (settings.get("term_windows") or {}).items():
+                                pending[f"window_term_{term}"] = tuple(window)
+                            if settings.get("combined_window"):
+                                pending["window_combined"] = tuple(settings["combined_window"])
+                            for term in TERM_ORDER:
+                                pending[f"use_{term}"] = term in (settings.get("terms") or [])
+                            pending["_applied_cell_type"] = settings.get("cell_type")
+                            st.session_state["_pending_settings"] = pending
+                            st.session_state["data"] = {
+                                "epsilon": curve["relative_deformation"].to_numpy(float),
+                                "force_N": curve["force_N"].to_numpy(float),
+                                "source": f"Box · {one}",
+                                "n_dropped": 0,
+                            }
+                            st.success(
+                                f"Loaded {one}. Open the **Force curve analysis** tab, "
+                                f"adjust it, then send it again to overwrite the record."
+                            )
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            with b3:
+                st.download_button(
+                    "📥 Export the whole index (CSV)",
+                    data=index.to_csv(index=False),
+                    file_name=f"afm_cell_database_{datetime.now():%Y%m%d}.csv",
+                    mime="text/csv",
+                    **STRETCH,
+                )
 
 
 # ========================================================= TAB 4: results ==
