@@ -165,6 +165,7 @@ def force_curve_figure(
     fit_window=None,
     rupture_epsilon=None,
     highlight=None,
+    highlight_window=None,
 ):
     """
     One figure for both preview and results.
@@ -214,8 +215,8 @@ def force_curve_figure(
                 x=fx,
                 y=fy,
                 mode="lines",
-                name="Model, total force",
-                line=dict(color=style.fit_color, width=style.line_width),
+                name="Model",
+                line=dict(color=style.fit_color, width=style.line_width, dash="dash"),
                 hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
@@ -265,6 +266,31 @@ def force_curve_figure(
                 annotation_text=win.get("label", "fit window"),
                 annotation_position="bottom left",
                 annotation_font_size=max(10, style.tick_size - 6),
+            )
+
+    if highlight_window is not None and not log_mode:
+        # The segment currently being edited in the range table. It is drawn
+        # over the fit windows rather than under them so that the stretch the
+        # user is typing numbers for is unmistakable on the curve.
+        try:
+            hw_lo, hw_hi = float(highlight_window[0]), float(highlight_window[1])
+            hw_label = (
+                highlight_window[2] if len(highlight_window) > 2 else "selected range"
+            )
+        except (TypeError, ValueError, IndexError):
+            hw_lo = hw_hi = None
+        if hw_lo is not None and hw_hi > hw_lo:
+            fig.add_vrect(
+                x0=hw_lo,
+                x1=hw_hi,
+                fillcolor="#ffd166",
+                opacity=0.34,
+                layer="below",
+                line=dict(color="#e8a600", width=3),
+                annotation_text=str(hw_label),
+                annotation_position="top left",
+                annotation_font_size=max(11, style.tick_size - 4),
+                annotation_font_color="#8a6100",
             )
 
     if highlight is not None:
@@ -418,6 +444,8 @@ def cell_schematic(
     shares=None,
     break_1=None,
     break_2=None,
+    membrane_mode="freeze",
+    cyto_start="break",
 ):
     """
     A small side-on diagram of what is being modelled.
@@ -466,17 +494,34 @@ def cell_schematic(
 
     membrane_line = max(3, membrane_thickness_nm * 0.9)
 
-    # Which elements are doing what at this deformation.
+    # Which elements are doing what at this deformation. The two composition
+    # settings decide it: whether the membrane keeps stiffening past the first
+    # boundary, and whether the cytoskeleton was already loaded before it.
     if break_1 is not None and break_2 is not None:
+        membrane_above = "loading" if membrane_mode == "continue" else "holding"
+        cyto_below = "loading" if cyto_start == "zero" else "waiting"
         if epsilon <= break_1:
-            state = {"membrane": "loading", "interior": "waiting", "nucleus": "waiting"}
-            stage_name = "Membrane alone"
+            state = {"membrane": "loading", "interior": cyto_below, "nucleus": "waiting"}
+            stage_name = (
+                "Membrane and cytoskeleton" if cyto_below == "loading"
+                else "Membrane alone"
+            )
         elif epsilon <= break_2:
-            state = {"membrane": "holding", "interior": "loading", "nucleus": "waiting"}
-            stage_name = "Cytoskeleton, membrane holding"
+            state = {
+                "membrane": membrane_above, "interior": "loading", "nucleus": "waiting",
+            }
+            stage_name = (
+                "Membrane and cytoskeleton" if membrane_above == "loading"
+                else "Cytoskeleton, membrane holding"
+            )
         else:
-            state = {"membrane": "holding", "interior": "loading", "nucleus": "loading"}
-            stage_name = "Cytoskeleton and nucleus together"
+            state = {
+                "membrane": membrane_above, "interior": "loading", "nucleus": "loading",
+            }
+            stage_name = (
+                "All three together" if membrane_above == "loading"
+                else "Cytoskeleton and nucleus together"
+            )
     else:
         state = {"membrane": "loading", "interior": "loading", "nucleus": "loading"}
         stage_name = None
