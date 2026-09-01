@@ -116,13 +116,23 @@ class GoogleSheetsManager:
             return False
 
         try:
+            # Use the tab that is already there. Creating a "Cells" tab when
+            # the spreadsheet has one perfectly good sheet is how rows end up
+            # somewhere the user is not looking: they see their header on the
+            # first tab and the app appends to a second one behind it.
             try:
                 self.worksheet = self.spreadsheet.worksheet("Cells")
             except gspread.WorksheetNotFound:
-                self.worksheet = self.spreadsheet.add_worksheet(
-                    title="Cells", rows=1000, cols=12
-                )
-                self._initialize_headers()
+                worksheets = self.spreadsheet.worksheets()
+                if worksheets:
+                    self.worksheet = worksheets[0]
+                    if not [c for c in self.worksheet.row_values(1) if str(c).strip()]:
+                        self._initialize_headers()
+                else:
+                    self.worksheet = self.spreadsheet.add_worksheet(
+                        title="Cells", rows=1000, cols=len(self.COLUMNS)
+                    )
+                    self._initialize_headers()
             return True
         except Exception as exc:
             st.error(f"Opened the spreadsheet but could not use it: {exc}")
@@ -185,31 +195,53 @@ class GoogleSheetsManager:
         else:
             st.error(f"Error accessing spreadsheet: {message}")
 
-    # The columns this app writes, in the order a new sheet gets them. An
-    # existing sheet keeps whatever order it already has: rows are written by
-    # header name, never by position, so a column moved or renamed by hand
-    # does not silently put the nucleus modulus in the notes column.
+    # The columns this app writes, in the order a new sheet gets them. Each
+    # modulus is followed by the stretch of deformation it was measured over,
+    # because a modulus without its range is not a result you can compare.
+    # The video link goes last: it is the widest cell and the least often
+    # read, so it belongs off the end rather than in the middle.
     COLUMNS = [
         ("cell_id", "Cell ID"),
-        ("date_analyzed", "Date Analyzed"),
+        ("experiment_date", "Experiment Date"),
         ("cell_height", "Cell Height (μm)"),
-        ("cantilever_constant", "Cantilever Constant (pN/nm)"),
+        ("spring_constant", "Spring Constant, K (N/m)"),
         ("Em", "Young's Modulus (Em, MPa)"),
+        ("Em_range", "Em range (ε)"),
         ("Ei", "Young's Modulus (Ei, kPa)"),
+        ("Ei_range", "Ei range (ε)"),
         ("En", "Young's Modulus (En, kPa)"),
+        ("En_range", "En range (ε)"),
         ("membrane_areal", "Membrane Em·h (mN/m)"),
-        ("break_1", "ε₁ membrane hands over"),
-        ("break_2", "ε₂ nucleus engages"),
         ("model", "Model"),
         ("combination", "Combination"),
-        ("fit_range", "Fitted range"),
-        ("video_link", "Video Link"),
-        ("force_curve_created", "Force Curve Created"),
+        ("break_1", "ε₁ membrane hands over"),
+        ("break_2", "ε₂ nucleus engages"),
+        ("fit_range", "Fitted range (ε)"),
         ("fit_quality", "Fit Quality (R²)"),
-        ("notes", "Notes"),
+        ("rmse_N", "RMSE (N)"),
+        ("n_points", "Points fitted"),
+        ("weighting", "Weighting"),
+        ("cell_radius", "Cell radius R₀ (μm)"),
+        ("nucleus_radius", "Nucleus radius (μm)"),
+        ("membrane_thickness", "Membrane thickness (nm)"),
+        ("poisson", "Poisson (membrane / interior)"),
+        ("force_curve_created", "Force Curve Created"),
         ("analysis_status", "Analysis Status"),
+        ("notes", "Notes"),
         ("timestamp", "Timestamp"),
+        ("video_link", "Video Link"),
     ]
+
+    # Columns this app used to write, and what they are called now. A header
+    # is renamed in place so the data under it stays put; without this the new
+    # name would look like a missing column and be appended alongside the old
+    # one, leaving two half-filled columns saying the same thing.
+    RENAMED = {
+        "Date Analyzed": "Experiment Date",
+        "Cantilever Constant (pN/nm)": "Spring Constant, K (N/m)",
+        "Fitted range": "Fitted range (ε)",
+        "Membrane Eₘ·h (mN/m)": "Membrane Em·h (mN/m)",
+    }
 
     def _initialize_headers(self):
         """Put the full header row on a brand new sheet."""
@@ -219,30 +251,76 @@ class GoogleSheetsManager:
             st.warning(f"Could not insert headers: {str(e)}")
 
     def _header_row(self):
-        """The sheet's current header, adding any columns it does not have."""
+        """
+        The sheet's header, brought up to date with the current layout.
+
+        Renames first, so data already under an old name stays with it; then
+        the columns this app writes but the sheet lacks. Order is only changed
+        when there is nothing to lose, which is why `reorder_columns` is a
+        separate, deliberate call.
+        """
         try:
-            header = self.worksheet.row_values(1)
+            header = [h for h in self.worksheet.row_values(1) if str(h).strip()]
         except Exception:
             header = []
-        header = [h for h in header if str(h).strip()]
+
         if not header:
             self._initialize_headers()
             return [name for _, name in self.COLUMNS]
 
-        missing = [name for _, name in self.COLUMNS if name not in header]
-        if missing:
-            # Extend to the right rather than inserting. Inserting would shift
-            # every cell in every existing row, and this sheet may already
-            # hold results someone has referenced by cell address.
-            header = header + missing
+        renamed = [self.RENAMED.get(name, name) for name in header]
+        missing = [name for _, name in self.COLUMNS if name not in renamed]
+        if renamed != header or missing:
+            renamed = renamed + missing
             try:
                 self.worksheet.update(
-                    values=[header],
-                    range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}",
+                    values=[renamed],
+                    range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(renamed))}",
                 )
             except Exception as e:
-                st.warning(f"Could not add the new columns: {e}")
-        return header
+                st.warning(f"Could not update the header: {e}")
+                return header
+        return renamed
+
+    def reorder_columns(self):
+        """
+        Rewrite the sheet in this app's column order, carrying the data.
+
+        Every row is remapped by column name, so nothing lands under the wrong
+        heading, and a column the app does not know about is kept and pushed
+        to the end rather than dropped. This rewrites the whole sheet, so it
+        is only ever run when asked for.
+        """
+        try:
+            values = self.worksheet.get_all_values()
+        except Exception as exc:
+            return False, f"Could not read the sheet: {exc}"
+        if not values:
+            self._initialize_headers()
+            return True, "Wrote the header to an empty sheet."
+
+        header = [self.RENAMED.get(h, h) for h in values[0]]
+        wanted = [name for _, name in self.COLUMNS]
+        extra = [h for h in header if h and h not in wanted]
+        new_header = wanted + extra
+
+        rows = []
+        for raw in values[1:]:
+            if not any(str(cell).strip() for cell in raw):
+                continue
+            by_name = dict(zip(header, raw))
+            rows.append([by_name.get(name, "") for name in new_header])
+
+        try:
+            self.worksheet.clear()
+            self.worksheet.update(
+                values=[new_header] + rows,
+                range_name=f"A1:{gspread.utils.rowcol_to_a1(len(rows) + 1, len(new_header))}",
+            )
+        except Exception as exc:
+            return False, f"Could not rewrite the sheet: {exc}"
+        kept = f" {len(rows)} row(s) kept." if rows else ""
+        return True, f"Columns are now in the app's order.{kept}"
 
     def append_cell_data(self, cell_data: Dict) -> Tuple[bool, str]:
         """
