@@ -545,6 +545,7 @@ class LulevichModel(_CouplingMixin):
         poisson_nucleus=0.5,
         nucleus_onset=0.15,
         expected_ranges=None,
+        active_windows=None,
     ):
         """
         Parameters
@@ -573,6 +574,11 @@ class LulevichModel(_CouplingMixin):
             Relative deformation at which the plates begin to feel the nucleus.
             Below it the nucleus term is exactly zero. See
             :meth:`scan_nucleus_onset` to find it from the data.
+        active_windows : dict, optional
+            Deformation range over which each element carries load, e.g.
+            ``{"membrane": (0.0, 0.40), "nucleus": (0.40, 1.0)}``. Elements
+            without an entry act everywhere. Use this to describe a curve whose
+            load-bearing structures change partway along.
         expected_ranges : dict, optional
             Plausibility bands in pascals used only for warnings, e.g.
             ``{"Em": (5e5, 1e7), "Ei": (3e2, 1e4), "En": (1e3, 5e4)}``. Set
@@ -621,6 +627,11 @@ class LulevichModel(_CouplingMixin):
             float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
         )
         self.nucleus_onset = float(nucleus_onset)
+        self.active_windows = (
+            {k: (float(v[0]), float(v[1])) for k, v in active_windows.items() if v}
+            if active_windows
+            else None
+        )
         self.expected_ranges = {
             "Em": PLAUSIBLE_EM_PA,
             "Ei": PLAUSIBLE_EI_PA,
@@ -679,17 +690,20 @@ class LulevichModel(_CouplingMixin):
         has the same 3/2 exponent but starts at zero deformation.
         """
         onset = self.nucleus_onset if onset is None else float(onset)
-        excess = np.clip(np.asarray(epsilon, dtype=float) - onset, 0.0, None)
-        return self.An * En * excess ** 1.5
+        raw = np.asarray(epsilon, dtype=float)
+        excess = np.clip(raw - onset, 0.0, None)
+        return self.An * En * excess ** 1.5 * self._active(raw, "nucleus")
 
     def balloon_model_cubic(self, epsilon, Em):
         """Membrane (balloon) term, force in newtons."""
-        return self.Am * Em * np.asarray(epsilon, dtype=float) ** 3
+        eps = np.asarray(epsilon, dtype=float)
+        return self.Am * Em * eps ** 3 * self._active(eps, "membrane")
 
     def hertzian_contact_model(self, epsilon, Ei):
         """Interior (Hertzian) term, force in newtons."""
-        eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, None)
-        return self.Ai * Ei * eps ** 1.5
+        raw = np.asarray(epsilon, dtype=float)
+        eps = np.clip(raw, 0.0, None)
+        return self.Ai * Ei * eps ** 1.5 * self._active(raw, "interior")
 
     def combined_model(self, epsilon, Em, Ei, force_offset=0.0, En=0.0, onset=None):
         """Full model, force in newtons. ``En=0`` gives the two-term Lulevich fit."""
@@ -708,17 +722,39 @@ class LulevichModel(_CouplingMixin):
         mask = (self.epsilon >= epsilon_min) & (self.epsilon <= epsilon_max)
         return self.epsilon[mask], self.force[mask], mask
 
+    def _active(self, eps, term):
+        """
+        1 where an element carries load, 0 where it does not.
+
+        With ``active_windows`` set, an element contributes only inside its own
+        deformation range. That is what lets a curve be described as one set of
+        elements up to some deformation and a different set beyond it: membrane
+        plus cytoskeleton while the cell is a pressurised balloon, cytoskeleton
+        plus nucleus once it is squashed flat and the membrane no longer holds
+        the load. The model stays linear in the moduli, because switching an
+        element off is just zeroing its column.
+        """
+        window = (self.active_windows or {}).get(term)
+        if not window:
+            return np.ones_like(eps)
+        lo, hi = window
+        return ((eps >= lo) & (eps <= hi)).astype(float)
+
     def _design_matrix(self, eps, terms, fit_offset):
         cols, names = [], []
         if "membrane" in terms:
-            cols.append(self.Am * eps ** 3)
+            cols.append(self.Am * eps ** 3 * self._active(eps, "membrane"))
             names.append("Em")
         if "interior" in terms:
-            cols.append(self.Ai * np.clip(eps, 0.0, None) ** 1.5)
+            cols.append(
+                self.Ai * np.clip(eps, 0.0, None) ** 1.5 * self._active(eps, "interior")
+            )
             names.append("Ei")
         if "nucleus" in terms:
             cols.append(
-                self.An * np.clip(eps - self.nucleus_onset, 0.0, None) ** 1.5
+                self.An
+                * np.clip(eps - self.nucleus_onset, 0.0, None) ** 1.5
+                * self._active(eps, "nucleus")
             )
             names.append("En")
         if fit_offset:
