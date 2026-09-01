@@ -790,7 +790,332 @@ class _SegmentedMixin:
         }
 
 
-class LulevichModel(_CouplingMixin, _SegmentedMixin):
+# ---------------------------------------------------------------------------
+#  Exploratory segmentation
+# ---------------------------------------------------------------------------
+#
+# Before fitting anything, ask the curve where its exponent changes.
+#
+# A power law F = A e^n is a straight line of slope n on log-log axes, so the
+# local slope of ln F against ln e measures the exponent at each point. That
+# alone would be enough if the segments were pure powers of e, but they are
+# not: past the first breakpoint the membrane contributes a constant and the
+# cytoskeleton term is shifted, F = F1 + B (e - e1)^1.5, and neither the offset
+# nor the shift shows up correctly in a naive log-log slope.
+#
+# So the exponent profile is reported for inspection, and the breakpoints are
+# located a second way that respects the structure: fit the law that should
+# hold, walk forward, and mark where the data starts to leave it behind. The
+# membrane goes first because it is what carries the load from zero
+# deformation, then the cytoskeleton law is fitted to what is left over, and
+# the point where that in turn starts under-predicting is where the nucleus
+# begins to take load.
+
+
+class _ExploreMixin:
+    """Find the segment boundaries from the shape of the curve."""
+
+    # ------------------------------------------------------------ helpers
+
+    def _smooth_noise(self):
+        """
+        Force noise, from the scatter about a local median.
+
+        Taking the spread of the first few points instead would confuse the
+        curve's own rise for noise and badly overestimate it, which then hides
+        every real feature.
+        """
+        if self.force.size < 9:
+            return float(np.std(self.force)) or 1e-15
+        width = max(5, (self.force.size // 40) | 1)
+        smooth = uniform_filter1d(self.force, size=width, mode="nearest")
+        residual = self.force - smooth
+        # Median absolute deviation, scaled to a standard deviation, so a few
+        # large excursions do not inflate it.
+        mad = float(np.median(np.abs(residual - np.median(residual))))
+        return (1.4826 * mad) or float(np.std(residual)) or 1e-15
+
+    def _binned(self, n_bins=60):
+        """Average the curve into deformation bins to lift it out of the noise."""
+        eps, force = self.epsilon, self.force
+        if eps.size < n_bins * 2:
+            return eps, force
+        edges = np.linspace(eps.min(), eps.max(), int(n_bins) + 1)
+        index = np.clip(np.digitize(eps, edges) - 1, 0, int(n_bins) - 1)
+        centres, means = [], []
+        for b in range(int(n_bins)):
+            here = index == b
+            if here.sum() >= 2:
+                centres.append(float(eps[here].mean()))
+                means.append(float(force[here].mean()))
+        return np.array(centres), np.array(means)
+
+    def local_exponent(self, window_frac=0.2, n_bins=60):
+        """
+        Local log-log slope along the curve.
+
+        The curve is binned first: a power-law slope is a ratio of small
+        differences, so on raw noisy points it is dominated by scatter. Near 3
+        means the membrane term is what is carrying the load there, near 1.5 a
+        Hertzian contact.
+        """
+        eps, force = self._binned(n_bins)
+        usable = (eps > 0) & (force > 0)
+        if usable.sum() < 6:
+            return np.array([]), np.array([])
+        x, y = np.log(eps[usable]), np.log(force[usable])
+        n = x.size
+        half = max(2, int(n * float(window_frac) / 2))
+        exponent = np.full(n, np.nan)
+        for i in range(n):
+            lo, hi = max(0, i - half), min(n, i + half + 1)
+            if hi - lo < 3:
+                continue
+            xs, ys = x[lo:hi], y[lo:hi]
+            varx = float(np.sum((xs - xs.mean()) ** 2))
+            if varx > 0:
+                exponent[i] = float(np.sum((xs - xs.mean()) * (ys - ys.mean())) / varx)
+        return eps[usable], exponent
+
+    @staticmethod
+    def _power_law_exponent(x, y, noise=0.0, min_points=6):
+        """
+        Exponent and R2 of a straight line through ln y against ln x.
+
+        Points at or below the noise level are dropped rather than logged. The
+        log of a value that is mostly noise is not a measurement, and including
+        those points drags the slope down: a clean cubic stage will read about
+        1.7 instead of 3 if the buried part of it is kept.
+        """
+        x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        good = (x > 0) & (y > max(3.0 * float(noise), 0.0))
+        if good.sum() < min_points:
+            return float("nan"), float("nan")
+        lx, ly = np.log(x[good]), np.log(y[good])
+        varx = float(np.sum((lx - lx.mean()) ** 2))
+        if varx <= 0:
+            return float("nan"), float("nan")
+        slope = float(np.sum((lx - lx.mean()) * (ly - ly.mean())) / varx)
+        intercept = float(ly.mean() - slope * lx.mean())
+        ss_res = float(np.sum((ly - (slope * lx + intercept)) ** 2))
+        ss_tot = float(np.sum((ly - ly.mean()) ** 2))
+        return slope, (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))
+
+    def _stage_evidence(self, break_1, break_2, fit, hi, noise):
+        """Measured exponent, point count and modulus for each of the three stages."""
+        eps, force = self._binned(80)
+
+        first = (eps > 0) & (eps <= break_1)
+        exponent_1, r2_1 = self._power_law_exponent(eps[first], force[first], noise)
+
+        frozen = float(
+            self.segment_terms(np.array([break_1]), break_1, break_2)[0][0] * fit["Em"]
+        )
+        second = (eps > break_1) & (eps <= break_2)
+        exponent_2, r2_2 = self._power_law_exponent(
+            eps[second] - break_1, force[second] - frozen, noise
+        )
+
+        third = eps > break_2
+        exponent_3, r2_3 = float("nan"), float("nan")
+        if third.sum() >= 4:
+            predicted = self.segmented_model(
+                eps[third], fit["Em"], fit["Ei"], 0.0, break_1, break_2
+            )
+            exponent_3, r2_3 = self._power_law_exponent(
+                eps[third] - break_2, force[third] - predicted, noise
+            )
+
+        return [
+            {
+                "stage": "membrane, ε³",
+                "range": (0.0, break_1),
+                "expected_exponent": 3.0,
+                "measured_exponent": exponent_1,
+                "power_law_r2": r2_1,
+                "n_points": int(np.sum((self.epsilon > 0) & (self.epsilon <= break_1))),
+                "modulus": fit["Em"],
+                "modulus_label": f"Eₘ = {fit['Em_MPa']:.3g} MPa",
+            },
+            {
+                "stage": "cytoskeleton, ⟨ε−ε₁⟩³ᐟ²",
+                "range": (break_1, break_2),
+                "expected_exponent": 1.5,
+                "measured_exponent": exponent_2,
+                "power_law_r2": r2_2,
+                "n_points": int(
+                    np.sum((self.epsilon > break_1) & (self.epsilon <= break_2))
+                ),
+                "modulus": fit["Ei"],
+                "modulus_label": f"E_c = {fit['Ei_kPa']:.3g} kPa",
+            },
+            {
+                "stage": "nucleus, ⟨ε−ε₂⟩³ᐟ²",
+                "range": (break_2, float(hi)),
+                "expected_exponent": 1.5,
+                "measured_exponent": exponent_3,
+                "power_law_r2": r2_3,
+                "n_points": int(np.sum(self.epsilon > break_2)),
+                "modulus": fit["En"],
+                "modulus_label": f"Eₙ = {fit['En_kPa']:.3g} kPa",
+            },
+        ]
+
+    # ---------------------------------------------------------- the search
+
+    def explore_segments(self, epsilon_min=None, epsilon_max=None, n_grid=18,
+                         terms=("membrane", "interior", "nucleus"),
+                         weighting="relative"):
+        """
+        Work out where the curve stops being cubic and where the nucleus joins.
+
+        The breakpoints come from scanning the segmented model over a grid of
+        candidate pairs, which is a fit-based search and therefore survives the
+        low-deformation region being buried in noise. Reading the exponent
+        directly off the curve there does not: the membrane term is small, and
+        below about the noise level its log-log slope is meaningless.
+
+        The exponents are still measured and reported, on binned data and after
+        removing what the earlier stages contribute, because they are the
+        evidence for the breakpoints rather than the means of finding them: a
+        first stage that measures 3 and a second that measures 1.5 says the
+        model matches this curve.
+
+        Returns
+        -------
+        dict
+            ``break_1``, ``break_2``, a row per stage with its measured
+            exponent and the modulus that stage implies, the local exponent
+            profile for plotting, and ``confident``.
+        """
+        lo = float(self.epsilon.min() if epsilon_min is None else epsilon_min)
+        hi = float(self.epsilon.max() if epsilon_max is None else epsilon_max)
+        if hi - lo <= 0 or self.epsilon.size < 20:
+            return {"success": False, "error": "Not enough curve to explore."}
+
+        # Relative weighting for the search. With uniform weights the total
+        # residual is dominated by the high-force end, so the first breakpoint,
+        # which only affects forces a hundred times smaller, barely moves the
+        # objective and lands almost anywhere. Weighting by 1/|F| gives the
+        # membrane region a say in where its own boundary goes.
+        candidates = []
+        for candidate_weighting in ("relative", "uniform"):
+            scan = self.scan_segment_breaks(
+                lo, hi, terms=terms, n_grid=n_grid, weighting=candidate_weighting
+            )
+            if scan.get("success"):
+                candidates.append((candidate_weighting, scan))
+        if not candidates:
+            return {"success": False, "error": "Breakpoint scan failed."}
+
+        # Choose between the two searches on physics rather than on residuals:
+        # the placement worth keeping is the one whose first stage actually
+        # measures an exponent near 3 and whose second measures near 1.5. A
+        # smaller residual means little if it was bought by putting the
+        # boundary somewhere the curve does not change behaviour.
+        noise = self._smooth_noise()
+        scored = []
+        for candidate_weighting, scan in candidates:
+            trial = scan["best"]
+            stages_trial = self._stage_evidence(
+                float(trial["break_1"]), float(trial["break_2"]), trial, float(hi), noise
+            )
+            penalty = 0.0
+            for stage in stages_trial[:2]:
+                measured = stage["measured_exponent"]
+                penalty += (
+                    abs(measured - stage["expected_exponent"])
+                    if np.isfinite(measured)
+                    else 1.5  # unmeasurable is worse than slightly off
+                )
+            scored.append((penalty, -float(trial["r_squared"]), candidate_weighting, scan))
+        scored.sort(key=lambda row: (row[0], row[1]))
+        weighting_used, scan = scored[0][2], scored[0][3]
+
+        best = scan["best"]
+        break_1, break_2 = float(best["break_1"]), float(best["break_2"])
+        notes = []
+
+        # How sharply the scan prefers this pair. A flat surface means the
+        # breakpoints are not really determined by the data.
+        r2_values = np.array([t["r_squared"] for t in scan["trials"]], dtype=float)
+        r2_values = r2_values[np.isfinite(r2_values)]
+        headroom = max(1.0 - best["r_squared"], 1e-12)
+        sharpness = float((r2_values.max() - np.median(r2_values)) / headroom) if r2_values.size else 0.0
+
+        stages = self._stage_evidence(break_1, break_2, best, float(hi), noise)
+        exponent_1 = stages[0]["measured_exponent"]
+        exponent_2 = stages[1]["measured_exponent"]
+
+        if stages[0]["n_points"] < 15:
+            notes.append(
+                f"Only {stages[0]['n_points']} points below ε₁. The membrane stage is "
+                f"short, so Eₘ rests on very little of the curve."
+            )
+        peak = float(np.nanmax(np.abs(self.force)))
+        if np.isfinite(peak) and peak > 0:
+            membrane_force = float(
+                self.segment_terms(np.array([break_1]), break_1, break_2)[0][0] * best["Em"]
+            )
+            if membrane_force < 5 * noise:
+                notes.append(
+                    f"At ε₁ the membrane has produced only {membrane_force:.2e} N, "
+                    f"about {membrane_force / noise:.1f} times the noise. Eₘ is "
+                    f"being read from a part of the curve barely above the "
+                    f"baseline; treat it as an upper bound rather than a "
+                    f"measurement."
+                )
+        if sharpness < 1.0:
+            notes.append(
+                "The breakpoint scan is flat: many placements fit about as well, so "
+                "these boundaries are weakly determined by this curve."
+            )
+        if not np.isfinite(exponent_1):
+            notes.append(
+                "The exponent of the first stage cannot be measured: too little of "
+                "it rises clearly above the noise. The breakpoint still comes from "
+                "the fit, but there is no independent confirmation that this part "
+                "of the curve is cubic."
+            )
+        elif abs(exponent_1 - 3.0) > 1.0:
+            notes.append(
+                f"The first stage measures an exponent of {exponent_1:.2f} rather "
+                f"than 3. Either the contact point is off, or the membrane is not "
+                f"what dominates the start of this curve."
+            )
+        if np.isfinite(exponent_2) and abs(exponent_2 - 1.5) > 0.8:
+            notes.append(
+                f"The second stage measures {exponent_2:.2f} rather than 1.5."
+            )
+
+        confident = bool(
+            sharpness >= 1.0
+            and stages[0]["n_points"] >= 15
+            and (not np.isfinite(exponent_1) or abs(exponent_1 - 3.0) <= 1.0)
+            and (not np.isfinite(exponent_2) or abs(exponent_2 - 1.5) <= 0.8)
+        )
+
+        profile_eps, profile_exponent = self.local_exponent()
+        out = {
+            "success": True,
+            "break_1": break_1,
+            "break_2": break_2,
+            "fit": best,
+            "r_squared": float(best["r_squared"]),
+            "sharpness": sharpness,
+            "noise": noise,
+            "weighting_used": weighting_used,
+            "confident": confident,
+            "stages": stages,
+            "profile": {"epsilon": profile_eps, "exponent": profile_exponent},
+            "trials": scan["trials"],
+            "notes": notes,
+        }
+        self.results["exploration"] = out
+        return out
+
+
+class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin):
     """Lulevich fit for single-cell compression curves."""
 
     # ------------------------------------------------------------------ init
