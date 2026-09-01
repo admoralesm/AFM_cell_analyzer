@@ -73,6 +73,11 @@ class PlotStyle:
     log_scale: bool = False
     show_fit_window: bool = True
     show_components: bool = True
+    # Extras that clutter a figure meant for a paper. Off means the marker or
+    # caption is not drawn at all, not merely faded.
+    show_video_marker: bool = True
+    show_rupture_marker: bool = True
+    show_schematic_moduli: bool = True
     template: str = "publication"
 
     # Legacy alias: older call sites used a single `font_size`.
@@ -268,7 +273,7 @@ def force_curve_figure(
                 annotation_font_size=max(10, style.tick_size - 6),
             )
 
-    if highlight_window is not None and not log_mode:
+    if highlight_window is not None and style.show_fit_window and not log_mode:
         # The segment currently being edited in the range table. It is drawn
         # over the fit windows rather than under them so that the stretch the
         # user is typing numbers for is unmistakable on the curve.
@@ -293,7 +298,7 @@ def force_curve_figure(
                 annotation_font_color="#8a6100",
             )
 
-    if highlight is not None:
+    if highlight is not None and style.show_video_marker:
         # The point on the curve that the displayed video frame corresponds to.
         hx, hy_N = highlight
         hy, _ = from_newtons(hy_N, style.force_unit)
@@ -315,7 +320,7 @@ def force_curve_figure(
         if not log_mode:
             fig.add_vline(x=hx, line=dict(color="#ff7f0e", width=2, dash="dot"))
 
-    if rupture_epsilon is not None and not log_mode:
+    if rupture_epsilon is not None and style.show_rupture_marker and not log_mode:
         fig.add_vline(
             x=rupture_epsilon,
             line=dict(color="#ff7f0e", width=2, dash="dashdot"),
@@ -615,6 +620,10 @@ def cell_schematic(
     WORD = {"loading": "carrying load", "holding": "holding, no new force",
             "waiting": "not reached yet"}
     labels = []
+    if not style.show_schematic_moduli:
+        # The moduli are in the results table anyway; some people want the
+        # diagram to be a diagram and nothing else.
+        Em_MPa = Ei_kPa = En_kPa = None
     if Em_MPa is not None:
         labels.append(
             f"<b>Membrane</b>  E<sub>m</sub> = {Em_MPa:.3g} MPa "
