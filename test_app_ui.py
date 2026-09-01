@@ -560,13 +560,24 @@ class FakeWorksheet:
         self.header = list(header)
         self.rows = []
         self.updates = []
+        self.all_values = [list(header)]
+        self.written_rows = []
+        self.cleared = False
 
     def row_values(self, index):
         return list(self.header) if index == 1 else []
 
+    def get_all_values(self):
+        return [list(row) for row in self.all_values]
+
+    def clear(self):
+        self.cleared = True
+
     def update(self, values=None, range_name=None, **kwargs):
         self.header = list(values[0])
         self.updates.append(list(values[0]))
+        if len(values) > 1:
+            self.written_rows = [list(r) for r in values[1:]]
 
     def append_row(self, row, **kwargs):
         self.rows.append(list(row))
@@ -583,7 +594,7 @@ def case_sheet_row_matches_the_header():
         print(f"  skip (gspread missing: {exc})")
         return
 
-    # The user's real sheet, as it stands today: no nucleus column.
+    # The user's real sheet as it stood before this change.
     existing = [
         "Cell ID", "Date Analyzed", "Cell Height (μm)",
         "Cantilever Constant (pN/nm)", "Young's Modulus (Em, MPa)",
@@ -596,32 +607,41 @@ def case_sheet_row_matches_the_header():
 
     ok, message = manager.append_cell_data({
         "cell_id": "cell-01", "Em": 0.605, "Ei": 1.196, "En": 3.027,
+        "Em_range": "0.000 to 0.151", "En_range": "0.403 to 0.600",
         "break_1": 0.151, "break_2": 0.403, "fit_quality": 0.9997,
-        "cell_height": 8.0, "notes": "test",
+        "cell_height": 8.0, "spring_constant": 0.08, "notes": "test",
     })
     check("the write succeeded", ok, message)
-    check("the header was extended, not rebuilt",
-          sheet.header[:12] == existing, str(sheet.header[:12]))
-    check("a nucleus column was added",
-          "Young's Modulus (En, kPa)" in sheet.header, str(sheet.header))
-    for wanted in ("ε₁ membrane hands over", "ε₂ nucleus engages"):
-        check(f"{wanted} column added", wanted in sheet.header)
+
+    check("Date Analyzed was renamed, not duplicated",
+          "Experiment Date" in sheet.header
+          and "Date Analyzed" not in sheet.header, str(sheet.header))
+    check("Cantilever Constant became Spring Constant",
+          "Spring Constant, K (N/m)" in sheet.header
+          and "Cantilever Constant (pN/nm)" not in sheet.header, str(sheet.header))
+    check("renamed columns kept their position",
+          sheet.header[1] == "Experiment Date"
+          and sheet.header[3] == "Spring Constant, K (N/m)", str(sheet.header[:5]))
+    for wanted in ("Young's Modulus (En, kPa)", "Em range (ε)", "Ei range (ε)",
+                   "En range (ε)", "ε₁ membrane hands over", "RMSE (N)"):
+        check(f"{wanted} column present", wanted in sheet.header, str(sheet.header))
 
     check("exactly one row was written", len(sheet.rows) == 1)
     written = dict(zip(sheet.header, sheet.rows[0]))
     check("cell id in the right column", written["Cell ID"] == "cell-01")
     check("Em in the Em column",
           abs(float(written["Young's Modulus (Em, MPa)"]) - 0.605) < 1e-6)
-    check("En in the new nucleus column",
+    check("En in the nucleus column",
           abs(float(written["Young's Modulus (En, kPa)"]) - 3.027) < 1e-6)
-    check("ε₂ written", abs(float(written["ε₂ nucleus engages"]) - 0.403) < 1e-6)
+    check("the Em range travelled with it",
+          written["Em range (ε)"] == "0.000 to 0.151", str(written["Em range (ε)"]))
+    check("spring constant in N/m, not converted",
+          abs(float(written["Spring Constant, K (N/m)"]) - 0.08) < 1e-9)
     check("row length matches the header", len(sheet.rows[0]) == len(sheet.header))
 
-    # A sheet whose columns someone has reordered must still be written
-    # correctly, which is the whole point of going by name.
-    shuffled = list(reversed(existing))
+    # A reordered header must still be written correctly.
     manager2 = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet2 = FakeWorksheet(shuffled)
+    sheet2 = FakeWorksheet(list(reversed(existing)))
     manager2.worksheet = sheet2
     manager2.append_cell_data({"cell_id": "cell-02", "Em": 1.5})
     written2 = dict(zip(sheet2.header, sheet2.rows[0]))
@@ -629,6 +649,48 @@ def case_sheet_row_matches_the_header():
           written2["Cell ID"] == "cell-02")
     check("reordered header still gets Em in the Em column",
           abs(float(written2["Young's Modulus (Em, MPa)"]) - 1.5) < 1e-6)
+
+
+def case_sheet_reorder_keeps_the_data():
+    print("reordering the columns does not lose a row")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    header = ["Cell ID", "Date Analyzed", "Video Link", "Notes", "Custom of mine"]
+    rows = [
+        ["cell-01", "2026-01-01", "http://v/1", "first", "keep me"],
+        ["cell-02", "2026-01-02", "http://v/2", "second", "keep me too"],
+    ]
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet = FakeWorksheet(header)
+    sheet.all_values = [header] + rows
+    manager.worksheet = sheet
+
+    ok, message = manager.reorder_columns()
+    check("the reorder succeeded", ok, message)
+    new_header = sheet.header
+    check("video link is last", new_header[-1] == "Video Link"
+          or new_header[-2:] == ["Video Link", "Custom of mine"], str(new_header[-3:]))
+    check("a column the app does not know about was kept",
+          "Custom of mine" in new_header)
+    check("the header was renamed here too",
+          "Experiment Date" in new_header and "Date Analyzed" not in new_header)
+
+    written = [dict(zip(new_header, row)) for row in sheet.written_rows]
+    check("both rows survived", len(written) == 2, str(len(written)))
+    if len(written) == 2:
+        check("row values followed their column",
+              written[0]["Cell ID"] == "cell-01"
+              and written[0]["Notes"] == "first"
+              and written[0]["Video Link"] == "http://v/1",
+              str(written[0]))
+        check("the date moved to the renamed column",
+              written[1]["Experiment Date"] == "2026-01-02", str(written[1]))
+        check("the unknown column kept its value",
+              written[1]["Custom of mine"] == "keep me too")
 
 
 def case_fit_line_and_heights_toggle():
@@ -695,6 +757,75 @@ def case_range_table_shows_zero_moduli():
     last = target.iloc[-1]
     check("the last range carries the nucleus",
           not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
+
+
+def case_plot_options_are_under_the_plot():
+    print("the plot switches are next to the plot, not buried in the sidebar")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "plot options"):
+        return
+    labels = [c.label for c in app.checkbox]
+    for wanted in ("Data and fit only", "The fitted curve", "Element curves",
+                   "Shaded segment bands", "Legend"):
+        check(f"“{wanted}” is on the page", wanted in labels, str(labels))
+
+    text = " ".join(
+        str(m.value) for m in list(app.get("markdown")) + list(app.get("caption"))
+    )
+    check("the sidebar points at the new place",
+          "Plot options" in text, "no pointer found")
+
+    # Ticking it must actually strip the plot.
+    switch = widget_by_label(app, "checkbox", "Data and fit only")
+    check("the switch is reachable", switch is not None)
+    if switch is not None:
+        switch.set_value(True).run()
+        no_exception(app, "bare plot from under the plot")
+        check("the switch stuck", app.session_state["bare_plot"] is True)
+
+
+def case_save_the_plot():
+    print("the plot can be saved with a sensible name")
+    import app as app_module
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+
+    app = start(cell_name="Cell 04 / trial 2")
+    downloads = [d for d in app.get("download_button")
+                 if "save" in (d.label or "").lower()]
+    check("a save button is offered", len(downloads) >= 1,
+          str([d.label for d in app.get("download_button")]))
+
+    import datetime as _dt
+    name = app_module.suggested_plot_name(
+        "Cell 04 / trial 2", fit, _dt.date(2026, 3, 4), ".png"
+    )
+    check("the name carries the cell", name.startswith("Cell_04___trial_2"), name)
+    check("the name carries the date", "2026-03-04" in name, name)
+    check("the name carries the moduli", "Em" in name and "Ec" in name, name)
+    check("the name has no path separators", "/" not in name and "\\" not in name, name)
+    check("the extension is kept", name.endswith(".png"), name)
+    blank = app_module.suggested_plot_name("", fit, _dt.date(2026, 3, 4), ".html")
+    check("an unnamed cell still gets a usable name",
+          blank.startswith("cell_") and blank.endswith(".html"), blank)
+
+
+def case_fit_maths_box():
+    print("the working behind the fit is shown")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "maths box"):
+        return
+    blocks = [str(b.value) for b in app.get("latex")]
+    check("equations are rendered", len(blocks) >= 3, str(len(blocks)))
+    joined = " ".join(blocks)
+    check("the model equation is there", "A_m E_m" in joined, joined[:120])
+    check("the least-squares statement is there",
+          "arg\\min" in joined or "argmin" in joined, joined[-160:])
+    code = " ".join(str(c.value) for c in app.get("code"))
+    check("the prefactors are printed with values", "Am =" in code, code[:160])
+    check("the fitted moduli are printed", "MPa" in code and "kPa" in code)
 
 
 def case_fit_quality():
@@ -835,7 +966,11 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_plot_options_are_under_the_plot,
+        case_save_the_plot,
+        case_fit_maths_box,
         case_sheet_row_matches_the_header,
+        case_sheet_reorder_keeps_the_data,
         case_fit_line_and_heights_toggle,
         case_range_table_shows_zero_moduli,
         case_all_three_moduli_always_reported,
