@@ -33,6 +33,71 @@ from plot_utils import (
     to_newtons,
 )
 
+# --------------------------------------------------- companion file check ---
+#
+# These files are updated together, and a deploy that picks up one but not
+# another fails somewhere deep inside a call with a TypeError that Streamlit
+# Cloud redacts, which tells you nothing. So check up front for the pieces
+# this version of app.py needs, name the file that is behind, and carry on
+# without the missing feature rather than crashing.
+
+def _missing_pieces():
+    """Which companion files are older than this app.py expects."""
+    import inspect
+
+    stale = []
+
+    try:
+        params = inspect.signature(force_curve_figure).parameters
+        if "highlight_window" not in params:
+            stale.append(
+                ("plot_utils.py", "the highlighted segment band on the curve")
+            )
+    except (TypeError, ValueError):  # pragma: no cover - builtin or C function
+        pass
+
+    try:
+        schematic_params = inspect.signature(cell_schematic).parameters
+        if "membrane_mode" not in schematic_params:
+            stale.append(
+                ("plot_utils.py", "the diagram following the chosen combination")
+            )
+    except (TypeError, ValueError):  # pragma: no cover
+        pass
+
+    for method, feature in (
+        ("fit_composition", "the segmented fit"),
+        ("search_compositions", "the “Try every combination” search"),
+        ("composition_terms", "the fitted components on the plot"),
+    ):
+        if not hasattr(LulevichModel, method):
+            stale.append(("lulevich_model.py", feature))
+
+    return stale
+
+
+STALE_FILES = _missing_pieces()
+
+
+def figure_kwargs(function, **kwargs):
+    """
+    Drop keyword arguments the installed version of a function cannot take.
+
+    Without this, one file left behind in a deploy takes the whole app down.
+    With it, the feature that file carries is simply missing until it is
+    updated, and the banner at the top says which file to update.
+    """
+    import inspect
+
+    try:
+        accepted = inspect.signature(function).parameters
+    except (TypeError, ValueError):  # pragma: no cover
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
+        return kwargs
+    return {name: value for name, value in kwargs.items() if name in accepted}
+
+
 # Optional dependencies: the app must still run without Google credentials
 # or the Igor toolchain installed.
 try:
@@ -125,6 +190,17 @@ def _supports_selection():
 
 
 SUPPORTS_SELECTION = _supports_selection()
+
+
+if STALE_FILES:
+    files = sorted({name for name, _ in STALE_FILES})
+    features = "\n".join(f"- {feature} (from `{name}`)" for name, feature in STALE_FILES)
+    st.error(
+        "**Some files are older than this version of `app.py`.**\n\n"
+        "Copy the current " + " and ".join(f"`{f}`" for f in files)
+        + " into the repository, then reboot the app. Until then these are "
+        "switched off:\n\n" + features
+    )
 
 
 def section(text: str):
@@ -1648,7 +1724,11 @@ with tab_analysis:
                     "picked above."
                 )
             with b2:
-                if st.button("🧩 Try every combination", type="secondary", **STRETCH):
+                can_search = hasattr(model, "search_compositions")
+                if st.button(
+                    "🧩 Try every combination", type="secondary",
+                    disabled=not can_search, **STRETCH,
+                ) and can_search:
                     with st.spinner(
                         "Fitting all four combinations at their own best "
                         "boundaries and cross-validating each…"
@@ -1664,6 +1744,8 @@ with tab_analysis:
                     "Fits all four ways the membrane and cytoskeleton can share the "
                     "first boundary, each with its own best ε₁ and ε₂, and ranks "
                     "them on data they were not fitted to."
+                    if can_search else
+                    "Needs an up to date `lulevich_model.py`."
                 )
 
             search = st.session_state.get("composition_search")
@@ -1972,13 +2054,21 @@ with tab_analysis:
             if segmented:
                 # fit_composition covers what fit_segmented did and adds the
                 # two choices about the first boundary, so it is the one path.
-                fit = model.fit_composition(
-                    fit_lo, fit_hi, e1=break_1, e2=break_2,
-                    membrane=membrane_mode,
-                    cyto_start=cyto_mode,
-                    use_nucleus="nucleus" in active,
-                    weighting=st.session_state["weighting"],
-                )
+                # An older lulevich_model.py has only the fixed version.
+                if hasattr(model, "fit_composition"):
+                    fit = model.fit_composition(
+                        fit_lo, fit_hi, e1=break_1, e2=break_2,
+                        membrane=membrane_mode,
+                        cyto_start=cyto_mode,
+                        use_nucleus="nucleus" in active,
+                        weighting=st.session_state["weighting"],
+                    )
+                else:
+                    fit = model.fit_segmented(
+                        fit_lo, fit_hi, e1=break_1, e2=break_2, terms=active,
+                        weighting=st.session_state["weighting"],
+                        fit_offset=st.session_state["fit_offset"],
+                    )
             elif coupling == "auto":
                 with st.spinner("Fitting every model and comparing…"):
                     comparison = compare_couplings(model, fit_lo, fit_hi, terms=active)
@@ -2059,10 +2149,15 @@ with tab_analysis:
             if fitted_coupling == "segmented":
                 # Draw the components with the same basis the fit used, or the
                 # curves would not add up to the line through the data.
-                membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
-                    epsilon, fit["break_1"], fit["break_2"],
-                    fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
-                )
+                if hasattr(model, "composition_terms"):
+                    membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
+                        epsilon, fit["break_1"], fit["break_2"],
+                        fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
+                    )
+                else:
+                    membrane_basis, cyto_basis, nucleus_basis = model.segment_terms(
+                        epsilon, fit["break_1"], fit["break_2"]
+                    )
                 fitted = (
                     membrane_basis * params[0]
                     + cyto_basis * params[1]
@@ -2240,17 +2335,22 @@ with tab_analysis:
                         epsilon,
                         force_N,
                         style,
-                        title=st.session_state["cell_name"] or "Force vs relative deformation",
-                        fit_force_N=fitted,
-                        membrane_N=membrane,
-                        interior_N=interior,
-                        nucleus_N=nucleus,
-                        fit_window=windows_for_plot,
-                        rupture_epsilon=rupture.get("epsilon")
-                        if rupture.get("method") == "force-drop"
-                        else None,
-                        highlight=highlight if (video_ready or show_schematic) else None,
-                        highlight_window=highlight_window,
+                        **figure_kwargs(
+                            force_curve_figure,
+                            title=st.session_state["cell_name"]
+                            or "Force vs relative deformation",
+                            fit_force_N=fitted,
+                            membrane_N=membrane,
+                            interior_N=interior,
+                            nucleus_N=nucleus,
+                            fit_window=windows_for_plot,
+                            rupture_epsilon=rupture.get("epsilon")
+                            if rupture.get("method") == "force-drop"
+                            else None,
+                            highlight=highlight
+                            if (video_ready or show_schematic) else None,
+                            highlight_window=highlight_window,
+                        ),
                     ),
                     key="main_fit_plot",
                     **plot_selection_kwargs(),
@@ -2264,26 +2364,34 @@ with tab_analysis:
                     st.plotly_chart(
                         cell_schematic(
                             style,
-                            coupling=(
-                                "series" if fitted_coupling == "series"
-                                else "hybrid" if fitted_coupling == "hybrid"
-                                else "parallel"
+                            **figure_kwargs(
+                                cell_schematic,
+                                coupling=(
+                                    "series" if fitted_coupling == "series"
+                                    else "hybrid" if fitted_coupling == "hybrid"
+                                    else "parallel"
+                                ),
+                                shares=deformation_shares,
+                                epsilon=selected_eps,
+                                cell_height_um=st.session_state["cell_height_um"],
+                                cell_radius_um=fit["R0"] * 1e6,
+                                nucleus_radius_um=fit.get(
+                                    "R_nucleus", fit["R0"] * 0.35
+                                ) * 1e6,
+                                membrane_thickness_nm=st.session_state[
+                                    "membrane_thickness_nm"
+                                ],
+                                nucleus_onset=model.nucleus_onset
+                                if "nucleus" in active else None,
+                                break_1=fit.get("break_1"),
+                                break_2=fit.get("break_2"),
+                                membrane_mode=fit.get("membrane", "freeze"),
+                                cyto_start=fit.get("cyto_start", "break"),
+                                Em_MPa=fit["Em_MPa"],
+                                Ei_kPa=fit["Ei_kPa"],
+                                En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                                show_nucleus="nucleus" in active,
                             ),
-                            shares=deformation_shares,
-                            epsilon=selected_eps,
-                            cell_height_um=st.session_state["cell_height_um"],
-                            cell_radius_um=fit["R0"] * 1e6,
-                            nucleus_radius_um=fit.get("R_nucleus", fit["R0"] * 0.35) * 1e6,
-                            membrane_thickness_nm=st.session_state["membrane_thickness_nm"],
-                            nucleus_onset=model.nucleus_onset if "nucleus" in active else None,
-                            break_1=fit.get("break_1"),
-                            break_2=fit.get("break_2"),
-                            membrane_mode=fit.get("membrane", "freeze"),
-                            cyto_start=fit.get("cyto_start", "break"),
-                            Em_MPa=fit["Em_MPa"],
-                            Ei_kPa=fit["Ei_kPa"],
-                            En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
-                            show_nucleus="nucleus" in active,
                         ),
                         key="schematic_plot",
                         **STRETCH,
