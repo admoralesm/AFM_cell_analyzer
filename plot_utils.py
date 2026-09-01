@@ -169,9 +169,10 @@ def force_curve_figure(
     """
     One figure for both preview and results.
 
-    Passing ``fit_force_N`` adds the fitted curve; passing ``membrane_N`` /
-    ``interior_N`` adds the two model components as dashed lines so it is
-    visible which term is carrying the force.
+    Passing ``fit_force_N`` adds the fitted curve. The component curves are
+    labelled as contributions to that one total rather than as separate fits,
+    because that is what they are: a single fit whose terms are drawn apart to
+    show which structure is carrying the force where.
     """
     epsilon = np.asarray(epsilon, dtype=float)
     y, unit_label = from_newtons(force_N, style.force_unit)
@@ -213,17 +214,17 @@ def force_curve_figure(
                 x=fx,
                 y=fy,
                 mode="lines",
-                name="Lulevich fit",
+                name="Model, total force",
                 line=dict(color=style.fit_color, width=style.line_width),
-                hovertemplate="ε = %{x:.4f}<br>F(fit) = %{y:.4g} " + unit_label + "<extra></extra>",
+                hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
 
         if style.show_components:
             for comp, label, dash, color in (
-                (membrane_N, "Membrane term (ε³)", "dash", "#2ca02c"),
-                (interior_N, "Cytoskeleton term (ε³ᐟ²)", "dot", "#9467bd"),
-                (nucleus_N, "Nucleus term (⟨ε−ε₀⟩³ᐟ²)", "dashdot", "#e377c2"),
+                (membrane_N, "· membrane contribution", "dash", "#2ca02c"),
+                (interior_N, "· cytoskeleton contribution", "dot", "#9467bd"),
+                (nucleus_N, "· nucleus contribution", "dashdot", "#e377c2"),
             ):
                 if comp is None or not np.any(np.asarray(comp)):
                     continue
@@ -415,6 +416,8 @@ def cell_schematic(
     height=None,
     coupling="parallel",
     shares=None,
+    break_1=None,
+    break_2=None,
 ):
     """
     A small side-on diagram of what is being modelled.
@@ -431,6 +434,13 @@ def cell_schematic(
     stacked between the plates and each takes its own slice of the squash.
     ``shares`` maps element name to its fraction of the total deformation and
     is used to size the stacked elements.
+
+    With ``break_1`` and ``break_2`` given, the diagram also shows which
+    elements are carrying load at the deformation on display: the one that is
+    taking up the squash right now is drawn solid, one that has handed over
+    and is merely holding what it reached is greyed, and one that has not been
+    reached yet is faint and dashed. That is the difference between the first
+    two thirds of a compression and what happens once the nucleus is met.
     """
     epsilon = float(np.clip(epsilon, 0.0, 0.95))
     h = cell_height_um * (1.0 - epsilon)
@@ -456,69 +466,87 @@ def cell_schematic(
 
     membrane_line = max(3, membrane_thickness_nm * 0.9)
 
+    # Which elements are doing what at this deformation.
+    if break_1 is not None and break_2 is not None:
+        if epsilon <= break_1:
+            state = {"membrane": "loading", "interior": "waiting", "nucleus": "waiting"}
+            stage_name = "Membrane alone"
+        elif epsilon <= break_2:
+            state = {"membrane": "holding", "interior": "loading", "nucleus": "waiting"}
+            stage_name = "Cytoskeleton, membrane holding"
+        else:
+            state = {"membrane": "holding", "interior": "loading", "nucleus": "loading"}
+            stage_name = "Cytoskeleton and nucleus together"
+    else:
+        state = {"membrane": "loading", "interior": "loading", "nucleus": "loading"}
+        stage_name = None
+
+    LOADING = {"membrane": "#1f77b4", "interior": "#e67e22", "nucleus": "#8e44ad"}
+    FADED = {"membrane": "#aebfcc", "interior": "#f0c9a0", "nucleus": "#cbb2d6"}
+
+    def colour(name):
+        return LOADING[name] if state[name] == "loading" else FADED[name]
+
+    def dash(name):
+        return "dot" if state[name] == "waiting" else None
+
     if coupling == "series":
         # Stacked between the plates: each element takes its own slice of the
         # total squash, sized by its share of the deformation.
         weights = shares or {}
-        # Bottom to top: membrane against the substrate, then the nucleus, then
-        # the cytoplasm the cantilever presses on. Series is order-independent
-        # mechanically; this order just matches the physical picture.
         order = [("membrane", "#1f77b4")]
         if show_nucleus:
             order.append(("nucleus", "#8e44ad"))
         order.append(("interior", "#e67e22"))
         total = sum(max(weights.get(k, 1.0 / len(order)), 0.02) for k, _ in order)
         y = 0.0
-        for name, color in order:
+        for name, _ in order:
             slice_h = h * max(weights.get(name, 1.0 / len(order)), 0.02) / total
             if name == "membrane":
                 fig.add_shape(
                     type="rect", x0=-r * 0.9, x1=r * 0.9, y0=y, y1=y + slice_h,
                     fillcolor="rgba(214,234,248,0.95)",
-                    line=dict(color="#1f77b4", width=membrane_line),
+                    line=dict(color=colour("membrane"), width=membrane_line),
                 )
             elif name == "interior":
-                _add_spring(fig, 0.0, y, y + slice_h, r * 0.85, color, 4, n_coils=5)
+                _add_spring(fig, 0.0, y, y + slice_h, r * 0.85, colour("interior"), 4, n_coils=5)
             else:
                 nr = min(nucleus_radius_um, r * 0.75)
                 fig.add_shape(
                     type="circle", x0=-nr, x1=nr, y0=y, y1=y + slice_h,
                     fillcolor="rgba(155,89,182,0.75)"
-                    if nucleus_engaged
-                    else "rgba(155,89,182,0.35)",
-                    line=dict(color="#8e44ad", width=2),
+                    if state["nucleus"] == "loading" else "rgba(155,89,182,0.25)",
+                    line=dict(color=colour("nucleus"), width=2),
                 )
             y += slice_h
     else:
-        # The membrane balloon, with the cytoskeleton spring inside it.
+        # The membrane balloon, with one cytoskeleton spring inside it and the
+        # nucleus drawn as a spring of its own.
         fig.add_shape(
             type="circle", x0=-r, x1=r, y0=0, y1=h,
             fillcolor="rgba(214,234,248,0.95)",
-            line=dict(color="#1f77b4", width=membrane_line),
+            line=dict(color=colour("membrane"), width=membrane_line,
+                      dash=dash("membrane")),
             layer="below",
         )
-        # Cytoskeleton springs flanking the middle.
-        _add_spring(fig, -r * 0.52, h * 0.14, h * 0.86, r * 0.30, "#e67e22", 3, n_coils=5)
-        _add_spring(fig, r * 0.52, h * 0.14, h * 0.86, r * 0.30, "#e67e22", 3, n_coils=5)
+        _add_spring(fig, -r * 0.50, h * 0.15, h * 0.85, r * 0.30,
+                    colour("interior"), 3, n_coils=5)
 
         if show_nucleus:
-            # The nucleus is drawn as a spring too. It is a third elastic
-            # element loaded in parallel with the others, so a spring is the
-            # honest picture; the outline behind it just says where it sits.
-            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.42)
+            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.40)
             nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.72)
+            engaged = state["nucleus"] == "loading"
             fig.add_shape(
                 type="circle",
-                x0=-nr, x1=nr,
+                x0=r * 0.16, x1=r * 0.16 + 2 * nr,
                 y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
-                fillcolor="rgba(155,89,182,0.30)" if nucleus_engaged else "rgba(155,89,182,0.12)",
-                line=dict(color="#8e44ad", width=2, dash="dot"),
+                fillcolor="rgba(155,89,182,0.30)" if engaged else "rgba(155,89,182,0.10)",
+                line=dict(color=colour("nucleus"), width=2, dash="dot"),
                 layer="below",
             )
             _add_spring(
-                fig, 0.0, h * 0.16, h * 0.84, min(nr * 1.3, r * 0.42),
-                "#8e44ad" if nucleus_engaged else "rgba(142,68,173,0.35)",
-                3, n_coils=5,
+                fig, r * 0.16 + nr, h * 0.17, h * 0.83, min(nr * 1.2, r * 0.34),
+                colour("nucleus"), 3, n_coils=5,
             )
 
     # Height marker.
@@ -539,20 +567,33 @@ def cell_schematic(
         xanchor="left", font=dict(size=max(10, style.tick_size - 6), color="#2c3e50"),
     )
 
+    WORD = {"loading": "carrying load", "holding": "holding, no new force",
+            "waiting": "not reached yet"}
     labels = []
     if Em_MPa is not None:
-        labels.append(f"<b>Membrane</b>  E<sub>m</sub> = {Em_MPa:.3g} MPa")
+        labels.append(
+            f"<b>Membrane</b>  E<sub>m</sub> = {Em_MPa:.3g} MPa "
+            f"<i>({WORD[state['membrane']]})</i>"
+        )
     if Ei_kPa is not None:
-        labels.append(f"<b>Cytoskeleton</b>  E<sub>c</sub> = {Ei_kPa:.3g} kPa")
+        labels.append(
+            f"<b>Cytoskeleton</b>  E<sub>c</sub> = {Ei_kPa:.3g} kPa "
+            f"<i>({WORD[state['interior']]})</i>"
+        )
     if show_nucleus and En_kPa is not None:
-        state = "engaged" if nucleus_engaged else "not engaged"
-        labels.append(f"<b>Nucleus</b>  E<sub>n</sub> = {En_kPa:.3g} kPa ({state})")
+        labels.append(
+            f"<b>Nucleus</b>  E<sub>n</sub> = {En_kPa:.3g} kPa "
+            f"<i>({WORD[state['nucleus']]})</i>"
+        )
     caption = f"ε = {epsilon:.3f}"
     if labels:
         caption += "<br>" + "<br>".join(labels)
 
+    # Centred on the axes, not on x = 0: the drawing is offset to leave room
+    # for the height marker, so a caption centred at the origin runs off the
+    # left edge and loses its first characters.
     fig.add_annotation(
-        x=0, y=-cell_height_um * 0.24, text=caption, showarrow=False,
+        x=span * 0.225, y=-cell_height_um * 0.24, text=caption, showarrow=False,
         xanchor="center", yanchor="top", align="center",
         font=dict(size=max(10, style.tick_size - 7), color="#2c3e50"),
     )
@@ -571,7 +612,8 @@ def cell_schematic(
         margin=dict(l=6, r=6, t=28, b=6),
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
         title=dict(text="<b>%s</b>" % (
-            "Stacked in series" if coupling == "series"
+            stage_name if stage_name
+            else "Stacked in series" if coupling == "series"
             else "Spring inside the balloon" if coupling == "parallel"
             else "Hybrid load path"),
                    font=dict(size=max(12, style.tick_size - 4), color="black"), x=0.5,
