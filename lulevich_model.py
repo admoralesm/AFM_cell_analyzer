@@ -1115,7 +1115,374 @@ class _ExploreMixin:
         return out
 
 
-class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin):
+# ---------------------------------------------------------------------------
+#  Searching the possible compositions
+# ---------------------------------------------------------------------------
+#
+# Which structures carry load in which stretch of the compression is not
+# something to assume. The membrane goes first and the nucleus last, but in
+# between there are real choices:
+#
+#   * past the first breakpoint, does the membrane keep stiffening as e^3, or
+#     does it stop adding force and simply hold what it reached?
+#   * does the cytoskeleton start from zero deformation, alongside the
+#     membrane, or only from the first breakpoint?
+#   * is there a nucleus stage at all?
+#
+# Each combination is a different model, and each is still linear in the three
+# moduli, so all of them can be fitted exactly and compared. Eight
+# combinations times a breakpoint scan is cheap, and it turns a guess about
+# the mechanics into something the data answers.
+#
+# The general form:
+#
+#     F(e) = Am Em g_m(e) + Ai Ec g_c(e) + An En <e - e2>^1.5
+#
+#     g_m(e) = e^3                     membrane keeps loading
+#            = min(e, e1)^3            membrane freezes at the first break
+#     g_c(e) = <e - 0>^1.5             cytoskeleton loaded from the start
+#            = <e - e1>^1.5            cytoskeleton starts at the first break
+
+
+COMPOSITIONS = [
+    {
+        "key": "freeze_late",
+        "membrane": "freeze",
+        "cyto_start": "break",
+        "label": "Membrane alone, then it holds while the cytoskeleton takes over",
+    },
+    {
+        "key": "freeze_early",
+        "membrane": "freeze",
+        "cyto_start": "zero",
+        "label": "Membrane and cytoskeleton from the start, membrane holds after ε₁",
+    },
+    {
+        "key": "continue_late",
+        "membrane": "continue",
+        "cyto_start": "break",
+        "label": "Membrane throughout, cytoskeleton joins at ε₁",
+    },
+    {
+        "key": "continue_early",
+        "membrane": "continue",
+        "cyto_start": "zero",
+        "label": "Membrane and cytoskeleton both throughout",
+    },
+]
+
+
+class _CompositionMixin:
+    """Fit and compare the ways the stages can be composed."""
+
+    def composition_terms(self, epsilon, e1, e2, membrane="freeze", cyto_start="break"):
+        """The three basis functions for one composition."""
+        eps = np.asarray(epsilon, dtype=float)
+        if membrane == "continue":
+            membrane_basis = self.Am * np.clip(eps, 0.0, None) ** 3
+        else:
+            membrane_basis = self.Am * np.clip(np.minimum(eps, e1), 0.0, None) ** 3
+        start = 0.0 if cyto_start == "zero" else float(e1)
+        cyto_basis = self.Ai * np.clip(eps - start, 0.0, None) ** 1.5
+        nucleus_basis = self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5
+        return membrane_basis, cyto_basis, nucleus_basis
+
+    def fit_composition(
+        self,
+        epsilon_min,
+        epsilon_max,
+        e1,
+        e2,
+        membrane="freeze",
+        cyto_start="break",
+        use_nucleus=True,
+        weighting="uniform",
+    ):
+        """Exact linear fit of one composition at fixed breakpoints."""
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        n_params = 2 + (1 if use_nucleus else 0)
+        if eps.size < n_params + 1:
+            return self._failure(f"Only {eps.size} points in the fitted range.")
+
+        m_basis, c_basis, n_basis = self.composition_terms(
+            eps, e1, e2, membrane, cyto_start
+        )
+        columns = [m_basis, c_basis] + ([n_basis] if use_nucleus else [])
+        design = np.column_stack(columns)
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
+            weights = 1.0 / scale
+        else:
+            weights = np.ones_like(force)
+        design_w, target_w = design * weights[:, None], force * weights
+        col_norm = np.linalg.norm(design_w, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        solution = lsq_linear(
+            design_w / col_norm, target_w, bounds=(0.0, np.inf), method="bvls"
+        )
+        params = solution.x / col_norm
+        Em, Ec = float(params[0]), float(params[1])
+        En = float(params[2]) if use_nucleus else 0.0
+
+        predicted = m_basis * Em + c_basis * Ec + (n_basis * En if use_nucleus else 0.0)
+        residuals = force - predicted
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        return {
+            "success": True,
+            "mode": "segmented",
+            "coupling": "segmented",
+            "membrane": membrane,
+            "cyto_start": cyto_start,
+            "use_nucleus": bool(use_nucleus),
+            "Em": Em, "Ei": Ec, "En": En,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Em_MPa_std": float("nan"), "Ei_kPa_std": float("nan"),
+            "En_kPa_std": float("nan"),
+            "force_offset": 0.0,
+            "break_1": float(e1), "break_2": float(e2),
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params + 2,  # the two breakpoints count as parameters
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": ["membrane", "interior"] + (["nucleus"] if use_nucleus else []),
+            "weighting": weighting,
+            "fit_offset": False,
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "nucleus_onset": float(e2),
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "mask": mask,
+            "warnings": [],
+        }
+
+    def search_compositions(
+        self,
+        epsilon_min=None,
+        epsilon_max=None,
+        n_grid=12,
+        weighting="uniform",
+        n_folds=5,
+        seed=0,
+        include_no_nucleus=True,
+    ):
+        """
+        Fit every composition at its own best breakpoints and rank them.
+
+        Ranking is by AICc, which charges each model for its parameters, and by
+        cross-validated error, which asks which one predicts points it was not
+        fitted on. The breakpoints count as parameters, so a composition does
+        not get to look good purely by having two extra knobs.
+
+        Returns
+        -------
+        dict
+            ``candidates`` ranked best first, ``best`` and its fit, and a
+            ``verdict`` that says plainly when the top few are indistinguishable.
+        """
+        lo = float(self.epsilon.min() if epsilon_min is None else epsilon_min)
+        hi = float(self.epsilon.max() if epsilon_max is None else epsilon_max)
+        eps_all, force_all, _ = self._select(lo, hi)
+        n = eps_all.size
+        if n < 20:
+            return {"success": False, "error": f"Only {n} points; need at least 20."}
+
+        span = hi - lo
+        first_grid = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
+        second_grid = np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+
+        rng = np.random.default_rng(seed)
+        folds = np.array_split(rng.permutation(n), min(n_folds, n))
+
+        rows, fits = [], {}
+        nucleus_options = [True, False] if include_no_nucleus else [True]
+
+        for composition in COMPOSITIONS:
+            for use_nucleus in nucleus_options:
+                best_here = None
+                for e1 in first_grid:
+                    for e2 in second_grid:
+                        if e2 <= e1 + 0.02 * span:
+                            continue
+                        trial = self.fit_composition(
+                            lo, hi, e1, e2, composition["membrane"],
+                            composition["cyto_start"], use_nucleus, weighting,
+                        )
+                        if not trial.get("success"):
+                            continue
+                        if best_here is None or trial["ss_res"] < best_here["ss_res"]:
+                            best_here = trial
+                if best_here is None:
+                    continue
+
+                key = composition["key"] + ("" if use_nucleus else "_no_nucleus")
+                label = composition["label"] + ("" if use_nucleus else ", no nucleus")
+                fits[key] = best_here
+
+                cv_errors = []
+                for fold in folds:
+                    if fold.size == 0 or fold.size >= n - 3:
+                        continue
+                    keep = np.ones(n, dtype=bool)
+                    keep[fold] = False
+                    sub = self._clone(force_all[keep], eps_all[keep])
+                    trained = sub.fit_composition(
+                        lo, hi, best_here["break_1"], best_here["break_2"],
+                        composition["membrane"], composition["cyto_start"],
+                        use_nucleus, weighting,
+                    )
+                    if not trained.get("success"):
+                        continue
+                    m_b, c_b, n_b = self.composition_terms(
+                        eps_all[fold], best_here["break_1"], best_here["break_2"],
+                        composition["membrane"], composition["cyto_start"],
+                    )
+                    predicted = (
+                        m_b * trained["Em"] + c_b * trained["Ei"] + n_b * trained["En"]
+                    )
+                    cv_errors.append(
+                        float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                    )
+
+                rows.append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "membrane": composition["membrane"],
+                        "cyto_start": composition["cyto_start"],
+                        "use_nucleus": use_nucleus,
+                        "break_1": best_here["break_1"],
+                        "break_2": best_here["break_2"],
+                        "Em_MPa": best_here["Em_MPa"],
+                        "Ec_kPa": best_here["Ei_kPa"],
+                        "En_kPa": best_here["En_kPa"],
+                        "r_squared": best_here["r_squared"],
+                        "n_params": best_here["n_params"],
+                        "aicc": _aicc(best_here["ss_res"], n, best_here["n_params"]),
+                        "cv_rmse": float(np.mean(cv_errors)) if cv_errors else float("nan"),
+                    }
+                )
+
+        if not rows:
+            return {"success": False, "error": "No composition produced a usable fit."}
+
+        finite = [r["aicc"] for r in rows if np.isfinite(r["aicc"])]
+        best_aicc = min(finite) if finite else float("nan")
+        for row in rows:
+            row["delta_aicc"] = (
+                row["aicc"] - best_aicc if np.isfinite(row["aicc"]) else float("nan")
+            )
+            # A modulus that came out at zero is a term the data did not want.
+            # Saying so matters: the composition is then not really the one it
+            # claims to be, it is the simpler one wearing an extra parameter.
+            zeros = [
+                name
+                for name, value in (
+                    ("Eₘ", row["Em_MPa"]), ("E_c", row["Ec_kPa"]), ("Eₙ", row["En_kPa"])
+                )
+                if value <= 0 and (name != "Eₙ" or row["use_nucleus"])
+            ]
+            row["empty_terms"] = zeros
+
+        # Rank on cross-validated error first. It measures what actually
+        # matters, prediction of points the fit has not seen, and it makes far
+        # fewer assumptions than AICc, which on these curves is confident about
+        # differences that the held-out error says are not there.
+        def sort_key(row):
+            cv = row["cv_rmse"]
+            return (
+                cv if np.isfinite(cv) else np.inf,
+                np.inf if not np.isfinite(row["aicc"]) else row["aicc"],
+            )
+
+        rows.sort(key=sort_key)
+        best = rows[0]
+
+        cv_rows = [r for r in rows if np.isfinite(r["cv_rmse"])]
+        cv_best = cv_rows[0] if cv_rows else None
+        aicc_best = min(
+            (r for r in rows if np.isfinite(r["aicc"])),
+            key=lambda r: r["aicc"],
+            default=None,
+        )
+
+        # Everything whose held-out error is within a few percent of the best
+        # is doing the same job as the best.
+        tied = []
+        if np.isfinite(best.get("cv_rmse", np.nan)) and best["cv_rmse"] > 0:
+            tied = [
+                r for r in rows[1:]
+                if np.isfinite(r["cv_rmse"])
+                and (r["cv_rmse"] - best["cv_rmse"]) / best["cv_rmse"] < 0.05
+            ]
+        for row in rows:
+            row["tied_with_best"] = row is not best and row in tied
+
+        if tied:
+            names = ", ".join(f"“{r['label']}”" for r in tied[:2])
+            verdict = (
+                f"“{best['label']}” has the lowest held-out error, but {names} "
+                f"predict within 5 % of it. This curve does not separate them, so "
+                f"the choice is yours to make on what you know about the cell "
+                f"rather than on these numbers."
+            )
+        elif aicc_best is not None and aicc_best["key"] != best["key"]:
+            verdict = (
+                f"Cross-validation prefers “{best['label']}” while AICc prefers "
+                f"“{aicc_best['label']}”. The held-out error is the one to trust: "
+                f"AICc is comparing fits on the same points it fitted."
+            )
+        else:
+            verdict = f"“{best['label']}” predicts held-out points best, clear of the rest."
+
+        if best.get("empty_terms"):
+            verdict += (
+                " Note that " + " and ".join(best["empty_terms"])
+                + " came out at zero, so that term is not supported by this curve."
+            )
+
+        out = {
+            "success": True,
+            "candidates": rows,
+            "best": best,
+            "best_by_cv": cv_best,
+            "fits": fits,
+            "verdict": verdict,
+            "n_points": int(n),
+        }
+        self.results["composition_search"] = out
+        return out
+
+    def _clone(self, force, epsilon):
+        """A model with the same geometry over a subset of the data."""
+        return LulevichModel(
+            force, epsilon, self.cell_height,
+            cell_radius=self.R0,
+            membrane_thickness=self.h_membrane,
+            poisson_membrane=self.nu_m,
+            poisson_interior=self.nu_i,
+            nucleus_radius=self.R_nucleus,
+            poisson_nucleus=self.nu_n,
+            nucleus_onset=self.nucleus_onset,
+            segment_break_1=self.segment_break_1,
+            segment_break_2=self.segment_break_2,
+        )
+
+
+class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _CompositionMixin):
     """Lulevich fit for single-cell compression curves."""
 
     # ------------------------------------------------------------------ init
