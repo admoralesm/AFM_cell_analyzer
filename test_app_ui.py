@@ -828,6 +828,153 @@ def case_fit_maths_box():
     check("the fitted moduli are printed", "MPa" in code and "kPa" in code)
 
 
+def case_guided_mode_is_the_default():
+    print("guided mode: one button, an answer in words")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "guided load"):
+        return
+    check("guided is the default",
+          app.session_state["ui_mode"].startswith("Guided"),
+          app.session_state["ui_mode"])
+
+    work = button_by_label(app, "Work it out for me")
+    check("the one-press button is there", work is not None)
+
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    for phrase in ("What this cell did as it was squashed",
+                   "How stiff each part turned out to be",
+                   "Does the model match the measurement"):
+        check(f"“{phrase[:34]}…” is shown", phrase in text)
+    check("no bare jargon in the headline",
+          "coupling" not in text.lower(), "the word coupling leaked out")
+
+    # The plain-language table names the parts in everyday words.
+    frames = [f.value for f in app.get("dataframe")]
+    parts = [f for f in frames if "Part of the cell" in list(getattr(f, "columns", []))]
+    check("the stiffness table is there", len(parts) == 1, str(len(parts)))
+    if parts:
+        table = parts[0]
+        check("it names all three parts", len(table) == 3, str(len(table)))
+        check("it explains what each part is",
+              all(isinstance(v, str) and v for v in table["What it is"]))
+        check("it gives an everyday comparison",
+              any("as" in str(v) for v in table["Roughly"]), str(list(table["Roughly"])))
+
+    if work is not None:
+        work.click().run()
+        if no_exception(app, "work it out"):
+            found = app.session_state["composition_search"]
+            check("the search ran", bool(found and found.get("success")))
+            if found and found.get("success"):
+                best = found["best"]
+                check("the winner was applied",
+                      abs(app.session_state["segment_break_1"]
+                          - round(best["break_1"], 3)) < 0.002,
+                      f"{app.session_state['segment_break_1']} vs {best['break_1']}")
+
+
+def case_full_control_shows_everything():
+    print("full control puts the settings back on the page")
+    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
+    if not no_exception(app, "full control"):
+        return
+    check("the one-press button is hidden in full control",
+          button_by_label(app, "Work it out for me") is None)
+    check("the section headings are back",
+          any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
+    check("the expert search button is still there",
+          button_by_label(app, "Find the best combination and fit it") is not None)
+    check("the plain-language summary is not duplicated",
+          not any("What this cell did as it was squashed" in str(m.value)
+                  for m in app.get("markdown")))
+
+
+def case_plain_language_helpers():
+    print("the everyday wording is honest about scale")
+    import app as app_module
+
+    check("a jelly-soft modulus reads soft",
+          "jelly" in app_module.stiffness_in_words(1.2e3),
+          app_module.stiffness_in_words(1.2e3))
+    check("a rubbery modulus reads firm",
+          "rubber" in app_module.stiffness_in_words(6e5),
+          app_module.stiffness_in_words(6e5))
+    check("zero is called unmeasurable",
+          "not measurable" in app_module.stiffness_in_words(0.0))
+    check("a NaN is called unmeasurable",
+          "not measurable" in app_module.stiffness_in_words(float("nan")))
+    check("the comparisons increase with stiffness",
+          len({app_module.stiffness_in_words(v)
+               for v in (5e2, 5e3, 5e4, 5e5)}) == 4)
+
+    check("a good fit is described as close",
+          "exactly" in app_module.quality_in_words(0.999))
+    check("a bad fit is called out",
+          "wrong" in app_module.quality_in_words(0.5),
+          app_module.quality_in_words(0.5))
+
+
+def case_curve_saved_as_a_tab():
+    print("the force curve can be stored in the spreadsheet")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    class FakeSpreadsheet:
+        url = "https://docs.google.com/spreadsheets/d/abc/edit"
+
+        def __init__(self):
+            self.tabs = {}
+
+        def worksheet(self, title):
+            import gspread
+            if title not in self.tabs:
+                raise gspread.WorksheetNotFound(title)
+            return self.tabs[title]
+
+        def add_worksheet(self, title, rows, cols):
+            sheet = FakeWorksheet([])
+            sheet.id = 7
+            self.tabs[title] = sheet
+            return sheet
+
+        def worksheets(self):
+            return list(self.tabs.values())
+
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    book = FakeSpreadsheet()
+    manager.spreadsheet = book
+
+    eps, force = synthetic()
+    fitted = force * 0.99
+    fitted[:5] = np.nan          # outside the fitted range
+
+    ok, message, url = manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
+    check("the curve was saved", ok, message)
+    check("the tab is named after the cell",
+          "curve_Cell 04 _ trial 2" in book.tabs, str(list(book.tabs)))
+    check("the url points at the tab", "#gid=" in url, url)
+
+    sheet = list(book.tabs.values())[0]
+    written = sheet.written_rows if sheet.written_rows else []
+    header = sheet.header
+    check("the header names the columns",
+          header == ["relative_deformation", "force_N", "fit_N"], str(header))
+    check("every point was written", len(written) == len(eps), str(len(written)))
+    check("NaN outside the fit is written as blank",
+          written[0][2] == "", repr(written[0][2]))
+    check("a fitted point carries its value",
+          isinstance(written[-1][2], float), repr(written[-1][2]))
+
+    # Saving the same cell twice replaces the tab rather than adding another.
+    manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
+    check("refitting replaces the tab, not duplicates it", len(book.tabs) == 1,
+          str(list(book.tabs)))
+    check("the tab was cleared before rewriting", sheet.cleared is True)
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -966,6 +1113,10 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_plain_language_helpers,
+        case_guided_mode_is_the_default,
+        case_full_control_shows_everything,
+        case_curve_saved_as_a_tab,
         case_plot_options_are_under_the_plot,
         case_save_the_plot,
         case_fit_maths_box,
