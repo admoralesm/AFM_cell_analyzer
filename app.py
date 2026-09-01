@@ -232,6 +232,10 @@ DEFAULTS = {
     "show_components": False,
     "bare_plot": False,
     "show_legend": True,
+    # Separate from the bare switch: sometimes you want the markings but not
+    # the model, to look at the data on its own.
+    "show_fit_line": True,
+    "show_component_heights": False,
     "show_fit_window": True,
     "show_video_marker": True,
     "show_rupture_marker": True,
@@ -370,6 +374,7 @@ PLOT_EXTRAS = (
     "show_video_marker",
     "show_rupture_marker",
     "show_legend",
+    "show_component_heights",
 )
 
 
@@ -421,6 +426,10 @@ def current_style(force_N=None) -> PlotStyle:
         show_video_marker=on("show_video_marker"),
         show_rupture_marker=on("show_rupture_marker"),
         show_legend=on("show_legend"),
+        show_component_heights=on("show_component_heights"),
+        # Not a marking: the fitted curve is the result, so the bare switch
+        # leaves it alone and only its own checkbox removes it.
+        show_fit_line=bool(st.session_state["show_fit_line"]),
         show_schematic_moduli=st.session_state["show_schematic_moduli"],
     )
 
@@ -973,6 +982,64 @@ def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model,
     )
 
 
+def send_cell_to_sheet(manager, fit, date_acquired):
+    """
+    Write one row into the Google Sheet.
+
+    The sheet is the flat summary: one row per cell, the numbers you would
+    plot across a population. The curve itself is too big for a cell and
+    lives in Box or in the downloaded zip.
+    """
+    terms = set(fit.get("terms") or ())
+    combination = ""
+    if fit.get("coupling") == "segmented":
+        membrane_word = (
+            "membrane keeps stiffening" if fit.get("membrane") == "continue"
+            else "membrane holds after ε₁"
+        )
+        cyto_word = (
+            "cytoskeleton from zero" if fit.get("cyto_start") == "zero"
+            else "cytoskeleton from ε₁"
+        )
+        combination = f"{membrane_word}, {cyto_word}"
+
+    def modulus(key, term):
+        # A term that was not fitted is written as 0, not blank: blank in a
+        # spreadsheet column is ambiguous between zero and not measured, and
+        # those mean different things once the rows are averaged.
+        return round(float(fit.get(key, 0.0)), 6) if term in terms else 0
+
+    lo, hi = fit.get("epsilon_range", (0.0, 0.0))
+    return manager.append_cell_data(
+        {
+            "cell_id": st.session_state["cell_name"].strip(),
+            "date_analyzed": str(date_acquired),
+            "cell_height": round(float(st.session_state["cell_height_um"]), 3),
+            "cantilever_constant": round(
+                float(st.session_state["spring_constant"]) * 1000.0, 4
+            ),
+            "Em": modulus("Em_MPa", "membrane"),
+            "Ei": modulus("Ei_kPa", "interior"),
+            "En": modulus("En_kPa", "nucleus"),
+            "membrane_areal": round(
+                float(fit.get("membrane_areal_modulus", 0.0)) * 1e3, 5
+            ),
+            "break_1": round(float(fit.get("break_1", float("nan"))), 4)
+            if fit.get("break_1") is not None else "",
+            "break_2": round(float(fit.get("break_2", float("nan"))), 4)
+            if fit.get("break_2") is not None else "",
+            "model": st.session_state["model_kind"],
+            "combination": combination,
+            "fit_range": f"{lo:.3f} to {hi:.3f}",
+            "video_link": st.session_state.get("video_link", ""),
+            "force_curve_created": "Yes",
+            "fit_quality": round(float(fit.get("r_squared", float("nan"))), 5),
+            "notes": st.session_state["cell_notes"],
+            "analysis_status": "Complete",
+        }
+    )
+
+
 def cell_bundle_zip(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
     """The same record as Box, as a zip the browser can download."""
     import zipfile
@@ -1259,6 +1326,12 @@ with st.sidebar:
             if bare else "Or switch off individual pieces:"
         )
         st.checkbox(
+            "The fitted curve", key="show_fit_line",
+            help="Off leaves the measured points alone, with no model drawn "
+            "over them. Independent of “Data and fit only”, so you can have "
+            "a bare plot of just the data.",
+        )
+        st.checkbox(
             "Element curves", key="show_components", disabled=bare,
             help="The membrane, cytoskeleton and nucleus contributions drawn "
             "apart. They are parts of the one fit, not separate fits.",
@@ -1276,6 +1349,12 @@ with st.sidebar:
         st.checkbox(
             "Rupture marker", key="show_rupture_marker", disabled=bare,
             help="The dash-dotted line where the force drops.",
+        )
+        st.checkbox(
+            "Height of each component", key="show_component_heights", disabled=bare,
+            help="Labels each element curve at the right-hand end with the "
+            "force it is carrying there, so you can read each contribution "
+            "off the plot without hovering.",
         )
         st.checkbox("Legend", key="show_legend", disabled=bare)
 
@@ -2579,15 +2658,23 @@ with tab_analysis:
                         "range": f"{lo:.3f} to {hi:.3f}",
                         "points": int(inside.sum()),
                     }
-                    for term, label in (
-                        ("membrane", "membrane"), ("interior", "cytoskeleton"),
-                        ("nucleus", "nucleus"),
+                    for term, label, key, unit in (
+                        ("membrane", "membrane", "Em_MPa", "MPa"),
+                        ("interior", "cytoskeleton", "Ei_kPa", "kPa"),
+                        ("nucleus", "nucleus", "En_kPa", "kPa"),
                     ):
                         word = state_words(term, lo, hi)
+                        carrying = term in fitted_terms and word != "not yet"
+                        # The modulus in force here, not just in the fit as a
+                        # whole. An element not yet reached in this range
+                        # contributes exactly zero, and the row says so with a
+                        # number rather than leaving you to infer it.
+                        value = float(fit.get(key, 0.0)) if carrying else 0.0
+                        row[f"E {label}"] = f"{value:.4g} {unit}"
                         if term not in fitted_terms:
                             row[label] = "not in model"
                         elif word == "not yet":
-                            row[label] = "0 %  not yet"
+                            row[label] = "0 %  not reached"
                         else:
                             row[label] = f"{100 * share[term] / total:.0f} %  {word}"
                     rows.append(row)
@@ -2595,6 +2682,11 @@ with tab_analysis:
                 if rows:
                     st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
                     st.caption(
+                        "Each range lists the modulus that element contributes "
+                        "there, which is zero for an element the compression has "
+                        "not reached yet: below ε₁ only the membrane carries "
+                        "load, so E_c and Eₙ really are 0 over that stretch even "
+                        "though the whole-curve fit reports a value for them. "
                         "Percentages are each element's share of the total force at "
                         "the top of that range, so they show who is carrying the "
                         "cell by the end of each stretch. “Holding” means the "
@@ -2985,11 +3077,32 @@ with tab_analysis:
             + ". The video is optional: a cell can be sent with none at all."
         )
 
-        c1, c2 = st.columns(2)
+        sheet_manager = st.session_state.get("gs_manager")
+        sheet_ready = bool(st.session_state.get("db_enabled") and sheet_manager)
+
+        c0, c1, c2 = st.columns(3)
+        with c0:
+            sheet_blockers = [b for b in blockers if "Box" not in b]
+            if not sheet_ready:
+                sheet_blockers.append("connect the Google Sheet in the sidebar")
+            if st.button(
+                "📗 Send to Google Sheet", type="primary",
+                disabled=bool(sheet_blockers), **STRETCH,
+            ):
+                try:
+                    ok, message = send_cell_to_sheet(sheet_manager, fit, date_acquired)
+                    (st.success if ok else st.error)(message)
+                except Exception as exc:
+                    st.error(f"Could not write the row: {exc}")
+            st.caption(
+                "One row per cell: the moduli, the boundaries and R². "
+                if not sheet_blockers
+                else "To enable: " + ", then ".join(sheet_blockers) + "."
+            )
         with c1:
             box_blockers = [b for b in blockers]
             if st.button(
-                "📤 Send to Box", type="primary",
+                "📤 Send to Box",
                 disabled=bool(box_blockers), **STRETCH,
             ):
                 try:
