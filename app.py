@@ -173,9 +173,15 @@ DEFAULTS = {
     "_scanned_onset": None,
     # fitting
     "model_kind": "Segmented (membrane → cytoskeleton → nucleus)",
-    "coupling": "Parallel (forces add)",
     "segment_break_1": 0.15,
     "segment_break_2": 0.40,
+    # What each element does either side of the first boundary. These are the
+    # two choices the physics leaves open, and the combination search below
+    # settles them from the data when you ask it to.
+    "membrane_after_break": "holds what it reached",
+    "cyto_starts_at": "at ε₁",
+    "highlight_segment": "(none)",
+    "composition_search": None,
     "procedure": "All at once",
     "crossover_mode": "Scan for best",
     "crossover": 0.18,
@@ -448,48 +454,59 @@ MODELS = {
     "Segmented (membrane → cytoskeleton → nucleus)":
         "Three stretches of deformation, each with different structures bearing "
         "the load. Continuous at the boundaries and linear in the moduli.",
-    "Parallel (every element acts everywhere)":
-        "All elements squashed by the same amount; their forces add.",
-    "Series (deformations add)":
-        "All elements carry the same force; their deformations add.",
-    "Hybrid: parallel below, series above":
-        "Parallel up to a crossover deformation, then the load path stacks.",
-    "Hybrid: series below, parallel above":
-        "Stacked at small deformation, sharing the squash once compressed.",
-    "Auto (compare and rank)":
-        "Fits parallel, series and both hybrids, then ranks them by AICc and "
-        "cross-validation.",
+    "Side by side (every element acts everywhere)":
+        "All elements squashed by the same amount, their forces adding. The "
+        "stiffest one dominates.",
+    "Stacked (elements in line)":
+        "All elements carrying the same force, their deformations adding. The "
+        "softest one dominates.",
+    "Side by side, then stacked":
+        "Side by side up to a crossover deformation, stacked above it.",
+    "Stacked, then side by side":
+        "Stacked at small deformation, side by side once compressed.",
+    "Compare these and rank them":
+        "Fits the four above and ranks them by AICc and cross-validation.",
 }
 MODEL_KEYS = {
     "Segmented (membrane → cytoskeleton → nucleus)": "segmented",
-    "Parallel (every element acts everywhere)": "parallel",
-    "Series (deformations add)": "series",
-    "Hybrid: parallel below, series above": "hybrid_ps",
-    "Hybrid: series below, parallel above": "hybrid_sp",
-    "Auto (compare and rank)": "auto",
+    "Side by side (every element acts everywhere)": "parallel",
+    "Stacked (elements in line)": "series",
+    "Side by side, then stacked": "hybrid_ps",
+    "Stacked, then side by side": "hybrid_sp",
+    "Compare these and rank them": "auto",
 }
 
-COUPLINGS = {
-    "Parallel (forces add)":
-        "Every element is squashed by the same amount; their forces add. The "
-        "stiffest element dominates.",
-    "Series (deformations add)":
-        "Every element carries the same force; their deformations add, a spring "
-        "stacked on a spring. The softest element dominates.",
-    "Hybrid: parallel below, series above":
-        "Parallel up to a crossover deformation, then the load path stacks.",
-    "Hybrid: series below, parallel above":
-        "Stacked at small deformation, sharing the squash once compressed.",
-    "Auto (let the data choose)":
-        "Fits all four and ranks them by AICc and cross-validation.",
-}
-COUPLING_KEYS = {
+# Older saved presets and stored database records name the model with the
+# wording this app used before, including "parallel below, series above",
+# which nobody could read. They are kept here only so that an old record still
+# refits; nothing in the interface offers these names any more.
+LEGACY_MODEL_NAMES = {
     "Parallel (forces add)": "parallel",
     "Series (deformations add)": "series",
     "Hybrid: parallel below, series above": "hybrid_ps",
     "Hybrid: series below, parallel above": "hybrid_sp",
     "Auto (let the data choose)": "auto",
 }
+# Any name the app has ever used, resolved to the key the fitter takes.
+MODEL_KEYS_ANY = {**LEGACY_MODEL_NAMES, **MODEL_KEYS}
+# The two things the physics does not settle for you, in plain words.
+# Left of the arrow is what you pick in the interface, right of it is the
+# argument the model takes.
+MEMBRANE_CHOICES = {
+    "holds what it reached": "freeze",
+    "keeps stiffening": "continue",
+}
+CYTO_CHOICES = {
+    "at ε₁": "break",
+    "from the very start": "zero",
+}
+COMPOSITION_LABELS = {
+    ("freeze", "break"): "Membrane alone, then it hands over to the cytoskeleton",
+    ("freeze", "zero"): "Both from the start, membrane holds after ε₁",
+    ("continue", "break"): "Membrane throughout, cytoskeleton joins at ε₁",
+    ("continue", "zero"): "Membrane and cytoskeleton both throughout",
+}
+
 STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 
 # Starting points, not literature constants. They set the geometry, the
@@ -592,8 +609,26 @@ def apply_preset(preset, lo, hi):
     applied at the top of the next run.
     """
     pending = {}
-    if preset.get("coupling") in COUPLINGS:
-        pending["coupling"] = preset["coupling"]
+    # A preset saved before the models were renamed still carries the old
+    # wording; resolve it to a name the radio actually offers.
+    stored_model = preset.get("coupling")
+    if stored_model in MODEL_KEYS:
+        pending["model_kind"] = stored_model
+    elif stored_model in LEGACY_MODEL_NAMES:
+        wanted = LEGACY_MODEL_NAMES[stored_model]
+        for label, key in MODEL_KEYS.items():
+            if key == wanted:
+                pending["model_kind"] = label
+                break
+    for field, allowed in (
+        ("membrane_after_break", MEMBRANE_CHOICES),
+        ("cyto_starts_at", CYTO_CHOICES),
+    ):
+        if preset.get(field) in allowed:
+            pending[field] = preset[field]
+    for field in ("segment_break_1", "segment_break_2"):
+        if preset.get(field) is not None:
+            pending[field] = float(preset[field])
     if preset.get("procedure") in ("All at once", "Stage by stage"):
         pending["procedure"] = preset["procedure"]
     for term in TERM_ORDER:
@@ -668,9 +703,15 @@ def apply_plot_drag(chart_key, lo, hi):
 def current_fit_settings():
     """Everything needed to reproduce the fit currently configured."""
     return {
-        "coupling": st.session_state["coupling"],
+        # "coupling" is the stored name of the model. It keeps its old key so
+        # that records written by earlier versions still load.
+        "coupling": st.session_state["model_kind"],
         "procedure": st.session_state["procedure"],
         "terms": list(active_terms()),
+        "segment_break_1": float(st.session_state["segment_break_1"]),
+        "segment_break_2": float(st.session_state["segment_break_2"]),
+        "membrane_after_break": st.session_state["membrane_after_break"],
+        "cyto_starts_at": st.session_state["cyto_starts_at"],
         "regime_mode": bool(st.session_state["regime_mode"]),
         "weighting": st.session_state["weighting"],
         "fit_offset": bool(st.session_state["fit_offset"]),
@@ -818,9 +859,26 @@ def refit_stored_cell(store, cell_id, settings):
 
     terms = tuple(settings.get("terms") or ("membrane", "interior"))
     lo, hi = settings.get("combined_window", [0.02, 0.4])
-    coupling = COUPLING_KEYS.get(settings.get("coupling", ""), "parallel")
+    coupling = MODEL_KEYS_ANY.get(settings.get("coupling", ""), "segmented")
 
-    if coupling == "series":
+    if coupling == "segmented":
+        # The default model, so bulk refits have to handle it. The composition
+        # comes from the record when it has one and from the current defaults
+        # when it was saved before compositions existed.
+        membrane = MEMBRANE_CHOICES.get(
+            settings.get("membrane_after_break", ""), "freeze"
+        )
+        cyto_start = CYTO_CHOICES.get(settings.get("cyto_starts_at", ""), "break")
+        fit = model.fit_composition(
+            lo, hi,
+            e1=float(settings.get("segment_break_1", 0.15)),
+            e2=float(settings.get("segment_break_2", 0.40)),
+            membrane=membrane,
+            cyto_start=cyto_start,
+            use_nucleus="nucleus" in terms,
+            weighting=settings.get("weighting", "uniform"),
+        )
+    elif coupling == "series":
         fit = model.fit_series(lo, hi, terms=terms, weighting=settings.get("weighting", "uniform"))
     elif coupling in ("hybrid_ps", "hybrid_sp"):
         order = "parallel-then-series" if coupling == "hybrid_ps" else "series-then-parallel"
@@ -1339,6 +1397,38 @@ with tab_analysis:
         segmented = kind == "segmented"
         coupling = kind
 
+        if segmented:
+            st.markdown("**3 · What each one does at the first boundary**")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.radio(
+                    "After ε₁ the membrane…",
+                    list(MEMBRANE_CHOICES.keys()),
+                    key="membrane_after_break",
+                    help="“Holds what it reached” means the membrane stops adding "
+                    "force above ε₁ and keeps the force it had there, so the whole "
+                    "of the extra load goes to the cytoskeleton. “Keeps stiffening” "
+                    "means the ε³ term carries on rising underneath the others.",
+                )
+            with c2:
+                st.radio(
+                    "The cytoskeleton starts…",
+                    list(CYTO_CHOICES.keys()),
+                    key="cyto_starts_at",
+                    help="“At ε₁” means the cytoskeleton only begins to bear load "
+                    "once the membrane hands over. “From the very start” means both "
+                    "carry load together from first contact.",
+                )
+            membrane_mode = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
+            cyto_mode = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
+            st.caption(
+                f"→ {COMPOSITION_LABELS[(membrane_mode, cyto_mode)]}. "
+                "The nucleus always joins at ε₂. If you are not sure which of the "
+                "four is right, the combination search below tries them all."
+            )
+        else:
+            membrane_mode, cyto_mode = "freeze", "break"
+
         # ---------------------------------------------------- exploration ---
         if segmented:
             section("4 · Explore the curve")
@@ -1448,6 +1538,8 @@ with tab_analysis:
         break_1 = float(st.session_state["segment_break_1"])
         break_2 = float(st.session_state["segment_break_2"])
 
+        highlight_window = None
+
         if segmented:
             st.markdown("**Segment table**")
             st.caption(
@@ -1455,22 +1547,36 @@ with tab_analysis:
                 "end of one is the start of the next: editing a row's ε end moves "
                 "that boundary."
             )
+            # The row names follow the composition chosen above, so the table
+            # always says what is actually carrying load in each stretch.
+            seg_1_name = (
+                "1 · membrane + cytoskeleton" if cyto_mode == "zero"
+                else "1 · membrane, ε³"
+            )
+            seg_2_name = (
+                "2 · membrane + cytoskeleton" if membrane_mode == "continue"
+                else "2 · cytoskeleton, membrane holding"
+            )
+            seg_3_name = (
+                "3 · " + ("membrane + " if membrane_mode == "continue" else "")
+                + "cytoskeleton + nucleus"
+            )
             table = pd.DataFrame(
                 [
                     {
-                        "segment": "1 · membrane, ε³",
+                        "segment": seg_1_name,
                         "ε start": round(fit_lo, 3),
                         "ε end": round(break_1, 3),
                         "points": int(((epsilon >= fit_lo) & (epsilon <= break_1)).sum()),
                     },
                     {
-                        "segment": "2 · cytoskeleton, ⟨ε−ε₁⟩³ᐟ²",
+                        "segment": seg_2_name,
                         "ε start": round(break_1, 3),
                         "ε end": round(break_2, 3),
                         "points": int(((epsilon > break_1) & (epsilon <= break_2)).sum()),
                     },
                     {
-                        "segment": "3 · cytoskeleton + nucleus",
+                        "segment": seg_3_name,
                         "ε start": round(break_2, 3),
                         "ε end": round(fit_hi, 3),
                         "points": int(((epsilon > break_2) & (epsilon <= fit_hi)).sum()),
@@ -1503,7 +1609,25 @@ with tab_analysis:
                 }
                 st.rerun()
 
-            b1, b2 = st.columns([1, 2])
+            # Which segment to shade on the curve. Editing a boundary is much
+            # easier when you can see the stretch of data it moves.
+            st.radio(
+                "Highlight on the plot",
+                ["(none)", "Segment 1", "Segment 2", "Segment 3", "Whole fitted range"],
+                key="highlight_segment",
+                horizontal=True,
+            )
+            highlight_bounds = {
+                "Segment 1": (fit_lo, break_1, seg_1_name),
+                "Segment 2": (break_1, break_2, seg_2_name),
+                "Segment 3": (break_2, fit_hi, seg_3_name),
+                "Whole fitted range": (fit_lo, fit_hi, "fitted range"),
+            }
+            highlight_window = highlight_bounds.get(
+                st.session_state["highlight_segment"]
+            )
+
+            b1, b2 = st.columns([1, 1])
             with b1:
                 if st.button("🔎 Find the boundaries from the data", **STRETCH):
                     with st.spinner("Scanning boundaries…"):
@@ -1519,14 +1643,112 @@ with tab_analysis:
                         st.rerun()
                     else:
                         st.error(scan_breaks.get("error", "Boundary scan failed."))
+                st.caption(
+                    "Moves the two boundaries only, keeping the combination you "
+                    "picked above."
+                )
             with b2:
-                if break_2 <= break_1:
-                    st.error("Segment 2 must end after segment 1.")
-                else:
-                    st.caption(
-                        "The force is continuous across both boundaries by "
-                        "construction, so moving one never puts a step in the curve."
+                if st.button("🧩 Try every combination", type="secondary", **STRETCH):
+                    with st.spinner(
+                        "Fitting all four combinations at their own best "
+                        "boundaries and cross-validating each…"
+                    ):
+                        st.session_state["composition_search"] = (
+                            model.search_compositions(
+                                fit_lo, fit_hi,
+                                weighting=st.session_state["weighting"],
+                                include_no_nucleus="nucleus" in active,
+                            )
+                        )
+                st.caption(
+                    "Fits all four ways the membrane and cytoskeleton can share the "
+                    "first boundary, each with its own best ε₁ and ε₂, and ranks "
+                    "them on data they were not fitted to."
+                )
+
+            search = st.session_state.get("composition_search")
+            if search and search.get("success"):
+                st.info(search["verdict"])
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "combination": row["label"],
+                                "ε₁": round(row["break_1"], 3),
+                                "ε₂": round(row["break_2"], 3),
+                                "Eₘ (MPa)": float(f"{row['Em_MPa']:.4g}"),
+                                "E_c (kPa)": float(f"{row['Ec_kPa']:.4g}"),
+                                "Eₙ (kPa)": float(f"{row['En_kPa']:.4g}"),
+                                "R²": round(row["r_squared"], 5),
+                                "CV RMSE": f"{row['cv_rmse']:.4g}",
+                                "ΔAICc": round(row["delta_aicc"], 1),
+                                "note": (
+                                    "ties with the best"
+                                    if row.get("tied_with_best") else ""
+                                ) + (
+                                    (" · " if row.get("tied_with_best") else "")
+                                    + ", ".join(row["empty_terms"]) + " came out zero"
+                                    if row.get("empty_terms") else ""
+                                ),
+                            }
+                            for row in search["candidates"]
+                        ]
+                    ),
+                    hide_index=True,
+                    **STRETCH,
+                )
+                st.caption(
+                    "Ranked by cross-validated error, which asks how well each "
+                    "combination predicts points it was not fitted on. ΔAICc is "
+                    "shown alongside but is not what decides the order: on these "
+                    "curves it is confident about differences the held-out error "
+                    "says are not there. A term that came out at zero means the "
+                    "data did not want it."
+                )
+                best = search["best"]
+                apply_labels = {
+                    (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
+                    for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
+                }
+                choice_names = [row["label"] for row in search["candidates"]]
+                a1, a2 = st.columns([2, 1])
+                with a1:
+                    picked = st.selectbox(
+                        "Combination to apply", choice_names, index=0,
+                        key="composition_pick",
                     )
+                with a2:
+                    st.markdown("<div style='height:1.7rem'></div>",
+                                unsafe_allow_html=True)
+                    if st.button("✓ Use this combination", type="primary", **STRETCH):
+                        row = next(
+                            r for r in search["candidates"] if r["label"] == picked
+                        )
+                        m_label, c_label = apply_labels[
+                            (row["membrane"], row["cyto_start"])
+                        ]
+                        st.session_state["_pending_settings"] = {
+                            "segment_break_1": round(float(row["break_1"]), 3),
+                            "segment_break_2": round(float(row["break_2"]), 3),
+                            "membrane_after_break": m_label,
+                            "cyto_starts_at": c_label,
+                            "use_nucleus": bool(row["use_nucleus"]),
+                        }
+                        st.rerun()
+                st.caption(
+                    f"The best combination puts ε₁ at {best['break_1']:.3f} and ε₂ "
+                    f"at {best['break_2']:.3f}."
+                )
+            elif search:
+                st.error(search.get("error", "The combination search failed."))
+
+            if break_2 <= break_1:
+                st.error("Segment 2 must end after segment 1.")
+            else:
+                st.caption(
+                    "The force is continuous across both boundaries by "
+                    "construction, so moving one never puts a step in the curve."
+                )
 
         elif coupling in ("hybrid_ps", "hybrid_sp"):
             h1, h2 = st.columns([1, 2])
@@ -1623,9 +1845,15 @@ with tab_analysis:
                         st.warning("Give the preset a name first.")
                     else:
                         st.session_state["range_presets"][name] = {
-                            "coupling": st.session_state["coupling"],
+                            # Stored under its old key so presets saved by
+                            # earlier versions still load.
+                            "coupling": st.session_state["model_kind"],
                             "procedure": st.session_state["procedure"],
-                            "combined_window": [float(combined_lo), float(combined_hi)],
+                            "segment_break_1": float(st.session_state["segment_break_1"]),
+                            "segment_break_2": float(st.session_state["segment_break_2"]),
+                            "membrane_after_break": st.session_state["membrane_after_break"],
+                            "cyto_starts_at": st.session_state["cyto_starts_at"],
+                            "combined_window": [float(fit_lo), float(fit_hi)],
                             "term_windows": {
                                 t: [float(w[0]), float(w[1])]
                                 for t, w in term_windows.items()
@@ -1665,7 +1893,9 @@ with tab_analysis:
                         [
                             {
                                 "preset": name,
-                                "coupling": pre.get("coupling", "?"),
+                                "model": pre.get("coupling", "?"),
+                                "ε₁": pre.get("segment_break_1"),
+                                "ε₂": pre.get("segment_break_2"),
                                 "cell type": pre.get("cell_type", "?"),
                                 "windows": " | ".join(
                                     " + ".join(TERM_LABELS.get(t, t) for t in st_["terms"])
@@ -1740,10 +1970,14 @@ with tab_analysis:
             st.error("Set ε₂ above ε₁ before fitting.")
         elif run:
             if segmented:
-                fit = model.fit_segmented(
-                    fit_lo, fit_hi, e1=break_1, e2=break_2, terms=active,
+                # fit_composition covers what fit_segmented did and adds the
+                # two choices about the first boundary, so it is the one path.
+                fit = model.fit_composition(
+                    fit_lo, fit_hi, e1=break_1, e2=break_2,
+                    membrane=membrane_mode,
+                    cyto_start=cyto_mode,
+                    use_nucleus="nucleus" in active,
                     weighting=st.session_state["weighting"],
-                    fit_offset=st.session_state["fit_offset"],
                 )
             elif coupling == "auto":
                 with st.spinner("Fitting every model and comparing…"):
@@ -1823,8 +2057,11 @@ with tab_analysis:
             params = tuple(0.0 if not np.isfinite(v) else v for v in params)
 
             if fitted_coupling == "segmented":
-                membrane_basis, cyto_basis, nucleus_basis = model.segment_terms(
-                    epsilon, fit["break_1"], fit["break_2"]
+                # Draw the components with the same basis the fit used, or the
+                # curves would not add up to the line through the data.
+                membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
+                    epsilon, fit["break_1"], fit["break_2"],
+                    fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
                 )
                 fitted = (
                     membrane_basis * params[0]
@@ -2013,6 +2250,7 @@ with tab_analysis:
                         if rupture.get("method") == "force-drop"
                         else None,
                         highlight=highlight if (video_ready or show_schematic) else None,
+                        highlight_window=highlight_window,
                     ),
                     key="main_fit_plot",
                     **plot_selection_kwargs(),
@@ -2040,6 +2278,8 @@ with tab_analysis:
                             nucleus_onset=model.nucleus_onset if "nucleus" in active else None,
                             break_1=fit.get("break_1"),
                             break_2=fit.get("break_2"),
+                            membrane_mode=fit.get("membrane", "freeze"),
+                            cyto_start=fit.get("cyto_start", "break"),
                             Em_MPa=fit["Em_MPa"],
                             Ei_kPa=fit["Ei_kPa"],
                             En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
