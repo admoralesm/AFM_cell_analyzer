@@ -184,6 +184,7 @@ def detect_cell(
     cell_side="anywhere",
     reject_dark=True,
     dark_margin=0.35,
+    appearance="either",
 ):
     """
     Find the cell in one frame.
@@ -221,6 +222,14 @@ def detect_cell(
         being mistaken for the cell even when it happens to look round. The
         default margin is deliberately low: a cell is often legitimately darker
         than its background, and a stricter cut throws the cell away too.
+    appearance : {"either", "clear", "dark"}
+        What the cell looks like against its background. Roundness and
+        solidity alone cannot separate a translucent cell from a dark blob of
+        debris of similar shape, and in phase contrast the cell is usually the
+        clear, bright object. Saying so adds a brightness term to the score
+        and discards candidates on the wrong side of the background level, so
+        the crop stored with the cell shows the cell rather than a dark patch
+        beside it.
 
     Returns
     -------
@@ -331,6 +340,7 @@ def detect_cell(
     best, best_score = None, -np.inf
     rejected_dark = 0
     rejected_side = 0
+    rejected_appearance = 0
     for contour in candidates:
         area = float(cv2.contourArea(contour))
         if area < min_area_frac * view_area or area > max_area_frac * view_area:
@@ -355,15 +365,27 @@ def detect_cell(
             rejected_side += 1
             continue
 
+        # Measured once and reused: the dark cut, the appearance filter and
+        # the brightness score all ask about the same number.
+        blob = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(blob, [contour], -1, 255, thickness=cv2.FILLED)
+        mean_intensity = float(cv2.mean(gray, mask=blob)[0])
+        # Positive when the candidate is brighter than its surroundings.
+        contrast = (mean_intensity - background) / max(background, 1.0)
+
         if reject_dark:
             # The cantilever is close to black. Anything much darker than the
             # frame's own median is the probe or its shadow, not a cell.
-            blob = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(blob, [contour], -1, 255, thickness=cv2.FILLED)
-            mean_intensity = float(cv2.mean(gray, mask=blob)[0])
             if mean_intensity < dark_margin * background:
                 rejected_dark += 1
                 continue
+
+        if appearance == "clear" and contrast < -0.02:
+            rejected_appearance += 1
+            continue
+        if appearance == "dark" and contrast > 0.02:
+            rejected_appearance += 1
+            continue
 
         circularity = float(np.clip(4.0 * np.pi * area / perimeter ** 2, 0.0, 1.0))
 
@@ -383,11 +405,23 @@ def detect_cell(
 
         # Roundness and solidity identify a cell; size breaks ties against
         # small artefacts; centrality prefers the object being compressed.
+        # Roundness and solidity identify a cell; size breaks ties against
+        # small artefacts; centrality prefers the object being compressed;
+        # and where the cell's appearance is known, brightness separates it
+        # from debris of the same shape. Capped so a blown-out highlight
+        # cannot outscore a well-shaped cell on brightness alone.
+        appearance_bonus = 0.0
+        if appearance == "clear":
+            appearance_bonus = 1.4 * float(np.clip(contrast / 0.25, 0.0, 1.0))
+        elif appearance == "dark":
+            appearance_bonus = 1.4 * float(np.clip(-contrast / 0.25, 0.0, 1.0))
+
         score = (
             1.6 * circularity
             + 1.2 * solidity
             + 1.0 * centrality
             + 1.5 * np.sqrt(area / view_area)
+            + appearance_bonus
             - (1.5 if touches_edge else 0.0)
         )
         if score > best_score:
@@ -407,6 +441,11 @@ def detect_cell(
             reason += f"; {rejected_dark} rejected as too dark (probe)"
         if rejected_side:
             reason += f"; {rejected_side} rejected on the wrong side of the probe"
+        if rejected_appearance:
+            reason += (
+                f"; {rejected_appearance} rejected as the wrong brightness "
+                f"for a {appearance} cell"
+            )
         return {"found": False, "reason": reason}
 
     contour = best["contour"]
@@ -438,6 +477,7 @@ def detect_cell(
         "score": best["score"],
         "rejected_dark": rejected_dark,
         "rejected_side": rejected_side,
+        "rejected_appearance": rejected_appearance,
         "ellipse": ellipse,
         "contour": contour + np.array([[x0, y0]]),
         "roi_px": (x0, y0, x1, y1),
@@ -528,7 +568,8 @@ def crop(frame_rgb, detection, pad_frac=0.35):
 
 
 def track_cell(path, n_samples=60, roi=None, sensitivity=1.0, start=0, end=None,
-               enhance=None, cell_side="anywhere", reject_dark=True, track_nucleus=False):
+               enhance=None, cell_side="anywhere", reject_dark=True,
+               track_nucleus=False, appearance="either"):
     """
     Measure the cell across the video.
 
@@ -572,6 +613,7 @@ def track_cell(path, n_samples=60, roi=None, sensitivity=1.0, start=0, end=None,
             det = detect_cell(
                 rgb, roi=roi, sensitivity=sensitivity,
                 probe=probe_here, cell_side=cell_side, reject_dark=reject_dark,
+                appearance=appearance,
             )
             if track_nucleus and det.get("found"):
                 det["nucleus"] = detect_nucleus(rgb, det)
