@@ -1197,18 +1197,35 @@ class _CompositionMixin:
         cyto_start="break",
         use_nucleus=True,
         weighting="uniform",
+        use_membrane=True,
+        use_interior=True,
     ):
-        """Exact linear fit of one composition at fixed breakpoints."""
+        """
+        Exact linear fit of one composition at fixed breakpoints.
+
+        A term switched off is left out of the design matrix entirely rather
+        than fitted and ignored. That matters: an unwanted column still soaks
+        up force, so leaving it in and hiding the answer would change the
+        moduli that are reported.
+        """
         eps, force, mask = self._select(epsilon_min, epsilon_max)
-        n_params = 2 + (1 if use_nucleus else 0)
+        wanted = {
+            "membrane": bool(use_membrane),
+            "interior": bool(use_interior),
+            "nucleus": bool(use_nucleus),
+        }
+        n_params = sum(wanted.values())
+        if n_params == 0:
+            return self._failure("No elements selected.")
         if eps.size < n_params + 1:
             return self._failure(f"Only {eps.size} points in the fitted range.")
 
         m_basis, c_basis, n_basis = self.composition_terms(
             eps, e1, e2, membrane, cyto_start
         )
-        columns = [m_basis, c_basis] + ([n_basis] if use_nucleus else [])
-        design = np.column_stack(columns)
+        bases = {"membrane": m_basis, "interior": c_basis, "nucleus": n_basis}
+        order = [name for name in ("membrane", "interior", "nucleus") if wanted[name]]
+        design = np.column_stack([bases[name] for name in order])
 
         if weighting == "relative":
             scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
@@ -1222,10 +1239,12 @@ class _CompositionMixin:
             design_w / col_norm, target_w, bounds=(0.0, np.inf), method="bvls"
         )
         params = solution.x / col_norm
-        Em, Ec = float(params[0]), float(params[1])
-        En = float(params[2]) if use_nucleus else 0.0
+        values = dict(zip(order, (float(v) for v in params)))
+        Em = values.get("membrane", 0.0)
+        Ec = values.get("interior", 0.0)
+        En = values.get("nucleus", 0.0)
 
-        predicted = m_basis * Em + c_basis * Ec + (n_basis * En if use_nucleus else 0.0)
+        predicted = m_basis * Em + c_basis * Ec + n_basis * En
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
         ss_tot = float(np.sum((force - force.mean()) ** 2))
@@ -1238,6 +1257,8 @@ class _CompositionMixin:
             "membrane": membrane,
             "cyto_start": cyto_start,
             "use_nucleus": bool(use_nucleus),
+            "use_membrane": bool(use_membrane),
+            "use_interior": bool(use_interior),
             "Em": Em, "Ei": Ec, "En": En,
             "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
             "Em_MPa_std": float("nan"), "Ei_kPa_std": float("nan"),
@@ -1256,7 +1277,7 @@ class _CompositionMixin:
             "n_params": n_params + 2,  # the two breakpoints count as parameters
             "ss_res": ss_res,
             "epsilon_range": [float(epsilon_min), float(epsilon_max)],
-            "terms": ["membrane", "interior"] + (["nucleus"] if use_nucleus else []),
+            "terms": list(order),
             "weighting": weighting,
             "fit_offset": False,
             "condition_number": float("nan"),
