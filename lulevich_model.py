@@ -1269,6 +1269,54 @@ class _CompositionMixin:
             "warnings": [],
         }
 
+    def _best_breakpoints(
+        self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid, rounds=2,
+    ):
+        """
+        The breakpoints that fit best for one composition.
+
+        A single coarse grid puts the boundary within half a grid step of the
+        truth, which on a 12-point grid over a range of 0.6 is about 0.02 in ε.
+        That is coarse enough to shift the moduli, so the coarse pass is
+        followed by refinement rounds that re-grid inside one step either side
+        of the current winner. Two rounds narrow it by roughly a factor of 25
+        for a fraction of the cost of a fine grid over the whole range.
+        """
+        span = hi - lo
+        gap = 0.02 * span
+        first = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
+        second = np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+        best = None
+
+        for round_index in range(int(rounds) + 1):
+            for e1 in first:
+                for e2 in second:
+                    if e2 <= e1 + gap:
+                        continue
+                    trial = self.fit_composition(
+                        lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+                    )
+                    if not trial.get("success"):
+                        continue
+                    if best is None or trial["ss_res"] < best["ss_res"]:
+                        best = trial
+            if best is None or round_index == int(rounds):
+                break
+            # Re-grid inside one step either side of the winner.
+            step_1 = (first[-1] - first[0]) / max(len(first) - 1, 1)
+            step_2 = (second[-1] - second[0]) / max(len(second) - 1, 1)
+            first = np.linspace(
+                max(lo + 1e-4, best["break_1"] - step_1),
+                min(hi - gap, best["break_1"] + step_1),
+                max(5, int(n_grid) // 2),
+            )
+            second = np.linspace(
+                max(lo + gap, best["break_2"] - step_2),
+                min(hi - 1e-4, best["break_2"] + step_2),
+                max(5, int(n_grid) // 2),
+            )
+        return best
+
     def search_compositions(
         self,
         epsilon_min=None,
@@ -1278,14 +1326,22 @@ class _CompositionMixin:
         n_folds=5,
         seed=0,
         include_no_nucleus=True,
+        refine_rounds=2,
+        cv_repeats=3,
     ):
         """
-        Fit every composition at its own best breakpoints and rank them.
+        Fit every composition at its own best breakpoints and pick one.
 
-        Ranking is by AICc, which charges each model for its parameters, and by
-        cross-validated error, which asks which one predicts points it was not
-        fitted on. The breakpoints count as parameters, so a composition does
-        not get to look good purely by having two extra knobs.
+        Each composition gets its own breakpoint search, refined past the
+        coarse grid, and is then scored by cross-validated error: how well it
+        predicts points it was not fitted on. That is repeated over several
+        different fold splits, because a single split of a few hundred points
+        is noisy enough to reorder candidates that are really tied.
+
+        Where several candidates predict equally well the search does not
+        pretend to separate them. It reports the tie and returns the simplest
+        of the tied set, since an extra term the data cannot see is a term
+        that will move around from cell to cell.
 
         Returns
         -------
@@ -1301,61 +1357,83 @@ class _CompositionMixin:
             return {"success": False, "error": f"Only {n} points; need at least 20."}
 
         span = hi - lo
-        first_grid = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
-        second_grid = np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
 
-        rng = np.random.default_rng(seed)
-        folds = np.array_split(rng.permutation(n), min(n_folds, n))
+        # Several independent splits, so the ranking does not turn on which
+        # points happened to land in which fold.
+        fold_sets = []
+        for repeat in range(max(1, int(cv_repeats))):
+            rng = np.random.default_rng(seed + repeat)
+            fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
 
         rows, fits = [], {}
         nucleus_options = [True, False] if include_no_nucleus else [True]
 
         for composition in COMPOSITIONS:
             for use_nucleus in nucleus_options:
-                best_here = None
-                for e1 in first_grid:
-                    for e2 in second_grid:
-                        if e2 <= e1 + 0.02 * span:
-                            continue
-                        trial = self.fit_composition(
-                            lo, hi, e1, e2, composition["membrane"],
-                            composition["cyto_start"], use_nucleus, weighting,
-                        )
-                        if not trial.get("success"):
-                            continue
-                        if best_here is None or trial["ss_res"] < best_here["ss_res"]:
-                            best_here = trial
+                best_here = self._best_breakpoints(
+                    lo, hi, composition["membrane"], composition["cyto_start"],
+                    use_nucleus, weighting, n_grid, refine_rounds,
+                )
                 if best_here is None:
                     continue
+
+                # Some combinations do not use one of their breakpoints at
+                # all. With the membrane continuing and the cytoskeleton
+                # starting at zero, nothing in the model depends on ε₁, so
+                # whatever number the search lands on is meaningless. Move
+                # each boundary and see whether the fit notices.
+                idle = []
+                scale = max(best_here["ss_res"], 1e-300)
+                for name, e1_try, e2_try in (
+                    ("ε₁", best_here["break_1"] + 0.08 * span, best_here["break_2"]),
+                    ("ε₂", best_here["break_1"], best_here["break_2"] + 0.08 * span),
+                ):
+                    if e2_try <= e1_try or e2_try >= hi:
+                        continue
+                    moved = self.fit_composition(
+                        lo, hi, e1_try, e2_try, composition["membrane"],
+                        composition["cyto_start"], use_nucleus, weighting,
+                    )
+                    if moved.get("success") and abs(
+                        moved["ss_res"] - best_here["ss_res"]
+                    ) / scale < 1e-6:
+                        idle.append(name)
 
                 key = composition["key"] + ("" if use_nucleus else "_no_nucleus")
                 label = composition["label"] + ("" if use_nucleus else ", no nucleus")
                 fits[key] = best_here
 
-                cv_errors = []
-                for fold in folds:
-                    if fold.size == 0 or fold.size >= n - 3:
-                        continue
-                    keep = np.ones(n, dtype=bool)
-                    keep[fold] = False
-                    sub = self._clone(force_all[keep], eps_all[keep])
-                    trained = sub.fit_composition(
-                        lo, hi, best_here["break_1"], best_here["break_2"],
-                        composition["membrane"], composition["cyto_start"],
-                        use_nucleus, weighting,
-                    )
-                    if not trained.get("success"):
-                        continue
-                    m_b, c_b, n_b = self.composition_terms(
-                        eps_all[fold], best_here["break_1"], best_here["break_2"],
-                        composition["membrane"], composition["cyto_start"],
-                    )
-                    predicted = (
-                        m_b * trained["Em"] + c_b * trained["Ei"] + n_b * trained["En"]
-                    )
-                    cv_errors.append(
-                        float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
-                    )
+                # One number per split, so the spread across splits can say
+                # whether a difference between candidates is real.
+                per_repeat = []
+                for folds in fold_sets:
+                    cv_errors = []
+                    for fold in folds:
+                        if fold.size == 0 or fold.size >= n - 3:
+                            continue
+                        keep = np.ones(n, dtype=bool)
+                        keep[fold] = False
+                        sub = self._clone(force_all[keep], eps_all[keep])
+                        trained = sub.fit_composition(
+                            lo, hi, best_here["break_1"], best_here["break_2"],
+                            composition["membrane"], composition["cyto_start"],
+                            use_nucleus, weighting,
+                        )
+                        if not trained.get("success"):
+                            continue
+                        m_b, c_b, n_b = self.composition_terms(
+                            eps_all[fold], best_here["break_1"], best_here["break_2"],
+                            composition["membrane"], composition["cyto_start"],
+                        )
+                        predicted = (
+                            m_b * trained["Em"] + c_b * trained["Ei"]
+                            + n_b * trained["En"]
+                        )
+                        cv_errors.append(
+                            float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                        )
+                    if cv_errors:
+                        per_repeat.append(float(np.mean(cv_errors)))
 
                 rows.append(
                     {
@@ -1372,7 +1450,16 @@ class _CompositionMixin:
                         "r_squared": best_here["r_squared"],
                         "n_params": best_here["n_params"],
                         "aicc": _aicc(best_here["ss_res"], n, best_here["n_params"]),
-                        "cv_rmse": float(np.mean(cv_errors)) if cv_errors else float("nan"),
+                        "cv_rmse": (
+                            float(np.mean(per_repeat)) if per_repeat else float("nan")
+                        ),
+                        # How much the held-out error moves when the folds are
+                        # redrawn. A gap smaller than this is not a gap.
+                        "cv_spread": (
+                            float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0
+                        ),
+                        # Boundaries this combination does not actually use.
+                        "idle_breaks": idle,
                     }
                 )
 
@@ -1409,7 +1496,7 @@ class _CompositionMixin:
             )
 
         rows.sort(key=sort_key)
-        best = rows[0]
+        lowest = rows[0]
 
         cv_rows = [r for r in rows if np.isfinite(r["cv_rmse"])]
         cv_best = cv_rows[0] if cv_rows else None
@@ -1419,26 +1506,51 @@ class _CompositionMixin:
             default=None,
         )
 
-        # Everything whose held-out error is within a few percent of the best
-        # is doing the same job as the best.
-        tied = []
-        if np.isfinite(best.get("cv_rmse", np.nan)) and best["cv_rmse"] > 0:
-            tied = [
-                r for r in rows[1:]
-                if np.isfinite(r["cv_rmse"])
-                and (r["cv_rmse"] - best["cv_rmse"]) / best["cv_rmse"] < 0.05
-            ]
+        # The tie band is the larger of a few percent and the noise in the
+        # held-out error itself. Redrawing the folds moves every candidate's
+        # score, and a gap smaller than that movement is not evidence.
+        tolerance = 0.0
+        if np.isfinite(lowest.get("cv_rmse", np.nan)) and lowest["cv_rmse"] > 0:
+            tolerance = max(
+                0.05 * lowest["cv_rmse"],
+                lowest.get("cv_spread", 0.0)
+                + max((r.get("cv_spread", 0.0) for r in cv_rows), default=0.0),
+            )
+        tied = [
+            r for r in rows[1:]
+            if np.isfinite(r["cv_rmse"])
+            and (r["cv_rmse"] - lowest["cv_rmse"]) <= tolerance
+        ]
+
+        # Where nothing separates them on prediction, take the simplest: the
+        # fewest free moduli, and none that came out at zero. An extra term
+        # the curve cannot see is a number that will wander from cell to cell.
+        def simplicity(row):
+            return (
+                len(row.get("empty_terms", [])),
+                row["n_params"],
+                row["cv_rmse"] if np.isfinite(row["cv_rmse"]) else np.inf,
+            )
+
+        best = min([lowest] + tied, key=simplicity)
         for row in rows:
-            row["tied_with_best"] = row is not best and row in tied
+            row["tied_with_best"] = row is not best and (row in tied or row is lowest)
 
         if tied:
-            names = ", ".join(f"“{r['label']}”" for r in tied[:2])
+            others = [r for r in [lowest] + tied if r is not best]
+            names = ", ".join(f"“{r['label']}”" for r in others[:2])
             verdict = (
-                f"“{best['label']}” has the lowest held-out error, but {names} "
-                f"predict within 5 % of it. This curve does not separate them, so "
-                f"the choice is yours to make on what you know about the cell "
-                f"rather than on these numbers."
+                f"“{best['label']}” is the pick. {names} predict this curve just "
+                f"as well, so nothing in the data separates them; of the tied set "
+                f"this is the one with the fewest free moduli, which is the one "
+                f"least likely to wander between cells."
             )
+            if best is not lowest:
+                verdict += (
+                    f" (“{lowest['label']}” has the marginally lower held-out "
+                    f"error, by less than the amount that number moves when the "
+                    f"folds are redrawn.)"
+                )
         elif aicc_best is not None and aicc_best["key"] != best["key"]:
             verdict = (
                 f"Cross-validation prefers “{best['label']}” while AICc prefers "
@@ -1453,12 +1565,20 @@ class _CompositionMixin:
                 " Note that " + " and ".join(best["empty_terms"])
                 + " came out at zero, so that term is not supported by this curve."
             )
+        if best.get("idle_breaks"):
+            verdict += (
+                " " + " and ".join(best["idle_breaks"])
+                + (" has" if len(best["idle_breaks"]) == 1 else " have")
+                + " no effect in this combination, so ignore the value shown."
+            )
 
         out = {
             "success": True,
             "candidates": rows,
             "best": best,
             "best_by_cv": cv_best,
+            "lowest_cv": lowest,
+            "tie_tolerance": float(tolerance),
             "fits": fits,
             "verdict": verdict,
             "n_points": int(n),
