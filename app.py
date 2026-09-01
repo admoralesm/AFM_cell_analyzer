@@ -366,6 +366,236 @@ for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
 
 
+def suggested_plot_name(cell_name, fit, date_acquired, extension):
+    """
+    A file name you would have typed yourself.
+
+    Takes the cell name rather than reading it from session state, so it can
+    be checked without a running app.
+    """
+    safe = "".join(
+        ch if (ch.isalnum() or ch in "-_") else "_" for ch in (cell_name or "").strip()
+    )
+    parts = [safe or "cell", str(date_acquired)]
+    if fit and fit.get("success"):
+        parts.append(f"Em{fit.get('Em_MPa', 0.0):.3g}MPa")
+        parts.append(f"Ec{fit.get('Ei_kPa', 0.0):.3g}kPa")
+    return "_".join(parts) + extension
+
+
+def save_plot_controls(figure, fit, date_acquired):
+    """
+    Offer the figure as a file, named after the cell.
+
+    PNG needs a headless browser, which is present on some deployments and
+    not others, so it is offered only when it actually works and HTML is
+    always there. An HTML figure keeps its vector text and stays zoomable,
+    which is usually the better thing to keep anyway.
+    """
+    st.markdown("**Save the plot**")
+    png = None
+    try:
+        png = figure.to_image(format="png", width=1400, height=900, scale=2)
+    except Exception:
+        png = None
+
+    if png:
+        st.download_button(
+            "🖼️ Save as PNG",
+            data=png,
+            file_name=suggested_plot_name(
+                st.session_state["cell_name"], fit, date_acquired, ".png"
+            ),
+            mime="image/png",
+            **STRETCH,
+        )
+    st.download_button(
+        "🖼️ Save as HTML" if png else "🖼️ Save the plot",
+        data=figure.to_html(include_plotlyjs="cdn"),
+        file_name=suggested_plot_name(
+            st.session_state["cell_name"], fit, date_acquired, ".html"
+        ),
+        mime="text/html",
+        **STRETCH,
+    )
+    st.caption(
+        "Named after the cell, the date and the moduli."
+        if png else
+        "Named after the cell, the date and the moduli. PNG export is not "
+        "available on this deployment; the camera icon on the chart still "
+        "saves one, and the HTML keeps the text sharp at any size."
+    )
+
+
+def show_fit_maths(fit, model):
+    """
+    The arithmetic behind the numbers, with this cell's values in it.
+
+    A modulus with no working shown is a number to be trusted or not. Written
+    out with the prefactors and the basis functions, it can be checked.
+    """
+    if not (fit and fit.get("success")):
+        st.caption("Fit the curve and the working appears here.")
+        return
+
+    terms = set(fit.get("terms") or ())
+    e1 = fit.get("break_1")
+    e2 = fit.get("break_2")
+    segmented = fit.get("coupling") == "segmented"
+
+    st.markdown("**1 · The model that was fitted**")
+    if segmented:
+        membrane_basis = (
+            r"\varepsilon^{3}" if fit.get("membrane") == "continue"
+            else r"\min(\varepsilon,\ \varepsilon_1)^{3}"
+        )
+        cyto_basis = (
+            r"\varepsilon^{3/2}" if fit.get("cyto_start") == "zero"
+            else r"\langle \varepsilon - \varepsilon_1 \rangle^{3/2}"
+        )
+        pieces = []
+        if "membrane" in terms:
+            pieces.append(r"A_m E_m\," + membrane_basis)
+        if "interior" in terms:
+            pieces.append(r"A_i E_c\," + cyto_basis)
+        if "nucleus" in terms:
+            pieces.append(r"A_n E_n \langle \varepsilon - \varepsilon_2 \rangle^{3/2}")
+        st.latex(r"F(\varepsilon) = " + " + ".join(pieces))
+        st.caption(
+            "⟨x⟩ is x when x is positive and zero otherwise, so a term "
+            "contributes nothing before its boundary. Every term shares the "
+            "same ε and the forces add: the elements are side by side, not "
+            "stacked."
+        )
+    else:
+        st.latex(
+            r"F(\varepsilon) = A_m E_m \varepsilon^{3} + A_i E_c "
+            r"\varepsilon^{3/2} + A_n E_n \langle \varepsilon - "
+            r"\varepsilon_0 \rangle^{3/2}"
+        )
+
+    st.markdown("**2 · The geometry, fixed before fitting**")
+    st.latex(
+        r"A_m = \frac{2\pi h_m R_0}{1-\nu_m} \qquad "
+        r"A_i = \frac{\sqrt{2}\, R_0^{1/2} h_0^{3/2}}{3(1-\nu_i^{2})} \qquad "
+        r"A_n = \frac{\sqrt{2}\, R_n^{1/2} h_0^{3/2}}{3(1-\nu_n^{2})}"
+    )
+    st.code(
+        f"h0 = {model.cell_height:.4g} m        (cell height)\n"
+        f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
+        f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        (nucleus radius)\n"
+        f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
+        f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
+        f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa\n"
+        f"An = {fit.get('An', float('nan')):.6g} N/Pa",
+        language="text",
+    )
+
+    st.markdown("**3 · Why this is a linear solve**")
+    st.latex(
+        r"\mathbf{F} = \mathbf{X}\,\boldsymbol{\theta}, \qquad "
+        r"\boldsymbol{\theta} = (E_m,\ E_c,\ E_n)"
+    )
+    st.latex(
+        r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta}\ \ge\ 0}"
+        r"\ \lVert \mathbf{W}(\mathbf{X}\boldsymbol{\theta} - \mathbf{F}) \rVert^{2}"
+    )
+    st.caption(
+        "With the boundaries held fixed the basis functions do not depend on "
+        "the moduli, so the moduli enter linearly. That makes this one "
+        "bounded least-squares solve with a single answer, not a search that "
+        "can land in the wrong place. The bound at zero is why a term the "
+        "data does not want comes back at exactly 0. Weighting "
+        f"here: {fit.get('weighting', 'uniform')}."
+    )
+
+    st.markdown("**4 · The answer for this cell**")
+    rows = []
+    for label, key, unit, term in (
+        ("Eₘ", "Em_MPa", "MPa", "membrane"),
+        ("E_c", "Ei_kPa", "kPa", "interior"),
+        ("Eₙ", "En_kPa", "kPa", "nucleus"),
+    ):
+        used = term in terms
+        rows.append(
+            f"{label:4} = {0.0 if not used else fit.get(key, 0.0):<12.6g} {unit}"
+            + ("" if used else "   (not in this model)")
+        )
+    boundary = ""
+    if segmented and e1 is not None and e2 is not None:
+        boundary = f"\nε1 = {e1:.4f}    ε2 = {e2:.4f}"
+    st.code(
+        "\n".join(rows)
+        + boundary
+        + f"\n\nR²   = {fit.get('r_squared', float('nan')):.6f}"
+        + f"\nRMSE = {fit.get('rmse', float('nan')):.4g} N"
+        + f"\nn    = {fit.get('n_points', 0)} points"
+        + f"\n\nMembrane areal modulus Em·hm = "
+        f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.5g} mN/m",
+        language="text",
+    )
+    st.caption(
+        "Eₘ·hₘ is what the ε³ term measures. Eₘ is that divided by the "
+        "assumed membrane thickness, so it moves with that assumption while "
+        "the measurement does not."
+    )
+
+
+def plot_option_controls():
+    """
+    The switches that change what is drawn on the curve.
+
+    These live directly under the plot, not in the sidebar. They are
+    about the figure in front of you, and a control for the thing you
+    are looking at belongs next to it: in a sidebar expander nobody
+    finds it, and the plot keeps its markings while the person hunts.
+    """
+    st.markdown("**What is drawn on the curve**")
+    bare = st.checkbox(
+        "Data and fit only", key="bare_plot",
+        help="Strips everything except the measured points and the one "
+        "fitted Lulevich curve: no bands, no markers, no element curves, "
+        "no legend. This is the figure version.",
+    )
+    st.caption(
+        "Everything below is off while “Data and fit only” is on."
+        if bare else "Or switch off individual pieces:"
+    )
+    st.checkbox(
+        "The fitted curve", key="show_fit_line",
+        help="Off leaves the measured points alone, with no model drawn "
+        "over them. Independent of “Data and fit only”, so you can have "
+        "a bare plot of just the data.",
+    )
+    st.checkbox(
+        "Element curves", key="show_components", disabled=bare,
+        help="The membrane, cytoskeleton and nucleus contributions drawn "
+        "apart. They are parts of the one fit, not separate fits.",
+    )
+    st.checkbox(
+        "Shaded segment bands", key="show_fit_window", disabled=bare,
+        help="The coloured blocks behind the curve marking each segment. "
+        "This also hides the highlighted segment.",
+    )
+    st.checkbox(
+        "Video frame marker", key="show_video_marker", disabled=bare,
+        help="The orange ring and dotted line showing where on the curve "
+        "the displayed video frame sits.",
+    )
+    st.checkbox(
+        "Rupture marker", key="show_rupture_marker", disabled=bare,
+        help="The dash-dotted line where the force drops.",
+    )
+    st.checkbox(
+        "Height of each component", key="show_component_heights", disabled=bare,
+        help="Labels each element curve at the right-hand end with the "
+        "force it is carrying there, so you can read each contribution "
+        "off the plot without hovering.",
+    )
+    st.checkbox("Legend", key="show_legend", disabled=bare)
+
+
+
 # The extras that can be drawn on the force curve, all of which the single
 # "Data and fit only" switch turns off together.
 PLOT_EXTRAS = (
@@ -991,17 +1221,33 @@ def send_cell_to_sheet(manager, fit, date_acquired):
     lives in Box or in the downloaded zip.
     """
     terms = set(fit.get("terms") or ())
+    lo, hi = fit.get("epsilon_range", (0.0, 0.0))
+    e1 = fit.get("break_1")
+    e2 = fit.get("break_2")
+    segmented = fit.get("coupling") == "segmented"
+
     combination = ""
-    if fit.get("coupling") == "segmented":
-        membrane_word = (
+    if segmented:
+        combination = "{}, {}".format(
             "membrane keeps stiffening" if fit.get("membrane") == "continue"
-            else "membrane holds after ε₁"
-        )
-        cyto_word = (
+            else "membrane holds after ε₁",
             "cytoskeleton from zero" if fit.get("cyto_start") == "zero"
-            else "cytoskeleton from ε₁"
+            else "cytoskeleton from ε₁",
         )
-        combination = f"{membrane_word}, {cyto_word}"
+
+    def span(term):
+        """The stretch of deformation this modulus was actually measured on."""
+        if term not in terms:
+            return "not fitted"
+        if not segmented or e1 is None or e2 is None:
+            return f"{lo:.3f} to {hi:.3f}"
+        if term == "membrane":
+            end = hi if fit.get("membrane") == "continue" else e1
+            return f"{lo:.3f} to {end:.3f}"
+        if term == "interior":
+            begin = lo if fit.get("cyto_start") == "zero" else e1
+            return f"{begin:.3f} to {hi:.3f}"
+        return f"{e2:.3f} to {hi:.3f}"
 
     def modulus(key, term):
         # A term that was not fitted is written as 0, not blank: blank in a
@@ -1009,33 +1255,44 @@ def send_cell_to_sheet(manager, fit, date_acquired):
         # those mean different things once the rows are averaged.
         return round(float(fit.get(key, 0.0)), 6) if term in terms else 0
 
-    lo, hi = fit.get("epsilon_range", (0.0, 0.0))
     return manager.append_cell_data(
         {
             "cell_id": st.session_state["cell_name"].strip(),
-            "date_analyzed": str(date_acquired),
+            "experiment_date": str(date_acquired),
             "cell_height": round(float(st.session_state["cell_height_um"]), 3),
-            "cantilever_constant": round(
-                float(st.session_state["spring_constant"]) * 1000.0, 4
-            ),
+            # Spring constant in N/m, which is the unit it is calibrated in.
+            "spring_constant": round(float(st.session_state["spring_constant"]), 6),
             "Em": modulus("Em_MPa", "membrane"),
+            "Em_range": span("membrane"),
             "Ei": modulus("Ei_kPa", "interior"),
+            "Ei_range": span("interior"),
             "En": modulus("En_kPa", "nucleus"),
+            "En_range": span("nucleus"),
             "membrane_areal": round(
                 float(fit.get("membrane_areal_modulus", 0.0)) * 1e3, 5
             ),
-            "break_1": round(float(fit.get("break_1", float("nan"))), 4)
-            if fit.get("break_1") is not None else "",
-            "break_2": round(float(fit.get("break_2", float("nan"))), 4)
-            if fit.get("break_2") is not None else "",
             "model": st.session_state["model_kind"],
             "combination": combination,
+            "break_1": round(float(e1), 4) if e1 is not None else "",
+            "break_2": round(float(e2), 4) if e2 is not None else "",
             "fit_range": f"{lo:.3f} to {hi:.3f}",
-            "video_link": st.session_state.get("video_link", ""),
-            "force_curve_created": "Yes",
             "fit_quality": round(float(fit.get("r_squared", float("nan"))), 5),
-            "notes": st.session_state["cell_notes"],
+            "rmse_N": float(f"{float(fit.get('rmse', float('nan'))):.4g}"),
+            "n_points": int(fit.get("n_points", 0)),
+            "weighting": fit.get("weighting", st.session_state["weighting"]),
+            "cell_radius": round(float(fit.get("R0", 0.0)) * 1e6, 4),
+            "nucleus_radius": round(float(fit.get("R_nucleus", 0.0)) * 1e6, 4),
+            "membrane_thickness": round(
+                float(st.session_state["membrane_thickness_nm"]), 3
+            ),
+            "poisson": "{:.2f} / {:.2f}".format(
+                float(st.session_state["poisson_membrane"]),
+                float(st.session_state["poisson_interior"]),
+            ),
+            "force_curve_created": "Yes",
             "analysis_status": "Complete",
+            "notes": st.session_state["cell_notes"],
+            "video_link": st.session_state.get("video_link", ""),
         }
     )
 
@@ -1314,49 +1571,10 @@ with st.sidebar:
         st.checkbox("Bold axis titles and ticks", key="bold_axes")
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
-        st.markdown("**What is drawn on the curve**")
-        bare = st.checkbox(
-            "Data and fit only", key="bare_plot",
-            help="Strips everything except the measured points and the one "
-            "fitted Lulevich curve: no bands, no markers, no element curves, "
-            "no legend. This is the figure version.",
-        )
         st.caption(
-            "Everything below is off while “Data and fit only” is on."
-            if bare else "Or switch off individual pieces:"
+            "What is drawn on the curve is set under the plot itself, "
+            "in **Plot options**."
         )
-        st.checkbox(
-            "The fitted curve", key="show_fit_line",
-            help="Off leaves the measured points alone, with no model drawn "
-            "over them. Independent of “Data and fit only”, so you can have "
-            "a bare plot of just the data.",
-        )
-        st.checkbox(
-            "Element curves", key="show_components", disabled=bare,
-            help="The membrane, cytoskeleton and nucleus contributions drawn "
-            "apart. They are parts of the one fit, not separate fits.",
-        )
-        st.checkbox(
-            "Shaded segment bands", key="show_fit_window", disabled=bare,
-            help="The coloured blocks behind the curve marking each segment. "
-            "This also hides the highlighted segment.",
-        )
-        st.checkbox(
-            "Video frame marker", key="show_video_marker", disabled=bare,
-            help="The orange ring and dotted line showing where on the curve "
-            "the displayed video frame sits.",
-        )
-        st.checkbox(
-            "Rupture marker", key="show_rupture_marker", disabled=bare,
-            help="The dash-dotted line where the force drops.",
-        )
-        st.checkbox(
-            "Height of each component", key="show_component_heights", disabled=bare,
-            help="Labels each element curve at the right-hand end with the "
-            "force it is carrying there, so you can read each contribution "
-            "off the plot without hovering.",
-        )
-        st.checkbox("Legend", key="show_legend", disabled=bare)
 
         st.markdown("**Panels beside the curve**")
         st.checkbox(
@@ -1451,10 +1669,20 @@ with st.sidebar:
                     if manager:
                         st.success("Connected.")
                 if st.session_state["gs_manager"]:
-                    st.caption("Connected ✓")
+                    st.caption("Connected ✓ · rows are appended to the first tab")
                     url = st.session_state["gs_manager"].get_spreadsheet_url()
                     if url:
                         st.caption(f"[Open the sheet]({url})")
+                    if st.button("↕️ Put the columns in order", **STRETCH):
+                        with st.spinner("Rewriting the header…"):
+                            ok, message = st.session_state["gs_manager"].reorder_columns()
+                        (st.success if ok else st.error)(message)
+                    st.caption(
+                        "Rewrites the sheet so each modulus is followed by its "
+                        "range and the video link is last. Rows are remapped by "
+                        "column name, so nothing moves under the wrong heading, "
+                        "and columns of your own are kept."
+                    )
                 with st.expander("Setting this up"):
                     st.markdown(
                         "1. In Google Cloud, create a service account and download "
@@ -2770,6 +2998,27 @@ with tab_analysis:
                     **STRETCH,
                 )
                 apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
+
+                figure = force_curve_figure(
+                    epsilon, force_N, style,
+                    **figure_kwargs(
+                        force_curve_figure,
+                        title=st.session_state["cell_name"]
+                        or "Force vs relative deformation",
+                        fit_force_N=fitted,
+                        membrane_N=membrane, interior_N=interior,
+                        nucleus_N=nucleus, fit_window=windows_for_plot,
+                    ),
+                )
+                o1, o2 = st.columns([2, 1])
+                with o1:
+                    with st.expander("🎛️ Plot options", expanded=False):
+                        plot_option_controls()
+                with o2:
+                    save_plot_controls(figure, fit, date_acquired)
+
+                with st.expander("∑ How this fit was calculated", expanded=False):
+                    show_fit_maths(fit, model)
 
             panel_index = 0
             if show_schematic and panel_index < len(panel_cols):
