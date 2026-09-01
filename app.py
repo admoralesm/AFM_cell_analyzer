@@ -227,7 +227,11 @@ DEFAULTS = {
     "axis_width": 4,
     "bold_axes": True,
     "log_scale": False,
-    "show_components": True,
+    # Off by default: the fit is one Lulevich curve, and the per-element
+    # curves beside it invite reading three fits into a plot that has one.
+    "show_components": False,
+    "bare_plot": False,
+    "show_legend": True,
     "show_fit_window": True,
     "show_video_marker": True,
     "show_rupture_marker": True,
@@ -351,11 +355,45 @@ for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
 
 
+# The extras that can be drawn on the force curve, all of which the single
+# "Data and fit only" switch turns off together.
+PLOT_EXTRAS = (
+    "show_components",
+    "show_fit_window",
+    "show_video_marker",
+    "show_rupture_marker",
+    "show_legend",
+)
+
+
+def plot_flags(state):
+    """
+    Which plot extras are drawn.
+
+    One switch beats five: "Data and fit only" overrides the individual boxes
+    rather than merely unticking them, so a plot cannot end up half cleaned
+    with no obvious reason why something is still on it.
+    """
+    def value(name):
+        # Streamlit's session state is dict-like but has no .get, and a plain
+        # dict is what the tests pass, so read both the same way.
+        try:
+            return bool(state[name])
+        except (KeyError, TypeError):
+            return False
+
+    bare = value("bare_plot")
+    return {name: (not bare) and value(name) for name in PLOT_EXTRAS}
+
+
 def current_style(force_N=None) -> PlotStyle:
     """Build the PlotStyle from the sidebar settings, honouring auto units."""
     unit = st.session_state["force_unit"]
     if unit == "auto":
         unit = autoscale_unit(force_N) if force_N is not None and np.size(force_N) else "nN"
+
+    on = plot_flags(st.session_state).get
+
     return PlotStyle(
         force_unit=unit,
         data_color=st.session_state["data_color"],
@@ -369,10 +407,13 @@ def current_style(force_N=None) -> PlotStyle:
         axis_width=st.session_state["axis_width"],
         bold_axes=st.session_state["bold_axes"],
         log_scale=st.session_state["log_scale"],
-        show_components=st.session_state["show_components"],
-        show_fit_window=st.session_state["show_fit_window"],
-        show_video_marker=st.session_state["show_video_marker"],
-        show_rupture_marker=st.session_state["show_rupture_marker"],
+        # One switch beats four: "Data and fit only" wins over the individual
+        # ones so a person cannot half-clean a plot and wonder what is left.
+        show_components=on("show_components"),
+        show_fit_window=on("show_fit_window"),
+        show_video_marker=on("show_video_marker"),
+        show_rupture_marker=on("show_rupture_marker"),
+        show_legend=on("show_legend"),
         show_schematic_moduli=st.session_state["show_schematic_moduli"],
     )
 
@@ -1160,22 +1201,36 @@ with st.sidebar:
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
         st.markdown("**What is drawn on the curve**")
-        st.caption("Turn these off for a clean plot to put in a figure.")
-        st.checkbox("Model components", key="show_components")
+        bare = st.checkbox(
+            "Data and fit only", key="bare_plot",
+            help="Strips everything except the measured points and the one "
+            "fitted Lulevich curve: no bands, no markers, no element curves, "
+            "no legend. This is the figure version.",
+        )
+        st.caption(
+            "Everything below is off while “Data and fit only” is on."
+            if bare else "Or switch off individual pieces:"
+        )
         st.checkbox(
-            "Shaded segment bands", key="show_fit_window",
+            "Element curves", key="show_components", disabled=bare,
+            help="The membrane, cytoskeleton and nucleus contributions drawn "
+            "apart. They are parts of the one fit, not separate fits.",
+        )
+        st.checkbox(
+            "Shaded segment bands", key="show_fit_window", disabled=bare,
             help="The coloured blocks behind the curve marking each segment. "
             "This also hides the highlighted segment.",
         )
         st.checkbox(
-            "Video frame marker", key="show_video_marker",
+            "Video frame marker", key="show_video_marker", disabled=bare,
             help="The orange ring and dotted line showing where on the curve "
             "the displayed video frame sits.",
         )
         st.checkbox(
-            "Rupture marker", key="show_rupture_marker",
+            "Rupture marker", key="show_rupture_marker", disabled=bare,
             help="The dash-dotted line where the force drops.",
         )
+        st.checkbox("Legend", key="show_legend", disabled=bare)
 
         st.markdown("**Panels beside the curve**")
         st.checkbox(
@@ -1776,27 +1831,52 @@ with tab_analysis:
                     "Moves the two boundaries only, keeping the combination you "
                     "picked above."
                 )
+            # Applying a winning combination means writing four widget keys,
+            # which Streamlit only allows before those widgets exist. So both
+            # the search button and the table's apply button stage the values
+            # and rerun; the fit then happens with them already in place.
+            apply_labels = {
+                (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
+                for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
+            }
+
+            def stage_combination(row):
+                m_label, c_label = apply_labels[(row["membrane"], row["cyto_start"])]
+                return {
+                    "segment_break_1": round(float(row["break_1"]), 3),
+                    "segment_break_2": round(float(row["break_2"]), 3),
+                    "membrane_after_break": m_label,
+                    "cyto_starts_at": c_label,
+                    "use_nucleus": bool(row["use_nucleus"]),
+                }
+
             with b2:
                 can_search = hasattr(model, "search_compositions")
                 if st.button(
-                    "🧩 Try every combination", type="secondary",
+                    "🧩 Find the best combination and fit it", type="primary",
                     disabled=not can_search, **STRETCH,
                 ) and can_search:
                     with st.spinner(
                         "Fitting all four combinations at their own best "
                         "boundaries and cross-validating each…"
                     ):
-                        st.session_state["composition_search"] = (
-                            model.search_compositions(
-                                fit_lo, fit_hi,
-                                weighting=st.session_state["weighting"],
-                                include_no_nucleus="nucleus" in active,
-                            )
+                        found = model.search_compositions(
+                            fit_lo, fit_hi,
+                            weighting=st.session_state["weighting"],
                         )
+                    st.session_state["composition_search"] = found
+                    if found.get("success"):
+                        # Go straight to the answer: apply the winner and let
+                        # the fit below run with it, so one press gives one
+                        # fitted line rather than a table to act on.
+                        st.session_state["_pending_settings"] = stage_combination(
+                            found["best"]
+                        )
+                        st.rerun()
                 st.caption(
-                    "Fits all four ways the membrane and cytoskeleton can share the "
-                    "first boundary, each with its own best ε₁ and ε₂, and ranks "
-                    "them on data they were not fitted to."
+                    "Searches all four ways the membrane and cytoskeleton can share "
+                    "the first boundary, each with its own best ε₁ and ε₂, ranks "
+                    "them on data they were not fitted to, and applies the winner."
                     if can_search else
                     "Needs an up to date `lulevich_model.py`."
                 )
@@ -1817,13 +1897,17 @@ with tab_analysis:
                                 "R²": round(row["r_squared"], 5),
                                 "CV RMSE": f"{row['cv_rmse']:.4g}",
                                 "ΔAICc": round(row["delta_aicc"], 1),
-                                "note": (
-                                    "ties with the best"
-                                    if row.get("tied_with_best") else ""
-                                ) + (
-                                    (" · " if row.get("tied_with_best") else "")
-                                    + ", ".join(row["empty_terms"]) + " came out zero"
-                                    if row.get("empty_terms") else ""
+                                "note": " · ".join(
+                                    part for part in (
+                                        "picked" if row is search["best"] else "",
+                                        "ties with the pick"
+                                        if row.get("tied_with_best") else "",
+                                        ", ".join(row["empty_terms"]) + " came out zero"
+                                        if row.get("empty_terms") else "",
+                                        ", ".join(row.get("idle_breaks", []))
+                                        + " unused here"
+                                        if row.get("idle_breaks") else "",
+                                    ) if part
                                 ),
                             }
                             for row in search["candidates"]
@@ -1834,45 +1918,39 @@ with tab_analysis:
                 )
                 st.caption(
                     "Ranked by cross-validated error, which asks how well each "
-                    "combination predicts points it was not fitted on. ΔAICc is "
-                    "shown alongside but is not what decides the order: on these "
-                    "curves it is confident about differences the held-out error "
-                    "says are not there. A term that came out at zero means the "
-                    "data did not want it."
+                    "combination predicts points it was not fitted on, averaged "
+                    "over several different fold splits. Candidates closer than "
+                    "the amount that number moves between splits are called tied, "
+                    "and the pick among tied candidates is the one with the fewest "
+                    "free moduli. ΔAICc is shown but does not decide the order: on "
+                    "these curves it is confident about differences the held-out "
+                    "error says are not there."
                 )
                 best = search["best"]
-                apply_labels = {
-                    (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
-                    for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
-                }
                 choice_names = [row["label"] for row in search["candidates"]]
                 a1, a2 = st.columns([2, 1])
                 with a1:
                     picked = st.selectbox(
-                        "Combination to apply", choice_names, index=0,
+                        "Override the pick", choice_names,
+                        index=choice_names.index(best["label"])
+                        if best["label"] in choice_names else 0,
                         key="composition_pick",
+                        help="The winner is already applied. Use this only to try "
+                        "one of the others.",
                     )
                 with a2:
                     st.markdown("<div style='height:1.7rem'></div>",
                                 unsafe_allow_html=True)
-                    if st.button("✓ Use this combination", type="primary", **STRETCH):
+                    if st.button("✓ Use this one instead", **STRETCH):
                         row = next(
                             r for r in search["candidates"] if r["label"] == picked
                         )
-                        m_label, c_label = apply_labels[
-                            (row["membrane"], row["cyto_start"])
-                        ]
-                        st.session_state["_pending_settings"] = {
-                            "segment_break_1": round(float(row["break_1"]), 3),
-                            "segment_break_2": round(float(row["break_2"]), 3),
-                            "membrane_after_break": m_label,
-                            "cyto_starts_at": c_label,
-                            "use_nucleus": bool(row["use_nucleus"]),
-                        }
+                        st.session_state["_pending_settings"] = stage_combination(row)
                         st.rerun()
                 st.caption(
-                    f"The best combination puts ε₁ at {best['break_1']:.3f} and ε₂ "
-                    f"at {best['break_2']:.3f}."
+                    f"Applied: ε₁ = {best['break_1']:.3f}, ε₂ = "
+                    f"{best['break_2']:.3f}, "
+                    f"{'with' if best['use_nucleus'] else 'without'} the nucleus."
                 )
             elif search:
                 st.error(search.get("error", "The combination search failed."))
