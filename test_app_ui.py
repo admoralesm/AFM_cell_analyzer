@@ -381,7 +381,7 @@ def case_fit_survives_a_rerun():
           any("compression video" in (l or "").lower() for l in uploader_labels),
           str(uploader_labels))
     check("the send button is still on the page",
-          button_by_label(app, "Send to database") is not None)
+          button_by_label(app, "Send to Box") is not None)
 
 
 def case_database_section_without_a_fit():
@@ -399,7 +399,7 @@ def case_database_section_without_a_fit():
     check("the video uploader is reachable with no fit",
           any("compression video" in (l or "").lower() for l in uploader_labels),
           str(uploader_labels))
-    send = button_by_label(app, "Send to database")
+    send = button_by_label(app, "Send to Box")
     check("the send button is shown with no fit", send is not None)
     if send is not None:
         check("and it is disabled until there is a fit", send.disabled is True)
@@ -434,7 +434,7 @@ def case_send_without_a_video():
     app = start(box_store=FakeStore(), cell_name="cell-01")
     check("no video is loaded", not app.session_state["video_path"])
 
-    send = button_by_label(app, "Send to database")
+    send = button_by_label(app, "Send to Box")
     check("send button present", send is not None)
     if send is None:
         return
@@ -458,6 +458,99 @@ def case_send_without_a_video():
           and "Ec_kPa" in (saved.get("record") or {}))
     check("the fitted column is in the curve csv",
           "fit_N" in (saved.get("curve") or ""))
+
+
+def case_clear_cell_wins_over_dark_debris():
+    print("the detector picks the clear cell, not a dark blob of the same shape")
+    try:
+        import cv2
+        import video_analysis as va
+    except Exception as exc:
+        print(f"  skip (no OpenCV: {exc})")
+        return
+
+    def scene():
+        """A dark blob that is bigger and more central than the real cell."""
+        f = np.full((300, 420, 3), 150, np.uint8)
+        cv2.ellipse(f, (210, 175), (52, 48), 0, 0, 360, (95, 95, 95), -1)
+        cv2.ellipse(f, (90, 175), (40, 37), 0, 0, 360, (205, 205, 205), -1)
+        cv2.rectangle(f, (0, 40), (420, 70), (18, 18, 18), -1)   # cantilever
+        rng = np.random.default_rng(0)
+        return np.clip(f.astype(int) + rng.normal(0, 4, f.shape), 0, 255).astype(np.uint8)
+
+    frame = scene()
+
+    on_shape = va.detect_cell(frame, appearance="either", min_area_frac=0.005)
+    check("without a hint the dark blob wins, which is the reported bug",
+          on_shape.get("found") and on_shape["center"][0] > 150,
+          str(on_shape.get("center")))
+
+    clear = va.detect_cell(frame, appearance="clear", min_area_frac=0.005)
+    check("told the cell is clear, it picks the clear one",
+          clear.get("found") and clear["center"][0] < 150,
+          str(clear.get("center")))
+
+    dark = va.detect_cell(frame, appearance="dark", min_area_frac=0.005)
+    check("told the cell is dark, it picks the dark one",
+          dark.get("found") and dark["center"][0] > 150,
+          str(dark.get("center")))
+
+    # The stored crop must actually contain the cell, not background.
+    crop = va.crop(frame, clear)
+    check("the crop is centred on the clear cell",
+          crop is not None and float(crop.mean()) > float(frame.mean()),
+          f"crop mean {float(crop.mean()):.0f} vs frame {float(frame.mean()):.0f}")
+
+
+def case_all_three_moduli_always_reported():
+    print("all three moduli appear even when a term is not in the model")
+    app = start(use_nucleus=False, use_interior=False)
+    if not no_exception(app, "membrane only"):
+        return
+    labels = [m.label for m in app.get("metric")]
+    for wanted in ("membrane", "cytoskeleton", "nucleus"):
+        check(f"{wanted} has a tile with only the membrane selected",
+              any(wanted in (l or "").lower() for l in labels), str(labels))
+    values = {m.label: (m.value, m.delta) for m in app.get("metric")}
+    # Only the modulus tiles, which are the ones named "Ec …" and "Eₙ …".
+    off = [
+        (label, values[label][0], values[label][1])
+        for label in ("Ec cytoskeleton", "E\u2099 nucleus") if label in values
+    ]
+    check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
+    for label, value, delta in off:
+        check(f"{label} reads zero", value.strip().startswith("0"), value)
+        check(f"{label} says it was not in the model",
+              "not in this model" in (delta or ""), str(delta))
+
+
+def case_load_share_table():
+    print("the range-by-range table says who carries the load")
+    app = start()
+    if not no_exception(app, "load share table"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the table has a heading", "share the load" in text, text[:120])
+
+
+def case_download_when_box_is_absent():
+    print("a cell can be saved with no Box account")
+    app = start(cell_name="cell-01")
+    box = button_by_label(app, "Send to Box")
+    check("the Box button is present", box is not None)
+    if box is not None:
+        check("and disabled without a connection", box.disabled is True)
+
+    downloads = [d for d in app.get("download_button")
+                 if "download this cell" in (d.label or "").lower()]
+    check("a download is offered instead", len(downloads) == 1)
+
+    import zipfile, io as _io, json as _json
+    import app as app_module
+    fit = app.session_state["_last_fit"]
+    eps, force = synthetic()
+    # Build the bundle through the app so session state is live.
+    check("there is a fit to package", fit is not None)
 
 
 def case_fit_quality():
@@ -598,6 +691,10 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_all_three_moduli_always_reported,
+        case_load_share_table,
+        case_download_when_box_is_absent,
+        case_clear_cell_wins_over_dark_debris,
         case_fit_survives_a_rerun,
         case_database_section_without_a_fit,
         case_send_without_a_video,
