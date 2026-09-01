@@ -79,6 +79,8 @@ class PlotStyle:
     show_rupture_marker: bool = True
     show_schematic_moduli: bool = True
     show_legend: bool = True
+    show_fit_line: bool = True
+    show_component_heights: bool = False
     template: str = "publication"
 
     # Legacy alias: older call sites used a single `font_size`.
@@ -211,7 +213,7 @@ def force_curve_figure(
         )
     )
 
-    if fit_force_N is not None:
+    if fit_force_N is not None and style.show_fit_line:
         fx = np.asarray(fit_epsilon if fit_epsilon is not None else epsilon, dtype=float)
         fy, _ = from_newtons(fit_force_N, style.force_unit)
         if log_mode:
@@ -227,6 +229,19 @@ def force_curve_figure(
                 hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
+        if style.show_component_heights and fy.size:
+            finite = np.isfinite(fy)
+            if finite.any():
+                end = int(np.max(np.flatnonzero(finite)))
+                fig.add_annotation(
+                    x=float(fx[end]), y=float(fy[end]),
+                    text=f"<b>{fy[end]:.3g} {unit_label}</b>",
+                    showarrow=False, xanchor="left", yanchor="middle", xshift=6,
+                    font=dict(
+                        size=max(10, style.tick_size - 6), color=style.fit_color,
+                        family=REGULAR_FAMILY,
+                    ),
+                )
 
         if style.show_components:
             for comp, label, dash, color in (
@@ -251,6 +266,23 @@ def force_curve_figure(
                         hovertemplate="ε = %{x:.4f}<br>%{y:.4g} " + unit_label + "<extra></extra>",
                     )
                 )
+                if style.show_component_heights and cy.size:
+                    # How high this component reaches, written where it ends.
+                    # Reading a contribution off a dashed line by eye is
+                    # guesswork; this states it.
+                    finite = np.isfinite(cy)
+                    if finite.any():
+                        end = int(np.max(np.flatnonzero(finite)))
+                        fig.add_annotation(
+                            x=float(cx[end]), y=float(cy[end]),
+                            text=f"<b>{cy[end]:.3g} {unit_label}</b>",
+                            showarrow=False,
+                            xanchor="left", yanchor="middle", xshift=6,
+                            font=dict(
+                                size=max(10, style.tick_size - 6), color=color,
+                                family=REGULAR_FAMILY,
+                            ),
+                        )
 
     if fit_window is not None and style.show_fit_window and not log_mode:
         # Accept a single (lo, hi) or a list of windows, each optionally
