@@ -13,6 +13,10 @@ sys.path.insert(0, "/root/AFM_cell_analyzer")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 from lulevich_model import LulevichModel  # noqa: E402
 
+# Label -> the argument the model takes, mirroring app.py.
+MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
+CYTO_MODE = {"at ε₁": "break", "from the very start": "zero"}
+
 
 def synthetic(membrane="freeze", cyto_start="break", En_kPa=3.0, n=260, noise=0.01):
     """A curve built from a known composition, so the answer is known."""
@@ -131,13 +135,17 @@ def case_highlight():
         no_exception(app2, f"highlight {option!r}")
 
 
-def case_search_and_apply():
-    print("combination search, then apply the result")
+def case_search_applies_in_one_press():
+    print("one press searches and applies the winner")
     app = start()
-    button = button_by_label(app, "Try every combination")
+    button = button_by_label(app, "Find the best combination and fit it")
     check("search button present", button is not None)
     if button is None:
         return
+    before = (
+        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
+        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
+    )
     button.click().run()
     if not no_exception(app, "combination search"):
         return
@@ -146,32 +154,122 @@ def case_search_and_apply():
           str(search.get("error") if search else None))
     if not (search and search.get("success")):
         return
-    labels = [r["label"] for r in search["candidates"]]
     check("all four compositions ranked",
           len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]}) == 4)
-    truth = ("freeze", "break")
-    top = (search["best"]["membrane"], search["best"]["cyto_start"])
-    tied = {
-        (r["membrane"], r["cyto_start"])
-        for r in search["candidates"] if r.get("tied_with_best")
-    } | {top}
-    check("true composition is top or tied with it", truth in tied,
-          f"top={top} tied={tied}")
 
-    apply_button = button_by_label(app, "Use this combination")
-    check("apply button present", apply_button is not None)
-    if apply_button is None:
+    truth = ("freeze", "break")
+    best = search["best"]
+    picked = (best["membrane"], best["cyto_start"])
+    check("the true composition is the one picked", picked == truth,
+          f"picked {picked}")
+    check("ε₁ recovered", abs(best["break_1"] - 0.15) < 0.02,
+          f"{best['break_1']:.3f}")
+    check("ε₂ recovered", abs(best["break_2"] - 0.40) < 0.02,
+          f"{best['break_2']:.3f}")
+
+    # The winner should already be in the widgets: no second click needed.
+    after = (
+        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
+        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
+    )
+    check("the winner was applied without a second click", after != before,
+          f"{before} -> {after}")
+    check("applied ε₁ matches the winner",
+          abs(after[0] - best["break_1"]) < 0.002, f"{after[0]} vs {best['break_1']}")
+    check("applied composition matches the winner",
+          MEMBRANE_MODE[after[2]] == best["membrane"]
+          and CYTO_MODE[after[3]] == best["cyto_start"])
+
+    override = button_by_label(app, "Use this one instead")
+    check("override button present", override is not None)
+    if override is not None:
+        override.click().run()
+        no_exception(app, "override the pick")
+    print(f"       picked {best['label']!r}, ε₁={after[0]}, ε₂={after[1]}")
+
+
+def case_search_beats_the_old_grid():
+    print("the refined search finds the breakpoints the coarse grid missed")
+    for membrane, cyto in (
+        ("freeze", "break"), ("freeze", "zero"), ("continue", "break"),
+    ):
+        eps, force = synthetic(membrane, cyto)
+        model = LulevichModel(force, eps, cell_height=8.0e-6)
+
+        coarse = model._best_breakpoints(
+            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=0
+        )
+        refined = model._best_breakpoints(
+            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=2
+        )
+        check(f"refinement does not make {membrane}/{cyto} worse",
+              refined["ss_res"] <= coarse["ss_res"] * (1 + 1e-9),
+              f"{refined['ss_res']:.4g} vs {coarse['ss_res']:.4g}")
+        check(f"ε₁ within 0.02 of truth for {membrane}/{cyto}",
+              abs(refined["break_1"] - 0.15) < 0.02, f"{refined['break_1']:.4f}")
+
+
+def case_search_flags_what_it_cannot_see():
+    print("the search says when a term or a boundary does nothing")
+    eps, force = synthetic("continue", "zero")
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    found = model.search_compositions(0.0, 0.60)
+    check("search succeeded", found.get("success"))
+    if not found.get("success"):
         return
-    before = (app.session_state["segment_break_1"], app.session_state["segment_break_2"])
-    apply_button.click().run()
-    if not no_exception(app, "apply combination"):
+    row = next(
+        r for r in found["candidates"]
+        if r["membrane"] == "continue" and r["cyto_start"] == "zero" and r["use_nucleus"]
+    )
+    check("ε₁ flagged as unused when nothing depends on it",
+          "ε₁" in row.get("idle_breaks", []), str(row.get("idle_breaks")))
+
+    # A curve with no nucleus should be answered without one.
+    eps, force = synthetic("freeze", "zero", En_kPa=0.0)
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    found = model.search_compositions(0.0, 0.60)
+    check("a curve with no nucleus is answered without one",
+          found["best"]["use_nucleus"] is False
+          or found["best"]["En_kPa"] <= 0,
+          f"En={found['best']['En_kPa']:.4g}, "
+          f"use_nucleus={found['best']['use_nucleus']}")
+
+
+def case_bare_plot():
+    print("one switch strips the plot to data and fit")
+    app = start()
+    switch = None
+    for box in app.checkbox:
+        if "data and fit only" in (box.label or "").lower():
+            switch = box
+    check("bare-plot switch present", switch is not None)
+    if switch is None:
         return
-    after = (app.session_state["segment_break_1"], app.session_state["segment_break_2"])
-    check("breakpoints were written", after != before or True, f"{before} -> {after}")
-    check("chosen membrane mode is a valid label",
-          app.session_state["membrane_after_break"]
-          in ("holds what it reached", "keeps stiffening"))
-    print(f"       search picked {labels[0]!r}, ε₁={after[0]}, ε₂={after[1]}")
+    check("element curves off by default",
+          app.session_state["show_components"] is False)
+    switch.set_value(True).run()
+    if not no_exception(app, "bare plot"):
+        return
+
+    import app as app_module
+
+    everything_on = {name: True for name in app_module.PLOT_EXTRAS}
+    normal = app_module.plot_flags({**everything_on, "bare_plot": False})
+    check("individual boxes respected when not bare", all(normal.values()),
+          str(normal))
+
+    stripped = app_module.plot_flags({**everything_on, "bare_plot": True})
+    for flag, drawn in stripped.items():
+        check(f"{flag} forced off by the bare switch", drawn is False)
+
+    partial = app_module.plot_flags(
+        {**everything_on, "show_legend": False, "bare_plot": False}
+    )
+    check("one box off leaves the others on",
+          partial["show_legend"] is False and partial["show_components"] is True)
+
+    # And the app itself must still run with the switch on.
+    check("app runs with the bare switch on", not app.exception)
 
 
 def case_buttons_do_not_break_widgets():
@@ -408,7 +506,10 @@ if __name__ == "__main__":
         case_range_starts_at_zero,
         case_composition_radios,
         case_highlight,
-        case_search_and_apply,
+        case_search_beats_the_old_grid,
+        case_search_flags_what_it_cannot_see,
+        case_search_applies_in_one_press,
+        case_bare_plot,
         case_buttons_do_not_break_widgets,
     ):
         case()
