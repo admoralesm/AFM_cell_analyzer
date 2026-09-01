@@ -525,7 +525,272 @@ class _CouplingMixin:
                 "best_crossover": best["crossover"]}
 
 
-class LulevichModel(_CouplingMixin):
+# ---------------------------------------------------------------------------
+#  Segmented model
+# ---------------------------------------------------------------------------
+#
+# The compression is treated as three stretches of deformation with different
+# structures carrying the load:
+#
+#     0   -> e1   the membrane alone, the cubic balloon term
+#     e1  -> e2   the cytoskeleton takes over; the membrane contributes no
+#                 further force and simply holds what it had reached at e1
+#     e2  -> end  the cytoskeleton continues and the nucleus joins it
+#
+# Writing that as one expression,
+#
+#     F(e) = Am Em min(e, e1)^3 + Ai Ec <e - e1>^1.5 + An En <e - e2>^1.5
+#
+# The min() freezes the membrane term at its value at e1 instead of letting it
+# keep climbing, and each later term starts from zero at its own breakpoint.
+# Two things follow, and both matter:
+#
+# * The curve is continuous at both breakpoints by construction. Nothing has to
+#   be stitched together afterwards and there is no step for the fit to chase.
+# * It is still LINEAR in Em, Ec and En, so the fit remains one exact bounded
+#   least-squares solve. Only the breakpoints are non-linear, and they are two
+#   bounded scalars, so they can be scanned on a grid.
+
+
+class _SegmentedMixin:
+    """The segmented three-stage model."""
+
+    def segment_terms(self, epsilon, e1=None, e2=None):
+        """The three basis functions, before scaling by their moduli."""
+        eps = np.asarray(epsilon, dtype=float)
+        e1 = self.segment_break_1 if e1 is None else float(e1)
+        e2 = self.segment_break_2 if e2 is None else float(e2)
+        membrane = self.Am * np.clip(np.minimum(eps, e1), 0.0, None) ** 3
+        cyto = self.Ai * np.clip(eps - e1, 0.0, None) ** 1.5
+        nucleus = self.An * np.clip(eps - e2, 0.0, None) ** 1.5
+        return membrane, cyto, nucleus
+
+    def segmented_model(self, epsilon, Em, Ec, En=0.0, e1=None, e2=None, force_offset=0.0):
+        """Total force under the segmented model."""
+        membrane, cyto, nucleus = self.segment_terms(epsilon, e1, e2)
+        return membrane * Em + cyto * Ec + nucleus * En + force_offset
+
+    def fit_segmented(
+        self,
+        epsilon_min=0.0,
+        epsilon_max=0.60,
+        e1=None,
+        e2=None,
+        terms=("membrane", "interior", "nucleus"),
+        weighting="uniform",
+        fit_offset=False,
+    ):
+        """
+        Fit the segmented model: one bounded linear solve.
+
+        Parameters
+        ----------
+        e1, e2 : float
+            Breakpoints. ``e1`` is where the membrane stops adding force and
+            the cytoskeleton takes over; ``e2`` is where the nucleus engages.
+        terms : tuple
+            Which of the three stages to include. Dropping one simply removes
+            its column.
+        """
+        e1 = self.segment_break_1 if e1 is None else float(e1)
+        e2 = self.segment_break_2 if e2 is None else float(e2)
+        if not (0 <= e1 < e2):
+            return self._failure(
+                f"Breakpoints must satisfy 0 <= e1 < e2; got e1={e1:.3f}, e2={e2:.3f}."
+            )
+
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        n_params = len(terms) + (1 if fit_offset else 0)
+        if eps.size < n_params + 1:
+            return self._failure(
+                f"Only {eps.size} points in e = [{epsilon_min:.3f}, "
+                f"{epsilon_max:.3f}]; need at least {n_params + 1}."
+            )
+
+        membrane, cyto, nucleus = self.segment_terms(eps, e1, e2)
+        columns, names = [], []
+        if "membrane" in terms:
+            columns.append(membrane)
+            names.append("Em")
+        if "interior" in terms:
+            columns.append(cyto)
+            names.append("Ei")
+        if "nucleus" in terms:
+            columns.append(nucleus)
+            names.append("En")
+        if fit_offset:
+            columns.append(np.ones_like(eps))
+            names.append("F0")
+        design = np.column_stack(columns)
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
+            weights = 1.0 / scale
+        else:
+            weights = np.ones_like(force)
+        design_w, target_w = design * weights[:, None], force * weights
+
+        col_norm = np.linalg.norm(design_w, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        lower = np.array([-np.inf if n == "F0" else 0.0 for n in names])
+        solution = lsq_linear(
+            design_w / col_norm, target_w,
+            bounds=(lower * col_norm, np.inf), method="bvls",
+        )
+        params = dict(zip(names, solution.x / col_norm))
+        Em = float(params.get("Em", 0.0))
+        Ec = float(params.get("Ei", 0.0))
+        En = float(params.get("En", 0.0))
+        F0 = float(params.get("F0", 0.0))
+
+        predicted = self.segmented_model(eps, Em, Ec, En, e1, e2, F0)
+        residuals = force - predicted
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        dof = max(eps.size - n_params, 1)
+
+        std_err, corr, cond = self._covariance(
+            design_w / col_norm, target_w, col_norm, names, dof, ss_res, eps.size
+        )
+
+        # What each stage contributes at the top of the fitted range.
+        top = float(eps.max())
+        m_top, c_top, n_top = self.segment_terms(np.array([top]), e1, e2)
+        f_mem, f_cyt, f_nuc = float(m_top[0] * Em), float(c_top[0] * Ec), float(n_top[0] * En)
+        total = f_mem + f_cyt + f_nuc
+
+        warnings_list = []
+        for value, key, unit, scale_to in (
+            (Em, "Em", "MPa", 1e6), (Ec, "Ei", "kPa", 1e3), (En, "En", "kPa", 1e3),
+        ):
+            label = {"Em": "Em", "Ei": "Ec", "En": "En"}[key]
+            if key in [{"membrane": "Em", "interior": "Ei", "nucleus": "En"}[t] for t in terms]:
+                if value <= 0:
+                    warnings_list.append(
+                        f"{label} came out zero: its segment shows no rise that the "
+                        f"other stages do not already explain. Check the breakpoints."
+                    )
+                else:
+                    lo, hi = self.expected_ranges[key]
+                    if not (lo <= value <= hi):
+                        warnings_list.append(
+                            f"{label} = {value / scale_to:.3g} {unit} is outside the "
+                            f"expected {lo / scale_to:.3g} to {hi / scale_to:.3g} "
+                            f"{unit} for this cell type."
+                        )
+        if np.isfinite(r_squared) and r_squared < 0.95:
+            warnings_list.append(
+                f"R2 = {r_squared:.3f}. Try moving the breakpoints, or run the "
+                f"breakpoint scan to place them from the data."
+            )
+
+        out = {
+            "success": True,
+            "mode": "segmented",
+            "coupling": "segmented",
+            "Em": Em, "Ei": Ec, "En": En,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Em_std": std_err.get("Em", float("nan")),
+            "Ei_std": std_err.get("Ei", float("nan")),
+            "En_std": std_err.get("En", float("nan")),
+            "Em_MPa_std": std_err.get("Em", float("nan")) / 1e6,
+            "Ei_kPa_std": std_err.get("Ei", float("nan")) / 1e3,
+            "En_kPa_std": std_err.get("En", float("nan")) / 1e3,
+            "force_offset": F0,
+            "break_1": e1,
+            "break_2": e2,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": 1.0 - (1.0 - r_squared) * (eps.size - 1) / dof
+            if np.isfinite(r_squared) and eps.size > n_params else float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params,
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": cond,
+            "corr_Em_Ei": corr,
+            "membrane_fraction_at_max": f_mem / total if total > 0 else float("nan"),
+            "interior_fraction_at_max": f_cyt / total if total > 0 else float("nan"),
+            "nucleus_fraction_at_max": f_nuc / total if total > 0 else float("nan"),
+            "nucleus_onset": e2,
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "mask": mask,
+            "warnings": warnings_list,
+        }
+        self.results["segmented"] = out
+        return out
+
+    def scan_segment_breaks(
+        self,
+        epsilon_min=0.0,
+        epsilon_max=0.60,
+        terms=("membrane", "interior", "nucleus"),
+        n_grid=14,
+        weighting="uniform",
+    ):
+        """
+        Place the two breakpoints from the data.
+
+        Both are bounded scalars and every trial is one exact linear solve, so
+        a grid over the pair is affordable and exhaustive. The returned surface
+        makes it visible when the optimum is a broad plateau, which means the
+        curve does not really locate the breakpoints.
+        """
+        lo = max(float(epsilon_min), float(self.epsilon.min()))
+        hi = min(float(epsilon_max), float(self.epsilon.max()))
+        span = hi - lo
+        if span <= 0:
+            return {"success": False, "error": "Empty deformation range."}
+
+        first = np.linspace(lo + 0.10 * span, lo + 0.55 * span, int(n_grid))
+        second = np.linspace(lo + 0.30 * span, lo + 0.92 * span, int(n_grid))
+
+        best, trials = None, []
+        for e1 in first:
+            for e2 in second:
+                if e2 <= e1 + 0.02 * span:
+                    continue
+                result = self.fit_segmented(
+                    epsilon_min, epsilon_max, e1=e1, e2=e2,
+                    terms=terms, weighting=weighting,
+                )
+                if not result.get("success"):
+                    continue
+                trials.append(
+                    {
+                        "e1": float(e1), "e2": float(e2),
+                        "r_squared": float(result["r_squared"]),
+                        "Em_MPa": result["Em_MPa"],
+                        "Ec_kPa": result["Ei_kPa"],
+                        "En_kPa": result["En_kPa"],
+                    }
+                )
+                if best is None or result["r_squared"] > best["r_squared"]:
+                    best = result
+
+        if best is None:
+            return {"success": False, "error": "No usable segmented fit on the grid."}
+        return {
+            "success": True,
+            "best": best,
+            "best_break_1": best["break_1"],
+            "best_break_2": best["break_2"],
+            "trials": trials,
+        }
+
+
+class LulevichModel(_CouplingMixin, _SegmentedMixin):
     """Lulevich fit for single-cell compression curves."""
 
     # ------------------------------------------------------------------ init
@@ -546,6 +811,8 @@ class LulevichModel(_CouplingMixin):
         nucleus_onset=0.15,
         expected_ranges=None,
         active_windows=None,
+        segment_break_1=0.15,
+        segment_break_2=0.40,
     ):
         """
         Parameters
@@ -627,6 +894,8 @@ class LulevichModel(_CouplingMixin):
             float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
         )
         self.nucleus_onset = float(nucleus_onset)
+        self.segment_break_1 = float(segment_break_1)
+        self.segment_break_2 = float(segment_break_2)
         self.active_windows = (
             {k: (float(v[0]), float(v[1])) for k, v in active_windows.items() if v}
             if active_windows
