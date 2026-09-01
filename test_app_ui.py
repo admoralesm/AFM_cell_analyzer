@@ -287,14 +287,125 @@ def case_legacy_record_refits():
         check(f"{new!r} resolves", app_module.MODEL_KEYS_ANY.get(new) == key)
 
 
+def case_range_starts_at_zero():
+    print("the segmented range always starts at zero")
+    app = start()
+    ends = [s for s in app.slider if "fit up to" in (s.label or "").lower()]
+    check("single end-of-range slider in the segmented view", len(ends) == 1)
+    pairs = [s for s in app.slider if (s.label or "").strip() == "Fitted range"]
+    check("no two-handle range slider in the segmented view", not pairs)
+    if ends:
+        ends[0].set_value(0.35).run()
+        no_exception(app, "moving the end of the range")
+        lo, hi = app.session_state["window_combined"]
+        check("range starts at zero", lo == 0.0, str(lo))
+        check("range ends where the slider was put", abs(hi - 0.35) < 0.01, str(hi))
+
+    # The other models keep the two-handle slider.
+    app2 = start()
+    widget_by_label(app2, "radio", "how the cell is modelled").set_value(
+        "Side by side (every element acts everywhere)"
+    ).run()
+    pairs = [s for s in app2.slider if (s.label or "").strip() == "Fitted range"]
+    check("two-handle slider still there for the other models", len(pairs) == 1)
+
+
+def case_fit_stops_at_the_end_of_the_range():
+    print("the model line stops where the range stops")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.35, 0.15, 0.30)
+    check("fit succeeded on a short range", fit.get("success"))
+    if not fit.get("success"):
+        return
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.30)
+    full = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+    lo, hi = fit["epsilon_range"]
+    clipped = np.array(full, dtype=float)
+    clipped[(eps < lo) | (eps > hi)] = np.nan
+
+    fig = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="N"), fit_force_N=clipped
+    )
+    line = next(t for t in fig.data if t.name == "Model")
+    drawn = np.asarray(line.y, dtype=float)
+    finite = np.isfinite(drawn)
+    check("nothing drawn past the end of the range",
+          not finite[eps > hi + 1e-9].any())
+    check("the whole range is drawn", finite[(eps >= lo) & (eps <= hi)].all())
+    check("the line reaches the end of the range",
+          abs(eps[finite].max() - hi) < 0.01, f"{eps[finite].max():.3f} vs {hi:.3f}")
+
+
+def case_plot_clutter_toggles():
+    print("each piece of clutter can be switched off")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+
+    def build(**flags):
+        style = plot_utils.PlotStyle(force_unit="N", **flags)
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=fitted,
+            fit_window=[{"range": (0.0, 0.6), "label": "fit"}],
+            highlight_window=(0.15, 0.40, "segment 2"),
+            highlight=(0.30, float(force[len(force) // 2])),
+            rupture_epsilon=0.55,
+        )
+
+    on = build()
+    check("shading on by default", len(on.layout.shapes) >= 2)
+    check("video marker on by default",
+          any(t.name == "video frame" for t in on.data))
+
+    off = build(show_fit_window=False)
+    check("shading gone", not [s for s in off.layout.shapes if s.type == "rect"])
+
+    off = build(show_video_marker=False)
+    check("video frame marker gone",
+          not any(t.name == "video frame" for t in off.data))
+
+    off = build(show_rupture_marker=False)
+    labels = [getattr(a, "text", "") for a in off.layout.annotations]
+    check("rupture marker gone", "rupture" not in labels, str(labels))
+
+    with_moduli = plot_utils.cell_schematic(
+        plot_utils.PlotStyle(force_unit="N"), epsilon=0.3,
+        break_1=0.15, break_2=0.40, Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    )
+    without = plot_utils.cell_schematic(
+        plot_utils.PlotStyle(force_unit="N", show_schematic_moduli=False),
+        epsilon=0.3, break_1=0.15, break_2=0.40,
+        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    )
+
+    def caption(fig):
+        return " ".join(getattr(a, "text", "") or "" for a in fig.layout.annotations)
+
+    check("moduli printed by default", "E<sub>m</sub>" in caption(with_moduli))
+    check("moduli gone when switched off",
+          "E<sub>m</sub>" not in caption(without) and "E<sub>c</sub>" not in caption(without))
+    check("the diagram still says where it is",
+          "ε =" in caption(without), caption(without)[:80])
+
+
 if __name__ == "__main__":
     for case in (
         case_loads_clean,
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_fit_stops_at_the_end_of_the_range,
+        case_plot_clutter_toggles,
         case_preset_round_trip,
         case_model_names,
+        case_range_starts_at_zero,
         case_composition_radios,
         case_highlight,
         case_search_and_apply,
