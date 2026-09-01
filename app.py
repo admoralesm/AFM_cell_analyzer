@@ -301,6 +301,10 @@ DEFAULTS = {
     "db_view": "Gallery",
     "exploration": None,
     "video_link": "",
+    # The last successful fit, kept so a rerun (uploading a video, ticking a
+    # box, changing tab) does not wipe the results off the page.
+    "_last_fit": None,
+    "_last_fit_signature": None,
     # video
     "video_path": None,
     "video_info": None,
@@ -2178,6 +2182,23 @@ with tab_analysis:
 
         run = st.session_state["live_fit"] or st.button("🚀 Fit curve", type="primary")
 
+        # A fit has to survive a rerun. Uploading a video, ticking a checkbox
+        # or opening a tab all rerun the script, and with live refitting off
+        # nothing recomputes the fit, so it used to vanish and take the whole
+        # database section with it. Keep the last good one and reuse it.
+        fit_signature = repr(
+            (
+                data.get("source"),
+                int(epsilon.size),
+                float(force_N[0]) if force_N.size else 0.0,
+                float(force_N[-1]) if force_N.size else 0.0,
+                sorted(current_fit_settings().items(), key=lambda kv: kv[0]),
+                round(fit_lo, 6), round(fit_hi, 6),
+                round(break_1, 6), round(break_2, 6),
+                kind,
+            )
+        )
+
         fit = None
         comparison = None
         if run and not active:
@@ -2243,6 +2264,28 @@ with tab_analysis:
                     epsilon_min=fit_lo, epsilon_max=fit_hi, terms=active,
                     fit_offset=st.session_state["fit_offset"],
                     weighting=st.session_state["weighting"],
+                )
+
+        # The video and database section below runs whether or not there is a
+        # fit, so the names it reads have to exist either way.
+        fitted = membrane = interior = nucleus = None
+
+        stale_fit = False
+        if fit is not None and fit.get("success"):
+            st.session_state["_last_fit"] = fit
+            st.session_state["_last_fit_signature"] = fit_signature
+        elif fit is None and st.session_state.get("_last_fit") is not None:
+            # Nothing asked for a fit on this run, so show the last good one
+            # rather than an empty page.
+            fit = st.session_state["_last_fit"]
+            stale_fit = (
+                st.session_state.get("_last_fit_signature") != fit_signature
+            )
+            if stale_fit:
+                st.info(
+                    "Showing the previous fit. Something has changed since it "
+                    "was made, so press **Fit curve** to bring it up to date, "
+                    "or switch on live refitting in Advanced fitting options."
                 )
 
         if comparison and comparison.get("success"):
@@ -2738,100 +2781,107 @@ with tab_analysis:
                     language="text",
                 )
 
-            section("7 · Video and database" if segmented else "6 · Video and database")
-            store = st.session_state.get("box_store")
-            ready = store is not None
+        section("7 · Video and database" if segmented else "6 · Video and database")
+        store = st.session_state.get("box_store")
+        ready = store is not None
 
-            v1, v2 = st.columns([2, 1])
-            with v1:
-                main_video = st.file_uploader(
-                    "Compression video for this cell",
-                    type=["mp4", "avi", "mov", "wmv", "mkv"],
-                    key="video_file_main",
-                    help="Uploaded here it is stored with the cell. The "
-                    "**Compression video** tab has the detection controls if you "
-                    "want the cell outlined and measured.",
+        v1, v2 = st.columns([2, 1])
+        with v1:
+            main_video = st.file_uploader(
+                "Compression video for this cell",
+                type=["mp4", "avi", "mov", "wmv", "mkv"],
+                key="video_file_main",
+                help="Uploaded here it is stored with the cell. The "
+                "**Compression video** tab has the detection controls if you "
+                "want the cell outlined and measured.",
+            )
+            if (
+                main_video is not None
+                and st.session_state.get("video_name") != main_video.name
+                and not VIDEO_IMPORT_ERROR
+            ):
+                destination = os.path.join(
+                    tempfile.gettempdir(), f"afm_video_{main_video.name}"
                 )
-                if (
-                    main_video is not None
-                    and st.session_state.get("video_name") != main_video.name
-                    and not VIDEO_IMPORT_ERROR
-                ):
-                    destination = os.path.join(
-                        tempfile.gettempdir(), f"afm_video_{main_video.name}"
-                    )
-                    with open(destination, "wb") as handle:
-                        handle.write(main_video.getvalue())
-                    st.session_state["video_path"] = destination
-                    st.session_state["video_name"] = main_video.name
-                    st.session_state["video_track"] = None
-                    try:
-                        st.session_state["video_info"] = va.probe(destination)
-                    except Exception as exc:
-                        st.session_state["video_info"] = None
-                        st.error(f"Could not open that video: {exc}")
-            with v2:
-                info = st.session_state.get("video_info")
-                if info:
-                    st.metric("Video frames", f"{info['n_frames']:,}")
-                    st.caption(
-                        f"{st.session_state.get('video_name', '')} · "
-                        f"{info['width']}×{info['height']}"
-                    )
-                    thumb = morphology_frame_png()
-                    if thumb:
-                        st.image(thumb, caption="frame stored with the cell", width=190)
-                else:
-                    st.caption("No video loaded for this cell.")
-
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                if not ready:
-                    st.caption(
-                        "Not connected to Box. Open **Box database** in the sidebar "
-                        "to connect, and the button here will send this cell."
-                    )
-                else:
-                    bits = []
-                    bits.append("curve and fit")
-                    if st.session_state.get("video_path") and os.path.exists(
-                        st.session_state["video_path"]
-                    ):
-                        bits.append("video")
-                        if not VIDEO_IMPORT_ERROR:
-                            bits.append("a morphology frame")
-                    st.caption("Will send: " + ", ".join(bits) + ".")
-                st.checkbox(
-                    "Also upload the video file itself",
-                    key="upload_video_with_cell",
-                    help="Off sends the cell without the video; the record, curve "
-                    "and fit go either way. On also copies the video into the "
-                    "cell's Box folder so it can be opened from the database.",
-                )
+                with open(destination, "wb") as handle:
+                    handle.write(main_video.getvalue())
+                st.session_state["video_path"] = destination
+                st.session_state["video_name"] = main_video.name
+                st.session_state["video_track"] = None
+                try:
+                    st.session_state["video_info"] = va.probe(destination)
+                except Exception as exc:
+                    st.session_state["video_info"] = None
+                    st.error(f"Could not open that video: {exc}")
+        with v2:
+            info = st.session_state.get("video_info")
+            if info:
+                st.metric("Video frames", f"{info['n_frames']:,}")
                 st.caption(
-                    "The video is optional. A cell can be sent with no video at all."
+                    f"{st.session_state.get('video_name', '')} · "
+                    f"{info['width']}×{info['height']}"
                 )
-            with c2:
-                st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
-                if st.button("📤 Send to database", type="primary", disabled=not ready,
-                             **STRETCH):
-                    if not st.session_state["cell_name"]:
-                        st.error("Give the cell a name first.")
-                    else:
-                        try:
-                            with st.spinner("Uploading to Box…"):
-                                saved = send_cell_to_box(
-                                    store, fit, epsilon, force_N, fitted,
-                                    date_acquired, model, stage_plan,
-                                )
-                            st.success(
-                                f"Saved **{saved['cell_id']}** to Box."
-                                + (f" [Open the video]({saved['video_url']})"
-                                   if saved.get("video_url") else "")
+                thumb = morphology_frame_png()
+                if thumb:
+                    st.image(thumb, caption="frame stored with the cell", width=190)
+            else:
+                st.caption("No video loaded for this cell.")
+
+        have_fit = bool(fit and fit.get("success"))
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            if not ready:
+                st.caption(
+                    "Not connected to Box. Open **Box database** in the sidebar "
+                    "to connect, and the button here will send this cell."
+                )
+            elif not have_fit:
+                st.caption(
+                    "Fit the curve above and the button here will send this cell. "
+                    "A video is not needed either way."
+                )
+            else:
+                bits = ["curve and fit"]
+                if st.session_state.get("video_path") and os.path.exists(
+                    st.session_state["video_path"]
+                ):
+                    bits.append("video" if st.session_state["upload_video_with_cell"]
+                                else "a link to the video")
+                    if not VIDEO_IMPORT_ERROR:
+                        bits.append("a morphology frame")
+                st.caption("Will send: " + ", ".join(bits) + ".")
+            st.checkbox(
+                "Also upload the video file itself",
+                key="upload_video_with_cell",
+                help="Off sends the cell without the video; the record, curve "
+                "and fit go either way. On also copies the video into the "
+                "cell's Box folder so it can be opened from the database.",
+            )
+            st.caption(
+                "The video is optional. A cell can be sent with no video at all."
+            )
+        with c2:
+            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+            if st.button("📤 Send to database", type="primary",
+                         disabled=not (ready and have_fit), **STRETCH):
+                if not st.session_state["cell_name"]:
+                    st.error("Give the cell a name first.")
+                else:
+                    try:
+                        with st.spinner("Uploading to Box…"):
+                            saved = send_cell_to_box(
+                                store, fit, epsilon, force_N, fitted,
+                                date_acquired, model, stage_plan,
                             )
-                            st.session_state["box_index"] = None
-                        except Exception as exc:
-                            st.error(f"Could not save: {exc}")
+                        st.success(
+                            f"Saved **{saved['cell_id']}** to Box."
+                            + (f" [Open the video]({saved['video_url']})"
+                               if saved.get("video_url") else "")
+                        )
+                        st.session_state["box_index"] = None
+                    except Exception as exc:
+                        st.error(f"Could not save: {exc}")
 
 
 # ==================================================== TAB 2: video analysis ==
