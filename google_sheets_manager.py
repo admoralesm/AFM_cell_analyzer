@@ -73,51 +73,117 @@ class GoogleSheetsManager:
 
     def get_or_create_sheet(self, spreadsheet_id: Optional[str] = None) -> bool:
         """
-        Get existing spreadsheet or create new one
+        Open the spreadsheet the service account has been given access to.
 
-        Parameters:
-        -----------
+        A service account is not a person: it has its own Drive with a storage
+        quota of zero bytes. Asking it to create a spreadsheet therefore fails
+        with
+
+            APIError [403]: The user's Drive storage quota has been exceeded
+
+        which reads like the wrong problem entirely. The fix is never to create
+        the file from here. Make the spreadsheet yourself, in your own Drive,
+        share it with the service account's client_email as an Editor, and pass
+        its id. Creation is still attempted as a last resort when no id is
+        configured, but the quota failure is reported with what to do about it.
+
+        Parameters
+        ----------
         spreadsheet_id : str, optional
-            ID of existing spreadsheet. If None, will try to find by name or create new
-
-        Returns:
-        --------
-        bool : True if successful
+            Spreadsheet id, or a full Google Sheets URL. Falls back to
+            ``st.secrets["google_sheets"]["spreadsheet_id"]``.
         """
-        try:
-            if not self.is_authenticated:
-                return False
+        if not self.is_authenticated:
+            return False
 
+        spreadsheet_id = spreadsheet_id or self._configured_id()
+        if spreadsheet_id:
+            spreadsheet_id = self.extract_spreadsheet_id(spreadsheet_id)
+
+        try:
             if spreadsheet_id:
-                # Open by ID
                 self.spreadsheet = self.client.open_by_key(spreadsheet_id)
             else:
-                # Try to open by name, or create if doesn't exist
                 try:
+                    # Works when a sheet of this name has been shared with the
+                    # service account.
                     self.spreadsheet = self.client.open(self.sheet_name)
                 except gspread.SpreadsheetNotFound:
-                    # Create new spreadsheet
                     self.spreadsheet = self.client.create(self.sheet_name)
-                    st.info(f"✅ Created new Google Sheet: {self.sheet_name}")
-                    print(f"Created spreadsheet: {self.spreadsheet.url}")
+                    st.info(f"Created a new Google Sheet: {self.sheet_name}")
+        except Exception as exc:
+            self._report_open_failure(exc, spreadsheet_id)
+            return False
 
-            # Get or create worksheet
+        try:
             try:
                 self.worksheet = self.spreadsheet.worksheet("Cells")
             except gspread.WorksheetNotFound:
-                # Create worksheet with headers
                 self.worksheet = self.spreadsheet.add_worksheet(
-                    title="Cells",
-                    rows=1000,
-                    cols=12
+                    title="Cells", rows=1000, cols=12
                 )
                 self._initialize_headers()
-
             return True
-
-        except Exception as e:
-            st.error(f"❌ Error accessing spreadsheet: {str(e)}")
+        except Exception as exc:
+            st.error(f"Opened the spreadsheet but could not use it: {exc}")
             return False
+
+    @staticmethod
+    def extract_spreadsheet_id(value: str) -> str:
+        """Accept either a bare id or a full Google Sheets URL."""
+        import re
+
+        value = (value or "").strip()
+        match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})", value)
+        return match.group(1) if match else value
+
+    def _configured_id(self) -> str:
+        """Spreadsheet id from secrets, if one was configured."""
+        try:
+            section = st.secrets.get("google_sheets", {})
+            return section.get("spreadsheet_id") or section.get("spreadsheet_url") or ""
+        except Exception:
+            return ""
+
+    def service_account_email(self) -> str:
+        try:
+            return st.secrets["google_sheets_credentials"].get("client_email", "")
+        except Exception:
+            return ""
+
+    def _report_open_failure(self, exc: Exception, spreadsheet_id: Optional[str]):
+        """Turn Google's API errors into something actionable."""
+        message = str(exc)
+        email = self.service_account_email() or "your service account's client_email"
+
+        if "storage quota" in message.lower():
+            st.error(
+                "Google refused to create the spreadsheet because the service "
+                "account has no Drive storage of its own. Service accounts always "
+                "have a zero-byte quota, so this is not something you can raise."
+            )
+            st.info(
+                "Do this instead:\n\n"
+                "1. Create a blank Google Sheet in your own Drive.\n"
+                f"2. Share it with **{email}** as an **Editor**.\n"
+                "3. Copy its id from the URL, the long string between `/d/` and "
+                "`/edit`.\n"
+                "4. Paste it into the Spreadsheet ID box in the sidebar, or add it "
+                "to `.streamlit/secrets.toml` as:\n\n"
+                "```toml\n[google_sheets]\nspreadsheet_id = \"your-id-here\"\n```"
+            )
+        elif "PERMISSION_DENIED" in message or "[403]" in message:
+            st.error(
+                f"The service account cannot open that spreadsheet. Share it with "
+                f"**{email}** as an Editor and try again."
+            )
+        elif "not found" in message.lower() or "[404]" in message:
+            st.error(
+                f"No spreadsheet with id `{spreadsheet_id}`. Check that you copied "
+                f"the part of the URL between `/d/` and `/edit`."
+            )
+        else:
+            st.error(f"Error accessing spreadsheet: {message}")
 
     def _initialize_headers(self):
         """Initialize worksheet with column headers"""
@@ -445,7 +511,10 @@ class GoogleSheetsManager:
         return ""
 
 
-def initialize_sheets_manager(sheet_name: str = "AFM_Cell_Database") -> Optional[GoogleSheetsManager]:
+def initialize_sheets_manager(
+    sheet_name: str = "AFM_Cell_Database",
+    spreadsheet_id: Optional[str] = None,
+) -> Optional[GoogleSheetsManager]:
     """
     Initialize and authenticate Google Sheets manager
 
@@ -461,7 +530,7 @@ def initialize_sheets_manager(sheet_name: str = "AFM_Cell_Database") -> Optional
     manager = GoogleSheetsManager(sheet_name)
 
     if manager.authenticate():
-        if manager.get_or_create_sheet():
+        if manager.get_or_create_sheet(spreadsheet_id):
             return manager
 
     return None
