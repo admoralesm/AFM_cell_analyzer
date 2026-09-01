@@ -578,3 +578,54 @@ def cell_schematic(
                    xanchor="center"),
     )
     return fig
+
+
+def exponent_profile_figure(profile, style: PlotStyle, break_1=None, break_2=None,
+                            title="What power law is the curve following?"):
+    """
+    Local log-log slope against deformation.
+
+    The two reference lines are the exponents the model assumes: 3 where the
+    membrane carries the load, 3/2 for a Hertzian contact. Where the measured
+    curve sits on one of them, that stage of the model is the right shape for
+    the data; where it wanders, it is not.
+    """
+    eps = np.asarray(profile.get("epsilon", []), dtype=float)
+    exponent = np.asarray(profile.get("exponent", []), dtype=float)
+    fig = go.Figure()
+    if eps.size:
+        fig.add_trace(
+            go.Scatter(
+                x=eps, y=exponent, mode="lines+markers",
+                name="measured exponent",
+                line=dict(color=style.data_color, width=style.line_width),
+                marker=dict(size=max(3, style.marker_size - 2)),
+                hovertemplate="ε = %{x:.3f}<br>exponent = %{y:.2f}<extra></extra>",
+            )
+        )
+    for value, label, colour in ((3.0, "ε³ membrane", "#2ca02c"),
+                                 (1.5, "ε³ᐟ² Hertzian", "#9467bd")):
+        # Inside the axes, not to the right of them: an annotation hung off the
+        # right edge is the first thing to be clipped.
+        fig.add_hline(
+            y=value, line=dict(color=colour, width=2, dash="dash"),
+            annotation_text=label, annotation_position="top left",
+            annotation_font_size=max(10, style.tick_size - 8),
+            annotation_font_color=colour,
+        )
+    for value, label, colour in ((break_1, "ε₁", "#2ca02c"), (break_2, "ε₂", "#e377c2")):
+        if value is not None:
+            fig.add_vline(
+                x=float(value), line=dict(color=colour, width=2, dash="dot"),
+                annotation_text=label, annotation_position="top",
+                annotation_font_size=max(10, style.tick_size - 6),
+            )
+    _base_layout(fig, style, title)
+    fig.update_layout(
+        height=max(360, int(style.height * 0.78)),
+        showlegend=False,
+        margin=dict(r=70),
+    )
+    _style_axes(fig, style, "Relative deformation, ε", "Local exponent")
+    fig.update_yaxes(range=[0, 4.4], dtick=1)
+    return fig
