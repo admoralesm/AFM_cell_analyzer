@@ -25,6 +25,7 @@ from plot_utils import (
     PlotStyle,
     autoscale_unit,
     cell_schematic,
+    exponent_profile_figure,
     force_curve_figure,
     from_newtons,
     residual_figure,
@@ -204,9 +205,10 @@ DEFAULTS = {
     "box_store": None,
     "box_index": None,
     "db_selection": [],
-    "upload_video_with_cell": True,
+    "upload_video_with_cell": False,
     "db_search": "",
     "db_view": "Gallery",
+    "exploration": None,
     "video_link": "",
     # video
     "video_path": None,
@@ -1312,12 +1314,14 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
-        model_col, element_col = st.columns([1.5, 1])
+        element_col, model_col = st.columns([1, 1.5])
         with model_col:
+            st.markdown("**2 · How they share the load**")
             st.radio(
                 "How the cell is modelled",
                 list(MODELS.keys()),
                 key="model_kind",
+                label_visibility="collapsed",
                 help="Segmented treats the compression as three stretches with "
                 "different structures bearing the load. The others assume every "
                 "element acts across the whole curve, which is what makes them "
@@ -1325,7 +1329,7 @@ with tab_analysis:
             )
             st.caption(MODELS[st.session_state["model_kind"]])
         with element_col:
-            st.markdown("**Elements**")
+            st.markdown("**1 · Which components**")
             st.checkbox("Membrane · Eₘ", key="use_membrane")
             st.checkbox("Cytoskeleton · Ec", key="use_interior")
             st.checkbox("Nucleus · Eₙ", key="use_nucleus")
@@ -1335,8 +1339,90 @@ with tab_analysis:
         segmented = kind == "segmented"
         coupling = kind
 
+        # ---------------------------------------------------- exploration ---
+        if segmented:
+            section("4 · Explore the curve")
+            e1_col, e2_col = st.columns([1, 2])
+            with e1_col:
+                if st.button("🔬 Find the segments", type="secondary", **STRETCH):
+                    with st.spinner("Measuring the exponent along the curve…"):
+                        st.session_state["exploration"] = model.explore_segments(
+                            terms=active or ("membrane", "interior", "nucleus")
+                        )
+                st.caption(
+                    "Scans for the two boundaries, then measures the power law each "
+                    "stage actually follows: 3 for the membrane, 3/2 for a Hertzian "
+                    "contact."
+                )
+            exploration = st.session_state.get("exploration")
+            with e2_col:
+                if exploration and exploration.get("success"):
+                    if exploration["confident"]:
+                        st.success(
+                            f"ε₁ = {exploration['break_1']:.3f}, "
+                            f"ε₂ = {exploration['break_2']:.3f}. Each stage follows "
+                            f"the law the model assigns it."
+                        )
+                    else:
+                        st.warning(
+                            f"ε₁ = {exploration['break_1']:.3f}, "
+                            f"ε₂ = {exploration['break_2']:.3f}, but the evidence is "
+                            f"weak. See the notes below."
+                        )
+                    if st.button("✓ Use these breakpoints", type="primary", **STRETCH):
+                        st.session_state["_pending_settings"] = {
+                            "segment_break_1": round(float(exploration["break_1"]), 3),
+                            "segment_break_2": round(float(exploration["break_2"]), 3),
+                        }
+                        st.rerun()
+                elif exploration:
+                    st.error(exploration.get("error", "Exploration failed."))
+
+            if exploration and exploration.get("success"):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "stage": row["stage"],
+                                "ε from": round(row["range"][0], 3),
+                                "ε to": round(row["range"][1], 3),
+                                "points": row["n_points"],
+                                "exponent measured": (
+                                    round(row["measured_exponent"], 2)
+                                    if np.isfinite(row["measured_exponent"])
+                                    else None
+                                ),
+                                "expected": row["expected_exponent"],
+                                "power-law R²": (
+                                    round(row["power_law_r2"], 3)
+                                    if np.isfinite(row["power_law_r2"]) else None
+                                ),
+                                "modulus": row["modulus_label"],
+                            }
+                            for row in exploration["stages"]
+                        ]
+                    ),
+                    hide_index=True,
+                    **STRETCH,
+                )
+                st.caption(
+                    "A blank exponent means that stage does not rise far enough above "
+                    "the noise for its power law to be measured. The breakpoint still "
+                    "comes from the fit, but nothing independently confirms the shape."
+                )
+                for note in exploration["notes"]:
+                    st.warning(note)
+                st.plotly_chart(
+                    exponent_profile_figure(
+                        exploration["profile"], current_style(force_N),
+                        exploration["break_1"], exploration["break_2"],
+                    ),
+                    key="exponent_profile",
+                    **STRETCH,
+                )
+
         # --------------------------------------------------------- ranges ---
-        section("4 · Deformation ranges")
+        section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
         st.caption(
             f"Data spans ε = {eps_lo_data:.3f} to {eps_hi_data:.3f}. "
             f"Auto-detected usable region: {auto_window[0]:.3f} to "
@@ -1363,29 +1449,64 @@ with tab_analysis:
         break_2 = float(st.session_state["segment_break_2"])
 
         if segmented:
-            st.markdown("**Segment boundaries**")
-            s1, s2, s3 = st.columns([1, 1, 1.2])
-            with s1:
-                break_1 = st.number_input(
-                    "ε₁ · membrane hands over",
-                    min_value=0.0, max_value=0.95, step=0.01, format="%.3f",
-                    key="segment_break_1",
-                    help="Below this the membrane alone carries the load as ε³. "
-                    "Above it the membrane adds no further force and holds what it "
-                    "had reached.",
-                )
-            with s2:
-                break_2 = st.number_input(
-                    "ε₂ · nucleus engages",
-                    min_value=0.01, max_value=0.99, step=0.01, format="%.3f",
-                    key="segment_break_2",
-                    help="Above this the nucleus carries load alongside the "
-                    "cytoskeleton.",
-                )
-            with s3:
-                st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-                if st.button("🔎 Find the breakpoints from the data", **STRETCH):
-                    with st.spinner("Scanning breakpoints…"):
+            st.markdown("**Segment table**")
+            st.caption(
+                "Type the boundaries directly. The segments are contiguous, so the "
+                "end of one is the start of the next: editing a row's ε end moves "
+                "that boundary."
+            )
+            table = pd.DataFrame(
+                [
+                    {
+                        "segment": "1 · membrane, ε³",
+                        "ε start": round(fit_lo, 3),
+                        "ε end": round(break_1, 3),
+                        "points": int(((epsilon >= fit_lo) & (epsilon <= break_1)).sum()),
+                    },
+                    {
+                        "segment": "2 · cytoskeleton, ⟨ε−ε₁⟩³ᐟ²",
+                        "ε start": round(break_1, 3),
+                        "ε end": round(break_2, 3),
+                        "points": int(((epsilon > break_1) & (epsilon <= break_2)).sum()),
+                    },
+                    {
+                        "segment": "3 · cytoskeleton + nucleus",
+                        "ε start": round(break_2, 3),
+                        "ε end": round(fit_hi, 3),
+                        "points": int(((epsilon > break_2) & (epsilon <= fit_hi)).sum()),
+                    },
+                ]
+            )
+            edited = st.data_editor(
+                table,
+                hide_index=True,
+                key="segment_table",
+                disabled=["segment", "ε start", "points"],
+                column_config={
+                    "ε end": st.column_config.NumberColumn(
+                        "ε end", min_value=0.0, max_value=1.0, step=0.005, format="%.3f",
+                    )
+                },
+                **STRETCH,
+            )
+            try:
+                new_1 = float(edited.loc[0, "ε end"])
+                new_2 = float(edited.loc[1, "ε end"])
+            except Exception:
+                new_1, new_2 = break_1, break_2
+            if (
+                abs(new_1 - break_1) > 1e-6 or abs(new_2 - break_2) > 1e-6
+            ) and 0 <= new_1 < new_2 <= 1:
+                st.session_state["_pending_settings"] = {
+                    "segment_break_1": round(new_1, 4),
+                    "segment_break_2": round(new_2, 4),
+                }
+                st.rerun()
+
+            b1, b2 = st.columns([1, 2])
+            with b1:
+                if st.button("🔎 Find the boundaries from the data", **STRETCH):
+                    with st.spinner("Scanning boundaries…"):
                         scan_breaks = model.scan_segment_breaks(
                             fit_lo, fit_hi, terms=active or ("membrane", "interior"),
                             weighting=st.session_state["weighting"],
@@ -1397,16 +1518,15 @@ with tab_analysis:
                         }
                         st.rerun()
                     else:
-                        st.error(scan_breaks.get("error", "Breakpoint scan failed."))
-
-            if break_2 <= break_1:
-                st.error("ε₂ must be greater than ε₁.")
-            else:
-                st.caption(
-                    f"Membrane on {fit_lo:.3f} to {break_1:.3f} · cytoskeleton from "
-                    f"{break_1:.3f} · nucleus from {break_2:.3f}. The curve is "
-                    f"continuous at both boundaries by construction."
-                )
+                        st.error(scan_breaks.get("error", "Boundary scan failed."))
+            with b2:
+                if break_2 <= break_1:
+                    st.error("Segment 2 must end after segment 1.")
+                else:
+                    st.caption(
+                        "The force is continuous across both boundaries by "
+                        "construction, so moving one never puts a step in the curve."
+                    )
 
         elif coupling in ("hybrid_ps", "hybrid_sp"):
             h1, h2 = st.columns([1, 2])
@@ -1588,7 +1708,7 @@ with tab_analysis:
             )
 
         # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
-        section("5 · Fit")
+        section("6 · Fit" if segmented else "5 · Fit")
 
         scan = None
         if (
@@ -1918,6 +2038,8 @@ with tab_analysis:
                             nucleus_radius_um=fit.get("R_nucleus", fit["R0"] * 0.35) * 1e6,
                             membrane_thickness_nm=st.session_state["membrane_thickness_nm"],
                             nucleus_onset=model.nucleus_onset if "nucleus" in active else None,
+                            break_1=fit.get("break_1"),
+                            break_2=fit.get("break_2"),
                             Em_MPa=fit["Em_MPa"],
                             Ei_kPa=fit["Ei_kPa"],
                             En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
@@ -2113,7 +2235,7 @@ with tab_analysis:
                     language="text",
                 )
 
-            section("6 · Video and database")
+            section("7 · Video and database" if segmented else "6 · Video and database")
             store = st.session_state.get("box_store")
             ready = store is not None
 
@@ -2177,11 +2299,14 @@ with tab_analysis:
                             bits.append("a morphology frame")
                     st.caption("Will send: " + ", ".join(bits) + ".")
                 st.checkbox(
-                    "Upload the video file too",
+                    "Also upload the video file itself",
                     key="upload_video_with_cell",
-                    help="Off keeps the record small; the video stays only on your "
-                    "machine. On stores it in the cell's Box folder so it can be "
-                    "opened from the database later.",
+                    help="Off sends the cell without the video; the record, curve "
+                    "and fit go either way. On also copies the video into the "
+                    "cell's Box folder so it can be opened from the database.",
+                )
+                st.caption(
+                    "The video is optional. A cell can be sent with no video at all."
                 )
             with c2:
                 st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
