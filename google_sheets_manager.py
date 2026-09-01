@@ -185,27 +185,64 @@ class GoogleSheetsManager:
         else:
             st.error(f"Error accessing spreadsheet: {message}")
 
-    def _initialize_headers(self):
-        """Initialize worksheet with column headers"""
-        headers = [
-            "Cell ID",
-            "Date Analyzed",
-            "Cell Height (μm)",
-            "Cantilever Constant (pN/nm)",
-            "Young's Modulus (Em, MPa)",
-            "Young's Modulus (Ei, kPa)",
-            "Video Link",
-            "Force Curve Created",
-            "Fit Quality (R²)",
-            "Notes",
-            "Analysis Status",
-            "Timestamp"
-        ]
+    # The columns this app writes, in the order a new sheet gets them. An
+    # existing sheet keeps whatever order it already has: rows are written by
+    # header name, never by position, so a column moved or renamed by hand
+    # does not silently put the nucleus modulus in the notes column.
+    COLUMNS = [
+        ("cell_id", "Cell ID"),
+        ("date_analyzed", "Date Analyzed"),
+        ("cell_height", "Cell Height (μm)"),
+        ("cantilever_constant", "Cantilever Constant (pN/nm)"),
+        ("Em", "Young's Modulus (Em, MPa)"),
+        ("Ei", "Young's Modulus (Ei, kPa)"),
+        ("En", "Young's Modulus (En, kPa)"),
+        ("membrane_areal", "Membrane Em·h (mN/m)"),
+        ("break_1", "ε₁ membrane hands over"),
+        ("break_2", "ε₂ nucleus engages"),
+        ("model", "Model"),
+        ("combination", "Combination"),
+        ("fit_range", "Fitted range"),
+        ("video_link", "Video Link"),
+        ("force_curve_created", "Force Curve Created"),
+        ("fit_quality", "Fit Quality (R²)"),
+        ("notes", "Notes"),
+        ("analysis_status", "Analysis Status"),
+        ("timestamp", "Timestamp"),
+    ]
 
+    def _initialize_headers(self):
+        """Put the full header row on a brand new sheet."""
         try:
-            self.worksheet.insert_row(headers, 1)
+            self.worksheet.insert_row([name for _, name in self.COLUMNS], 1)
         except Exception as e:
             st.warning(f"Could not insert headers: {str(e)}")
+
+    def _header_row(self):
+        """The sheet's current header, adding any columns it does not have."""
+        try:
+            header = self.worksheet.row_values(1)
+        except Exception:
+            header = []
+        header = [h for h in header if str(h).strip()]
+        if not header:
+            self._initialize_headers()
+            return [name for _, name in self.COLUMNS]
+
+        missing = [name for _, name in self.COLUMNS if name not in header]
+        if missing:
+            # Extend to the right rather than inserting. Inserting would shift
+            # every cell in every existing row, and this sheet may already
+            # hold results someone has referenced by cell address.
+            header = header + missing
+            try:
+                self.worksheet.update(
+                    values=[header],
+                    range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}",
+                )
+            except Exception as e:
+                st.warning(f"Could not add the new columns: {e}")
+        return header
 
     def append_cell_data(self, cell_data: Dict) -> Tuple[bool, str]:
         """
@@ -238,24 +275,24 @@ class GoogleSheetsManager:
             if "cell_id" not in cell_data or not cell_data["cell_id"]:
                 return False, "Cell ID is required"
 
-            # Prepare row data
-            row = [
-                cell_data.get("cell_id", ""),
-                cell_data.get("date_analyzed", datetime.now().strftime("%Y-%m-%d")),
-                cell_data.get("cell_height", ""),
-                cell_data.get("cantilever_constant", ""),
-                cell_data.get("Em", ""),
-                cell_data.get("Ei", ""),
-                cell_data.get("video_link", ""),
-                cell_data.get("force_curve_created", "No"),
-                cell_data.get("fit_quality", ""),
-                cell_data.get("notes", ""),
-                cell_data.get("analysis_status", "Complete"),
-                datetime.now().isoformat()
-            ]
+            # Build the row against the sheet's own header, so a column the
+            # user has moved still receives the right value and a column the
+            # app does not know about is left alone rather than overwritten.
+            defaults = {
+                "date_analyzed": datetime.now().strftime("%Y-%m-%d"),
+                "force_curve_created": "Yes",
+                "analysis_status": "Complete",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            by_name = {}
+            for key, name in self.COLUMNS:
+                value = cell_data.get(key, defaults.get(key, ""))
+                by_name[name] = "" if value is None else value
 
-            # Append to worksheet
-            self.worksheet.append_row(row)
+            header = self._header_row()
+            row = [by_name.get(name, "") for name in header]
+
+            self.worksheet.append_row(row, value_input_option="USER_ENTERED")
 
             return True, f"✅ Cell {cell_data['cell_id']} saved to database"
 
