@@ -233,6 +233,36 @@ def case_preset_round_trip():
                   str(app.session_state["membrane_after_break"]))
 
 
+def case_companion_file_guard():
+    print("mismatched companion files are named, not crashed on")
+    import app as app_module
+
+    check("no stale files in a matched tree", app_module.STALE_FILES == [],
+          str(app_module.STALE_FILES))
+
+    def old_signature(a, b, title=None):
+        return (a, b, title)
+
+    filtered = app_module.figure_kwargs(
+        old_signature, title="keep", highlight_window=(0.1, 0.2), fit_window=(0, 1)
+    )
+    check("unknown keywords dropped", filtered == {"title": "keep"}, str(filtered))
+
+    def new_signature(a, title=None, highlight_window=None):
+        return None
+
+    kept = app_module.figure_kwargs(
+        new_signature, title="keep", highlight_window=(0.1, 0.2)
+    )
+    check("known keywords kept", set(kept) == {"title", "highlight_window"}, str(kept))
+
+    def takes_anything(a, **kwargs):
+        return None
+
+    passthrough = app_module.figure_kwargs(takes_anything, anything=1, else_=2)
+    check("**kwargs passes everything through", len(passthrough) == 2)
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -261,6 +291,7 @@ if __name__ == "__main__":
     for case in (
         case_loads_clean,
         case_legacy_record_refits,
+        case_companion_file_guard,
         case_fit_quality,
         case_preset_round_trip,
         case_model_names,
