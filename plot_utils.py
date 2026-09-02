@@ -81,6 +81,11 @@ class PlotStyle:
     show_legend: bool = True
     show_fit_line: bool = True
     show_component_heights: bool = False
+    # Axis limits. None means "let plotly decide from the data". x defaults to
+    # the full 0 to 1 of relative deformation so curves from different cells
+    # can be laid side by side without one looking twice as squashed.
+    x_range: tuple = None
+    y_range: tuple = None
     template: str = "publication"
 
     # Legacy alias: older call sites used a single `font_size`.
@@ -372,7 +377,32 @@ def force_curve_figure(
         log_x=log_mode,
         log_y=log_mode,
     )
+    _apply_ranges(fig, style, log_mode)
     return fig
+
+
+def _apply_ranges(fig, style: PlotStyle, log_mode=False):
+    """
+    Pin the axes when limits were asked for.
+
+    Skipped on log axes, where a range is in decades and a linear pair of
+    numbers would silently mean something else entirely.
+    """
+    if log_mode:
+        return
+    for axis, limits in (("x", style.x_range), ("y", style.y_range)):
+        if not limits:
+            continue
+        try:
+            lo, hi = float(limits[0]), float(limits[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            continue
+        if axis == "x":
+            fig.update_xaxes(range=[lo, hi], autorange=False)
+        else:
+            fig.update_yaxes(range=[lo, hi], autorange=False)
 
 
 def residual_figure(epsilon, residual_N, style: PlotStyle, title="Fit residuals"):
@@ -613,8 +643,29 @@ def cell_schematic(
                       dash=dash("membrane")),
             layer="below",
         )
-        _add_spring(fig, -r * 0.50, h * 0.15, h * 0.85, r * 0.30,
-                    colour("interior"), 3, n_coils=5)
+        # A spring is drawn only as long as the stretch of the squash it
+        # actually resists. A nucleus that is not met until 40 % of the way
+        # down gets a short spring high in the cell, because a full-height
+        # spring says it has been carrying load the whole time.
+        def spring_span(term):
+            """(bottom, top) for this element's spring, in cell-height units."""
+            if break_1 is None or break_2 is None:
+                return h * 0.15, h * 0.85
+            starts = {
+                "membrane": 0.0,
+                "interior": 0.0 if cyto_start == "zero" else break_1,
+                "nucleus": break_2,
+            }
+            begin = float(np.clip(starts.get(term, 0.0), 0.0, 0.95))
+            # An element that starts late is compressed over less of the
+            # cell's travel, so its spring occupies the top of that travel.
+            bottom = h * (0.15 + 0.70 * begin)
+            return bottom, h * 0.85
+
+        cyto_bottom, cyto_top = spring_span("interior")
+        _add_spring(fig, -r * 0.50, cyto_bottom, cyto_top, r * 0.30,
+                    colour("interior"), 3,
+                    n_coils=5 if cyto_bottom < h * 0.4 else 3)
 
         if show_nucleus:
             nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.40)
@@ -628,9 +679,21 @@ def cell_schematic(
                 line=dict(color=colour("nucleus"), width=2, dash="dot"),
                 layer="below",
             )
+            nucleus_bottom, nucleus_top = spring_span("nucleus")
+            # Keep the spring inside the nucleus outline: a coil poking out of
+            # the body it belongs to reads as a drawing mistake rather than as
+            # "this one engages late".
+            body_bottom, body_top = h / 2 - nh / 2, h / 2 + nh / 2
+            nucleus_top = min(nucleus_top, body_top - nh * 0.06)
+            nucleus_bottom = min(
+                max(nucleus_bottom, body_bottom + nh * 0.06),
+                nucleus_top - nh * 0.15,
+            )
+            fraction = (nucleus_top - nucleus_bottom) / max(nh * 0.88, 1e-9)
             _add_spring(
-                fig, r * 0.16 + nr, h * 0.17, h * 0.83, min(nr * 1.2, r * 0.34),
-                colour("nucleus"), 3, n_coils=5,
+                fig, r * 0.16 + nr, nucleus_bottom, nucleus_top,
+                min(nr * 1.2, r * 0.34), colour("nucleus"), 3,
+                n_coils=max(2, int(round(5 * fraction))),
             )
 
     # Height marker.
