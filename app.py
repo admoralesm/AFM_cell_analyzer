@@ -109,6 +109,17 @@ except Exception as exc:  # pragma: no cover - depends on local install
     SHEETS_IMPORT_ERROR = str(exc)
 
 try:
+    import onedrive_store
+    from onedrive_store import OneDriveStore, OneDriveError
+
+    ONEDRIVE_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover
+    onedrive_store = None
+    OneDriveStore = None
+    OneDriveError = Exception
+    ONEDRIVE_IMPORT_ERROR = str(exc)
+
+try:
     import box_store
     from box_store import BoxStore, BoxError
 
@@ -310,6 +321,10 @@ DEFAULTS = {
     "cell_notes": "",
     "box_root_folder": "",
     "box_store": None,
+    "onedrive_store": None,
+    "onedrive_root": "AFM cells",
+    "onedrive_index": None,
+    "_device_login": None,
     "box_index": None,
     "db_selection": [],
     "upload_video_with_cell": False,
@@ -694,11 +709,22 @@ def plain_language_summary(fit, model):
         )
     st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
 
+    chi_red = float(fit.get("chi_squared_reduced", float("nan")))
     st.markdown(
         f"**Does the model match the measurement?** "
         f"{quality_in_words(float(fit.get('r_squared', float('nan'))))} "
-        f"(R² = {fit.get('r_squared', float('nan')):.4f})."
+        f"(R² = {fit.get('r_squared', float('nan')):.4f}"
+        + (f", χ²/dof = {chi_red:.1f}" if np.isfinite(chi_red) else "")
+        + ")."
     )
+    if np.isfinite(chi_red) and chi_red > 5:
+        st.warning(
+            f"The line looks close, but it misses the points by about "
+            f"{np.sqrt(chi_red):.0f} times the scatter in the measurement. "
+            f"That usually means a part of the cell is missing from the "
+            f"model, or the boundaries are in the wrong place. R² alone "
+            f"would not have told you."
+        )
     if float(fit.get("r_squared", 0.0)) < 0.9:
         st.warning(
             "A poor match usually means the cell height or the contact point "
@@ -1116,11 +1142,24 @@ COMPONENT_SETS = {
     },
     "Cardiomyocyte": {
         "membrane": ("Membrane and cortex", "a strong shell holding fluid in"),
-        "interior": ("Myofibrils", "the contractile bundles running through it"),
-        "nucleus": ("Nucleus", "the dense body at the centre"),
+        "interior": (
+            "Myofibril bundle",
+            "the contractile machinery, treated as one stiff body",
+        ),
+        # Listed so the term has a name if anyone switches it on, but a
+        # cardiomyocyte is modelled without it: the cell is packed with
+        # myofibrils and behaves as one stiff interior, so a separate nucleus
+        # term has nothing distinct left to describe and only trades off
+        # against the interior modulus.
+        "nucleus": ("Nucleus", "not modelled separately in a cardiomyocyte"),
     },
 }
 DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
+
+# Which terms a cell type is fitted with by default.
+DEFAULT_TERMS_BY_TYPE = {
+    "Cardiomyocyte": {"membrane": True, "interior": True, "nucleus": False},
+}
 
 
 def components_for(cell_type):
@@ -1180,6 +1219,14 @@ def apply_cell_type(name):
         st.session_state[key] = preset[key]
     for term, window in preset["windows"].items():
         st.session_state[f"celltype_window_{term}"] = tuple(window)
+    # Which terms this cell type is modelled with. A cardiomyocyte is packed
+    # with myofibrils and is treated as one stiff interior, so the nucleus
+    # term is switched off: left on it has nothing distinct to describe and
+    # simply trades off against the interior modulus, making both unstable.
+    for term, on in DEFAULT_TERMS_BY_TYPE.get(
+        name, {"membrane": True, "interior": True, "nucleus": True}
+    ).items():
+        st.session_state[f"use_{term}"] = bool(on)
     for key in list(st.session_state.keys()):
         if key.startswith("window_"):
             del st.session_state[key]
@@ -1439,8 +1486,14 @@ def cell_record(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
     return record, curve, video_bytes, video_name
 
 
-def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model, stage_plan):
-    """Package this analysis and write it into the cell's Box folder."""
+def send_cell_to_store(store, fit, epsilon, force_N, fitted, date_acquired,
+                       model, stage_plan):
+    """
+    Package this analysis and write it into the cell's folder.
+
+    Box and OneDrive expose the same save_cell, so one function serves both
+    and the two archives cannot drift into holding different things.
+    """
     record, curve, video_bytes, video_name = cell_record(
         fit, epsilon, force_N, fitted, date_acquired, stage_plan
     )
@@ -1451,6 +1504,10 @@ def send_cell_to_box(store, fit, epsilon, force_N, fitted, date_acquired, model,
         video_bytes=video_bytes,
         video_name=video_name,
     )
+
+
+# The old name, kept so nothing that still calls it breaks.
+send_cell_to_box = send_cell_to_store
 
 
 def send_cell_to_sheet(manager, fit, date_acquired):
@@ -1518,6 +1575,12 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "break_2": round(float(e2), 4) if e2 is not None else "",
             "fit_range": f"{lo:.3f} to {hi:.3f}",
             "fit_quality": round(float(fit.get("r_squared", float("nan"))), 5),
+            "adj_r_squared": round(float(fit.get("adj_r_squared", float("nan"))), 5),
+            "chi_squared": float(f"{float(fit.get('chi_squared', float('nan'))):.5g}"),
+            "chi_squared_reduced": round(
+                float(fit.get("chi_squared_reduced", float("nan"))), 4
+            ),
+            "noise_sigma": float(f"{float(fit.get('noise_sigma', float('nan'))):.4g}"),
             "rmse_N": float(f"{float(fit.get('rmse', float('nan'))):.4g}"),
             "n_points": int(fit.get("n_points", 0)),
             "weighting": fit.get("weighting", st.session_state["weighting"]),
@@ -1834,6 +1897,88 @@ with st.sidebar:
             key="video_show_panel",
             help="Only appears once a video is loaded in the Compression video tab.",
         )
+
+    with st.expander("☁️ OneDrive database", expanded=False):
+        if ONEDRIVE_IMPORT_ERROR:
+            st.error("OneDrive support could not load.")
+            st.caption(ONEDRIVE_IMPORT_ERROR)
+        else:
+            st.caption(
+                "Storage you already have, and you can authorise it yourself. "
+                "Files go to a folder per cell."
+            )
+            st.text_input("Folder for the cells", key="onedrive_root")
+            if st.button("🔌 Connect to OneDrive", **STRETCH):
+                store = onedrive_store.store_from_secrets(
+                    st, st.session_state["onedrive_root"] or None
+                )
+                if store is None:
+                    st.error(
+                        "No [onedrive] section in secrets. Add client_id and "
+                        "tenant, then sign in below to get a refresh token."
+                    )
+                else:
+                    status = store.check()
+                    if status["ok"]:
+                        st.session_state["onedrive_store"] = store
+                        st.success(f"Connected: {status['detail']}")
+                    else:
+                        st.error(status["detail"])
+            if st.session_state.get("onedrive_store"):
+                st.caption(
+                    f"Connected ✓ · {st.session_state['onedrive_store'].auth_method()}"
+                )
+
+            with st.expander("Sign in to get a refresh token"):
+                st.caption(
+                    "Do this once. It needs client_id and tenant in secrets; "
+                    "everything else happens in your browser."
+                )
+                if st.button("Start sign-in", **STRETCH):
+                    try:
+                        config = dict(st.secrets.get("onedrive", {}))
+                        flow = onedrive_store.begin_device_login(
+                            config.get("client_id"),
+                            config.get("tenant", "common"),
+                        )
+                        st.session_state["_device_login"] = flow
+                    except Exception as exc:
+                        st.error(str(exc))
+                flow = st.session_state.get("_device_login")
+                if flow:
+                    st.markdown(
+                        f"1. Open **{flow.get('verification_uri', '')}**\n\n"
+                        f"2. Enter the code **`{flow.get('user_code', '')}`**\n\n"
+                        f"3. Sign in, then press the button below."
+                    )
+                    if st.button("I have signed in", type="primary", **STRETCH):
+                        try:
+                            config = dict(st.secrets.get("onedrive", {}))
+                            payload = onedrive_store.poll_device_login(
+                                config.get("client_id"),
+                                flow.get("device_code"),
+                                config.get("tenant", "common"),
+                            )
+                        except Exception as exc:
+                            payload = None
+                            st.error(str(exc))
+                        if payload is None:
+                            st.info("Not signed in yet. Finish in the browser "
+                                    "and press again.")
+                        else:
+                            st.success("Signed in. Copy this into your secrets:")
+                            st.code(
+                                "[onedrive]\n"
+                                f'tenant = "{dict(st.secrets.get("onedrive", {})).get("tenant", "common")}"\n'
+                                f'client_id = "{dict(st.secrets.get("onedrive", {})).get("client_id", "")}"\n'
+                                f'refresh_token = "{payload.get("refresh_token", "")}"\n'
+                                f'root_folder = "{st.session_state["onedrive_root"] or "AFM cells"}"',
+                                language="toml",
+                            )
+                            st.caption(
+                                "Paste it into Settings → Secrets, reboot, "
+                                "then press Connect. Treat it like a password."
+                            )
 
     with st.expander("📦 Box database", expanded=False):
         if BOX_IMPORT_ERROR:
@@ -2240,13 +2385,13 @@ with tab_analysis:
                 icon="⚠️",
             )
             st.caption(
-                "What it does today: the shell carries the load as ε³, exactly "
-                "as the membrane term does, because a pressurised shell around "
-                "incompressible fluid gives that same cubic law. The Hertzian "
-                "interior term is switched off, since a fluid that does not "
-                "compress does not resist as an elastic solid. The third term "
-                "is available for whatever is met next, named myofibrils for "
-                "this cell type."
+                "What it does today: the shell carries the load as ε³, "
+                "because a pressurised shell around incompressible fluid "
+                "gives that cubic law, and one interior term stands for the "
+                "whole myofibril bundle. There is no separate nucleus: a "
+                "cardiomyocyte is packed with contractile machinery, so the "
+                "interior is treated as one stiff body and a third term would "
+                "only trade off against it."
             )
 
         if segmented:
@@ -3182,9 +3327,36 @@ with tab_analysis:
                     delta=note,
                     delta_color="off",
                 )
-            metric_cols[3].metric("R²", f"{fit['r_squared']:.4f}")
+            metric_cols[3].metric(
+                "R²", f"{fit['r_squared']:.4f}",
+                delta=f"adj {fit.get('adj_r_squared', float('nan')):.4f}"
+                if np.isfinite(fit.get("adj_r_squared", np.nan)) else None,
+                delta_color="off",
+            )
+            chi_red = fit.get("chi_squared_reduced", float("nan"))
+            metric_cols[4].metric(
+                "χ²/dof",
+                f"{chi_red:.2f}" if np.isfinite(chi_red) else "n/a",
+                delta=f"χ² = {fit.get('chi_squared', float('nan')):.4g}"
+                if np.isfinite(fit.get("chi_squared", np.nan)) else None,
+                delta_color="off",
+            )
+
             rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
-            metric_cols[4].metric("RMSE", f"{float(rmse_disp):.3g} {rmse_unit}")
+            sigma_disp, sigma_unit = from_newtons(
+                fit.get("noise_sigma", float("nan")), style.force_unit
+            )
+            st.caption(
+                f"RMSE {float(rmse_disp):.3g} {rmse_unit} · measured noise "
+                f"±{float(sigma_disp):.3g} {sigma_unit} per point. "
+                "χ²/dof compares the residuals against that noise: about 1 "
+                "means the model is as close to the points as the scatter "
+                "allows, and much above 1 means it is missing something real. "
+                "R² can still look excellent when χ²/dof is in the hundreds, "
+                "which is exactly when the model is wrong. The noise is "
+                "estimated from the curve itself, so read χ²/dof as an "
+                "order of magnitude, not to two decimal places."
+            )
 
             st.caption(
                 f"Membrane areal modulus Eₘ·h = "
@@ -3688,7 +3860,7 @@ with tab_analysis:
         sheet_manager = st.session_state.get("gs_manager")
         sheet_ready = bool(st.session_state.get("db_enabled") and sheet_manager)
 
-        c0, c1, c2 = st.columns(3)
+        c0, c1, c1b, c2 = st.columns(4)
         with c0:
             sheet_blockers = [b for b in blockers if "Box" not in b]
             if not sheet_ready:
@@ -3727,6 +3899,35 @@ with tab_analysis:
                 else "To enable: " + ", then ".join(sheet_blockers) + "."
             )
         with c1:
+            drive_store = st.session_state.get("onedrive_store")
+            drive_blockers = [b for b in blockers if "Box" not in b]
+            if drive_store is None:
+                drive_blockers.append("connect OneDrive in the sidebar")
+            if st.button(
+                "☁️ Send to OneDrive",
+                disabled=bool(drive_blockers), **STRETCH,
+            ):
+                try:
+                    with st.spinner("Uploading to OneDrive…"):
+                        saved = send_cell_to_store(
+                            drive_store, fit, epsilon, force_N, fitted,
+                            date_acquired, model, stage_plan,
+                        )
+                    st.success(
+                        f"Saved **{saved['cell_id']}** to OneDrive."
+                        + (f" [Open the video]({saved['video_url']})"
+                           if saved.get("video_url") else "")
+                    )
+                    st.session_state["onedrive_index"] = None
+                except Exception as exc:
+                    st.error(f"Could not save: {exc}")
+            st.caption(
+                "A folder per cell: the record, the curve, the frame and the "
+                "video. Your own storage, no administrator needed."
+                if not drive_blockers
+                else "To enable: " + ", then ".join(drive_blockers) + "."
+            )
+        with c1b:
             box_blockers = [b for b in blockers]
             if st.button(
                 "📤 Send to Box",
@@ -3734,7 +3935,7 @@ with tab_analysis:
             ):
                 try:
                     with st.spinner("Uploading to Box…"):
-                        saved = send_cell_to_box(
+                        saved = send_cell_to_store(
                             store, fit, epsilon, force_N, fitted,
                             date_acquired, model, stage_plan,
                         )
