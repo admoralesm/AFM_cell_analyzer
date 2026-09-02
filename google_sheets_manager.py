@@ -234,6 +234,8 @@ class GoogleSheetsManager:
         ("nucleus_radius", "Nucleus radius (μm)"),
         ("membrane_thickness", "Membrane thickness (nm)"),
         ("protein_coat", "Protein coat thickness (nm)"),
+        ("sarcomere_relaxed", "Relaxed sarcomere (nm)"),
+        ("sarcomere_at_max", "Sarcomere at ε_max (nm)"),
         ("poisson", "Poisson (membrane / interior)"),
         ("force_curve_created", "Force Curve Created"),
         ("analysis_status", "Analysis Status"),
