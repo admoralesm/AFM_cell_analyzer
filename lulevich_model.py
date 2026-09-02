@@ -1144,6 +1144,13 @@ class _ExploreMixin:
 #            = <e - e1>^1.5            cytoskeleton starts at the first break
 
 
+# The order the terms are always written in: outside of the cell inwards,
+# and within the shell, the taut network before the elastic one. Keeping
+# one order
+# everywhere is what lets the design matrix, the tables and the schematic be
+# read against each other without translating.
+COMPOSITION_TERMS = ("tension", "membrane", "interior", "nucleus")
+
 COMPOSITIONS = [
     {
         "key": "freeze_late",
@@ -1296,16 +1303,43 @@ class _CompositionMixin:
     """Fit and compare the ways the stages can be composed."""
 
     def composition_terms(self, epsilon, e1, e2, membrane="freeze", cyto_start="break"):
-        """The three basis functions for one composition."""
+        """The three classic basis functions for one composition."""
+        basis = self.composition_basis(epsilon, e1, e2, membrane, cyto_start)
+        return basis["membrane"], basis["interior"], basis["nucleus"]
+
+    def composition_basis(
+        self, epsilon, e1, e2, membrane="freeze", cyto_start="break",
+    ):
+        """
+        Every basis function the composition can use, keyed by term name.
+
+        Four of them, and the exponents are what keep them apart:
+
+        ``tension``   At e              a taut protein network, horizontal spring
+        ``membrane``  Am e^3            elastic dilation of the same shell
+        ``interior``  Ai <e - s>^1.5    a network filling the cell
+        ``nucleus``   An <e - e2>^1.5   a stiffer layer reached deeper in
+
+        A fit can only separate terms whose shapes differ. Two networks with
+        the same exponent and the same onset are one term wearing two names,
+        and the solver would split them arbitrarily. That is why the second
+        membrane spring is a tension law rather than a second cube law, and
+        why the deeper of the two interior networks is given an onset.
+        """
         eps = np.asarray(epsilon, dtype=float)
-        if membrane == "continue":
-            membrane_basis = self.Am * np.clip(eps, 0.0, None) ** 3
-        else:
-            membrane_basis = self.Am * np.clip(np.minimum(eps, e1), 0.0, None) ** 3
+        positive = np.clip(eps, 0.0, None)
+        # A ruptured membrane holds what it reached: both of its springs stop
+        # taking up more, because they are the same piece of material.
+        held = positive if membrane == "continue" else np.clip(
+            np.minimum(eps, e1), 0.0, None
+        )
         start = 0.0 if cyto_start == "zero" else float(e1)
-        cyto_basis = self.Ai * np.clip(eps - start, 0.0, None) ** 1.5
-        nucleus_basis = self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5
-        return membrane_basis, cyto_basis, nucleus_basis
+        return {
+            "membrane": self.Am * held ** 3,
+            "tension": self.At * held,
+            "interior": self.Ai * np.clip(eps - start, 0.0, None) ** 1.5,
+            "nucleus": self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5,
+        }
 
     def fit_composition(
         self,
@@ -1319,6 +1353,7 @@ class _CompositionMixin:
         weighting="uniform",
         use_membrane=True,
         use_interior=True,
+        use_tension=False,
         with_stats=True,
     ):
         """
@@ -1337,6 +1372,7 @@ class _CompositionMixin:
         eps, force, mask = self._select(epsilon_min, epsilon_max)
         wanted = {
             "membrane": bool(use_membrane),
+            "tension": bool(use_tension),
             "interior": bool(use_interior),
             "nucleus": bool(use_nucleus),
         }
@@ -1346,11 +1382,12 @@ class _CompositionMixin:
         if eps.size < n_params + 1:
             return self._failure(f"Only {eps.size} points in the fitted range.")
 
-        m_basis, c_basis, n_basis = self.composition_terms(
-            eps, e1, e2, membrane, cyto_start
-        )
-        bases = {"membrane": m_basis, "interior": c_basis, "nucleus": n_basis}
-        order = [name for name in ("membrane", "interior", "nucleus") if wanted[name]]
+        bases = self.composition_basis(eps, e1, e2, membrane, cyto_start)
+        m_basis = bases["membrane"]
+        t_basis = bases["tension"]
+        c_basis = bases["interior"]
+        n_basis = bases["nucleus"]
+        order = [name for name in COMPOSITION_TERMS if wanted[name]]
         design = np.column_stack([bases[name] for name in order])
 
         if weighting == "relative":
@@ -1367,12 +1404,59 @@ class _CompositionMixin:
         params = solution.x / col_norm
         values = dict(zip(order, (float(v) for v in params)))
         Em = values.get("membrane", 0.0)
+        T0 = values.get("tension", 0.0)
         Ec = values.get("interior", 0.0)
         En = values.get("nucleus", 0.0)
 
-        predicted = m_basis * Em + c_basis * Ec + n_basis * En
+        # How badly the chosen terms imitate each other over this range. Two
+        # nearly parallel columns still fit, but the split between them is
+        # arbitrary, and a modulus nobody can trust is worse than a missing
+        # one. Reported so the app can say so out loud.
+        scaled = design_w / col_norm
+        try:
+            condition = float(np.linalg.cond(scaled))
+        except Exception:
+            condition = float("nan")
+        worst_pair, worst_corr = None, 0.0
+        if len(order) > 1:
+            centred = scaled - scaled.mean(axis=0)
+            norms = np.linalg.norm(centred, axis=0)
+            norms[norms == 0] = 1.0
+            corr = (centred / norms).T @ (centred / norms)
+            for i in range(len(order)):
+                for j in range(i + 1, len(order)):
+                    if abs(corr[i, j]) > abs(worst_corr):
+                        worst_corr = float(corr[i, j])
+                        worst_pair = (order[i], order[j])
+
+        predicted = m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
+
+        # Error bars, and they are the point rather than decoration. Two terms
+        # that imitate each other still fit beautifully; what goes wrong is
+        # that the split between them is not determined, and the honest way to
+        # say so is a number next to each modulus rather than a correlation
+        # the reader has to interpret. Standard errors come from the usual
+        # linear least-squares covariance, sigma^2 (X'X)^-1, evaluated in the
+        # scaled space and then unscaled.
+        errors = {}
+        if with_stats:
+            dof_here = eps.size - n_params - 2
+            if dof_here > 0:
+                try:
+                    # A modulus pinned at the zero bound is not a free
+                    # parameter; leaving it in makes the matrix singular.
+                    free = [i for i, v in enumerate(solution.x) if v > 0]
+                    if free:
+                        sub = scaled[:, free]
+                        cov = (ss_res / dof_here) * np.linalg.inv(sub.T @ sub)
+                        for slot, index in enumerate(free):
+                            errors[order[index]] = float(
+                                np.sqrt(max(cov[slot, slot], 0.0)) / col_norm[index]
+                            )
+                except np.linalg.LinAlgError:
+                    pass
         # The two breakpoints are free parameters too, so they count against
         # the degrees of freedom that reduced chi-squared divides by.
         if with_stats:
@@ -1398,10 +1482,15 @@ class _CompositionMixin:
             "use_nucleus": bool(use_nucleus),
             "use_membrane": bool(use_membrane),
             "use_interior": bool(use_interior),
-            "Em": Em, "Ei": Ec, "En": En,
+            "use_tension": bool(use_tension),
+            "Em": Em, "Ei": Ec, "En": En, "T0": T0,
             "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
-            "Em_MPa_std": float("nan"), "Ei_kPa_std": float("nan"),
-            "En_kPa_std": float("nan"),
+            "T0_mN_m": T0 * 1e3,
+            "T0_as_modulus_kPa": (T0 / self.h_shell) / 1e3 if self.h_shell else float("nan"),
+            "Em_MPa_std": errors.get("membrane", float("nan")) / 1e6,
+            "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
+            "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
+            "T0_mN_m_std": errors.get("tension", float("nan")) * 1e3,
             "force_offset": 0.0,
             "break_1": float(e1), "break_2": float(e2),
             "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
@@ -1423,18 +1512,153 @@ class _CompositionMixin:
             "terms": list(order),
             "weighting": weighting,
             "fit_offset": False,
-            "condition_number": float("nan"),
+            "condition_number": condition,
             "corr_Em_Ei": float("nan"),
+            "worst_pair": worst_pair,
+            "worst_correlation": worst_corr,
+            # Relative error per modulus, which is what says "this number is
+            # not determined" in one glance.
+            "relative_errors": {
+                name: (errors[name] / value if value > 0 else float("nan"))
+                for name, value in (
+                    ("tension", T0), ("membrane", Em),
+                    ("interior", Ec), ("nucleus", En),
+                ) if name in errors
+            },
             "nucleus_onset": float(e2),
             "R0": self.R0, "R_nucleus": self.R_nucleus,
             "cell_height": self.cell_height,
-            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An, "At": self.At,
+            "h_shell": self.h_shell,
             "mask": mask,
-            "warnings": [],
+            "warnings": self._identifiability_warnings(
+                {name: errors[name] / v for name, v in (
+                    ("tension", T0), ("membrane", Em),
+                    ("interior", Ec), ("nucleus", En),
+                ) if name in errors and v > 0},
+                worst_pair, worst_corr,
+            ),
         }
 
+    @staticmethod
+    def _identifiability_warnings(relative, pair, corr):
+        """
+        Say when a modulus is not actually determined by this curve.
+
+        Driven by the fitted error bars rather than by a correlation
+        threshold, because the error bar is the thing that matters and a
+        threshold on correlation is a guess at where it starts to. A term
+        whose standard error is a third of its own value is a term the curve
+        does not pin down, however good the R-squared looks.
+        """
+        nice = {
+            "tension": "the membrane's in-plane tension T₀",
+            "membrane": "the membrane's elastic modulus Eₘ",
+            "interior": "the interior network Ec",
+            "nucleus": "the deeper layer Eₙ",
+        }
+        loose = sorted(
+            (name for name, value in relative.items()
+             if np.isfinite(value) and value > 0.33),
+            key=lambda n: -relative[n],
+        )
+        if not loose:
+            return []
+        listed = " and ".join(
+            f"{nice.get(n, n)} (± {100 * relative[n]:.0f} %)" for n in loose[:2]
+        )
+        message = (
+            f"This curve does not pin down {listed}. The fit still passes "
+            f"through the points, and the total force is right; what is not "
+            f"determined is how much of it belongs to each of those terms."
+        )
+        if pair and np.isfinite(corr) and abs(corr) > 0.9:
+            message += (
+                f" The reason is that the {pair[0]} and {pair[1]} terms have "
+                f"nearly the same shape here (correlation {abs(corr):.4f}). "
+                f"Widening the range, especially down towards ε = 0, is what "
+                f"separates them; failing that, quote the pair together "
+                f"rather than each on its own."
+            )
+        return [message]
+
+    def breakpoint_spread(
+        self, lo, hi, e1, e2, membrane, cyto_start, use_nucleus=True,
+        weighting="uniform", use_tension=False, n_grid=13,
+    ):
+        """
+        How far each modulus moves across boundaries the data cannot separate.
+
+        The breakpoints are fitted like everything else, but they are profiled
+        out: the search picks the pair with the lowest residual, and every
+        number afterwards is quoted as though that pair were known exactly. It
+        is not. Nearby boundaries often fit within the noise, and on some
+        curves a modulus moves several-fold across them while the residual
+        barely twitches. A standard error computed at fixed boundaries cannot
+        see any of that, so it comes back reassuringly small next to a number
+        that is not determined at all.
+
+        This scans boundaries around the winner, keeps every pair whose fit is
+        no worse than the noise allows, and reports the range each modulus
+        takes over that set. It is the honest error bar on a profiled fit.
+
+        The acceptance band is the usual one: a residual sum within a factor
+        (1 + 2/dof) of the best, which for a linear model is roughly where the
+        fit has become one standard deviation worse.
+        """
+        best = self.fit_composition(
+            lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+            use_tension=use_tension, with_stats=False,
+        )
+        if not best.get("success"):
+            return {"success": False}
+        dof = max(int(best.get("dof") or 0), 1)
+        ceiling = best["ss_res"] * (1.0 + 2.0 / dof)
+
+        keys = ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa")
+        found = {key: [best.get(key, 0.0)] for key in keys}
+        accepted = [(float(e1), float(e2))]
+
+        span = hi - lo
+        first = np.linspace(max(lo + 1e-4, e1 - 0.25 * span),
+                            min(hi - 1e-3, e1 + 0.25 * span), int(n_grid))
+        second = np.linspace(max(lo + 1e-3, e2 - 0.25 * span),
+                             min(hi - 1e-4, e2 + 0.25 * span), int(n_grid))
+        for a in first:
+            for b in second:
+                if b <= a + 0.02 * span:
+                    continue
+                trial = self.fit_composition(
+                    lo, hi, a, b, membrane, cyto_start, use_nucleus, weighting,
+                    use_tension=use_tension, with_stats=False,
+                )
+                if not trial.get("success") or trial["ss_res"] > ceiling:
+                    continue
+                accepted.append((float(a), float(b)))
+                for key in keys:
+                    found[key].append(trial.get(key, 0.0))
+
+        out = {"success": True, "n_accepted": len(accepted), "ranges": {}}
+        for key, values in found.items():
+            low, high = float(min(values)), float(max(values))
+            centre = float(best.get(key, 0.0))
+            out["ranges"][key] = {
+                "value": centre,
+                "low": low,
+                "high": high,
+                # How much of its own size the number moves across boundaries
+                # that fit the curve equally well.
+                "relative": (high - low) / abs(centre) if centre else float("nan"),
+            }
+        out["break_1_range"] = (min(a for a, _ in accepted),
+                                max(a for a, _ in accepted))
+        out["break_2_range"] = (min(b for _, b in accepted),
+                                max(b for _, b in accepted))
+        return out
+
     def _best_breakpoints(
-        self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid, rounds=2,
+        self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
+        rounds=2, use_tension=False,
     ):
         """
         The breakpoints that fit best for one composition.
@@ -1459,7 +1683,7 @@ class _CompositionMixin:
                         continue
                     trial = self.fit_composition(
                         lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
-                        weighting, with_stats=False,
+                        weighting, use_tension=use_tension, with_stats=False,
                     )
                     if not trial.get("success"):
                         continue
@@ -1484,7 +1708,7 @@ class _CompositionMixin:
             # One full fit for the winner, so the caller gets the statistics.
             best = self.fit_composition(
                 lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
-                use_nucleus, weighting,
+                use_nucleus, weighting, use_tension=use_tension,
             )
         return best
 
@@ -1499,6 +1723,7 @@ class _CompositionMixin:
         include_no_nucleus=True,
         refine_rounds=2,
         cv_repeats=3,
+        tension_mode="off",
     ):
         """
         Fit every composition at its own best breakpoints and pick one.
@@ -1538,12 +1763,29 @@ class _CompositionMixin:
 
         rows, fits = [], {}
         nucleus_options = [True, False] if include_no_nucleus else [True]
+        # Three ways to treat the second membrane spring.
+        #
+        # "off"     the classic three-element model, tension not considered.
+        # "search"  offer it and let the held-out error decide.
+        # "always"  the structure is asserted, and the search's job is only to
+        #           place the boundaries inside it.
+        #
+        # "always" is not laziness. A linear term is flexible enough to help a
+        # wrong composition imitate the right one, so on a curve where the
+        # biology says the taut network is there, letting the search drop it
+        # buys a worse story for a better number. Where the biology does not
+        # say, use "search" and read the verdict.
+        tension_options = {
+            "off": [False], "search": [False, True], "always": [True],
+        }.get(str(tension_mode), [False])
 
         for composition in COMPOSITIONS:
+          for use_tension in tension_options:
             for use_nucleus in nucleus_options:
                 best_here = self._best_breakpoints(
                     lo, hi, composition["membrane"], composition["cyto_start"],
                     use_nucleus, weighting, n_grid, refine_rounds,
+                    use_tension=use_tension,
                 )
                 if best_here is None:
                     continue
@@ -1564,15 +1806,23 @@ class _CompositionMixin:
                     moved = self.fit_composition(
                         lo, hi, e1_try, e2_try, composition["membrane"],
                         composition["cyto_start"], use_nucleus, weighting,
-                        with_stats=False,
+                        use_tension=use_tension, with_stats=False,
                     )
                     if moved.get("success") and abs(
                         moved["ss_res"] - best_here["ss_res"]
                     ) / scale < 1e-6:
                         idle.append(name)
 
-                key = composition["key"] + ("" if use_nucleus else "_no_nucleus")
-                label = composition["label"] + ("" if use_nucleus else ", no nucleus")
+                key = (
+                    composition["key"]
+                    + ("" if use_nucleus else "_no_nucleus")
+                    + ("_tension" if use_tension else "")
+                )
+                label = (
+                    composition["label"]
+                    + ("" if use_nucleus else ", no nucleus")
+                    + (", with the membrane's tension spring" if use_tension else "")
+                )
                 fits[key] = best_here
 
                 # One number per split, so the spread across splits can say
@@ -1589,17 +1839,20 @@ class _CompositionMixin:
                         trained = sub.fit_composition(
                             lo, hi, best_here["break_1"], best_here["break_2"],
                             composition["membrane"], composition["cyto_start"],
-                            use_nucleus, weighting, with_stats=False,
+                            use_nucleus, weighting, use_tension=use_tension,
+                            with_stats=False,
                         )
                         if not trained.get("success"):
                             continue
-                        m_b, c_b, n_b = self.composition_terms(
+                        basis = self.composition_basis(
                             eps_all[fold], best_here["break_1"], best_here["break_2"],
                             composition["membrane"], composition["cyto_start"],
                         )
                         predicted = (
-                            m_b * trained["Em"] + c_b * trained["Ei"]
-                            + n_b * trained["En"]
+                            basis["membrane"] * trained["Em"]
+                            + basis["tension"] * trained.get("T0", 0.0)
+                            + basis["interior"] * trained["Ei"]
+                            + basis["nucleus"] * trained["En"]
                         )
                         cv_errors.append(
                             float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
@@ -1614,11 +1867,13 @@ class _CompositionMixin:
                         "membrane": composition["membrane"],
                         "cyto_start": composition["cyto_start"],
                         "use_nucleus": use_nucleus,
+                        "use_tension": use_tension,
                         "break_1": best_here["break_1"],
                         "break_2": best_here["break_2"],
                         "Em_MPa": best_here["Em_MPa"],
                         "Ec_kPa": best_here["Ei_kPa"],
                         "En_kPa": best_here["En_kPa"],
+                        "T0_mN_m": best_here.get("T0_mN_m", 0.0),
                         "r_squared": best_here["r_squared"],
                         "n_params": best_here["n_params"],
                         "aicc": _aicc(best_here["ss_res"], n, best_here["n_params"]),
@@ -1647,12 +1902,19 @@ class _CompositionMixin:
             # A modulus that came out at zero is a term the data did not want.
             # Saying so matters: the composition is then not really the one it
             # claims to be, it is the simpler one wearing an extra parameter.
+            carried = {
+                "Eₘ": True,
+                "T₀": bool(row.get("use_tension")),
+                "E_c": True,
+                "Eₙ": bool(row["use_nucleus"]),
+            }
             zeros = [
                 name
                 for name, value in (
-                    ("Eₘ", row["Em_MPa"]), ("E_c", row["Ec_kPa"]), ("Eₙ", row["En_kPa"])
+                    ("Eₘ", row["Em_MPa"]), ("T₀", row.get("T0_mN_m", 0.0)),
+                    ("E_c", row["Ec_kPa"]), ("Eₙ", row["En_kPa"]),
                 )
-                if value <= 0 and (name != "Eₙ" or row["use_nucleus"])
+                if value <= 0 and carried[name]
             ]
             row["empty_terms"] = zeros
 
@@ -1764,6 +2026,12 @@ class _CompositionMixin:
             force, epsilon, self.cell_height,
             cell_radius=self.R0,
             membrane_thickness=self.h_membrane,
+            # Every geometry field, not most of them. A clone that quietly
+            # reverted to the nucleus radius trained each cross-validation
+            # fold on a different model from the one being scored, which made
+            # the true composition look like the worst one on the list.
+            shell_thickness=self.h_shell,
+            deep_uses_cell_radius=self.deep_uses_cell_radius,
             poisson_membrane=self.nu_m,
             poisson_interior=self.nu_i,
             nucleus_radius=self.R_nucleus,
@@ -1786,6 +2054,8 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         cell_height,
         cell_radius=None,
         membrane_thickness=4e-9,
+        shell_thickness=None,
+        deep_uses_cell_radius=False,
         poisson_membrane=0.5,
         poisson_interior=0.5,
         radius_from_height=0.55,
@@ -1866,6 +2136,15 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
 
         self.cell_height = cell_height
         self.h_membrane = float(membrane_thickness)
+        # The load-bearing shell is not always the bilayer. A cardiomyocyte
+        # carries a sub-membranous protein coat a hundred times thicker, and
+        # it is that layer the fitted tension belongs to. Used only to turn a
+        # tension into an equivalent modulus; default it to the membrane so
+        # nothing that does not set it moves.
+        self.h_shell = float(shell_thickness) if shell_thickness else self.h_membrane
+        # Myofibrils span the whole cell; a nucleus does not. The deep term
+        # can therefore be given either radius.
+        self.deep_uses_cell_radius = bool(deep_uses_cell_radius)
         self.nu_m = float(poisson_membrane)
         self.nu_i = float(poisson_interior)
         self.R0 = float(cell_radius) if cell_radius else cell_height * radius_from_height
@@ -1923,11 +2202,42 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         )
 
     @property
+    def At(self):
+        """
+        Cortical tension prefactor: F_tension = At * T0 * e  [N per N/m = m].
+
+        The horizontal spring. A protein network under a pre-existing in-plane
+        tension T0 resists the area the cell has to gain when it is flattened.
+        Flattening by e adds an area of order pi R0^2 e^2, so at constant
+        tension the stored energy is U = T0 pi R0^2 e^2 and the force is
+
+            F = dU/d(delta) = (1/h0) dU/de = (2 pi R0^2 / h0) T0 e
+
+        Linear in e, where the elastic dilation term goes as e^3. That is the
+        whole reason the two can be separated: near first contact the network
+        is already taut and answers in proportion to how far it is pushed,
+        while the elastic term is still negligible and only takes over once
+        the area strain is large.
+
+        Note the size of it. The bending stiffness of the same shell carries
+        h^2 / R0, which for any real membrane is four orders of magnitude
+        smaller than R0^2 / h0 and could never be seen in a force curve. The
+        tension is the term worth fitting.
+        """
+        return 2.0 * np.pi * self.R0 ** 2 / self.cell_height
+
+    @property
     def An(self):
-        """Nucleus prefactor: F_nucleus = An * En * <e - e_onset>^1.5  [N/Pa]."""
+        """Deep prefactor: F_deep = An * En * <e - e_onset>^1.5  [N/Pa].
+
+        Uses the nucleus radius by default. A cardiomyocyte's myofibrils are
+        not a compact body at the centre, they run the length of the cell, so
+        ``deep_uses_cell_radius`` puts the cell's own radius here instead.
+        """
+        radius = self.R0 if self.deep_uses_cell_radius else self.R_nucleus
         return (
             np.sqrt(2.0)
-            * np.sqrt(self.R_nucleus)
+            * np.sqrt(radius)
             * self.cell_height ** 1.5
             / (3.0 * (1.0 - self.nu_n ** 2))
         )
@@ -2988,6 +3298,7 @@ def search_arrangements(
     n_folds=5,
     seed=0,
     cv_repeats=3,
+    tension_mode="off",
 ):
     """
     Decide how the cell is arranged, then how its parts share the boundary.
@@ -3049,6 +3360,7 @@ def search_arrangements(
     composition = model.search_compositions(
         lo, hi, weighting=weighting, n_folds=n_folds, seed=seed,
         cv_repeats=cv_repeats, include_no_nucleus="nucleus" in terms,
+        tension_mode=tension_mode,
     )
     if composition.get("success"):
         best = composition["best"]
