@@ -551,6 +551,74 @@ def annotate(
     return out
 
 
+def manual_detection(frame_rgb, box_fraction):
+    """
+    Build a detection from a box the user drew instead of one found by code.
+
+    Automatic detection is a guess informed by shape and brightness, and on a
+    crowded or low-contrast field it guesses wrong. A person looking at the
+    frame does not. This makes their box a first-class detection so
+    everything downstream, the crop, the height, the tracking reference,
+    works from it unchanged.
+
+    Parameters
+    ----------
+    box_fraction : (x0, y0, x1, y1)
+        Fractions of the frame, left, top, right, bottom.
+    """
+    frame = np.asarray(frame_rgb)
+    H, W = frame.shape[:2]
+    x0, y0, x1, y1 = box_fraction
+    x0, x1 = sorted((float(np.clip(x0, 0, 1)), float(np.clip(x1, 0, 1))))
+    y0, y1 = sorted((float(np.clip(y0, 0, 1)), float(np.clip(y1, 0, 1))))
+    x, y = int(x0 * W), int(y0 * H)
+    w, h = max(1, int((x1 - x0) * W)), max(1, int((y1 - y0) * H))
+    return {
+        "found": True,
+        "manual": True,
+        "bbox": (x, y, w, h),
+        "center": (x + w / 2.0, y + h / 2.0),
+        "height_px": float(h),
+        "width_px": float(w),
+        "area_px": float(w * h),
+        "circularity": float("nan"),
+        "solidity": float("nan"),
+        "centrality": float("nan"),
+        "score": float("nan"),
+        "ellipse": None,
+        "contour": None,
+        "reason": "drawn by hand",
+    }
+
+
+def scale_from_probe(probe_box_fraction, frame_shape, probe_width_um):
+    """
+    Micrometres per pixel, from a cantilever of known width.
+
+    The probe is the one object in the field whose size is known exactly: a
+    tipless cantilever is specified to the micrometre. Measuring it in the
+    image gives the scale for everything else, which turns cell heights in
+    pixels into cell heights in micrometres without a separate calibration.
+
+    Returns
+    -------
+    (um_per_px, detail) : the scale and a sentence explaining it, or
+    (None, reason) when it cannot be worked out.
+    """
+    H, W = np.asarray(frame_shape)[:2]
+    x0, _, x1, _ = probe_box_fraction
+    width_px = abs(float(x1) - float(x0)) * float(W)
+    if width_px < 4:
+        return None, "The probe box is too narrow to measure."
+    if not probe_width_um or probe_width_um <= 0:
+        return None, "Set the probe width in micrometres."
+    scale = float(probe_width_um) / width_px
+    return scale, (
+        f"{width_px:.0f} px across a {probe_width_um:.0f} µm probe "
+        f"= {scale:.4f} µm per pixel"
+    )
+
+
 def crop(frame_rgb, detection, pad_frac=0.35):
     """Crop tightly around the detection, with padding, for a side panel."""
     frame = np.asarray(frame_rgb)
