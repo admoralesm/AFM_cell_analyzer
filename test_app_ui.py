@@ -1054,8 +1054,10 @@ def case_component_names_follow_the_cell_type():
     cardio = app_module.components_for("Cardiomyocyte")
     check("the myoblast interior is the cytoskeleton",
           myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
-    check("the cardiomyocyte interior is the myofibrils",
-          cardio["interior"][0] == "Myofibrils", str(cardio["interior"]))
+    check("the cardiomyocyte interior is the myofibril bundle",
+          cardio["interior"][0].startswith("Myofibril"), str(cardio["interior"]))
+    check("and it is described as one stiff body",
+          "one stiff" in cardio["interior"][1], str(cardio["interior"]))
     check("the cardiomyocyte shell is named for holding fluid",
           "fluid" in cardio["membrane"][1], str(cardio["membrane"]))
     check("an unknown cell type still gets names",
@@ -1070,7 +1072,24 @@ def case_component_names_follow_the_cell_type():
     if parts:
         listed = list(parts[0]["Part of the cell"])
         check("it says myofibrils, not cytoskeleton",
-              "Myofibrils" in listed and "Cytoskeleton" not in listed, str(listed))
+              any(v.startswith("Myofibril") for v in listed)
+              and "Cytoskeleton" not in listed, str(listed))
+        row = parts[0][parts[0]["Part of the cell"] == "Nucleus"]
+        check("the nucleus is not fitted for a cardiomyocyte",
+              len(row) == 1 and str(row.iloc[0]["Stiffness"]).startswith("0"),
+              str(list(row.iloc[0])) if len(row) else "no nucleus row")
+    check("the nucleus term is switched off for a cardiomyocyte",
+          app.session_state["use_nucleus"] is False,
+          str(app.session_state["use_nucleus"]))
+    check("the fit still succeeds with two terms",
+          app.session_state["_last_fit"] is not None
+          and app.session_state["_last_fit"].get("success"))
+    fit = app.session_state["_last_fit"]
+    if fit:
+        check("only two terms were fitted",
+              set(fit["terms"]) == {"membrane", "interior"}, str(fit["terms"]))
+        check("and it still follows the data",
+              fit["r_squared"] > 0.9, f"R2={fit['r_squared']:.4f}")
 
 
 def case_cardiomyocyte_model_is_flagged_provisional():
@@ -1099,6 +1118,76 @@ def case_not_reached_is_explained():
           in captions, captions[:200])
     check("it says this is not missing data",
           "not missing data" in captions, "explanation absent")
+
+
+def case_fit_statistics():
+    print("chi squared catches what R-squared misses")
+    from lulevich_model import LulevichModel as LM, noise_sigma, fit_statistics
+
+    eps = np.linspace(0.001, 0.60, 260)
+    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+    clean = m * 0.6e6 + c * 1.2e3 + nu * 3e3
+
+    force = clean + 5e-11 * np.random.default_rng(0).standard_normal(260)
+    model = LM(force, eps, cell_height=8.0e-6)
+    right = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    check("the right model gives chi2/dof near 1",
+          0.2 < right["chi_squared_reduced"] < 3.0,
+          f"{right['chi_squared_reduced']:.2f}")
+
+    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, use_nucleus=False)
+    check("dropping a real term is caught by chi2",
+          wrong["chi_squared_reduced"] > 10 * right["chi_squared_reduced"],
+          f"{wrong['chi_squared_reduced']:.1f} vs {right['chi_squared_reduced']:.2f}")
+    check("R-squared alone would not have caught it",
+          wrong["r_squared"] > 0.97, f"R2={wrong['r_squared']:.4f}")
+
+    check("adjusted R-squared is reported",
+          np.isfinite(right["adj_r_squared"]))
+    check("adjusted is never above plain",
+          right["adj_r_squared"] <= right["r_squared"] + 1e-12)
+    check("degrees of freedom account for the parameters",
+          right["dof"] == right["n_points"] - right["n_params"],
+          f"{right['dof']} vs {right['n_points']}-{right['n_params']}")
+
+    # Noise that grows with force must not be read as the quiet end.
+    sigma, typical = noise_sigma(eps, clean * (1 + 0.02 *
+                                np.random.default_rng(0).standard_normal(260)))
+    check("the noise estimate is per point", np.size(sigma) == 260, str(np.size(sigma)))
+    check("and it grows where the force grows",
+          np.median(sigma[-50:]) > np.median(sigma[:50]) * 3,
+          f"{np.median(sigma[:50]):.2e} -> {np.median(sigma[-50:]):.2e}")
+    check("a typical value is reported", np.isfinite(typical))
+
+    # A curve too short to estimate noise must not crash.
+    stats = fit_statistics(np.array([1.0, 2.0]), np.array([1.0, 2.0]), 2,
+                           epsilon=np.array([0.1, 0.2]))
+    check("two points do not raise", np.isnan(stats["chi_squared"]))
+
+
+def case_chi_squared_reaches_the_page():
+    print("the fit statistics are shown and stored")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "chi squared on the page"):
+        return
+    labels = [m.label for m in app.get("metric")]
+    check("a chi-squared tile is shown",
+          any("χ²" in (l or "") for l in labels), str(labels))
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("it explains what about 1 means",
+          "as close to the points as the scatter" in captions, "no explanation")
+    check("it warns that R² can look fine",
+          "R² can still look excellent" in captions, "no warning")
+
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception:
+        return
+    names = [name for _, name in GoogleSheetsManager.COLUMNS]
+    for wanted in ("Chi squared", "Chi squared / dof", "Adjusted R²",
+                   "Measured noise σ (N)"):
+        check(f"the sheet records {wanted}", wanted in names, str(names))
 
 
 def case_fit_quality():
@@ -1239,6 +1328,8 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_fit_statistics,
+        case_chi_squared_reaches_the_page,
         case_axis_ranges,
         case_nucleus_spring_is_shorter,
         case_component_names_follow_the_cell_type,
