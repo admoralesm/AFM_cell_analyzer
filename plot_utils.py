@@ -560,7 +560,9 @@ def cell_schematic(
     Em_MPa=None,
     Ei_kPa=None,
     En_kPa=None,
+    T0_mN_m=None,
     show_nucleus=True,
+    show_tension=False,
     height=None,
     coupling="parallel",
     shares=None,
@@ -590,14 +592,20 @@ def cell_schematic(
     parts are named as its own rather than as a generic cell's.
     """
     names = labels or {
+        "tension": ("Membrane tension", ""),
         "membrane": ("Membrane", ""),
         "interior": ("Cytoskeleton", ""),
         "nucleus": ("Nucleus", ""),
     }
     epsilon = float(np.clip(epsilon, 0.0, 0.95))
 
-    COLORS = {"membrane": "#1f77b4", "interior": "#e67e22", "nucleus": "#8e44ad"}
-    FADED = {"membrane": "#a9c4d8", "interior": "#f2cda6", "nucleus": "#c9b0d8"}
+    # The two membrane springs share a hue: they are one piece of material
+    # answering two ways, and colouring them as unrelated parts would say the
+    # opposite of what the model means.
+    COLORS = {"tension": "#5dade2", "membrane": "#1f77b4",
+              "interior": "#e67e22", "nucleus": "#8e44ad"}
+    FADED = {"tension": "#bcdcf0", "membrane": "#a9c4d8",
+             "interior": "#f2cda6", "nucleus": "#c9b0d8"}
 
     # What each element is doing at the deformation on display.
     if break_1 is not None and break_2 is not None:
@@ -612,7 +620,11 @@ def cell_schematic(
         else:
             state = {"membrane": membrane_above, "interior": "loading",
                      "nucleus": "loading"}
+        # The taut network is the same shell as the elastic term, so it does
+        # exactly what that one does, including going slack together with it.
+        state["tension"] = state["membrane"]
         onset = {
+            "tension": 0.0,
             "membrane": 0.0,
             "interior": 0.0 if cyto_start == "zero" else break_1,
             "nucleus": break_2,
@@ -621,13 +633,19 @@ def cell_schematic(
         state = {k: "loading" for k in COLORS}
         onset = {k: 0.0 for k in COLORS}
 
-    terms = ["membrane", "interior"] + (["nucleus"] if show_nucleus else [])
+    terms = (
+        (["tension"] if show_tension else [])
+        + ["membrane", "interior"]
+        + (["nucleus"] if show_nucleus else [])
+    )
     moduli = {
+        "tension": (T0_mN_m, "mN/m", "T<sub>0</sub>"),
         "membrane": (Em_MPa, "MPa", "E<sub>m</sub>"),
         "interior": (Ei_kPa, "kPa", "E<sub>c</sub>"),
         "nucleus": (En_kPa, "kPa", "E<sub>n</sub>"),
     }
-    LAW = {"membrane": "ε³", "interior": "ε³ᐟ²", "nucleus": "ε³ᐟ²"}
+    LAW = {"tension": "ε", "membrane": "ε³",
+           "interior": "ε³ᐟ²", "nucleus": "ε³ᐟ²"}
 
     fig = go.Figure()
     GROUND_Y, PLATEN_Y = 20.0, 78.0
@@ -725,14 +743,15 @@ def cell_schematic(
             y += slice_h
         subtitle = "Stacked: same force through each, squashes add"
     else:
-        spacing = 80.0 / max(len(terms), 1)
+        spacing = 88.0 / max(len(terms), 1)
         for index, term in enumerate(terms):
-            x = 12 + spacing * (index + 0.5)
+            x = 6 + spacing * (index + 0.5)
             fig.add_shape(type="line", x0=x, x1=x, y0=PLATEN_Y, y1=PLATEN_Y - 3,
                           line=dict(color="#2c3e50", width=2))
             fig.add_shape(type="line", x0=x, x1=x, y0=GROUND_Y, y1=GROUND_Y + 3,
                           line=dict(color="#2c3e50", width=2))
-            draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3, 13)
+            draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
+                         13 if len(terms) < 4 else 10)
         subtitle = "Side by side: same squash on each, forces add"
 
     fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True)
