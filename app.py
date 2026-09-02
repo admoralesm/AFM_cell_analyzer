@@ -123,16 +123,11 @@ except Exception as exc:  # pragma: no cover
     OneDriveError = Exception
     ONEDRIVE_IMPORT_ERROR = str(exc)
 
-try:
-    import box_store
-    from box_store import BoxStore, BoxError
-
-    BOX_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover
-    box_store = None
-    BoxStore = None
-    BoxError = Exception
-    BOX_IMPORT_ERROR = str(exc)
+# The archive is OneDrive. Box was here too and was removed: on a UC Davis
+# tenant it cannot be authorised without an administrator, so it was a button
+# that could never light up. OneDriveStore exposes the same interface, so the
+# gallery did not have to change shape.
+ArchiveError = RuntimeError
 
 try:
     import video_analysis as va
@@ -297,6 +292,7 @@ DEFAULTS = {
     "highlight_segment": "(none)",
     "composition_search": None,
     "arrangement_search": None,
+    "guided_window_end": 0.60,
     # The segmented model always starts at zero, so only the far end is set.
     "window_end": 0.60,
     "procedure": "All at once",
@@ -324,14 +320,11 @@ DEFAULTS = {
     "invols_nm_per_V": 50.0,
     "operator": "",
     "cell_notes": "",
-    "box_root_folder": "",
-    "box_store": None,
     "onedrive_store": None,
     "onedrive_root": "AFM cells",
     "onedrive_account": "personal",
-    "onedrive_index": None,
     "_device_login": None,
-    "box_index": None,
+    "archive_index": None,
     "db_selection": [],
     "upload_video_with_cell": False,
     "db_search": "",
@@ -465,6 +458,88 @@ def save_plot_controls(figure, fit, date_acquired):
             **STRETCH,
         )
     st.caption("Named after the cell, the date and the moduli.")
+
+
+def show_search_maths():
+    """
+    The mathematics behind the "Work it out for me" button.
+
+    Someone is entitled to know what a button decided on their behalf. This
+    is the whole of it: three candidate models, one scoring rule, one tie
+    rule.
+    """
+    st.markdown("**1 · The three arrangements it compares**")
+    st.caption(
+        "These are different physics, not different settings. Each says "
+        "something different about how the parts of the cell carry the load."
+    )
+    st.markdown("*Side by side* — every part squashed by the same ε, forces add:")
+    st.latex(
+        r"F(\varepsilon) = A_m E_m \varepsilon^{3} + A_i E_c \varepsilon^{3/2} "
+        r"+ A_n E_n \langle \varepsilon - \varepsilon_0 \rangle^{3/2}"
+    )
+    st.markdown("*Stacked* — every part carries the same F, squashes add:")
+    st.latex(
+        r"\varepsilon(F) = a F^{1/3} + b F^{2/3} + c \langle F - F_0 \rangle^{2/3},"
+        r"\qquad E_m = \frac{1}{A_m a^{3}}"
+    )
+    st.markdown(
+        "*Segmented* — side by side, but each part switches on at its own "
+        "boundary, which is the extra thing the other two cannot express:"
+    )
+    st.latex(
+        r"F(\varepsilon) = A_m E_m\, g_m(\varepsilon) + A_i E_c\, g_c(\varepsilon) "
+        r"+ A_n E_n \langle \varepsilon - \varepsilon_2 \rangle^{3/2}"
+    )
+    st.caption(
+        "with g_m either min(ε, ε₁)³ or ε³, and g_c either ⟨ε − ε₁⟩³ᐟ² or "
+        "ε³ᐟ², which is the four combinations it also searches."
+    )
+
+    st.markdown("**2 · How it scores them**")
+    st.caption(
+        "Not by R², which rises whenever a model is given more freedom, and "
+        "not by residual sum, for the same reason. By how well each predicts "
+        "points it was never fitted on."
+    )
+    st.latex(
+        r"\mathrm{CV} = \frac{1}{R}\sum_{r=1}^{R} \frac{1}{K}\sum_{k=1}^{K} "
+        r"\sqrt{\frac{1}{|S_k|}\sum_{i \in S_k} "
+        r"\bigl(F_i - \hat{F}^{(-k)}(\varepsilon_i)\bigr)^{2}}"
+    )
+    st.caption(
+        "The points are split into K folds; the model is fitted on everything "
+        "except fold k and asked to predict fold k; that is repeated over R "
+        "different random splits, because one split of a few hundred points "
+        "is noisy enough to reorder candidates that are genuinely tied. "
+        "Lower is better. Here K = 5 and R = 3."
+    )
+
+    st.markdown("**3 · How it breaks a tie**")
+    st.latex(
+        r"\tau = \max\bigl(0.05\,\mathrm{CV}_{\min},\; "
+        r"s_{\min} + \max_j s_j\bigr)"
+    )
+    st.caption(
+        "s is the spread of a candidate's score across those repeated "
+        "splits. Anything within τ of the best is called tied, because a gap "
+        "smaller than the amount the number moves when you redraw the folds "
+        "is not evidence. Among tied candidates the one with the fewest free "
+        "moduli wins: a part the curve cannot see gives a number that will "
+        "wander from cell to cell."
+    )
+
+    st.markdown("**4 · Where the boundaries come from**")
+    st.caption(
+        "The moduli are linear once the boundaries are fixed, so they are one "
+        "exact bounded least-squares solve. The boundaries are not: they sit "
+        "inside min and ⟨ ⟩ where the residual has a kink at every point a "
+        "boundary crosses, which gradient methods handle badly. So they are "
+        "profiled out instead: a grid of (ε₁, ε₂) is tried, each with the "
+        "exact solve, and the pair with the smallest residual wins. Two "
+        "refinement rounds then re-grid inside one step either side of that "
+        "winner, narrowing it by roughly 25 times."
+    )
 
 
 def show_fit_maths(fit, model):
@@ -971,7 +1046,7 @@ def load_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, max_entries=256)
 def cached_thumbnail(root_folder, file_id):
     """Thumbnails are small and re-requested on every rerun, so cache them."""
-    store = st.session_state.get("box_store")
+    store = st.session_state.get("onedrive_store")
     if store is None:
         return None
     return store.thumbnail_bytes(file_id)
@@ -1219,6 +1294,25 @@ DEFAULT_TERMS_BY_TYPE = {
     "Cardiomyocyte": {"membrane": True, "interior": True, "nucleus": True},
 }
 
+# How each cell type is expected to behave at the first boundary.
+#
+# A myoblast shows the membrane alone at small deformation, an almost pure
+# cube law, so the cytoskeleton is taken to start at the boundary.
+#
+# A cardiomyocyte does not: the measured local exponent near contact is about
+# 1.7, not 3. That is the signature of the membrane's cube law and the
+# cytoskeleton's 3/2 law acting together from the very start, with the 3/2
+# term dominating. Physically the cortex and the myofibrils are anchored to
+# the membrane through the costameres, so there is no stretch where the
+# membrane is deforming on its own. Starting the cytoskeleton at zero is what
+# reproduces a 1.7 rather than a 3.
+DEFAULT_COMPOSITION_BY_TYPE = {
+    "Cardiomyocyte": {
+        "membrane_after_break": "keeps stiffening",
+        "cyto_starts_at": "from the very start",
+    },
+}
+
 
 def components_for(cell_type):
     """Names for the three terms, falling back to the general ones."""
@@ -1285,6 +1379,8 @@ def apply_cell_type(name):
         name, {"membrane": True, "interior": True, "nucleus": True}
     ).items():
         st.session_state[f"use_{term}"] = bool(on)
+    for key, value in DEFAULT_COMPOSITION_BY_TYPE.get(name, {}).items():
+        st.session_state[key] = value
     for key in list(st.session_state.keys()):
         if key.startswith("window_"):
             del st.session_state[key]
@@ -1421,7 +1517,7 @@ def apply_plot_drag(chart_key, lo, hi):
 
 
 
-# ======================================================== the Box database ==
+# ==================================================== the archive database ==
 
 
 def current_fit_settings():
@@ -1487,9 +1583,9 @@ def cell_record(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
     """
     The record and the curve, built once.
 
-    Box and the download both go through here, so the file you keep on disk
-    is the same record the database holds rather than a near-copy that drifts
-    from it.
+    The archive and the download both go through here, so the file you keep
+    on disk is the same record the archive holds rather than a near-copy that
+    drifts from it.
     """
     curve = pd.DataFrame(
         {
@@ -1549,8 +1645,8 @@ def send_cell_to_store(store, fit, epsilon, force_N, fitted, date_acquired,
     """
     Package this analysis and write it into the cell's folder.
 
-    Box and OneDrive expose the same save_cell, so one function serves both
-    and the two archives cannot drift into holding different things.
+    Written against a store's save_cell rather than against one service, so
+    the packaging stays in one place if another archive is added later.
     """
     record, curve, video_bytes, video_name = cell_record(
         fit, epsilon, force_N, fitted, date_acquired, stage_plan
@@ -1565,7 +1661,7 @@ def send_cell_to_store(store, fit, epsilon, force_N, fitted, date_acquired,
 
 
 # The old name, kept so nothing that still calls it breaks.
-send_cell_to_box = send_cell_to_store
+send_cell_to_archive = send_cell_to_store
 
 
 def send_cell_to_sheet(manager, fit, date_acquired):
@@ -1574,7 +1670,7 @@ def send_cell_to_sheet(manager, fit, date_acquired):
 
     The sheet is the flat summary: one row per cell, the numbers you would
     plot across a population. The curve itself is too big for a cell and
-    lives in Box or in the downloaded zip.
+    lives in OneDrive or in the downloaded zip.
     """
     terms = set(fit.get("terms") or ())
     lo, hi = fit.get("epsilon_range", (0.0, 0.0))
@@ -1660,7 +1756,7 @@ def send_cell_to_sheet(manager, fit, date_acquired):
 
 
 def cell_bundle_zip(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
-    """The same record as Box, as a zip the browser can download."""
+    """The same record as the archive, as a zip the browser can download."""
     import zipfile
 
     record, curve, video_bytes, video_name = cell_record(
@@ -1708,7 +1804,7 @@ def refit_stored_cell(store, cell_id, settings):
     """
     record = store.load_cell(cell_id)
     if not record or not record.get("curve_csv"):
-        raise BoxError(f"{cell_id}: no stored curve to refit.")
+        raise ArchiveError(f"{cell_id}: no stored curve to refit.")
     curve = pd.read_csv(io.StringIO(record["curve_csv"]))
 
     merged = dict(record.get("settings") or {})
@@ -1745,12 +1841,12 @@ def refit_stored_cell(store, cell_id, settings):
         order = "parallel-then-series" if coupling == "hybrid_ps" else "series-then-parallel"
         scan = model.scan_crossover(lo, hi, terms=terms, order=order)
         if not scan.get("success"):
-            raise BoxError(f"{cell_id}: hybrid fit failed.")
+            raise ArchiveError(f"{cell_id}: hybrid fit failed.")
         fit = scan["best"]
     elif coupling == "auto":
         comparison = compare_couplings(model, lo, hi, terms=terms)
         if not comparison.get("success"):
-            raise BoxError(f"{cell_id}: {comparison.get('error')}")
+            raise ArchiveError(f"{cell_id}: {comparison.get('error')}")
         fit = comparison["fits"][comparison["best"]["coupling"]]
     elif settings.get("procedure") == "Stage by stage":
         windows = settings.get("term_windows", {})
@@ -1768,7 +1864,7 @@ def refit_stored_cell(store, cell_id, settings):
                         fit_offset=bool(settings.get("fit_offset", False)))
 
     if not fit.get("success"):
-        raise BoxError(f"{cell_id}: {fit.get('error', 'fit failed')}")
+        raise ArchiveError(f"{cell_id}: {fit.get('error', 'fit failed')}")
 
     record.update(
         {
@@ -2057,58 +2153,6 @@ with st.sidebar:
                                 "then press Connect. Treat it like a password."
                             )
 
-    with st.expander("📦 Box database", expanded=False):
-        if BOX_IMPORT_ERROR:
-            st.error(f"Box module unavailable: {BOX_IMPORT_ERROR}")
-        else:
-            st.text_input(
-                "Root folder ID",
-                key="box_root_folder",
-                placeholder="0 for All Files, or the id from the folder URL",
-                help="Open the folder in Box; the id is the number at the end of "
-                "the URL. Everything is stored under it as cells/<cell name>/.",
-            )
-            if st.button("🔌 Connect to Box", **STRETCH):
-                try:
-                    store = box_store.store_from_secrets(
-                        st, st.session_state["box_root_folder"] or None
-                    )
-                    if store is None:
-                        st.error(
-                            "No [box] section in secrets. See the setup notes below."
-                        )
-                    else:
-                        info = store.check()
-                        st.session_state["box_store"] = store
-                        st.session_state["box_index"] = None
-                        st.success(
-                            f"Connected as {info['login']} · folder "
-                            f"“{info['folder_name']}” · {info['auth_method']}"
-                        )
-                except Exception as exc:
-                    st.session_state["box_store"] = None
-                    st.error(str(exc))
-            if st.session_state.get("box_store"):
-                st.caption("Connected ✓")
-            with st.expander("Setting up Box"):
-                st.markdown(
-                    "Create an app at **developer.box.com**, then put its "
-                    "credentials in `.streamlit/secrets.toml`:\n\n"
-                    "```toml\n[box]\nclient_id = \"...\"\n"
-                    "client_secret = \"...\"\nenterprise_id = \"...\"\n"
-                    "root_folder_id = \"0\"\n```\n\n"
-                    "**Client Credentials Grant** is the one to ask for: its tokens "
-                    "renew themselves, so nothing expires mid-session. On a UC Davis "
-                    "account a Box admin has to authorise the app once, from Admin "
-                    "Console → Enterprise Settings → Platform Apps.\n\n"
-                    "To try it before that approval comes through, generate a "
-                    "**developer token** in the console and use "
-                    "`developer_token = \"...\"` instead. It works for 60 minutes.\n\n"
-                    "With client credentials the app acts as its own service user, "
-                    "not as you, so share the target folder with that user or point "
-                    "`root_folder_id` at a folder it owns."
-                )
-
     with st.expander("🗄️ Google Sheets (optional mirror)"):
         if SHEETS_IMPORT_ERROR:
             st.info("Database module unavailable in this environment.")
@@ -2384,7 +2428,35 @@ with tab_analysis:
             if not chosen:
                 st.warning("Tick at least one part before analysing.")
 
-            st.markdown("#### Step 2 · Work it out")
+            st.markdown("#### Step 2 · How far into the squash to look")
+            st.caption(
+                "The model describes a cell being flattened, not one being "
+                "burst. Past about 60 % the geometry it assumes stops "
+                "describing a real cell, and a curve that has ruptured should "
+                "be cut before the drop. Everything from 0 up to here is used."
+            )
+            st.session_state["guided_window_end"] = float(
+                np.clip(
+                    st.session_state.get("guided_window_end", eps_hi_data),
+                    float(step), eps_hi_data,
+                )
+            )
+            guided_hi = st.slider(
+                "Analyse from ε = 0 up to",
+                min_value=float(step), max_value=eps_hi_data, step=step,
+                key="guided_window_end",
+            )
+            inside = int(((epsilon >= 0.0) & (epsilon <= guided_hi)).sum())
+            st.caption(
+                f"{inside} of {epsilon.size} points. "
+                + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
+                   f"stop before that."
+                   if rupture.get("method") == "force-drop"
+                   and rupture.get("epsilon") is not None
+                   else "No sudden force drop was detected in this curve.")
+            )
+
+            st.markdown("#### Step 3 · Work it out")
             st.caption(
                 "This decides how the parts are arranged, whether the cell is "
                 "segmented, side by side or stacked, then where each part "
@@ -2403,14 +2475,14 @@ with tab_analysis:
                         "every way the parts can share the boundaries…"
                     ):
                         found = search_arrangements(
-                            model, 0.0, eps_hi_data, terms=chosen,
+                            model, 0.0, guided_hi, terms=chosen,
                             weighting=st.session_state["weighting"],
                         )
                     st.session_state["arrangement_search"] = found
                     st.session_state["composition_search"] = found.get("composition")
                     if found.get("success"):
                         st.session_state["_pending_settings"] = (
-                            settings_from_arrangement(found["best"], eps_hi_data)
+                            settings_from_arrangement(found["best"], guided_hi)
                         )
                         st.rerun()
                     else:
@@ -2536,6 +2608,17 @@ with tab_analysis:
                 )
             membrane_mode = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
             cyto_mode = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
+            if st.session_state["cell_type"] == "Cardiomyocyte":
+                st.caption(
+                    "For a cardiomyocyte the cytoskeleton is set to start from "
+                    "the very start. The measured slope near contact is about "
+                    "1.7, between the membrane's cube law and the "
+                    "cytoskeleton's 3/2, which only happens if both are "
+                    "loaded together: the cortex and the myofibrils are "
+                    "anchored to the membrane, so there is no stretch where "
+                    "the membrane deforms alone. A pure membrane start would "
+                    "read close to 3."
+                )
             st.caption(
                 f"→ {COMPOSITION_LABELS[(membrane_mode, cyto_mode)]}. "
                 "The nucleus always joins at ε₂. If you are not sure which of the "
@@ -3661,6 +3744,11 @@ with tab_analysis:
                 with st.expander("∑ How this fit was calculated", expanded=False):
                     show_fit_maths(fit, model)
 
+                with st.expander(
+                    "∑ What “Work it out for me” does, in maths", expanded=False
+                ):
+                    show_search_maths()
+
             panel_index = 0
             if show_schematic and panel_index < len(panel_cols):
                 with panel_cols[panel_index]:
@@ -3690,6 +3778,7 @@ with tab_analysis:
                                 break_2=fit.get("break_2"),
                                 membrane_mode=fit.get("membrane", "freeze"),
                                 cyto_start=fit.get("cyto_start", "break"),
+                                labels=components_for(st.session_state["cell_type"]),
                                 Em_MPa=fit["Em_MPa"],
                                 Ei_kPa=fit["Ei_kPa"],
                                 En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
@@ -3888,7 +3977,7 @@ with tab_analysis:
                 )
 
         section("7 · Video and database" if segmented else "6 · Video and database")
-        store = st.session_state.get("box_store")
+        store = st.session_state.get("onedrive_store")
         ready = store is not None
 
         v1, v2 = st.columns([2, 1])
@@ -3938,20 +4027,22 @@ with tab_analysis:
 
         # Say what is blocking the send, in the order you would fix it. A
         # greyed-out button with no explanation is the same as a broken one.
-        blockers = []
+        # What is missing, and it is deliberately not one flat list: every
+        # destination needs the name and the fit, but each needs a different
+        # connection, and filtering one list by substring is how the download
+        # button ended up disabled by a OneDrive problem it does not have.
+        common_blockers = []
         if not named:
-            blockers.append("give the cell a name in section 1")
+            common_blockers.append("give the cell a name in section 1")
         if not have_fit:
-            blockers.append("fit the curve above")
-        if not ready:
-            blockers.append("connect to Box in the sidebar")
+            common_blockers.append("fit the curve above")
 
         st.checkbox(
             "Also upload the video file itself",
             key="upload_video_with_cell",
             help="Off sends the cell without the video; the record, curve "
             "and fit go either way. On also copies the video into the "
-            "cell's Box folder so it can be opened from the database.",
+            "cell's folder so it can be opened from the database.",
         )
 
         will_send = ["the record, the curve and the fit"]
@@ -3970,9 +4061,9 @@ with tab_analysis:
         sheet_manager = st.session_state.get("gs_manager")
         sheet_ready = bool(st.session_state.get("db_enabled") and sheet_manager)
 
-        c0, c1, c1b, c2 = st.columns(4)
+        c0, c1, c2 = st.columns(3)
         with c0:
-            sheet_blockers = [b for b in blockers if "Box" not in b]
+            sheet_blockers = list(common_blockers)
             if not sheet_ready:
                 sheet_blockers.append("connect the Google Sheet in the sidebar")
             if st.button(
@@ -4004,13 +4095,13 @@ with tab_analysis:
             st.caption(
                 "The row is the summary; the curve tab is every measured "
                 "point, force against relative deformation, in the same "
-                "spreadsheet. Somewhere to keep curves until Box is ready."
+                "spreadsheet, next to the summary row."
                 if not sheet_blockers
                 else "To enable: " + ", then ".join(sheet_blockers) + "."
             )
         with c1:
             drive_store = st.session_state.get("onedrive_store")
-            drive_blockers = [b for b in blockers if "Box" not in b]
+            drive_blockers = list(common_blockers)
             if drive_store is None:
                 drive_blockers.append("connect OneDrive in the sidebar")
             if st.button(
@@ -4028,7 +4119,7 @@ with tab_analysis:
                         + (f" [Open the video]({saved['video_url']})"
                            if saved.get("video_url") else "")
                     )
-                    st.session_state["onedrive_index"] = None
+                    st.session_state["archive_index"] = None
                 except Exception as exc:
                     st.error(f"Could not save: {exc}")
             st.caption(
@@ -4037,35 +4128,12 @@ with tab_analysis:
                 if not drive_blockers
                 else "To enable: " + ", then ".join(drive_blockers) + "."
             )
-        with c1b:
-            box_blockers = [b for b in blockers]
-            if st.button(
-                "📤 Send to Box",
-                disabled=bool(box_blockers), **STRETCH,
-            ):
-                try:
-                    with st.spinner("Uploading to Box…"):
-                        saved = send_cell_to_store(
-                            store, fit, epsilon, force_N, fitted,
-                            date_acquired, model, stage_plan,
-                        )
-                    st.success(
-                        f"Saved **{saved['cell_id']}** to Box."
-                        + (f" [Open the video]({saved['video_url']})"
-                           if saved.get("video_url") else "")
-                    )
-                    st.session_state["box_index"] = None
-                except Exception as exc:
-                    st.error(f"Could not save: {exc}")
-            st.caption(
-                "Ready to send." if not box_blockers
-                else "To enable: " + ", then ".join(box_blockers) + "."
-            )
         with c2:
-            # Box needs credentials that take a while to obtain. This does
-            # not, and it writes exactly the same record, so the analysis is
-            # never stuck inside the app waiting on an administrator.
-            download_blockers = [b for b in blockers if "Box" not in b]
+            # OneDrive needs a one-time sign-in. This needs nothing at all
+            # and writes exactly the same record, so an analysis is never
+            # stuck inside the app waiting on a credential.
+            # The download needs nothing beyond a named, fitted cell.
+            download_blockers = list(common_blockers)
             if download_blockers:
                 st.button("⬇️ Download this cell", disabled=True, **STRETCH)
             else:
@@ -4593,27 +4661,27 @@ with tab_igor:
 
 with tab_db:
     section("Cell database")
-    store = st.session_state.get("box_store")
+    store = st.session_state.get("onedrive_store")
 
-    if BOX_IMPORT_ERROR:
-        st.error(f"Box module unavailable: {BOX_IMPORT_ERROR}")
+    if ONEDRIVE_IMPORT_ERROR:
+        st.error(f"OneDrive support unavailable: {ONEDRIVE_IMPORT_ERROR}")
     elif store is None:
         st.info(
-            "Not connected. Open **Box database** in the sidebar and connect, then "
-            "every cell you send appears here."
+            "Not connected. Open **OneDrive database** in the sidebar and "
+            "connect, then every cell you send appears here."
         )
     else:
         head1, head2, head3 = st.columns([1, 1, 2])
         with head1:
             if st.button("🔄 Refresh", **STRETCH):
-                st.session_state["box_index"] = None
+                st.session_state["archive_index"] = None
         with head2:
             if st.button("🛠️ Rebuild index", **STRETCH,
                          help="Reads every cell's record.json and writes a fresh "
                               "index. Slower, but it recovers a stale or damaged one."):
                 progress = st.progress(0.0, text="Reading cells…")
                 try:
-                    st.session_state["box_index"] = store.rebuild_index(
+                    st.session_state["archive_index"] = store.rebuild_index(
                         progress=lambda n, total, name: progress.progress(
                             n / max(total, 1), text=f"{n}/{total}  {name}"
                         )
@@ -4624,17 +4692,17 @@ with tab_db:
                     progress.empty()
                     st.error(str(exc))
 
-        if st.session_state.get("box_index") is None:
+        if st.session_state.get("archive_index") is None:
             try:
                 with st.spinner("Loading the index…"):
-                    st.session_state["box_index"] = store.load_index()
+                    st.session_state["archive_index"] = store.load_index()
             except Exception as exc:
                 st.error(str(exc))
-                st.session_state["box_index"] = pd.DataFrame()
+                st.session_state["archive_index"] = pd.DataFrame()
 
-        index = st.session_state.get("box_index")
+        index = st.session_state.get("archive_index")
         if index is None or index.empty:
-            st.info("No cells stored yet. Fit a curve and press **Send to database**.")
+            st.info("No cells stored yet. Fit a curve and press **Send to OneDrive**.")
         else:
             with head3:
                 search = st.text_input(
@@ -4682,11 +4750,15 @@ with tab_db:
                         record = row._asdict()
                         cell_id = str(record.get("cell_id", ""))
                         with column:
-                            thumb_id = record.get("thumbnail_file_id")
+                            # OneDrive addresses a stored file by its path
+                            # where Box used an opaque id.
+                            thumb_id = record.get("thumbnail_path") or record.get(
+                                "thumbnail_file_id"
+                            )
                             image = None
                             if thumb_id and str(thumb_id) not in ("", "nan"):
                                 image = cached_thumbnail(
-                                    st.session_state["box_root_folder"], str(thumb_id)
+                                    st.session_state["onedrive_root"], str(thumb_id)
                                 )
                             if image:
                                 st.image(image, **STRETCH)
@@ -4763,7 +4835,7 @@ with tab_db:
                         except Exception as exc:
                             failed.append(f"{cell_id}: {exc}")
                     progress.empty()
-                    st.session_state["box_index"] = None
+                    st.session_state["archive_index"] = None
                     if done:
                         st.success(f"Refitted {len(done)} cell(s).")
                         st.dataframe(
