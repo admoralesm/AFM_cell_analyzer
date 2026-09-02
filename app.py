@@ -244,6 +244,7 @@ DEFAULTS = {
     "show_legend": True,
     # Separate from the bare switch: sometimes you want the markings but not
     # the model, to look at the data on its own.
+    "show_data": True,
     "show_fit_line": True,
     "show_component_heights": False,
     # Relative deformation runs 0 to 1 by definition, so that is the honest
@@ -355,6 +356,17 @@ DEFAULTS = {
     # In phase contrast the cell is usually the clear, bright object; saying
     # so stops a dark patch of debris winning on shape alone.
     "video_appearance": "clear",
+    # Draw the cell yourself when the detector guesses wrong, and measure the
+    # probe to turn pixels into micrometres.
+    "video_manual_cell": False,
+    "video_cell_box_x": (0.35, 0.65),
+    "video_cell_box_y": (0.35, 0.75),
+    "video_use_probe_scale": False,
+    "video_probe_box_x": (0.10, 0.90),
+    "video_probe_width_um": 60.0,
+    "video_crop_pad": 0.35,
+    "video_saved_frame": None,
+    "video_saved_frame_index": None,
     "video_reject_dark": True,
     "video_find_nucleus": True,
     "video_strip_lines": True,
@@ -371,6 +383,25 @@ DEFAULTS = {
 # Streamlit refuses a write to a widget's key once that widget has been built
 # this run. Buttons further down the page therefore stage their changes here
 # and rerun, and this block applies them before anything is drawn.
+if st.session_state.pop("_start_new_cell", False):
+    # Everything that belongs to one cell. Connections, geometry defaults and
+    # display settings are deliberately not in this list: they are the
+    # session's setup, not the cell's data.
+    for key in (
+        "data", "results", "_last_fit", "_last_fit_signature", "_plot_png",
+        "cell_name", "cell_notes", "exploration", "composition_search",
+        "arrangement_search", "video_path", "video_info", "video_track",
+        "video_name", "video_link", "eps_percent_fix",
+        "video_saved_frame", "video_saved_frame_index",
+    ):
+        st.session_state[key] = DEFAULTS.get(key)
+    for key in [k for k in st.session_state if k.startswith("window_")]:
+        del st.session_state[key]
+    st.session_state["_pending_settings"] = {
+        "window_end": DEFAULTS["window_end"],
+        "guided_window_end": DEFAULTS["guided_window_end"],
+    }
+
 if st.session_state.pop("_pending_clear_windows", False):
     for _stale in [k for k in st.session_state if k.startswith("window_")]:
         del st.session_state[_stale]
@@ -882,6 +913,11 @@ def plot_option_controls():
         if bare else "Or switch off individual pieces:"
     )
     st.checkbox(
+        "The measured points", key="show_data",
+        help="Off leaves only the fitted curve, for showing the model on its "
+        "own or laying several fits over each other.",
+    )
+    st.checkbox(
         "The fitted curve", key="show_fit_line",
         help="Off leaves the measured points alone, with no model drawn "
         "over them. Independent of “Data and fit only”, so you can have "
@@ -1018,6 +1054,9 @@ def current_style(force_N=None) -> PlotStyle:
         show_component_heights=on("show_component_heights"),
         # Not a marking: the fitted curve is the result, so the bare switch
         # leaves it alone and only its own checkbox removes it.
+        # Neither the data nor the fit is a "marking", so the bare switch
+        # leaves both alone and each has its own box.
+        show_data=bool(st.session_state["show_data"]),
         show_fit_line=bool(st.session_state["show_fit_line"]),
         x_range=axis_range("x"),
         y_range=axis_range("y"),
@@ -1552,7 +1591,16 @@ def current_fit_settings():
 
 
 def morphology_frame_png():
-    """A single frame showing the cell, for the database gallery."""
+    """
+    The picture stored with the cell.
+
+    A frame the person chose in the video tab wins over one recomputed here.
+    They looked at that frame and approved it; regenerating it later from
+    settings that have since changed can quietly store a different picture.
+    """
+    pinned = st.session_state.get("video_saved_frame")
+    if pinned:
+        return pinned
     if VIDEO_IMPORT_ERROR or not st.session_state.get("video_path"):
         return None
     path = st.session_state["video_path"]
@@ -1574,7 +1622,11 @@ def morphology_frame_png():
         if frame is None:
             return None
         annotated = va.annotate(frame, det, nucleus=nucleus, probe=probe_box)
-        return png_bytes(va.crop(annotated, det) if det and det.get("found") else annotated)
+        pad = float(st.session_state.get("video_crop_pad", 0.35))
+        return png_bytes(
+            va.crop(annotated, det, pad_frac=pad)
+            if det and det.get("found") else annotated
+        )
     except Exception:
         return None
 
@@ -2240,6 +2292,22 @@ tab_analysis, tab_video, tab_igor, tab_db, tab_results, tab_export = st.tabs(
 
 with tab_analysis:
     section("1 · Cell information")
+
+    # Working through a plate means several cells per session, often
+    # alternating between types. Without this the previous cell's name, fit,
+    # video and search results carry over silently into the next one, which
+    # is how a modulus ends up filed under the wrong cell.
+    new1, new2 = st.columns([1, 3])
+    with new1:
+        if st.button("🆕 Start a new cell", **STRETCH):
+            st.session_state["_start_new_cell"] = True
+            st.rerun()
+    with new2:
+        st.caption(
+            "Clears the curve, the fit, the video and the name, and leaves "
+            "the geometry, the display settings and the database connections "
+            "alone. Use it between cells, and whenever you switch cell type."
+        )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.text_input("Cell name / ID", placeholder="C2C12_001", key="cell_name")
@@ -3626,16 +3694,36 @@ with tab_analysis:
                         # number rather than leaving you to infer it.
                         value = float(fit.get(key, 0.0)) if carrying else 0.0
                         row[f"E {label}"] = f"{value:.4g} {unit}"
+                        # Short cells. The long sentences were being cut off
+                        # by the table, which is worse than a word plus a
+                        # legend underneath.
                         if term not in fitted_terms:
-                            row[label] = "not in model"
+                            row[label] = "off"
                         elif word == "not yet":
-                            row[label] = "0 %  the plates have not met it yet"
+                            row[label] = "0 %  not reached"
+                        elif word == "holding":
+                            row[label] = f"{100 * share[term] / total:.0f} %  holding"
                         else:
-                            row[label] = f"{100 * share[term] / total:.0f} %  {word}"
+                            row[label] = f"{100 * share[term] / total:.0f} %  loading"
                     rows.append(row)
 
                 if rows:
-                    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+                    frame = pd.DataFrame(rows)
+                    st.dataframe(
+                        frame, hide_index=True,
+                        column_config={
+                            column: st.column_config.TextColumn(column, width="small")
+                            for column in frame.columns if column != "range"
+                        },
+                        **STRETCH,
+                    )
+                    st.caption(
+                        "**loading** = carrying more force as the squash "
+                        "deepens · **holding** = keeps the force it reached "
+                        "but adds no more · **not reached** = the plates have "
+                        "not met it yet, so it contributes exactly zero · "
+                        "**off** = not in the model at all."
+                    )
                     st.caption(
                         "“The plates have not met it yet” means the cell has "
                         "not been squashed far enough for that part to touch "
@@ -3663,6 +3751,42 @@ with tab_analysis:
                     "three copies of the total. The deformation share each one "
                     "takes is in the diagram beside the plot."
                 )
+
+            # A modulus of exactly zero is the solver saying it did not want
+            # that term. Usually that is informative; in one case it is two
+            # settings cancelling each other, and saying which is the whole
+            # difference between a useful message and a confusing one.
+            zeroed = [
+                label for label, key, term in (
+                    ("Eₘ", "Em_MPa", "membrane"),
+                    ("E_c", "Ei_kPa", "interior"),
+                    ("Eₙ", "En_kPa", "nucleus"),
+                )
+                if term in fitted_terms and float(fit.get(key, 0.0)) <= 0
+            ]
+            if zeroed:
+                message = (
+                    f"{' and '.join(zeroed)} came back at exactly zero, which "
+                    f"means the fit found no work for that term to do."
+                )
+                if (
+                    "Eₘ" in zeroed
+                    and fit.get("membrane") == "freeze"
+                    and fit.get("cyto_start") == "zero"
+                ):
+                    message += (
+                        "  **Here the two choices above are cancelling each "
+                        "other.** If the cytoskeleton is loaded from the very "
+                        "start, freezing the membrane at ε₁ leaves its term a "
+                        "flat constant for the rest of the curve, and a "
+                        "constant cannot describe anything the cytoskeleton "
+                        "is not already describing, so the solver sets it to "
+                        "zero. For a cell whose membrane and cytoskeleton are "
+                        "coupled from first contact, set the membrane to "
+                        "**keeps stiffening**: both then act everywhere, which "
+                        "is what coupled means."
+                    )
+                st.warning(message)
 
             for message in fit["warnings"]:
                 st.warning(message)
@@ -4018,7 +4142,18 @@ with tab_analysis:
                 )
                 thumb = morphology_frame_png()
                 if thumb:
-                    st.image(thumb, caption="frame stored with the cell", width=190)
+                    pinned = st.session_state.get("video_saved_frame_index")
+                    st.image(
+                        thumb,
+                        caption=(f"frame {pinned}, chosen in the video tab"
+                                 if pinned is not None
+                                 else "frame stored with the cell"),
+                        width=190,
+                    )
+                    if pinned is not None and st.button("Use a different frame"):
+                        st.session_state["video_saved_frame"] = None
+                        st.session_state["video_saved_frame_index"] = None
+                        st.rerun()
             else:
                 st.caption("No video loaded for this cell.")
 
@@ -4288,6 +4423,46 @@ with tab_video:
                 ry = st.slider("Vertical", 0.0, 1.0, step=0.01, key="video_roi_y")
                 st.session_state["video_roi"] = (rx[0], ry[0], rx[1], ry[1])
 
+            with st.expander("✍️ Draw the cell yourself, and set the scale"):
+                m1, m2 = st.columns(2)
+                with m1:
+                    st.checkbox(
+                        "Select the cell by hand", key="video_manual_cell",
+                        help="Use this whenever the outline below is on the "
+                        "wrong object. Your box is used exactly as drawn, and "
+                        "the detector is not consulted at all.",
+                    )
+                    st.slider("Cell: left and right", 0.0, 1.0, step=0.01,
+                              key="video_cell_box_x",
+                              disabled=not st.session_state["video_manual_cell"])
+                    st.slider("Cell: top and bottom", 0.0, 1.0, step=0.01,
+                              key="video_cell_box_y",
+                              disabled=not st.session_state["video_manual_cell"])
+                with m2:
+                    st.checkbox(
+                        "Measure the probe to set the scale",
+                        key="video_use_probe_scale",
+                        help="The cantilever is the one object whose size is "
+                        "known exactly, so measuring it across the image "
+                        "turns every pixel into micrometres.",
+                    )
+                    st.slider("Probe: left and right edge", 0.0, 1.0, step=0.01,
+                              key="video_probe_box_x",
+                              disabled=not st.session_state["video_use_probe_scale"])
+                    st.number_input(
+                        "Probe width (µm)", min_value=1.0, max_value=500.0,
+                        step=5.0, key="video_probe_width_um",
+                        disabled=not st.session_state["video_use_probe_scale"],
+                        help="A tipless cantilever is usually 40 or 60 µm wide.",
+                    )
+                st.slider(
+                    "How much room around the cell in the saved frame",
+                    0.0, 2.0, step=0.05, key="video_crop_pad",
+                    help="0 crops tight to the outline, which is what made the "
+                    "stored frame look zoomed in. Higher shows more of the "
+                    "field around it.",
+                )
+
             roi = st.session_state["video_roi"]
             # Widget state must be clamped to this video before the widgets are
             # built, or a shorter clip than the previous one raises.
@@ -4319,6 +4494,19 @@ with tab_video:
                 st.session_state["video_appearance"],
             )
 
+            if st.session_state["video_manual_cell"] and frame is not None:
+                bx = st.session_state["video_cell_box_x"]
+                by = st.session_state["video_cell_box_y"]
+                det = va.manual_detection(frame, (bx[0], by[0], bx[1], by[1]))
+
+            scale_um_px, scale_detail = None, ""
+            if st.session_state["video_use_probe_scale"] and frame is not None:
+                px = st.session_state["video_probe_box_x"]
+                scale_um_px, scale_detail = va.scale_from_probe(
+                    (px[0], 0.0, px[1], 0.0), frame.shape,
+                    float(st.session_state["video_probe_width_um"]),
+                )
+
             p1, p2 = st.columns([2, 1])
             with p1:
                 if frame is None:
@@ -4337,10 +4525,33 @@ with tab_video:
                         **STRETCH,
                     )
             with p2:
+                if scale_um_px:
+                    st.caption(f"Scale: {scale_detail}")
+                elif st.session_state["video_use_probe_scale"]:
+                    st.caption(scale_detail or "Scale not set.")
+
                 if det and det.get("found"):
-                    st.success("Cell detected")
-                    st.metric("Cell height", f"{det['height_px']:.0f} px")
-                    st.metric("Cell width", f"{det['width_px']:.0f} px")
+                    st.success("Cell drawn by hand" if det.get("manual")
+                               else "Cell detected")
+                    if scale_um_px:
+                        st.metric(
+                            "Cell height",
+                            f"{det['height_px'] * scale_um_px:.2f} µm",
+                            delta=f"{det['height_px']:.0f} px", delta_color="off",
+                        )
+                        st.metric(
+                            "Cell width",
+                            f"{det['width_px'] * scale_um_px:.2f} µm",
+                            delta=f"{det['width_px']:.0f} px", delta_color="off",
+                        )
+                        st.caption(
+                            "Compare the height against the cell height in "
+                            "section 1: they should agree, and the moduli are "
+                            "sensitive to that number."
+                        )
+                    else:
+                        st.metric("Cell height", f"{det['height_px']:.0f} px")
+                        st.metric("Cell width", f"{det['width_px']:.0f} px")
                     st.caption(
                         f"circularity {det['circularity']:.2f} · "
                         f"solidity {det['solidity']:.2f}"
@@ -4358,12 +4569,27 @@ with tab_video:
                         )
                     elif st.session_state["video_find_nucleus"]:
                         st.caption(f"Nucleus: {nucleus.get('reason', 'not found')}")
+                    annotated = va.annotate(frame, det, label=label,
+                                            nucleus=nucleus, probe=probe_box)
+                    cropped = va.crop(
+                        annotated, det,
+                        pad_frac=float(st.session_state["video_crop_pad"]),
+                    )
+                    if st.button("📸 Use this frame for the cell", type="primary",
+                                 **STRETCH):
+                        # Pinned rather than recomputed: the frame you looked
+                        # at and approved is the one that gets stored, not
+                        # whatever the detector produces later from settings
+                        # that have since moved.
+                        st.session_state["video_saved_frame"] = png_bytes(cropped)
+                        st.session_state["video_saved_frame_index"] = int(preview_frame)
+                        st.success(
+                            f"Frame {preview_frame} is now the picture stored "
+                            f"with this cell. It appears in section 7."
+                        )
                     st.download_button(
-                        "📷 Save this frame",
-                        data=png_bytes(
-                            va.annotate(frame, det, label=label, nucleus=nucleus,
-                                        probe=probe_box)
-                        ),
+                        "📷 Save this frame to a file",
+                        data=png_bytes(annotated),
                         file_name=f"frame_{preview_frame}.png",
                         mime="image/png",
                         **STRETCH,
