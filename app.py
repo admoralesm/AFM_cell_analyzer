@@ -169,6 +169,30 @@ st.markdown(
     .hint {color: #6b7785; font-size: 0.83rem;}
     div[data-testid="stMetricValue"] {font-size: 1.5rem;}
     section[data-testid="stSidebar"] div[data-testid="stExpander"] {border: none;}
+    /* Results tables. table-layout:fixed is the whole point: it divides the
+       width that is actually there rather than asking for more and being
+       clipped, and word-wrap lets a long cell grow downwards instead of
+       sideways off the edge. */
+    table.flat-table {
+        width: 100%; table-layout: fixed; border-collapse: collapse;
+        font-size: 0.86rem; margin: 0.35rem 0 0.15rem 0;
+    }
+    table.flat-table th, table.flat-table td {
+        padding: 0.32rem 0.5rem; vertical-align: top;
+        overflow-wrap: anywhere; word-break: normal; hyphens: auto;
+        border-bottom: 1px solid rgba(128,128,128,0.25);
+    }
+    table.flat-table th {
+        font-weight: 600; border-bottom: 2px solid rgba(128,128,128,0.45);
+    }
+    table.flat-table tbody tr:last-child td {border-bottom: none;}
+    .flat-table-caption {
+        font-size: 0.78rem; opacity: 0.72; margin-bottom: 0.6rem;
+    }
+    /* And where a real dataframe is still the right widget, stop it from
+       spilling: let it scroll inside its own box rather than under the
+       neighbouring column. */
+    div[data-testid="stDataFrame"] {max-width: 100%; overflow-x: auto;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -188,6 +212,43 @@ def _stretch_kwargs():
 
 
 STRETCH = _stretch_kwargs()
+
+
+def flat_table(frame, align_right=None, caption=None):
+    """
+    A results table that shows every column, always.
+
+    ``st.dataframe`` lays its columns out in a scrolling grid sized before the
+    surrounding column is measured. Inside a narrow column, or with more than
+    about five columns, the last one is simply cut off the right-hand edge,
+    and the scrollbar that would reveal it is easy to miss. Every table in
+    this app is a small, finished result meant to be read at a glance, not
+    browsed, so they are drawn as plain HTML instead: fixed layout, cells that
+    wrap, nothing off the edge. Sorting is lost, and none of these tables is
+    long enough for that to matter.
+
+    ``align_right`` names the columns holding numbers.
+    """
+    columns = list(frame.columns)
+    right = set(align_right or [])
+    head = "".join(
+        f'<th style="text-align:{"right" if c in right else "left"}">{c}</th>'
+        for c in columns
+    )
+    body = []
+    for _, row in frame.iterrows():
+        cells = "".join(
+            f'<td style="text-align:{"right" if c in right else "left"}">'
+            f"{'' if pd.isna(row[c]) else row[c]}</td>"
+            for c in columns
+        )
+        body.append(f"<tr>{cells}</tr>")
+    st.markdown(
+        '<table class="flat-table"><thead><tr>' + head + "</tr></thead><tbody>"
+        + "".join(body) + "</tbody></table>"
+        + (f'<div class="flat-table-caption">{caption}</div>' if caption else ""),
+        unsafe_allow_html=True,
+    )
 
 
 def _supports_selection():
@@ -267,6 +328,9 @@ DEFAULTS = {
     "radius_aspect": 0.55,
     "cell_radius_um": 4.45,
     "membrane_thickness_nm": 4.0,
+    # The sub-membranous protein layer, two orders thicker than the bilayer.
+    # Only used to express a fitted tension as an equivalent modulus.
+    "protein_coat_nm": 200.0,
     "poisson_membrane": 0.50,
     "poisson_interior": 0.50,
     # cell type
@@ -302,6 +366,9 @@ DEFAULTS = {
     "use_membrane": True,
     "use_interior": True,
     "use_nucleus": True,
+    # Only offered for cell types whose membrane is two springs, so off here
+    # and switched on by the cell type's own defaults.
+    "use_tension": False,
     "regime_mode": False,
     "regime_split": 0.40,
     "stage_of_membrane": 2,
@@ -395,6 +462,10 @@ if st.session_state.pop("_start_new_cell", False):
         "video_saved_frame", "video_saved_frame_index",
     ):
         st.session_state[key] = DEFAULTS.get(key)
+    # What each upload box last handed over. Cleared with the rest, or
+    # re-uploading the same file for the next cell would look like no change
+    # at all and be silently ignored.
+    st.session_state["_video_seen"] = {}
     for key in [k for k in st.session_state if k.startswith("window_")]:
         del st.session_state[key]
     st.session_state["_pending_settings"] = {
@@ -600,6 +671,13 @@ def show_fit_maths(fit, model):
             else r"\langle \varepsilon - \varepsilon_1 \rangle^{3/2}"
         )
         pieces = []
+        if "tension" in terms:
+            # Same held basis as the elastic term: one shell, one history.
+            pieces.append(
+                r"A_t T_0\,"
+                + (r"\varepsilon" if fit.get("membrane") == "continue"
+                   else r"\min(\varepsilon,\ \varepsilon_1)")
+            )
         if "membrane" in terms:
             pieces.append(r"A_m E_m\," + membrane_basis)
         if "interior" in terms:
@@ -613,6 +691,18 @@ def show_fit_maths(fit, model):
             "same ε and the forces add: the elements are side by side, not "
             "stacked."
         )
+        if "tension" in terms:
+            st.caption(
+                "The first two terms are both the membrane. T₀ is the "
+                "in-plane tension already in the protein network, which "
+                "resists the area the cell has to gain as it flattens and so "
+                "answers in proportion to ε; Eₘ is the shell's elastic "
+                "resistance to that same area strain, which only bites when "
+                "the strain is large and so goes as ε³. They rise at "
+                "different rates, which is the only reason a fit can tell "
+                "them apart, and they stop together, because they are one "
+                "piece of material."
+            )
     else:
         st.latex(
             r"F(\varepsilon) = A_m E_m \varepsilon^{3} + A_i E_c "
@@ -626,6 +716,15 @@ def show_fit_maths(fit, model):
         r"A_i = \frac{\sqrt{2}\, R_0^{1/2} h_0^{3/2}}{3(1-\nu_i^{2})} \qquad "
         r"A_n = \frac{\sqrt{2}\, R_n^{1/2} h_0^{3/2}}{3(1-\nu_n^{2})}"
     )
+    if "tension" in terms:
+        st.latex(r"A_t = \frac{2\pi R_0^{2}}{h_0}")
+        st.caption(
+            "A_t comes from the area a flattening sphere gains, ΔA ≈ πR₀²ε². "
+            "At a fixed tension the stored energy is T₀ΔA, and the force is "
+            "its derivative with respect to the travel δ = εh₀, which gives "
+            "2πR₀²T₀ε/h₀. Note there is no thickness in it: a tension is a "
+            "force per unit length and the curve measures it directly."
+        )
     st.code(
         f"h0 = {model.cell_height:.4g} m        (cell height)\n"
         f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
@@ -633,14 +732,18 @@ def show_fit_maths(fit, model):
         f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
         f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
         f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa\n"
-        f"An = {fit.get('An', float('nan')):.6g} N/Pa",
+        f"An = {fit.get('An', float('nan')):.6g} N/Pa"
+        + (f"\nAt = {fit.get('At', float('nan')):.6g} m        "
+           f"(F = At*T0*eps)" if "tension" in terms else ""),
         language="text",
     )
 
     st.markdown("**3 · Why this is a linear solve**")
     st.latex(
         r"\mathbf{F} = \mathbf{X}\,\boldsymbol{\theta}, \qquad "
-        r"\boldsymbol{\theta} = (E_m,\ E_c,\ E_n)"
+        + (r"\boldsymbol{\theta} = (T_0,\ E_m,\ E_c,\ E_n)"
+           if "tension" in terms
+           else r"\boldsymbol{\theta} = (E_m,\ E_c,\ E_n)")
     )
     st.latex(
         r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta}\ \ge\ 0}"
@@ -658,10 +761,13 @@ def show_fit_maths(fit, model):
     st.markdown("**4 · The answer for this cell**")
     rows = []
     for label, key, unit, term in (
+        ("T₀", "T0_mN_m", "mN/m", "tension"),
         ("Eₘ", "Em_MPa", "MPa", "membrane"),
         ("E_c", "Ei_kPa", "kPa", "interior"),
         ("Eₙ", "En_kPa", "kPa", "nucleus"),
     ):
+        if term == "tension" and "tension" not in terms:
+            continue
         used = term in terms
         rows.append(
             f"{label:4} = {0.0 if not used else fit.get(key, 0.0):<12.6g} {unit}"
@@ -685,6 +791,15 @@ def show_fit_maths(fit, model):
         "assumed membrane thickness, so it moves with that assumption while "
         "the measurement does not."
     )
+    worst = fit.get("worst_pair")
+    if worst and abs(fit.get("worst_correlation", 0.0) or 0.0) > 0.97:
+        st.caption(
+            f"Over this range the {worst[0]} and {worst[1]} basis functions "
+            f"have correlation {abs(fit['worst_correlation']):.4f}. Their sum "
+            f"is well determined; the split between them is only as good as "
+            f"that number is below 1. Widening the range, especially towards "
+            f"ε = 0, is what separates them."
+        )
 
 
 def settings_from_arrangement(best, epsilon_max):
@@ -717,6 +832,7 @@ def settings_from_arrangement(best, epsilon_max):
                 "membrane_after_break": membrane_label,
                 "cyto_starts_at": cyto_label,
                 "use_nucleus": bool(composition.get("use_nucleus", True)),
+                "use_tension": bool(composition.get("use_tension", False)),
             }
         )
     elif arrangement == "series":
@@ -845,11 +961,18 @@ def plain_language_summary(fit, model):
     st.markdown("#### How stiff each part turned out to be")
     names = components_for(st.session_state["cell_type"])
     rows = []
+    # The tension row is a tension, in newtons per metre, not a modulus. It
+    # is listed with the others because it is one of the springs, and given
+    # its own units rather than being dressed up as a stiffness it is not.
+    coat_m = float(st.session_state["protein_coat_nm"]) * 1e-9
     for key, pa_factor, unit, term in (
+        ("T0_mN_m", 1e-3 / max(coat_m, 1e-12), "mN/m", "tension"),
         ("Em_MPa", 1e6, "MPa", "membrane"),
         ("Ei_kPa", 1e3, "kPa", "interior"),
         ("En_kPa", 1e3, "kPa", "nucleus"),
     ):
+        if term not in terms_for(st.session_state["cell_type"]):
+            continue
         label, everyday = names[term]
         used = term in terms
         value = float(fit.get(key, 0.0)) if used else 0.0
@@ -861,11 +984,22 @@ def plain_language_summary(fit, model):
                 "Roughly": (
                     "not included in this model" if not used
                     else "the data did not need it" if value <= 0
+                    # A tension divided by the layer it sits in is a modulus,
+                    # which is the only way to put it on the same scale as
+                    # the rest.
                     else stiffness_in_words(value * pa_factor)
                 ),
             }
         )
-    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+    flat_table(pd.DataFrame(rows), align_right=["Stiffness"])
+    if "tension" in terms_for(st.session_state["cell_type"]):
+        st.caption(
+            "The protein network is quoted as a tension, in mN/m, because "
+            "that is what the curve measures: a taut sheet answers with a "
+            "force per unit length, and turning it into a stiffness needs an "
+            "assumed layer thickness (set in the sidebar). The everyday "
+            "comparison in the last column does make that conversion."
+        )
 
     chi_red = float(fit.get("chi_squared_reduced", float("nan")))
     st.markdown(
@@ -1201,6 +1335,12 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
         cell_height=height_m,
         cell_radius=radius_m,
         membrane_thickness=float(st.session_state["membrane_thickness_nm"]) * 1e-9,
+        # The taut layer is the protein coat, not the bilayer, and the deep
+        # element of a four-element cell is myofibrils running the length of
+        # the cell rather than a compact body at its centre. Both change the
+        # prefactors, so both follow the cell type.
+        shell_thickness=float(st.session_state["protein_coat_nm"]) * 1e-9,
+        deep_uses_cell_radius=st.session_state["cell_type"] in FOUR_ELEMENT_TYPES,
         poisson_membrane=float(st.session_state["poisson_membrane"]),
         poisson_interior=float(st.session_state["poisson_interior"]),
         nucleus_radius=nucleus_m,
@@ -1216,11 +1356,21 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
 # ============================================================ cell presets ==
 
 TERM_LABELS = {
+    "tension": "membrane tension (T₀)",
     "membrane": "membrane (Eₘ)",
     "interior": "cytoskeleton (Ec)",
     "nucleus": "nucleus (Eₙ)",
 }
+# The three classic elements. The tension spring is a fourth, offered only
+# where a cell type calls for it, and deliberately not in this tuple: every
+# loop that walks the classic model must keep walking exactly three.
 TERM_ORDER = ("membrane", "interior", "nucleus")
+ALL_TERMS = ("tension", "membrane", "interior", "nucleus")
+
+
+def terms_for(cell_type):
+    """The elements this cell type is modelled with, outermost first."""
+    return ALL_TERMS if cell_type in FOUR_ELEMENT_TYPES else TERM_ORDER
 
 # How the elements share the load. These are physics, not fitting procedure:
 # parallel and series here describe the spring network, while "All at once"
@@ -1306,31 +1456,43 @@ COMPONENT_SETS = {
         "interior": ("Cytoskeleton", "the scaffolding filling the cell"),
         "nucleus": ("Nucleus", "the dense body at the centre"),
     },
+    # Four layers, not three. The membrane of a cardiomyocyte is not one
+    # spring: a protein network runs through it that is already taut, and it
+    # answers a push in proportion to how far it is pushed, while the shell's
+    # own elasticity only bites once the area strain is large. Inside, the
+    # general scaffolding is engaged from first contact and the myofibrils
+    # are met deeper in.
     "Cardiomyocyte": {
-        "membrane": ("Membrane and cortex", "a strong shell holding fluid in"),
-        # A cardiomyocyte has two kinds of cytoskeleton and they are not the
-        # same material. The non-sarcomeric network is the general scaffolding
-        # every cell has; the sarcomeric apparatus is the contractile
-        # machinery, stiffer and reached later as the cell is flattened onto
-        # it. The third slot holds the sarcomeric one rather than a nucleus,
-        # which in a cell this packed has nothing distinct left to describe.
+        "tension": (
+            "Membrane protein network",
+            "already taut, the horizontal spring",
+        ),
+        "membrane": (
+            "Membrane elasticity",
+            "the shell itself resisting being stretched",
+        ),
         "interior": (
             "Non-sarcomeric cytoskeleton",
             "the general scaffolding, not contractile",
         ),
         "nucleus": (
-            "Sarcomeric cytoskeleton",
-            "the contractile machinery, the myofibrils",
+            "Sarcomeric myofibrils",
+            "the contractile machinery, reached deeper in",
         ),
     },
 }
 DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 
+# Cell types whose membrane is modelled as two springs rather than one.
+FOUR_ELEMENT_TYPES = ("Cardiomyocyte",)
+
 # Which terms a cell type is fitted with by default. All three for both,
 # but the third means different things: a nucleus in a myoblast, the
 # contractile apparatus in a cardiomyocyte.
 DEFAULT_TERMS_BY_TYPE = {
-    "Cardiomyocyte": {"membrane": True, "interior": True, "nucleus": True},
+    "Cardiomyocyte": {
+        "tension": True, "membrane": True, "interior": True, "nucleus": True,
+    },
 }
 
 # How each cell type is expected to behave at the first boundary.
@@ -1426,8 +1588,14 @@ def apply_cell_type(name):
 
 
 def active_terms():
-    """Terms currently switched on, always in membrane -> nucleus order."""
-    return tuple(t for t in TERM_ORDER if st.session_state.get(f"use_{t}", False))
+    """Terms currently switched on, always outermost first.
+
+    Walks every term the current cell type has, so a four-element cell type
+    reports its tension spring and a three-element one never can, whatever is
+    left behind in session state from an earlier cell.
+    """
+    available = terms_for(st.session_state.get("cell_type"))
+    return tuple(t for t in available if st.session_state.get(f"use_{t}", False))
 
 
 def stage_groups(terms):
@@ -1487,7 +1655,7 @@ def apply_preset(preset, lo, hi):
             pending[field] = float(preset[field])
     if preset.get("procedure") in ("All at once", "Stage by stage"):
         pending["procedure"] = preset["procedure"]
-    for term in TERM_ORDER:
+    for term in ALL_TERMS:
         pending[f"use_{term}"] = term in preset.get("terms", [])
     for term, stage in (preset.get("stage_of") or {}).items():
         pending[f"stage_of_{term}"] = int(stage)
@@ -1580,14 +1748,110 @@ def current_fit_settings():
         "radius_aspect": float(st.session_state["radius_aspect"]),
         "nucleus_fraction": float(st.session_state["nucleus_fraction"]),
         "membrane_thickness_nm": float(st.session_state["membrane_thickness_nm"]),
+        "protein_coat_nm": float(st.session_state["protein_coat_nm"]),
         "poisson_membrane": float(st.session_state["poisson_membrane"]),
         "poisson_interior": float(st.session_state["poisson_interior"]),
         "term_windows": {
             term: list(st.session_state.get(f"window_term_{term}", (0.0, 1.0)))
-            for term in TERM_ORDER
+            for term in ALL_TERMS
         },
         "combined_window": list(st.session_state.get("window_combined", (0.0, 1.0))),
     }
+
+
+def adopt_video(uploaded, widget_key):
+    """
+    Take an uploaded video as *the* video for this cell, from either uploader.
+
+    There are two upload boxes on purpose: one beside the database controls,
+    where you are already standing when you finish a cell, and one in the
+    video tab, where the analysis happens. They are two doors into one room.
+    Both call this, so both write the same file, and whichever you used, the
+    video tab is analysing what you uploaded.
+
+    The subtlety is knowing when a box has something new in it. Comparing
+    against the loaded video's name is not enough: upload A here, then B
+    there, and on the next rerun this box still holds A, sees that the loaded
+    name is B, and helpfully replaces it. The two boxes then fight, one
+    winning per rerun. So each box remembers what it last handed over, and
+    only speaks up when its own contents change.
+    """
+    seen = st.session_state.setdefault("_video_seen", {})
+    signature = None if uploaded is None else (uploaded.name, uploaded.size)
+    if signature == seen.get(widget_key):
+        return False
+    seen[widget_key] = signature
+    if uploaded is None:
+        return False
+
+    destination = os.path.join(tempfile.gettempdir(), f"afm_video_{uploaded.name}")
+    with open(destination, "wb") as handle:
+        handle.write(uploaded.getvalue())
+    st.session_state["video_path"] = destination
+    st.session_state["video_name"] = uploaded.name
+    st.session_state["video_track"] = None
+    # A frame pinned from the previous video is not a frame of this one.
+    st.session_state["video_saved_frame"] = None
+    st.session_state["video_saved_frame_index"] = None
+    try:
+        st.session_state["video_info"] = va.probe(destination)
+    except Exception as exc:
+        st.session_state["video_info"] = None
+        st.error(f"Could not open that video: {exc}")
+    return True
+
+
+def video_loaded():
+    """True when there is a video on disk this session can read."""
+    path = st.session_state.get("video_path")
+    return bool(
+        not VIDEO_IMPORT_ERROR
+        and path
+        and st.session_state.get("video_info")
+        and os.path.exists(path)
+    )
+
+
+def detection_at(frame_index):
+    """
+    The cell in one frame, as the video tab has it set up.
+
+    Every reader of a frame goes through here, so the box drawn by hand and
+    the scale taken from the probe apply everywhere, not only on the tab
+    where they were set. The side panel next to the force curve was reading
+    the raw detector and quietly ignoring both.
+
+    Returns ``(frame, detection, nucleus, probe_box, scale_um_px)``.
+    """
+    frame, det, nucleus, probe_box = cached_detection(
+        st.session_state["video_path"],
+        video_signature(),
+        int(frame_index),
+        st.session_state["video_roi"],
+        float(st.session_state["video_sensitivity"]),
+        bool(st.session_state["video_strip_lines"]),
+        enhancement(),
+        st.session_state["video_cell_side"],
+        bool(st.session_state["video_reject_dark"]),
+        bool(st.session_state["video_find_nucleus"]),
+        st.session_state["video_appearance"],
+    )
+    if frame is None:
+        return None, None, None, None, None
+
+    if st.session_state.get("video_manual_cell"):
+        bx = st.session_state["video_cell_box_x"]
+        by = st.session_state["video_cell_box_y"]
+        det = va.manual_detection(frame, (bx[0], by[0], bx[1], by[1]))
+
+    scale_um_px = None
+    if st.session_state.get("video_use_probe_scale"):
+        px = st.session_state["video_probe_box_x"]
+        scale_um_px, _ = va.scale_from_probe(
+            (px[0], 0.0, px[1], 0.0), frame.shape,
+            float(st.session_state["video_probe_width_um"]),
+        )
+    return frame, det, nucleus, probe_box, scale_um_px
 
 
 def morphology_frame_png():
@@ -1608,17 +1872,7 @@ def morphology_frame_png():
         return None
     try:
         index = int(st.session_state.get("video_preview_frame", 0))
-        frame, det, nucleus, probe_box = cached_detection(
-            path, video_signature(), index,
-            st.session_state["video_roi"],
-            float(st.session_state["video_sensitivity"]),
-            bool(st.session_state["video_strip_lines"]),
-            enhancement(),
-            st.session_state["video_cell_side"],
-            bool(st.session_state["video_reject_dark"]),
-            bool(st.session_state["video_find_nucleus"]),
-            st.session_state["video_appearance"],
-        )
+        frame, det, nucleus, probe_box, _ = detection_at(index)
         if frame is None:
             return None
         annotated = va.annotate(frame, det, nucleus=nucleus, probe=probe_box)
@@ -1745,7 +1999,7 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             return "not fitted"
         if not segmented or e1 is None or e2 is None:
             return f"{lo:.3f} to {hi:.3f}"
-        if term == "membrane":
+        if term in ("membrane", "tension"):
             end = hi if fit.get("membrane") == "continue" else e1
             return f"{lo:.3f} to {end:.3f}"
         if term == "interior":
@@ -1766,6 +2020,17 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "cell_height": round(float(st.session_state["cell_height_um"]), 3),
             # Spring constant in N/m, which is the unit it is calibrated in.
             "spring_constant": round(float(st.session_state["spring_constant"]), 6),
+            # Blank, not zero, where the cell type has no tension spring at
+            # all: a zero in this column would read as "measured and found to
+            # be nothing", which is a different claim.
+            "T0": (
+                modulus("T0_mN_m", "tension")
+                if "tension" in terms_for(st.session_state["cell_type"]) else ""
+            ),
+            "T0_range": (
+                span("tension")
+                if "tension" in terms_for(st.session_state["cell_type"]) else ""
+            ),
             "Em": modulus("Em_MPa", "membrane"),
             "Em_range": span("membrane"),
             "Ei": modulus("Ei_kPa", "interior"),
@@ -1794,6 +2059,10 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "nucleus_radius": round(float(fit.get("R_nucleus", 0.0)) * 1e6, 4),
             "membrane_thickness": round(
                 float(st.session_state["membrane_thickness_nm"]), 3
+            ),
+            "protein_coat": (
+                round(float(st.session_state["protein_coat_nm"]), 2)
+                if "tension" in terms_for(st.session_state["cell_type"]) else ""
             ),
             "poisson": "{:.2f} / {:.2f}".format(
                 float(st.session_state["poisson_membrane"]),
@@ -1838,6 +2107,8 @@ def model_from_record(record, curve):
         cell_height=height_m,
         cell_radius=radius_m,
         membrane_thickness=float(settings.get("membrane_thickness_nm", 4.0)) * 1e-9,
+        shell_thickness=float(settings.get("protein_coat_nm", 200.0)) * 1e-9,
+        deep_uses_cell_radius=settings.get("cell_type") in FOUR_ELEMENT_TYPES,
         poisson_membrane=float(settings.get("poisson_membrane", 0.5)),
         poisson_interior=float(settings.get("poisson_interior", 0.5)),
         nucleus_radius=radius_m * float(settings.get("nucleus_fraction", 0.35)),
@@ -1885,6 +2156,7 @@ def refit_stored_cell(store, cell_id, settings):
             use_membrane="membrane" in terms,
             use_interior="interior" in terms,
             use_nucleus="nucleus" in terms,
+            use_tension="tension" in terms,
             weighting=settings.get("weighting", "uniform"),
         )
     elif coupling == "series":
@@ -2007,6 +2279,20 @@ with st.sidebar:
             "assume 8 nm instead of 4 and Eₘ halves, with the data unchanged. The "
             "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
+        if st.session_state["cell_type"] in FOUR_ELEMENT_TYPES:
+            st.number_input(
+                "Protein coat thickness h_p (nm)",
+                min_value=5.0,
+                max_value=2000.0,
+                step=10.0,
+                key="protein_coat_nm",
+                help="The sub-membranous protein layer the taut network sits "
+                "in, tens to hundreds of nanometres, not the 4 nm bilayer. "
+                "Nothing in the fit depends on it: the tension T₀ is fitted "
+                "in N/m and is what the data actually determines. This only "
+                "converts that tension into an equivalent modulus T₀/h_p for "
+                "comparison with the other three.",
+            )
         st.slider("Poisson ratio, membrane νₘ", 0.0, 0.5, step=0.01, key="poisson_membrane")
         st.slider("Poisson ratio, cytoskeleton νc", 0.0, 0.5, step=0.01, key="poisson_interior")
         st.caption("0.5 = incompressible, the usual choice for living cells.")
@@ -2478,19 +2764,31 @@ with tab_analysis:
         if guided:
             names = components_for(st.session_state["cell_type"])
 
+            here = terms_for(st.session_state["cell_type"])
             st.markdown("#### Step 1 · Which parts of the cell are in the model")
             st.caption(
-                "Leave all three ticked unless you have a reason not to. The "
-                "names follow the cell type chosen in the sidebar, because a "
+                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
+                "unless you have a reason not to. The names follow the cell "
+                "type chosen in the sidebar, because a "
                 f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
                 "not built like every other cell."
             )
-            p1, p2, p3 = st.columns(3)
-            for column, term in zip((p1, p2, p3), TERM_ORDER):
+            for column, term in zip(st.columns(len(here)), here):
                 label, everyday = names[term]
                 with column:
                     st.checkbox(label, key=f"use_{term}")
                     st.caption(everyday)
+            if len(here) == 4:
+                st.caption(
+                    "The first two are both the membrane. A cardiomyocyte's "
+                    "membrane carries a protein network that is already taut, "
+                    "so it pushes back from the very first contact in "
+                    "proportion to how far it is pushed (a law in ε); the "
+                    "shell's own elasticity only bites once the cell has been "
+                    "flattened enough to stretch it (a law in ε³). They are "
+                    "one piece of material answering two ways, which is why "
+                    "they start and stop together."
+                )
 
             chosen = active_terms()
             if not chosen:
@@ -2545,6 +2843,16 @@ with tab_analysis:
                         found = search_arrangements(
                             model, 0.0, guided_hi, terms=chosen,
                             weighting=st.session_state["weighting"],
+                            # Where the cell type says the membrane is two
+                            # springs, that is the structure to place the
+                            # boundaries inside, not a hypothesis to test. A
+                            # linear term is flexible enough to help a wrong
+                            # composition imitate the right one, so letting
+                            # the search drop it buys a worse story for a
+                            # better number.
+                            tension_mode=(
+                                "always" if "tension" in chosen else "off"
+                            ),
                         )
                     st.session_state["arrangement_search"] = found
                     st.session_state["composition_search"] = found.get("composition")
@@ -2570,7 +2878,10 @@ with tab_analysis:
                         }
                         for row in previous["candidates"]
                     ]
-                    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+                    flat_table(
+                        pd.DataFrame(rows),
+                        align_right=["predicts held-out points", "free numbers"],
+                    )
                     st.caption(
                         "Lower is better in the middle column: it is how far "
                         "the model misses points it never saw. Where two are "
@@ -2610,15 +2921,18 @@ with tab_analysis:
                 # them twice is a duplicate widget key, which Streamlit
                 # refuses outright.
                 picked = components_for(st.session_state["cell_type"])
-                for term in TERM_ORDER:
+                for term in terms_for(st.session_state["cell_type"]):
                     mark = "☑" if st.session_state[f"use_{term}"] else "☐"
                     st.caption(f"{mark} {picked[term][0]}")
                 st.caption("Change these in **Step 1** above.")
             else:
                 names = components_for(st.session_state["cell_type"])
-                st.checkbox(f"{names['membrane'][0]} · Eₘ", key="use_membrane")
-                st.checkbox(f"{names['interior'][0]} · Ec", key="use_interior")
-                st.checkbox(f"{names['nucleus'][0]} · Eₙ", key="use_nucleus")
+                symbols = {"tension": "T₀", "membrane": "Eₘ",
+                           "interior": "Ec", "nucleus": "Eₙ"}
+                for term in terms_for(st.session_state["cell_type"]):
+                    st.checkbox(
+                        f"{names[term][0]} · {symbols[term]}", key=f"use_{term}"
+                    )
 
         active = active_terms()
         kind = MODEL_KEYS[st.session_state["model_kind"]]
@@ -2641,16 +2955,55 @@ with tab_analysis:
                 icon="⚠️",
             )
             st.caption(
-                "What it does today: the shell carries the load as ε³, "
-                "because a pressurised shell around incompressible fluid "
-                "gives that cubic law. The two interior terms are the two "
-                "kinds of cytoskeleton a cardiomyocyte has: the "
-                "non-sarcomeric network, which is the general scaffolding, "
-                "and the sarcomeric apparatus, the contractile myofibrils, "
-                "which is stiffer and met later as the cell flattens onto it. "
-                "There is no separate nucleus term: in a cell this packed it "
-                "has nothing distinct left to describe."
+                "What it does today: four springs, in the order the plates "
+                "meet them. **T₀**, the protein network running through the "
+                "membrane, already taut and so answering from first contact "
+                "in proportion to ε. **Eₘ**, the same shell's own elasticity, "
+                "which only resists once the flattening has stretched it, "
+                "and so goes as ε³. **Ec**, the non-sarcomeric cytoskeleton, "
+                "the general scaffolding, Hertzian in ε³ᐟ². **Eₙ**, the "
+                "sarcomeric myofibrils, the same Hertzian law but switched "
+                "on at ε₂, because they are stiff discrete bundles the "
+                "plates reach only after the softer scaffolding around them "
+                "has been squeezed down. There is no separate nucleus term: "
+                "in a cell this packed it has nothing distinct left to "
+                "describe."
             )
+            with st.expander("Why four springs and not three"):
+                st.markdown(
+                    "A fit can only separate terms whose **shapes** differ. "
+                    "Two springs with the same law and the same starting "
+                    "point are one spring wearing two names, and the solver "
+                    "would split them arbitrarily, giving two numbers that "
+                    "move from cell to cell while their sum stays put.\n\n"
+                    "So the two membrane springs are given the two laws a "
+                    "taut shell actually has. A network already under "
+                    "tension T₀ resists the **area** the cell must gain as "
+                    "it flattens; the area gained goes as ε², the energy "
+                    "T₀ΔA goes as ε², and the force, its derivative, goes as "
+                    "**ε**. The shell's elastic resistance to that same area "
+                    "strain stores energy as the square of the strain, so "
+                    "its force goes as **ε³**. One rises straight, the other "
+                    "accelerates. Near first contact the tension is nearly "
+                    "all of the membrane's answer and the elasticity is "
+                    "negligible; deep into the squash it is the other way "
+                    "round. That difference is what a fit can see.\n\n"
+                    "The two interior networks are separated the same way, "
+                    "by *when* rather than by *how*: both are Hertzian, so "
+                    "one has to start later or they are indistinguishable. "
+                    "Which of the two is the late one the curve cannot tell "
+                    "you. That is a claim about the cell, not about the "
+                    "data, and here it is the myofibrils by assumption.\n\n"
+                    "Two honest cautions. T₀ is fitted as a tension in N/m, "
+                    "which is what the measurement determines; quoting it as "
+                    "a modulus needs an assumed coat thickness and inherits "
+                    "all the uncertainty of that assumption. And ε against "
+                    "ε³ᐟ² are more alike than ε against ε³, so T₀ and Ec "
+                    "trade off against each other more than the other pairs "
+                    "do. The fit reports how alike they were over your range, "
+                    "and a range that reaches down to ε = 0 is what pulls "
+                    "them apart."
+                )
 
         if segmented:
             st.markdown("**3 · What each one does at the first boundary**")
@@ -2739,7 +3092,7 @@ with tab_analysis:
                     st.error(exploration.get("error", "Exploration failed."))
 
             if exploration and exploration.get("success"):
-                st.dataframe(
+                flat_table(
                     pd.DataFrame(
                         [
                             {
@@ -2762,8 +3115,10 @@ with tab_analysis:
                             for row in exploration["stages"]
                         ]
                     ),
-                    hide_index=True,
-                    **STRETCH,
+                    align_right=[
+                        "ε from", "ε to", "points", "exponent measured",
+                        "expected", "power-law R²",
+                    ],
                 )
                 st.caption(
                     "A blank exponent means that stage does not rise far enough above "
@@ -2995,19 +3350,26 @@ with tab_analysis:
             search = st.session_state.get("composition_search")
             if search and search.get("success"):
                 st.info(search["verdict"])
-                st.dataframe(
+                shows_tension = any(
+                    row.get("use_tension") for row in search["candidates"]
+                )
+                flat_table(
                     pd.DataFrame(
                         [
                             {
                                 "combination": row["label"],
-                                "ε₁": round(row["break_1"], 3),
-                                "ε₂": round(row["break_2"], 3),
-                                "Eₘ (MPa)": float(f"{row['Em_MPa']:.4g}"),
-                                "E_c (kPa)": float(f"{row['Ec_kPa']:.4g}"),
-                                "Eₙ (kPa)": float(f"{row['En_kPa']:.4g}"),
-                                "R²": round(row["r_squared"], 5),
+                                "ε₁": f"{row['break_1']:.3f}",
+                                "ε₂": f"{row['break_2']:.3f}",
+                                **(
+                                    {"T₀ (mN/m)": f"{row.get('T0_mN_m', 0.0):.4g}"}
+                                    if shows_tension else {}
+                                ),
+                                "Eₘ (MPa)": f"{row['Em_MPa']:.4g}",
+                                "E_c (kPa)": f"{row['Ec_kPa']:.4g}",
+                                "Eₙ (kPa)": f"{row['En_kPa']:.4g}",
+                                "R²": f"{row['r_squared']:.5f}",
                                 "CV RMSE": f"{row['cv_rmse']:.4g}",
-                                "ΔAICc": round(row["delta_aicc"], 1),
+                                "ΔAICc": f"{row['delta_aicc']:.1f}",
                                 "note": " · ".join(
                                     part for part in (
                                         "picked" if row is search["best"] else "",
@@ -3024,8 +3386,10 @@ with tab_analysis:
                             for row in search["candidates"]
                         ]
                     ),
-                    hide_index=True,
-                    **STRETCH,
+                    align_right=[
+                        "ε₁", "ε₂", "T₀ (mN/m)", "Eₘ (MPa)", "E_c (kPa)",
+                        "Eₙ (kPa)", "R²", "CV RMSE", "ΔAICc",
+                    ],
                 )
                 st.caption(
                     "Ranked by cross-validated error, which asks how well each "
@@ -3215,7 +3579,7 @@ with tab_analysis:
                         presets.pop(chosen, None)
                         st.rerun()
 
-                st.dataframe(
+                flat_table(
                     pd.DataFrame(
                         [
                             {
@@ -3234,8 +3598,7 @@ with tab_analysis:
                             for name, pre in presets.items()
                         ]
                     ),
-                    hide_index=True,
-                    **STRETCH,
+                    align_right=["ε₁", "ε₂"],
                 )
 
             e1, e2 = st.columns(2)
@@ -3329,6 +3692,7 @@ with tab_analysis:
                         use_membrane="membrane" in active,
                         use_interior="interior" in active,
                         use_nucleus="nucleus" in active,
+                        use_tension="tension" in active,
                         weighting=st.session_state["weighting"],
                     )
                 else:
@@ -3387,6 +3751,24 @@ with tab_analysis:
 
         stale_fit = False
         if fit is not None and fit.get("success"):
+            # How much each modulus depends on where the boundaries were put.
+            # Done once, here, rather than in the panel that displays it: this
+            # runs when a fit happens, that runs on every rerun.
+            if fit.get("coupling") == "segmented" and hasattr(
+                model, "breakpoint_spread"
+            ):
+                try:
+                    fit["breakpoint_spread"] = model.breakpoint_spread(
+                        fit["epsilon_range"][0], fit["epsilon_range"][1],
+                        fit["break_1"], fit["break_2"],
+                        fit.get("membrane", "freeze"),
+                        fit.get("cyto_start", "break"),
+                        use_nucleus="nucleus" in (fit.get("terms") or ()),
+                        weighting=fit.get("weighting", "uniform"),
+                        use_tension="tension" in (fit.get("terms") or ()),
+                    )
+                except Exception:
+                    fit["breakpoint_spread"] = None
             st.session_state["_last_fit"] = fit
             st.session_state["_last_fit_signature"] = fit_signature
         elif fit is None and st.session_state.get("_last_fit") is not None:
@@ -3405,22 +3787,21 @@ with tab_analysis:
 
         if comparison and comparison.get("success"):
             st.info(comparison["verdict"])
-            st.dataframe(
+            flat_table(
                 pd.DataFrame(
                     [
                         {
                             "model": row["label"],
-                            "R²": round(row["r_squared"], 5),
-                            "ΔAICc": round(row["delta_aicc"], 1),
-                            "weight": round(row["weight"], 3),
+                            "R²": f"{row['r_squared']:.5f}",
+                            "ΔAICc": f"{row['delta_aicc']:.1f}",
+                            "weight": f"{row['weight']:.3f}",
                             "CV RMSE": f"{row['cv_rmse']:.3g}",
                             "params": row["n_params"],
                         }
                         for row in comparison["candidates"]
                     ]
                 ),
-                hide_index=True,
-                **STRETCH,
+                align_right=["R²", "ΔAICc", "weight", "CV RMSE", "params"],
             )
             st.caption(
                 "ΔAICc under 2 means the curve cannot tell those models apart. A "
@@ -3437,11 +3818,24 @@ with tab_analysis:
             fitted_coupling = fit.get("coupling", "parallel")
             params = (fit.get("Em", 0.0), fit.get("Ei", 0.0), En_value)
             params = tuple(0.0 if not np.isfinite(v) else v for v in params)
+            T0_value = float(fit.get("T0", 0.0) or 0.0)
+            if not np.isfinite(T0_value):
+                T0_value = 0.0
 
             if fitted_coupling == "segmented":
                 # Draw the components with the same basis the fit used, or the
                 # curves would not add up to the line through the data.
-                if hasattr(model, "composition_terms"):
+                tension_basis = None
+                if hasattr(model, "composition_basis"):
+                    basis = model.composition_basis(
+                        epsilon, fit["break_1"], fit["break_2"],
+                        fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
+                    )
+                    membrane_basis = basis["membrane"]
+                    cyto_basis = basis["interior"]
+                    nucleus_basis = basis["nucleus"]
+                    tension_basis = basis["tension"]
+                elif hasattr(model, "composition_terms"):
                     membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
                         epsilon, fit["break_1"], fit["break_2"],
                         fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
@@ -3450,10 +3844,15 @@ with tab_analysis:
                     membrane_basis, cyto_basis, nucleus_basis = model.segment_terms(
                         epsilon, fit["break_1"], fit["break_2"]
                     )
+                tension = (
+                    tension_basis * T0_value
+                    if (tension_basis is not None and T0_value) else None
+                )
                 fitted = (
                     membrane_basis * params[0]
                     + cyto_basis * params[1]
                     + nucleus_basis * params[2]
+                    + (tension if tension is not None else 0.0)
                     + fit.get("force_offset", 0.0)
                 )
                 membrane = membrane_basis * params[0]
@@ -3469,6 +3868,7 @@ with tab_analysis:
                 membrane = model.balloon_model_cubic(epsilon, params[0])
                 interior = model.hertzian_contact_model(epsilon, params[1])
                 nucleus = model.nucleus_model(epsilon, params[2]) if params[2] else None
+                tension = None
             else:
                 base_coupling = "series" if fitted_coupling == "series" else "hybrid"
                 fitted = model.predict(
@@ -3479,7 +3879,7 @@ with tab_analysis:
                 # In series every element carries the whole force, so there are
                 # no separate force curves to draw; what differs between them is
                 # how much of the deformation each one takes.
-                membrane = interior = nucleus = None
+                membrane = interior = nucleus = tension = None
 
             # The model is only claimed over the range it was fitted on.
             # Drawn past that it is extrapolation, and a power law far outside
@@ -3498,6 +3898,7 @@ with tab_analysis:
                 return out
 
             fitted = clip_to_window(fitted)
+            tension = clip_to_window(tension)
             membrane = clip_to_window(membrane)
             interior = clip_to_window(interior)
             nucleus = clip_to_window(nucleus)
@@ -3567,17 +3968,23 @@ with tab_analysis:
             # results table is ambiguous between "zero" and "not measured",
             # and the two mean very different things when you pool cells.
             fitted_terms = set(fit.get("terms") or active)
-            metric_cols = st.columns(5)
-            for slot, (label, value, unit, term) in enumerate(
-                (
+            here = terms_for(st.session_state["cell_type"])
+            moduli_shown = [
+                row for row in (
+                    ("T₀ network", fit.get("T0_mN_m", 0.0), "mN/m", "tension"),
                     ("Eₘ membrane", fit.get("Em_MPa", 0.0), "MPa", "membrane"),
                     ("Ec cytoskeleton", fit.get("Ei_kPa", 0.0), "kPa", "interior"),
                     ("Eₙ nucleus", fit.get("En_kPa", 0.0), "kPa", "nucleus"),
-                )
-            ):
+                ) if row[3] in here
+            ]
+            # Two more columns for the two goodness-of-fit numbers.
+            metric_cols = st.columns(len(moduli_shown) + 2)
+            quality_slots = (len(moduli_shown), len(moduli_shown) + 1)
+            for slot, (label, value, unit, term) in enumerate(moduli_shown):
                 used = term in fitted_terms
                 std = fit.get(
-                    {"membrane": "Em_MPa_std", "interior": "Ei_kPa_std",
+                    {"tension": "T0_mN_m_std", "membrane": "Em_MPa_std",
+                     "interior": "Ei_kPa_std",
                      "nucleus": "En_kPa_std"}[term], float("nan")
                 )
                 if not used:
@@ -3596,14 +4003,14 @@ with tab_analysis:
                     delta=note,
                     delta_color="off",
                 )
-            metric_cols[3].metric(
+            metric_cols[quality_slots[0]].metric(
                 "R²", f"{fit['r_squared']:.4f}",
                 delta=f"adj {fit.get('adj_r_squared', float('nan')):.4f}"
                 if np.isfinite(fit.get("adj_r_squared", np.nan)) else None,
                 delta_color="off",
             )
             chi_red = fit.get("chi_squared_reduced", float("nan"))
-            metric_cols[4].metric(
+            metric_cols[quality_slots[1]].metric(
                 "χ²/dof",
                 f"{chi_red:.2f}" if np.isfinite(chi_red) else "n/a",
                 delta=f"χ² = {fit.get('chi_squared', float('nan')):.4g}"
@@ -3627,6 +4034,78 @@ with tab_analysis:
                 "order of magnitude, not to two decimal places."
             )
 
+            # How much each number depends on where the boundaries landed.
+            # A standard error is computed with the boundaries held fixed, so
+            # on a curve where the boundaries are not well determined it can
+            # be small next to a modulus that is not determined at all. This
+            # is the part that catches that.
+            spread = fit.get("breakpoint_spread")
+            if spread and spread.get("success") and spread["n_accepted"] > 1:
+                loose_rows, spread_rows = [], []
+                for key, unit, term in (
+                    ("T0_mN_m", "mN/m", "tension"),
+                    ("Em_MPa", "MPa", "membrane"),
+                    ("Ei_kPa", "kPa", "interior"),
+                    ("En_kPa", "kPa", "nucleus"),
+                ):
+                    if term not in fitted_terms:
+                        continue
+                    band = spread["ranges"].get(key)
+                    if not band or not np.isfinite(band["relative"]):
+                        continue
+                    spread_rows.append(
+                        {
+                            "modulus": components_for(
+                                st.session_state["cell_type"]
+                            )[term][0],
+                            "best fit": f"{band['value']:.4g} {unit}",
+                            "but anywhere in": (
+                                f"{band['low']:.4g} to {band['high']:.4g} {unit}"
+                            ),
+                            "how loose": f"{100 * band['relative']:.0f} % of itself",
+                        }
+                    )
+                    if band["relative"] > 0.5:
+                        loose_rows.append(term)
+                if spread_rows:
+                    with st.expander(
+                        "📏 How much do these numbers depend on where the "
+                        "boundaries were put?",
+                        expanded=bool(loose_rows),
+                    ):
+                        st.caption(
+                            f"ε₁ and ε₂ are fitted too, and "
+                            f"{spread['n_accepted']} placements of them fit "
+                            f"this curve within its own noise "
+                            f"(ε₁ from {spread['break_1_range'][0]:.3f} to "
+                            f"{spread['break_1_range'][1]:.3f}, ε₂ from "
+                            f"{spread['break_2_range'][0]:.3f} to "
+                            f"{spread['break_2_range'][1]:.3f}). This is the "
+                            f"range each modulus takes across all of them, "
+                            f"which is a truer error bar than the ± beside "
+                            f"each number: that one is worked out with the "
+                            f"boundaries held fixed, as though they were known."
+                        )
+                        flat_table(
+                            pd.DataFrame(spread_rows),
+                            align_right=["best fit", "but anywhere in",
+                                         "how loose"],
+                        )
+                        if loose_rows:
+                            st.warning(
+                                "**"
+                                + " and ".join(
+                                    components_for(
+                                        st.session_state["cell_type"]
+                                    )[t][0] for t in loose_rows
+                                )
+                                + "** moves by more than half its own value "
+                                "across boundaries this curve cannot tell "
+                                "apart. Quote it with that range, not with "
+                                "the ± above. A wider fitted range, or more "
+                                "points near ε = 0, is what narrows it."
+                            )
+
             st.caption(
                 f"Membrane areal modulus Eₘ·h = "
                 f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.4g} mN/m, which is what "
@@ -3647,7 +4126,9 @@ with tab_analysis:
                 cyto_mode_fit = fit.get("cyto_start", "break")
 
                 def state_words(term, lo, hi):
-                    if term == "membrane":
+                    # The two membrane springs are one piece of material, so
+                    # they load and hold together.
+                    if term in ("membrane", "tension"):
                         if hi <= e1 or membrane_mode_fit == "continue":
                             return "loading"
                         return "holding"
@@ -3668,8 +4149,8 @@ with tab_analysis:
                         continue
                     share = {}
                     for term, curve in (
-                        ("membrane", membrane), ("interior", interior),
-                        ("nucleus", nucleus),
+                        ("tension", tension), ("membrane", membrane),
+                        ("interior", interior), ("nucleus", nucleus),
                     ):
                         if curve is None:
                             share[term] = 0.0
@@ -3681,11 +4162,19 @@ with tab_analysis:
                         "range": f"{lo:.3f} to {hi:.3f}",
                         "points": int(inside.sum()),
                     }
-                    for term, label, key, unit in (
-                        ("membrane", "membrane", "Em_MPa", "MPa"),
-                        ("interior", "cytoskeleton", "Ei_kPa", "kPa"),
-                        ("nucleus", "nucleus", "En_kPa", "kPa"),
+                    short = {
+                        "tension": "tension", "membrane": "membrane",
+                        "interior": "cytoskeleton", "nucleus": "nucleus",
+                    }
+                    for term, key, unit in (
+                        ("tension", "T0_mN_m", "mN/m"),
+                        ("membrane", "Em_MPa", "MPa"),
+                        ("interior", "Ei_kPa", "kPa"),
+                        ("nucleus", "En_kPa", "kPa"),
                     ):
+                        if term not in terms_for(st.session_state["cell_type"]):
+                            continue
+                        label = short[term]
                         word = state_words(term, lo, hi)
                         carrying = term in fitted_terms and word != "not yet"
                         # The modulus in force here, not just in the fit as a
@@ -3693,7 +4182,8 @@ with tab_analysis:
                         # contributes exactly zero, and the row says so with a
                         # number rather than leaving you to infer it.
                         value = float(fit.get(key, 0.0)) if carrying else 0.0
-                        row[f"E {label}"] = f"{value:.4g} {unit}"
+                        symbol = "T₀" if term == "tension" else "E"
+                        row[f"{symbol} {label}"] = f"{value:.4g} {unit}"
                         # Short cells. The long sentences were being cut off
                         # by the table, which is worse than a word plus a
                         # legend underneath.
@@ -3709,13 +4199,9 @@ with tab_analysis:
 
                 if rows:
                     frame = pd.DataFrame(rows)
-                    st.dataframe(
-                        frame, hide_index=True,
-                        column_config={
-                            column: st.column_config.TextColumn(column, width="small")
-                            for column in frame.columns if column != "range"
-                        },
-                        **STRETCH,
+                    flat_table(
+                        frame,
+                        align_right=[c for c in frame.columns if c != "range"],
                     )
                     st.caption(
                         "**loading** = carrying more force as the squash "
@@ -3906,7 +4392,9 @@ with tab_analysis:
                                 Em_MPa=fit["Em_MPa"],
                                 Ei_kPa=fit["Ei_kPa"],
                                 En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                                T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
                                 show_nucleus="nucleus" in active,
+                                show_tension="tension" in active,
                             ),
                         ),
                         key="schematic_plot",
@@ -3923,19 +4411,11 @@ with tab_analysis:
                         st.session_state["video_end_frame"] or (vinfo["n_frames"] - 1),
                         float(epsilon.max()),
                     )
-                    vframe, vdet, vnuc, vprobe = cached_detection(
-                        st.session_state["video_path"],
-                        video_signature(),
-                        int(frame_index),
-                        st.session_state["video_roi"],
-                        float(st.session_state["video_sensitivity"]),
-                        bool(st.session_state["video_strip_lines"]),
-                        enhancement(),
-                        st.session_state["video_cell_side"],
-                        bool(st.session_state["video_reject_dark"]),
-                        bool(st.session_state["video_find_nucleus"]),
-                        st.session_state["video_appearance"],
-                    )
+                    # Through the shared reader, so a box drawn by hand and a
+                    # scale taken from the probe on the video tab apply here
+                    # too. This panel used to call the detector directly and
+                    # ignore both.
+                    vframe, vdet, vnuc, vprobe, vscale = detection_at(frame_index)
                     if vframe is None:
                         st.info("Frame unavailable.")
                     else:
@@ -3951,7 +4431,14 @@ with tab_analysis:
                             **STRETCH,
                         )
                         if vdet and vdet.get("found"):
-                            st.caption(f"Cell height {vdet['height_px']:.0f} px")
+                            height_note = f"Cell height {vdet['height_px']:.0f} px"
+                            if vscale:
+                                height_note += (
+                                    f" · {vdet['height_px'] * vscale:.2f} µm"
+                                )
+                            if vdet.get("manual"):
+                                height_note += " · outlined by hand"
+                            st.caption(height_note)
                         st.download_button(
                             "📷 Save screenshot",
                             data=png_bytes(snap),
@@ -4018,14 +4505,12 @@ with tab_analysis:
                             "staged result."
                         )
                     )
-                    st.dataframe(
+                    flat_table(
                         pd.DataFrame(fit["iterations"]).round(
                             {"Em_MPa": 4, "Ei_kPa": 4, "En_kPa": 4}
-                        ),
-                        hide_index=True,
-                        **STRETCH,
+                        ).astype(str),
                     )
-                    st.dataframe(
+                    flat_table(
                         pd.DataFrame(
                             [
                                 {
@@ -4035,15 +4520,14 @@ with tab_analysis:
                                     ),
                                     "ε window": f"{plan['range'][0]:.3f} to {plan['range'][1]:.3f}",
                                     "points": res["n_points"],
-                                    "R² in window": round(float(res["r_squared"]), 4),
+                                    "R² in window": f"{float(res['r_squared']):.4f}",
                                 }
                                 for i, (plan, res) in enumerate(
                                     zip(fit["stage_plan"], fit["stages"])
                                 )
                             ]
                         ),
-                        hide_index=True,
-                        **STRETCH,
+                        align_right=["points", "R² in window"],
                     )
                 else:
                     st.markdown("**How much does the answer depend on the window?**")
@@ -4110,28 +4594,13 @@ with tab_analysis:
                 "Compression video for this cell",
                 type=["mp4", "avi", "mov", "wmv", "mkv"],
                 key="video_file_main",
-                help="Uploaded here it is stored with the cell. The "
-                "**Compression video** tab has the detection controls if you "
-                "want the cell outlined and measured.",
+                help="The same video the **Compression video** tab works on: "
+                "upload it in either place and both see it. Outlining the "
+                "cell, measuring the probe and choosing the frame all happen "
+                "on that tab.",
             )
-            if (
-                main_video is not None
-                and st.session_state.get("video_name") != main_video.name
-                and not VIDEO_IMPORT_ERROR
-            ):
-                destination = os.path.join(
-                    tempfile.gettempdir(), f"afm_video_{main_video.name}"
-                )
-                with open(destination, "wb") as handle:
-                    handle.write(main_video.getvalue())
-                st.session_state["video_path"] = destination
-                st.session_state["video_name"] = main_video.name
-                st.session_state["video_track"] = None
-                try:
-                    st.session_state["video_info"] = va.probe(destination)
-                except Exception as exc:
-                    st.session_state["video_info"] = None
-                    st.error(f"Could not open that video: {exc}")
+            if not VIDEO_IMPORT_ERROR and adopt_video(main_video, "video_file_main"):
+                st.rerun()
         with v2:
             info = st.session_state.get("video_info")
             if info:
@@ -4154,6 +4623,12 @@ with tab_analysis:
                         st.session_state["video_saved_frame"] = None
                         st.session_state["video_saved_frame_index"] = None
                         st.rerun()
+                st.caption(
+                    "To choose the frame, outline the cell by hand or set the "
+                    "scale from the probe, go to the **Compression video** "
+                    "tab and press **📸 Use this frame for the cell**. What "
+                    "you pin there is what is sent from here."
+                )
             else:
                 st.caption("No video loaded for this cell.")
 
@@ -4309,7 +4784,10 @@ with tab_video:
         src1, src2 = st.columns([1, 1])
         with src1:
             uploaded_video = st.file_uploader(
-                "Upload video", type=["mp4", "avi", "mov", "wmv", "mkv"], key="video_file"
+                "Upload video", type=["mp4", "avi", "mov", "wmv", "mkv"],
+                key="video_file",
+                help="The same video as the one in section 7 of the analysis "
+                "tab. Uploading in either place loads it for both.",
             )
         with src2:
             st.text_input(
@@ -4334,22 +4812,14 @@ with tab_video:
                     st.session_state["video_name"] = "linked video"
                     st.session_state["video_info"] = va.probe(dest)
                     st.session_state["video_track"] = None
+                    st.session_state["video_saved_frame"] = None
+                    st.session_state["video_saved_frame_index"] = None
                     st.rerun()
                 except Exception as exc:
                     st.error(f"{exc}")
 
-        if uploaded_video is not None and st.session_state["video_name"] != uploaded_video.name:
-            path = os.path.join(tempfile.gettempdir(), f"afm_video_{uploaded_video.name}")
-            with open(path, "wb") as handle:
-                handle.write(uploaded_video.getvalue())
-            st.session_state["video_path"] = path
-            st.session_state["video_name"] = uploaded_video.name
-            st.session_state["video_track"] = None
-            try:
-                st.session_state["video_info"] = va.probe(path)
-            except Exception as exc:
-                st.session_state["video_info"] = None
-                st.error(f"Could not open that video: {exc}")
+        if adopt_video(uploaded_video, "video_file"):
+            st.rerun()
 
         info = st.session_state.get("video_info")
         path = st.session_state.get("video_path")
@@ -4480,29 +4950,13 @@ with tab_video:
             )
 
             preview_frame = st.slider("Preview frame", 0, last, key="video_preview_frame")
-            frame, det, nucleus, probe_box = cached_detection(
-                path,
-                signature,
-                int(preview_frame),
-                roi,
-                float(st.session_state["video_sensitivity"]),
-                bool(st.session_state["video_strip_lines"]),
-                enhancement(),
-                st.session_state["video_cell_side"],
-                bool(st.session_state["video_reject_dark"]),
-                bool(st.session_state["video_find_nucleus"]),
-                st.session_state["video_appearance"],
-            )
-
-            if st.session_state["video_manual_cell"] and frame is not None:
-                bx = st.session_state["video_cell_box_x"]
-                by = st.session_state["video_cell_box_y"]
-                det = va.manual_detection(frame, (bx[0], by[0], bx[1], by[1]))
-
-            scale_um_px, scale_detail = None, ""
+            # One reader for the whole app, so what is set here is what every
+            # other part of the app sees.
+            frame, det, nucleus, probe_box, scale_um_px = detection_at(preview_frame)
+            scale_detail = ""
             if st.session_state["video_use_probe_scale"] and frame is not None:
                 px = st.session_state["video_probe_box_x"]
-                scale_um_px, scale_detail = va.scale_from_probe(
+                _, scale_detail = va.scale_from_probe(
                     (px[0], 0.0, px[1], 0.0), frame.shape,
                     float(st.session_state["video_probe_width_um"]),
                 )
@@ -5064,21 +5518,22 @@ with tab_db:
                     st.session_state["archive_index"] = None
                     if done:
                         st.success(f"Refitted {len(done)} cell(s).")
-                        st.dataframe(
+                        flat_table(
                             pd.DataFrame(
                                 [
                                     {
                                         "cell": r["cell_id"],
-                                        "Eₘ (MPa)": round(r["Em_MPa"], 4),
-                                        "Ec (kPa)": round(r["Ec_kPa"], 4),
-                                        "Eₙ (kPa)": round(r["En_kPa"], 4),
-                                        "R²": round(r["r_squared"], 4),
+                                        "Eₘ (MPa)": f"{r['Em_MPa']:.4f}",
+                                        "Ec (kPa)": f"{r['Ec_kPa']:.4f}",
+                                        "Eₙ (kPa)": f"{r['En_kPa']:.4f}",
+                                        "R²": f"{r['r_squared']:.4f}",
                                     }
                                     for r in done
                                 ]
                             ),
-                            hide_index=True,
-                            **STRETCH,
+                            align_right=[
+                                "Eₘ (MPa)", "Ec (kPa)", "Eₙ (kPa)", "R²",
+                            ],
                         )
                     for message in failed:
                         st.warning(message)
@@ -5120,7 +5575,7 @@ with tab_db:
                                 pending[f"window_term_{term}"] = tuple(window)
                             if settings.get("combined_window"):
                                 pending["window_combined"] = tuple(settings["combined_window"])
-                            for term in TERM_ORDER:
+                            for term in ALL_TERMS:
                                 pending[f"use_{term}"] = term in (settings.get("terms") or [])
                             pending["_applied_cell_type"] = settings.get("cell_type")
                             st.session_state["_pending_settings"] = pending
