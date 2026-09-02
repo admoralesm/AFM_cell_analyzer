@@ -1678,7 +1678,7 @@ class _CompositionMixin:
         does not pin down, however good the R-squared looks.
         """
         nice = {
-            "tension": "the membrane's in-plane tension T₀",
+            "tension": "the in-plane spring T₀",
             "membrane": "the membrane's elastic modulus Eₘ",
             "interior": "the interior network Ec",
             "nucleus": "the deeper layer Eₙ",
@@ -3613,6 +3613,156 @@ def _aicc(ss_res, n, k):
     if n <= 0 or ss_res <= 0 or n - k - 1 <= 0:
         return float("nan")
     return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+
+
+def recommend_components(
+    model, epsilon_min, epsilon_max, candidates=("membrane", "interior", "nucleus"),
+    e1=None, e2=None, membrane="continue", cyto_start="zero",
+    weighting="uniform", n_folds=5, seed=0, cv_repeats=3, required=("membrane",),
+):
+    """
+    Which of the available elements this curve actually needs.
+
+    Every subset of ``candidates`` is fitted at the same boundaries and
+    scored the same way, by how well it predicts points it was not fitted
+    on. That is the question "is this element real" asked properly: a term
+    added to a fit can only ever lower the residual on the points it was
+    fitted to, so residuals cannot answer it, and only held-out error can.
+
+    ``required`` names elements that are never dropped. The membrane's cube
+    law is the Lulevich model; a fit without it is a different model, not a
+    simpler one.
+
+    Where several subsets predict equally well the smallest wins, for the
+    reason it always does here: an element the curve cannot see gives a
+    modulus that will wander from cell to cell while its neighbours absorb
+    the difference.
+    """
+    lo, hi = float(epsilon_min), float(epsilon_max)
+    eps_all, force_all, _ = model._select(lo, hi)
+    n = eps_all.size
+    if n < 20:
+        return {"success": False, "error": f"Only {n} points; need at least 20."}
+
+    e1 = model.segment_break_1 if e1 is None else float(e1)
+    e2 = model.segment_break_2 if e2 is None else float(e2)
+    pool = [t for t in COMPOSITION_TERMS if t in candidates]
+    if not pool:
+        return {"success": False, "error": "No elements to choose between."}
+    fixed = tuple(t for t in required if t in pool)
+
+    fold_sets = []
+    for repeat in range(max(1, int(cv_repeats))):
+        rng = np.random.default_rng(seed + repeat)
+        fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
+
+    optional = [t for t in pool if t not in fixed]
+    rows = []
+    for mask in range(1 << len(optional)):
+        subset = tuple(fixed) + tuple(
+            t for i, t in enumerate(optional) if mask & (1 << i)
+        )
+        if not subset:
+            continue
+        subset = tuple(t for t in COMPOSITION_TERMS if t in subset)
+        flags = {
+            "use_membrane": "membrane" in subset,
+            "use_interior": "interior" in subset,
+            "use_nucleus": "nucleus" in subset,
+            "use_tension": "tension" in subset,
+        }
+        whole = model.fit_composition(
+            lo, hi, e1, e2, membrane, cyto_start, weighting=weighting, **flags
+        )
+        if not whole.get("success"):
+            continue
+
+        per_repeat = []
+        for folds in fold_sets:
+            errors = []
+            for fold in folds:
+                if fold.size == 0 or fold.size >= n - 3:
+                    continue
+                keep = np.ones(n, dtype=bool)
+                keep[fold] = False
+                sub = model._clone(force_all[keep], eps_all[keep])
+                trained = sub.fit_composition(
+                    lo, hi, e1, e2, membrane, cyto_start, weighting=weighting,
+                    with_stats=False, **flags
+                )
+                if not trained.get("success"):
+                    continue
+                basis = model.composition_basis(
+                    eps_all[fold], e1, e2, membrane, cyto_start
+                )
+                predicted = (
+                    basis["membrane"] * trained["Em"]
+                    + basis["tension"] * trained.get("T0", 0.0)
+                    + basis["interior"] * trained["Ei"]
+                    + basis["nucleus"] * trained["En"]
+                    + trained.get("force_offset", 0.0)
+                )
+                errors.append(
+                    float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                )
+            if errors:
+                per_repeat.append(float(np.mean(errors)))
+
+        rows.append({
+            "terms": subset,
+            "n_terms": len(subset),
+            "cv_rmse": float(np.mean(per_repeat)) if per_repeat else float("nan"),
+            "cv_spread": float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+            "r_squared": whole["r_squared"],
+            "n_params": whole["n_params"],
+            "aicc": _aicc(whole["ss_res"], n, whole["n_params"]),
+            "T0_mN_m": whole.get("T0_mN_m", 0.0),
+            "Em_MPa": whole["Em_MPa"],
+            "Ec_kPa": whole["Ei_kPa"],
+            "En_kPa": whole["En_kPa"],
+            # An element that came back at zero was in the fit and did
+            # nothing, which is the same answer as leaving it out but with
+            # an extra parameter spent saying so.
+            "empty": tuple(
+                t for t, v in (
+                    ("tension", whole.get("T0_mN_m", 0.0)),
+                    ("membrane", whole["Em_MPa"]),
+                    ("interior", whole["Ei_kPa"]),
+                    ("nucleus", whole["En_kPa"]),
+                ) if t in subset and v <= 0
+            ),
+            "fit": whole,
+        })
+
+    usable = [r for r in rows if np.isfinite(r["cv_rmse"])]
+    if not usable:
+        return {"success": False, "error": "No combination produced a usable fit."}
+
+    usable.sort(key=lambda r: r["cv_rmse"])
+    lowest = usable[0]
+    tolerance = max(
+        0.05 * lowest["cv_rmse"],
+        lowest["cv_spread"] + max(r["cv_spread"] for r in usable),
+    )
+    tied = [r for r in usable[1:] if r["cv_rmse"] - lowest["cv_rmse"] <= tolerance]
+    best = min(
+        [lowest] + tied,
+        key=lambda r: (len(r["empty"]), r["n_terms"], r["cv_rmse"]),
+    )
+    for row in usable:
+        row["recommended"] = row is best
+        row["tied_with_best"] = row is not best and (row in tied or row is lowest)
+
+    dropped = tuple(t for t in pool if t not in best["terms"])
+    return {
+        "success": True,
+        "candidates": usable,
+        "best": best,
+        "recommended": best["terms"],
+        "dropped": dropped,
+        "tie_tolerance": float(tolerance),
+        "clear_cut": not tied,
+    }
 
 
 def search_arrangements(
