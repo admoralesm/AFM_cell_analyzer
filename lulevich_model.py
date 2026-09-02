@@ -2075,6 +2075,7 @@ class _CompositionMixin:
             # the true composition look like the worst one on the list.
             shell_thickness=self.h_shell,
             deep_uses_cell_radius=self.deep_uses_cell_radius,
+            sarcomere_length=self.L_sarcomere,
             poisson_membrane=self.nu_m,
             poisson_interior=self.nu_i,
             nucleus_radius=self.R_nucleus,
@@ -2106,6 +2107,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         nucleus_from_radius=0.35,
         poisson_nucleus=0.5,
         nucleus_onset=0.15,
+        sarcomere_length=2.1e-6,
         expected_ranges=None,
         active_windows=None,
         segment_break_1=0.15,
@@ -2134,6 +2136,9 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             Nucleus radius as a fraction of the cell radius.
         poisson_nucleus : float
             Poisson ratio of the nucleus.
+        sarcomere_length : float
+            Relaxed sarcomere length in metres, 2.1 um for cardiac muscle.
+            Used only by :meth:`sarcomere_at`, never by the fit.
         nucleus_onset : float
             Relative deformation at which the plates begin to feel the nucleus.
             Below it the nucleus term is exactly zero. See
@@ -2200,6 +2205,9 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
         )
         self.nucleus_onset = float(nucleus_onset)
+        # Relaxed sarcomere length. Nothing in the fit uses it; it turns the
+        # fitted deformation into a length a muscle physiologist can judge.
+        self.L_sarcomere = float(sarcomere_length)
         self.segment_break_1 = float(segment_break_1)
         self.segment_break_2 = float(segment_break_2)
         self.active_windows = (
@@ -2243,6 +2251,71 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             * self.cell_height ** 1.5
             / (3.0 * (1.0 - self.nu_i ** 2))
         )
+
+    def sarcomere_at(self, epsilon, spread=1.0):
+        """
+        Sarcomere length at a given deformation, in metres.
+
+        Squashing a cardiomyocyte does not shorten its sarcomeres, it
+        lengthens them. The myofibrils run along the cell's long axis, across
+        the direction of the squash, and a cell that keeps its volume has to
+        spread sideways by exactly as much as it loses in height. That
+        spreading pulls the sarcomeres out.
+
+        Constant volume gives in-plane linear stretch (1 - e)^(-1/2) if the
+        cell spreads equally in both in-plane directions, so
+
+            L(e) = L0 (1 - e)^(-spread/2)
+
+        ``spread`` is how much of that spreading goes along the myofibrils.
+        1.0 is a cell free to spread in every direction, which is the most
+        the sarcomeres can lengthen. 0.0 is a cell held at its ends, where
+        they do not lengthen at all. The truth for an attached cell is
+        somewhere between, and the two ends are worth quoting as bounds
+        rather than picking one and calling it the answer.
+
+        This is geometry and nothing else. No fitted quantity depends on it;
+        it exists so the fitted range can be read as a sarcomere length and
+        checked against what a sarcomere can actually do.
+        """
+        eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, 0.999)
+        return self.L_sarcomere * (1.0 - eps) ** (-0.5 * float(spread))
+
+    def sarcomere_report(self, epsilon_max, onset=None, spread=1.0,
+                         working_ratio=1.10):
+        """
+        What the fitted range means in sarcomere lengths.
+
+        ``working_ratio`` sets the top of the useful range as a multiple of
+        the relaxed length, defaulting to 1.10 (2.31 um for a 2.1 um
+        sarcomere), roughly where actin and myosin overlap stops improving
+        and the descending limb begins. It is expressed as a ratio so that
+        changing the relaxed length moves the band with it, instead of
+        leaving a hard-coded number behind that no longer belongs to it.
+        """
+        top = float(self.sarcomere_at(epsilon_max, spread))
+        limit = self.L_sarcomere * float(working_ratio)
+        # The deformation at which the sarcomere reaches that limit.
+        reached = 1.0 - float(working_ratio) ** (-2.0 / max(spread, 1e-9)) \
+            if spread > 0 else float("inf")
+        out = {
+            "relaxed_nm": self.L_sarcomere * 1e9,
+            "at_epsilon_max_nm": top * 1e9,
+            "epsilon_max": float(epsilon_max),
+            "working_limit_nm": limit * 1e9,
+            "epsilon_at_limit": reached,
+            "stretch": top / self.L_sarcomere,
+            "spread": float(spread),
+            "beyond_working_range": top > limit,
+            # How many sarcomeres lie along the cell, which is what makes the
+            # myofibril modulus a per-cell number rather than a per-sarcomere
+            # one.
+            "n_along_cell": (2.0 * self.R0) / self.L_sarcomere,
+        }
+        if onset is not None:
+            out["onset"] = float(onset)
+            out["at_onset_nm"] = float(self.sarcomere_at(onset, spread)) * 1e9
+        return out
 
     @property
     def At(self):
