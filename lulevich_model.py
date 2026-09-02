@@ -1172,6 +1172,119 @@ COMPOSITIONS = [
 ]
 
 
+def noise_sigma(epsilon, force, window=21):
+    """
+    Estimate the measurement noise along a force curve, point by point.
+
+    There are no error bars on an AFM curve, so chi-squared has nothing to
+    divide by unless the noise is estimated from the data itself. Successive
+    points sit close together in deformation, so the true force barely changes
+    between them and their difference is almost pure noise.
+
+    The estimate is local rather than global because noise on these curves is
+    rarely constant: it often grows with force, and a single number then reads
+    the quiet low-force end and calls the whole curve that quiet, which makes
+    chi-squared far too large. A rolling median over ``window`` points follows
+    the real scatter instead.
+
+    The 0.6745 converts a median absolute deviation to a standard deviation
+    for Gaussian noise, and the sqrt(2) removes the variance doubling that
+    differencing introduces.
+
+    Returns
+    -------
+    (sigma_per_point, sigma_typical) : array in the order given, and one
+    representative number for reporting.
+    """
+    force = np.asarray(force, dtype=float)
+    n = force.size
+    if n < 4:
+        return np.full(n, np.nan), float("nan")
+
+    order = np.argsort(np.asarray(epsilon, dtype=float))
+    ordered = force[order]
+    diffs = np.abs(np.diff(ordered))
+    # One difference per point: pad the last so lengths line up.
+    diffs = np.append(diffs, diffs[-1] if diffs.size else np.nan)
+
+    half = max(2, int(window) // 2)
+    local = np.empty(n)
+    for index in range(n):
+        lo, hi = max(0, index - half), min(n, index + half + 1)
+        chunk = diffs[lo:hi]
+        chunk = chunk[np.isfinite(chunk)]
+        local[index] = np.median(chunk) if chunk.size else np.nan
+
+    local = local / 0.6745 / np.sqrt(2.0)
+    finite = local[np.isfinite(local) & (local > 0)]
+    if finite.size == 0:
+        return np.full(n, np.nan), float("nan")
+
+    # A flat stretch can give a local median of exactly zero, which would
+    # divide by nothing; hold those at the smallest real estimate.
+    floor = float(np.min(finite))
+    local[~np.isfinite(local) | (local <= 0)] = floor
+
+    sigma = np.empty(n)
+    sigma[order] = local
+    return sigma, float(np.median(finite))
+
+
+def fit_statistics(force, predicted, n_params, sigma=None, epsilon=None):
+    """
+    Goodness-of-fit numbers for one fitted curve.
+
+    Returns R², adjusted R², chi-squared, reduced chi-squared and the noise
+    level it was measured against. Reduced chi-squared is the useful one: it
+    compares the residuals against the scatter in the data, so about 1 means
+    the model is as close to the points as the noise allows, well above 1
+    means the model is missing something real, and well below 1 means the
+    noise estimate is too generous rather than that the fit is unusually good.
+    """
+    force = np.asarray(force, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    keep = np.isfinite(force) & np.isfinite(predicted)
+    force, predicted = force[keep], predicted[keep]
+    n = force.size
+    residuals = force - predicted
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((force - force.mean()) ** 2)) if n else 0.0
+
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    dof = n - int(n_params)
+    adjusted = (
+        1.0 - (1.0 - r_squared) * (n - 1) / dof
+        if dof > 0 and np.isfinite(r_squared) else float("nan")
+    )
+
+    if sigma is None:
+        sigma, typical = noise_sigma(
+            epsilon[keep] if epsilon is not None else np.arange(n), force
+        )
+    else:
+        sigma = np.asarray(sigma, dtype=float)
+        typical = float(np.median(sigma[np.isfinite(sigma)])) if sigma.size else float("nan")
+
+    sigma = np.asarray(sigma, dtype=float)
+    usable = np.isfinite(sigma) & (sigma > 0) & np.isfinite(residuals)
+    if usable.any():
+        chi_squared = float(np.sum((residuals[usable] / sigma[usable]) ** 2))
+        chi_reduced = chi_squared / dof if dof > 0 else float("nan")
+    else:
+        chi_squared = chi_reduced = float("nan")
+
+    return {
+        "r_squared": r_squared,
+        "adj_r_squared": adjusted,
+        "chi_squared": float(chi_squared),
+        "chi_squared_reduced": float(chi_reduced),
+        "noise_sigma": float(typical),
+        "dof": int(dof),
+        "n_points": int(n),
+        "ss_res": ss_res,
+    }
+
+
 class _CompositionMixin:
     """Fit and compare the ways the stages can be composed."""
 
@@ -1247,8 +1360,10 @@ class _CompositionMixin:
         predicted = m_basis * Em + c_basis * Ec + n_basis * En
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
-        ss_tot = float(np.sum((force - force.mean()) ** 2))
-        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        # The two breakpoints are free parameters too, so they count against
+        # the degrees of freedom that reduced chi-squared divides by.
+        stats = fit_statistics(force, predicted, n_params + 2, epsilon=eps)
+        r_squared = stats["r_squared"]
 
         return {
             "success": True,
@@ -1270,7 +1385,11 @@ class _CompositionMixin:
             / (K_BOLTZMANN * 300.0),
             "membrane_areal_modulus": Em * self.h_membrane,
             "r_squared": r_squared,
-            "adj_r_squared": float("nan"),
+            "adj_r_squared": stats["adj_r_squared"],
+            "chi_squared": stats["chi_squared"],
+            "chi_squared_reduced": stats["chi_squared_reduced"],
+            "noise_sigma": stats["noise_sigma"],
+            "dof": stats["dof"],
             "rmse": float(np.sqrt(ss_res / eps.size)),
             "residual_std": float(np.std(residuals)),
             "n_points": int(eps.size),
