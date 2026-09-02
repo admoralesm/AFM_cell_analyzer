@@ -81,6 +81,46 @@ PLAUSIBLE_EM_PA = (1e3, 1e9)      # 1 kPa .. 1 GPa
 PLAUSIBLE_EI_PA = (1e0, 1e7)      # 1 Pa  .. 10 MPa
 K_BOLTZMANN = 1.380649e-23
 
+# The elements the classic three-spring machinery knows about. The membrane's
+# in-plane tension is a fourth, and only the composition fit implements it, so
+# every other entry point has to be told what to do when it arrives.
+CLASSIC_TERMS = ("membrane", "interior", "nucleus")
+
+# Term name -> the key its modulus is stored under.
+TERM_KEYS = {
+    "tension": "T0", "membrane": "Em", "interior": "Ei", "nucleus": "En",
+}
+
+
+def classic_terms(terms):
+    """
+    Split a term list into what the three-spring paths can carry, and what
+    they cannot.
+
+    Silently dropping the tension spring here would be worse than crashing:
+    the caller would get a three-spring answer labelled as a four-spring one.
+    So it comes back separately, and every caller turns it into a warning that
+    names the model that does implement it.
+    """
+    wanted = tuple(terms or ())
+    kept = tuple(t for t in wanted if t in CLASSIC_TERMS)
+    dropped = tuple(t for t in wanted if t not in CLASSIC_TERMS)
+    return (kept or CLASSIC_TERMS), dropped
+
+
+def dropped_term_warning(dropped):
+    """One sentence naming what was left out, and where it does work."""
+    if not dropped:
+        return []
+    names = {"tension": "the membrane's in-plane tension, T₀"}
+    listed = " and ".join(names.get(t, t) for t in dropped)
+    return [
+        f"This model does not have {listed}, so it was left out. The moduli "
+        f"here describe the rest of the cell only, and the membrane number "
+        f"will have absorbed some of what the missing spring would have "
+        f"carried. Use the segmented model, which is the one that has it."
+    ]
+
 
 # ============================================================================
 #  Coupling: how the elements share load
@@ -219,6 +259,7 @@ class _CouplingMixin:
         error. On a synthetic series curve the linear stage alone returns
         Em = 3.9 MPa against a true 2.5; refined it returns 2.5.
         """
+        terms, dropped = classic_terms(terms)
         eps, force, mask = self._select(epsilon_min, epsilon_max)
         usable = force > 0
         eps, force = eps[usable], force[usable]
@@ -275,7 +316,7 @@ class _CouplingMixin:
         ss_tot = float(np.sum((force - force.mean()) ** 2))
         r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
-        warnings_list = []
+        warnings_list = dropped_term_warning(dropped)
         for value, label in ((Em, "Em"), (Ec, "Ec"), (En, "En")):
             if np.isinf(value):
                 warnings_list.append(
@@ -407,6 +448,7 @@ class _CouplingMixin:
                 f"Crossover e = {crossover:.3f} lies outside the fitted window."
             )
 
+        terms, dropped = classic_terms(terms)
         if seed is None:
             base = self.fit(epsilon_min, epsilon_max, terms=terms)
             seed = (
@@ -490,7 +532,7 @@ class _CouplingMixin:
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An,
             "mask": mask,
-            "warnings": [],
+            "warnings": dropped_term_warning(dropped),
         }
         self.results["hybrid"] = out
         return out
@@ -592,6 +634,7 @@ class _SegmentedMixin:
             Which of the three stages to include. Dropping one simply removes
             its column.
         """
+        terms, dropped = classic_terms(terms)
         e1 = self.segment_break_1 if e1 is None else float(e1)
         e2 = self.segment_break_2 if e2 is None else float(e2)
         if not (0 <= e1 < e2):
@@ -660,12 +703,12 @@ class _SegmentedMixin:
         f_mem, f_cyt, f_nuc = float(m_top[0] * Em), float(c_top[0] * Ec), float(n_top[0] * En)
         total = f_mem + f_cyt + f_nuc
 
-        warnings_list = []
+        warnings_list = dropped_term_warning(dropped)
         for value, key, unit, scale_to in (
             (Em, "Em", "MPa", 1e6), (Ec, "Ei", "kPa", 1e3), (En, "En", "kPa", 1e3),
         ):
             label = {"Em": "Em", "Ei": "Ec", "En": "En"}[key]
-            if key in [{"membrane": "Em", "interior": "Ei", "nucleus": "En"}[t] for t in terms]:
+            if key in [TERM_KEYS[t] for t in terms if t in TERM_KEYS]:
                 if value <= 0:
                     warnings_list.append(
                         f"{label} came out zero: its segment shows no rise that the "
@@ -2371,9 +2414,9 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             only when the input data is unusable (too few points, degenerate).
         """
         fixed = dict(fixed or {})
+        terms, dropped = classic_terms(terms)
         # A term that is held fixed is not a free parameter.
-        _fixed_key = {"membrane": "Em", "interior": "Ei", "nucleus": "En"}
-        free_terms = tuple(t for t in terms if _fixed_key.get(t) not in fixed)
+        free_terms = tuple(t for t in terms if TERM_KEYS.get(t) not in fixed)
 
         eps, force_all, mask = self._select(epsilon_min, epsilon_max)
         force = force_all.copy()
@@ -2462,7 +2505,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
 
         Km = Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2))
 
-        warnings_list = self._warnings(
+        warnings_list = dropped_term_warning(dropped) + self._warnings(
             Em, Ei, names, cond, r_squared, eps.size, membrane_fraction, En=En
         )
 
@@ -2646,11 +2689,22 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             Same shape as :meth:`fit`, plus ``stages``, ``iterations`` and a
             joint ``r_squared`` over the union of all windows.
         """
+        # Staged fitting runs on the three classic springs. A stage that
+        # asked only for something else has nothing left to solve and is
+        # dropped along with it.
+        dropped = tuple(dict.fromkeys(
+            t for st in stages for t in (st.get("terms") or ())
+            if t not in CLASSIC_TERMS
+        ))
         stages = [
-            {"terms": tuple(st["terms"]), "range": (float(st["range"][0]), float(st["range"][1]))}
+            {
+                "terms": tuple(t for t in st["terms"] if t in CLASSIC_TERMS),
+                "range": (float(st["range"][0]), float(st["range"][1])),
+            }
             for st in stages
             if st.get("terms")
         ]
+        stages = [st for st in stages if st["terms"]]
         if not stages:
             return self._failure("No stages defined.")
 
@@ -2695,7 +2749,9 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
                     fixed=carry or None,
                 )
                 if not result.get("success"):
-                    labels = ", ".join(self.TERM_LABEL[t] for t in st["terms"])
+                    labels = ", ".join(
+                        self.TERM_LABEL.get(t, t) for t in st["terms"]
+                    )
                     return self._failure(f"Stage '{labels}': {result['error']}")
                 for t in st["terms"]:
                     estimates[self.TERM_KEY[t]] = result[self.TERM_KEY[t]]
@@ -2737,7 +2793,10 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         f_nuc = float(self.nucleus_model(e_top, En)) if En else 0.0
         f_tot = f_mem + f_int + f_nuc
 
-        warnings_list = self._staged_warnings(stages, estimates, r_squared)
+        warnings_list = (
+            dropped_term_warning(dropped)
+            + self._staged_warnings(stages, estimates, r_squared)
+        )
 
         out = {
             "success": True,
@@ -2812,7 +2871,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         for term, key in self.TERM_KEY.items():
             if any(term in st["terms"] for st in stages) and estimates[key] <= 0:
                 warnings_list.append(
-                    f"The {self.TERM_LABEL[term]} modulus came out zero: its window "
+                    f"The {self.TERM_LABEL.get(term, term)} modulus came out zero: its window "
                     f"holds no signal of that term's shape once the others are removed."
                 )
         if np.isfinite(r_squared) and r_squared < 0.9:
