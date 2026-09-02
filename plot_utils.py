@@ -659,8 +659,12 @@ def cell_schematic(
             begin = float(np.clip(starts.get(term, 0.0), 0.0, 0.95))
             # An element that starts late is compressed over less of the
             # cell's travel, so its spring occupies the top of that travel.
-            bottom = h * (0.15 + 0.70 * begin)
-            return bottom, h * 0.85
+            # The mapping is deliberately steep: a nucleus first met at 40 %
+            # has done well under half the work the membrane has, and a
+            # spring that looks nearly full length says otherwise.
+            top = h * 0.85
+            travel = h * 0.70 * max(1.0 - begin / 0.65, 0.18)
+            return top - travel, top
 
         cyto_bottom, cyto_top = spring_span("interior")
         _add_spring(fig, -r * 0.50, cyto_bottom, cyto_top, r * 0.30,
