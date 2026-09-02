@@ -520,20 +520,46 @@ def _hatched_ground(fig, x0, x1, y, depth, color="#2c3e50"):
 COIL_PITCH = 7.0
 
 
-def _zigzag(x, y_bottom, y_top, width, coils=None, pitch=COIL_PITCH):
+def _zigzag(x, y_bottom, y_top, width, coils=None, pitch=COIL_PITCH,
+            round_coils=True):
     """
     Points for a spring drawn between two heights.
 
     ``coils`` is derived from the height so every spring in a figure shares
     the same pitch; pass a number only to override that.
+
+    ``round_coils`` draws a real helix rather than a zigzag: each turn is a
+    sine in x against a straight climb in y, which is how a spring is drawn
+    anywhere outside a circuit diagram. A zigzag with few turns reads as a
+    lightning bolt, and with many turns in a narrow column it fills in
+    solid; the sine keeps its shape at both extremes, which is what a
+    schematic with four elements side by side needs.
     """
     span = y_top - y_bottom
     lead = span * 0.12
     body_bottom, body_top = y_bottom + lead, y_top - lead
     if coils is None:
         coils = int(round(max(2.0, (body_top - body_bottom) / max(pitch, 1e-9))))
+    coils = max(1, int(coils))
+
+    if round_coils:
+        # Enough points per turn that the curve is smooth at any size.
+        per_turn = 24
+        total = coils * per_turn
+        xs, ys = [x], [y_bottom]
+        for i in range(total + 1):
+            fraction = i / total
+            ys.append(body_bottom + (body_top - body_bottom) * fraction)
+            # Held at zero for the first and last tenth of a turn so the coil
+            # meets its lead-in straight rather than at an angle.
+            taper = min(1.0, fraction * coils * 4.0, (1.0 - fraction) * coils * 4.0)
+            xs.append(x + (width / 2) * taper * np.sin(2 * np.pi * coils * fraction))
+        xs.append(x)
+        ys.append(y_top)
+        return xs, ys
+
     xs, ys = [x], [y_bottom]
-    steps = max(2, int(coils) * 2)
+    steps = max(2, coils * 2)
     for i in range(steps + 1):
         ys.append(body_bottom + (body_top - body_bottom) * i / steps)
         # The parentheses matter. Without them Python reads this as
@@ -714,7 +740,9 @@ def cell_schematic(
         fig.add_trace(
             go.Scatter(
                 x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
-                line=dict(color=colour, width=3),
+                # Thicker, because four of these across a narrow panel with a
+                # 3 px line read as hairlines.
+                line=dict(color=colour, width=5, shape="spline"),
             )
         )
 
@@ -739,7 +767,7 @@ def cell_schematic(
             slice_h = (PLATEN_Y - GROUND_Y) * max(
                 weights.get(term, 1.0 / len(terms)), 0.05
             ) / total
-            draw_element(term, 40, y, y + slice_h, 16)
+            draw_element(term, 40, y, y + slice_h, 20)
             y += slice_h
         subtitle = "Stacked: same force through each, squashes add"
     else:
@@ -750,8 +778,11 @@ def cell_schematic(
                           line=dict(color="#2c3e50", width=2))
             fig.add_shape(type="line", x0=x, x1=x, y0=GROUND_Y, y1=GROUND_Y + 3,
                           line=dict(color="#2c3e50", width=2))
+            # Wider springs, not narrower ones, when there are more of them:
+            # a coil needs amplitude to read as a coil. The room comes from
+            # the spacing instead.
             draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
-                         13 if len(terms) < 4 else 10)
+                         16 if len(terms) < 4 else 13)
         subtitle = "Side by side: same squash on each, forces add"
 
     fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True)
@@ -766,6 +797,162 @@ def cell_schematic(
             font=dict(size=max(11, style.tick_size - 5), color="black"),
             x=0.5, xanchor="center",
         ),
+    )
+    return fig
+
+
+def balloon_figure(
+    style: PlotStyle,
+    epsilon=0.0,
+    cell_height_um=8.0,
+    labels=None,
+    show_nucleus=True,
+    show_tension=False,
+    deep_onset=None,
+    height=None,
+):
+    """
+    The cell as a balloon with a spring inside, squashed between two plates.
+
+    The mechanics schematic says what the model computes. This says what the
+    model is *about*, which is a different job and a picture people read
+    faster: a taut skin holding an interior, flattened between a cantilever
+    and a dish, spreading sideways because it keeps its volume.
+
+    Drawn from the same numbers as everything else. The outline is a stadium
+    of constant area, which is what a squashed cylinder's cross-section
+    actually is, so the widening is the real widening rather than a
+    suggestion of one, and the spring inside shortens by exactly the
+    deformation on display.
+    """
+    names = labels or {
+        "membrane": ("Membrane", ""), "interior": ("Cytoskeleton", ""),
+        "nucleus": ("Nucleus", ""), "tension": ("In-plane spring", ""),
+    }
+    eps = float(np.clip(epsilon, 0.0, 0.9))
+    fig = go.Figure()
+
+    GROUND_Y, CEILING = 12.0, 86.0
+    R0 = 26.0                     # resting half-height, in figure units
+    half_height = R0 * (1.0 - eps)
+    # Constant area: pi R0^2 = pi h^2 + 2 h w, with h the half-height.
+    width = max(
+        0.0, (np.pi * R0 ** 2 - np.pi * half_height ** 2) / (2 * 2 * half_height)
+    )
+    centre_y = GROUND_Y + 14.0 + half_height
+    centre_x = 50.0
+
+    # ---- the plates
+    _hatched_ground(fig, 8, 92, GROUND_Y, 7)
+    platen_y = centre_y + half_height
+    fig.add_shape(type="rect", x0=10, x1=90, y0=platen_y, y1=platen_y + 6,
+                  fillcolor="#566573", line=dict(width=0))
+    fig.add_annotation(x=50, y=platen_y + 3, text="<b>cantilever</b>",
+                       showarrow=False, font=dict(size=max(9, style.tick_size - 10),
+                                                  color="white"))
+    fig.add_annotation(
+        x=50, y=platen_y + 7, ax=50, ay=platen_y + 20,
+        xref="x", yref="y", axref="x", ayref="y", showarrow=True,
+        arrowhead=2, arrowsize=1.1, arrowwidth=3, arrowcolor="#2c3e50", text="",
+    )
+
+    # ---- the balloon: a stadium, straight sides and semicircular ends
+    angle = np.linspace(-np.pi / 2, np.pi / 2, 60)
+    right_x = centre_x + width + half_height * np.cos(angle)
+    right_y = centre_y + half_height * np.sin(angle)
+    left_x = centre_x - width - half_height * np.cos(angle)
+    left_y = centre_y - half_height * np.sin(angle)
+    outline_x = np.concatenate([right_x, left_x, right_x[:1]])
+    outline_y = np.concatenate([right_y, left_y, right_y[:1]])
+    fig.add_trace(go.Scatter(
+        x=outline_x, y=outline_y, mode="lines", fill="toself",
+        fillcolor="rgba(174, 214, 241, 0.35)", showlegend=False,
+        hoverinfo="skip", line=dict(color="#1f77b4", width=6),
+    ))
+
+    # ---- the spring inside, standing between the plates
+    inner_bottom = centre_y - half_height + 3.0
+    inner_top = centre_y + half_height - 3.0
+    xs, ys = _zigzag(centre_x, inner_bottom, inner_top, 15.0)
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+        line=dict(color="#e67e22", width=5, shape="spline"),
+    ))
+
+    # ---- the deeper element, met only once the plates get down to it
+    if show_nucleus:
+        reached = deep_onset is None or eps >= float(deep_onset)
+        deep_h = min(7.0, half_height * 0.45)
+        fig.add_shape(
+            type="circle",
+            x0=centre_x - deep_h * 1.6, x1=centre_x + deep_h * 1.6,
+            y0=centre_y - deep_h, y1=centre_y + deep_h,
+            fillcolor="rgba(142, 68, 173, 0.55)" if reached
+            else "rgba(201, 176, 216, 0.30)",
+            line=dict(color="#8e44ad" if reached else "#c9b0d8",
+                      width=4, dash="solid" if reached else "dot"),
+        )
+        fig.add_annotation(
+            x=centre_x, y=centre_y - half_height - 7,
+            text=f"<b>{names['nucleus'][0]}</b>"
+                 + ("" if reached else "<br><i>not reached yet</i>"),
+            showarrow=False, font=dict(size=max(9, style.tick_size - 9),
+                                       color="#8e44ad" if reached else "#c9b0d8"),
+            yanchor="top",
+        )
+
+    # ---- labels
+    fig.add_annotation(
+        x=centre_x + width + half_height + 3, y=centre_y + half_height * 0.5,
+        text=f"<b>{names['membrane'][0]}</b>", showarrow=False, xanchor="left",
+        font=dict(size=max(9, style.tick_size - 9), color="#1f77b4"),
+    )
+    fig.add_annotation(
+        x=centre_x - 10, y=centre_y + half_height * 0.55,
+        text=f"<b>{names['interior'][0]}</b>", showarrow=False, xanchor="right",
+        font=dict(size=max(9, style.tick_size - 9), color="#e67e22"),
+    )
+    if show_tension:
+        # The horizontal spring, drawn where it acts: along the skin, not
+        # across the cell. _zigzag builds a vertical coil, so it is built
+        # along y and then laid on its side by swapping the axes.
+        band_y = centre_y + half_height * 0.72
+        span = (width + half_height) * 0.72
+        along, across = _zigzag(0.0, centre_x - span, centre_x + span, 9.0)
+        fig.add_trace(go.Scatter(
+            x=across, y=[band_y + v for v in along],
+            mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="#5dade2", width=4, shape="spline"),
+        ))
+        fig.add_annotation(
+            x=centre_x, y=centre_y + half_height * 0.82 + 7,
+            text=f"<b>{names['tension'][0]}</b>", showarrow=False,
+            font=dict(size=max(9, style.tick_size - 10), color="#5dade2"),
+        )
+
+    # ---- how far it has been squashed, and how far it has spread
+    fig.add_annotation(
+        x=50, y=CEILING - 2,
+        text=f"squashed to <b>ε = {eps:.3f}</b>"
+             + (f"  ({eps * cell_height_um:.2f} µm of {cell_height_um:.1f})"
+                if cell_height_um else "")
+             + f"<br>keeping its volume, so it spreads to "
+             f"{(width + half_height) / R0:.2f}× its resting width",
+        showarrow=False, font=dict(size=max(9, style.tick_size - 9),
+                                   color="#2c3e50"),
+    )
+
+    fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True,
+                     scaleanchor="y", scaleratio=1)
+    fig.update_yaxes(visible=False, range=[GROUND_Y - 14, CEILING + 6],
+                     fixedrange=True)
+    fig.update_layout(
+        height=height or max(340, int(style.height * 0.74)),
+        margin=dict(l=6, r=6, t=28, b=6),
+        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+        title=dict(text="<b>A balloon with a spring inside</b>",
+                   font=dict(size=max(11, style.tick_size - 5), color="black"),
+                   x=0.5, xanchor="center"),
     )
     return fig
 
