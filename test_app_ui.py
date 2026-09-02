@@ -1,2403 +1,3782 @@
 """
-Drive the app the way a person does: through the widgets.
+Lulevich et al. 2006 cell-compression model.
 
-Setting session_state directly is not a test of a Streamlit app. Streamlit
-rejects a write to a widget key after that widget exists, so a bug of that
-kind only shows up when a button is actually clicked. Every case here clicks.
+Reference
+---------
+Lulevich, V., Zink, T., Chen, H.-Y., Liu, F.-T., Liu, G.-Y. (2006).
+"Cell Mechanics Using Atomic Force Microscopy-Based Single-Cell Compression."
+Langmuir 22(19), 8151-8155.
+
+Physical model
+--------------
+Total force during whole-cell compression is a sum of a membrane (balloon)
+term, an interior/cytoskeleton (Hertzian) term, and optionally a nucleus
+term that only engages once the cell has been squashed onto it:
+
+    F(e) = Am * Em * e^3  +  Ai * Ei * e^(3/2)  +  An * En * <e - e0>^(3/2)
+
+with the geometry prefactors
+
+    Am = 2 * pi * h_m * R0 / (1 - nu_m)
+    Ai = sqrt(2) * R0^(1/2) * h0^(3/2) / (3 * (1 - nu_i^2))
+    An = sqrt(2) * Rn^(1/2) * h0^(3/2) / (3 * (1 - nu_n^2))
+
+<x> is x for x > 0 and zero otherwise, so the nucleus contributes nothing
+below the onset deformation e0. That offset is the only thing separating the
+nucleus term from the cytoskeleton term, which carries the same 3/2 exponent:
+without it the two are identical in shape and their moduli trade off freely.
+
+What the membrane term actually measures is the product Em * h_m. Em is that
+divided by whatever bilayer thickness is assumed, so it scales inversely with
+that assumption and the areal modulus Em * h_m is reported alongside it.
+
+where
+    e    = relative deformation, delta / h0  (dimensionless)
+    h0   = initial cell height [m]
+    R0   = cell radius [m]
+    h_m  = membrane thickness [m]
+    delta= absolute indentation [m] = e * h0
+
+Two things this module is deliberate about, because both were wrong in
+earlier versions and both silently destroy the result:
+
+1. ALL LENGTHS ARE IN METRES. A cell height of 8.09 um must be passed as
+   8.09e-6, not 8.09. Passing micrometres inflates R0 by 1e6 and drives the
+   fitted moduli into their bounds. The constructor raises if the value
+   looks like micrometres.
+
+2. The Hertzian term needs an absolute indentation, delta = e * h0. Feeding
+   it the dimensionless e directly leaves the term with units of
+   Pa*m^(1/2) instead of newtons, which is off by h0^(3/2) (~1e-8 for an
+   8 um cell).
+
+Fitting
+-------
+F is LINEAR in Em, Ei and En. There is no need for a non-linear optimiser, an
+initial guess, or a convergence check: the fit is a bounded linear least
+squares problem with a closed-form normal-equation solution. This makes the
+result deterministic, guess-independent, and impossible to "fail to
+converge". Uncertainties come from the analytic covariance matrix.
+
+The onset e0 is the single exception, the only non-linear parameter. It is a
+bounded scalar, so :meth:`scan_nucleus_onset` sweeps it on a grid where each
+trial is one exact linear solve, and reports whether the R2 peak is sharp
+enough for the data to have located it at all.
+
+Terms can also be fitted in stages on separate windows (:meth:`fit_staged`),
+each stage subtracting the current estimates of the terms it is not solving
+for and the whole sequence repeating until it settles.
 """
-import html.parser
-import pathlib
-import sys
+
+from __future__ import annotations
+
 import numpy as np
-import pandas as pd
+from scipy.optimize import lsq_linear
+from scipy.ndimage import uniform_filter1d
 
-sys.path.insert(0, "/root/AFM_cell_analyzer")
-from streamlit.testing.v1 import AppTest  # noqa: E402
-from lulevich_model import LulevichModel  # noqa: E402
+__all__ = ["LulevichModel"]
 
-# Label -> the argument the model takes, mirroring app.py.
-MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
-CYTO_MODE = {"at ε₁": "break", "from the very start": "zero"}
+# Sanity limits used for warnings only, never to clamp the fit.
+PLAUSIBLE_EM_PA = (1e3, 1e9)      # 1 kPa .. 1 GPa
+PLAUSIBLE_EI_PA = (1e0, 1e7)      # 1 Pa  .. 10 MPa
+K_BOLTZMANN = 1.380649e-23
 
+# The elements the classic three-spring machinery knows about. The membrane's
+# in-plane tension is a fourth, and only the composition fit implements it, so
+# every other entry point has to be told what to do when it arrives.
+CLASSIC_TERMS = ("membrane", "interior", "nucleus")
 
-def synthetic(membrane="freeze", cyto_start="break", En_kPa=3.0, n=260, noise=0.01):
-    """A curve built from a known composition, so the answer is known."""
-    eps = np.linspace(0.001, 0.60, n)
-    model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    m, c, nu = model.composition_terms(eps, 0.15, 0.40, membrane, cyto_start)
-    force = m * 0.6e6 + c * 1.2e3 + nu * En_kPa * 1e3
-    rng = np.random.default_rng(0)
-    force = force * (1.0 + noise * rng.standard_normal(n))
-    return eps, force
+# Term name -> the key its modulus is stored under.
+TERM_KEYS = {
+    "tension": "T0", "membrane": "Em", "interior": "Ei", "nucleus": "En",
+}
 
 
-def load(app, eps, force):
-    app.session_state["data"] = {
-        "epsilon": eps, "force_N": force, "source": "synthetic.csv", "n_dropped": 0,
+def classic_terms(terms):
+    """
+    Split a term list into what the three-spring paths can carry, and what
+    they cannot.
+
+    Silently dropping the tension spring here would be worse than crashing:
+    the caller would get a three-spring answer labelled as a four-spring one.
+    So it comes back separately, and every caller turns it into a warning that
+    names the model that does implement it.
+    """
+    wanted = tuple(terms or ())
+    kept = tuple(t for t in wanted if t in CLASSIC_TERMS)
+    dropped = tuple(t for t in wanted if t not in CLASSIC_TERMS)
+    return (kept or CLASSIC_TERMS), dropped
+
+
+def dropped_term_warning(dropped):
+    """One sentence naming what was left out, and where it does work."""
+    if not dropped:
+        return []
+    names = {"tension": "the membrane's in-plane tension, T₀"}
+    listed = " and ".join(names.get(t, t) for t in dropped)
+    return [
+        f"This model does not have {listed}, so it was left out. The moduli "
+        f"here describe the rest of the cell only, and the membrane number "
+        f"will have absorbed some of what the missing spring would have "
+        f"carried. Use the segmented model, which is the one that has it."
+    ]
+
+
+# ============================================================================
+#  Coupling: how the elements share load
+# ============================================================================
+#
+# The model above puts the elements in PARALLEL: every element is squashed by
+# the same relative deformation and their forces add. That is the right
+# picture for a membrane stretched over a cytoskeleton that is compressed
+# with it.
+#
+# The alternative is SERIES: every element carries the same force and their
+# deformations add, a spring stacked on a spring. That is the right picture
+# when the load path runs through the elements one after another, for example
+# the cantilever compressing the cytoplasm which then bears down on the
+# nucleus underneath it.
+#
+# The two make genuinely different predictions. In parallel the stiffest
+# element dominates the force; in series the softest element dominates the
+# deformation. Which one the data prefers is an empirical question, which is
+# what compare_couplings() is for.
+#
+# Series is still exactly solvable. Inverting each element's law,
+#
+#     membrane      F = Am Em d^3     ->  d = (F / (Am Em))^(1/3)
+#     cytoskeleton  F = Ai Ec d^1.5   ->  d = (F / (Ai Ec))^(2/3)
+#     nucleus       F = An En d^1.5   ->  d = (<F - F0> / (An En))^(2/3)
+#
+# and adding the deformations gives
+#
+#     e(F) = a F^(1/3) + b F^(2/3) + c <F - F0>^(2/3)
+#
+# which is LINEAR in the compliances a, b, c exactly as the parallel model is
+# linear in the moduli. The moduli come back as
+#
+#     Em = 1 / (Am a^3),  Ec = 1 / (Ai b^1.5),  En = 1 / (An c^1.5)
+#
+# The nucleus needs the force offset F0 for the same reason it needed a
+# deformation offset in parallel: without it the cytoskeleton and nucleus
+# terms are both F^(2/3) and their compliances are not separable.
+
+
+class _CouplingMixin:
+    """Series and hybrid coupling, mixed into LulevichModel below."""
+
+    # ------------------------------------------------------------- series
+
+    def series_epsilon(self, force, Em, Ec, En=0.0, force_onset=0.0):
+        """Relative deformation produced by a given force, elements in series."""
+        F = np.clip(np.asarray(force, dtype=float), 0.0, None)
+        eps = np.zeros_like(F)
+        if Em and Em > 0:
+            eps = eps + (F / (self.Am * Em)) ** (1.0 / 3.0)
+        if Ec and Ec > 0:
+            eps = eps + (F / (self.Ai * Ec)) ** (2.0 / 3.0)
+        if En and En > 0:
+            excess = np.clip(F - float(force_onset), 0.0, None)
+            eps = eps + (excess / (self.An * En)) ** (2.0 / 3.0)
+        return eps
+
+    def series_force(self, epsilon, Em, Ec, En=0.0, force_onset=0.0, f_max=None, n_grid=4000):
+        """
+        Force required for a given deformation, elements in series.
+
+        There is no closed form, but e(F) is monotonically increasing, so the
+        inverse is obtained by evaluating it on a dense force grid and
+        interpolating. Doing it this way lets a series fit be scored on force
+        residuals, the same space the parallel fit uses, so the two are
+        directly comparable.
+        """
+        eps = np.asarray(epsilon, dtype=float)
+        top = f_max if f_max else float(np.nanmax(self.force)) * 1.6
+        if not np.isfinite(top) or top <= 0:
+            return np.zeros_like(eps)
+        grid = np.linspace(0.0, top, int(n_grid))
+        eps_grid = self.series_epsilon(grid, Em, Ec, En, force_onset)
+        # np.interp needs an increasing x; ties at zero force are harmless.
+        return np.interp(eps, eps_grid, grid, left=0.0, right=top)
+
+    def _refine_series(self, eps, force, Em, Ec, En, force_onset, terms):
+        """Polish the series moduli against force residuals."""
+        from scipy.optimize import least_squares
+
+        active = [("membrane" in terms), ("interior" in terms), ("nucleus" in terms)]
+        values = [Em, Ec, En]
+        # A rigid element (infinite modulus) is not something the optimiser can
+        # search over, so it is left as found.
+        if any(active[i] and not np.isfinite(values[i]) for i in range(3)):
+            return Em, Ec, En
+        start = np.log10([max(values[i], 1e-3) if active[i] else 1e-6 for i in range(3)])
+        free = np.array(active, dtype=bool)
+        scale = max(float(np.nanmax(np.abs(force))), 1e-15)
+        f_max = float(np.nanmax(self.force)) * 1.6
+
+        def residual(free_log):
+            full = start.copy()
+            full[free] = free_log
+            params = [10.0 ** full[i] if active[i] else 0.0 for i in range(3)]
+            predicted = self.series_force(
+                eps, params[0], params[1], params[2], force_onset, f_max=f_max
+            )
+            return (force - predicted) / scale
+
+        try:
+            solution = least_squares(
+                residual, start[free],
+                bounds=(np.full(free.sum(), -1.0), np.full(free.sum(), 11.0)),
+                xtol=1e-10, ftol=1e-10, max_nfev=300,
+            )
+        except Exception:  # pragma: no cover
+            return Em, Ec, En
+        full = start.copy()
+        full[free] = solution.x
+        return tuple(10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+
+    def fit_series(
+        self,
+        epsilon_min=0.01,
+        epsilon_max=0.3,
+        terms=("membrane", "interior"),
+        force_onset=None,
+        weighting="uniform",
+        refine=True,
+    ):
+        """
+        Fit the series model: one bounded linear least squares in compliance.
+
+        The linear stage minimises deformation residuals, because that is the
+        space the model is linear in. Goodness of fit is then reported on
+        force residuals, computed by inverting the model, so R2 and RMSE mean
+        the same thing here as they do for the parallel fit.
+
+        ``refine`` then polishes the moduli against those force residuals.
+        This matters more than it sounds: Em = 1 / (Am a^3), so a one percent
+        error in the fitted compliance becomes three percent in Em, and
+        minimising deformation error is not the same as minimising force
+        error. On a synthetic series curve the linear stage alone returns
+        Em = 3.9 MPa against a true 2.5; refined it returns 2.5.
+        """
+        terms, dropped = classic_terms(terms)
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        usable = force > 0
+        eps, force = eps[usable], force[usable]
+        n_params = len(terms)
+        if eps.size < n_params + 1:
+            return self._failure(
+                f"Only {eps.size} points with positive force in e = "
+                f"[{epsilon_min:.3f}, {epsilon_max:.3f}]; need at least "
+                f"{n_params + 1}."
+            )
+
+        if force_onset is None:
+            force_onset = 0.5 * float(np.nanmax(force)) if "nucleus" in terms else 0.0
+
+        cols, names = [], []
+        if "membrane" in terms:
+            cols.append(force ** (1.0 / 3.0))
+            names.append("a")
+        if "interior" in terms:
+            cols.append(force ** (2.0 / 3.0))
+            names.append("b")
+        if "nucleus" in terms:
+            cols.append(np.clip(force - force_onset, 0.0, None) ** (2.0 / 3.0))
+            names.append("c")
+        X = np.column_stack(cols)
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(eps), np.percentile(np.abs(eps), 10) or 1e-9)
+            w = 1.0 / scale
+        else:
+            w = np.ones_like(eps)
+        Xw, yw = X * w[:, None], eps * w
+
+        col_norm = np.linalg.norm(Xw, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        sol = lsq_linear(Xw / col_norm, yw, bounds=(0.0, np.inf), method="bvls")
+        params = dict(zip(names, sol.x / col_norm))
+
+        def modulus(compliance, prefactor, power):
+            if compliance is None or compliance <= 0:
+                return float("inf")  # zero compliance = rigid element
+            return float(1.0 / (prefactor * compliance ** power))
+
+        Em = modulus(params.get("a"), self.Am, 3.0) if "membrane" in terms else 0.0
+        Ec = modulus(params.get("b"), self.Ai, 1.5) if "interior" in terms else 0.0
+        En = modulus(params.get("c"), self.An, 1.5) if "nucleus" in terms else 0.0
+
+        if refine and np.isfinite([Em, Ec, En]).any():
+            Em, Ec, En = self._refine_series(eps, force, Em, Ec, En, force_onset, terms)
+
+        pred = self.series_force(eps, Em, Ec, En, force_onset)
+        residuals = force - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        warnings_list = dropped_term_warning(dropped)
+        for value, label in ((Em, "Em"), (Ec, "Ec"), (En, "En")):
+            if np.isinf(value):
+                warnings_list.append(
+                    f"{label} came out rigid (zero compliance): in series this element "
+                    f"absorbs no deformation, so the data gives no handle on it."
+                )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Series R2 = {r_squared:.3f}. The stacked-spring picture does not "
+                f"describe this curve well; compare it against parallel."
+            )
+
+        out = {
+            "success": True,
+            "mode": "series",
+            "coupling": "series",
+            "Em": Em if np.isfinite(Em) else 0.0,
+            "Ei": Ec if np.isfinite(Ec) else 0.0,
+            "En": En if np.isfinite(En) else 0.0,
+            "Em_MPa": (Em / 1e6) if np.isfinite(Em) else float("inf"),
+            "Ei_kPa": (Ec / 1e3) if np.isfinite(Ec) else float("inf"),
+            "En_kPa": (En / 1e3) if np.isfinite(En) else float("inf"),
+            "Em_MPa_std": float("nan"),
+            "Ei_kPa_std": float("nan"),
+            "En_kPa_std": float("nan"),
+            "compliances": {k: float(v) for k, v in params.items()},
+            "force_offset": 0.0,
+            "nucleus_force_onset": float(force_onset),
+            "Km": 0.0,
+            "Km_kT": 0.0,
+            "membrane_areal_modulus": (Em * self.h_membrane) if np.isfinite(Em) else float("nan"),
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params,
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": weighting,
+            "fit_offset": False,
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": float("nan"),
+            "interior_fraction_at_max": float("nan"),
+            "nucleus_fraction_at_max": float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0,
+            "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "An": self.An,
+            "mask": mask,
+            "warnings": warnings_list,
+        }
+        self.results["series"] = out
+        return out
+
+    # ------------------------------------------------------------- hybrid
+
+    def predict(self, epsilon, params, coupling, crossover=None, order="parallel-then-series"):
+        """
+        Force predicted at each deformation under any of the couplings.
+
+        ``params`` is ``(Em, Ec, En)`` in pascals. For the hybrid couplings
+        the elements act in parallel on one side of ``crossover`` and in
+        series on the other, so a single set of moduli produces a curve that
+        changes its load path partway along.
+        """
+        Em, Ec, En = params
+        eps = np.asarray(epsilon, dtype=float)
+        if coupling == "parallel":
+            return self.combined_model(eps, Em, Ec, En=En)
+        if coupling == "series":
+            return self.series_force(eps, Em, Ec, En, self._nucleus_force_onset(Em, Ec, En))
+        if coupling == "hybrid":
+            out = np.empty_like(eps)
+            low = eps <= float(crossover)
+            first, second = (
+                ("parallel", "series")
+                if order == "parallel-then-series"
+                else ("series", "parallel")
+            )
+            out[low] = self.predict(eps[low], params, first)
+            out[~low] = self.predict(eps[~low], params, second)
+            # Remove the step at the crossover: the load path changes there,
+            # but the force the cantilever reads does not jump.
+            if low.any() and (~low).any():
+                jump = self.predict(np.array([crossover]), params, first)[0] - self.predict(
+                    np.array([crossover]), params, second
+                )[0]
+                out[~low] = out[~low] + jump
+            return out
+        raise ValueError(f"Unknown coupling: {coupling}")
+
+    def _nucleus_force_onset(self, Em, Ec, En):
+        """Force at which the nucleus engages, from its deformation onset."""
+        if not En or En <= 0:
+            return 0.0
+        return float(self.combined_model(np.array([self.nucleus_onset]), Em, Ec)[0])
+
+    def fit_hybrid(
+        self,
+        epsilon_min,
+        epsilon_max,
+        crossover,
+        terms=("membrane", "interior"),
+        order="parallel-then-series",
+        seed=None,
+    ):
+        """
+        One set of moduli, two load paths, split at ``crossover``.
+
+        Parallel is linear in the moduli and series is linear in their
+        compliances, so a model that is parallel on one side and series on the
+        other is linear in neither. It is still only two or three parameters,
+        and seeding from the separate parallel and series fits of each region
+        puts the optimiser close enough that this is quick and stable.
+        """
+        from scipy.optimize import least_squares
+
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        if eps.size < len(terms) + 2:
+            return self._failure("Not enough points for a hybrid fit.")
+        if not (eps.min() < crossover < eps.max()):
+            return self._failure(
+                f"Crossover e = {crossover:.3f} lies outside the fitted window."
+            )
+
+        terms, dropped = classic_terms(terms)
+        if seed is None:
+            base = self.fit(epsilon_min, epsilon_max, terms=terms)
+            seed = (
+                base.get("Em", 1e6) or 1e6,
+                base.get("Ei", 1e3) or 1e3,
+                base.get("En", 1e3) or 1e3,
+            )
+        seed = [max(float(v), 1e-3) for v in seed]
+
+        active = [
+            ("membrane" in terms),
+            ("interior" in terms),
+            ("nucleus" in terms),
+        ]
+        start = np.log10([seed[i] if active[i] else 1e-6 for i in range(3)])
+        free = np.array(active, dtype=bool)
+        scale = max(float(np.nanmax(np.abs(force))), 1e-15)
+
+        def residual(free_log):
+            full = start.copy()
+            full[free] = free_log
+            params = tuple(10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+            return (force - self.predict(eps, params, "hybrid", crossover, order)) / scale
+
+        try:
+            solution = least_squares(
+                residual,
+                start[free],
+                bounds=(np.full(free.sum(), -1.0), np.full(free.sum(), 11.0)),
+                xtol=1e-10,
+                ftol=1e-10,
+                max_nfev=400,
+            )
+        except Exception as exc:  # pragma: no cover - optimiser edge cases
+            return self._failure(f"Hybrid fit failed: {exc}")
+
+        full = start.copy()
+        full[free] = solution.x
+        Em, Ec, En = (10.0 ** full[i] if active[i] else 0.0 for i in range(3))
+
+        pred = self.predict(eps, (Em, Ec, En), "hybrid", crossover, order)
+        residuals = force - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        out = {
+            "success": True,
+            "mode": "hybrid",
+            "coupling": "hybrid",
+            "order": order,
+            "crossover": float(crossover),
+            "Em": Em, "Ei": Ec, "En": En,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Em_MPa_std": float("nan"),
+            "Ei_kPa_std": float("nan"),
+            "En_kPa_std": float("nan"),
+            "force_offset": 0.0,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": int(free.sum()) + 1,  # + the crossover
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": "uniform",
+            "fit_offset": False,
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": float("nan"),
+            "interior_fraction_at_max": float("nan"),
+            "nucleus_fraction_at_max": float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "mask": mask,
+            "warnings": dropped_term_warning(dropped),
+        }
+        self.results["hybrid"] = out
+        return out
+
+    def scan_crossover(
+        self, epsilon_min, epsilon_max, terms=("membrane", "interior"),
+        order="parallel-then-series", n_trials=15,
+    ):
+        """Grid search for the deformation at which the load path changes."""
+        lo = epsilon_min + 0.15 * (epsilon_max - epsilon_min)
+        hi = epsilon_min + 0.85 * (epsilon_max - epsilon_min)
+        trials, best = [], None
+        for crossover in np.linspace(lo, hi, max(3, int(n_trials))):
+            result = self.fit_hybrid(
+                epsilon_min, epsilon_max, float(crossover), terms=terms, order=order
+            )
+            if not result.get("success"):
+                continue
+            trials.append(
+                {
+                    "crossover": float(crossover),
+                    "r_squared": float(result["r_squared"]),
+                    "Em_MPa": result["Em_MPa"],
+                    "Ei_kPa": result["Ei_kPa"],
+                }
+            )
+            if best is None or result["r_squared"] > best["r_squared"]:
+                best = result
+        if best is None:
+            return {"success": False, "error": "No usable hybrid fit.", "trials": trials}
+        return {"success": True, "best": best, "trials": trials,
+                "best_crossover": best["crossover"]}
+
+
+# ---------------------------------------------------------------------------
+#  Segmented model
+# ---------------------------------------------------------------------------
+#
+# The compression is treated as three stretches of deformation with different
+# structures carrying the load:
+#
+#     0   -> e1   the membrane alone, the cubic balloon term
+#     e1  -> e2   the cytoskeleton takes over; the membrane contributes no
+#                 further force and simply holds what it had reached at e1
+#     e2  -> end  the cytoskeleton continues and the nucleus joins it
+#
+# Writing that as one expression,
+#
+#     F(e) = Am Em min(e, e1)^3 + Ai Ec <e - e1>^1.5 + An En <e - e2>^1.5
+#
+# The min() freezes the membrane term at its value at e1 instead of letting it
+# keep climbing, and each later term starts from zero at its own breakpoint.
+# Two things follow, and both matter:
+#
+# * The curve is continuous at both breakpoints by construction. Nothing has to
+#   be stitched together afterwards and there is no step for the fit to chase.
+# * It is still LINEAR in Em, Ec and En, so the fit remains one exact bounded
+#   least-squares solve. Only the breakpoints are non-linear, and they are two
+#   bounded scalars, so they can be scanned on a grid.
+
+
+class _SegmentedMixin:
+    """The segmented three-stage model."""
+
+    def segment_terms(self, epsilon, e1=None, e2=None):
+        """The three basis functions, before scaling by their moduli."""
+        eps = np.asarray(epsilon, dtype=float)
+        e1 = self.segment_break_1 if e1 is None else float(e1)
+        e2 = self.segment_break_2 if e2 is None else float(e2)
+        membrane = self.Am * np.clip(np.minimum(eps, e1), 0.0, None) ** 3
+        cyto = self.Ai * np.clip(eps - e1, 0.0, None) ** 1.5
+        nucleus = self.An * np.clip(eps - e2, 0.0, None) ** 1.5
+        return membrane, cyto, nucleus
+
+    def segmented_model(self, epsilon, Em, Ec, En=0.0, e1=None, e2=None, force_offset=0.0):
+        """Total force under the segmented model."""
+        membrane, cyto, nucleus = self.segment_terms(epsilon, e1, e2)
+        return membrane * Em + cyto * Ec + nucleus * En + force_offset
+
+    def fit_segmented(
+        self,
+        epsilon_min=0.0,
+        epsilon_max=0.60,
+        e1=None,
+        e2=None,
+        terms=("membrane", "interior", "nucleus"),
+        weighting="uniform",
+        fit_offset=False,
+    ):
+        """
+        Fit the segmented model: one bounded linear solve.
+
+        Parameters
+        ----------
+        e1, e2 : float
+            Breakpoints. ``e1`` is where the membrane stops adding force and
+            the cytoskeleton takes over; ``e2`` is where the nucleus engages.
+        terms : tuple
+            Which of the three stages to include. Dropping one simply removes
+            its column.
+        """
+        terms, dropped = classic_terms(terms)
+        e1 = self.segment_break_1 if e1 is None else float(e1)
+        e2 = self.segment_break_2 if e2 is None else float(e2)
+        if not (0 <= e1 < e2):
+            return self._failure(
+                f"Breakpoints must satisfy 0 <= e1 < e2; got e1={e1:.3f}, e2={e2:.3f}."
+            )
+
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        n_params = len(terms) + (1 if fit_offset else 0)
+        if eps.size < n_params + 1:
+            return self._failure(
+                f"Only {eps.size} points in e = [{epsilon_min:.3f}, "
+                f"{epsilon_max:.3f}]; need at least {n_params + 1}."
+            )
+
+        membrane, cyto, nucleus = self.segment_terms(eps, e1, e2)
+        columns, names = [], []
+        if "membrane" in terms:
+            columns.append(membrane)
+            names.append("Em")
+        if "interior" in terms:
+            columns.append(cyto)
+            names.append("Ei")
+        if "nucleus" in terms:
+            columns.append(nucleus)
+            names.append("En")
+        if fit_offset:
+            columns.append(np.ones_like(eps))
+            names.append("F0")
+        design = np.column_stack(columns)
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
+            weights = 1.0 / scale
+        else:
+            weights = np.ones_like(force)
+        design_w, target_w = design * weights[:, None], force * weights
+
+        col_norm = np.linalg.norm(design_w, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        lower = np.array([-np.inf if n == "F0" else 0.0 for n in names])
+        solution = lsq_linear(
+            design_w / col_norm, target_w,
+            bounds=(lower * col_norm, np.inf), method="bvls",
+        )
+        params = dict(zip(names, solution.x / col_norm))
+        Em = float(params.get("Em", 0.0))
+        Ec = float(params.get("Ei", 0.0))
+        En = float(params.get("En", 0.0))
+        F0 = float(params.get("F0", 0.0))
+
+        predicted = self.segmented_model(eps, Em, Ec, En, e1, e2, F0)
+        residuals = force - predicted
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force - force.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        dof = max(eps.size - n_params, 1)
+
+        std_err, corr, cond = self._covariance(
+            design_w / col_norm, target_w, col_norm, names, dof, ss_res, eps.size
+        )
+
+        # What each stage contributes at the top of the fitted range.
+        top = float(eps.max())
+        m_top, c_top, n_top = self.segment_terms(np.array([top]), e1, e2)
+        f_mem, f_cyt, f_nuc = float(m_top[0] * Em), float(c_top[0] * Ec), float(n_top[0] * En)
+        total = f_mem + f_cyt + f_nuc
+
+        warnings_list = dropped_term_warning(dropped)
+        for value, key, unit, scale_to in (
+            (Em, "Em", "MPa", 1e6), (Ec, "Ei", "kPa", 1e3), (En, "En", "kPa", 1e3),
+        ):
+            label = {"Em": "Em", "Ei": "Ec", "En": "En"}[key]
+            if key in [TERM_KEYS[t] for t in terms if t in TERM_KEYS]:
+                if value <= 0:
+                    warnings_list.append(
+                        f"{label} came out zero: its segment shows no rise that the "
+                        f"other stages do not already explain. Check the breakpoints."
+                    )
+                else:
+                    lo, hi = self.expected_ranges[key]
+                    if not (lo <= value <= hi):
+                        warnings_list.append(
+                            f"{label} = {value / scale_to:.3g} {unit} is outside the "
+                            f"expected {lo / scale_to:.3g} to {hi / scale_to:.3g} "
+                            f"{unit} for this cell type."
+                        )
+        if np.isfinite(r_squared) and r_squared < 0.95:
+            warnings_list.append(
+                f"R2 = {r_squared:.3f}. Try moving the breakpoints, or run the "
+                f"breakpoint scan to place them from the data."
+            )
+
+        out = {
+            "success": True,
+            "mode": "segmented",
+            "coupling": "segmented",
+            "Em": Em, "Ei": Ec, "En": En,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Em_std": std_err.get("Em", float("nan")),
+            "Ei_std": std_err.get("Ei", float("nan")),
+            "En_std": std_err.get("En", float("nan")),
+            "Em_MPa_std": std_err.get("Em", float("nan")) / 1e6,
+            "Ei_kPa_std": std_err.get("Ei", float("nan")) / 1e3,
+            "En_kPa_std": std_err.get("En", float("nan")) / 1e3,
+            "force_offset": F0,
+            "break_1": e1,
+            "break_2": e2,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": 1.0 - (1.0 - r_squared) * (eps.size - 1) / dof
+            if np.isfinite(r_squared) and eps.size > n_params else float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params,
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(terms),
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": cond,
+            "corr_Em_Ei": corr,
+            "membrane_fraction_at_max": f_mem / total if total > 0 else float("nan"),
+            "interior_fraction_at_max": f_cyt / total if total > 0 else float("nan"),
+            "nucleus_fraction_at_max": f_nuc / total if total > 0 else float("nan"),
+            "nucleus_onset": e2,
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An,
+            "mask": mask,
+            "warnings": warnings_list,
+        }
+        self.results["segmented"] = out
+        return out
+
+    def scan_segment_breaks(
+        self,
+        epsilon_min=0.0,
+        epsilon_max=0.60,
+        terms=("membrane", "interior", "nucleus"),
+        n_grid=14,
+        weighting="uniform",
+    ):
+        """
+        Place the two breakpoints from the data.
+
+        Both are bounded scalars and every trial is one exact linear solve, so
+        a grid over the pair is affordable and exhaustive. The returned surface
+        makes it visible when the optimum is a broad plateau, which means the
+        curve does not really locate the breakpoints.
+        """
+        lo = max(float(epsilon_min), float(self.epsilon.min()))
+        hi = min(float(epsilon_max), float(self.epsilon.max()))
+        span = hi - lo
+        if span <= 0:
+            return {"success": False, "error": "Empty deformation range."}
+
+        first = np.linspace(lo + 0.10 * span, lo + 0.55 * span, int(n_grid))
+        second = np.linspace(lo + 0.30 * span, lo + 0.92 * span, int(n_grid))
+
+        best, trials = None, []
+        for e1 in first:
+            for e2 in second:
+                if e2 <= e1 + 0.02 * span:
+                    continue
+                result = self.fit_segmented(
+                    epsilon_min, epsilon_max, e1=e1, e2=e2,
+                    terms=terms, weighting=weighting,
+                )
+                if not result.get("success"):
+                    continue
+                trials.append(
+                    {
+                        "e1": float(e1), "e2": float(e2),
+                        "r_squared": float(result["r_squared"]),
+                        "Em_MPa": result["Em_MPa"],
+                        "Ec_kPa": result["Ei_kPa"],
+                        "En_kPa": result["En_kPa"],
+                    }
+                )
+                if best is None or result["r_squared"] > best["r_squared"]:
+                    best = result
+
+        if best is None:
+            return {"success": False, "error": "No usable segmented fit on the grid."}
+        return {
+            "success": True,
+            "best": best,
+            "best_break_1": best["break_1"],
+            "best_break_2": best["break_2"],
+            "trials": trials,
+        }
+
+
+# ---------------------------------------------------------------------------
+#  Exploratory segmentation
+# ---------------------------------------------------------------------------
+#
+# Before fitting anything, ask the curve where its exponent changes.
+#
+# A power law F = A e^n is a straight line of slope n on log-log axes, so the
+# local slope of ln F against ln e measures the exponent at each point. That
+# alone would be enough if the segments were pure powers of e, but they are
+# not: past the first breakpoint the membrane contributes a constant and the
+# cytoskeleton term is shifted, F = F1 + B (e - e1)^1.5, and neither the offset
+# nor the shift shows up correctly in a naive log-log slope.
+#
+# So the exponent profile is reported for inspection, and the breakpoints are
+# located a second way that respects the structure: fit the law that should
+# hold, walk forward, and mark where the data starts to leave it behind. The
+# membrane goes first because it is what carries the load from zero
+# deformation, then the cytoskeleton law is fitted to what is left over, and
+# the point where that in turn starts under-predicting is where the nucleus
+# begins to take load.
+
+
+class _ExploreMixin:
+    """Find the segment boundaries from the shape of the curve."""
+
+    # ------------------------------------------------------------ helpers
+
+    def _smooth_noise(self):
+        """
+        Force noise, from the scatter about a local median.
+
+        Taking the spread of the first few points instead would confuse the
+        curve's own rise for noise and badly overestimate it, which then hides
+        every real feature.
+        """
+        if self.force.size < 9:
+            return float(np.std(self.force)) or 1e-15
+        width = max(5, (self.force.size // 40) | 1)
+        smooth = uniform_filter1d(self.force, size=width, mode="nearest")
+        residual = self.force - smooth
+        # Median absolute deviation, scaled to a standard deviation, so a few
+        # large excursions do not inflate it.
+        mad = float(np.median(np.abs(residual - np.median(residual))))
+        return (1.4826 * mad) or float(np.std(residual)) or 1e-15
+
+    def _binned(self, n_bins=60):
+        """Average the curve into deformation bins to lift it out of the noise."""
+        eps, force = self.epsilon, self.force
+        if eps.size < n_bins * 2:
+            return eps, force
+        edges = np.linspace(eps.min(), eps.max(), int(n_bins) + 1)
+        index = np.clip(np.digitize(eps, edges) - 1, 0, int(n_bins) - 1)
+        centres, means = [], []
+        for b in range(int(n_bins)):
+            here = index == b
+            if here.sum() >= 2:
+                centres.append(float(eps[here].mean()))
+                means.append(float(force[here].mean()))
+        return np.array(centres), np.array(means)
+
+    def local_exponent(self, window_frac=0.2, n_bins=60):
+        """
+        Local log-log slope along the curve.
+
+        The curve is binned first: a power-law slope is a ratio of small
+        differences, so on raw noisy points it is dominated by scatter. Near 3
+        means the membrane term is what is carrying the load there, near 1.5 a
+        Hertzian contact.
+        """
+        eps, force = self._binned(n_bins)
+        usable = (eps > 0) & (force > 0)
+        if usable.sum() < 6:
+            return np.array([]), np.array([])
+        x, y = np.log(eps[usable]), np.log(force[usable])
+        n = x.size
+        half = max(2, int(n * float(window_frac) / 2))
+        exponent = np.full(n, np.nan)
+        for i in range(n):
+            lo, hi = max(0, i - half), min(n, i + half + 1)
+            if hi - lo < 3:
+                continue
+            xs, ys = x[lo:hi], y[lo:hi]
+            varx = float(np.sum((xs - xs.mean()) ** 2))
+            if varx > 0:
+                exponent[i] = float(np.sum((xs - xs.mean()) * (ys - ys.mean())) / varx)
+        return eps[usable], exponent
+
+    @staticmethod
+    def _power_law_exponent(x, y, noise=0.0, min_points=6):
+        """
+        Exponent and R2 of a straight line through ln y against ln x.
+
+        Points at or below the noise level are dropped rather than logged. The
+        log of a value that is mostly noise is not a measurement, and including
+        those points drags the slope down: a clean cubic stage will read about
+        1.7 instead of 3 if the buried part of it is kept.
+        """
+        x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        good = (x > 0) & (y > max(3.0 * float(noise), 0.0))
+        if good.sum() < min_points:
+            return float("nan"), float("nan")
+        lx, ly = np.log(x[good]), np.log(y[good])
+        varx = float(np.sum((lx - lx.mean()) ** 2))
+        if varx <= 0:
+            return float("nan"), float("nan")
+        slope = float(np.sum((lx - lx.mean()) * (ly - ly.mean())) / varx)
+        intercept = float(ly.mean() - slope * lx.mean())
+        ss_res = float(np.sum((ly - (slope * lx + intercept)) ** 2))
+        ss_tot = float(np.sum((ly - ly.mean()) ** 2))
+        return slope, (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"))
+
+    def _stage_evidence(self, break_1, break_2, fit, hi, noise):
+        """Measured exponent, point count and modulus for each of the three stages."""
+        eps, force = self._binned(80)
+
+        first = (eps > 0) & (eps <= break_1)
+        exponent_1, r2_1 = self._power_law_exponent(eps[first], force[first], noise)
+
+        frozen = float(
+            self.segment_terms(np.array([break_1]), break_1, break_2)[0][0] * fit["Em"]
+        )
+        second = (eps > break_1) & (eps <= break_2)
+        exponent_2, r2_2 = self._power_law_exponent(
+            eps[second] - break_1, force[second] - frozen, noise
+        )
+
+        third = eps > break_2
+        exponent_3, r2_3 = float("nan"), float("nan")
+        if third.sum() >= 4:
+            predicted = self.segmented_model(
+                eps[third], fit["Em"], fit["Ei"], 0.0, break_1, break_2
+            )
+            exponent_3, r2_3 = self._power_law_exponent(
+                eps[third] - break_2, force[third] - predicted, noise
+            )
+
+        return [
+            {
+                "stage": "membrane, ε³",
+                "range": (0.0, break_1),
+                "expected_exponent": 3.0,
+                "measured_exponent": exponent_1,
+                "power_law_r2": r2_1,
+                "n_points": int(np.sum((self.epsilon > 0) & (self.epsilon <= break_1))),
+                "modulus": fit["Em"],
+                "modulus_label": f"Eₘ = {fit['Em_MPa']:.3g} MPa",
+            },
+            {
+                "stage": "cytoskeleton, ⟨ε−ε₁⟩³ᐟ²",
+                "range": (break_1, break_2),
+                "expected_exponent": 1.5,
+                "measured_exponent": exponent_2,
+                "power_law_r2": r2_2,
+                "n_points": int(
+                    np.sum((self.epsilon > break_1) & (self.epsilon <= break_2))
+                ),
+                "modulus": fit["Ei"],
+                "modulus_label": f"E_c = {fit['Ei_kPa']:.3g} kPa",
+            },
+            {
+                "stage": "nucleus, ⟨ε−ε₂⟩³ᐟ²",
+                "range": (break_2, float(hi)),
+                "expected_exponent": 1.5,
+                "measured_exponent": exponent_3,
+                "power_law_r2": r2_3,
+                "n_points": int(np.sum(self.epsilon > break_2)),
+                "modulus": fit["En"],
+                "modulus_label": f"Eₙ = {fit['En_kPa']:.3g} kPa",
+            },
+        ]
+
+    # ---------------------------------------------------------- the search
+
+    def explore_segments(self, epsilon_min=None, epsilon_max=None, n_grid=18,
+                         terms=("membrane", "interior", "nucleus"),
+                         weighting="relative"):
+        """
+        Work out where the curve stops being cubic and where the nucleus joins.
+
+        The breakpoints come from scanning the segmented model over a grid of
+        candidate pairs, which is a fit-based search and therefore survives the
+        low-deformation region being buried in noise. Reading the exponent
+        directly off the curve there does not: the membrane term is small, and
+        below about the noise level its log-log slope is meaningless.
+
+        The exponents are still measured and reported, on binned data and after
+        removing what the earlier stages contribute, because they are the
+        evidence for the breakpoints rather than the means of finding them: a
+        first stage that measures 3 and a second that measures 1.5 says the
+        model matches this curve.
+
+        Returns
+        -------
+        dict
+            ``break_1``, ``break_2``, a row per stage with its measured
+            exponent and the modulus that stage implies, the local exponent
+            profile for plotting, and ``confident``.
+        """
+        lo = float(self.epsilon.min() if epsilon_min is None else epsilon_min)
+        hi = float(self.epsilon.max() if epsilon_max is None else epsilon_max)
+        if hi - lo <= 0 or self.epsilon.size < 20:
+            return {"success": False, "error": "Not enough curve to explore."}
+
+        # Relative weighting for the search. With uniform weights the total
+        # residual is dominated by the high-force end, so the first breakpoint,
+        # which only affects forces a hundred times smaller, barely moves the
+        # objective and lands almost anywhere. Weighting by 1/|F| gives the
+        # membrane region a say in where its own boundary goes.
+        candidates = []
+        for candidate_weighting in ("relative", "uniform"):
+            scan = self.scan_segment_breaks(
+                lo, hi, terms=terms, n_grid=n_grid, weighting=candidate_weighting
+            )
+            if scan.get("success"):
+                candidates.append((candidate_weighting, scan))
+        if not candidates:
+            return {"success": False, "error": "Breakpoint scan failed."}
+
+        # Choose between the two searches on physics rather than on residuals:
+        # the placement worth keeping is the one whose first stage actually
+        # measures an exponent near 3 and whose second measures near 1.5. A
+        # smaller residual means little if it was bought by putting the
+        # boundary somewhere the curve does not change behaviour.
+        noise = self._smooth_noise()
+        scored = []
+        for candidate_weighting, scan in candidates:
+            trial = scan["best"]
+            stages_trial = self._stage_evidence(
+                float(trial["break_1"]), float(trial["break_2"]), trial, float(hi), noise
+            )
+            penalty = 0.0
+            for stage in stages_trial[:2]:
+                measured = stage["measured_exponent"]
+                penalty += (
+                    abs(measured - stage["expected_exponent"])
+                    if np.isfinite(measured)
+                    else 1.5  # unmeasurable is worse than slightly off
+                )
+            scored.append((penalty, -float(trial["r_squared"]), candidate_weighting, scan))
+        scored.sort(key=lambda row: (row[0], row[1]))
+        weighting_used, scan = scored[0][2], scored[0][3]
+
+        best = scan["best"]
+        break_1, break_2 = float(best["break_1"]), float(best["break_2"])
+        notes = []
+
+        # How sharply the scan prefers this pair. A flat surface means the
+        # breakpoints are not really determined by the data.
+        r2_values = np.array([t["r_squared"] for t in scan["trials"]], dtype=float)
+        r2_values = r2_values[np.isfinite(r2_values)]
+        headroom = max(1.0 - best["r_squared"], 1e-12)
+        sharpness = float((r2_values.max() - np.median(r2_values)) / headroom) if r2_values.size else 0.0
+
+        stages = self._stage_evidence(break_1, break_2, best, float(hi), noise)
+        exponent_1 = stages[0]["measured_exponent"]
+        exponent_2 = stages[1]["measured_exponent"]
+
+        if stages[0]["n_points"] < 15:
+            notes.append(
+                f"Only {stages[0]['n_points']} points below ε₁. The membrane stage is "
+                f"short, so Eₘ rests on very little of the curve."
+            )
+        peak = float(np.nanmax(np.abs(self.force)))
+        if np.isfinite(peak) and peak > 0:
+            membrane_force = float(
+                self.segment_terms(np.array([break_1]), break_1, break_2)[0][0] * best["Em"]
+            )
+            if membrane_force < 5 * noise:
+                notes.append(
+                    f"At ε₁ the membrane has produced only {membrane_force:.2e} N, "
+                    f"about {membrane_force / noise:.1f} times the noise. Eₘ is "
+                    f"being read from a part of the curve barely above the "
+                    f"baseline; treat it as an upper bound rather than a "
+                    f"measurement."
+                )
+        if sharpness < 1.0:
+            notes.append(
+                "The breakpoint scan is flat: many placements fit about as well, so "
+                "these boundaries are weakly determined by this curve."
+            )
+        if not np.isfinite(exponent_1):
+            notes.append(
+                "The exponent of the first stage cannot be measured: too little of "
+                "it rises clearly above the noise. The breakpoint still comes from "
+                "the fit, but there is no independent confirmation that this part "
+                "of the curve is cubic."
+            )
+        elif abs(exponent_1 - 3.0) > 1.0:
+            notes.append(
+                f"The first stage measures an exponent of {exponent_1:.2f} rather "
+                f"than 3. Either the contact point is off, or the membrane is not "
+                f"what dominates the start of this curve."
+            )
+        if np.isfinite(exponent_2) and abs(exponent_2 - 1.5) > 0.8:
+            notes.append(
+                f"The second stage measures {exponent_2:.2f} rather than 1.5."
+            )
+
+        confident = bool(
+            sharpness >= 1.0
+            and stages[0]["n_points"] >= 15
+            and (not np.isfinite(exponent_1) or abs(exponent_1 - 3.0) <= 1.0)
+            and (not np.isfinite(exponent_2) or abs(exponent_2 - 1.5) <= 0.8)
+        )
+
+        profile_eps, profile_exponent = self.local_exponent()
+        out = {
+            "success": True,
+            "break_1": break_1,
+            "break_2": break_2,
+            "fit": best,
+            "r_squared": float(best["r_squared"]),
+            "sharpness": sharpness,
+            "noise": noise,
+            "weighting_used": weighting_used,
+            "confident": confident,
+            "stages": stages,
+            "profile": {"epsilon": profile_eps, "exponent": profile_exponent},
+            "trials": scan["trials"],
+            "notes": notes,
+        }
+        self.results["exploration"] = out
+        return out
+
+
+# ---------------------------------------------------------------------------
+#  Searching the possible compositions
+# ---------------------------------------------------------------------------
+#
+# Which structures carry load in which stretch of the compression is not
+# something to assume. The membrane goes first and the nucleus last, but in
+# between there are real choices:
+#
+#   * past the first breakpoint, does the membrane keep stiffening as e^3, or
+#     does it stop adding force and simply hold what it reached?
+#   * does the cytoskeleton start from zero deformation, alongside the
+#     membrane, or only from the first breakpoint?
+#   * is there a nucleus stage at all?
+#
+# Each combination is a different model, and each is still linear in the three
+# moduli, so all of them can be fitted exactly and compared. Eight
+# combinations times a breakpoint scan is cheap, and it turns a guess about
+# the mechanics into something the data answers.
+#
+# The general form:
+#
+#     F(e) = Am Em g_m(e) + Ai Ec g_c(e) + An En <e - e2>^1.5
+#
+#     g_m(e) = e^3                     membrane keeps loading
+#            = min(e, e1)^3            membrane freezes at the first break
+#     g_c(e) = <e - 0>^1.5             cytoskeleton loaded from the start
+#            = <e - e1>^1.5            cytoskeleton starts at the first break
+
+
+# The order the terms are always written in: outside of the cell inwards,
+# and within the shell, the taut network before the elastic one. Keeping
+# one order
+# everywhere is what lets the design matrix, the tables and the schematic be
+# read against each other without translating.
+COMPOSITION_TERMS = ("tension", "membrane", "interior", "nucleus")
+
+COMPOSITIONS = [
+    {
+        "key": "freeze_late",
+        "membrane": "freeze",
+        "cyto_start": "break",
+        "label": "Membrane alone, then it holds while the cytoskeleton takes over",
+    },
+    {
+        "key": "freeze_early",
+        "membrane": "freeze",
+        "cyto_start": "zero",
+        "label": "Membrane and cytoskeleton from the start, membrane holds after ε₁",
+    },
+    {
+        "key": "continue_late",
+        "membrane": "continue",
+        "cyto_start": "break",
+        "label": "Membrane throughout, cytoskeleton joins at ε₁",
+    },
+    {
+        "key": "continue_early",
+        "membrane": "continue",
+        "cyto_start": "zero",
+        "label": "Membrane and cytoskeleton both throughout",
+    },
+]
+
+
+def noise_sigma(epsilon, force, window=21):
+    """
+    Estimate the measurement noise along a force curve, point by point.
+
+    There are no error bars on an AFM curve, so chi-squared has nothing to
+    divide by unless the noise is estimated from the data itself. Successive
+    points sit close together in deformation, so the true force barely changes
+    between them and their difference is almost pure noise.
+
+    The estimate is local rather than global because noise on these curves is
+    rarely constant: it often grows with force, and a single number then reads
+    the quiet low-force end and calls the whole curve that quiet, which makes
+    chi-squared far too large. A rolling median over ``window`` points follows
+    the real scatter instead.
+
+    The 0.6745 converts a median absolute deviation to a standard deviation
+    for Gaussian noise, and the sqrt(2) removes the variance doubling that
+    differencing introduces.
+
+    Returns
+    -------
+    (sigma_per_point, sigma_typical) : array in the order given, and one
+    representative number for reporting.
+    """
+    force = np.asarray(force, dtype=float)
+    n = force.size
+    if n < 4:
+        return np.full(n, np.nan), float("nan")
+
+    order = np.argsort(np.asarray(epsilon, dtype=float))
+    ordered = force[order]
+    diffs = np.abs(np.diff(ordered))
+    # One difference per point: pad the last so lengths line up.
+    diffs = np.append(diffs, diffs[-1] if diffs.size else np.nan)
+
+    # A rolling median, vectorised. The obvious Python loop over points is
+    # O(n * window) and this runs inside the breakpoint search, which fits
+    # hundreds of candidates: at three thousand points the loop turned a
+    # half-second search into well over a minute.
+    half = max(2, int(window) // 2)
+    filled = np.where(np.isfinite(diffs), diffs, np.nanmedian(diffs))
+    try:
+        from scipy.ndimage import median_filter
+
+        local = median_filter(filled, size=2 * half + 1, mode="nearest")
+    except Exception:  # pragma: no cover - scipy is a hard dependency
+        local = np.array(
+            [np.median(filled[max(0, i - half):i + half + 1]) for i in range(n)]
+        )
+
+    local = local / 0.6745 / np.sqrt(2.0)
+    finite = local[np.isfinite(local) & (local > 0)]
+    if finite.size == 0:
+        return np.full(n, np.nan), float("nan")
+
+    # A flat stretch can give a local median of exactly zero, which would
+    # divide by nothing; hold those at the smallest real estimate.
+    floor = float(np.min(finite))
+    local[~np.isfinite(local) | (local <= 0)] = floor
+
+    sigma = np.empty(n)
+    sigma[order] = local
+    return sigma, float(np.median(finite))
+
+
+def fit_statistics(force, predicted, n_params, sigma=None, epsilon=None):
+    """
+    Goodness-of-fit numbers for one fitted curve.
+
+    Returns R², adjusted R², chi-squared, reduced chi-squared and the noise
+    level it was measured against. Reduced chi-squared is the useful one: it
+    compares the residuals against the scatter in the data, so about 1 means
+    the model is as close to the points as the noise allows, well above 1
+    means the model is missing something real, and well below 1 means the
+    noise estimate is too generous rather than that the fit is unusually good.
+    """
+    force = np.asarray(force, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    keep = np.isfinite(force) & np.isfinite(predicted)
+    force, predicted = force[keep], predicted[keep]
+    n = force.size
+    residuals = force - predicted
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((force - force.mean()) ** 2)) if n else 0.0
+
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    dof = n - int(n_params)
+    adjusted = (
+        1.0 - (1.0 - r_squared) * (n - 1) / dof
+        if dof > 0 and np.isfinite(r_squared) else float("nan")
+    )
+
+    if sigma is None:
+        sigma, typical = noise_sigma(
+            epsilon[keep] if epsilon is not None else np.arange(n), force
+        )
+    else:
+        sigma = np.asarray(sigma, dtype=float)
+        typical = float(np.median(sigma[np.isfinite(sigma)])) if sigma.size else float("nan")
+
+    sigma = np.asarray(sigma, dtype=float)
+    usable = np.isfinite(sigma) & (sigma > 0) & np.isfinite(residuals)
+    if usable.any():
+        chi_squared = float(np.sum((residuals[usable] / sigma[usable]) ** 2))
+        chi_reduced = chi_squared / dof if dof > 0 else float("nan")
+    else:
+        chi_squared = chi_reduced = float("nan")
+
+    return {
+        "r_squared": r_squared,
+        "adj_r_squared": adjusted,
+        "chi_squared": float(chi_squared),
+        "chi_squared_reduced": float(chi_reduced),
+        "noise_sigma": float(typical),
+        "dof": int(dof),
+        "n_points": int(n),
+        "ss_res": ss_res,
     }
 
 
-def start(**state):
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
-    app.run()
-    eps, force = synthetic()
-    load(app, eps, force)
-    for key, value in state.items():
-        app.session_state[key] = value
-    app.run()
-    return app
+class _CompositionMixin:
+    """Fit and compare the ways the stages can be composed."""
 
+    def composition_terms(self, epsilon, e1, e2, membrane="freeze", cyto_start="break"):
+        """The three classic basis functions for one composition."""
+        basis = self.composition_basis(epsilon, e1, e2, membrane, cyto_start)
+        return basis["membrane"], basis["interior"], basis["nucleus"]
 
-def widget_by_label(app, kind, label):
-    for w in getattr(app, kind):
-        if label.lower() in (w.label or "").lower():
-            return w
-    return None
-
-
-def button_by_label(app, label):
-    for b in app.button:
-        if label.lower() in (b.label or "").lower():
-            return b
-    return None
-
-
-class _FlatTableReader(html.parser.HTMLParser):
-    """Pull the app's HTML result tables back into DataFrames."""
-
-    def __init__(self):
-        super().__init__()
-        self.tables, self._rows, self._cells, self._text = [], None, None, None
-
-    def handle_starttag(self, tag, attrs):
-        classes = dict(attrs).get("class", "")
-        if tag == "table" and "flat-table" in classes:
-            self._rows = []
-        elif tag == "tr" and self._rows is not None:
-            self._cells = []
-        elif tag in ("td", "th") and self._cells is not None:
-            self._text = []
-
-    def handle_data(self, data):
-        if self._text is not None:
-            self._text.append(data)
-
-    def handle_endtag(self, tag):
-        if tag in ("td", "th") and self._text is not None:
-            self._cells.append("".join(self._text).strip())
-            self._text = None
-        elif tag == "tr" and self._cells is not None:
-            self._rows.append(self._cells)
-            self._cells = None
-        elif tag == "table" and self._rows is not None:
-            if len(self._rows) > 1:
-                self.tables.append(
-                    pd.DataFrame(self._rows[1:], columns=self._rows[0])
-                )
-            self._rows = None
-
-
-def flat_tables(app):
-    """Every result table on the page, as DataFrames of strings.
-
-    The app draws these as plain HTML so that no column can be clipped off
-    the right-hand edge, which means AppTest sees markdown rather than a
-    dataframe element. Parsing it back is how a test still reads them.
-    """
-    reader = _FlatTableReader()
-    for element in app.get("markdown"):
-        text = str(element.value)
-        if "flat-table" in text:
-            reader.feed(text)
-    return reader.tables
-
-
-def table_with(app, *columns):
-    """The one result table carrying all of these column names, or None."""
-    for frame in flat_tables(app):
-        if all(c in frame.columns for c in columns):
-            return frame
-    return None
-
-
-FAILURES = []
-
-
-def check(name, condition, detail=""):
-    if condition:
-        print(f"  ok   {name}")
-    else:
-        print(f"  FAIL {name} {detail}")
-        FAILURES.append(name)
-
-
-def no_exception(app, name):
-    if app.exception:
-        print(f"  FAIL {name}: {app.exception[0].value}")
-        FAILURES.append(name)
-        return False
-    return True
-
-
-# ---------------------------------------------------------------- cases ---
-
-def case_loads_clean():
-    print("app loads with a curve, no exception")
-    app = start()
-    no_exception(app, "clean load")
-    check("no old hybrid wording anywhere",
-          not any("parallel below" in str(r.value) for r in app.radio))
-
-
-def case_model_names():
-    print("every model choice runs")
-    app = start()
-    radio = widget_by_label(app, "radio", "how the cell is modelled")
-    check("model radio present", radio is not None)
-    if radio is None:
-        return
-    check("no confusing name",
-          not any("below" in o and "above" in o for o in radio.options),
-          str(radio.options))
-    for option in radio.options:
-        if option.startswith("Compare"):
-            continue  # slow, covered separately
-        app2 = start()
-        widget_by_label(app2, "radio", "how the cell is modelled").set_value(option).run()
-        no_exception(app2, f"model {option!r}")
-
-
-def case_composition_radios():
-    print("composition radios drive the fit")
-    seen = set()
-    for membrane in ("holds what it reached", "keeps stiffening"):
-        for cyto in ("at ε₁", "from the very start"):
-            app = start()
-            widget_by_label(app, "radio", "the membrane").set_value(membrane).run()
-            widget_by_label(app, "radio", "cytoskeleton starts").set_value(cyto).run()
-            if not no_exception(app, f"composition {membrane}/{cyto}"):
-                continue
-            state = app.session_state
-            seen.add((state["membrane_after_break"], state["cyto_starts_at"]))
-    check("all four combinations reachable", len(seen) == 4, str(seen))
-
-
-def case_highlight():
-    print("highlight selector")
-    app = start()
-    radio = widget_by_label(app, "radio", "highlight on the plot")
-    check("highlight radio present", radio is not None)
-    if radio is None:
-        return
-    for option in radio.options:
-        app2 = start()
-        widget_by_label(app2, "radio", "highlight on the plot").set_value(option).run()
-        no_exception(app2, f"highlight {option!r}")
-
-
-def case_search_applies_in_one_press():
-    print("one press searches and applies the winner")
-    app = start()
-    button = button_by_label(app, "Find the best combination and fit it")
-    check("search button present", button is not None)
-    if button is None:
-        return
-    before = (
-        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
-        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
-    )
-    button.click().run()
-    if not no_exception(app, "combination search"):
-        return
-    search = app.session_state["composition_search"]
-    check("search succeeded", bool(search and search.get("success")),
-          str(search.get("error") if search else None))
-    if not (search and search.get("success")):
-        return
-    check("all four compositions ranked",
-          len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]}) == 4)
-
-    truth = ("freeze", "break")
-    best = search["best"]
-    picked = (best["membrane"], best["cyto_start"])
-    check("the true composition is the one picked", picked == truth,
-          f"picked {picked}")
-    check("ε₁ recovered", abs(best["break_1"] - 0.15) < 0.02,
-          f"{best['break_1']:.3f}")
-    check("ε₂ recovered", abs(best["break_2"] - 0.40) < 0.02,
-          f"{best['break_2']:.3f}")
-
-    # The winner should already be in the widgets: no second click needed.
-    after = (
-        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
-        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
-    )
-    check("the winner was applied without a second click", after != before,
-          f"{before} -> {after}")
-    check("applied ε₁ matches the winner",
-          abs(after[0] - best["break_1"]) < 0.002, f"{after[0]} vs {best['break_1']}")
-    check("applied composition matches the winner",
-          MEMBRANE_MODE[after[2]] == best["membrane"]
-          and CYTO_MODE[after[3]] == best["cyto_start"])
-
-    override = button_by_label(app, "Use this one instead")
-    check("override button present", override is not None)
-    if override is not None:
-        override.click().run()
-        no_exception(app, "override the pick")
-    print(f"       picked {best['label']!r}, ε₁={after[0]}, ε₂={after[1]}")
-
-
-def case_search_beats_the_old_grid():
-    print("the refined search finds the breakpoints the coarse grid missed")
-    for membrane, cyto in (
-        ("freeze", "break"), ("freeze", "zero"), ("continue", "break"),
+    def composition_basis(
+        self, epsilon, e1, e2, membrane="freeze", cyto_start="break",
     ):
-        eps, force = synthetic(membrane, cyto)
-        model = LulevichModel(force, eps, cell_height=8.0e-6)
+        """
+        Every basis function the composition can use, keyed by term name.
 
-        coarse = model._best_breakpoints(
-            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=0
+        Four of them, and the exponents are what keep them apart:
+
+        ``tension``   At e              a taut protein network, horizontal spring
+        ``membrane``  Am e^3            elastic dilation of the same shell
+        ``interior``  Ai <e - s>^1.5    a network filling the cell
+        ``nucleus``   An <e - e2>^1.5   a stiffer layer reached deeper in
+
+        A fit can only separate terms whose shapes differ. Two networks with
+        the same exponent and the same onset are one term wearing two names,
+        and the solver would split them arbitrarily. That is why the second
+        membrane spring is a tension law rather than a second cube law, and
+        why the deeper of the two interior networks is given an onset.
+        """
+        eps = np.asarray(epsilon, dtype=float)
+        positive = np.clip(eps, 0.0, None)
+        # A ruptured membrane holds what it reached: both of its springs stop
+        # taking up more, because they are the same piece of material.
+        held = positive if membrane == "continue" else np.clip(
+            np.minimum(eps, e1), 0.0, None
         )
-        refined = model._best_breakpoints(
-            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=2
-        )
-        check(f"refinement does not make {membrane}/{cyto} worse",
-              refined["ss_res"] <= coarse["ss_res"] * (1 + 1e-9),
-              f"{refined['ss_res']:.4g} vs {coarse['ss_res']:.4g}")
-        check(f"ε₁ within 0.02 of truth for {membrane}/{cyto}",
-              abs(refined["break_1"] - 0.15) < 0.02, f"{refined['break_1']:.4f}")
-
-
-def case_search_flags_what_it_cannot_see():
-    print("the search says when a term or a boundary does nothing")
-    eps, force = synthetic("continue", "zero")
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    found = model.search_compositions(0.0, 0.60)
-    check("search succeeded", found.get("success"))
-    if not found.get("success"):
-        return
-    row = next(
-        r for r in found["candidates"]
-        if r["membrane"] == "continue" and r["cyto_start"] == "zero" and r["use_nucleus"]
-    )
-    check("ε₁ flagged as unused when nothing depends on it",
-          "ε₁" in row.get("idle_breaks", []), str(row.get("idle_breaks")))
-
-    # A curve with no nucleus should be answered without one.
-    eps, force = synthetic("freeze", "zero", En_kPa=0.0)
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    found = model.search_compositions(0.0, 0.60)
-    check("a curve with no nucleus is answered without one",
-          found["best"]["use_nucleus"] is False
-          or found["best"]["En_kPa"] <= 0,
-          f"En={found['best']['En_kPa']:.4g}, "
-          f"use_nucleus={found['best']['use_nucleus']}")
-
-
-def case_bare_plot():
-    print("one switch strips the plot to data and fit")
-    app = start()
-    switch = None
-    for box in app.checkbox:
-        if "data and fit only" in (box.label or "").lower():
-            switch = box
-    check("bare-plot switch present", switch is not None)
-    if switch is None:
-        return
-    check("element curves off by default",
-          app.session_state["show_components"] is False)
-    switch.set_value(True).run()
-    if not no_exception(app, "bare plot"):
-        return
-
-    import app as app_module
-
-    everything_on = {name: True for name in app_module.PLOT_EXTRAS}
-    normal = app_module.plot_flags({**everything_on, "bare_plot": False})
-    check("individual boxes respected when not bare", all(normal.values()),
-          str(normal))
-
-    stripped = app_module.plot_flags({**everything_on, "bare_plot": True})
-    for flag, drawn in stripped.items():
-        check(f"{flag} forced off by the bare switch", drawn is False)
-
-    partial = app_module.plot_flags(
-        {**everything_on, "show_legend": False, "bare_plot": False}
-    )
-    check("one box off leaves the others on",
-          partial["show_legend"] is False and partial["show_components"] is True)
-
-    # And the app itself must still run with the switch on.
-    check("app runs with the bare switch on", not app.exception)
-
-
-def case_buttons_do_not_break_widgets():
-    print("every button clicks cleanly, for every cell type")
-    # Both cell types, because they build different models out of different
-    # numbers of terms, and a button that only ever ran under the default
-    # one is a button that has only been half tested. "Find the segments"
-    # passed a four-term list into the three-term segmented machinery and
-    # raised a KeyError on the fourth, for every cardiomyocyte, and this
-    # case did not catch it because it only ever ran as a myoblast.
-    for cell_type in ("Myoblast (C2C12)", "Cardiomyocyte"):
-        app = start(cell_type=cell_type)
-        labels = [b.label for b in app.button]
-        for label in labels:
-            if any(word in label.lower()
-                   for word in ("box", "database", "send", "upload")):
-                continue
-            app2 = start(cell_type=cell_type)
-            target = button_by_label(app2, label)
-            if target is None:
-                continue
-            target.click().run()
-            no_exception(app2, f"{cell_type}: button {label!r}")
-
-
-def case_preset_round_trip():
-    print("save a preset, then apply it back")
-    app = start()
-    widget_by_label(app, "radio", "the membrane").set_value("keeps stiffening").run()
-    name_box = None
-    for box in app.text_input:
-        if "preset" in (box.key or ""):
-            name_box = box
-    check("preset name box present", name_box is not None)
-    if name_box is None:
-        return
-    name_box.set_value("test preset").run()
-    save = button_by_label(app, "Save current")
-    check("save button present", save is not None)
-    if save is None:
-        return
-    save.click().run()
-    if not no_exception(app, "save preset"):
-        return
-    stored = app.session_state["range_presets"].get("test preset")
-    check("preset stored", stored is not None)
-    if stored is None:
-        return
-    check("preset carries the model name",
-          stored["coupling"].startswith("Segmented"), str(stored.get("coupling")))
-    check("preset carries the composition",
-          stored["membrane_after_break"] == "keeps stiffening",
-          str(stored.get("membrane_after_break")))
-    check("preset carries the boundaries",
-          "segment_break_1" in stored and "segment_break_2" in stored)
-
-    # Now switch away and apply the preset back.
-    widget_by_label(app, "radio", "the membrane").set_value(
-        "holds what it reached"
-    ).run()
-    apply = button_by_label(app, "Apply")
-    if apply is not None:
-        apply.click().run()
-        if no_exception(app, "apply preset"):
-            check("preset restored the composition",
-                  app.session_state["membrane_after_break"] == "keeps stiffening",
-                  str(app.session_state["membrane_after_break"]))
-
-
-def case_companion_file_guard():
-    print("mismatched companion files are named, not crashed on")
-    import app as app_module
-
-    check("no stale files in a matched tree", app_module.STALE_FILES == [],
-          str(app_module.STALE_FILES))
-
-    def old_signature(a, b, title=None):
-        return (a, b, title)
-
-    filtered = app_module.figure_kwargs(
-        old_signature, title="keep", highlight_window=(0.1, 0.2), fit_window=(0, 1)
-    )
-    check("unknown keywords dropped", filtered == {"title": "keep"}, str(filtered))
-
-    def new_signature(a, title=None, highlight_window=None):
-        return None
-
-    kept = app_module.figure_kwargs(
-        new_signature, title="keep", highlight_window=(0.1, 0.2)
-    )
-    check("known keywords kept", set(kept) == {"title", "highlight_window"}, str(kept))
-
-    def takes_anything(a, **kwargs):
-        return None
-
-    passthrough = app_module.figure_kwargs(takes_anything, anything=1, else_=2)
-    check("**kwargs passes everything through", len(passthrough) == 2)
-
-
-def case_fit_survives_a_rerun():
-    print("the fit survives a rerun with live refitting off")
-    app = start()
-    # Fit once, then take live refitting away, as uploading a video does.
-    check("a fit exists to begin with",
-          app.session_state["_last_fit"] is not None)
-    app.session_state["live_fit"] = False
-    app.run()
-    if not no_exception(app, "rerun with live refitting off"):
-        return
-    check("the fit is still there after a rerun",
-          app.session_state["_last_fit"] is not None)
-
-    # The database section must still be on the page, which is what actually
-    # vanished before: it lived inside the fit-succeeded branch.
-    uploader_labels = [u.label for u in app.get("file_uploader")]
-    check("the video uploader is still on the page",
-          any("compression video" in (l or "").lower() for l in uploader_labels),
-          str(uploader_labels))
-    check("the send button is still on the page",
-          button_by_label(app, "Send to OneDrive") is not None)
-
-
-def case_database_section_without_a_fit():
-    print("the database section is reachable before any fit")
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
-    app.run()
-    eps, force = synthetic()
-    load(app, eps, force)
-    app.session_state["live_fit"] = False
-    app.run()
-    if not no_exception(app, "no fit yet"):
-        return
-    check("no fit has been made", app.session_state["_last_fit"] is None)
-    uploader_labels = [u.label for u in app.get("file_uploader")]
-    check("the video uploader is reachable with no fit",
-          any("compression video" in (l or "").lower() for l in uploader_labels),
-          str(uploader_labels))
-    send = button_by_label(app, "Send to OneDrive")
-    check("the send button is shown with no fit", send is not None)
-    if send is not None:
-        check("and it is disabled until there is a fit", send.disabled is True)
-
-
-class FakeStore:
-    """Stands in for Box so the send path can be exercised for real."""
-
-    last = {}
-
-    def save_cell(self, record, curve_csv=None, thumbnail_png=None,
-                  video_bytes=None, video_name=None):
-        FakeStore.last = {
-            "record": record, "curve": curve_csv, "thumb": thumbnail_png,
-            "video": video_bytes, "video_name": video_name,
+        start = 0.0 if cyto_start == "zero" else float(e1)
+        return {
+            "membrane": self.Am * held ** 3,
+            "tension": self.At * held,
+            "interior": self.Ai * np.clip(eps - start, 0.0, None) ** 1.5,
+            "nucleus": self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5,
         }
-        return {"cell_id": record["cell_id"], "video_url": ""}
 
-    def load_index(self):
-        return pd.DataFrame(columns=["cell_id", "date", "Em_MPa", "Ec_kPa"])
-
-    def check(self):
-        return {"ok": True, "detail": "fake store"}
-
-    def auth_method(self):
-        return "fake"
-
-
-def case_send_without_a_video():
-    print("a cell can be sent with no video at all")
-    FakeStore.last = {}
-    app = start(onedrive_store=FakeStore(), cell_name="cell-01")
-    check("no video is loaded", not app.session_state["video_path"])
-
-    send = button_by_label(app, "Send to OneDrive")
-    check("send button present", send is not None)
-    if send is None:
-        return
-    check("send button is enabled with a fit and no video", send.disabled is False)
-
-    send.click().run()
-    if not no_exception(app, "send with no video"):
-        return
-    check("no error was shown", not app.error, str([e.value for e in app.error]))
-    check("a success message was shown",
-          any("cell-01" in (m.value or "") for m in app.success),
-          str([m.value for m in app.success]))
-
-    saved = FakeStore.last
-    check("the cell reached the store", bool(saved))
-    check("no video bytes were sent", saved.get("video") is None)
-    check("no morphology frame was sent", saved.get("thumb") is None)
-    check("the curve went anyway", bool(saved.get("curve")))
-    check("the moduli went anyway",
-          "Em_MPa" in (saved.get("record") or {})
-          and "Ec_kPa" in (saved.get("record") or {}))
-    check("the fitted column is in the curve csv",
-          "fit_N" in (saved.get("curve") or ""))
-
-
-def case_clear_cell_wins_over_dark_debris():
-    print("the detector picks the clear cell, not a dark blob of the same shape")
-    try:
-        import cv2
-        import video_analysis as va
-    except Exception as exc:
-        print(f"  skip (no OpenCV: {exc})")
-        return
-
-    def scene():
-        """A dark blob that is bigger and more central than the real cell."""
-        f = np.full((300, 420, 3), 150, np.uint8)
-        cv2.ellipse(f, (210, 175), (52, 48), 0, 0, 360, (95, 95, 95), -1)
-        cv2.ellipse(f, (90, 175), (40, 37), 0, 0, 360, (205, 205, 205), -1)
-        cv2.rectangle(f, (0, 40), (420, 70), (18, 18, 18), -1)   # cantilever
-        rng = np.random.default_rng(0)
-        return np.clip(f.astype(int) + rng.normal(0, 4, f.shape), 0, 255).astype(np.uint8)
-
-    frame = scene()
-
-    on_shape = va.detect_cell(frame, appearance="either", min_area_frac=0.005)
-    check("without a hint the dark blob wins, which is the reported bug",
-          on_shape.get("found") and on_shape["center"][0] > 150,
-          str(on_shape.get("center")))
-
-    clear = va.detect_cell(frame, appearance="clear", min_area_frac=0.005)
-    check("told the cell is clear, it picks the clear one",
-          clear.get("found") and clear["center"][0] < 150,
-          str(clear.get("center")))
-
-    dark = va.detect_cell(frame, appearance="dark", min_area_frac=0.005)
-    check("told the cell is dark, it picks the dark one",
-          dark.get("found") and dark["center"][0] > 150,
-          str(dark.get("center")))
-
-    # The stored crop must actually contain the cell, not background.
-    crop = va.crop(frame, clear)
-    check("the crop is centred on the clear cell",
-          crop is not None and float(crop.mean()) > float(frame.mean()),
-          f"crop mean {float(crop.mean()):.0f} vs frame {float(frame.mean()):.0f}")
-
-
-def case_all_three_moduli_always_reported():
-    print("all three moduli appear even when a term is not in the model")
-    app = start(use_nucleus=False, use_interior=False)
-    if not no_exception(app, "membrane only"):
-        return
-    labels = [m.label for m in app.get("metric")]
-    for wanted in ("membrane", "cytoskeleton", "nucleus"):
-        check(f"{wanted} has a tile with only the membrane selected",
-              any(wanted in (l or "").lower() for l in labels), str(labels))
-    values = {m.label: (m.value, m.delta) for m in app.get("metric")}
-    # Only the modulus tiles, which are the ones named "Ec …" and "Eₙ …".
-    off = [
-        (label, values[label][0], values[label][1])
-        for label in ("Ec cytoskeleton", "E\u2099 nucleus") if label in values
-    ]
-    check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
-    for label, value, delta in off:
-        check(f"{label} reads zero", value.strip().startswith("0"), value)
-        check(f"{label} says it was not in the model",
-              "not in this model" in (delta or ""), str(delta))
-
-
-def case_load_share_table():
-    print("the range-by-range table says who carries the load")
-    app = start()
-    if not no_exception(app, "load share table"):
-        return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the table has a heading", "share the load" in text, text[:120])
-
-
-def case_download_when_box_is_absent():
-    print("a cell can be saved with no Box account")
-    app = start(cell_name="cell-01")
-    drive = button_by_label(app, "Send to OneDrive")
-    check("the OneDrive button is present", drive is not None)
-    if drive is not None:
-        check("and disabled without a connection", drive.disabled is True)
-    check("Box is gone from the app",
-          button_by_label(app, "Send to Box") is None
-          and not any("Box" in (b.label or "") for b in app.button),
-          str([b.label for b in app.button]))
-
-    downloads = [d for d in app.get("download_button")
-                 if "download this cell" in (d.label or "").lower()]
-    check("a download is offered instead", len(downloads) == 1, str(len(downloads)))
-
-    import zipfile, io as _io, json as _json
-    import app as app_module
-    fit = app.session_state["_last_fit"]
-    eps, force = synthetic()
-    # Build the bundle through the app so session state is live.
-    check("there is a fit to package", fit is not None)
-
-
-class FakeWorksheet:
-    """A worksheet that records what would be written to the real sheet."""
-
-    def __init__(self, header):
-        self.header = list(header)
-        self.rows = []
-        self.updates = []
-        self.all_values = [list(header)]
-        self.written_rows = []
-        self.cleared = False
-
-    def row_values(self, index):
-        return list(self.header) if index == 1 else []
-
-    def get_all_values(self):
-        return [list(row) for row in self.all_values]
-
-    def clear(self):
-        self.cleared = True
-
-    def update(self, values=None, range_name=None, **kwargs):
-        self.header = list(values[0])
-        self.updates.append(list(values[0]))
-        if len(values) > 1:
-            self.written_rows = [list(r) for r in values[1:]]
-
-    def append_row(self, row, **kwargs):
-        self.rows.append(list(row))
-
-    def insert_row(self, row, index):
-        self.header = list(row)
-
-
-def case_sheet_row_matches_the_header():
-    print("the sheet row is built from the sheet's own header")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    # The user's real sheet as it stood before this change.
-    existing = [
-        "Cell ID", "Date Analyzed", "Cell Height (μm)",
-        "Cantilever Constant (pN/nm)", "Young's Modulus (Em, MPa)",
-        "Young's Modulus (Ei, kPa)", "Video Link", "Force Curve Created",
-        "Fit Quality (R²)", "Notes", "Analysis Status", "Timestamp",
-    ]
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet = FakeWorksheet(existing)
-    manager.worksheet = sheet
-
-    ok, message = manager.append_cell_data({
-        "cell_id": "cell-01", "Em": 0.605, "Ei": 1.196, "En": 3.027,
-        "Em_range": "0.000 to 0.151", "En_range": "0.403 to 0.600",
-        "break_1": 0.151, "break_2": 0.403, "fit_quality": 0.9997,
-        "cell_height": 8.0, "spring_constant": 0.08, "notes": "test",
-    })
-    check("the write succeeded", ok, message)
-
-    check("Date Analyzed was renamed, not duplicated",
-          "Experiment Date" in sheet.header
-          and "Date Analyzed" not in sheet.header, str(sheet.header))
-    check("Cantilever Constant became Spring Constant",
-          "Spring Constant, K (N/m)" in sheet.header
-          and "Cantilever Constant (pN/nm)" not in sheet.header, str(sheet.header))
-    check("renamed columns kept their position",
-          sheet.header[1] == "Experiment Date"
-          and sheet.header[3] == "Spring Constant, K (N/m)", str(sheet.header[:5]))
-    for wanted in ("Young's Modulus (En, kPa)", "Em range (ε)", "Ei range (ε)",
-                   "En range (ε)", "ε₁ membrane hands over", "RMSE (N)"):
-        check(f"{wanted} column present", wanted in sheet.header, str(sheet.header))
-
-    check("exactly one row was written", len(sheet.rows) == 1)
-    written = dict(zip(sheet.header, sheet.rows[0]))
-    check("cell id in the right column", written["Cell ID"] == "cell-01")
-    check("Em in the Em column",
-          abs(float(written["Young's Modulus (Em, MPa)"]) - 0.605) < 1e-6)
-    check("En in the nucleus column",
-          abs(float(written["Young's Modulus (En, kPa)"]) - 3.027) < 1e-6)
-    check("the Em range travelled with it",
-          written["Em range (ε)"] == "0.000 to 0.151", str(written["Em range (ε)"]))
-    check("spring constant in N/m, not converted",
-          abs(float(written["Spring Constant, K (N/m)"]) - 0.08) < 1e-9)
-    check("row length matches the header", len(sheet.rows[0]) == len(sheet.header))
-
-    # A reordered header must still be written correctly.
-    manager2 = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet2 = FakeWorksheet(list(reversed(existing)))
-    manager2.worksheet = sheet2
-    manager2.append_cell_data({"cell_id": "cell-02", "Em": 1.5})
-    written2 = dict(zip(sheet2.header, sheet2.rows[0]))
-    check("reordered header still gets the right cell id",
-          written2["Cell ID"] == "cell-02")
-    check("reordered header still gets Em in the Em column",
-          abs(float(written2["Young's Modulus (Em, MPa)"]) - 1.5) < 1e-6)
-
-
-def case_sheet_reorder_keeps_the_data():
-    print("reordering the columns does not lose a row")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    header = ["Cell ID", "Date Analyzed", "Video Link", "Notes", "Custom of mine"]
-    rows = [
-        ["cell-01", "2026-01-01", "http://v/1", "first", "keep me"],
-        ["cell-02", "2026-01-02", "http://v/2", "second", "keep me too"],
-    ]
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet = FakeWorksheet(header)
-    sheet.all_values = [header] + rows
-    manager.worksheet = sheet
-
-    ok, message = manager.reorder_columns()
-    check("the reorder succeeded", ok, message)
-    new_header = sheet.header
-    check("video link is last", new_header[-1] == "Video Link"
-          or new_header[-2:] == ["Video Link", "Custom of mine"], str(new_header[-3:]))
-    check("a column the app does not know about was kept",
-          "Custom of mine" in new_header)
-    check("the header was renamed here too",
-          "Experiment Date" in new_header and "Date Analyzed" not in new_header)
-
-    written = [dict(zip(new_header, row)) for row in sheet.written_rows]
-    check("both rows survived", len(written) == 2, str(len(written)))
-    if len(written) == 2:
-        check("row values followed their column",
-              written[0]["Cell ID"] == "cell-01"
-              and written[0]["Notes"] == "first"
-              and written[0]["Video Link"] == "http://v/1",
-              str(written[0]))
-        check("the date moved to the renamed column",
-              written[1]["Experiment Date"] == "2026-01-02", str(written[1]))
-        check("the unknown column kept its value",
-              written[1]["Custom of mine"] == "keep me too")
-
-
-def case_fit_line_and_heights_toggle():
-    print("the fitted curve and the component heights each have a switch")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
-    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-
-    def build(**flags):
-        style = plot_utils.PlotStyle(force_unit="N", show_components=True, **flags)
-        return plot_utils.force_curve_figure(
-            eps, force, style, fit_force_N=fitted,
-            membrane_N=mb * fit["Em"], interior_N=cb * fit["Ei"],
-            nucleus_N=nb * fit["En"],
-        )
-
-    on = build()
-    check("the model line is drawn by default",
-          any(t.name == "Model" for t in on.data))
-    check("no height labels by default", len(on.layout.annotations) == 0)
-
-    off = build(show_fit_line=False)
-    check("switching the fit off removes the model line",
-          not any(t.name == "Model" for t in off.data))
-    check("the data is still there",
-          any(t.name == "Experimental data" for t in off.data))
-
-    labelled = build(show_component_heights=True)
-    texts = [a.text for a in labelled.layout.annotations]
-    check("a height label per component plus the total",
-          len(texts) == 4, str(texts))
-    check("the labels carry the force unit",
-          all("N" in (t or "") for t in texts), str(texts))
-
-
-def case_range_table_shows_zero_moduli():
-    print("each range lists the moduli active there, zero where not reached")
-    app = start()
-    if not no_exception(app, "range table"):
-        return
-    target = table_with(app, "range", "membrane")
-    check("the range table is on the page", target is not None)
-    if target is None:
-        return
-    for column in ("E membrane", "E cytoskeleton", "E nucleus"):
-        check(f"{column} column present", column in target.columns,
-              str(list(target.columns)))
-    first = target.iloc[0]
-    check("the first range carries only the membrane",
-          first["E cytoskeleton"].startswith("0")
-          and first["E nucleus"].startswith("0"),
-          f"{first['E cytoskeleton']!r} {first['E nucleus']!r}")
-    check("and the membrane is non-zero there",
-          not first["E membrane"].startswith("0 "), str(first["E membrane"]))
-    last = target.iloc[-1]
-    check("the last range carries the nucleus",
-          not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
-
-
-def case_plot_options_are_under_the_plot():
-    print("the plot switches are next to the plot, not buried in the sidebar")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "plot options"):
-        return
-    labels = [c.label for c in app.checkbox]
-    for wanted in ("Data and fit only", "The fitted curve", "Element curves",
-                   "Shaded segment bands", "Legend"):
-        check(f"“{wanted}” is on the page", wanted in labels, str(labels))
-
-    text = " ".join(
-        str(m.value) for m in list(app.get("markdown")) + list(app.get("caption"))
-    )
-    check("the sidebar points at the new place",
-          "Plot options" in text, "no pointer found")
-
-    # Ticking it must actually strip the plot.
-    switch = widget_by_label(app, "checkbox", "Data and fit only")
-    check("the switch is reachable", switch is not None)
-    if switch is not None:
-        switch.set_value(True).run()
-        no_exception(app, "bare plot from under the plot")
-        check("the switch stuck", app.session_state["bare_plot"] is True)
-
-
-def case_save_the_plot():
-    print("the plot can be saved with a sensible name")
-    import app as app_module
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-
-    app = start(cell_name="Cell 04 / trial 2")
-    downloads = [d for d in app.get("download_button")
-                 if "save" in (d.label or "").lower()]
-    check("a save button is offered", len(downloads) >= 1,
-          str([d.label for d in app.get("download_button")]))
-
-    import datetime as _dt
-    name = app_module.suggested_plot_name(
-        "Cell 04 / trial 2", fit, _dt.date(2026, 3, 4), ".png"
-    )
-    check("the name carries the cell", name.startswith("Cell_04___trial_2"), name)
-    check("the name carries the date", "2026-03-04" in name, name)
-    check("the name carries the moduli", "Em" in name and "Ec" in name, name)
-    check("the name has no path separators", "/" not in name and "\\" not in name, name)
-    check("the extension is kept", name.endswith(".png"), name)
-    blank = app_module.suggested_plot_name("", fit, _dt.date(2026, 3, 4), ".html")
-    check("an unnamed cell still gets a usable name",
-          blank.startswith("cell_") and blank.endswith(".html"), blank)
-
-
-def case_fit_maths_box():
-    print("the working behind the fit is shown")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "maths box"):
-        return
-    blocks = [str(b.value) for b in app.get("latex")]
-    check("equations are rendered", len(blocks) >= 3, str(len(blocks)))
-    joined = " ".join(blocks)
-    check("the model equation is there", "A_m E_m" in joined, joined[:120])
-    check("the least-squares statement is there",
-          "arg\\min" in joined or "argmin" in joined, joined[-160:])
-    code = " ".join(str(c.value) for c in app.get("code"))
-    check("the prefactors are printed with values", "Am =" in code, code[:160])
-    check("the fitted moduli are printed", "MPa" in code and "kPa" in code)
-
-
-def case_guided_mode_is_the_default():
-    print("guided mode: one button, an answer in words")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "guided load"):
-        return
-    check("guided is the default",
-          app.session_state["ui_mode"].startswith("Guided"),
-          app.session_state["ui_mode"])
-
-    work = button_by_label(app, "Work it out for me")
-    check("the one-press button is there", work is not None)
-
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    for phrase in ("What this cell did as it was squashed",
-                   "How stiff each part turned out to be",
-                   "Does the model match the measurement"):
-        check(f"“{phrase[:34]}…” is shown", phrase in text)
-    check("no bare jargon in the headline",
-          "coupling" not in text.lower(), "the word coupling leaked out")
-
-    # The plain-language table names the parts in everyday words.
-    parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
-    check("the stiffness table is there", len(parts) == 1, str(len(parts)))
-    if parts:
-        table = parts[0]
-        check("it names all three parts", len(table) == 3, str(len(table)))
-        check("it explains what each part is",
-              all(isinstance(v, str) and v for v in table["What it is"]))
-        check("it gives an everyday comparison",
-              any("as" in str(v) for v in table["Roughly"]), str(list(table["Roughly"])))
-
-    if work is not None:
-        work.click().run()
-        if no_exception(app, "work it out"):
-            found = app.session_state["composition_search"]
-            check("the search ran", bool(found and found.get("success")))
-            if found and found.get("success"):
-                best = found["best"]
-                check("the winner was applied",
-                      abs(app.session_state["segment_break_1"]
-                          - round(best["break_1"], 3)) < 0.002,
-                      f"{app.session_state['segment_break_1']} vs {best['break_1']}")
-
-
-def case_full_control_shows_everything():
-    print("full control puts the settings back on the page")
-    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
-    if not no_exception(app, "full control"):
-        return
-    check("the one-press button is hidden in full control",
-          button_by_label(app, "Work it out for me") is None)
-    check("the section headings are back",
-          any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
-    check("the expert search button is still there",
-          button_by_label(app, "Find the best combination and fit it") is not None)
-    check("the plain-language summary is not duplicated",
-          not any("What this cell did as it was squashed" in str(m.value)
-                  for m in app.get("markdown")))
-
-
-def case_plain_language_helpers():
-    print("the everyday wording is honest about scale")
-    import app as app_module
-
-    check("a jelly-soft modulus reads soft",
-          "jelly" in app_module.stiffness_in_words(1.2e3),
-          app_module.stiffness_in_words(1.2e3))
-    check("a rubbery modulus reads firm",
-          "rubber" in app_module.stiffness_in_words(6e5),
-          app_module.stiffness_in_words(6e5))
-    check("zero is called unmeasurable",
-          "not measurable" in app_module.stiffness_in_words(0.0))
-    check("a NaN is called unmeasurable",
-          "not measurable" in app_module.stiffness_in_words(float("nan")))
-    check("the comparisons increase with stiffness",
-          len({app_module.stiffness_in_words(v)
-               for v in (5e2, 5e3, 5e4, 5e5)}) == 4)
-
-    check("a good fit is described as close",
-          "exactly" in app_module.quality_in_words(0.999))
-    check("a bad fit is called out",
-          "wrong" in app_module.quality_in_words(0.5),
-          app_module.quality_in_words(0.5))
-
-
-def case_curve_saved_as_a_tab():
-    print("the force curve can be stored in the spreadsheet")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    class FakeSpreadsheet:
-        url = "https://docs.google.com/spreadsheets/d/abc/edit"
-
-        def __init__(self):
-            self.tabs = {}
-
-        def worksheet(self, title):
-            import gspread
-            if title not in self.tabs:
-                raise gspread.WorksheetNotFound(title)
-            return self.tabs[title]
-
-        def add_worksheet(self, title, rows, cols):
-            sheet = FakeWorksheet([])
-            sheet.id = 7
-            self.tabs[title] = sheet
-            return sheet
-
-        def worksheets(self):
-            return list(self.tabs.values())
-
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    book = FakeSpreadsheet()
-    manager.spreadsheet = book
-
-    eps, force = synthetic()
-    fitted = force * 0.99
-    fitted[:5] = np.nan          # outside the fitted range
-
-    ok, message, url = manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
-    check("the curve was saved", ok, message)
-    check("the tab is named after the cell",
-          "curve_Cell 04 _ trial 2" in book.tabs, str(list(book.tabs)))
-    check("the url points at the tab", "#gid=" in url, url)
-
-    sheet = list(book.tabs.values())[0]
-    written = sheet.written_rows if sheet.written_rows else []
-    header = sheet.header
-    check("the header names the columns",
-          header == ["relative_deformation", "force_N", "fit_N"], str(header))
-    check("every point was written", len(written) == len(eps), str(len(written)))
-    check("NaN outside the fit is written as blank",
-          written[0][2] == "", repr(written[0][2]))
-    check("a fitted point carries its value",
-          isinstance(written[-1][2], float), repr(written[-1][2]))
-
-    # Saving the same cell twice replaces the tab rather than adding another.
-    manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
-    check("refitting replaces the tab, not duplicates it", len(book.tabs) == 1,
-          str(list(book.tabs)))
-    check("the tab was cleared before rewriting", sheet.cleared is True)
-
-
-def case_axis_ranges():
-    print("the axes can be pinned, and deformation defaults to 0-1")
-    import plot_utils
-    import app as app_module
-
-    check("0 to 1 is the default deformation axis",
-          app_module.DEFAULTS["x_axis_mode"].startswith("0 to 1"),
-          app_module.DEFAULTS["x_axis_mode"])
-
-    eps, force = synthetic()
-    style = plot_utils.PlotStyle(force_unit="N", x_range=(0.0, 1.0))
-    fig = plot_utils.force_curve_figure(eps, force, style)
-    check("the deformation axis is pinned to 0-1",
-          list(fig.layout.xaxis.range) == [0.0, 1.0], str(fig.layout.xaxis.range))
-    check("autorange is off so it stays pinned",
-          fig.layout.xaxis.autorange is False, str(fig.layout.xaxis.autorange))
-
-    style = plot_utils.PlotStyle(force_unit="N", y_range=(0.0, 5.0))
-    fig = plot_utils.force_curve_figure(eps, force, style)
-    check("the force axis can be pinned too",
-          list(fig.layout.yaxis.range) == [0.0, 5.0], str(fig.layout.yaxis.range))
-
-    loose = plot_utils.force_curve_figure(eps, force, plot_utils.PlotStyle(force_unit="N"))
-    check("no range means plotly decides", loose.layout.xaxis.range is None)
-
-    # A reversed or nonsense range must be ignored, not applied.
-    bad = plot_utils.force_curve_figure(
-        eps, force, plot_utils.PlotStyle(force_unit="N", x_range=(1.0, 0.0))
-    )
-    check("a reversed range is ignored", bad.layout.xaxis.range is None,
-          str(bad.layout.xaxis.range))
-
-    # Log axes take decades, so a linear pair must not be applied there.
-    logged = plot_utils.force_curve_figure(
-        eps, force,
-        plot_utils.PlotStyle(force_unit="N", log_scale=True, x_range=(0.0, 1.0)),
-    )
-    check("ranges are not applied on log axes",
-          logged.layout.xaxis.range is None, str(logged.layout.xaxis.range))
-
-
-def case_nucleus_spring_is_shorter():
-    print("a component met late gets a shorter spring")
-    import plot_utils
-
-    style = plot_utils.PlotStyle(force_unit="N")
-
-    def springs(cyto_start):
-        fig = plot_utils.cell_schematic(
-            style, epsilon=0.5, break_1=0.15, break_2=0.40,
-            membrane_mode="freeze", cyto_start=cyto_start,
-            Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
-        )
-        # Springs are line traces; measure how far each spans vertically.
-        spans = []
-        for trace in fig.data:
-            ys = [v for v in (trace.y or []) if v is not None]
-            if len(ys) > 4:
-                spans.append(max(ys) - min(ys))
-        return sorted(spans)
-
-    late = springs("break")
-    early = springs("zero")
-    check("some springs were drawn", len(late) >= 2, str(late))
-    if len(late) >= 2 and len(early) >= 2:
-        check("the late component's spring is shorter than the earliest one",
-              min(late) < max(late) * 0.95, str(late))
-        check("starting at zero makes the interior spring full length",
-              max(early) >= max(late) * 0.99, f"{early} vs {late}")
-
-
-def case_component_names_follow_the_cell_type():
-    print("a cardiomyocyte is not described as a myoblast")
-    import app as app_module
-
-    myoblast = app_module.components_for("Myoblast (C2C12)")
-    cardio = app_module.components_for("Cardiomyocyte")
-    check("the myoblast interior is the cytoskeleton",
-          myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
-    check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
-          "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
-    check("and a sarcomeric, contractile one",
-          "Sarcomeric" in cardio["nucleus"][0]
-          and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
-    check("the two are described as different things",
-          cardio["interior"][1] != cardio["nucleus"][1])
-    # The membrane is two springs for this cell type, and they have to be
-    # named as two things, not one thing twice.
-    check("the taut protein network is one of them",
-          "taut" in cardio["tension"][1], str(cardio["tension"]))
-    check("the shell's own elasticity is the other",
-          "stretch" in cardio["membrane"][1], str(cardio["membrane"]))
-    check("a myoblast has no tension spring",
-          "tension" not in app_module.terms_for("Myoblast (C2C12)"))
-    check("a cardiomyocyte does",
-          "tension" in app_module.terms_for("Cardiomyocyte"))
-    check("an unknown cell type still gets names",
-          app_module.components_for("Something else")["interior"][0])
-
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "cardiomyocyte names"):
-        return
-    parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
-    check("the plain-language table is there", len(parts) == 1)
-    if parts:
-        listed = list(parts[0]["Part of the cell"])
-        check("it lists both kinds of cytoskeleton",
-              any("Non-sarcomeric" in v for v in listed)
-              and any("Sarcomeric myofibrils" == v for v in listed), str(listed))
-        check("and never calls anything a nucleus",
-              not any("Nucleus" in v for v in listed), str(listed))
-        check("and both membrane springs are named",
-              sum("Membrane" in v for v in listed) == 2, str(listed))
-    check("the fit succeeds for a cardiomyocyte",
-          app.session_state["_last_fit"] is not None
-          and app.session_state["_last_fit"].get("success"))
-    fit = app.session_state["_last_fit"]
-    if fit:
-        check("and it follows the data",
-              fit["r_squared"] > 0.9, f"R2={fit['r_squared']:.4f}")
-
-
-def case_cardiomyocyte_model_is_flagged_provisional():
-    print("the cardiomyocyte model says it is provisional")
-    app = start(cell_name="cell-01",
-                model_kind="Cardiomyocyte (Morales Maldonado)")
-    if not no_exception(app, "cardiomyocyte model"):
-        return
-    warnings = " ".join(str(w.value) for w in app.warning)
-    check("a provisional warning is shown", "provisional" in warnings.lower(),
-          warnings[:120])
-    check("it says the equations were not available",
-          "equations" in warnings.lower(), warnings[:200])
-    check("it asks for the paper's equation",
-          "send me" in warnings.lower(), warnings[:200])
-
-
-def case_not_reached_is_explained():
-    print("“not reached yet” is spelled out")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "range wording"):
-        return
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("the wording is explained",
-          "have not met it yet" in captions or "not been squashed far enough"
-          in captions, captions[:200])
-    check("it says this is not missing data",
-          "not missing data" in captions, "explanation absent")
-
-
-def case_fit_statistics():
-    print("chi squared catches what R-squared misses")
-    from lulevich_model import LulevichModel as LM, noise_sigma, fit_statistics
-
-    eps = np.linspace(0.001, 0.60, 260)
-    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-    clean = m * 0.6e6 + c * 1.2e3 + nu * 3e3
-
-    force = clean + 5e-11 * np.random.default_rng(0).standard_normal(260)
-    model = LM(force, eps, cell_height=8.0e-6)
-    right = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    check("the right model gives chi2/dof near 1",
-          0.2 < right["chi_squared_reduced"] < 3.0,
-          f"{right['chi_squared_reduced']:.2f}")
-
-    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, use_nucleus=False)
-    check("dropping a real term is caught by chi2",
-          wrong["chi_squared_reduced"] > 10 * right["chi_squared_reduced"],
-          f"{wrong['chi_squared_reduced']:.1f} vs {right['chi_squared_reduced']:.2f}")
-    check("R-squared alone would not have caught it",
-          wrong["r_squared"] > 0.97, f"R2={wrong['r_squared']:.4f}")
-
-    check("adjusted R-squared is reported",
-          np.isfinite(right["adj_r_squared"]))
-    check("adjusted is never above plain",
-          right["adj_r_squared"] <= right["r_squared"] + 1e-12)
-    check("degrees of freedom account for the parameters",
-          right["dof"] == right["n_points"] - right["n_params"],
-          f"{right['dof']} vs {right['n_points']}-{right['n_params']}")
-
-    # Noise that grows with force must not be read as the quiet end.
-    sigma, typical = noise_sigma(eps, clean * (1 + 0.02 *
-                                np.random.default_rng(0).standard_normal(260)))
-    check("the noise estimate is per point", np.size(sigma) == 260, str(np.size(sigma)))
-    check("and it grows where the force grows",
-          np.median(sigma[-50:]) > np.median(sigma[:50]) * 3,
-          f"{np.median(sigma[:50]):.2e} -> {np.median(sigma[-50:]):.2e}")
-    check("a typical value is reported", np.isfinite(typical))
-
-    # A curve too short to estimate noise must not crash.
-    stats = fit_statistics(np.array([1.0, 2.0]), np.array([1.0, 2.0]), 2,
-                           epsilon=np.array([0.1, 0.2]))
-    check("two points do not raise", np.isnan(stats["chi_squared"]))
-
-
-def case_chi_squared_reaches_the_page():
-    print("the fit statistics are shown and stored")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "chi squared on the page"):
-        return
-    labels = [m.label for m in app.get("metric")]
-    check("a chi-squared tile is shown",
-          any("χ²" in (l or "") for l in labels), str(labels))
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("it explains what about 1 means",
-          "as close to the points as the scatter" in captions, "no explanation")
-    check("it warns that R² can look fine",
-          "R² can still look excellent" in captions, "no warning")
-
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception:
-        return
-    names = [name for _, name in GoogleSheetsManager.COLUMNS]
-    for wanted in ("Chi squared", "Chi squared / dof", "Adjusted R²",
-                   "Measured noise σ (N)"):
-        check(f"the sheet records {wanted}", wanted in names, str(names))
-
-
-def case_search_stays_fast():
-    print("the search does not crawl on a realistic curve")
-    import time
-    from lulevich_model import LulevichModel as LM
-
-    # A real .ibw curve has thousands of points, not a few hundred. The
-    # search fits hundreds of candidates, so anything expensive per fit is
-    # multiplied by that. This is the guard on that multiplication.
-    for n, budget in ((1000, 6.0), (3000, 12.0)):
-        eps = np.linspace(0.001, 0.60, n)
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-        force = (m * 0.6e6 + c * 1.2e3 + nu * 3e3) * (
-            1 + 0.01 * np.random.default_rng(0).standard_normal(n)
-        )
-        model = LM(force, eps, cell_height=8.0e-6)
-
-        start_time = time.time()
-        found = model.search_compositions(0.0, 0.60)
-        elapsed = time.time() - start_time
-        check(f"the search finishes on {n} points", found.get("success"))
-        check(f"and takes under {budget:.0f}s at {n} points ({elapsed:.1f}s)",
-              elapsed < budget, f"{elapsed:.1f}s")
-        if found.get("success"):
-            best = found["best"]
-            check(f"and is still right at {n} points",
-                  (best["membrane"], best["cyto_start"]) == ("freeze", "break"),
-                  f"{best['membrane']}/{best['cyto_start']}")
-
-    # The winner must still come back with its statistics, even though the
-    # candidates were fitted without them.
-    check("the winner carries chi squared",
-          np.isfinite(found["best"].get("chi_squared_reduced", np.nan))
-          or np.isfinite(
-              model.fit_composition(
-                  0.0, 0.60, found["best"]["break_1"], found["best"]["break_2"]
-              )["chi_squared_reduced"]
-          ))
-
-
-def case_png_is_not_rendered_every_run():
-    print("the plot is not re-rendered to PNG on every rerun")
-    import plot_utils
-    import app as app_module
-
-    calls = []
-    original = plot_utils.go.Figure.to_image
-
-    def counting(self, *args, **kwargs):
-        calls.append(1)
-        raise RuntimeError("no chrome here")
-
-    plot_utils.go.Figure.to_image = counting
-    try:
-        app = start(cell_name="cell-01")
-        app.run()
-        app.run()
-    finally:
-        plot_utils.go.Figure.to_image = original
-
-    check("no PNG render happened without being asked",
-          len(calls) == 0, f"{len(calls)} renders")
-    check("a Prepare a PNG button is offered",
-          button_by_label(app, "Prepare a PNG") is not None)
-    check("HTML is still available without asking",
-          any("save as html" in (d.label or "").lower()
-              for d in app.get("download_button")),
-          str([d.label for d in app.get("download_button")]))
-
-
-def case_guided_order_is_parts_then_work_it_out():
-    print("Step 1 picks the parts, Step 2 works it out")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "guided order"):
-        return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("Step 1 names the parts",
-          "Step 1 · Which parts of the cell" in text, text[:150])
-    check("Step 2 is the range", "Step 2 · How far" in text, text[:200])
-    check("Step 3 is the button", "Step 3 · Work it out" in text, text[:200])
-    check("the steps are in order",
-          text.index("Step 1 ·") < text.index("Step 2 ·") < text.index("Step 3 ·"))
-
-    # The part checkboxes must exist exactly once, in Step 1.
-    labels = [c.label for c in app.checkbox]
-    for term in ("Membrane", "Cytoskeleton", "Nucleus"):
-        matching = [l for l in labels if l and l.startswith(term)]
-        check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
-
-    # Unticking a part must disable the button rather than fail later.
-    for term in ("membrane", "interior", "nucleus"):
-        app.session_state[f"use_{term}"] = False
-    app.run()
-    if no_exception(app, "no parts selected"):
-        work = button_by_label(app, "Work it out for me")
-        check("with nothing ticked the button is disabled",
-              work is not None and work.disabled is True)
-
-
-def case_it_picks_the_arrangement():
-    print("the search chooses segmented, side by side or stacked")
-    from lulevich_model import LulevichModel as LM, search_arrangements
-
-    eps = np.linspace(0.001, 0.60, 300)
-
-    def segmented():
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-        return m * 0.6e6 + c * 1.2e3 + nu * 3e3
-
-    def side_by_side():
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        return g.combined_model(eps, 0.6e6, 1.2e3, 0.0, En=0.0)
-
-    for name, maker, expected in (
-        ("a segmented curve", segmented, "segmented"),
-        ("a side-by-side curve", side_by_side, "parallel"),
+    def fit_composition(
+        self,
+        epsilon_min,
+        epsilon_max,
+        e1,
+        e2,
+        membrane="freeze",
+        cyto_start="break",
+        use_nucleus=True,
+        weighting="uniform",
+        use_membrane=True,
+        use_interior=True,
+        use_tension=False,
+        with_stats=True,
     ):
-        force = maker() * (
-            1 + 0.01 * np.random.default_rng(0).standard_normal(eps.size)
-        )
-        model = LM(force, eps, cell_height=8.0e-6)
-        found = search_arrangements(model, 0.0, 0.60)
-        check(f"{name}: the search ran", found.get("success"),
-              str(found.get("error")))
-        if not found.get("success"):
-            continue
-        picked = found["best"]["arrangement"]
-        tied = {c["arrangement"] for c in found["candidates"]
-                if c.get("tied_with_best")} | {picked}
-        check(f"{name} is called {expected}", expected in tied,
-              f"picked {picked}, tied {tied}")
-        check(f"{name}: all three arrangements were tried",
-              len(found["candidates"]) == 3, str(len(found["candidates"])))
-        check(f"{name}: the verdict is in plain words",
-              "curve" in found["verdict"].lower(), found["verdict"][:80])
+        """
+        Exact linear fit of one composition at fixed breakpoints.
 
-    # The winner has to translate into settings the app can apply.
-    import app as app_module
-    for arrangement, expected_model in (
-        ("segmented", "Segmented"),
-        ("series", "Stacked"),
-        ("parallel", "Side by side"),
+        A term switched off is left out of the design matrix entirely rather
+        than fitted and ignored. That matters: an unwanted column still soaks
+        up force, so leaving it in and hiding the answer would change the
+        moduli that are reported.
+
+        ``with_stats=False`` skips chi-squared and the noise estimate. The
+        breakpoint search compares candidates on residual sum alone and calls
+        this hundreds of times, so it does not pay for statistics it will
+        throw away; the winner is refitted once with them.
+        """
+        eps, force, mask = self._select(epsilon_min, epsilon_max)
+        wanted = {
+            "membrane": bool(use_membrane),
+            "tension": bool(use_tension),
+            "interior": bool(use_interior),
+            "nucleus": bool(use_nucleus),
+        }
+        n_params = sum(wanted.values())
+        if n_params == 0:
+            return self._failure("No elements selected.")
+        if eps.size < n_params + 1:
+            return self._failure(f"Only {eps.size} points in the fitted range.")
+
+        bases = self.composition_basis(eps, e1, e2, membrane, cyto_start)
+        m_basis = bases["membrane"]
+        t_basis = bases["tension"]
+        c_basis = bases["interior"]
+        n_basis = bases["nucleus"]
+        order = [name for name in COMPOSITION_TERMS if wanted[name]]
+        design = np.column_stack([bases[name] for name in order])
+
+        if weighting == "relative":
+            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
+            weights = 1.0 / scale
+        else:
+            weights = np.ones_like(force)
+        design_w, target_w = design * weights[:, None], force * weights
+        col_norm = np.linalg.norm(design_w, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        solution = lsq_linear(
+            design_w / col_norm, target_w, bounds=(0.0, np.inf), method="bvls"
+        )
+        params = solution.x / col_norm
+        values = dict(zip(order, (float(v) for v in params)))
+        Em = values.get("membrane", 0.0)
+        T0 = values.get("tension", 0.0)
+        Ec = values.get("interior", 0.0)
+        En = values.get("nucleus", 0.0)
+
+        # How badly the chosen terms imitate each other over this range. Two
+        # nearly parallel columns still fit, but the split between them is
+        # arbitrary, and a modulus nobody can trust is worse than a missing
+        # one. Reported so the app can say so out loud.
+        scaled = design_w / col_norm
+        try:
+            condition = float(np.linalg.cond(scaled))
+        except Exception:
+            condition = float("nan")
+        worst_pair, worst_corr = None, 0.0
+        if len(order) > 1:
+            centred = scaled - scaled.mean(axis=0)
+            norms = np.linalg.norm(centred, axis=0)
+            norms[norms == 0] = 1.0
+            corr = (centred / norms).T @ (centred / norms)
+            for i in range(len(order)):
+                for j in range(i + 1, len(order)):
+                    if abs(corr[i, j]) > abs(worst_corr):
+                        worst_corr = float(corr[i, j])
+                        worst_pair = (order[i], order[j])
+
+        predicted = m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En
+        residuals = force - predicted
+        ss_res = float(np.sum(residuals ** 2))
+
+        # Error bars, and they are the point rather than decoration. Two terms
+        # that imitate each other still fit beautifully; what goes wrong is
+        # that the split between them is not determined, and the honest way to
+        # say so is a number next to each modulus rather than a correlation
+        # the reader has to interpret. Standard errors come from the usual
+        # linear least-squares covariance, sigma^2 (X'X)^-1, evaluated in the
+        # scaled space and then unscaled.
+        errors = {}
+        if with_stats:
+            dof_here = eps.size - n_params - 2
+            if dof_here > 0:
+                try:
+                    # A modulus pinned at the zero bound is not a free
+                    # parameter; leaving it in makes the matrix singular.
+                    free = [i for i, v in enumerate(solution.x) if v > 0]
+                    if free:
+                        sub = scaled[:, free]
+                        cov = (ss_res / dof_here) * np.linalg.inv(sub.T @ sub)
+                        for slot, index in enumerate(free):
+                            errors[order[index]] = float(
+                                np.sqrt(max(cov[slot, slot], 0.0)) / col_norm[index]
+                            )
+                except np.linalg.LinAlgError:
+                    pass
+        # The two breakpoints are free parameters too, so they count against
+        # the degrees of freedom that reduced chi-squared divides by.
+        if with_stats:
+            stats = fit_statistics(force, predicted, n_params + 2, epsilon=eps)
+        else:
+            ss_tot = float(np.sum((force - force.mean()) ** 2))
+            stats = {
+                "r_squared": 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
+                "adj_r_squared": float("nan"),
+                "chi_squared": float("nan"),
+                "chi_squared_reduced": float("nan"),
+                "noise_sigma": float("nan"),
+                "dof": int(eps.size - n_params - 2),
+            }
+        r_squared = stats["r_squared"]
+
+        return {
+            "success": True,
+            "mode": "segmented",
+            "coupling": "segmented",
+            "membrane": membrane,
+            "cyto_start": cyto_start,
+            "use_nucleus": bool(use_nucleus),
+            "use_membrane": bool(use_membrane),
+            "use_interior": bool(use_interior),
+            "use_tension": bool(use_tension),
+            "Em": Em, "Ei": Ec, "En": En, "T0": T0,
+            "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "T0_mN_m": T0 * 1e3,
+            "T0_as_modulus_kPa": (T0 / self.h_shell) / 1e3 if self.h_shell else float("nan"),
+            "Em_MPa_std": errors.get("membrane", float("nan")) / 1e6,
+            "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
+            "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
+            "T0_mN_m_std": errors.get("tension", float("nan")) * 1e3,
+            "force_offset": 0.0,
+            "break_1": float(e1), "break_2": float(e2),
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": stats["adj_r_squared"],
+            "chi_squared": stats["chi_squared"],
+            "chi_squared_reduced": stats["chi_squared_reduced"],
+            "noise_sigma": stats["noise_sigma"],
+            "dof": stats["dof"],
+            "rmse": float(np.sqrt(ss_res / eps.size)),
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "n_params": n_params + 2,  # the two breakpoints count as parameters
+            "ss_res": ss_res,
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "terms": list(order),
+            "weighting": weighting,
+            "fit_offset": False,
+            "condition_number": condition,
+            "corr_Em_Ei": float("nan"),
+            "worst_pair": worst_pair,
+            "worst_correlation": worst_corr,
+            # Relative error per modulus, which is what says "this number is
+            # not determined" in one glance.
+            "relative_errors": {
+                name: (errors[name] / value if value > 0 else float("nan"))
+                for name, value in (
+                    ("tension", T0), ("membrane", Em),
+                    ("interior", Ec), ("nucleus", En),
+                ) if name in errors
+            },
+            "nucleus_onset": float(e2),
+            "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am, "Ai": self.Ai, "An": self.An, "At": self.At,
+            "h_shell": self.h_shell,
+            "mask": mask,
+            "warnings": self._identifiability_warnings(
+                {name: errors[name] / v for name, v in (
+                    ("tension", T0), ("membrane", Em),
+                    ("interior", Ec), ("nucleus", En),
+                ) if name in errors and v > 0},
+                worst_pair, worst_corr,
+            ),
+        }
+
+    @staticmethod
+    def _identifiability_warnings(relative, pair, corr):
+        """
+        Say when a modulus is not actually determined by this curve.
+
+        Driven by the fitted error bars rather than by a correlation
+        threshold, because the error bar is the thing that matters and a
+        threshold on correlation is a guess at where it starts to. A term
+        whose standard error is a third of its own value is a term the curve
+        does not pin down, however good the R-squared looks.
+        """
+        nice = {
+            "tension": "the membrane's in-plane tension T₀",
+            "membrane": "the membrane's elastic modulus Eₘ",
+            "interior": "the interior network Ec",
+            "nucleus": "the deeper layer Eₙ",
+        }
+        loose = sorted(
+            (name for name, value in relative.items()
+             if np.isfinite(value) and value > 0.33),
+            key=lambda n: -relative[n],
+        )
+        if not loose:
+            return []
+        listed = " and ".join(
+            f"{nice.get(n, n)} (± {100 * relative[n]:.0f} %)" for n in loose[:2]
+        )
+        message = (
+            f"This curve does not pin down {listed}. The fit still passes "
+            f"through the points, and the total force is right; what is not "
+            f"determined is how much of it belongs to each of those terms."
+        )
+        if pair and np.isfinite(corr) and abs(corr) > 0.9:
+            message += (
+                f" The reason is that the {pair[0]} and {pair[1]} terms have "
+                f"nearly the same shape here (correlation {abs(corr):.4f}). "
+                f"Widening the range, especially down towards ε = 0, is what "
+                f"separates them; failing that, quote the pair together "
+                f"rather than each on its own."
+            )
+        return [message]
+
+    def breakpoint_spread(
+        self, lo, hi, e1, e2, membrane, cyto_start, use_nucleus=True,
+        weighting="uniform", use_tension=False, n_grid=13,
     ):
-        pending = app_module.settings_from_arrangement(
-            {"arrangement": arrangement,
-             "composition": {"membrane": "freeze", "cyto_start": "break",
-                             "break_1": 0.15, "break_2": 0.40,
-                             "use_nucleus": True}},
-            0.6,
+        """
+        How far each modulus moves across boundaries the data cannot separate.
+
+        The breakpoints are fitted like everything else, but they are profiled
+        out: the search picks the pair with the lowest residual, and every
+        number afterwards is quoted as though that pair were known exactly. It
+        is not. Nearby boundaries often fit within the noise, and on some
+        curves a modulus moves several-fold across them while the residual
+        barely twitches. A standard error computed at fixed boundaries cannot
+        see any of that, so it comes back reassuringly small next to a number
+        that is not determined at all.
+
+        This scans boundaries around the winner, keeps every pair whose fit is
+        no worse than the noise allows, and reports the range each modulus
+        takes over that set. It is the honest error bar on a profiled fit.
+
+        The acceptance band is the usual one: a residual sum within a factor
+        (1 + 2/dof) of the best, which for a linear model is roughly where the
+        fit has become one standard deviation worse.
+        """
+        best = self.fit_composition(
+            lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+            use_tension=use_tension, with_stats=False,
         )
-        check(f"{arrangement} maps to a real model name",
-              pending["model_kind"].startswith(expected_model),
-              pending["model_kind"])
-        check(f"{arrangement} maps to a name the radio offers",
-              pending["model_kind"] in app_module.MODEL_KEYS,
-              pending["model_kind"])
+        if not best.get("success"):
+            return {"success": False}
+        dof = max(int(best.get("dof") or 0), 1)
+        ceiling = best["ss_res"] * (1.0 + 2.0 / dof)
 
+        keys = ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa")
+        found = {key: [best.get(key, 0.0)] for key in keys}
+        accepted = [(float(e1), float(e2))]
 
-def case_work_it_out_applies_the_arrangement():
-    print("pressing it applies what it found")
-    app = start(cell_name="cell-01")
-    work = button_by_label(app, "Work it out for me")
-    check("the button is there", work is not None)
-    if work is None:
-        return
-    work.click().run()
-    if not no_exception(app, "work it out"):
-        return
-    found = app.session_state["arrangement_search"]
-    check("the arrangement search ran", bool(found and found.get("success")),
-          str(found.get("error") if found else None))
-    if not (found and found.get("success")):
-        return
-    check("the model on the page matches what it chose",
-          app.session_state["model_kind"]
-          == app_module_model_name(found["best"]["arrangement"]),
-          f"{app.session_state['model_kind']} vs {found['best']['arrangement']}")
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the answer is shown in words", "curve" in text.lower())
+        span = hi - lo
+        first = np.linspace(max(lo + 1e-4, e1 - 0.25 * span),
+                            min(hi - 1e-3, e1 + 0.25 * span), int(n_grid))
+        second = np.linspace(max(lo + 1e-3, e2 - 0.25 * span),
+                             min(hi - 1e-4, e2 + 0.25 * span), int(n_grid))
+        for a in first:
+            for b in second:
+                if b <= a + 0.02 * span:
+                    continue
+                trial = self.fit_composition(
+                    lo, hi, a, b, membrane, cyto_start, use_nucleus, weighting,
+                    use_tension=use_tension, with_stats=False,
+                )
+                if not trial.get("success") or trial["ss_res"] > ceiling:
+                    continue
+                accepted.append((float(a), float(b)))
+                for key in keys:
+                    found[key].append(trial.get(key, 0.0))
 
+        out = {"success": True, "n_accepted": len(accepted), "ranges": {}}
+        for key, values in found.items():
+            low, high = float(min(values)), float(max(values))
+            centre = float(best.get(key, 0.0))
+            out["ranges"][key] = {
+                "value": centre,
+                "low": low,
+                "high": high,
+                # How much of its own size the number moves across boundaries
+                # that fit the curve equally well.
+                "relative": (high - low) / abs(centre) if centre else float("nan"),
+            }
+        out["break_1_range"] = (min(a for a, _ in accepted),
+                                max(a for a, _ in accepted))
+        out["break_2_range"] = (min(b for _, b in accepted),
+                                max(b for _, b in accepted))
+        return out
 
-def app_module_model_name(arrangement):
-    import app as app_module
-    return app_module.settings_from_arrangement(
-        {"arrangement": arrangement, "composition": {}}, 0.6
-    )["model_kind"]
+    def _best_breakpoints(
+        self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
+        rounds=2, use_tension=False,
+    ):
+        """
+        The breakpoints that fit best for one composition.
 
+        A single coarse grid puts the boundary within half a grid step of the
+        truth, which on a 12-point grid over a range of 0.6 is about 0.02 in ε.
+        That is coarse enough to shift the moduli, so the coarse pass is
+        followed by refinement rounds that re-grid inside one step either side
+        of the current winner. Two rounds narrow it by roughly a factor of 25
+        for a fraction of the cost of a fine grid over the whole range.
+        """
+        span = hi - lo
+        gap = 0.02 * span
+        first = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
+        second = np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+        best = None
 
-def case_guided_range_is_settable():
-    print("the range can be set before working it out")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "guided range"):
-        return
-    slider = widget_by_label(app, "slider", "Analyse from")
-    check("a range slider sits before the button", slider is not None,
-          str([s.label for s in app.slider]))
-    if slider is None:
-        return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("it is its own step",
-          "How far into the squash" in text, text[:150])
+        for round_index in range(int(rounds) + 1):
+            for e1 in first:
+                for e2 in second:
+                    if e2 <= e1 + gap:
+                        continue
+                    trial = self.fit_composition(
+                        lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
+                        weighting, use_tension=use_tension, with_stats=False,
+                    )
+                    if not trial.get("success"):
+                        continue
+                    if best is None or trial["ss_res"] < best["ss_res"]:
+                        best = trial
+            if best is None or round_index == int(rounds):
+                break
+            # Re-grid inside one step either side of the winner.
+            step_1 = (first[-1] - first[0]) / max(len(first) - 1, 1)
+            step_2 = (second[-1] - second[0]) / max(len(second) - 1, 1)
+            first = np.linspace(
+                max(lo + 1e-4, best["break_1"] - step_1),
+                min(hi - gap, best["break_1"] + step_1),
+                max(5, int(n_grid) // 2),
+            )
+            second = np.linspace(
+                max(lo + gap, best["break_2"] - step_2),
+                min(hi - 1e-4, best["break_2"] + step_2),
+                max(5, int(n_grid) // 2),
+            )
+        if best is not None:
+            # One full fit for the winner, so the caller gets the statistics.
+            best = self.fit_composition(
+                lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
+                use_nucleus, weighting, use_tension=use_tension,
+            )
+        return best
 
-    slider.set_value(0.35).run()
-    if not no_exception(app, "narrowed range"):
-        return
-    check("the slider holds the new end",
-          abs(app.session_state["guided_window_end"] - 0.35) < 0.01,
-          str(app.session_state["guided_window_end"]))
+    def search_compositions(
+        self,
+        epsilon_min=None,
+        epsilon_max=None,
+        n_grid=12,
+        weighting="uniform",
+        n_folds=5,
+        seed=0,
+        include_no_nucleus=True,
+        refine_rounds=2,
+        cv_repeats=3,
+        tension_mode="off",
+    ):
+        """
+        Fit every composition at its own best breakpoints and pick one.
 
-    button_by_label(app, "Work it out for me").click().run()
-    if not no_exception(app, "search over the chosen range"):
-        return
-    fit = app.session_state["_last_fit"]
-    check("the fit stops where the range stopped",
-          fit is not None and abs(fit["epsilon_range"][1] - 0.35) < 0.02,
-          str(fit["epsilon_range"]) if fit else "no fit")
+        Each composition gets its own breakpoint search, refined past the
+        coarse grid, and is then scored by cross-validated error: how well it
+        predicts points it was not fitted on. That is repeated over several
+        different fold splits, because a single split of a few hundred points
+        is noisy enough to reorder candidates that are really tied.
 
+        Where several candidates predict equally well the search does not
+        pretend to separate them. It reports the tie and returns the simplest
+        of the tied set, since an extra term the data cannot see is a term
+        that will move around from cell to cell.
 
-def case_search_maths_is_shown():
-    print("the maths behind the button is available")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "search maths"):
-        return
-    blocks = [str(b.value) for b in app.get("latex")]
-    joined = " ".join(blocks)
-    check("the cross-validation formula is shown",
-          "mathrm{CV}" in joined, joined[-200:])
-    check("the tie tolerance is shown", "tau" in joined, joined[-200:])
-    check("the stacked form is shown", "F^{1/3}" in joined, joined[:200])
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("it says these are three arrangements",
-          "three arrangements" in text, "not found")
+        Returns
+        -------
+        dict
+            ``candidates`` ranked best first, ``best`` and its fit, and a
+            ``verdict`` that says plainly when the top few are indistinguishable.
+        """
+        lo = float(self.epsilon.min() if epsilon_min is None else epsilon_min)
+        hi = float(self.epsilon.max() if epsilon_max is None else epsilon_max)
+        eps_all, force_all, _ = self._select(lo, hi)
+        n = eps_all.size
+        if n < 20:
+            return {"success": False, "error": f"Only {n} points; need at least 20."}
 
+        span = hi - lo
 
-def case_cardiomyocyte_starts_loaded_together():
-    print("a cardiomyocyte loads membrane and cytoskeleton together")
-    import app as app_module
+        # Several independent splits, so the ranking does not turn on which
+        # points happened to land in which fold.
+        fold_sets = []
+        for repeat in range(max(1, int(cv_repeats))):
+            rng = np.random.default_rng(seed + repeat)
+            fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
 
-    defaults = app_module.DEFAULT_COMPOSITION_BY_TYPE["Cardiomyocyte"]
-    check("the cytoskeleton starts at zero",
-          defaults["cyto_starts_at"] == "from the very start",
-          str(defaults))
+        rows, fits = [], {}
+        nucleus_options = [True, False] if include_no_nucleus else [True]
+        # Three ways to treat the second membrane spring.
+        #
+        # "off"     the classic three-element model, tension not considered.
+        # "search"  offer it and let the held-out error decide.
+        # "always"  the structure is asserted, and the search's job is only to
+        #           place the boundaries inside it.
+        #
+        # "always" is not laziness. A linear term is flexible enough to help a
+        # wrong composition imitate the right one, so on a curve where the
+        # biology says the taut network is there, letting the search drop it
+        # buys a worse story for a better number. Where the biology does not
+        # say, use "search" and read the verdict.
+        tension_options = {
+            "off": [False], "search": [False, True], "always": [True],
+        }.get(str(tension_mode), [False])
 
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "cardiomyocyte defaults"):
-        return
-    check("the app applied it",
-          app.session_state["cyto_starts_at"] == "from the very start",
-          app.session_state["cyto_starts_at"])
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("and explains it with the measured slope",
-          "1.7" in captions, "no explanation of the 1.7")
+        for composition in COMPOSITIONS:
+          for use_tension in tension_options:
+            for use_nucleus in nucleus_options:
+                best_here = self._best_breakpoints(
+                    lo, hi, composition["membrane"], composition["cyto_start"],
+                    use_nucleus, weighting, n_grid, refine_rounds,
+                    use_tension=use_tension,
+                )
+                if best_here is None:
+                    continue
 
-    # The physics that justifies it: both loaded together gives a slope
-    # between 3/2 and 3, membrane alone gives 3.
-    from lulevich_model import LulevichModel as LM
-    eps = np.linspace(0.001, 0.60, 300)
-    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    slopes = {}
-    for name, (m, c) in (("alone", ("freeze", "break")), ("together", ("freeze", "zero"))):
-        mb, cb, nb = g.composition_terms(eps, 0.15, 0.40, m, c)
-        force = mb * 0.6e6 + cb * 1.2e3 + nb * 3e3
-        near = (eps > 0.02) & (eps < 0.12)
-        slopes[name] = float(
-            np.polyfit(np.log(eps[near]), np.log(force[near]), 1)[0]
+                # Some combinations do not use one of their breakpoints at
+                # all. With the membrane continuing and the cytoskeleton
+                # starting at zero, nothing in the model depends on ε₁, so
+                # whatever number the search lands on is meaningless. Move
+                # each boundary and see whether the fit notices.
+                idle = []
+                scale = max(best_here["ss_res"], 1e-300)
+                for name, e1_try, e2_try in (
+                    ("ε₁", best_here["break_1"] + 0.08 * span, best_here["break_2"]),
+                    ("ε₂", best_here["break_1"], best_here["break_2"] + 0.08 * span),
+                ):
+                    if e2_try <= e1_try or e2_try >= hi:
+                        continue
+                    moved = self.fit_composition(
+                        lo, hi, e1_try, e2_try, composition["membrane"],
+                        composition["cyto_start"], use_nucleus, weighting,
+                        use_tension=use_tension, with_stats=False,
+                    )
+                    if moved.get("success") and abs(
+                        moved["ss_res"] - best_here["ss_res"]
+                    ) / scale < 1e-6:
+                        idle.append(name)
+
+                key = (
+                    composition["key"]
+                    + ("" if use_nucleus else "_no_nucleus")
+                    + ("_tension" if use_tension else "")
+                )
+                label = (
+                    composition["label"]
+                    + ("" if use_nucleus else ", no nucleus")
+                    + (", with the membrane's tension spring" if use_tension else "")
+                )
+                fits[key] = best_here
+
+                # One number per split, so the spread across splits can say
+                # whether a difference between candidates is real.
+                per_repeat = []
+                for folds in fold_sets:
+                    cv_errors = []
+                    for fold in folds:
+                        if fold.size == 0 or fold.size >= n - 3:
+                            continue
+                        keep = np.ones(n, dtype=bool)
+                        keep[fold] = False
+                        sub = self._clone(force_all[keep], eps_all[keep])
+                        trained = sub.fit_composition(
+                            lo, hi, best_here["break_1"], best_here["break_2"],
+                            composition["membrane"], composition["cyto_start"],
+                            use_nucleus, weighting, use_tension=use_tension,
+                            with_stats=False,
+                        )
+                        if not trained.get("success"):
+                            continue
+                        basis = self.composition_basis(
+                            eps_all[fold], best_here["break_1"], best_here["break_2"],
+                            composition["membrane"], composition["cyto_start"],
+                        )
+                        predicted = (
+                            basis["membrane"] * trained["Em"]
+                            + basis["tension"] * trained.get("T0", 0.0)
+                            + basis["interior"] * trained["Ei"]
+                            + basis["nucleus"] * trained["En"]
+                        )
+                        cv_errors.append(
+                            float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                        )
+                    if cv_errors:
+                        per_repeat.append(float(np.mean(cv_errors)))
+
+                rows.append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "membrane": composition["membrane"],
+                        "cyto_start": composition["cyto_start"],
+                        "use_nucleus": use_nucleus,
+                        "use_tension": use_tension,
+                        "break_1": best_here["break_1"],
+                        "break_2": best_here["break_2"],
+                        "Em_MPa": best_here["Em_MPa"],
+                        "Ec_kPa": best_here["Ei_kPa"],
+                        "En_kPa": best_here["En_kPa"],
+                        "T0_mN_m": best_here.get("T0_mN_m", 0.0),
+                        "r_squared": best_here["r_squared"],
+                        "n_params": best_here["n_params"],
+                        "aicc": _aicc(best_here["ss_res"], n, best_here["n_params"]),
+                        "cv_rmse": (
+                            float(np.mean(per_repeat)) if per_repeat else float("nan")
+                        ),
+                        # How much the held-out error moves when the folds are
+                        # redrawn. A gap smaller than this is not a gap.
+                        "cv_spread": (
+                            float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0
+                        ),
+                        # Boundaries this combination does not actually use.
+                        "idle_breaks": idle,
+                    }
+                )
+
+        if not rows:
+            return {"success": False, "error": "No composition produced a usable fit."}
+
+        finite = [r["aicc"] for r in rows if np.isfinite(r["aicc"])]
+        best_aicc = min(finite) if finite else float("nan")
+        for row in rows:
+            row["delta_aicc"] = (
+                row["aicc"] - best_aicc if np.isfinite(row["aicc"]) else float("nan")
+            )
+            # A modulus that came out at zero is a term the data did not want.
+            # Saying so matters: the composition is then not really the one it
+            # claims to be, it is the simpler one wearing an extra parameter.
+            carried = {
+                "Eₘ": True,
+                "T₀": bool(row.get("use_tension")),
+                "E_c": True,
+                "Eₙ": bool(row["use_nucleus"]),
+            }
+            zeros = [
+                name
+                for name, value in (
+                    ("Eₘ", row["Em_MPa"]), ("T₀", row.get("T0_mN_m", 0.0)),
+                    ("E_c", row["Ec_kPa"]), ("Eₙ", row["En_kPa"]),
+                )
+                if value <= 0 and carried[name]
+            ]
+            row["empty_terms"] = zeros
+
+        # Rank on cross-validated error first. It measures what actually
+        # matters, prediction of points the fit has not seen, and it makes far
+        # fewer assumptions than AICc, which on these curves is confident about
+        # differences that the held-out error says are not there.
+        def sort_key(row):
+            cv = row["cv_rmse"]
+            return (
+                cv if np.isfinite(cv) else np.inf,
+                np.inf if not np.isfinite(row["aicc"]) else row["aicc"],
+            )
+
+        rows.sort(key=sort_key)
+        lowest = rows[0]
+
+        cv_rows = [r for r in rows if np.isfinite(r["cv_rmse"])]
+        cv_best = cv_rows[0] if cv_rows else None
+        aicc_best = min(
+            (r for r in rows if np.isfinite(r["aicc"])),
+            key=lambda r: r["aicc"],
+            default=None,
         )
-    check("membrane alone gives a cube law",
-          abs(slopes["alone"] - 3.0) < 0.05, f"{slopes['alone']:.2f}")
-    check("loaded together gives well under 2",
-          slopes["together"] < 2.0, f"{slopes['together']:.2f}")
+
+        # The tie band is the larger of a few percent and the noise in the
+        # held-out error itself. Redrawing the folds moves every candidate's
+        # score, and a gap smaller than that movement is not evidence.
+        tolerance = 0.0
+        if np.isfinite(lowest.get("cv_rmse", np.nan)) and lowest["cv_rmse"] > 0:
+            tolerance = max(
+                0.05 * lowest["cv_rmse"],
+                lowest.get("cv_spread", 0.0)
+                + max((r.get("cv_spread", 0.0) for r in cv_rows), default=0.0),
+            )
+        tied = [
+            r for r in rows[1:]
+            if np.isfinite(r["cv_rmse"])
+            and (r["cv_rmse"] - lowest["cv_rmse"]) <= tolerance
+        ]
+
+        # Where nothing separates them on prediction, take the simplest: the
+        # fewest free moduli, and none that came out at zero. An extra term
+        # the curve cannot see is a number that will wander from cell to cell.
+        def simplicity(row):
+            return (
+                len(row.get("empty_terms", [])),
+                row["n_params"],
+                row["cv_rmse"] if np.isfinite(row["cv_rmse"]) else np.inf,
+            )
+
+        best = min([lowest] + tied, key=simplicity)
+        for row in rows:
+            row["tied_with_best"] = row is not best and (row in tied or row is lowest)
+
+        if tied:
+            others = [r for r in [lowest] + tied if r is not best]
+            names = ", ".join(f"“{r['label']}”" for r in others[:2])
+            verdict = (
+                f"“{best['label']}” is the pick. {names} predict this curve just "
+                f"as well, so nothing in the data separates them; of the tied set "
+                f"this is the one with the fewest free moduli, which is the one "
+                f"least likely to wander between cells."
+            )
+            if best is not lowest:
+                verdict += (
+                    f" (“{lowest['label']}” has the marginally lower held-out "
+                    f"error, by less than the amount that number moves when the "
+                    f"folds are redrawn.)"
+                )
+        elif aicc_best is not None and aicc_best["key"] != best["key"]:
+            verdict = (
+                f"Cross-validation prefers “{best['label']}” while AICc prefers "
+                f"“{aicc_best['label']}”. The held-out error is the one to trust: "
+                f"AICc is comparing fits on the same points it fitted."
+            )
+        else:
+            verdict = f"“{best['label']}” predicts held-out points best, clear of the rest."
+
+        if best.get("empty_terms"):
+            verdict += (
+                " Note that " + " and ".join(best["empty_terms"])
+                + " came out at zero, so that term is not supported by this curve."
+            )
+        if best.get("idle_breaks"):
+            verdict += (
+                " " + " and ".join(best["idle_breaks"])
+                + (" has" if len(best["idle_breaks"]) == 1 else " have")
+                + " no effect in this combination, so ignore the value shown."
+            )
+
+        out = {
+            "success": True,
+            "candidates": rows,
+            "best": best,
+            "best_by_cv": cv_best,
+            "lowest_cv": lowest,
+            "tie_tolerance": float(tolerance),
+            "fits": fits,
+            "verdict": verdict,
+            "n_points": int(n),
+        }
+        self.results["composition_search"] = out
+        return out
+
+    def _clone(self, force, epsilon):
+        """A model with the same geometry over a subset of the data."""
+        return LulevichModel(
+            force, epsilon, self.cell_height,
+            cell_radius=self.R0,
+            membrane_thickness=self.h_membrane,
+            # Every geometry field, not most of them. A clone that quietly
+            # reverted to the nucleus radius trained each cross-validation
+            # fold on a different model from the one being scored, which made
+            # the true composition look like the worst one on the list.
+            shell_thickness=self.h_shell,
+            deep_uses_cell_radius=self.deep_uses_cell_radius,
+            sarcomere_length=self.L_sarcomere,
+            poisson_membrane=self.nu_m,
+            poisson_interior=self.nu_i,
+            nucleus_radius=self.R_nucleus,
+            poisson_nucleus=self.nu_n,
+            nucleus_onset=self.nucleus_onset,
+            segment_break_1=self.segment_break_1,
+            segment_break_2=self.segment_break_2,
+        )
 
 
-def case_schematic_is_a_mechanics_diagram():
-    print("the diagram reads as a mechanics schematic")
-    import plot_utils
-    import app as app_module
+class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _CompositionMixin):
+    """Lulevich fit for single-cell compression curves."""
 
-    style = plot_utils.PlotStyle(force_unit="nN")
-    fig = plot_utils.cell_schematic(
-        style, epsilon=0.28, break_1=0.15, break_2=0.40,
-        membrane_mode="freeze", cyto_start="break",
-        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
-        labels=app_module.components_for("Cardiomyocyte"),
+    # ------------------------------------------------------------------ init
+
+    def __init__(
+        self,
+        force,
+        relative_deformation,
+        cell_height,
+        cell_radius=None,
+        membrane_thickness=4e-9,
+        shell_thickness=None,
+        deep_uses_cell_radius=False,
+        poisson_membrane=0.5,
+        poisson_interior=0.5,
+        radius_from_height=0.55,
+        nucleus_radius=None,
+        nucleus_from_radius=0.35,
+        poisson_nucleus=0.5,
+        nucleus_onset=0.15,
+        sarcomere_length=2.1e-6,
+        expected_ranges=None,
+        active_windows=None,
+        segment_break_1=0.15,
+        segment_break_2=0.40,
+    ):
+        """
+        Parameters
+        ----------
+        force : array
+            Force in newtons.
+        relative_deformation : array
+            Relative deformation e = delta / h0, dimensionless.
+        cell_height : float
+            Initial cell height h0 **in metres** (8.09 um -> 8.09e-6).
+        cell_radius : float, optional
+            Cell radius R0 in metres. Defaults to ``radius_from_height * h0``.
+        membrane_thickness : float
+            Membrane thickness h_m in metres (default 4 nm).
+        poisson_membrane, poisson_interior : float
+            Poisson ratios; 0.5 (incompressible) for living cells.
+        radius_from_height : float
+            Aspect factor used when ``cell_radius`` is not given.
+        nucleus_radius : float, optional
+            Nucleus radius in metres. Defaults to ``nucleus_from_radius * R0``.
+        nucleus_from_radius : float
+            Nucleus radius as a fraction of the cell radius.
+        poisson_nucleus : float
+            Poisson ratio of the nucleus.
+        sarcomere_length : float
+            Relaxed sarcomere length in metres, 2.1 um for cardiac muscle.
+            Used only by :meth:`sarcomere_at`, never by the fit.
+        nucleus_onset : float
+            Relative deformation at which the plates begin to feel the nucleus.
+            Below it the nucleus term is exactly zero. See
+            :meth:`scan_nucleus_onset` to find it from the data.
+        active_windows : dict, optional
+            Deformation range over which each element carries load, e.g.
+            ``{"membrane": (0.0, 0.40), "nucleus": (0.40, 1.0)}``. Elements
+            without an entry act everywhere. Use this to describe a curve whose
+            load-bearing structures change partway along.
+        expected_ranges : dict, optional
+            Plausibility bands in pascals used only for warnings, e.g.
+            ``{"Em": (5e5, 1e7), "Ei": (3e2, 1e4), "En": (1e3, 5e4)}``. Set
+            these per cell type so an out-of-range result is flagged against
+            something meaningful rather than a generic 1 kPa to 1 GPa window.
+        """
+        force = np.asarray(force, dtype=float).ravel()
+        epsilon = np.asarray(relative_deformation, dtype=float).ravel()
+
+        if force.shape != epsilon.shape:
+            raise ValueError(
+                f"force and relative_deformation must be the same length "
+                f"({force.size} vs {epsilon.size})"
+            )
+
+        cell_height = float(cell_height)
+        if not np.isfinite(cell_height) or cell_height <= 0:
+            raise ValueError("cell_height must be a positive number of metres")
+        if cell_height > 1e-3:
+            raise ValueError(
+                f"cell_height={cell_height:g} m is larger than 1 mm. Cell "
+                f"heights must be given in METRES: {cell_height:g} um should "
+                f"be passed as {cell_height * 1e-6:g}. Use "
+                f"LulevichModel.from_micrometres() if you have micrometres."
+            )
+
+        # Drop non-finite samples and sort by epsilon so that derivative-based
+        # diagnostics below are meaningful.
+        good = np.isfinite(force) & np.isfinite(epsilon)
+        order = np.argsort(epsilon[good], kind="stable")
+        self.force = force[good][order]
+        self.epsilon = epsilon[good][order]
+        self.n_dropped = int((~good).sum())
+
+        self.cell_height = cell_height
+        self.h_membrane = float(membrane_thickness)
+        # The load-bearing shell is not always the bilayer. A cardiomyocyte
+        # carries a sub-membranous protein coat a hundred times thicker, and
+        # it is that layer the fitted tension belongs to. Used only to turn a
+        # tension into an equivalent modulus; default it to the membrane so
+        # nothing that does not set it moves.
+        self.h_shell = float(shell_thickness) if shell_thickness else self.h_membrane
+        # Myofibrils span the whole cell; a nucleus does not. The deep term
+        # can therefore be given either radius.
+        self.deep_uses_cell_radius = bool(deep_uses_cell_radius)
+        self.nu_m = float(poisson_membrane)
+        self.nu_i = float(poisson_interior)
+        self.R0 = float(cell_radius) if cell_radius else cell_height * radius_from_height
+
+        if self.R0 <= 0:
+            raise ValueError("cell_radius must be positive")
+
+        self.nu_n = float(poisson_nucleus)
+        self.R_nucleus = (
+            float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
+        )
+        self.nucleus_onset = float(nucleus_onset)
+        # Relaxed sarcomere length. Nothing in the fit uses it; it turns the
+        # fitted deformation into a length a muscle physiologist can judge.
+        self.L_sarcomere = float(sarcomere_length)
+        self.segment_break_1 = float(segment_break_1)
+        self.segment_break_2 = float(segment_break_2)
+        self.active_windows = (
+            {k: (float(v[0]), float(v[1])) for k, v in active_windows.items() if v}
+            if active_windows
+            else None
+        )
+        self.expected_ranges = {
+            "Em": PLAUSIBLE_EM_PA,
+            "Ei": PLAUSIBLE_EI_PA,
+            "En": (1e1, 1e7),
+        }
+        if expected_ranges:
+            self.expected_ranges.update(
+                {k: (float(v[0]), float(v[1])) for k, v in expected_ranges.items() if v}
+            )
+
+        self.results = {}
+
+    @classmethod
+    def from_micrometres(cls, force, relative_deformation, cell_height_um, **kwargs):
+        """Convenience constructor taking the cell height in micrometres."""
+        if "cell_radius_um" in kwargs:
+            radius_um = kwargs.pop("cell_radius_um")
+            kwargs["cell_radius"] = None if not radius_um else radius_um * 1e-6
+        return cls(force, relative_deformation, float(cell_height_um) * 1e-6, **kwargs)
+
+    # -------------------------------------------------------- geometry terms
+
+    @property
+    def Am(self):
+        """Membrane prefactor: F_membrane = Am * Em * e^3  [N/Pa]."""
+        return 2.0 * np.pi * self.h_membrane * self.R0 / (1.0 - self.nu_m)
+
+    @property
+    def Ai(self):
+        """Hertzian prefactor: F_interior = Ai * Ei * e^1.5  [N/Pa]."""
+        return (
+            np.sqrt(2.0)
+            * np.sqrt(self.R0)
+            * self.cell_height ** 1.5
+            / (3.0 * (1.0 - self.nu_i ** 2))
+        )
+
+    def sarcomere_at(self, epsilon, spread=1.0):
+        """
+        Sarcomere length at a given deformation, in metres.
+
+        Squashing a cardiomyocyte does not shorten its sarcomeres, it
+        lengthens them. The myofibrils run along the cell's long axis, across
+        the direction of the squash, and a cell that keeps its volume has to
+        spread sideways by exactly as much as it loses in height. That
+        spreading pulls the sarcomeres out.
+
+        Constant volume gives in-plane linear stretch (1 - e)^(-1/2) if the
+        cell spreads equally in both in-plane directions, so
+
+            L(e) = L0 (1 - e)^(-spread/2)
+
+        ``spread`` is how much of that spreading goes along the myofibrils.
+        1.0 is a cell free to spread in every direction, which is the most
+        the sarcomeres can lengthen. 0.0 is a cell held at its ends, where
+        they do not lengthen at all. The truth for an attached cell is
+        somewhere between, and the two ends are worth quoting as bounds
+        rather than picking one and calling it the answer.
+
+        This is geometry and nothing else. No fitted quantity depends on it;
+        it exists so the fitted range can be read as a sarcomere length and
+        checked against what a sarcomere can actually do.
+        """
+        eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, 0.999)
+        return self.L_sarcomere * (1.0 - eps) ** (-0.5 * float(spread))
+
+    def sarcomere_report(self, epsilon_max, onset=None, spread=1.0,
+                         working_ratio=1.10):
+        """
+        What the fitted range means in sarcomere lengths.
+
+        ``working_ratio`` sets the top of the useful range as a multiple of
+        the relaxed length, defaulting to 1.10 (2.31 um for a 2.1 um
+        sarcomere), roughly where actin and myosin overlap stops improving
+        and the descending limb begins. It is expressed as a ratio so that
+        changing the relaxed length moves the band with it, instead of
+        leaving a hard-coded number behind that no longer belongs to it.
+        """
+        top = float(self.sarcomere_at(epsilon_max, spread))
+        limit = self.L_sarcomere * float(working_ratio)
+        # The deformation at which the sarcomere reaches that limit.
+        reached = 1.0 - float(working_ratio) ** (-2.0 / max(spread, 1e-9)) \
+            if spread > 0 else float("inf")
+        out = {
+            "relaxed_nm": self.L_sarcomere * 1e9,
+            "at_epsilon_max_nm": top * 1e9,
+            "epsilon_max": float(epsilon_max),
+            "working_limit_nm": limit * 1e9,
+            "epsilon_at_limit": reached,
+            "stretch": top / self.L_sarcomere,
+            "spread": float(spread),
+            "beyond_working_range": top > limit,
+            # How many sarcomeres lie along the cell, which is what makes the
+            # myofibril modulus a per-cell number rather than a per-sarcomere
+            # one.
+            "n_along_cell": (2.0 * self.R0) / self.L_sarcomere,
+        }
+        if onset is not None:
+            out["onset"] = float(onset)
+            out["at_onset_nm"] = float(self.sarcomere_at(onset, spread)) * 1e9
+        return out
+
+    @property
+    def At(self):
+        """
+        Cortical tension prefactor: F_tension = At * T0 * e  [N per N/m = m].
+
+        The horizontal spring. A protein network under a pre-existing in-plane
+        tension T0 resists the area the cell has to gain when it is flattened.
+        Flattening by e adds an area of order pi R0^2 e^2, so at constant
+        tension the stored energy is U = T0 pi R0^2 e^2 and the force is
+
+            F = dU/d(delta) = (1/h0) dU/de = (2 pi R0^2 / h0) T0 e
+
+        Linear in e, where the elastic dilation term goes as e^3. That is the
+        whole reason the two can be separated: near first contact the network
+        is already taut and answers in proportion to how far it is pushed,
+        while the elastic term is still negligible and only takes over once
+        the area strain is large.
+
+        Note the size of it. The bending stiffness of the same shell carries
+        h^2 / R0, which for any real membrane is four orders of magnitude
+        smaller than R0^2 / h0 and could never be seen in a force curve. The
+        tension is the term worth fitting.
+        """
+        return 2.0 * np.pi * self.R0 ** 2 / self.cell_height
+
+    @property
+    def An(self):
+        """Deep prefactor: F_deep = An * En * <e - e_onset>^1.5  [N/Pa].
+
+        Uses the nucleus radius by default. A cardiomyocyte's myofibrils are
+        not a compact body at the centre, they run the length of the cell, so
+        ``deep_uses_cell_radius`` puts the cell's own radius here instead.
+        """
+        radius = self.R0 if self.deep_uses_cell_radius else self.R_nucleus
+        return (
+            np.sqrt(2.0)
+            * np.sqrt(radius)
+            * self.cell_height ** 1.5
+            / (3.0 * (1.0 - self.nu_n ** 2))
+        )
+
+    def nucleus_model(self, epsilon, En, onset=None):
+        """
+        Nucleus term, force in newtons.
+
+        The nucleus carries no load until the cytoplasm above it has been
+        squashed away, so the term is exactly zero below ``onset`` and rises as
+        a Hertzian contact in the excess deformation beyond it. That offset is
+        what keeps this term distinguishable from the cytoskeleton term, which
+        has the same 3/2 exponent but starts at zero deformation.
+        """
+        onset = self.nucleus_onset if onset is None else float(onset)
+        raw = np.asarray(epsilon, dtype=float)
+        excess = np.clip(raw - onset, 0.0, None)
+        return self.An * En * excess ** 1.5 * self._active(raw, "nucleus")
+
+    def balloon_model_cubic(self, epsilon, Em):
+        """Membrane (balloon) term, force in newtons."""
+        eps = np.asarray(epsilon, dtype=float)
+        return self.Am * Em * eps ** 3 * self._active(eps, "membrane")
+
+    def hertzian_contact_model(self, epsilon, Ei):
+        """Interior (Hertzian) term, force in newtons."""
+        raw = np.asarray(epsilon, dtype=float)
+        eps = np.clip(raw, 0.0, None)
+        return self.Ai * Ei * eps ** 1.5 * self._active(raw, "interior")
+
+    def combined_model(self, epsilon, Em, Ei, force_offset=0.0, En=0.0, onset=None):
+        """Full model, force in newtons. ``En=0`` gives the two-term Lulevich fit."""
+        total = (
+            self.balloon_model_cubic(epsilon, Em)
+            + self.hertzian_contact_model(epsilon, Ei)
+            + force_offset
+        )
+        if En:
+            total = total + self.nucleus_model(epsilon, En, onset)
+        return total
+
+    # ---------------------------------------------------------------- fitting
+
+    def _select(self, epsilon_min, epsilon_max):
+        mask = (self.epsilon >= epsilon_min) & (self.epsilon <= epsilon_max)
+        return self.epsilon[mask], self.force[mask], mask
+
+    def _active(self, eps, term):
+        """
+        1 where an element carries load, 0 where it does not.
+
+        With ``active_windows`` set, an element contributes only inside its own
+        deformation range. That is what lets a curve be described as one set of
+        elements up to some deformation and a different set beyond it: membrane
+        plus cytoskeleton while the cell is a pressurised balloon, cytoskeleton
+        plus nucleus once it is squashed flat and the membrane no longer holds
+        the load. The model stays linear in the moduli, because switching an
+        element off is just zeroing its column.
+        """
+        window = (self.active_windows or {}).get(term)
+        if not window:
+            return np.ones_like(eps)
+        lo, hi = window
+        return ((eps >= lo) & (eps <= hi)).astype(float)
+
+    def _design_matrix(self, eps, terms, fit_offset):
+        cols, names = [], []
+        if "membrane" in terms:
+            cols.append(self.Am * eps ** 3 * self._active(eps, "membrane"))
+            names.append("Em")
+        if "interior" in terms:
+            cols.append(
+                self.Ai * np.clip(eps, 0.0, None) ** 1.5 * self._active(eps, "interior")
+            )
+            names.append("Ei")
+        if "nucleus" in terms:
+            cols.append(
+                self.An
+                * np.clip(eps - self.nucleus_onset, 0.0, None) ** 1.5
+                * self._active(eps, "nucleus")
+            )
+            names.append("En")
+        if fit_offset:
+            cols.append(np.ones_like(eps))
+            names.append("F0")
+        return np.column_stack(cols), names
+
+    def fit(
+        self,
+        epsilon_min=0.01,
+        epsilon_max=0.3,
+        terms=("membrane", "interior"),
+        fit_offset=False,
+        weighting="uniform",
+        enforce_positive=True,
+        fixed=None,
+    ):
+        """
+        Bounded linear least-squares fit of the Lulevich model.
+
+        Parameters
+        ----------
+        epsilon_min, epsilon_max : float
+            Fitting window in relative deformation.
+        terms : tuple
+            Any of ``"membrane"``, ``"interior"``. Use one for a single-term
+            fit, both for the full two-term Lulevich fit.
+        fit_offset : bool
+            Also fit a constant force offset, absorbing a residual baseline
+            or contact-point error. The offset is unbounded in sign.
+        weighting : {"uniform", "relative"}
+            ``"uniform"`` minimises absolute residuals and is dominated by the
+            high-force end. ``"relative"`` weights each point by 1/|F|, so the
+            low-deformation region carries comparable weight. Use "relative"
+            when the fit visibly ignores the small-e points.
+        enforce_positive : bool
+            Constrain the moduli to be >= 0. Negative moduli are unphysical;
+            hitting the zero bound means that term is not supported by the
+            data, which is reported rather than treated as a failure.
+        fixed : dict, optional
+            Moduli to hold at a known value instead of fitting, e.g.
+            ``{"Ei": 800.0}``. The corresponding term is subtracted from the
+            force before fitting and added back into the reported model. This
+            is what the sequential (two-stage) workflow uses to carry Ei from
+            the low-deformation window into the membrane fit.
+
+        Returns
+        -------
+        dict
+            Fit results, diagnostics, and uncertainties. ``success`` is False
+            only when the input data is unusable (too few points, degenerate).
+        """
+        fixed = dict(fixed or {})
+        terms, dropped = classic_terms(terms)
+        # A term that is held fixed is not a free parameter.
+        free_terms = tuple(t for t in terms if TERM_KEYS.get(t) not in fixed)
+
+        eps, force_all, mask = self._select(epsilon_min, epsilon_max)
+        force = force_all.copy()
+        # Remove the known contributions so the remaining fit is on the residual.
+        if "Em" in fixed:
+            force = force - self.balloon_model_cubic(eps, fixed["Em"])
+        if "Ei" in fixed:
+            force = force - self.hertzian_contact_model(eps, fixed["Ei"])
+        if "En" in fixed:
+            force = force - self.nucleus_model(eps, fixed["En"])
+
+        if not free_terms:
+            return self._failure("Every requested term is held fixed; nothing to fit.")
+
+        terms = free_terms
+        n_params = len(terms) + (1 if fit_offset else 0)
+
+        if eps.size < n_params + 1:
+            return self._failure(
+                f"Only {eps.size} points in e = [{epsilon_min:.3f}, "
+                f"{epsilon_max:.3f}]; need at least {n_params + 1} for a "
+                f"{n_params}-parameter fit. Widen the range."
+            )
+        if np.ptp(eps) <= 0:
+            return self._failure("All points in range share the same e value.")
+
+        X, names = self._design_matrix(eps, terms, fit_offset)
+
+        # Weights
+        if weighting == "relative":
+            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10))
+            scale[scale <= 0] = 1.0
+            w = 1.0 / scale
+        else:
+            w = np.ones_like(force)
+        Xw, yw = X * w[:, None], force * w
+
+        # Column scaling keeps the normal equations well conditioned even
+        # though Am and Ai differ by orders of magnitude.
+        col_norm = np.linalg.norm(Xw, axis=0)
+        col_norm[col_norm == 0] = 1.0
+        Xs = Xw / col_norm
+
+        lo = np.full(len(names), 0.0 if enforce_positive else -np.inf)
+        hi = np.full(len(names), np.inf)
+        if fit_offset:
+            lo[names.index("F0")] = -np.inf  # offset may be negative
+
+        sol = lsq_linear(Xs, yw, bounds=(lo * col_norm, hi), method="bvls")
+        params = sol.x / col_norm
+        p = dict(zip(names, params))
+
+        Em = float(p.get("Em", fixed.get("Em", 0.0)))
+        Ei = float(p.get("Ei", fixed.get("Ei", 0.0)))
+        En = float(p.get("En", fixed.get("En", 0.0)))
+        F0 = float(p.get("F0", 0.0))
+
+        # Goodness of fit is always measured against the ORIGINAL force with
+        # the complete model, so a staged fit is scored on the same footing as
+        # a simultaneous one.
+        pred = self.combined_model(eps, Em, Ei, F0, En=En)
+        residuals = force_all - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((force_all - force_all.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        dof = max(eps.size - n_params, 1)
+        adj_r2 = (
+            1.0 - (1.0 - r_squared) * (eps.size - 1) / dof
+            if np.isfinite(r_squared) and eps.size > n_params
+            else float("nan")
+        )
+        rmse = float(np.sqrt(ss_res / eps.size))
+
+        # Analytic covariance of the (scaled) linear parameters.
+        std_err, corr_EmEi, cond = self._covariance(Xs, yw, col_norm, names, dof, ss_res, eps.size)
+
+        # How much of the force at the top of the window each term explains.
+        e_top = eps.max()
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        f_nuc = float(self.nucleus_model(e_top, En)) if En else 0.0
+        f_tot = f_mem + f_int + f_nuc
+        membrane_fraction = f_mem / f_tot if f_tot > 0 else float("nan")
+        interior_fraction = f_int / f_tot if f_tot > 0 else float("nan")
+        nucleus_fraction = f_nuc / f_tot if f_tot > 0 else float("nan")
+
+        Km = Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2))
+
+        warnings_list = dropped_term_warning(dropped) + self._warnings(
+            Em, Ei, names, cond, r_squared, eps.size, membrane_fraction, En=En
+        )
+
+        out = {
+            "success": True,
+            "Em": Em,
+            "Ei": Ei,
+            "En": En,
+            "Em_MPa": Em / 1e6,
+            "Ei_kPa": Ei / 1e3,
+            "En_kPa": En / 1e3,
+            "En_std": std_err.get("En", float("nan")),
+            "En_kPa_std": std_err.get("En", float("nan")) / 1e3,
+            "nucleus_onset": self.nucleus_onset,
+            "R_nucleus": self.R_nucleus,
+            "An": self.An,
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "Em_std": std_err.get("Em", float("nan")),
+            "Ei_std": std_err.get("Ei", float("nan")),
+            "Em_MPa_std": std_err.get("Em", float("nan")) / 1e6,
+            "Ei_kPa_std": std_err.get("Ei", float("nan")) / 1e3,
+            "force_offset": F0,
+            "Km": Km,
+            "Km_kT": Km / (K_BOLTZMANN * 300.0),
+            "r_squared": r_squared,
+            "adj_r_squared": adj_r2,
+            "rmse": rmse,
+            "residual_std": float(np.std(residuals)),
+            "n_points": int(eps.size),
+            "epsilon_range": [float(epsilon_min), float(epsilon_max)],
+            "epsilon_used": [float(eps.min()), float(eps.max())],
+            "terms": list(terms),
+            "fixed": {k: float(v) for k, v in fixed.items()},
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": cond,
+            "corr_Em_Ei": corr_EmEi,
+            "membrane_fraction_at_max": membrane_fraction,
+            "interior_fraction_at_max": interior_fraction,
+            "nucleus_fraction_at_max": nucleus_fraction,
+            "R0": self.R0,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "mask": mask,
+            "warnings": warnings_list,
+        }
+        self.results["combined"] = out
+        return out
+
+    def _covariance(self, Xs, yw, col_norm, names, dof, ss_res, n):
+        """Standard errors, Em/Ei correlation, condition number."""
+        std_err, corr, cond = {}, float("nan"), float("nan")
+        try:
+            cond = float(np.linalg.cond(Xs))
+            XtX_inv = np.linalg.inv(Xs.T @ Xs)
+            sigma2 = ss_res / dof
+            # Undo column scaling: cov(params) = D^-1 cov(scaled) D^-1
+            D_inv = np.diag(1.0 / col_norm)
+            cov = D_inv @ (sigma2 * XtX_inv) @ D_inv
+            diag = np.diag(cov)
+            for i, name in enumerate(names):
+                std_err[name] = float(np.sqrt(diag[i])) if diag[i] > 0 else float("nan")
+            if "Em" in names and "Ei" in names:
+                a, b = names.index("Em"), names.index("Ei")
+                denom = np.sqrt(diag[a] * diag[b])
+                if denom > 0:
+                    corr = float(cov[a, b] / denom)
+        except np.linalg.LinAlgError:
+            pass
+        return std_err, corr, cond
+
+    def _warnings(self, Em, Ei, names, cond, r2, n_points, membrane_fraction, En=0.0):
+        w = []
+        if "En" in names and En <= 0:
+            w.append(
+                "En collapsed to zero: past the onset deformation the data shows no "
+                "extra stiffening, so this curve gives no evidence of the nucleus. "
+                "Either it was never engaged, or the onset is set too high."
+            )
+        if "Em" in names and Em <= 0:
+            w.append(
+                "Em collapsed to zero: over this e-window the data is fully "
+                "explained by the Hertzian term. Extend e_max to include more "
+                "of the stiffening region where the membrane term dominates."
+            )
+        if "Ei" in names and Ei <= 0:
+            w.append(
+                "Ei collapsed to zero: the low-e region carries no cubic-free "
+                "signal. Lower e_min, or check the contact point."
+            )
+        if np.isfinite(cond) and cond > 30:
+            w.append(
+                f"e^3 and e^1.5 are nearly collinear over this window "
+                f"(condition number {cond:.0f}). The SUM is well determined but "
+                f"the Em/Ei split is not; widen the range or fix one term."
+            )
+        for value, key, unit, scale in (
+            (Em, "Em", "MPa", 1e6),
+            (Ei, "Ei", "kPa", 1e3),
+            (En, "En", "kPa", 1e3),
+        ):
+            if key not in names:
+                continue
+            lo, hi = self.expected_ranges[key]
+            if value > 0 and not (lo <= value <= hi):
+                w.append(
+                    f"{key} = {value/scale:.3g} {unit} is outside the expected "
+                    f"{lo/scale:.3g} to {hi/scale:.3g} {unit} for this cell type. "
+                    f"Check the cell height, radius and force units before "
+                    f"trusting it."
+                )
+        if np.isfinite(r2) and r2 < 0.9:
+            w.append(
+                f"R2 = {r2:.3f}. The two-term model does not describe this "
+                f"window well; try enabling the force offset, switching to "
+                f"relative weighting, or trimming past the rupture point."
+            )
+        if n_points < 20:
+            w.append(f"Only {n_points} points in the window; the fit is poorly constrained.")
+        if np.isfinite(membrane_fraction):
+            if membrane_fraction > 0.98:
+                w.append("Membrane term carries >98% of the force; Ei is essentially unconstrained.")
+            elif membrane_fraction < 0.02:
+                w.append("Hertzian term carries >98% of the force; Em is essentially unconstrained.")
+        return w
+
+    @staticmethod
+    def _failure(message):
+        return {
+            "success": False,
+            "error": message,
+            "Em": 0.0,
+            "Ei": 0.0,
+            "Em_MPa": 0.0,
+            "Ei_kPa": 0.0,
+            "r_squared": float("nan"),
+            "warnings": [],
+        }
+
+    # ------------------------------------------------------- staged fitting
+
+    TERM_KEY = {"membrane": "Em", "interior": "Ei", "nucleus": "En"}
+    TERM_LABEL = {"membrane": "membrane", "interior": "cytoskeleton", "nucleus": "nucleus"}
+
+    def fit_staged(
+        self,
+        stages,
+        weighting="uniform",
+        fit_offset=False,
+        refine_iterations=3,
+        seed_parallel=True,
+    ):
+        """
+        Fit groups of terms in sequence, each on its own deformation window.
+
+        This is the general form of the series workflow. Each stage names the
+        terms it solves for and the window it solves them on; every other term
+        is held at its current estimate and subtracted first. Stages run in
+        order, and the whole sequence repeats so that early stages get the
+        benefit of what the later ones learned.
+
+        Parameters
+        ----------
+        stages : list of dict
+            ``[{"terms": ("membrane",), "range": (0.20, 0.35)},
+               {"terms": ("interior", "nucleus"), "range": (0.01, 0.15)}]``
+        refine_iterations : int
+            Passes over the whole sequence. Later passes let early stages
+            benefit from what the later ones found. 3 is normally converged.
+        seed_parallel : bool
+            Start from a parallel fit over the union of all windows. Without a
+            seed the first stage has nothing to subtract, so it absorbs the
+            whole force; the non-negativity constraint then pins the later
+            stages at zero and the sequence has no way back. Seeding removes
+            that trap. Turn it off only to see the unseeded staged behaviour.
+
+        Returns
+        -------
+        dict
+            Same shape as :meth:`fit`, plus ``stages``, ``iterations`` and a
+            joint ``r_squared`` over the union of all windows.
+        """
+        # Staged fitting runs on the three classic springs. A stage that
+        # asked only for something else has nothing left to solve and is
+        # dropped along with it.
+        dropped = tuple(dict.fromkeys(
+            t for st in stages for t in (st.get("terms") or ())
+            if t not in CLASSIC_TERMS
+        ))
+        stages = [
+            {
+                "terms": tuple(t for t in st["terms"] if t in CLASSIC_TERMS),
+                "range": (float(st["range"][0]), float(st["range"][1])),
+            }
+            for st in stages
+            if st.get("terms")
+        ]
+        stages = [st for st in stages if st["terms"]]
+        if not stages:
+            return self._failure("No stages defined.")
+
+        estimates = {"Em": 0.0, "Ei": 0.0, "En": 0.0}
+        all_terms = [t for st in stages for t in st["terms"]]
+        history, stage_results = [], []
+
+        seed = None
+        if seed_parallel and len(stages) > 1:
+            union_lo = min(st["range"][0] for st in stages)
+            union_hi = max(st["range"][1] for st in stages)
+            seed = self.fit(
+                union_lo,
+                union_hi,
+                terms=tuple(dict.fromkeys(all_terms)),
+                weighting=weighting,
+                fit_offset=fit_offset,
+            )
+            if seed.get("success"):
+                for term in all_terms:
+                    key = self.TERM_KEY[term]
+                    estimates[key] = seed[key]
+            else:
+                seed = None
+
+        for iteration in range(max(1, int(refine_iterations))):
+            stage_results = []
+            for st in stages:
+                keys_here = {self.TERM_KEY[t] for t in st["terms"]}
+                # Hold every other term of the model at its current value.
+                carry = {
+                    self.TERM_KEY[t]: estimates[self.TERM_KEY[t]]
+                    for t in all_terms
+                    if self.TERM_KEY[t] not in keys_here
+                }
+                result = self.fit(
+                    st["range"][0],
+                    st["range"][1],
+                    terms=st["terms"],
+                    weighting=weighting,
+                    fit_offset=fit_offset,
+                    fixed=carry or None,
+                )
+                if not result.get("success"):
+                    labels = ", ".join(
+                        self.TERM_LABEL.get(t, t) for t in st["terms"]
+                    )
+                    return self._failure(f"Stage '{labels}': {result['error']}")
+                for t in st["terms"]:
+                    estimates[self.TERM_KEY[t]] = result[self.TERM_KEY[t]]
+                stage_results.append(result)
+
+            history.append(
+                {
+                    "iteration": iteration + 1,
+                    "Em_MPa": estimates["Em"] / 1e6,
+                    "Ei_kPa": estimates["Ei"] / 1e3,
+                    "En_kPa": estimates["En"] / 1e3,
+                }
+            )
+            if len(history) > 1:
+                prev, now = history[-2], history[-1]
+                moved = max(
+                    abs(now[k] - prev[k]) / max(abs(now[k]), 1e-12)
+                    for k in ("Em_MPa", "Ei_kPa", "En_kPa")
+                )
+                if moved < 1e-3:
+                    break
+
+        Em, Ei, En = estimates["Em"], estimates["Ei"], estimates["En"]
+        F0 = stage_results[-1].get("force_offset", 0.0)
+
+        union = np.zeros(self.epsilon.shape, dtype=bool)
+        for result in stage_results:
+            union |= result["mask"]
+        eps_u, force_u = self.epsilon[union], self.force[union]
+        pred_u = self.combined_model(eps_u, Em, Ei, F0, En=En)
+        residual = force_u - pred_u
+        ss_res = float(np.sum(residual ** 2))
+        ss_tot = float(np.sum((force_u - force_u.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        e_top = float(eps_u.max()) if eps_u.size else 0.0
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        f_nuc = float(self.nucleus_model(e_top, En)) if En else 0.0
+        f_tot = f_mem + f_int + f_nuc
+
+        warnings_list = (
+            dropped_term_warning(dropped)
+            + self._staged_warnings(stages, estimates, r_squared)
+        )
+
+        out = {
+            "success": True,
+            "mode": "staged",
+            "Em": Em,
+            "Ei": Ei,
+            "En": En,
+            "Em_MPa": Em / 1e6,
+            "Ei_kPa": Ei / 1e3,
+            "En_kPa": En / 1e3,
+            "Em_std": float("nan"),
+            "Ei_std": float("nan"),
+            "En_std": float("nan"),
+            "force_offset": F0,
+            "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
+            "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
+            / (K_BOLTZMANN * 300.0),
+            "membrane_areal_modulus": Em * self.h_membrane,
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps_u.size)) if eps_u.size else float("nan"),
+            "residual_std": float(np.std(residual)) if residual.size else float("nan"),
+            "n_points": int(eps_u.size),
+            "epsilon_range": [
+                float(min(st["range"][0] for st in stages)),
+                float(max(st["range"][1] for st in stages)),
+            ],
+            "stage_plan": stages,
+            "terms": all_terms,
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": f_mem / f_tot if f_tot > 0 else float("nan"),
+            "interior_fraction_at_max": f_int / f_tot if f_tot > 0 else float("nan"),
+            "nucleus_fraction_at_max": f_nuc / f_tot if f_tot > 0 else float("nan"),
+            "nucleus_onset": self.nucleus_onset,
+            "R0": self.R0,
+            "R_nucleus": self.R_nucleus,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "An": self.An,
+            "mask": union,
+            "stages": stage_results,
+            "iterations": history,
+            "n_iterations": len(history),
+            "seeded": seed is not None,
+            "warnings": warnings_list,
+        }
+        for key in ("Em", "Ei", "En"):
+            unit = 1e6 if key == "Em" else 1e3
+            suffix = "MPa" if key == "Em" else "kPa"
+            out[f"{key}_{suffix}_std"] = out[f"{key}_std"] / unit
+        self.results["staged"] = out
+        return out
+
+    def _staged_warnings(self, stages, estimates, r_squared):
+        warnings_list = []
+        for i, first in enumerate(stages):
+            for second in stages[i + 1 :]:
+                lo = max(first["range"][0], second["range"][0])
+                hi = min(first["range"][1], second["range"][1])
+                if lo < hi:
+                    a = "/".join(self.TERM_LABEL[t] for t in first["terms"])
+                    b = "/".join(self.TERM_LABEL[t] for t in second["terms"])
+                    warnings_list.append(
+                        f"The '{a}' and '{b}' windows overlap between e = {lo:.3f} and "
+                        f"{hi:.3f}. Separate them so each stage measures where its own "
+                        f"terms dominate."
+                    )
+        for term, key in self.TERM_KEY.items():
+            if any(term in st["terms"] for st in stages) and estimates[key] <= 0:
+                warnings_list.append(
+                    f"The {self.TERM_LABEL.get(term, term)} modulus came out zero: its window "
+                    f"holds no signal of that term's shape once the others are removed."
+                )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Joint R2 = {r_squared:.3f} across all windows. The staged result does "
+                f"not describe the whole curve; try different windows or fit in parallel."
+            )
+        return warnings_list
+
+    def scan_nucleus_onset(self, epsilon_min, epsilon_max, terms=("membrane", "interior", "nucleus"),
+                           n_trials=25, weighting="uniform", fit_offset=False):
+        """
+        Find the onset deformation that best explains the data.
+
+        The onset is the only non-linear parameter in the model, and it is a
+        single bounded scalar, so a scan over a grid is both exhaustive and
+        cheap: each trial is one exact linear solve. Returns the best onset,
+        its fit, and the whole R2 curve so a flat maximum (meaning the data
+        does not really locate the nucleus) is visible rather than hidden.
+        """
+        original = self.nucleus_onset
+        lo = epsilon_min + 0.15 * (epsilon_max - epsilon_min)
+        hi = epsilon_min + 0.85 * (epsilon_max - epsilon_min)
+        trials = []
+        best = None
+        try:
+            for onset in np.linspace(lo, hi, max(3, int(n_trials))):
+                self.nucleus_onset = float(onset)
+                result = self.fit(
+                    epsilon_min, epsilon_max, terms=terms,
+                    weighting=weighting, fit_offset=fit_offset,
+                )
+                if not result.get("success"):
+                    continue
+                trials.append(
+                    {
+                        "onset": float(onset),
+                        "r_squared": float(result["r_squared"]),
+                        "Em_MPa": result["Em_MPa"],
+                        "Ei_kPa": result["Ei_kPa"],
+                        "En_kPa": result["En_kPa"],
+                    }
+                )
+                if best is None or result["r_squared"] > best["r_squared"]:
+                    best = {"onset": float(onset), "r_squared": float(result["r_squared"])}
+        finally:
+            self.nucleus_onset = original
+
+        if best is None:
+            return {"success": False, "error": "No usable fit across the onset scan.",
+                    "trials": trials}
+
+        r2_values = np.array([t["r_squared"] for t in trials], dtype=float)
+        spread = float(np.nanmax(r2_values) - np.nanmin(r2_values)) if r2_values.size else 0.0
+        # Judge the spread against the residual that is left at the optimum,
+        # not against an absolute number: on a clean curve the whole scan sits
+        # within a thousandth of 1.0 and an absolute threshold would call a
+        # sharply located onset "undetermined".
+        headroom = max(1.0 - best["r_squared"], 1e-12)
+        significance = spread / headroom
+        out = {
+            "success": True,
+            "best_onset": best["onset"],
+            "best_r_squared": best["r_squared"],
+            "trials": trials,
+            "r_squared_spread": spread,
+            "significance": float(significance),
+            "well_determined": bool(significance > 1.0),
+        }
+        self.results["nucleus_onset_scan"] = out
+        return out
+
+    # ------------------------------------------------------ sequential fit
+
+    def fit_sequential(
+        self,
+        interior_range=(0.01, 0.10),
+        membrane_range=(0.15, 0.30),
+        weighting="uniform",
+        fit_offset=False,
+        order="interior-first",
+        refine_iterations=3,
+    ):
+        """
+        Two-stage fit on two separate deformation windows.
+
+        The physical justification is the exponents: at small e the Hertzian
+        term (e^1.5) dominates, at large e the membrane term (e^3) takes over.
+        So the interior modulus is measured where the membrane contributes
+        least, then held fixed while the membrane modulus is measured where it
+        dominates. This avoids asking one window to separate two nearly
+        collinear basis functions, which is what makes the simultaneous fit
+        sensitive to the range.
+
+        Parameters
+        ----------
+        interior_range : (float, float)
+            Low-deformation window used for Ei.
+        membrane_range : (float, float)
+            High-deformation window used for Em.
+        order : {"interior-first", "membrane-first"}
+            Which modulus is measured on its own window first. The default
+            matches the physics; "membrane-first" is available for curves
+            where the high-e region is the cleaner one.
+        refine_iterations : int
+            A single pass is biased: the first stage has no knowledge of the
+            other term, so it absorbs whatever that term contributes inside
+            its own window. Repeating the pair of fits, each time subtracting
+            the other term's current estimate, removes most of that bias
+            (this is backfitting). 1 = plain one-pass sequential fit;
+            3 is usually converged. The per-iteration values are returned in
+            ``iterations`` so the convergence is visible.
+
+        Returns
+        -------
+        dict
+            Same shape as :meth:`fit`, with an extra ``stages`` entry holding
+            the two individual fits. ``r_squared`` is measured over the union
+            of the two windows using the complete two-term model.
+        """
+        interior_range = (float(interior_range[0]), float(interior_range[1]))
+        membrane_range = (float(membrane_range[0]), float(membrane_range[1]))
+
+        if order == "membrane-first":
+            first_terms, first_range, first_key = ("membrane",), membrane_range, "Em"
+            second_terms, second_range, second_key = ("interior",), interior_range, "Ei"
+        else:
+            first_terms, first_range, first_key = ("interior",), interior_range, "Ei"
+            second_terms, second_range, second_key = ("membrane",), membrane_range, "Em"
+
+        stage1 = stage2 = None
+        estimates = {"Em": 0.0, "Ei": 0.0}
+        history = []
+
+        for iteration in range(max(1, int(refine_iterations))):
+            # Stage 1: measure the first modulus on its own window, removing
+            # the other term's current estimate (zero on the first pass).
+            carry = {second_key: estimates[second_key]} if iteration > 0 else None
+            stage1 = self.fit(
+                first_range[0],
+                first_range[1],
+                terms=first_terms,
+                weighting=weighting,
+                fit_offset=fit_offset,
+                fixed=carry,
+            )
+            if not stage1.get("success"):
+                return self._failure(f"Stage 1 ({first_terms[0]} window): {stage1['error']}")
+            estimates[first_key] = stage1[first_key]
+
+            # Stage 2: the other modulus on its window, holding stage 1 fixed.
+            stage2 = self.fit(
+                second_range[0],
+                second_range[1],
+                terms=second_terms,
+                weighting=weighting,
+                fit_offset=fit_offset,
+                fixed={first_key: estimates[first_key]},
+            )
+            if not stage2.get("success"):
+                return self._failure(f"Stage 2 ({second_terms[0]} window): {stage2['error']}")
+            estimates[second_key] = stage2[second_key]
+
+            history.append(
+                {
+                    "iteration": iteration + 1,
+                    "Em_MPa": estimates["Em"] / 1e6,
+                    "Ei_kPa": estimates["Ei"] / 1e3,
+                }
+            )
+            # Stop once both moduli move by less than 0.1 %.
+            if len(history) > 1:
+                prev, now = history[-2], history[-1]
+                moved = max(
+                    abs(now["Em_MPa"] - prev["Em_MPa"]) / max(abs(now["Em_MPa"]), 1e-12),
+                    abs(now["Ei_kPa"] - prev["Ei_kPa"]) / max(abs(now["Ei_kPa"]), 1e-12),
+                )
+                if moved < 1e-3:
+                    break
+
+        Em, Ei = estimates["Em"], estimates["Ei"]
+        F0 = stage2.get("force_offset", 0.0)
+
+        # Score the joint model over both windows together.
+        union = stage1["mask"] | stage2["mask"]
+        eps_u, force_u = self.epsilon[union], self.force[union]
+        pred_u = self.combined_model(eps_u, Em, Ei, F0)
+        res_u = force_u - pred_u
+        ss_res = float(np.sum(res_u ** 2))
+        ss_tot = float(np.sum((force_u - force_u.mean()) ** 2))
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+        e_top = float(eps_u.max()) if eps_u.size else 0.0
+        f_mem = float(self.balloon_model_cubic(e_top, Em))
+        f_int = float(self.hertzian_contact_model(e_top, Ei))
+        membrane_fraction = f_mem / (f_mem + f_int) if (f_mem + f_int) > 0 else float("nan")
+
+        warnings_list = []
+        if interior_range[1] > membrane_range[0]:
+            warnings_list.append(
+                f"The two windows overlap between e = {membrane_range[0]:.3f} and "
+                f"{interior_range[1]:.3f}. Separate them so each modulus is measured "
+                f"where its own term dominates."
+            )
+        if Ei <= 0:
+            warnings_list.append(
+                "Ei came out zero on the low-e window. Lower its start, or check "
+                "the contact point."
+            )
+        if Em <= 0:
+            warnings_list.append(
+                "Em came out zero on the high-e window. The residual after removing "
+                "the Hertzian term has no cubic content there."
+            )
+        if np.isfinite(r_squared) and r_squared < 0.9:
+            warnings_list.append(
+                f"Joint R2 = {r_squared:.3f} across both windows. The staged result "
+                f"does not describe the whole curve; try different windows or the "
+                f"simultaneous fit."
+            )
+        warnings_list.extend(w for w in stage1["warnings"] if "collinear" not in w)
+
+        Km = Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2))
+
+        out = {
+            "success": True,
+            "mode": "sequential",
+            "order": order,
+            "Em": Em,
+            "Ei": Ei,
+            "Em_MPa": Em / 1e6,
+            "Ei_kPa": Ei / 1e3,
+            "Em_std": stage2.get("Em_std", float("nan")) if "membrane" in second_terms else stage1.get("Em_std", float("nan")),
+            "Ei_std": stage1.get("Ei_std", float("nan")) if "interior" in first_terms else stage2.get("Ei_std", float("nan")),
+            "force_offset": F0,
+            "Km": Km,
+            "Km_kT": Km / (K_BOLTZMANN * 300.0),
+            "r_squared": r_squared,
+            "adj_r_squared": float("nan"),
+            "rmse": float(np.sqrt(ss_res / eps_u.size)) if eps_u.size else float("nan"),
+            "residual_std": float(np.std(res_u)) if res_u.size else float("nan"),
+            "n_points": int(eps_u.size),
+            "epsilon_range": [
+                float(min(interior_range[0], membrane_range[0])),
+                float(max(interior_range[1], membrane_range[1])),
+            ],
+            "interior_range": list(interior_range),
+            "membrane_range": list(membrane_range),
+            "terms": ["membrane", "interior"],
+            "weighting": weighting,
+            "fit_offset": bool(fit_offset),
+            "condition_number": float("nan"),
+            "corr_Em_Ei": float("nan"),
+            "membrane_fraction_at_max": membrane_fraction,
+            "interior_fraction_at_max": interior_fraction,
+            "nucleus_fraction_at_max": nucleus_fraction,
+            "R0": self.R0,
+            "cell_height": self.cell_height,
+            "Am": self.Am,
+            "Ai": self.Ai,
+            "mask": union,
+            "stages": {"first": stage1, "second": stage2},
+            "iterations": history,
+            "n_iterations": len(history),
+            "warnings": warnings_list,
+        }
+        out["Em_MPa_std"] = out["Em_std"] / 1e6
+        out["Ei_kPa_std"] = out["Ei_std"] / 1e3
+        self.results["sequential"] = out
+        return out
+
+    def suggest_sequential_windows(self, crossover_fraction=0.5):
+        """
+        Propose a low-e window for Ei and a high-e window for Em by splitting
+        the usable range at the point where the two terms would contribute
+        equally under a provisional simultaneous fit.
+        """
+        auto = self.auto_detect_elastic_range()
+        lo, hi = auto["elastic_epsilon_min"], auto["elastic_epsilon_max"]
+
+        provisional = self.fit(lo, hi)
+        crossover = None
+        if provisional.get("success") and provisional["Em"] > 0 and provisional["Ei"] > 0:
+            # Am*Em*e^3 == Ai*Ei*e^1.5  ->  e^1.5 = Ai*Ei / (Am*Em)
+            ratio = (self.Ai * provisional["Ei"]) / (self.Am * provisional["Em"])
+            if ratio > 0:
+                crossover = float(ratio ** (2.0 / 3.0))
+
+        if crossover is None or not (lo < crossover < hi):
+            crossover = lo + crossover_fraction * (hi - lo)
+
+        gap = 0.05 * (hi - lo)
+        interior = (float(lo), float(max(lo + 1e-3, crossover - gap)))
+        membrane = (float(min(hi - 1e-3, crossover + gap)), float(hi))
+        out = {
+            "interior_range": interior,
+            "membrane_range": membrane,
+            "crossover": float(crossover),
+            "note": (
+                f"Below e = {crossover:.3f} the Hertzian term dominates, above it the "
+                f"membrane term does."
+            ),
+        }
+        self.results["sequential_suggestion"] = out
+        return out
+
+    # --------------------------------------------- backwards-compatible API
+
+    def fit_combined_elasticity(self, epsilon_max=0.3, epsilon_min=0.01, **kwargs):
+        """Two-term fit (membrane + interior). Kept for API compatibility."""
+        return self.fit(
+            epsilon_min=epsilon_min,
+            epsilon_max=epsilon_max,
+            terms=("membrane", "interior"),
+            **kwargs,
+        )
+
+    def fit_membrane_elasticity(self, epsilon_max=0.3, epsilon_min=0.02, **kwargs):
+        """Single-term balloon fit."""
+        res = self.fit(
+            epsilon_min=epsilon_min, epsilon_max=epsilon_max, terms=("membrane",), **kwargs
+        )
+        self.results["membrane"] = res
+        return res
+
+    def fit_cytoskeleton_elasticity(self, epsilon_max=0.3, epsilon_min=0.05, **kwargs):
+        """Single-term Hertzian fit."""
+        res = self.fit(
+            epsilon_min=epsilon_min, epsilon_max=epsilon_max, terms=("interior",), **kwargs
+        )
+        res["Ei_Pa"] = res.get("Ei", 0.0)
+        self.results["cytoskeleton"] = res
+        return res
+
+    # ------------------------------------------------------------ diagnostics
+
+    def detect_rupture_point(self):
+        """
+        Locate membrane rupture: the first large *drop* in force after the
+        curve has risen appreciably. Falls back to the global force maximum.
+        """
+        eps, force = self.epsilon, self.force
+        result = {"epsilon": float(eps.max()) if eps.size else 0.0,
+                  "force": float(force.max()) if force.size else 0.0,
+                  "index": int(np.argmax(force)) if force.size else 0,
+                  "method": "max-force"}
+        if eps.size < 10:
+            return self._store_rupture(result)
+
+        smooth = uniform_filter1d(force, size=max(3, eps.size // 40), mode="nearest")
+        peak_idx = int(np.argmax(smooth))
+
+        # A rupture is a sustained drop after the peak.
+        span = smooth.max() - smooth.min()
+        if span > 0 and peak_idx < eps.size - 3:
+            after = smooth[peak_idx:]
+            drop = (smooth[peak_idx] - after.min()) / span
+            if drop > 0.05:
+                result = {
+                    "epsilon": float(eps[peak_idx]),
+                    "force": float(force[peak_idx]),
+                    "index": peak_idx,
+                    "method": "force-drop",
+                }
+                return self._store_rupture(result)
+
+        # No drop: the curve is still rising, so there is no rupture in view.
+        result["method"] = "no-rupture-detected"
+        return self._store_rupture(result)
+
+    def _store_rupture(self, result):
+        self.results["rupture"] = result
+        return result
+
+    def auto_detect_elastic_range(self, noise_sigma=3.0, max_epsilon=0.35):
+        """
+        Suggest a fitting window from the data itself.
+
+        e_min: where the force first rises above the pre-contact noise floor.
+        e_max: the rupture point (or the largest usable e), capped.
+        """
+        eps, force = self.epsilon, self.force
+        if eps.size < 8:
+            return self._store_range(0.01, min(0.3, float(eps.max()) if eps.size else 0.3), None)
+
+        # Noise floor from the lowest-e tenth of the curve.
+        n_base = max(5, eps.size // 10)
+        base = force[:n_base]
+        floor = float(np.mean(base) + noise_sigma * (np.std(base) or 1e-15))
+
+        above = np.where(force > floor)[0]
+        eps_min = float(eps[above[0]]) if above.size else float(np.percentile(eps, 5))
+        eps_min = float(np.clip(eps_min, 0.005, 0.15))
+
+        rupture = self.detect_rupture_point()
+        eps_max = rupture["epsilon"]
+        if rupture["method"] == "force-drop":
+            eps_max *= 0.95  # stay just below the rupture
+        eps_max = float(min(eps_max, max_epsilon, eps.max()))
+
+        # Guarantee a usable span.
+        if eps_max <= eps_min * 1.5:
+            eps_max = float(min(max(eps_min * 3.0, 0.1), eps.max()))
+
+        return self._store_range(eps_min, eps_max, rupture)
+
+    def _store_range(self, eps_min, eps_max, rupture):
+        n = int(((self.epsilon >= eps_min) & (self.epsilon <= eps_max)).sum())
+        out = {
+            "elastic_epsilon_min": eps_min,
+            "elastic_epsilon_max": eps_max,
+            "n_points": n,
+            "rupture_point": rupture["epsilon"] if rupture else None,
+            "rupture_method": rupture["method"] if rupture else None,
+            "recommendation": f"Fit over e in [{eps_min:.3f}, {eps_max:.3f}] ({n} points)",
+        }
+        self.results["auto_range"] = out
+        return out
+
+    def range_sensitivity(self, epsilon_min, epsilon_max, n_trials=7, **fit_kwargs):
+        """
+        Refit over a family of shrinking upper bounds to show how much the
+        answer depends on the chosen window. Large spread means the Em/Ei
+        split is not identifiable from this curve, not that the fit is buggy.
+
+        Returns
+        -------
+        dict with per-trial rows and the relative spread of Em and Ei.
+        """
+        rows = []
+        uppers = np.linspace(epsilon_min + 0.6 * (epsilon_max - epsilon_min), epsilon_max, n_trials)
+        for upper in uppers:
+            r = self.fit(epsilon_min=epsilon_min, epsilon_max=float(upper), **fit_kwargs)
+            if r.get("success"):
+                rows.append(
+                    {
+                        "epsilon_max": float(upper),
+                        "n_points": r["n_points"],
+                        "Em_MPa": r["Em_MPa"],
+                        "Ei_kPa": r["Ei_kPa"],
+                        "r_squared": r["r_squared"],
+                    }
+                )
+
+        def spread(key):
+            vals = np.array([r[key] for r in rows], dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size < 2 or np.mean(vals) == 0:
+                return float("nan")
+            return float(np.ptp(vals) / abs(np.mean(vals)))
+
+        out = {
+            "trials": rows,
+            "Em_relative_spread": spread("Em_MPa"),
+            "Ei_relative_spread": spread("Ei_kPa"),
+        }
+        self.results["range_sensitivity"] = out
+        return out
+
+    def get_summary(self):
+        """All stored results."""
+        return self.results
+
+
+# ---------------------------------------------------------------------------
+#  Choosing between the couplings
+# ---------------------------------------------------------------------------
+
+
+def _aicc(ss_res, n, k):
+    """Small-sample corrected Akaike information criterion."""
+    if n <= 0 or ss_res <= 0 or n - k - 1 <= 0:
+        return float("nan")
+    return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+
+
+def search_arrangements(
+    model,
+    epsilon_min,
+    epsilon_max,
+    terms=("membrane", "interior", "nucleus"),
+    weighting="uniform",
+    n_folds=5,
+    seed=0,
+    cv_repeats=3,
+    tension_mode="off",
+):
+    """
+    Decide how the cell is arranged, then how its parts share the boundary.
+
+    The composition search asks which of four segmented stories fits best.
+    This asks the question above that one: is the cell segmented at all, or
+    do all its parts simply act everywhere at once (side by side), or in a
+    line (stacked)? Those are different physics, not different settings, and
+    picking between them by eye is exactly what a person new to mechanics
+    cannot do.
+
+    All three are scored the same way, by cross-validated error on the same
+    folds, so the comparison is fair. Where they tie the simplest wins, for
+    the same reason as in the composition search: a structure the curve
+    cannot see is one that will wander from cell to cell.
+    """
+    lo = float(epsilon_min)
+    hi = float(epsilon_max)
+    eps_all, force_all, _ = model._select(lo, hi)
+    n = eps_all.size
+    if n < 20:
+        return {"success": False, "error": f"Only {n} points; need at least 20."}
+
+    fold_sets = []
+    for repeat in range(max(1, int(cv_repeats))):
+        rng = np.random.default_rng(seed + repeat)
+        fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
+
+    def cross_validate(fit_on, predict_with):
+        """Mean held-out RMSE over every fold of every split."""
+        per_repeat = []
+        for folds in fold_sets:
+            errors = []
+            for fold in folds:
+                if fold.size == 0 or fold.size >= n - 3:
+                    continue
+                keep = np.ones(n, dtype=bool)
+                keep[fold] = False
+                sub = model._clone(force_all[keep], eps_all[keep])
+                trained = fit_on(sub)
+                if not (trained and trained.get("success")):
+                    continue
+                predicted = predict_with(trained, eps_all[fold])
+                if predicted is None:
+                    continue
+                errors.append(
+                    float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                )
+            if errors:
+                per_repeat.append(float(np.mean(errors)))
+        return (
+            float(np.mean(per_repeat)) if per_repeat else float("nan"),
+            float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+        )
+
+    candidates = []
+
+    # ---- segmented, including which of the four combinations ----
+    composition = model.search_compositions(
+        lo, hi, weighting=weighting, n_folds=n_folds, seed=seed,
+        cv_repeats=cv_repeats, include_no_nucleus="nucleus" in terms,
+        tension_mode=tension_mode,
     )
-    text = " ".join(str(getattr(a, "text", "")) for a in fig.layout.annotations)
-    check("the cantilever is drawn", "cantilever" in text, text[:120])
-    check("the applied force is labelled", "<b>F</b>" in text, text[:120])
-    check("the squash is stated", "ε = 0.280" in text, text[:160])
-    check("a component not yet reached shows its gap",
-          "gap closes at ε = 0.40" in text, text[-200:])
-    check("a component that handed over shows as locked",
-          "locked" in text, text[-260:])
-    check("it uses the cell type's own names",
-          "Sarcomeric myofibrils" in text and "Cytoskeleton<" not in text,
-          text[-260:])
-
-    # Springs must hang straight, not lean: a precedence bug once drew them
-    # diagonally across the page.
-    for trace in fig.data:
-        xs = [v for v in (trace.x or []) if v is not None]
-        if len(xs) > 5:
-            check("the spring hangs straight",
-                  abs(xs[0] - xs[-1]) < 1e-9 and max(xs) - min(xs) < 20,
-                  f"x from {min(xs):.1f} to {max(xs):.1f}")
-            break
-
-    stacked = plot_utils.cell_schematic(
-        style, epsilon=0.4, coupling="series", Em_MPa=0.6, Ei_kPa=1.2,
-        En_kPa=3.0, labels=app_module.components_for("Myoblast (C2C12)"),
-    )
-    check("the stacked arrangement says so",
-          "Stacked" in str(stacked.layout.title.text),
-          str(stacked.layout.title.text))
-
-
-def case_fit_only_plot():
-    print("the fit can be plotted without the data")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
-    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-
-    def names(**flags):
-        style = plot_utils.PlotStyle(force_unit="N", **flags)
-        fig = plot_utils.force_curve_figure(eps, force, style, fit_force_N=fitted)
-        return [t.name for t in fig.data]
-
-    check("both by default",
-          set(names()) == {"Experimental data", "Model"}, str(names()))
-    check("data off leaves only the model",
-          names(show_data=False) == ["Model"], str(names(show_data=False)))
-    check("fit off leaves only the data",
-          names(show_fit_line=False) == ["Experimental data"],
-          str(names(show_fit_line=False)))
-
-    app = start(cell_name="cell-01")
-    check("there is a checkbox for the points",
-          any("measured points" in (c.label or "").lower() for c in app.checkbox),
-          str([c.label for c in app.checkbox]))
-
-
-def case_springs_share_a_pitch():
-    print("springs can be compared because their coils match")
-    from plot_utils import _zigzag, COIL_PITCH
-
-    def pitch_of(y_bottom, y_top):
-        xs, ys = _zigzag(50, y_bottom, y_top, 12)
-        turns = sum(
-            1 for a, b, c in zip(xs, xs[1:], xs[2:])
-            if (b - a) * (c - b) < 0
+    if composition.get("success"):
+        best = composition["best"]
+        candidates.append(
+            {
+                "arrangement": "segmented",
+                "label": "Segmented: the parts take over from each other",
+                "detail": best["label"],
+                "cv_rmse": best["cv_rmse"],
+                "cv_spread": best.get("cv_spread", 0.0),
+                "n_params": best["n_params"],
+                "fit": composition["fits"].get(best["key"]),
+                "composition": best,
+            }
         )
-        return (max(ys) - min(ys)) / max(turns, 1)
 
-    tall, short = pitch_of(10, 70), pitch_of(30, 70)
-    check("a short spring keeps the pitch of a tall one",
-          abs(tall - short) / tall < 0.25, f"{tall:.2f} vs {short:.2f}")
-    check("the pitch is near the declared one",
-          abs(tall - COIL_PITCH) / COIL_PITCH < 0.6, f"{tall:.2f} vs {COIL_PITCH}")
-    check("a short element gets fewer coils, not tighter ones",
-          len(_zigzag(50, 30, 70, 12)[0]) < len(_zigzag(50, 10, 70, 12)[0]))
+    # ---- side by side: every element acts across the whole curve ----
+    parallel = model.fit(
+        epsilon_min=lo, epsilon_max=hi, terms=terms, weighting=weighting
+    )
+    if parallel.get("success"):
+        def fit_parallel(sub):
+            return sub.fit(
+                epsilon_min=lo, epsilon_max=hi, terms=terms, weighting=weighting
+            )
 
+        def predict_parallel(trained, eps):
+            return model.combined_model(
+                eps, trained.get("Em", 0.0), trained.get("Ei", 0.0),
+                trained.get("force_offset", 0.0), En=trained.get("En", 0.0),
+            )
 
-def case_start_a_new_cell():
-    print("a new cell clears the last one but keeps the setup")
-    app = start(cell_name="cell-01", cell_notes="first cell")
-    check("there is a fit to clear", app.session_state["_last_fit"] is not None)
-    app.session_state["fit_color"] = "#123456"
-    app.session_state["cell_height_um"] = 11.5
-    app.run()
+        mean, spread = cross_validate(fit_parallel, predict_parallel)
+        candidates.append(
+            {
+                "arrangement": "parallel",
+                "label": "Side by side: every part resists the whole way",
+                "detail": "same squash on each, forces add",
+                "cv_rmse": mean, "cv_spread": spread,
+                "n_params": parallel.get("n_params", len(terms)),
+                "fit": parallel,
+            }
+        )
 
-    button = button_by_label(app, "Start a new cell")
-    check("the button is there", button is not None)
-    if button is None:
-        return
-    button.click().run()
-    if not no_exception(app, "start a new cell"):
-        return
+    # ---- stacked: same force through each, squashes add ----
+    series = model.fit_series(lo, hi, terms=terms, weighting=weighting)
+    if series.get("success"):
+        def fit_series(sub):
+            return sub.fit_series(lo, hi, terms=terms, weighting=weighting)
 
-    for key in ("data", "_last_fit", "arrangement_search", "video_saved_frame"):
-        check(f"{key} was cleared", app.session_state[key] is None,
-              str(app.session_state[key])[:40])
-    check("the name was cleared", app.session_state["cell_name"] == "",
-          repr(app.session_state["cell_name"]))
-    check("the notes were cleared", app.session_state["cell_notes"] == "")
-    check("display settings survive", app.session_state["fit_color"] == "#123456")
-    check("the geometry survives", app.session_state["cell_height_um"] == 11.5)
+        def predict_series(trained, eps):
+            try:
+                return model.predict(
+                    eps,
+                    (trained.get("Em", 0.0), trained.get("Ei", 0.0),
+                     trained.get("En", 0.0)),
+                    "series",
+                )
+            except Exception:
+                return None
 
+        mean, spread = cross_validate(fit_series, predict_series)
+        candidates.append(
+            {
+                "arrangement": "series",
+                "label": "Stacked: the parts sit in a line",
+                "detail": "same force through each, squashes add",
+                "cv_rmse": mean, "cv_spread": spread,
+                "n_params": series.get("n_params", len(terms)),
+                "fit": series,
+            }
+        )
 
-def case_manual_cell_and_probe_scale():
-    print("the cell can be drawn by hand and the probe sets the scale")
-    try:
-        import cv2
-        import video_analysis as va
-    except Exception as exc:
-        print(f"  skip (no OpenCV: {exc})")
-        return
+    usable = [c for c in candidates if np.isfinite(c["cv_rmse"])]
+    if not usable:
+        return {
+            "success": False,
+            "error": "No arrangement produced a usable fit on this curve.",
+        }
 
-    frame = np.full((300, 420, 3), 150, np.uint8)
-    det = va.manual_detection(frame, (0.25, 0.30, 0.55, 0.70))
-    check("a hand-drawn box is a detection", det["found"] and det["manual"])
-    check("its height is the box height",
-          abs(det["height_px"] - 0.40 * 300) < 2, str(det["height_px"]))
-    check("its width is the box width",
-          abs(det["width_px"] - 0.30 * 420) < 2, str(det["width_px"]))
-    check("a reversed box is still read correctly",
-          va.manual_detection(frame, (0.55, 0.70, 0.25, 0.30))["bbox"]
-          == det["bbox"])
+    usable.sort(key=lambda c: c["cv_rmse"])
+    lowest = usable[0]
+    tolerance = max(
+        0.05 * lowest["cv_rmse"],
+        lowest["cv_spread"] + max(c["cv_spread"] for c in usable),
+    )
+    tied = [c for c in usable[1:] if c["cv_rmse"] - lowest["cv_rmse"] <= tolerance]
+    best = min([lowest] + tied, key=lambda c: (c["n_params"], c["cv_rmse"]))
+    for candidate in usable:
+        candidate["tied_with_best"] = candidate is not best and (
+            candidate in tied or candidate is lowest
+        )
 
-    scale, detail = va.scale_from_probe((0.10, 0, 0.60, 0), frame.shape, 60.0)
-    check("the probe gives a scale", scale is not None)
-    if scale:
-        check("and it is right",
-              abs(scale - 60.0 / (0.5 * 420)) < 1e-9, f"{scale:.5f}")
-        check("the detail says how it was worked out",
-              "µm per pixel" in detail, detail)
-        # The whole point: pixels become micrometres.
-        check("the cell height converts to micrometres",
-              abs(det["height_px"] * scale - 120 * (60.0 / 210)) < 0.5,
-              f"{det['height_px'] * scale:.2f} µm")
-
-    check("too narrow a probe box is refused",
-          va.scale_from_probe((0.1, 0, 0.1, 0), frame.shape, 60.0)[0] is None)
-    check("a missing width is refused",
-          va.scale_from_probe((0.1, 0, 0.6, 0), frame.shape, 0)[0] is None)
-
-    # The switches live inside the video tab, which only draws its controls
-    # once a video is loaded, so AppTest cannot reach them from a bare
-    # start(). Check that the app is wired to them instead.
-    src = pathlib.Path(__file__).with_name("app.py").read_text()
-    check("the manual switch is wired up",
-          'key="video_manual_cell"' in src)
-    check("the probe switch is wired up",
-          'key="video_use_probe_scale"' in src)
-    check("the app calls the hand-drawn detector",
-          "va.manual_detection(" in src)
-    check("the app calls the probe scale",
-          "va.scale_from_probe(" in src)
-
-    app = start(cell_name="cell-01")
-    check("the manual switch starts off",
-          app.session_state["video_manual_cell"] is False)
-    check("the probe switch starts off",
-          app.session_state["video_use_probe_scale"] is False)
-
-
-def case_zero_modulus_explains_itself():
-    print("a membrane driven to zero says why")
-    eps = np.linspace(0.001, 0.60, 300)
-    g = LulevichModel(np.zeros_like(eps), eps, cell_height=12.0e-6)
-    mb, cb, nb = g.composition_terms(eps, 0.15, 0.40, "continue", "zero")
-    force = mb * 1.4e6 + cb * 3.1e3 + nb * 9.0e3
-    model = LulevichModel(force, eps, cell_height=12.0e-6)
-
-    right = model.fit_composition(0.0, 0.60, 0.15, 0.40, "continue", "zero")
-    check("the right combination recovers the membrane",
-          abs(right["Em_MPa"] - 1.4) / 1.4 < 0.1, f"{right['Em_MPa']:.4f} MPa")
-
-    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "zero")
-    check("holding plus starting at zero kills the membrane",
-          wrong["Em_MPa"] <= 0, f"{wrong['Em_MPa']:.4f} MPa")
-
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte",
-                membrane_after_break="holds what it reached",
-                cyto_starts_at="from the very start")
-    if not no_exception(app, "zero membrane"):
-        return
-    warnings = " ".join(str(w.value) for w in app.warning)
-    if any("zero" in warnings for _ in [1]) and "Eₘ" in warnings:
-        check("the app says the two choices cancel",
-              "cancelling each other" in warnings, warnings[:200])
-        check("and names the fix",
-              "keeps stiffening" in warnings, warnings[:260])
+    if tied:
+        others = ", ".join(
+            f"“{c['label'].split(':')[0]}”" for c in [lowest] + tied if c is not best
+        )
+        verdict = (
+            f"This curve looks **{best['label'].split(':')[0].lower()}**, though "
+            f"{others} predicts it about as well. Where nothing separates them "
+            f"the simpler arrangement is the safer one."
+        )
     else:
-        print("       (this curve did not zero the membrane; logic tested above)")
+        verdict = (
+            f"This curve is clearly **{best['label'].split(':')[0].lower()}**: "
+            f"{best['detail']}."
+        )
+
+    return {
+        "success": True,
+        "candidates": usable,
+        "best": best,
+        "verdict": verdict,
+        "composition": composition if composition.get("success") else None,
+        "n_points": int(n),
+    }
 
 
-def case_fit_quality():
-    print("the fit actually follows the data")
-    for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
-        eps, force = synthetic(membrane, cyto)
-        model = LulevichModel(force, eps, cell_height=8.0e-6)
-        fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, membrane, cyto)
-        check(f"R² > 0.99 for {membrane}/{cyto}",
-              fit["success"] and fit["r_squared"] > 0.99,
-              f"R²={fit.get('r_squared')}")
-        check(f"Eₘ recovered for {membrane}/{cyto}",
-              abs(fit["Em_MPa"] - 0.6) / 0.6 < 0.15, f"{fit['Em_MPa']:.3f} MPa")
-        check(f"E_c recovered for {membrane}/{cyto}",
-              abs(fit["Ei_kPa"] - 1.2) / 1.2 < 0.20, f"{fit['Ei_kPa']:.3f} kPa")
+def compare_couplings(
+    model,
+    epsilon_min,
+    epsilon_max,
+    terms=("membrane", "interior"),
+    n_folds=5,
+    seed=0,
+):
+    """
+    Fit every coupling on the same window and report which the data supports.
 
+    This is model selection, not proof. Two criteria are computed because they
+    fail in different ways:
 
-def four_element_curve(T0=1.2e-3, seed=3, noise=0.003, n=500):
-    """A cardiomyocyte curve with all four springs in it."""
-    eps = np.linspace(0.002, 0.65, n)
-    geometry = dict(cell_height=14.0e-6, shell_thickness=200e-9,
-                    deep_uses_cell_radius=True)
-    blank = LulevichModel(np.zeros_like(eps), eps, **geometry)
-    basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
-    force = (
-        basis["tension"] * T0
-        + basis["membrane"] * 1.4e6
-        + basis["interior"] * 3.1e3
-        + basis["nucleus"] * 9.0e3
-    )
+    * AICc balances fit against parameter count on the data used for fitting.
+      It is quick but assumes the residuals are independent and Gaussian,
+      which force curves only roughly satisfy.
+    * K-fold cross-validation refits on part of the curve and measures error
+      on the part held out. It makes almost no assumptions and directly asks
+      which model predicts data it has not seen, which is the question that
+      matters when the couplings fit the fitted region about equally well.
+
+    When the two disagree, trust the cross-validation. When the top models are
+    within a couple of AICc units of each other, the honest answer is that
+    this curve does not distinguish them, and the returned verdict says so.
+
+    Returns
+    -------
+    dict
+        ``candidates`` (one row per coupling, ranked), ``best``, ``verdict``
+        and the raw fit of each.
+    """
     rng = np.random.default_rng(seed)
-    noisy = force + rng.normal(0.0, noise * force.max(), force.size)
-    return eps, noisy, LulevichModel(noisy, eps, **geometry), geometry
+    eps_all, force_all, _ = model._select(epsilon_min, epsilon_max)
+    n = eps_all.size
+    if n < 12:
+        return {"success": False, "error": f"Only {n} points in the window; need at least 12 to compare couplings."}
 
+    def fit_for(coupling, order=None, lo=epsilon_min, hi=epsilon_max):
+        if coupling == "parallel":
+            return model.fit(lo, hi, terms=terms)
+        if coupling == "series":
+            return model.fit_series(lo, hi, terms=terms)
+        scan = model.scan_crossover(lo, hi, terms=terms, order=order)
+        return scan["best"] if scan.get("success") else {"success": False, "error": "hybrid scan failed"}
 
-def case_four_element_model():
-    print("the membrane is two springs and the fit can tell them apart")
-    eps, force, model, geometry = four_element_curve()
+    candidates = {
+        "parallel": {"label": "Parallel (forces add)", "order": None},
+        "series": {"label": "Series (deformations add)", "order": None},
+        "hybrid_ps": {"label": "Parallel below, series above", "order": "parallel-then-series"},
+        "hybrid_sp": {"label": "Series below, parallel above", "order": "series-then-parallel"},
+    }
 
-    blank = LulevichModel(np.zeros_like(eps), eps, **geometry)
-    basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
-    check("there are four basis functions", len(basis) == 4, str(sorted(basis)))
+    # K-fold indices, shared across candidates so the comparison is paired.
+    order_idx = rng.permutation(n)
+    folds = np.array_split(order_idx, min(n_folds, n))
 
-    # The two membrane laws must not be the same shape, or the split between
-    # them is arbitrary and the numbers wander from cell to cell.
-    a = basis["tension"] / max(basis["tension"].max(), 1e-30)
-    b = basis["membrane"] / max(basis["membrane"].max(), 1e-30)
-    check("the two membrane springs have different shapes",
-          abs(np.corrcoef(a, b)[0, 1]) < 0.95,
-          f"correlation {np.corrcoef(a, b)[0, 1]:.4f}")
-    # And the crossover is the point of the pair: the taut network answers
-    # first, the shell's elasticity takes over once the strain is large.
-    taut = basis["tension"] * 1.2e-3
-    elastic = basis["membrane"] * 1.4e6
-    check("the taut one leads near first contact",
-          taut[5] > elastic[5] * 10, f"{taut[5]:.3g} vs {elastic[5]:.3g}")
-    check("the elastic one leads deep in",
-          elastic[-1] > taut[-1], f"{elastic[-1]:.3g} vs {taut[-1]:.3g}")
-
-    fit = model.fit_composition(
-        0.0, 0.65, 0.15, 0.40, "continue", "zero", use_tension=True
-    )
-    check("the four-term fit succeeds", fit.get("success"))
-    check("T0 is recovered", abs(fit["T0_mN_m"] - 1.2) / 1.2 < 0.25,
-          f"{fit['T0_mN_m']:.3f} mN/m")
-    check("Em is recovered", abs(fit["Em_MPa"] - 1.4) / 1.4 < 0.12,
-          f"{fit['Em_MPa']:.3f} MPa")
-    check("Ec is recovered", abs(fit["Ei_kPa"] - 3.1) / 3.1 < 0.20,
-          f"{fit['Ei_kPa']:.3f} kPa")
-    check("En is recovered", abs(fit["En_kPa"] - 9.0) / 9.0 < 0.15,
-          f"{fit['En_kPa']:.3f} kPa")
-    check("it says which terms it used",
-          set(fit["terms"]) == {"tension", "membrane", "interior", "nucleus"},
-          str(fit["terms"]))
-    check("the breakpoints still count as parameters", fit["n_params"] == 6,
-          str(fit["n_params"]))
-
-    # A tension is a force per length. Turning it into a modulus needs the
-    # coat thickness, and the model must not pretend otherwise.
-    check("the tension prefactor has no thickness in it",
-          abs(model.At - 2 * np.pi * model.R0 ** 2 / model.cell_height)
-          < 1e-12 * model.At)
-    check("the equivalent modulus divides by the coat",
-          abs(fit["T0_as_modulus_kPa"]
-              - (fit["T0_mN_m"] * 1e-3 / 200e-9) / 1e3) < 1e-6)
-
-    # Switching the spring off must leave the classic model exactly as it was.
-    three = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero")
-    check("the classic three-term fit still runs", three.get("success"))
-    check("and reports no tension", three.get("T0_mN_m", 0.0) == 0.0)
-    check("and is a term shorter", three["n_params"] == 5, str(three["n_params"]))
-
-
-def case_sarcomere_length():
-    print("the squash is reported as a sarcomere length")
-    eps, force, model, _ = four_element_curve()
-    check("the relaxed length is 2.1 um by default",
-          abs(model.L_sarcomere - 2.1e-6) < 1e-12, str(model.L_sarcomere))
-    check("unsquashed, the sarcomere is its relaxed length",
-          abs(model.sarcomere_at(0.0) - 2.1e-6) < 1e-15)
-
-    # The direction matters and is easy to get backwards: squashing a
-    # cardiomyocyte lengthens its sarcomeres, because the cell spreads
-    # sideways and the myofibrils run that way.
-    check("squashing lengthens them, it does not shorten them",
-          model.sarcomere_at(0.30) > model.sarcomere_at(0.0),
-          f"{model.sarcomere_at(0.30) * 1e9:.0f} nm")
-    check("constant volume gives the (1-e)^-1/2 stretch",
-          abs(model.sarcomere_at(0.30) - 2.1e-6 / np.sqrt(0.70)) < 1e-15,
-          f"{model.sarcomere_at(0.30) * 1e9:.1f} nm")
-    check("a cell held at its ends keeps them at rest length",
-          abs(model.sarcomere_at(0.50, spread=0.0) - 2.1e-6) < 1e-15)
-    check("and half the spreading gives half the exponent",
-          abs(model.sarcomere_at(0.30, spread=0.5)
-              - 2.1e-6 * 0.70 ** -0.25) < 1e-15)
-    check("it stays finite at full compression",
-          np.isfinite(model.sarcomere_at(1.0)))
-
-    report = model.sarcomere_report(0.65, onset=0.40)
-    check("the report gives the length at the top of the range",
-          abs(report["at_epsilon_max_nm"] - model.sarcomere_at(0.65) * 1e9) < 1e-6)
-    check("and where the myofibrils engage",
-          abs(report["at_onset_nm"] - model.sarcomere_at(0.40) * 1e9) < 1e-6)
-    check("the working limit follows the relaxed length",
-          abs(report["working_limit_nm"] - 2310.0) < 1e-6,
-          f"{report['working_limit_nm']:.1f} nm")
-    check("a deep squash is flagged as past it",
-          report["beyond_working_range"])
-    check("and it says where that started",
-          0.0 < report["epsilon_at_limit"] < 0.65,
-          f"{report['epsilon_at_limit']:.3f}")
-    check("the flag agrees with the length",
-          report["at_epsilon_max_nm"] > report["working_limit_nm"])
-
-    shallow = model.sarcomere_report(0.10, onset=0.40)
-    check("a shallow squash is not flagged", not shallow["beyond_working_range"],
-          f"{shallow['at_epsilon_max_nm']:.0f} nm")
-
-    check("it counts the sarcomeres along the cell",
-          abs(report["n_along_cell"] - (2 * model.R0) / 2.1e-6) < 1e-9,
-          f"{report['n_along_cell']:.1f}")
-
-    # None of this may touch the fit.
-    changed = LulevichModel(model.force, model.epsilon, cell_height=14.0e-6,
-                            shell_thickness=200e-9, deep_uses_cell_radius=True,
-                            sarcomere_length=1.8e-6)
-    a = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
-                              use_tension=True)
-    b = changed.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
-                                use_tension=True)
-    for key in ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa", "r_squared"):
-        check(f"changing the sarcomere length leaves {key} alone",
-              abs(a[key] - b[key]) < 1e-12, f"{a[key]!r} vs {b[key]!r}")
-    check("but the clone carries it", model._clone(
-        model.force, model.epsilon).L_sarcomere == model.L_sarcomere)
-
-    # And it has to reach the page, for cardiomyocytes only.
-    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "sarcomere panel"):
-        return
-    # Captions are their own element type in AppTest, not markdown.
-    def page_text(a):
-        return " ".join(
-            str(x.value) for kind in ("markdown", "caption")
-            for x in a.get(kind)
-        )
-
-    check("the sarcomere panel is shown for a cardiomyocyte",
-          any("sarcomere" in (e.label or "").lower()
-              for e in app.get("expander")),
-          str([e.label for e in app.get("expander")]))
-    labels = [m.label for m in app.get("metric")]
-    check("the relaxed length is on the page", "Relaxed" in labels, str(labels))
-    check("so is the length at the top of the range",
-          any(l.startswith("At ε =") for l in labels), str(labels))
-    check("it says which way the length goes",
-          "lengthens them" in page_text(app))
-
-    plain = start(cell_name="myo-01")
-    if no_exception(plain, "no sarcomere panel"):
-        check("and not for a myoblast",
-              not any("sarcomere" in (e.label or "").lower()
-                      for e in plain.get("expander")),
-              str([e.label for e in plain.get("expander")]))
-        check("nor in its text", "sarcomere" not in page_text(plain).lower())
-
-
-def case_extra_terms_never_crash_old_paths():
-    print("a fourth spring reaching three-spring code is dropped, loudly")
-    import lulevich_model as lm
-    eps, force, model, _ = four_element_curve()
-    four = ("tension", "membrane", "interior", "nucleus")
-
-    kept, dropped = lm.classic_terms(four)
-    check("the classic paths keep three", kept == lm.CLASSIC_TERMS, str(kept))
-    check("and report what they could not take", dropped == ("tension",),
-          str(dropped))
-    check("an all-classic list is untouched",
-          lm.classic_terms(("membrane", "interior"))[0] == ("membrane", "interior"))
-    check("an empty list falls back to all three",
-          lm.classic_terms(())[0] == lm.CLASSIC_TERMS)
-
-    # This is the exact path that raised a KeyError on Streamlit Cloud for
-    # every cardiomyocyte: the "Find the segments" button.
-    explored = model.explore_segments(0.0, 0.65, terms=four, n_grid=8)
-    check("exploring the curve survives the extra term",
-          explored.get("success"), str(explored.get("error")))
-
-    for name, call in (
-        ("fit", lambda: model.fit(0.0, 0.65, terms=four)),
-        ("fit_segmented",
-         lambda: model.fit_segmented(0.0, 0.65, 0.15, 0.40, terms=four)),
-        ("fit_series", lambda: model.fit_series(0.01, 0.65, terms=four)),
-        ("fit_staged", lambda: model.fit_staged([
-            {"terms": ("tension", "membrane"), "range": (0.20, 0.65)},
-            {"terms": ("interior", "nucleus"), "range": (0.00, 0.20)},
-        ])),
-    ):
-        try:
-            out = call()
-        except Exception as exc:
-            check(f"{name} survives the extra term", False,
-                  f"{type(exc).__name__}: {exc}")
+    rows = []
+    fits = {}
+    for key, meta in candidates.items():
+        coupling = "parallel" if key == "parallel" else ("series" if key == "series" else "hybrid")
+        result = fit_for(coupling, meta["order"])
+        if not result.get("success"):
             continue
-        check(f"{name} survives the extra term", out.get("success"))
-        check(f"{name} reports only the terms it really used",
-              "tension" not in (out.get("terms") or []), str(out.get("terms")))
-        check(f"{name} says the spring was left out",
-              any("T₀" in w for w in (out.get("warnings") or [])),
-              str(out.get("warnings"))[:120])
+        fits[key] = result
 
-    # Scans go through those same fits and must not raise either.
-    for name, call in (
-        ("scan_segment_breaks",
-         lambda: model.scan_segment_breaks(0.0, 0.65, terms=four, n_grid=6)),
-        ("scan_nucleus_onset",
-         lambda: model.scan_nucleus_onset(0.0, 0.65, terms=four, n_trials=5)),
-        ("scan_crossover",
-         lambda: model.scan_crossover(0.02, 0.65, terms=four, n_trials=4)),
-    ):
-        try:
-            check(f"{name} survives the extra term", call().get("success"))
-        except Exception as exc:
-            check(f"{name} survives the extra term", False,
-                  f"{type(exc).__name__}: {exc}")
+        k = int(result.get("n_params") or len(terms))
+        ss_res = float(result.get("ss_res") or (result["rmse"] ** 2 * result["n_points"]))
 
-    # And the composition fit, which does implement it, still does.
-    real = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
-                                 use_tension=True)
-    check("the segmented fit still carries the spring",
-          "tension" in real["terms"] and real["T0_mN_m"] > 0,
-          str(real["terms"]))
+        # Cross-validation: refit on the training folds, score the held-out one.
+        cv_errors = []
+        for fold in folds:
+            if fold.size == 0 or fold.size >= n - 2:
+                continue
+            keep = np.ones(n, dtype=bool)
+            keep[fold] = False
+            sub = LulevichModel(
+                force_all[keep], eps_all[keep], model.cell_height,
+                cell_radius=model.R0, membrane_thickness=model.h_membrane,
+                poisson_membrane=model.nu_m, poisson_interior=model.nu_i,
+                nucleus_radius=model.R_nucleus, poisson_nucleus=model.nu_n,
+                nucleus_onset=model.nucleus_onset,
+            )
+            trained = (
+                sub.fit(epsilon_min, epsilon_max, terms=terms)
+                if coupling == "parallel"
+                else sub.fit_series(epsilon_min, epsilon_max, terms=terms)
+                if coupling == "series"
+                else sub.fit_hybrid(
+                    epsilon_min, epsilon_max, result.get("crossover"),
+                    terms=terms, order=meta["order"],
+                )
+            )
+            if not trained.get("success"):
+                continue
+            params = (trained.get("Em", 0.0), trained.get("Ei", 0.0), trained.get("En", 0.0))
+            params = tuple(0.0 if not np.isfinite(v) else v for v in params)
+            predicted = model.predict(
+                eps_all[fold], params, coupling,
+                trained.get("crossover", result.get("crossover")), meta["order"] or "parallel-then-series",
+            )
+            cv_errors.append(float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2))))
 
-
-def case_four_element_search():
-    print("the search places the boundaries inside the four-spring model")
-    eps, force, model, _ = four_element_curve(seed=11)
-    found = model.search_compositions(0.0, 0.65, tension_mode="always", n_grid=10)
-    check("the search succeeded", found.get("success"))
-    if not found.get("success"):
-        return
-    best = found["best"]
-    check("every candidate keeps the tension spring",
-          all(row["use_tension"] for row in found["candidates"]))
-    check("the membrane is not made to hand over",
-          best["membrane"] == "continue", best["membrane"])
-    check("the deeper layer is found near where it was put",
-          abs(best["break_2"] - 0.40) < 0.05, f"{best['break_2']:.3f}")
-    check("Em survives the search", abs(best["Em_MPa"] - 1.4) / 1.4 < 0.15,
-          f"{best['Em_MPa']:.3f}")
-    check("En survives the search", abs(best["En_kPa"] - 9.0) / 9.0 < 0.15,
-          f"{best['En_kPa']:.3f}")
-
-    off = model.search_compositions(0.0, 0.65, n_grid=8)
-    check("with the spring off, no candidate carries it",
-          off.get("success")
-          and not any(row["use_tension"] for row in off["candidates"]))
-
-
-def case_breakpoint_spread_is_the_real_error_bar():
-    print("the boundaries are fitted too, and the numbers say how much that matters")
-    eps, force, model, _ = four_element_curve(seed=5, noise=0.004)
-
-    # Two boundary placements that fit this curve equally well give very
-    # different tensions. A standard error worked out at fixed boundaries
-    # cannot see that, which is the whole reason this exists.
-    a = model.fit_composition(0.0, 0.65, 0.024, 0.40, "continue", "break",
-                              use_tension=True)
-    b = model.fit_composition(0.0, 0.65, 0.0, 0.40, "continue", "zero",
-                              use_tension=True)
-    check("both placements fit about as well",
-          abs(a["ss_res"] - b["ss_res"]) / a["ss_res"] < 0.05,
-          f"{a['ss_res']:.3e} vs {b['ss_res']:.3e}")
-    check("but they disagree about the tension",
-          abs(a["T0_mN_m"] - b["T0_mN_m"]) / max(b["T0_mN_m"], 1e-12) > 0.5,
-          f"{a['T0_mN_m']:.3f} vs {b['T0_mN_m']:.3f}")
-    check("while the fixed-boundary error bar looks small",
-          a["T0_mN_m_std"] / a["T0_mN_m"] < 0.2,
-          f"± {a['T0_mN_m_std']:.3f} on {a['T0_mN_m']:.3f}")
-
-    spread = model.breakpoint_spread(0.0, 0.65, 0.024, 0.40, "continue",
-                                     "break", use_tension=True)
-    check("the spread is measurable", spread.get("success"))
-    if not spread.get("success"):
-        return
-    check("more than one placement is accepted", spread["n_accepted"] > 1,
-          str(spread["n_accepted"]))
-    bands = spread["ranges"]
-    for key in ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa"):
-        band = bands[key]
-        check(f"{key} is bracketed", band["low"] <= band["value"] <= band["high"],
-              f"{band['low']:.4g} .. {band['value']:.4g} .. {band['high']:.4g}")
-    check("the tension is the loose one here",
-          bands["T0_mN_m"]["relative"] > bands["Em_MPa"]["relative"],
-          f"T0 {bands['T0_mN_m']['relative']:.2f} vs "
-          f"Em {bands['Em_MPa']['relative']:.2f}")
-    check("and it is not cheap to compute",
-          spread["break_1_range"][0] <= 0.024 <= spread["break_1_range"][1])
-
-    # It has to reach the page, or it is a diagnostic nobody sees.
-    source = pathlib.Path(__file__).with_name("app.py").read_text()
-    check("the app computes it once per fit",
-          'fit["breakpoint_spread"] = model.breakpoint_spread(' in source)
-    check("and shows it", "but anywhere in" in source)
-
-
-def case_error_bars_are_reported():
-    print("every modulus comes with a standard error")
-    eps, force = synthetic("freeze", "break")
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "break")
-    for key in ("Em_MPa_std", "Ei_kPa_std", "En_kPa_std"):
-        check(f"{key} is a number", np.isfinite(fit[key]), str(fit[key]))
-    check("a clean curve gets tight bars",
-          fit["Em_MPa_std"] / fit["Em_MPa"] < 0.1,
-          f"± {fit['Em_MPa_std']:.4g} on {fit['Em_MPa']:.4g}")
-    check("and no complaint about identifiability",
-          not fit["warnings"], str(fit["warnings"]))
-
-    # A term pinned at the zero bound is not free, and must not make the
-    # covariance singular or produce a bogus error bar for itself.
-    zeroed = model.fit_composition(0.0, 0.60, 0.15, 0.40, "continue", "zero")
-    check("a fit with a zeroed term still returns", zeroed.get("success"))
-    check("and the fast path skips the error bars entirely",
-          not np.isfinite(model.fit_composition(
-              0.0, 0.60, 0.15, 0.40, "freeze", "break", with_stats=False
-          )["Em_MPa_std"]))
-
-
-def case_clone_keeps_the_whole_geometry():
-    print("a cross-validation clone is the model it is standing in for")
-    eps, force, model, _ = four_element_curve()
-    twin = model._clone(model.force, model.epsilon)
-    for name in ("cell_height", "R0", "R_nucleus", "h_membrane", "h_shell",
-                 "Am", "Ai", "An", "At"):
-        mine, theirs = getattr(model, name), getattr(twin, name)
-        check(f"{name} survives the clone", abs(theirs - mine) <= abs(mine) * 1e-12,
-              f"{theirs!r} vs {mine!r}")
-    check("so does the myofibril radius choice",
-          twin.deep_uses_cell_radius is model.deep_uses_cell_radius)
-
-
-def case_four_elements_reach_the_page():
-    print("a cardiomyocyte shows four springs, a myoblast three")
-    import app as app_module
-    check("the myoblast has three",
-          len(app_module.terms_for("Myoblast (C2C12)")) == 3)
-    check("the cardiomyocyte has four",
-          len(app_module.terms_for("Cardiomyocyte")) == 4)
-
-    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "four elements"):
-        return
-    check("the tension spring is on by default",
-          app.session_state["use_tension"] is True)
-    fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
-    check("and it is in the fitted terms", "tension" in fitted, str(fitted))
-
-    labels = [c.label for c in app.checkbox]
-    check("both membrane springs have their own switch",
-          sum("Membrane" in (l or "") for l in labels) == 2, str(labels))
-
-    table = table_with(app, "Part of the cell")
-    check("the stiffness table lists four parts",
-          table is not None and len(table) == 4,
-          "none" if table is None else str(len(table)))
-    if table is not None:
-        check("the tension is quoted in mN/m",
-              any("mN/m" in v for v in table["Stiffness"]),
-              str(list(table["Stiffness"])))
-
-    # A myoblast must be untouched by any of this.
-    plain = start(cell_name="myo-01")
-    if no_exception(plain, "three elements"):
-        plain_table = table_with(plain, "Part of the cell")
-        check("a myoblast still lists three parts",
-              plain_table is not None and len(plain_table) == 3,
-              "none" if plain_table is None else str(len(plain_table)))
-        check("and fits without a tension term",
-              "tension" not in ((plain.session_state["_last_fit"] or {}).get(
-                  "terms") or []))
-
-
-def case_tables_are_not_clipped():
-    print("no table can lose a column off the right-hand edge")
-    source = pathlib.Path(__file__).with_name("app.py").read_text()
-    check("the fixed-layout style is defined", "table-layout: fixed" in source)
-    check("cells wrap rather than overflow", "overflow-wrap: anywhere" in source)
-
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "tables"):
-        return
-    tables = flat_tables(app)
-    check("the result tables are drawn as flat tables", len(tables) >= 2,
-          str(len(tables)))
-    for frame in tables:
-        check(f"every column of the {len(frame.columns)}-column table is named",
-              all(str(c).strip() for c in frame.columns), str(list(frame.columns)))
-        check("no row is short of cells",
-              all(len(row) == len(frame.columns)
-                  for row in frame.itertuples(index=False)),
-              str(frame.shape))
-
-
-def case_one_video_two_doors():
-    print("uploading in either place loads the same video")
-    source = pathlib.Path(__file__).with_name("app.py").read_text()
-    check("both uploaders go through one adopter",
-          source.count("adopt_video(") >= 3, str(source.count("adopt_video(")))
-    check("only the adopter and the link fetcher set the path",
-          source.count('st.session_state["video_path"] = ') == 2,
-          str(source.count('st.session_state["video_path"] = ')))
-    check("every frame is read through one place",
-          source.count("cached_detection(") == 2,
-          str(source.count("cached_detection(")))
-    check("the side panel no longer calls the detector directly",
-          "vframe, vdet, vnuc, vprobe, vscale = detection_at(" in source)
-
-    # The adopter must act only when its own box changes. Keyed on the loaded
-    # video's name instead, two boxes holding different files overwrite each
-    # other on alternate reruns, one winning per pass.
-    class Fake:
-        def __init__(self, name, data):
-            self.name, self._data, self.size = name, data, len(data)
-
-        def getvalue(self):
-            return self._data
-
-    seen, taken = {}, []
-
-    def adopt(uploaded, widget_key):
-        signature = None if uploaded is None else (uploaded.name, uploaded.size)
-        if signature == seen.get(widget_key):
-            return False
-        seen[widget_key] = signature
-        if uploaded is None:
-            return False
-        taken.append((widget_key, uploaded.name))
-        return True
-
-    a, b = Fake("a.mp4", b"aaa"), Fake("b.mp4", b"bbbb")
-    check("the first upload is taken", adopt(a, "main") is True)
-    check("the same box unchanged is ignored", adopt(a, "main") is False)
-    check("the other box with a new file is taken", adopt(b, "tab") is True)
-    check("and the first box does not grab it back", adopt(a, "main") is False)
-    check("only two adoptions happened", len(taken) == 2, str(taken))
-    check("starting a new cell forgets what each box handed over",
-          'st.session_state["_video_seen"] = {}' in source,
-          "otherwise re-uploading the same file is ignored")
-
-
-def case_legacy_record_refits():
-    print("a record saved under the old model names still resolves")
-    import app as app_module
-    for old, key in app_module.LEGACY_MODEL_NAMES.items():
-        check(f"{old!r} resolves", app_module.MODEL_KEYS_ANY.get(old) == key)
-    for new, key in app_module.MODEL_KEYS.items():
-        check(f"{new!r} resolves", app_module.MODEL_KEYS_ANY.get(new) == key)
-
-
-def case_range_starts_at_zero():
-    print("the segmented range always starts at zero")
-    app = start()
-    ends = [s for s in app.slider if "fit up to" in (s.label or "").lower()]
-    check("single end-of-range slider in the segmented view", len(ends) == 1)
-    pairs = [s for s in app.slider if (s.label or "").strip() == "Fitted range"]
-    check("no two-handle range slider in the segmented view", not pairs)
-    if ends:
-        ends[0].set_value(0.35).run()
-        no_exception(app, "moving the end of the range")
-        lo, hi = app.session_state["window_combined"]
-        check("range starts at zero", lo == 0.0, str(lo))
-        check("range ends where the slider was put", abs(hi - 0.35) < 0.01, str(hi))
-
-    # The other models keep the two-handle slider.
-    app2 = start()
-    widget_by_label(app2, "radio", "how the cell is modelled").set_value(
-        "Side by side (every element acts everywhere)"
-    ).run()
-    pairs = [s for s in app2.slider if (s.label or "").strip() == "Fitted range"]
-    check("two-handle slider still there for the other models", len(pairs) == 1)
-
-
-def case_fit_stops_at_the_end_of_the_range():
-    print("the model line stops where the range stops")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.35, 0.15, 0.30)
-    check("fit succeeded on a short range", fit.get("success"))
-    if not fit.get("success"):
-        return
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.30)
-    full = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-    lo, hi = fit["epsilon_range"]
-    clipped = np.array(full, dtype=float)
-    clipped[(eps < lo) | (eps > hi)] = np.nan
-
-    fig = plot_utils.force_curve_figure(
-        eps, force, plot_utils.PlotStyle(force_unit="N"), fit_force_N=clipped
-    )
-    line = next(t for t in fig.data if t.name == "Model")
-    drawn = np.asarray(line.y, dtype=float)
-    finite = np.isfinite(drawn)
-    check("nothing drawn past the end of the range",
-          not finite[eps > hi + 1e-9].any())
-    check("the whole range is drawn", finite[(eps >= lo) & (eps <= hi)].all())
-    check("the line reaches the end of the range",
-          abs(eps[finite].max() - hi) < 0.01, f"{eps[finite].max():.3f} vs {hi:.3f}")
-
-
-def case_plot_clutter_toggles():
-    print("each piece of clutter can be switched off")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
-    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-
-    def build(**flags):
-        style = plot_utils.PlotStyle(force_unit="N", **flags)
-        return plot_utils.force_curve_figure(
-            eps, force, style, fit_force_N=fitted,
-            fit_window=[{"range": (0.0, 0.6), "label": "fit"}],
-            highlight_window=(0.15, 0.40, "segment 2"),
-            highlight=(0.30, float(force[len(force) // 2])),
-            rupture_epsilon=0.55,
+        rows.append(
+            {
+                "coupling": key,
+                "label": meta["label"],
+                "r_squared": float(result["r_squared"]),
+                "rmse": float(result["rmse"]),
+                "n_params": k,
+                "aicc": _aicc(ss_res, n, k),
+                "cv_rmse": float(np.mean(cv_errors)) if cv_errors else float("nan"),
+                "Em_MPa": result.get("Em_MPa"),
+                "Ei_kPa": result.get("Ei_kPa"),
+                "En_kPa": result.get("En_kPa"),
+                "crossover": result.get("crossover"),
+            }
         )
 
-    on = build()
-    check("shading on by default", len(on.layout.shapes) >= 2)
-    check("video marker on by default",
-          any(t.name == "video frame" for t in on.data))
+    if not rows:
+        return {"success": False, "error": "No coupling produced a usable fit."}
 
-    off = build(show_fit_window=False)
-    check("shading gone", not [s for s in off.layout.shapes if s.type == "rect"])
+    finite = [r["aicc"] for r in rows if np.isfinite(r["aicc"])]
+    best_aicc = min(finite) if finite else float("nan")
+    for row in rows:
+        row["delta_aicc"] = row["aicc"] - best_aicc if np.isfinite(row["aicc"]) else float("nan")
+    # Akaike weights: the relative likelihood of each model given the data.
+    weights = np.array([np.exp(-0.5 * r["delta_aicc"]) if np.isfinite(r["delta_aicc"]) else 0.0
+                        for r in rows])
+    total = weights.sum()
+    for row, weight in zip(rows, weights):
+        row["weight"] = float(weight / total) if total > 0 else float("nan")
 
-    off = build(show_video_marker=False)
-    check("video frame marker gone",
-          not any(t.name == "video frame" for t in off.data))
+    rows.sort(key=lambda r: (np.inf if not np.isfinite(r["aicc"]) else r["aicc"]))
+    best = rows[0]
 
-    off = build(show_rupture_marker=False)
-    labels = [getattr(a, "text", "") for a in off.layout.annotations]
-    check("rupture marker gone", "rupture" not in labels, str(labels))
+    cv_rows = [r for r in rows if np.isfinite(r["cv_rmse"])]
+    cv_best = min(cv_rows, key=lambda r: r["cv_rmse"]) if cv_rows else None
 
-    with_moduli = plot_utils.cell_schematic(
-        plot_utils.PlotStyle(force_unit="N"), epsilon=0.3,
-        break_1=0.15, break_2=0.40, Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
-    )
-    without = plot_utils.cell_schematic(
-        plot_utils.PlotStyle(force_unit="N", show_schematic_moduli=False),
-        epsilon=0.3, break_1=0.15, break_2=0.40,
-        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
-    )
+    runner_up = rows[1] if len(rows) > 1 else None
+    if runner_up is not None and np.isfinite(runner_up["delta_aicc"]) and runner_up["delta_aicc"] < 2:
+        verdict = (
+            f"{best['label']} fits best, but {runner_up['label']} is within "
+            f"{runner_up['delta_aicc']:.1f} AICc of it. This curve does not "
+            f"distinguish them; pick on physical grounds, not on this number."
+        )
+    elif cv_best is not None and cv_best["coupling"] != best["coupling"]:
+        verdict = (
+            f"AICc prefers {best['label']} but cross-validation prefers "
+            f"{cv_best['label']}. They disagree, which usually means the extra "
+            f"structure is fitting noise; the cross-validated choice is the safer one."
+        )
+    else:
+        verdict = (
+            f"{best['label']} is preferred, ahead of the next by "
+            f"{runner_up['delta_aicc']:.1f} AICc."
+            if runner_up is not None and np.isfinite(runner_up["delta_aicc"])
+            else f"{best['label']} is preferred."
+        )
 
-    def caption(fig):
-        return " ".join(getattr(a, "text", "") or "" for a in fig.layout.annotations)
-
-    check("moduli printed by default", "E<sub>m</sub>" in caption(with_moduli))
-    check("moduli gone when switched off",
-          "E<sub>m</sub>" not in caption(without) and "E<sub>c</sub>" not in caption(without))
-    check("the diagram still says where it is",
-          "ε =" in caption(without), caption(without)[:80])
-
-
-if __name__ == "__main__":
-    for case in (
-        case_loads_clean,
-        case_legacy_record_refits,
-        case_companion_file_guard,
-        case_fit_quality,
-        case_fit_only_plot,
-        case_springs_share_a_pitch,
-        case_start_a_new_cell,
-        case_manual_cell_and_probe_scale,
-        case_four_element_model,
-        case_sarcomere_length,
-        case_extra_terms_never_crash_old_paths,
-        case_four_element_search,
-        case_breakpoint_spread_is_the_real_error_bar,
-        case_error_bars_are_reported,
-        case_clone_keeps_the_whole_geometry,
-        case_four_elements_reach_the_page,
-        case_tables_are_not_clipped,
-        case_one_video_two_doors,
-        case_zero_modulus_explains_itself,
-        case_guided_range_is_settable,
-        case_search_maths_is_shown,
-        case_cardiomyocyte_starts_loaded_together,
-        case_schematic_is_a_mechanics_diagram,
-        case_guided_order_is_parts_then_work_it_out,
-        case_it_picks_the_arrangement,
-        case_work_it_out_applies_the_arrangement,
-        case_search_stays_fast,
-        case_png_is_not_rendered_every_run,
-        case_fit_statistics,
-        case_chi_squared_reaches_the_page,
-        case_axis_ranges,
-        case_nucleus_spring_is_shorter,
-        case_component_names_follow_the_cell_type,
-        case_cardiomyocyte_model_is_flagged_provisional,
-        case_not_reached_is_explained,
-        case_plain_language_helpers,
-        case_guided_mode_is_the_default,
-        case_full_control_shows_everything,
-        case_curve_saved_as_a_tab,
-        case_plot_options_are_under_the_plot,
-        case_save_the_plot,
-        case_fit_maths_box,
-        case_sheet_row_matches_the_header,
-        case_sheet_reorder_keeps_the_data,
-        case_fit_line_and_heights_toggle,
-        case_range_table_shows_zero_moduli,
-        case_all_three_moduli_always_reported,
-        case_load_share_table,
-        case_download_when_box_is_absent,
-        case_clear_cell_wins_over_dark_debris,
-        case_fit_survives_a_rerun,
-        case_database_section_without_a_fit,
-        case_send_without_a_video,
-        case_fit_stops_at_the_end_of_the_range,
-        case_plot_clutter_toggles,
-        case_preset_round_trip,
-        case_model_names,
-        case_range_starts_at_zero,
-        case_composition_radios,
-        case_highlight,
-        case_search_beats_the_old_grid,
-        case_search_flags_what_it_cannot_see,
-        case_search_applies_in_one_press,
-        case_bare_plot,
-        case_buttons_do_not_break_widgets,
-    ):
-        case()
-    print()
-    if FAILURES:
-        print(f"{len(FAILURES)} failing: {FAILURES}")
-        sys.exit(1)
-    print("all passing")
+    return {
+        "success": True,
+        "candidates": rows,
+        "best": best,
+        "best_by_cv": cv_best,
+        "fits": fits,
+        "verdict": verdict,
+        "n_points": int(n),
+    }
