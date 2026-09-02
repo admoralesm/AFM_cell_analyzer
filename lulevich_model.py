@@ -372,6 +372,7 @@ class _CouplingMixin:
             "Ai": self.Ai,
             "An": self.An,
             "mask": mask,
+            "dropped_terms": tuple(dropped),
             "warnings": warnings_list,
         }
         self.results["series"] = out
@@ -532,6 +533,7 @@ class _CouplingMixin:
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An,
             "mask": mask,
+            "dropped_terms": tuple(dropped),
             "warnings": dropped_term_warning(dropped),
         }
         self.results["hybrid"] = out
@@ -769,6 +771,7 @@ class _SegmentedMixin:
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An,
             "mask": mask,
+            "dropped_terms": tuple(dropped),
             "warnings": warnings_list,
         }
         self.results["segmented"] = out
@@ -2814,6 +2817,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             "Am": self.Am,
             "Ai": self.Ai,
             "mask": mask,
+            "dropped_terms": tuple(dropped),
             "warnings": warnings_list,
         }
         self.results["combined"] = out
@@ -3691,6 +3695,7 @@ def search_arrangements(
                 "arrangement": "segmented",
                 "label": "Segmented: the parts take over from each other",
                 "detail": best["label"],
+                "dropped": (),
                 "cv_rmse": best["cv_rmse"],
                 "cv_spread": best.get("cv_spread", 0.0),
                 "n_params": best["n_params"],
@@ -3721,6 +3726,10 @@ def search_arrangements(
                 "arrangement": "parallel",
                 "label": "Side by side: every part resists the whole way",
                 "detail": "same squash on each, forces add",
+                # This arrangement has no tension spring. Comparing it against
+                # segmented without saying so compares a four-spring fit with
+                # a three-spring one and calls the difference arrangement.
+                "dropped": tuple(t for t in terms if t not in CLASSIC_TERMS),
                 "cv_rmse": mean, "cv_spread": spread,
                 "n_params": parallel.get("n_params", len(terms)),
                 "fit": parallel,
@@ -3750,6 +3759,7 @@ def search_arrangements(
                 "arrangement": "series",
                 "label": "Stacked: the parts sit in a line",
                 "detail": "same force through each, squashes add",
+                "dropped": tuple(t for t in terms if t not in CLASSIC_TERMS),
                 "cv_rmse": mean, "cv_spread": spread,
                 "n_params": series.get("n_params", len(terms)),
                 "fit": series,
@@ -3789,6 +3799,19 @@ def search_arrangements(
         verdict = (
             f"This curve is clearly **{best['label'].split(':')[0].lower()}**: "
             f"{best['detail']}."
+        )
+    # A winner that cannot carry every element asked for is not simply the
+    # winner. It won a comparison it entered with fewer springs than the
+    # others, and whoever reads the moduli has to know that.
+    if best.get("dropped"):
+        verdict += (
+            " Note that this arrangement has no place for "
+            + " or ".join(
+                {"tension": "the membrane's in-plane tension T₀"}.get(t, t)
+                for t in best["dropped"]
+            )
+            + ", so it was compared, and fitted, without it. Segmented is the "
+            "only arrangement that carries every element."
         )
 
     return {
