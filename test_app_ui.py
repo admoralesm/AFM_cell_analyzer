@@ -1,1564 +1,786 @@
 """
-Drive the app the way a person does: through the widgets.
+Plot construction for the AFM Cell Analyzer.
 
-Setting session_state directly is not a test of a Streamlit app. Streamlit
-rejects a write to a widget key after that widget exists, so a bug of that
-kind only shows up when a button is actually clicked. Every case here clicks.
+Every figure in the app is built here from one PlotStyle object, so the
+display settings live in a single place instead of being re-declared next to
+each chart. Force is always passed in NEWTONS and converted for display at
+the last moment.
 """
-import sys
+
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+
 import numpy as np
-import pandas as pd
+import plotly.graph_objects as go
 
-sys.path.insert(0, "/root/AFM_cell_analyzer")
-from streamlit.testing.v1 import AppTest  # noqa: E402
-from lulevich_model import LulevichModel  # noqa: E402
+# Display unit -> (factor applied to newtons, axis label)
+FORCE_UNITS = {
+    "N": (1.0, "N"),
+    "mN": (1e3, "mN"),
+    "μN": (1e6, "μN"),
+    "nN": (1e9, "nN"),
+    "pN": (1e12, "pN"),
+}
 
-# Label -> the argument the model takes, mirroring app.py.
-MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
-CYTO_MODE = {"at ε₁": "break", "from the very start": "zero"}
-
-
-def synthetic(membrane="freeze", cyto_start="break", En_kPa=3.0, n=260, noise=0.01):
-    """A curve built from a known composition, so the answer is known."""
-    eps = np.linspace(0.001, 0.60, n)
-    model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    m, c, nu = model.composition_terms(eps, 0.15, 0.40, membrane, cyto_start)
-    force = m * 0.6e6 + c * 1.2e3 + nu * En_kPa * 1e3
-    rng = np.random.default_rng(0)
-    force = force * (1.0 + noise * rng.standard_normal(n))
-    return eps, force
-
-
-def load(app, eps, force):
-    app.session_state["data"] = {
-        "epsilon": eps, "force_N": force, "source": "synthetic.csv", "n_dropped": 0,
-    }
+# Input unit -> factor to newtons
+INPUT_FORCE_UNITS = {
+    "N (newtons)": 1.0,
+    "mN (millinewtons)": 1e-3,
+    "μN (micronewtons)": 1e-6,
+    "nN (nanonewtons)": 1e-9,
+    "pN (piconewtons)": 1e-12,
+}
 
 
-def start(**state):
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
-    app.run()
-    eps, force = synthetic()
-    load(app, eps, force)
-    for key, value in state.items():
-        app.session_state[key] = value
-    app.run()
-    return app
+def to_newtons(values, input_unit):
+    return np.asarray(values, dtype=float) * INPUT_FORCE_UNITS.get(input_unit, 1e-9)
 
 
-def widget_by_label(app, kind, label):
-    for w in getattr(app, kind):
-        if label.lower() in (w.label or "").lower():
-            return w
-    return None
+def from_newtons(values_N, display_unit):
+    factor, label = FORCE_UNITS.get(display_unit, (1e9, "nN"))
+    return np.asarray(values_N, dtype=float) * factor, label
 
 
-def button_by_label(app, label):
-    for b in app.button:
-        if label.lower() in (b.label or "").lower():
-            return b
-    return None
+def autoscale_unit(values_N):
+    """Pick the display unit that puts the peak force in a readable 1-1000 range."""
+    peak = float(np.nanmax(np.abs(values_N))) if np.size(values_N) else 0.0
+    if peak <= 0:
+        return "nN"
+    for unit in ("N", "mN", "μN", "nN", "pN"):
+        factor, _ = FORCE_UNITS[unit]
+        if 1.0 <= peak * factor < 1000.0:
+            return unit
+    return "nN"
 
 
-FAILURES = []
+@dataclass
+class PlotStyle:
+    """Everything the user can change about how a figure looks."""
+
+    force_unit: str = "nN"
+    data_color: str = "#1f77b4"
+    fit_color: str = "#d62728"
+    marker_size: int = 7
+    line_width: int = 4
+    height: int = 560
+    show_grid: bool = False
+    axis_width: int = 4
+    axis_title_size: int = 28
+    tick_size: int = 22
+    title_size: int = 24
+    bold_axes: bool = True
+    log_scale: bool = False
+    show_fit_window: bool = True
+    show_components: bool = True
+    # Extras that clutter a figure meant for a paper. Off means the marker or
+    # caption is not drawn at all, not merely faded.
+    show_video_marker: bool = True
+    show_rupture_marker: bool = True
+    show_schematic_moduli: bool = True
+    show_legend: bool = True
+    show_fit_line: bool = True
+    show_component_heights: bool = False
+    # Axis limits. None means "let plotly decide from the data". x defaults to
+    # the full 0 to 1 of relative deformation so curves from different cells
+    # can be laid side by side without one looking twice as squashed.
+    x_range: tuple = None
+    y_range: tuple = None
+    template: str = "publication"
+
+    # Legacy alias: older call sites used a single `font_size`.
+    @property
+    def font_size(self):
+        return self.tick_size
+
+    def as_dict(self):
+        return asdict(self)
 
 
-def check(name, condition, detail=""):
-    if condition:
-        print(f"  ok   {name}")
+# Plotly's `weight` font attribute is recent; a black font family gives bold
+# tick labels on every version.
+BOLD_FAMILY = "Arial Black, Arial Bold, Helvetica, sans-serif"
+REGULAR_FAMILY = "Arial, Helvetica, sans-serif"
+
+
+def _bold(text, enabled=True):
+    """Plotly renders a small HTML subset in titles."""
+    return f"<b>{text}</b>" if enabled else text
+
+
+def _style_axes(fig, style: PlotStyle, x_title, y_title, log_x=False, log_y=False):
+    family = BOLD_FAMILY if style.bold_axes else REGULAR_FAMILY
+    common = dict(
+        showline=True,
+        linewidth=style.axis_width,
+        linecolor="black",
+        mirror=True,
+        showgrid=style.show_grid,
+        gridcolor="#e6e6e6",
+        gridwidth=1,
+        zeroline=False,
+        ticks="outside",
+        tickwidth=style.axis_width,
+        ticklen=max(8, style.axis_width * 3),
+        tickcolor="black",
+        title_font=dict(size=style.axis_title_size, color="black", family=family),
+        tickfont=dict(size=style.tick_size, color="black", family=family),
+        automargin=True,
+    )
+    fig.update_xaxes(
+        title_text=_bold(x_title, style.bold_axes),
+        type="log" if log_x else "linear",
+        **common,
+    )
+    fig.update_yaxes(
+        title_text=_bold(y_title, style.bold_axes),
+        type="log" if log_y else "linear",
+        **common,
+    )
+
+
+def _base_layout(fig, style: PlotStyle, title):
+    # Bigger fonts need proportionally bigger margins or the axis titles clip.
+    side = 60 + int(2.6 * style.axis_title_size)
+    bottom = 50 + int(2.4 * style.axis_title_size)
+    fig.update_layout(
+        title=dict(
+            text=_bold(title, style.bold_axes),
+            font=dict(size=style.title_size, color="black", family=REGULAR_FAMILY),
+            x=0.02,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        hovermode="closest",
+        height=style.height,
+        margin=dict(l=side, r=40, t=max(70, style.title_size * 3), b=bottom),
+        showlegend=style.show_legend,
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="black",
+            borderwidth=1,
+            x=0.02,
+            y=0.98,
+            font=dict(size=max(11, style.tick_size - 6), family=REGULAR_FAMILY),
+        ),
+    )
+
+
+def force_curve_figure(
+    epsilon,
+    force_N,
+    style: PlotStyle,
+    title="Force vs relative deformation",
+    fit_epsilon=None,
+    fit_force_N=None,
+    membrane_N=None,
+    interior_N=None,
+    nucleus_N=None,
+    fit_window=None,
+    rupture_epsilon=None,
+    highlight=None,
+    highlight_window=None,
+):
+    """
+    One figure for both preview and results.
+
+    Passing ``fit_force_N`` adds the fitted curve. The component curves are
+    labelled as contributions to that one total rather than as separate fits,
+    because that is what they are: a single fit whose terms are drawn apart to
+    show which structure is carrying the force where.
+    """
+    epsilon = np.asarray(epsilon, dtype=float)
+    y, unit_label = from_newtons(force_N, style.force_unit)
+
+    log_mode = style.log_scale
+    fig = go.Figure()
+
+    if log_mode:
+        # Log axes cannot show non-positive values; drop them rather than
+        # letting plotly silently blank the trace.
+        keep = (epsilon > 0) & (y > 0)
+        epsilon_plot, y_plot = epsilon[keep], y[keep]
     else:
-        print(f"  FAIL {name} {detail}")
-        FAILURES.append(name)
+        epsilon_plot, y_plot = epsilon, y
 
-
-def no_exception(app, name):
-    if app.exception:
-        print(f"  FAIL {name}: {app.exception[0].value}")
-        FAILURES.append(name)
-        return False
-    return True
-
-
-# ---------------------------------------------------------------- cases ---
-
-def case_loads_clean():
-    print("app loads with a curve, no exception")
-    app = start()
-    no_exception(app, "clean load")
-    check("no old hybrid wording anywhere",
-          not any("parallel below" in str(r.value) for r in app.radio))
-
-
-def case_model_names():
-    print("every model choice runs")
-    app = start()
-    radio = widget_by_label(app, "radio", "how the cell is modelled")
-    check("model radio present", radio is not None)
-    if radio is None:
-        return
-    check("no confusing name",
-          not any("below" in o and "above" in o for o in radio.options),
-          str(radio.options))
-    for option in radio.options:
-        if option.startswith("Compare"):
-            continue  # slow, covered separately
-        app2 = start()
-        widget_by_label(app2, "radio", "how the cell is modelled").set_value(option).run()
-        no_exception(app2, f"model {option!r}")
-
-
-def case_composition_radios():
-    print("composition radios drive the fit")
-    seen = set()
-    for membrane in ("holds what it reached", "keeps stiffening"):
-        for cyto in ("at ε₁", "from the very start"):
-            app = start()
-            widget_by_label(app, "radio", "the membrane").set_value(membrane).run()
-            widget_by_label(app, "radio", "cytoskeleton starts").set_value(cyto).run()
-            if not no_exception(app, f"composition {membrane}/{cyto}"):
-                continue
-            state = app.session_state
-            seen.add((state["membrane_after_break"], state["cyto_starts_at"]))
-    check("all four combinations reachable", len(seen) == 4, str(seen))
-
-
-def case_highlight():
-    print("highlight selector")
-    app = start()
-    radio = widget_by_label(app, "radio", "highlight on the plot")
-    check("highlight radio present", radio is not None)
-    if radio is None:
-        return
-    for option in radio.options:
-        app2 = start()
-        widget_by_label(app2, "radio", "highlight on the plot").set_value(option).run()
-        no_exception(app2, f"highlight {option!r}")
-
-
-def case_search_applies_in_one_press():
-    print("one press searches and applies the winner")
-    app = start()
-    button = button_by_label(app, "Find the best combination and fit it")
-    check("search button present", button is not None)
-    if button is None:
-        return
-    before = (
-        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
-        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
-    )
-    button.click().run()
-    if not no_exception(app, "combination search"):
-        return
-    search = app.session_state["composition_search"]
-    check("search succeeded", bool(search and search.get("success")),
-          str(search.get("error") if search else None))
-    if not (search and search.get("success")):
-        return
-    check("all four compositions ranked",
-          len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]}) == 4)
-
-    truth = ("freeze", "break")
-    best = search["best"]
-    picked = (best["membrane"], best["cyto_start"])
-    check("the true composition is the one picked", picked == truth,
-          f"picked {picked}")
-    check("ε₁ recovered", abs(best["break_1"] - 0.15) < 0.02,
-          f"{best['break_1']:.3f}")
-    check("ε₂ recovered", abs(best["break_2"] - 0.40) < 0.02,
-          f"{best['break_2']:.3f}")
-
-    # The winner should already be in the widgets: no second click needed.
-    after = (
-        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
-        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
-    )
-    check("the winner was applied without a second click", after != before,
-          f"{before} -> {after}")
-    check("applied ε₁ matches the winner",
-          abs(after[0] - best["break_1"]) < 0.002, f"{after[0]} vs {best['break_1']}")
-    check("applied composition matches the winner",
-          MEMBRANE_MODE[after[2]] == best["membrane"]
-          and CYTO_MODE[after[3]] == best["cyto_start"])
-
-    override = button_by_label(app, "Use this one instead")
-    check("override button present", override is not None)
-    if override is not None:
-        override.click().run()
-        no_exception(app, "override the pick")
-    print(f"       picked {best['label']!r}, ε₁={after[0]}, ε₂={after[1]}")
-
-
-def case_search_beats_the_old_grid():
-    print("the refined search finds the breakpoints the coarse grid missed")
-    for membrane, cyto in (
-        ("freeze", "break"), ("freeze", "zero"), ("continue", "break"),
-    ):
-        eps, force = synthetic(membrane, cyto)
-        model = LulevichModel(force, eps, cell_height=8.0e-6)
-
-        coarse = model._best_breakpoints(
-            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=0
+    fig.add_trace(
+        go.Scatter(
+            x=epsilon_plot,
+            y=y_plot,
+            mode="markers",
+            name="Experimental data",
+            marker=dict(
+                size=style.marker_size,
+                color=style.data_color,
+                line=dict(width=0.5, color="rgba(0,0,0,0.4)"),
+            ),
+            hovertemplate="ε = %{x:.4f}<br>F = %{y:.4g} " + unit_label + "<extra></extra>",
         )
-        refined = model._best_breakpoints(
-            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=2
+    )
+
+    if fit_force_N is not None and style.show_fit_line:
+        fx = np.asarray(fit_epsilon if fit_epsilon is not None else epsilon, dtype=float)
+        fy, _ = from_newtons(fit_force_N, style.force_unit)
+        if log_mode:
+            keep = (fx > 0) & (fy > 0)
+            fx, fy = fx[keep], fy[keep]
+        fig.add_trace(
+            go.Scatter(
+                x=fx,
+                y=fy,
+                mode="lines",
+                name="Model",
+                line=dict(color=style.fit_color, width=style.line_width, dash="dash"),
+                hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
+            )
         )
-        check(f"refinement does not make {membrane}/{cyto} worse",
-              refined["ss_res"] <= coarse["ss_res"] * (1 + 1e-9),
-              f"{refined['ss_res']:.4g} vs {coarse['ss_res']:.4g}")
-        check(f"ε₁ within 0.02 of truth for {membrane}/{cyto}",
-              abs(refined["break_1"] - 0.15) < 0.02, f"{refined['break_1']:.4f}")
+        if style.show_component_heights and fy.size:
+            finite = np.isfinite(fy)
+            if finite.any():
+                end = int(np.max(np.flatnonzero(finite)))
+                fig.add_annotation(
+                    x=float(fx[end]), y=float(fy[end]),
+                    text=f"<b>{fy[end]:.3g} {unit_label}</b>",
+                    showarrow=False, xanchor="left", yanchor="middle", xshift=6,
+                    font=dict(
+                        size=max(10, style.tick_size - 6), color=style.fit_color,
+                        family=REGULAR_FAMILY,
+                    ),
+                )
 
+        if style.show_components:
+            for comp, label, dash, color in (
+                (membrane_N, "· membrane contribution", "dash", "#2ca02c"),
+                (interior_N, "· cytoskeleton contribution", "dot", "#9467bd"),
+                (nucleus_N, "· nucleus contribution", "dashdot", "#e377c2"),
+            ):
+                if comp is None or not np.any(np.asarray(comp)):
+                    continue
+                cy, _ = from_newtons(comp, style.force_unit)
+                cx = np.asarray(fit_epsilon if fit_epsilon is not None else epsilon, dtype=float)
+                if log_mode:
+                    keep = (cx > 0) & (cy > 0)
+                    cx, cy = cx[keep], cy[keep]
+                fig.add_trace(
+                    go.Scatter(
+                        x=cx,
+                        y=cy,
+                        mode="lines",
+                        name=label,
+                        line=dict(color=color, width=max(1, style.line_width - 1), dash=dash),
+                        hovertemplate="ε = %{x:.4f}<br>%{y:.4g} " + unit_label + "<extra></extra>",
+                    )
+                )
+                if style.show_component_heights and cy.size:
+                    # How high this component reaches, written where it ends.
+                    # Reading a contribution off a dashed line by eye is
+                    # guesswork; this states it.
+                    finite = np.isfinite(cy)
+                    if finite.any():
+                        end = int(np.max(np.flatnonzero(finite)))
+                        fig.add_annotation(
+                            x=float(cx[end]), y=float(cy[end]),
+                            text=f"<b>{cy[end]:.3g} {unit_label}</b>",
+                            showarrow=False,
+                            xanchor="left", yanchor="middle", xshift=6,
+                            font=dict(
+                                size=max(10, style.tick_size - 6), color=color,
+                                family=REGULAR_FAMILY,
+                            ),
+                        )
 
-def case_search_flags_what_it_cannot_see():
-    print("the search says when a term or a boundary does nothing")
-    eps, force = synthetic("continue", "zero")
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    found = model.search_compositions(0.0, 0.60)
-    check("search succeeded", found.get("success"))
-    if not found.get("success"):
-        return
-    row = next(
-        r for r in found["candidates"]
-        if r["membrane"] == "continue" and r["cyto_start"] == "zero" and r["use_nucleus"]
+    if fit_window is not None and style.show_fit_window and not log_mode:
+        # Accept a single (lo, hi) or a list of windows, each optionally
+        # carrying its own label and colour, so the sequential fit can show
+        # the cytoskeleton and membrane windows separately.
+        windows = fit_window
+        if len(windows) == 2 and np.isscalar(windows[0]):
+            windows = [{"range": tuple(fit_window), "label": "fit window"}]
+        for i, win in enumerate(windows):
+            if not isinstance(win, dict):
+                win = {"range": tuple(win)}
+            lo, hi = win["range"]
+            fig.add_vrect(
+                x0=lo,
+                x1=hi,
+                fillcolor=win.get("color", ("#2ca02c", "#9467bd")[i % 2]),
+                opacity=win.get("opacity", 0.12),
+                layer="below",
+                line_width=0,
+                annotation_text=win.get("label", "fit window"),
+                annotation_position="bottom left",
+                annotation_font_size=max(10, style.tick_size - 6),
+            )
+
+    if highlight_window is not None and style.show_fit_window and not log_mode:
+        # The segment currently being edited in the range table. It is drawn
+        # over the fit windows rather than under them so that the stretch the
+        # user is typing numbers for is unmistakable on the curve.
+        try:
+            hw_lo, hw_hi = float(highlight_window[0]), float(highlight_window[1])
+            hw_label = (
+                highlight_window[2] if len(highlight_window) > 2 else "selected range"
+            )
+        except (TypeError, ValueError, IndexError):
+            hw_lo = hw_hi = None
+        if hw_lo is not None and hw_hi > hw_lo:
+            fig.add_vrect(
+                x0=hw_lo,
+                x1=hw_hi,
+                fillcolor="#ffd166",
+                opacity=0.34,
+                layer="below",
+                line=dict(color="#e8a600", width=3),
+                annotation_text=str(hw_label),
+                annotation_position="top left",
+                annotation_font_size=max(11, style.tick_size - 4),
+                annotation_font_color="#8a6100",
+            )
+
+    if highlight is not None and style.show_video_marker:
+        # The point on the curve that the displayed video frame corresponds to.
+        hx, hy_N = highlight
+        hy, _ = from_newtons(hy_N, style.force_unit)
+        fig.add_trace(
+            go.Scatter(
+                x=[hx],
+                y=[float(hy)],
+                mode="markers",
+                name="video frame",
+                marker=dict(
+                    size=style.marker_size + 12,
+                    color="rgba(255,165,0,0.9)",
+                    symbol="circle-open",
+                    line=dict(width=4, color="#ff7f0e"),
+                ),
+                hovertemplate="ε = %{x:.4f}<br>F = %{y:.4g}<extra>video frame</extra>",
+            )
+        )
+        if not log_mode:
+            fig.add_vline(x=hx, line=dict(color="#ff7f0e", width=2, dash="dot"))
+
+    if rupture_epsilon is not None and style.show_rupture_marker and not log_mode:
+        fig.add_vline(
+            x=rupture_epsilon,
+            line=dict(color="#ff7f0e", width=2, dash="dashdot"),
+            annotation_text="rupture",
+            annotation_position="top right",
+            annotation_font_size=style.font_size - 3,
+        )
+
+    _base_layout(fig, style, title)
+    _style_axes(
+        fig,
+        style,
+        "Relative deformation, ε",
+        f"Force ({unit_label})",
+        log_x=log_mode,
+        log_y=log_mode,
     )
-    check("ε₁ flagged as unused when nothing depends on it",
-          "ε₁" in row.get("idle_breaks", []), str(row.get("idle_breaks")))
-
-    # A curve with no nucleus should be answered without one.
-    eps, force = synthetic("freeze", "zero", En_kPa=0.0)
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    found = model.search_compositions(0.0, 0.60)
-    check("a curve with no nucleus is answered without one",
-          found["best"]["use_nucleus"] is False
-          or found["best"]["En_kPa"] <= 0,
-          f"En={found['best']['En_kPa']:.4g}, "
-          f"use_nucleus={found['best']['use_nucleus']}")
+    _apply_ranges(fig, style, log_mode)
+    return fig
 
 
-def case_bare_plot():
-    print("one switch strips the plot to data and fit")
-    app = start()
-    switch = None
-    for box in app.checkbox:
-        if "data and fit only" in (box.label or "").lower():
-            switch = box
-    check("bare-plot switch present", switch is not None)
-    if switch is None:
+def _apply_ranges(fig, style: PlotStyle, log_mode=False):
+    """
+    Pin the axes when limits were asked for.
+
+    Skipped on log axes, where a range is in decades and a linear pair of
+    numbers would silently mean something else entirely.
+    """
+    if log_mode:
         return
-    check("element curves off by default",
-          app.session_state["show_components"] is False)
-    switch.set_value(True).run()
-    if not no_exception(app, "bare plot"):
-        return
-
-    import app as app_module
-
-    everything_on = {name: True for name in app_module.PLOT_EXTRAS}
-    normal = app_module.plot_flags({**everything_on, "bare_plot": False})
-    check("individual boxes respected when not bare", all(normal.values()),
-          str(normal))
-
-    stripped = app_module.plot_flags({**everything_on, "bare_plot": True})
-    for flag, drawn in stripped.items():
-        check(f"{flag} forced off by the bare switch", drawn is False)
-
-    partial = app_module.plot_flags(
-        {**everything_on, "show_legend": False, "bare_plot": False}
-    )
-    check("one box off leaves the others on",
-          partial["show_legend"] is False and partial["show_components"] is True)
-
-    # And the app itself must still run with the switch on.
-    check("app runs with the bare switch on", not app.exception)
-
-
-def case_buttons_do_not_break_widgets():
-    print("every button in the segmented view clicks without a widget-key error")
-    app = start()
-    labels = [b.label for b in app.button]
-    for label in labels:
-        if any(word in label.lower() for word in ("box", "database", "send", "upload")):
+    for axis, limits in (("x", style.x_range), ("y", style.y_range)):
+        if not limits:
             continue
-        app2 = start()
-        target = button_by_label(app2, label)
-        if target is None:
+        try:
+            lo, hi = float(limits[0]), float(limits[1])
+        except (TypeError, ValueError, IndexError):
             continue
-        target.click().run()
-        no_exception(app2, f"button {label!r}")
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            continue
+        if axis == "x":
+            fig.update_xaxes(range=[lo, hi], autorange=False)
+        else:
+            fig.update_yaxes(range=[lo, hi], autorange=False)
 
 
-def case_preset_round_trip():
-    print("save a preset, then apply it back")
-    app = start()
-    widget_by_label(app, "radio", "the membrane").set_value("keeps stiffening").run()
-    name_box = None
-    for box in app.text_input:
-        if "preset" in (box.key or ""):
-            name_box = box
-    check("preset name box present", name_box is not None)
-    if name_box is None:
-        return
-    name_box.set_value("test preset").run()
-    save = button_by_label(app, "Save current")
-    check("save button present", save is not None)
-    if save is None:
-        return
-    save.click().run()
-    if not no_exception(app, "save preset"):
-        return
-    stored = app.session_state["range_presets"].get("test preset")
-    check("preset stored", stored is not None)
-    if stored is None:
-        return
-    check("preset carries the model name",
-          stored["coupling"].startswith("Segmented"), str(stored.get("coupling")))
-    check("preset carries the composition",
-          stored["membrane_after_break"] == "keeps stiffening",
-          str(stored.get("membrane_after_break")))
-    check("preset carries the boundaries",
-          "segment_break_1" in stored and "segment_break_2" in stored)
-
-    # Now switch away and apply the preset back.
-    widget_by_label(app, "radio", "the membrane").set_value(
-        "holds what it reached"
-    ).run()
-    apply = button_by_label(app, "Apply")
-    if apply is not None:
-        apply.click().run()
-        if no_exception(app, "apply preset"):
-            check("preset restored the composition",
-                  app.session_state["membrane_after_break"] == "keeps stiffening",
-                  str(app.session_state["membrane_after_break"]))
-
-
-def case_companion_file_guard():
-    print("mismatched companion files are named, not crashed on")
-    import app as app_module
-
-    check("no stale files in a matched tree", app_module.STALE_FILES == [],
-          str(app_module.STALE_FILES))
-
-    def old_signature(a, b, title=None):
-        return (a, b, title)
-
-    filtered = app_module.figure_kwargs(
-        old_signature, title="keep", highlight_window=(0.1, 0.2), fit_window=(0, 1)
+def residual_figure(epsilon, residual_N, style: PlotStyle, title="Fit residuals"):
+    y, unit_label = from_newtons(residual_N, style.force_unit)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=epsilon,
+            y=y,
+            mode="markers",
+            name="Residual",
+            marker=dict(size=style.marker_size, color=style.data_color),
+            hovertemplate="ε = %{x:.4f}<br>ΔF = %{y:.4g} " + unit_label + "<extra></extra>",
+        )
     )
-    check("unknown keywords dropped", filtered == {"title": "keep"}, str(filtered))
+    fig.add_hline(y=0, line=dict(color="black", width=1))
+    _base_layout(fig, style, title)
+    fig.update_layout(height=max(220, style.height // 2), showlegend=False)
+    _style_axes(fig, style, "Relative deformation, ε", f"Data − fit ({unit_label})")
+    return fig
 
-    def new_signature(a, title=None, highlight_window=None):
+
+def sensitivity_figure(trials, style: PlotStyle, title="Sensitivity to fit window"):
+    """Em and Ei as a function of the upper bound of the fit window."""
+    if not trials:
         return None
-
-    kept = app_module.figure_kwargs(
-        new_signature, title="keep", highlight_window=(0.1, 0.2)
+    x = [t["epsilon_max"] for t in trials]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=[t["Em_MPa"] for t in trials],
+            mode="lines+markers",
+            name="Em (MPa)",
+            line=dict(color="#2ca02c", width=style.line_width),
+            marker=dict(size=style.marker_size + 1),
+        )
     )
-    check("known keywords kept", set(kept) == {"title", "highlight_window"}, str(kept))
-
-    def takes_anything(a, **kwargs):
-        return None
-
-    passthrough = app_module.figure_kwargs(takes_anything, anything=1, else_=2)
-    check("**kwargs passes everything through", len(passthrough) == 2)
-
-
-def case_fit_survives_a_rerun():
-    print("the fit survives a rerun with live refitting off")
-    app = start()
-    # Fit once, then take live refitting away, as uploading a video does.
-    check("a fit exists to begin with",
-          app.session_state["_last_fit"] is not None)
-    app.session_state["live_fit"] = False
-    app.run()
-    if not no_exception(app, "rerun with live refitting off"):
-        return
-    check("the fit is still there after a rerun",
-          app.session_state["_last_fit"] is not None)
-
-    # The database section must still be on the page, which is what actually
-    # vanished before: it lived inside the fit-succeeded branch.
-    uploader_labels = [u.label for u in app.get("file_uploader")]
-    check("the video uploader is still on the page",
-          any("compression video" in (l or "").lower() for l in uploader_labels),
-          str(uploader_labels))
-    check("the send button is still on the page",
-          button_by_label(app, "Send to Box") is not None)
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=[t["Ei_kPa"] for t in trials],
+            mode="lines+markers",
+            name="Ei (kPa)",
+            yaxis="y2",
+            line=dict(color="#9467bd", width=style.line_width, dash="dot"),
+            marker=dict(size=style.marker_size + 1),
+        )
+    )
+    _base_layout(fig, style, title)
+    fig.update_layout(
+        height=max(260, style.height // 2),
+        yaxis2=dict(
+            title="Ei (kPa)",
+            overlaying="y",
+            side="right",
+            showline=True,
+            linewidth=style.axis_width,
+            linecolor="black",
+            title_font=dict(size=style.font_size + 1),
+            tickfont=dict(size=style.font_size - 1),
+        ),
+    )
+    _style_axes(fig, style, "Upper bound of fit window, ε_max", "Em (MPa)")
+    fig.update_yaxes(mirror=False)
+    return fig
 
 
-def case_database_section_without_a_fit():
-    print("the database section is reachable before any fit")
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
-    app.run()
-    eps, force = synthetic()
-    load(app, eps, force)
-    app.session_state["live_fit"] = False
-    app.run()
-    if not no_exception(app, "no fit yet"):
-        return
-    check("no fit has been made", app.session_state["_last_fit"] is None)
-    uploader_labels = [u.label for u in app.get("file_uploader")]
-    check("the video uploader is reachable with no fit",
-          any("compression video" in (l or "").lower() for l in uploader_labels),
-          str(uploader_labels))
-    send = button_by_label(app, "Send to Box")
-    check("the send button is shown with no fit", send is not None)
-    if send is not None:
-        check("and it is disabled until there is a fit", send.disabled is True)
+# ------------------------------------------------------------- schematic
 
 
-class FakeStore:
-    """Stands in for Box so the send path can be exercised for real."""
+def _spring_path(x_center, y_bottom, y_top, width, n_coils=6):
+    """Zigzag points for a drawn spring between two heights."""
+    n = max(2, int(n_coils)) * 2
+    ys = np.linspace(y_bottom, y_top, n + 3)
+    xs = [x_center]
+    for i in range(1, n + 2):
+        xs.append(x_center + (width / 2 if i % 2 else -width / 2))
+    xs.append(x_center)
+    return list(xs[: len(ys)]), list(ys)
 
-    last = {}
 
-    def save_cell(self, record, curve_csv=None, thumbnail_png=None,
-                  video_bytes=None, video_name=None):
-        FakeStore.last = {
-            "record": record, "curve": curve_csv, "thumb": thumbnail_png,
-            "video": video_bytes, "video_name": video_name,
+def _add_spring(fig, x_center, y_bottom, y_top, width, color, line_width, n_coils=6):
+    xs, ys = _spring_path(x_center, y_bottom, y_top, width, n_coils)
+    fig.add_trace(
+        go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color=color, width=line_width),
+            hoverinfo="skip", showlegend=False,
+        )
+    )
+
+
+def _hatched_ground(fig, x0, x1, y, depth, color="#2c3e50"):
+    """A fixed support drawn the way an engineering diagram draws one."""
+    fig.add_shape(type="line", x0=x0, x1=x1, y0=y, y1=y,
+                  line=dict(color=color, width=4))
+    step = (x1 - x0) / 26.0
+    x = x0
+    while x < x1:
+        fig.add_shape(
+            type="line", x0=x + step * 0.6, x1=x, y0=y, y1=y - depth,
+            line=dict(color=color, width=2),
+        )
+        x += step
+
+
+def _zigzag(x, y_bottom, y_top, width, coils=6):
+    """Points for a spring drawn between two heights."""
+    span = y_top - y_bottom
+    lead = span * 0.14
+    body_bottom, body_top = y_bottom + lead, y_top - lead
+    xs, ys = [x], [y_bottom]
+    steps = max(2, coils * 2)
+    for i in range(steps + 1):
+        ys.append(body_bottom + (body_top - body_bottom) * i / steps)
+        # The parentheses matter. Without them Python reads this as
+        # x + ((...) if 0 < i < steps else x), which appends 2x at the ends
+        # and draws the spring leaning across the page instead of hanging
+        # straight down. That was a real bug, visible as a slanted coil.
+        if 0 < i < steps:
+            xs.append(x + (width / 2 if i % 2 else -width / 2))
+        else:
+            xs.append(x)
+    xs.append(x)
+    ys.append(y_top)
+    return xs, ys
+
+
+def cell_schematic(
+    style: PlotStyle,
+    epsilon=0.0,
+    cell_height_um=8.0,
+    cell_radius_um=4.4,
+    nucleus_radius_um=1.5,
+    membrane_thickness_nm=4.0,
+    nucleus_onset=None,
+    Em_MPa=None,
+    Ei_kPa=None,
+    En_kPa=None,
+    show_nucleus=True,
+    height=None,
+    coupling="parallel",
+    shares=None,
+    break_1=None,
+    break_2=None,
+    membrane_mode="freeze",
+    cyto_start="break",
+    labels=None,
+):
+    """
+    The model drawn as a mechanics schematic rather than a picture of a cell.
+
+    A drawing of a squashed blob with springs in it looks like a cell but does
+    not say what the model computes. This says it: a fixed support, a rigid
+    platen carrying the applied force, and the elements between them in the
+    arrangement the fit actually used.
+
+    Two notations do the work that prose was doing before. An element the
+    plates have not reached yet is drawn with a **gap** above its spring,
+    which is how a contact that starts later is drawn anywhere in mechanics,
+    and the gap is labelled with the deformation at which it closes. An
+    element that has handed over and is holding what it reached is drawn with
+    a **locked block** in series with its spring, meaning it takes no further
+    extension.
+
+    ``labels`` maps term name to (title, description) so a cardiomyocyte's
+    parts are named as its own rather than as a generic cell's.
+    """
+    names = labels or {
+        "membrane": ("Membrane", ""),
+        "interior": ("Cytoskeleton", ""),
+        "nucleus": ("Nucleus", ""),
+    }
+    epsilon = float(np.clip(epsilon, 0.0, 0.95))
+
+    COLORS = {"membrane": "#1f77b4", "interior": "#e67e22", "nucleus": "#8e44ad"}
+    FADED = {"membrane": "#a9c4d8", "interior": "#f2cda6", "nucleus": "#c9b0d8"}
+
+    # What each element is doing at the deformation on display.
+    if break_1 is not None and break_2 is not None:
+        membrane_above = "loading" if membrane_mode == "continue" else "holding"
+        cyto_below = "loading" if cyto_start == "zero" else "waiting"
+        if epsilon <= break_1:
+            state = {"membrane": "loading", "interior": cyto_below,
+                     "nucleus": "waiting"}
+        elif epsilon <= break_2:
+            state = {"membrane": membrane_above, "interior": "loading",
+                     "nucleus": "waiting"}
+        else:
+            state = {"membrane": membrane_above, "interior": "loading",
+                     "nucleus": "loading"}
+        onset = {
+            "membrane": 0.0,
+            "interior": 0.0 if cyto_start == "zero" else break_1,
+            "nucleus": break_2,
         }
-        return {"cell_id": record["cell_id"], "video_url": ""}
+    else:
+        state = {k: "loading" for k in COLORS}
+        onset = {k: 0.0 for k in COLORS}
 
-    def load_index(self):
-        return pd.DataFrame(columns=["cell_id", "date", "Em_MPa", "Ec_kPa"])
+    terms = ["membrane", "interior"] + (["nucleus"] if show_nucleus else [])
+    moduli = {
+        "membrane": (Em_MPa, "MPa", "E<sub>m</sub>"),
+        "interior": (Ei_kPa, "kPa", "E<sub>c</sub>"),
+        "nucleus": (En_kPa, "kPa", "E<sub>n</sub>"),
+    }
+    LAW = {"membrane": "ε³", "interior": "ε³ᐟ²", "nucleus": "ε³ᐟ²"}
 
-    def check(self):
-        return {"ok": True, "detail": "fake store"}
+    fig = go.Figure()
+    GROUND_Y, PLATEN_Y = 20.0, 78.0
+    # Labels sit below the hatching, not through it.
+    LABEL_Y = GROUND_Y - 11.0
+    label_size = max(10, style.tick_size - 8)
+    small = max(9, style.tick_size - 10)
 
-    def auth_method(self):
-        return "fake"
+    _hatched_ground(fig, 4, 96, GROUND_Y, 8)
+    fig.add_shape(type="rect", x0=6, x1=94, y0=PLATEN_Y, y1=PLATEN_Y + 7,
+                  fillcolor="#566573", line=dict(width=0))
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 3.5, text="<b>cantilever</b>", showarrow=False,
+        font=dict(size=small, color="white"),
+    )
 
+    # Applied force, and how far the cell has been squashed.
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 8, ax=50, ay=PLATEN_Y + 22,
+        xref="x", yref="y", axref="x", ayref="y",
+        showarrow=True, arrowhead=2, arrowsize=1.1, arrowwidth=3,
+        arrowcolor="#2c3e50", text="",
+    )
+    fig.add_annotation(
+        x=53, y=PLATEN_Y + 17, text="<b>F</b>", showarrow=False,
+        font=dict(size=label_size + 2, color="#2c3e50"),
+    )
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 26,
+        text=f"squashed to <b>ε = {epsilon:.3f}</b>"
+             + (f"  ({epsilon * cell_height_um:.2f} µm of {cell_height_um:.1f})"
+                if cell_height_um else ""),
+        showarrow=False, font=dict(size=label_size, color="#2c3e50"),
+    )
 
-def case_send_without_a_video():
-    print("a cell can be sent with no video at all")
-    FakeStore.last = {}
-    app = start(box_store=FakeStore(), cell_name="cell-01")
-    check("no video is loaded", not app.session_state["video_path"])
+    def draw_element(term, x, y_bottom, y_top, width):
+        """One spring, with a gap or a lock when the model says so."""
+        colour = COLORS[term] if state[term] == "loading" else FADED[term]
+        # The spring itself is always drawn solid. A dotted zigzag reads as a
+        # skewed line rather than as "not engaged", and the gap symbol below
+        # already carries that meaning, which is what it is for.
+        top = y_top
+        note = ""
 
-    send = button_by_label(app, "Send to Box")
-    check("send button present", send is not None)
-    if send is None:
-        return
-    check("send button is enabled with a fit and no video", send.disabled is False)
+        if state[term] == "waiting":
+            # A contact that has not closed yet: a real gap, labelled with
+            # the deformation that closes it.
+            gap = (y_top - y_bottom) * 0.22
+            for y in (y_top, y_top - gap):
+                fig.add_shape(type="line", x0=x - width * 0.5, x1=x + width * 0.5,
+                              y0=y, y1=y, line=dict(color=colour, width=3))
+            note = f"gap closes at ε = {onset[term]:.2f}"
+            top = y_top - gap
+        elif state[term] == "holding":
+            # Held at what it reached: a locked block takes no more travel.
+            block = (y_top - y_bottom) * 0.13
+            fig.add_shape(
+                type="rect", x0=x - width * 0.45, x1=x + width * 0.45,
+                y0=y_top - block, y1=y_top,
+                fillcolor=colour, line=dict(color=colour, width=2),
+            )
+            note = "locked, no further force"
+            top = y_top - block
 
-    send.click().run()
-    if not no_exception(app, "send with no video"):
-        return
-    check("no error was shown", not app.error, str([e.value for e in app.error]))
-    check("a success message was shown",
-          any("cell-01" in (m.value or "") for m in app.success),
-          str([m.value for m in app.success]))
-
-    saved = FakeStore.last
-    check("the cell reached the store", bool(saved))
-    check("no video bytes were sent", saved.get("video") is None)
-    check("no morphology frame was sent", saved.get("thumb") is None)
-    check("the curve went anyway", bool(saved.get("curve")))
-    check("the moduli went anyway",
-          "Em_MPa" in (saved.get("record") or {})
-          and "Ec_kPa" in (saved.get("record") or {}))
-    check("the fitted column is in the curve csv",
-          "fit_N" in (saved.get("curve") or ""))
-
-
-def case_clear_cell_wins_over_dark_debris():
-    print("the detector picks the clear cell, not a dark blob of the same shape")
-    try:
-        import cv2
-        import video_analysis as va
-    except Exception as exc:
-        print(f"  skip (no OpenCV: {exc})")
-        return
-
-    def scene():
-        """A dark blob that is bigger and more central than the real cell."""
-        f = np.full((300, 420, 3), 150, np.uint8)
-        cv2.ellipse(f, (210, 175), (52, 48), 0, 0, 360, (95, 95, 95), -1)
-        cv2.ellipse(f, (90, 175), (40, 37), 0, 0, 360, (205, 205, 205), -1)
-        cv2.rectangle(f, (0, 40), (420, 70), (18, 18, 18), -1)   # cantilever
-        rng = np.random.default_rng(0)
-        return np.clip(f.astype(int) + rng.normal(0, 4, f.shape), 0, 255).astype(np.uint8)
-
-    frame = scene()
-
-    on_shape = va.detect_cell(frame, appearance="either", min_area_frac=0.005)
-    check("without a hint the dark blob wins, which is the reported bug",
-          on_shape.get("found") and on_shape["center"][0] > 150,
-          str(on_shape.get("center")))
-
-    clear = va.detect_cell(frame, appearance="clear", min_area_frac=0.005)
-    check("told the cell is clear, it picks the clear one",
-          clear.get("found") and clear["center"][0] < 150,
-          str(clear.get("center")))
-
-    dark = va.detect_cell(frame, appearance="dark", min_area_frac=0.005)
-    check("told the cell is dark, it picks the dark one",
-          dark.get("found") and dark["center"][0] > 150,
-          str(dark.get("center")))
-
-    # The stored crop must actually contain the cell, not background.
-    crop = va.crop(frame, clear)
-    check("the crop is centred on the clear cell",
-          crop is not None and float(crop.mean()) > float(frame.mean()),
-          f"crop mean {float(crop.mean()):.0f} vs frame {float(frame.mean()):.0f}")
-
-
-def case_all_three_moduli_always_reported():
-    print("all three moduli appear even when a term is not in the model")
-    app = start(use_nucleus=False, use_interior=False)
-    if not no_exception(app, "membrane only"):
-        return
-    labels = [m.label for m in app.get("metric")]
-    for wanted in ("membrane", "cytoskeleton", "nucleus"):
-        check(f"{wanted} has a tile with only the membrane selected",
-              any(wanted in (l or "").lower() for l in labels), str(labels))
-    values = {m.label: (m.value, m.delta) for m in app.get("metric")}
-    # Only the modulus tiles, which are the ones named "Ec …" and "Eₙ …".
-    off = [
-        (label, values[label][0], values[label][1])
-        for label in ("Ec cytoskeleton", "E\u2099 nucleus") if label in values
-    ]
-    check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
-    for label, value, delta in off:
-        check(f"{label} reads zero", value.strip().startswith("0"), value)
-        check(f"{label} says it was not in the model",
-              "not in this model" in (delta or ""), str(delta))
-
-
-def case_load_share_table():
-    print("the range-by-range table says who carries the load")
-    app = start()
-    if not no_exception(app, "load share table"):
-        return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the table has a heading", "share the load" in text, text[:120])
-
-
-def case_download_when_box_is_absent():
-    print("a cell can be saved with no Box account")
-    app = start(cell_name="cell-01")
-    box = button_by_label(app, "Send to Box")
-    check("the Box button is present", box is not None)
-    if box is not None:
-        check("and disabled without a connection", box.disabled is True)
-
-    downloads = [d for d in app.get("download_button")
-                 if "download this cell" in (d.label or "").lower()]
-    check("a download is offered instead", len(downloads) == 1)
-
-    import zipfile, io as _io, json as _json
-    import app as app_module
-    fit = app.session_state["_last_fit"]
-    eps, force = synthetic()
-    # Build the bundle through the app so session state is live.
-    check("there is a fit to package", fit is not None)
-
-
-class FakeWorksheet:
-    """A worksheet that records what would be written to the real sheet."""
-
-    def __init__(self, header):
-        self.header = list(header)
-        self.rows = []
-        self.updates = []
-        self.all_values = [list(header)]
-        self.written_rows = []
-        self.cleared = False
-
-    def row_values(self, index):
-        return list(self.header) if index == 1 else []
-
-    def get_all_values(self):
-        return [list(row) for row in self.all_values]
-
-    def clear(self):
-        self.cleared = True
-
-    def update(self, values=None, range_name=None, **kwargs):
-        self.header = list(values[0])
-        self.updates.append(list(values[0]))
-        if len(values) > 1:
-            self.written_rows = [list(r) for r in values[1:]]
-
-    def append_row(self, row, **kwargs):
-        self.rows.append(list(row))
-
-    def insert_row(self, row, index):
-        self.header = list(row)
-
-
-def case_sheet_row_matches_the_header():
-    print("the sheet row is built from the sheet's own header")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    # The user's real sheet as it stood before this change.
-    existing = [
-        "Cell ID", "Date Analyzed", "Cell Height (μm)",
-        "Cantilever Constant (pN/nm)", "Young's Modulus (Em, MPa)",
-        "Young's Modulus (Ei, kPa)", "Video Link", "Force Curve Created",
-        "Fit Quality (R²)", "Notes", "Analysis Status", "Timestamp",
-    ]
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet = FakeWorksheet(existing)
-    manager.worksheet = sheet
-
-    ok, message = manager.append_cell_data({
-        "cell_id": "cell-01", "Em": 0.605, "Ei": 1.196, "En": 3.027,
-        "Em_range": "0.000 to 0.151", "En_range": "0.403 to 0.600",
-        "break_1": 0.151, "break_2": 0.403, "fit_quality": 0.9997,
-        "cell_height": 8.0, "spring_constant": 0.08, "notes": "test",
-    })
-    check("the write succeeded", ok, message)
-
-    check("Date Analyzed was renamed, not duplicated",
-          "Experiment Date" in sheet.header
-          and "Date Analyzed" not in sheet.header, str(sheet.header))
-    check("Cantilever Constant became Spring Constant",
-          "Spring Constant, K (N/m)" in sheet.header
-          and "Cantilever Constant (pN/nm)" not in sheet.header, str(sheet.header))
-    check("renamed columns kept their position",
-          sheet.header[1] == "Experiment Date"
-          and sheet.header[3] == "Spring Constant, K (N/m)", str(sheet.header[:5]))
-    for wanted in ("Young's Modulus (En, kPa)", "Em range (ε)", "Ei range (ε)",
-                   "En range (ε)", "ε₁ membrane hands over", "RMSE (N)"):
-        check(f"{wanted} column present", wanted in sheet.header, str(sheet.header))
-
-    check("exactly one row was written", len(sheet.rows) == 1)
-    written = dict(zip(sheet.header, sheet.rows[0]))
-    check("cell id in the right column", written["Cell ID"] == "cell-01")
-    check("Em in the Em column",
-          abs(float(written["Young's Modulus (Em, MPa)"]) - 0.605) < 1e-6)
-    check("En in the nucleus column",
-          abs(float(written["Young's Modulus (En, kPa)"]) - 3.027) < 1e-6)
-    check("the Em range travelled with it",
-          written["Em range (ε)"] == "0.000 to 0.151", str(written["Em range (ε)"]))
-    check("spring constant in N/m, not converted",
-          abs(float(written["Spring Constant, K (N/m)"]) - 0.08) < 1e-9)
-    check("row length matches the header", len(sheet.rows[0]) == len(sheet.header))
-
-    # A reordered header must still be written correctly.
-    manager2 = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet2 = FakeWorksheet(list(reversed(existing)))
-    manager2.worksheet = sheet2
-    manager2.append_cell_data({"cell_id": "cell-02", "Em": 1.5})
-    written2 = dict(zip(sheet2.header, sheet2.rows[0]))
-    check("reordered header still gets the right cell id",
-          written2["Cell ID"] == "cell-02")
-    check("reordered header still gets Em in the Em column",
-          abs(float(written2["Young's Modulus (Em, MPa)"]) - 1.5) < 1e-6)
-
-
-def case_sheet_reorder_keeps_the_data():
-    print("reordering the columns does not lose a row")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    header = ["Cell ID", "Date Analyzed", "Video Link", "Notes", "Custom of mine"]
-    rows = [
-        ["cell-01", "2026-01-01", "http://v/1", "first", "keep me"],
-        ["cell-02", "2026-01-02", "http://v/2", "second", "keep me too"],
-    ]
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    sheet = FakeWorksheet(header)
-    sheet.all_values = [header] + rows
-    manager.worksheet = sheet
-
-    ok, message = manager.reorder_columns()
-    check("the reorder succeeded", ok, message)
-    new_header = sheet.header
-    check("video link is last", new_header[-1] == "Video Link"
-          or new_header[-2:] == ["Video Link", "Custom of mine"], str(new_header[-3:]))
-    check("a column the app does not know about was kept",
-          "Custom of mine" in new_header)
-    check("the header was renamed here too",
-          "Experiment Date" in new_header and "Date Analyzed" not in new_header)
-
-    written = [dict(zip(new_header, row)) for row in sheet.written_rows]
-    check("both rows survived", len(written) == 2, str(len(written)))
-    if len(written) == 2:
-        check("row values followed their column",
-              written[0]["Cell ID"] == "cell-01"
-              and written[0]["Notes"] == "first"
-              and written[0]["Video Link"] == "http://v/1",
-              str(written[0]))
-        check("the date moved to the renamed column",
-              written[1]["Experiment Date"] == "2026-01-02", str(written[1]))
-        check("the unknown column kept its value",
-              written[1]["Custom of mine"] == "keep me too")
-
-
-def case_fit_line_and_heights_toggle():
-    print("the fitted curve and the component heights each have a switch")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
-    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-
-    def build(**flags):
-        style = plot_utils.PlotStyle(force_unit="N", show_components=True, **flags)
-        return plot_utils.force_curve_figure(
-            eps, force, style, fit_force_N=fitted,
-            membrane_N=mb * fit["Em"], interior_N=cb * fit["Ei"],
-            nucleus_N=nb * fit["En"],
+        xs, ys = _zigzag(x, y_bottom, top, width,
+                         coils=max(3, int(6 * (top - y_bottom) / (y_top - y_bottom))))
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+                line=dict(color=colour, width=3),
+            )
         )
 
-    on = build()
-    check("the model line is drawn by default",
-          any(t.name == "Model" for t in on.data))
-    check("no height labels by default", len(on.layout.annotations) == 0)
-
-    off = build(show_fit_line=False)
-    check("switching the fit off removes the model line",
-          not any(t.name == "Model" for t in off.data))
-    check("the data is still there",
-          any(t.name == "Experimental data" for t in off.data))
-
-    labelled = build(show_component_heights=True)
-    texts = [a.text for a in labelled.layout.annotations]
-    check("a height label per component plus the total",
-          len(texts) == 4, str(texts))
-    check("the labels carry the force unit",
-          all("N" in (t or "") for t in texts), str(texts))
-
-
-def case_range_table_shows_zero_moduli():
-    print("each range lists the moduli active there, zero where not reached")
-    app = start()
-    if not no_exception(app, "range table"):
-        return
-    frames = app.get("dataframe")
-    target = None
-    for frame in frames:
-        columns = list(getattr(frame.value, "columns", []))
-        if "range" in columns and "membrane" in columns:
-            target = frame.value
-    check("the range table is on the page", target is not None)
-    if target is None:
-        return
-    for column in ("E membrane", "E cytoskeleton", "E nucleus"):
-        check(f"{column} column present", column in target.columns,
-              str(list(target.columns)))
-    first = target.iloc[0]
-    check("the first range carries only the membrane",
-          first["E cytoskeleton"].startswith("0")
-          and first["E nucleus"].startswith("0"),
-          f"{first['E cytoskeleton']!r} {first['E nucleus']!r}")
-    check("and the membrane is non-zero there",
-          not first["E membrane"].startswith("0 "), str(first["E membrane"]))
-    last = target.iloc[-1]
-    check("the last range carries the nucleus",
-          not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
-
-
-def case_plot_options_are_under_the_plot():
-    print("the plot switches are next to the plot, not buried in the sidebar")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "plot options"):
-        return
-    labels = [c.label for c in app.checkbox]
-    for wanted in ("Data and fit only", "The fitted curve", "Element curves",
-                   "Shaded segment bands", "Legend"):
-        check(f"“{wanted}” is on the page", wanted in labels, str(labels))
-
-    text = " ".join(
-        str(m.value) for m in list(app.get("markdown")) + list(app.get("caption"))
-    )
-    check("the sidebar points at the new place",
-          "Plot options" in text, "no pointer found")
-
-    # Ticking it must actually strip the plot.
-    switch = widget_by_label(app, "checkbox", "Data and fit only")
-    check("the switch is reachable", switch is not None)
-    if switch is not None:
-        switch.set_value(True).run()
-        no_exception(app, "bare plot from under the plot")
-        check("the switch stuck", app.session_state["bare_plot"] is True)
-
-
-def case_save_the_plot():
-    print("the plot can be saved with a sensible name")
-    import app as app_module
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-
-    app = start(cell_name="Cell 04 / trial 2")
-    downloads = [d for d in app.get("download_button")
-                 if "save" in (d.label or "").lower()]
-    check("a save button is offered", len(downloads) >= 1,
-          str([d.label for d in app.get("download_button")]))
-
-    import datetime as _dt
-    name = app_module.suggested_plot_name(
-        "Cell 04 / trial 2", fit, _dt.date(2026, 3, 4), ".png"
-    )
-    check("the name carries the cell", name.startswith("Cell_04___trial_2"), name)
-    check("the name carries the date", "2026-03-04" in name, name)
-    check("the name carries the moduli", "Em" in name and "Ec" in name, name)
-    check("the name has no path separators", "/" not in name and "\\" not in name, name)
-    check("the extension is kept", name.endswith(".png"), name)
-    blank = app_module.suggested_plot_name("", fit, _dt.date(2026, 3, 4), ".html")
-    check("an unnamed cell still gets a usable name",
-          blank.startswith("cell_") and blank.endswith(".html"), blank)
-
-
-def case_fit_maths_box():
-    print("the working behind the fit is shown")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "maths box"):
-        return
-    blocks = [str(b.value) for b in app.get("latex")]
-    check("equations are rendered", len(blocks) >= 3, str(len(blocks)))
-    joined = " ".join(blocks)
-    check("the model equation is there", "A_m E_m" in joined, joined[:120])
-    check("the least-squares statement is there",
-          "arg\\min" in joined or "argmin" in joined, joined[-160:])
-    code = " ".join(str(c.value) for c in app.get("code"))
-    check("the prefactors are printed with values", "Am =" in code, code[:160])
-    check("the fitted moduli are printed", "MPa" in code and "kPa" in code)
-
-
-def case_guided_mode_is_the_default():
-    print("guided mode: one button, an answer in words")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "guided load"):
-        return
-    check("guided is the default",
-          app.session_state["ui_mode"].startswith("Guided"),
-          app.session_state["ui_mode"])
-
-    work = button_by_label(app, "Work it out for me")
-    check("the one-press button is there", work is not None)
-
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    for phrase in ("What this cell did as it was squashed",
-                   "How stiff each part turned out to be",
-                   "Does the model match the measurement"):
-        check(f"“{phrase[:34]}…” is shown", phrase in text)
-    check("no bare jargon in the headline",
-          "coupling" not in text.lower(), "the word coupling leaked out")
-
-    # The plain-language table names the parts in everyday words.
-    frames = [f.value for f in app.get("dataframe")]
-    parts = [f for f in frames if "Part of the cell" in list(getattr(f, "columns", []))]
-    check("the stiffness table is there", len(parts) == 1, str(len(parts)))
-    if parts:
-        table = parts[0]
-        check("it names all three parts", len(table) == 3, str(len(table)))
-        check("it explains what each part is",
-              all(isinstance(v, str) and v for v in table["What it is"]))
-        check("it gives an everyday comparison",
-              any("as" in str(v) for v in table["Roughly"]), str(list(table["Roughly"])))
-
-    if work is not None:
-        work.click().run()
-        if no_exception(app, "work it out"):
-            found = app.session_state["composition_search"]
-            check("the search ran", bool(found and found.get("success")))
-            if found and found.get("success"):
-                best = found["best"]
-                check("the winner was applied",
-                      abs(app.session_state["segment_break_1"]
-                          - round(best["break_1"], 3)) < 0.002,
-                      f"{app.session_state['segment_break_1']} vs {best['break_1']}")
-
-
-def case_full_control_shows_everything():
-    print("full control puts the settings back on the page")
-    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
-    if not no_exception(app, "full control"):
-        return
-    check("the one-press button is hidden in full control",
-          button_by_label(app, "Work it out for me") is None)
-    check("the section headings are back",
-          any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
-    check("the expert search button is still there",
-          button_by_label(app, "Find the best combination and fit it") is not None)
-    check("the plain-language summary is not duplicated",
-          not any("What this cell did as it was squashed" in str(m.value)
-                  for m in app.get("markdown")))
-
-
-def case_plain_language_helpers():
-    print("the everyday wording is honest about scale")
-    import app as app_module
-
-    check("a jelly-soft modulus reads soft",
-          "jelly" in app_module.stiffness_in_words(1.2e3),
-          app_module.stiffness_in_words(1.2e3))
-    check("a rubbery modulus reads firm",
-          "rubber" in app_module.stiffness_in_words(6e5),
-          app_module.stiffness_in_words(6e5))
-    check("zero is called unmeasurable",
-          "not measurable" in app_module.stiffness_in_words(0.0))
-    check("a NaN is called unmeasurable",
-          "not measurable" in app_module.stiffness_in_words(float("nan")))
-    check("the comparisons increase with stiffness",
-          len({app_module.stiffness_in_words(v)
-               for v in (5e2, 5e3, 5e4, 5e5)}) == 4)
-
-    check("a good fit is described as close",
-          "exactly" in app_module.quality_in_words(0.999))
-    check("a bad fit is called out",
-          "wrong" in app_module.quality_in_words(0.5),
-          app_module.quality_in_words(0.5))
-
-
-def case_curve_saved_as_a_tab():
-    print("the force curve can be stored in the spreadsheet")
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception as exc:
-        print(f"  skip (gspread missing: {exc})")
-        return
-
-    class FakeSpreadsheet:
-        url = "https://docs.google.com/spreadsheets/d/abc/edit"
-
-        def __init__(self):
-            self.tabs = {}
-
-        def worksheet(self, title):
-            import gspread
-            if title not in self.tabs:
-                raise gspread.WorksheetNotFound(title)
-            return self.tabs[title]
-
-        def add_worksheet(self, title, rows, cols):
-            sheet = FakeWorksheet([])
-            sheet.id = 7
-            self.tabs[title] = sheet
-            return sheet
-
-        def worksheets(self):
-            return list(self.tabs.values())
-
-    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
-    book = FakeSpreadsheet()
-    manager.spreadsheet = book
-
-    eps, force = synthetic()
-    fitted = force * 0.99
-    fitted[:5] = np.nan          # outside the fitted range
-
-    ok, message, url = manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
-    check("the curve was saved", ok, message)
-    check("the tab is named after the cell",
-          "curve_Cell 04 _ trial 2" in book.tabs, str(list(book.tabs)))
-    check("the url points at the tab", "#gid=" in url, url)
-
-    sheet = list(book.tabs.values())[0]
-    written = sheet.written_rows if sheet.written_rows else []
-    header = sheet.header
-    check("the header names the columns",
-          header == ["relative_deformation", "force_N", "fit_N"], str(header))
-    check("every point was written", len(written) == len(eps), str(len(written)))
-    check("NaN outside the fit is written as blank",
-          written[0][2] == "", repr(written[0][2]))
-    check("a fitted point carries its value",
-          isinstance(written[-1][2], float), repr(written[-1][2]))
-
-    # Saving the same cell twice replaces the tab rather than adding another.
-    manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
-    check("refitting replaces the tab, not duplicates it", len(book.tabs) == 1,
-          str(list(book.tabs)))
-    check("the tab was cleared before rewriting", sheet.cleared is True)
-
-
-def case_axis_ranges():
-    print("the axes can be pinned, and deformation defaults to 0-1")
-    import plot_utils
-    import app as app_module
-
-    check("0 to 1 is the default deformation axis",
-          app_module.DEFAULTS["x_axis_mode"].startswith("0 to 1"),
-          app_module.DEFAULTS["x_axis_mode"])
-
-    eps, force = synthetic()
-    style = plot_utils.PlotStyle(force_unit="N", x_range=(0.0, 1.0))
-    fig = plot_utils.force_curve_figure(eps, force, style)
-    check("the deformation axis is pinned to 0-1",
-          list(fig.layout.xaxis.range) == [0.0, 1.0], str(fig.layout.xaxis.range))
-    check("autorange is off so it stays pinned",
-          fig.layout.xaxis.autorange is False, str(fig.layout.xaxis.autorange))
-
-    style = plot_utils.PlotStyle(force_unit="N", y_range=(0.0, 5.0))
-    fig = plot_utils.force_curve_figure(eps, force, style)
-    check("the force axis can be pinned too",
-          list(fig.layout.yaxis.range) == [0.0, 5.0], str(fig.layout.yaxis.range))
-
-    loose = plot_utils.force_curve_figure(eps, force, plot_utils.PlotStyle(force_unit="N"))
-    check("no range means plotly decides", loose.layout.xaxis.range is None)
-
-    # A reversed or nonsense range must be ignored, not applied.
-    bad = plot_utils.force_curve_figure(
-        eps, force, plot_utils.PlotStyle(force_unit="N", x_range=(1.0, 0.0))
-    )
-    check("a reversed range is ignored", bad.layout.xaxis.range is None,
-          str(bad.layout.xaxis.range))
-
-    # Log axes take decades, so a linear pair must not be applied there.
-    logged = plot_utils.force_curve_figure(
-        eps, force,
-        plot_utils.PlotStyle(force_unit="N", log_scale=True, x_range=(0.0, 1.0)),
-    )
-    check("ranges are not applied on log axes",
-          logged.layout.xaxis.range is None, str(logged.layout.xaxis.range))
-
-
-def case_nucleus_spring_is_shorter():
-    print("a component met late gets a shorter spring")
-    import plot_utils
-
-    style = plot_utils.PlotStyle(force_unit="N")
-
-    def springs(cyto_start):
-        fig = plot_utils.cell_schematic(
-            style, epsilon=0.5, break_1=0.15, break_2=0.40,
-            membrane_mode="freeze", cyto_start=cyto_start,
-            Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
-        )
-        # Springs are line traces; measure how far each spans vertically.
-        spans = []
-        for trace in fig.data:
-            ys = [v for v in (trace.y or []) if v is not None]
-            if len(ys) > 4:
-                spans.append(max(ys) - min(ys))
-        return sorted(spans)
-
-    late = springs("break")
-    early = springs("zero")
-    check("some springs were drawn", len(late) >= 2, str(late))
-    if len(late) >= 2 and len(early) >= 2:
-        check("the late component's spring is shorter than the earliest one",
-              min(late) < max(late) * 0.95, str(late))
-        check("starting at zero makes the interior spring full length",
-              max(early) >= max(late) * 0.99, f"{early} vs {late}")
-
-
-def case_component_names_follow_the_cell_type():
-    print("a cardiomyocyte is not described as a myoblast")
-    import app as app_module
-
-    myoblast = app_module.components_for("Myoblast (C2C12)")
-    cardio = app_module.components_for("Cardiomyocyte")
-    check("the myoblast interior is the cytoskeleton",
-          myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
-    check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
-          "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
-    check("and a sarcomeric, contractile one",
-          "Sarcomeric" in cardio["nucleus"][0]
-          and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
-    check("the two are described as different things",
-          cardio["interior"][1] != cardio["nucleus"][1])
-    check("the cardiomyocyte shell is named for holding fluid",
-          "fluid" in cardio["membrane"][1], str(cardio["membrane"]))
-    check("an unknown cell type still gets names",
-          app_module.components_for("Something else")["interior"][0])
-
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "cardiomyocyte names"):
-        return
-    frames = [f.value for f in app.get("dataframe")]
-    parts = [f for f in frames if "Part of the cell" in list(getattr(f, "columns", []))]
-    check("the plain-language table is there", len(parts) == 1)
-    if parts:
-        listed = list(parts[0]["Part of the cell"])
-        check("it lists both kinds of cytoskeleton",
-              any("Non-sarcomeric" in v for v in listed)
-              and any(v == "Sarcomeric cytoskeleton" for v in listed), str(listed))
-        check("and never calls anything a nucleus",
-              not any("Nucleus" in v for v in listed), str(listed))
-    check("the fit succeeds for a cardiomyocyte",
-          app.session_state["_last_fit"] is not None
-          and app.session_state["_last_fit"].get("success"))
-    fit = app.session_state["_last_fit"]
-    if fit:
-        check("and it follows the data",
-              fit["r_squared"] > 0.9, f"R2={fit['r_squared']:.4f}")
-
-
-def case_cardiomyocyte_model_is_flagged_provisional():
-    print("the cardiomyocyte model says it is provisional")
-    app = start(cell_name="cell-01",
-                model_kind="Cardiomyocyte (Morales Maldonado)")
-    if not no_exception(app, "cardiomyocyte model"):
-        return
-    warnings = " ".join(str(w.value) for w in app.warning)
-    check("a provisional warning is shown", "provisional" in warnings.lower(),
-          warnings[:120])
-    check("it says the equations were not available",
-          "equations" in warnings.lower(), warnings[:200])
-    check("it asks for the paper's equation",
-          "send me" in warnings.lower(), warnings[:200])
-
-
-def case_not_reached_is_explained():
-    print("“not reached yet” is spelled out")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "range wording"):
-        return
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("the wording is explained",
-          "have not met it yet" in captions or "not been squashed far enough"
-          in captions, captions[:200])
-    check("it says this is not missing data",
-          "not missing data" in captions, "explanation absent")
-
-
-def case_fit_statistics():
-    print("chi squared catches what R-squared misses")
-    from lulevich_model import LulevichModel as LM, noise_sigma, fit_statistics
-
-    eps = np.linspace(0.001, 0.60, 260)
-    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-    clean = m * 0.6e6 + c * 1.2e3 + nu * 3e3
-
-    force = clean + 5e-11 * np.random.default_rng(0).standard_normal(260)
-    model = LM(force, eps, cell_height=8.0e-6)
-    right = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    check("the right model gives chi2/dof near 1",
-          0.2 < right["chi_squared_reduced"] < 3.0,
-          f"{right['chi_squared_reduced']:.2f}")
-
-    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, use_nucleus=False)
-    check("dropping a real term is caught by chi2",
-          wrong["chi_squared_reduced"] > 10 * right["chi_squared_reduced"],
-          f"{wrong['chi_squared_reduced']:.1f} vs {right['chi_squared_reduced']:.2f}")
-    check("R-squared alone would not have caught it",
-          wrong["r_squared"] > 0.97, f"R2={wrong['r_squared']:.4f}")
-
-    check("adjusted R-squared is reported",
-          np.isfinite(right["adj_r_squared"]))
-    check("adjusted is never above plain",
-          right["adj_r_squared"] <= right["r_squared"] + 1e-12)
-    check("degrees of freedom account for the parameters",
-          right["dof"] == right["n_points"] - right["n_params"],
-          f"{right['dof']} vs {right['n_points']}-{right['n_params']}")
-
-    # Noise that grows with force must not be read as the quiet end.
-    sigma, typical = noise_sigma(eps, clean * (1 + 0.02 *
-                                np.random.default_rng(0).standard_normal(260)))
-    check("the noise estimate is per point", np.size(sigma) == 260, str(np.size(sigma)))
-    check("and it grows where the force grows",
-          np.median(sigma[-50:]) > np.median(sigma[:50]) * 3,
-          f"{np.median(sigma[:50]):.2e} -> {np.median(sigma[-50:]):.2e}")
-    check("a typical value is reported", np.isfinite(typical))
-
-    # A curve too short to estimate noise must not crash.
-    stats = fit_statistics(np.array([1.0, 2.0]), np.array([1.0, 2.0]), 2,
-                           epsilon=np.array([0.1, 0.2]))
-    check("two points do not raise", np.isnan(stats["chi_squared"]))
-
-
-def case_chi_squared_reaches_the_page():
-    print("the fit statistics are shown and stored")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "chi squared on the page"):
-        return
-    labels = [m.label for m in app.get("metric")]
-    check("a chi-squared tile is shown",
-          any("χ²" in (l or "") for l in labels), str(labels))
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("it explains what about 1 means",
-          "as close to the points as the scatter" in captions, "no explanation")
-    check("it warns that R² can look fine",
-          "R² can still look excellent" in captions, "no warning")
-
-    try:
-        from google_sheets_manager import GoogleSheetsManager
-    except Exception:
-        return
-    names = [name for _, name in GoogleSheetsManager.COLUMNS]
-    for wanted in ("Chi squared", "Chi squared / dof", "Adjusted R²",
-                   "Measured noise σ (N)"):
-        check(f"the sheet records {wanted}", wanted in names, str(names))
-
-
-def case_search_stays_fast():
-    print("the search does not crawl on a realistic curve")
-    import time
-    from lulevich_model import LulevichModel as LM
-
-    # A real .ibw curve has thousands of points, not a few hundred. The
-    # search fits hundreds of candidates, so anything expensive per fit is
-    # multiplied by that. This is the guard on that multiplication.
-    for n, budget in ((1000, 6.0), (3000, 12.0)):
-        eps = np.linspace(0.001, 0.60, n)
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-        force = (m * 0.6e6 + c * 1.2e3 + nu * 3e3) * (
-            1 + 0.01 * np.random.default_rng(0).standard_normal(n)
-        )
-        model = LM(force, eps, cell_height=8.0e-6)
-
-        start_time = time.time()
-        found = model.search_compositions(0.0, 0.60)
-        elapsed = time.time() - start_time
-        check(f"the search finishes on {n} points", found.get("success"))
-        check(f"and takes under {budget:.0f}s at {n} points ({elapsed:.1f}s)",
-              elapsed < budget, f"{elapsed:.1f}s")
-        if found.get("success"):
-            best = found["best"]
-            check(f"and is still right at {n} points",
-                  (best["membrane"], best["cyto_start"]) == ("freeze", "break"),
-                  f"{best['membrane']}/{best['cyto_start']}")
-
-    # The winner must still come back with its statistics, even though the
-    # candidates were fitted without them.
-    check("the winner carries chi squared",
-          np.isfinite(found["best"].get("chi_squared_reduced", np.nan))
-          or np.isfinite(
-              model.fit_composition(
-                  0.0, 0.60, found["best"]["break_1"], found["best"]["break_2"]
-              )["chi_squared_reduced"]
-          ))
-
-
-def case_png_is_not_rendered_every_run():
-    print("the plot is not re-rendered to PNG on every rerun")
-    import plot_utils
-    import app as app_module
-
-    calls = []
-    original = plot_utils.go.Figure.to_image
-
-    def counting(self, *args, **kwargs):
-        calls.append(1)
-        raise RuntimeError("no chrome here")
-
-    plot_utils.go.Figure.to_image = counting
-    try:
-        app = start(cell_name="cell-01")
-        app.run()
-        app.run()
-    finally:
-        plot_utils.go.Figure.to_image = original
-
-    check("no PNG render happened without being asked",
-          len(calls) == 0, f"{len(calls)} renders")
-    check("a Prepare a PNG button is offered",
-          button_by_label(app, "Prepare a PNG") is not None)
-    check("HTML is still available without asking",
-          any("save as html" in (d.label or "").lower()
-              for d in app.get("download_button")),
-          str([d.label for d in app.get("download_button")]))
-
-
-def case_guided_order_is_parts_then_work_it_out():
-    print("Step 1 picks the parts, Step 2 works it out")
-    app = start(cell_name="cell-01")
-    if not no_exception(app, "guided order"):
-        return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("Step 1 names the parts",
-          "Step 1 · Which parts of the cell" in text, text[:150])
-    check("Step 2 is the button",
-          "Step 2 · Work it out" in text, text[:150])
-    check("Step 1 comes before Step 2",
-          text.index("Step 1 ·") < text.index("Step 2 ·"))
-
-    # The part checkboxes must exist exactly once, in Step 1.
-    labels = [c.label for c in app.checkbox]
-    for term in ("Membrane", "Cytoskeleton", "Nucleus"):
-        matching = [l for l in labels if l and l.startswith(term)]
-        check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
-
-    # Unticking a part must disable the button rather than fail later.
-    for term in ("membrane", "interior", "nucleus"):
-        app.session_state[f"use_{term}"] = False
-    app.run()
-    if no_exception(app, "no parts selected"):
-        work = button_by_label(app, "Work it out for me")
-        check("with nothing ticked the button is disabled",
-              work is not None and work.disabled is True)
-
-
-def case_it_picks_the_arrangement():
-    print("the search chooses segmented, side by side or stacked")
-    from lulevich_model import LulevichModel as LM, search_arrangements
-
-    eps = np.linspace(0.001, 0.60, 300)
-
-    def segmented():
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-        return m * 0.6e6 + c * 1.2e3 + nu * 3e3
-
-    def side_by_side():
-        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
-        return g.combined_model(eps, 0.6e6, 1.2e3, 0.0, En=0.0)
-
-    for name, maker, expected in (
-        ("a segmented curve", segmented, "segmented"),
-        ("a side-by-side curve", side_by_side, "parallel"),
-    ):
-        force = maker() * (
-            1 + 0.01 * np.random.default_rng(0).standard_normal(eps.size)
-        )
-        model = LM(force, eps, cell_height=8.0e-6)
-        found = search_arrangements(model, 0.0, 0.60)
-        check(f"{name}: the search ran", found.get("success"),
-              str(found.get("error")))
-        if not found.get("success"):
-            continue
-        picked = found["best"]["arrangement"]
-        tied = {c["arrangement"] for c in found["candidates"]
-                if c.get("tied_with_best")} | {picked}
-        check(f"{name} is called {expected}", expected in tied,
-              f"picked {picked}, tied {tied}")
-        check(f"{name}: all three arrangements were tried",
-              len(found["candidates"]) == 3, str(len(found["candidates"])))
-        check(f"{name}: the verdict is in plain words",
-              "curve" in found["verdict"].lower(), found["verdict"][:80])
-
-    # The winner has to translate into settings the app can apply.
-    import app as app_module
-    for arrangement, expected_model in (
-        ("segmented", "Segmented"),
-        ("series", "Stacked"),
-        ("parallel", "Side by side"),
-    ):
-        pending = app_module.settings_from_arrangement(
-            {"arrangement": arrangement,
-             "composition": {"membrane": "freeze", "cyto_start": "break",
-                             "break_1": 0.15, "break_2": 0.40,
-                             "use_nucleus": True}},
-            0.6,
-        )
-        check(f"{arrangement} maps to a real model name",
-              pending["model_kind"].startswith(expected_model),
-              pending["model_kind"])
-        check(f"{arrangement} maps to a name the radio offers",
-              pending["model_kind"] in app_module.MODEL_KEYS,
-              pending["model_kind"])
-
-
-def case_work_it_out_applies_the_arrangement():
-    print("pressing it applies what it found")
-    app = start(cell_name="cell-01")
-    work = button_by_label(app, "Work it out for me")
-    check("the button is there", work is not None)
-    if work is None:
-        return
-    work.click().run()
-    if not no_exception(app, "work it out"):
-        return
-    found = app.session_state["arrangement_search"]
-    check("the arrangement search ran", bool(found and found.get("success")),
-          str(found.get("error") if found else None))
-    if not (found and found.get("success")):
-        return
-    check("the model on the page matches what it chose",
-          app.session_state["model_kind"]
-          == app_module_model_name(found["best"]["arrangement"]),
-          f"{app.session_state['model_kind']} vs {found['best']['arrangement']}")
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the answer is shown in words", "curve" in text.lower())
-
-
-def app_module_model_name(arrangement):
-    import app as app_module
-    return app_module.settings_from_arrangement(
-        {"arrangement": arrangement, "composition": {}}, 0.6
-    )["model_kind"]
-
-
-def case_fit_quality():
-    print("the fit actually follows the data")
-    for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
-        eps, force = synthetic(membrane, cyto)
-        model = LulevichModel(force, eps, cell_height=8.0e-6)
-        fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, membrane, cyto)
-        check(f"R² > 0.99 for {membrane}/{cyto}",
-              fit["success"] and fit["r_squared"] > 0.99,
-              f"R²={fit.get('r_squared')}")
-        check(f"Eₘ recovered for {membrane}/{cyto}",
-              abs(fit["Em_MPa"] - 0.6) / 0.6 < 0.15, f"{fit['Em_MPa']:.3f} MPa")
-        check(f"E_c recovered for {membrane}/{cyto}",
-              abs(fit["Ei_kPa"] - 1.2) / 1.2 < 0.20, f"{fit['Ei_kPa']:.3f} kPa")
-
-
-def case_legacy_record_refits():
-    print("a record saved under the old model names still resolves")
-    import app as app_module
-    for old, key in app_module.LEGACY_MODEL_NAMES.items():
-        check(f"{old!r} resolves", app_module.MODEL_KEYS_ANY.get(old) == key)
-    for new, key in app_module.MODEL_KEYS.items():
-        check(f"{new!r} resolves", app_module.MODEL_KEYS_ANY.get(new) == key)
-
-
-def case_range_starts_at_zero():
-    print("the segmented range always starts at zero")
-    app = start()
-    ends = [s for s in app.slider if "fit up to" in (s.label or "").lower()]
-    check("single end-of-range slider in the segmented view", len(ends) == 1)
-    pairs = [s for s in app.slider if (s.label or "").strip() == "Fitted range"]
-    check("no two-handle range slider in the segmented view", not pairs)
-    if ends:
-        ends[0].set_value(0.35).run()
-        no_exception(app, "moving the end of the range")
-        lo, hi = app.session_state["window_combined"]
-        check("range starts at zero", lo == 0.0, str(lo))
-        check("range ends where the slider was put", abs(hi - 0.35) < 0.01, str(hi))
-
-    # The other models keep the two-handle slider.
-    app2 = start()
-    widget_by_label(app2, "radio", "how the cell is modelled").set_value(
-        "Side by side (every element acts everywhere)"
-    ).run()
-    pairs = [s for s in app2.slider if (s.label or "").strip() == "Fitted range"]
-    check("two-handle slider still there for the other models", len(pairs) == 1)
-
-
-def case_fit_stops_at_the_end_of_the_range():
-    print("the model line stops where the range stops")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.35, 0.15, 0.30)
-    check("fit succeeded on a short range", fit.get("success"))
-    if not fit.get("success"):
-        return
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.30)
-    full = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-    lo, hi = fit["epsilon_range"]
-    clipped = np.array(full, dtype=float)
-    clipped[(eps < lo) | (eps > hi)] = np.nan
-
-    fig = plot_utils.force_curve_figure(
-        eps, force, plot_utils.PlotStyle(force_unit="N"), fit_force_N=clipped
-    )
-    line = next(t for t in fig.data if t.name == "Model")
-    drawn = np.asarray(line.y, dtype=float)
-    finite = np.isfinite(drawn)
-    check("nothing drawn past the end of the range",
-          not finite[eps > hi + 1e-9].any())
-    check("the whole range is drawn", finite[(eps >= lo) & (eps <= hi)].all())
-    check("the line reaches the end of the range",
-          abs(eps[finite].max() - hi) < 0.01, f"{eps[finite].max():.3f} vs {hi:.3f}")
-
-
-def case_plot_clutter_toggles():
-    print("each piece of clutter can be switched off")
-    import plot_utils
-
-    eps, force = synthetic()
-    model = LulevichModel(force, eps, cell_height=8.0e-6)
-    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
-    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
-    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
-
-    def build(**flags):
-        style = plot_utils.PlotStyle(force_unit="N", **flags)
-        return plot_utils.force_curve_figure(
-            eps, force, style, fit_force_N=fitted,
-            fit_window=[{"range": (0.0, 0.6), "label": "fit"}],
-            highlight_window=(0.15, 0.40, "segment 2"),
-            highlight=(0.30, float(force[len(force) // 2])),
-            rupture_epsilon=0.55,
+        value, unit, symbol = moduli[term]
+        caption = f"<b>{names[term][0]}</b>"
+        if value is not None and style.show_schematic_moduli:
+            caption += f"<br>{symbol} = {value:.3g} {unit}"
+        caption += f"<br>{LAW[term]}"
+        if note:
+            caption += f"<br><i>{note}</i>"
+        fig.add_annotation(
+            x=x, y=LABEL_Y, text=caption, showarrow=False,
+            yanchor="top", font=dict(size=small, color=colour),
         )
 
-    on = build()
-    check("shading on by default", len(on.layout.shapes) >= 2)
-    check("video marker on by default",
-          any(t.name == "video frame" for t in on.data))
+    if coupling == "series":
+        # One column: same force through each, the squashes adding.
+        weights = shares or {}
+        total = sum(max(weights.get(t, 1.0 / len(terms)), 0.05) for t in terms)
+        y = GROUND_Y
+        for term in terms:
+            slice_h = (PLATEN_Y - GROUND_Y) * max(
+                weights.get(term, 1.0 / len(terms)), 0.05
+            ) / total
+            draw_element(term, 40, y, y + slice_h, 16)
+            y += slice_h
+        subtitle = "Stacked: same force through each, squashes add"
+    else:
+        spacing = 80.0 / max(len(terms), 1)
+        for index, term in enumerate(terms):
+            x = 12 + spacing * (index + 0.5)
+            fig.add_shape(type="line", x0=x, x1=x, y0=PLATEN_Y, y1=PLATEN_Y - 3,
+                          line=dict(color="#2c3e50", width=2))
+            fig.add_shape(type="line", x0=x, x1=x, y0=GROUND_Y, y1=GROUND_Y + 3,
+                          line=dict(color="#2c3e50", width=2))
+            draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3, 13)
+        subtitle = "Side by side: same squash on each, forces add"
 
-    off = build(show_fit_window=False)
-    check("shading gone", not [s for s in off.layout.shapes if s.type == "rect"])
-
-    off = build(show_video_marker=False)
-    check("video frame marker gone",
-          not any(t.name == "video frame" for t in off.data))
-
-    off = build(show_rupture_marker=False)
-    labels = [getattr(a, "text", "") for a in off.layout.annotations]
-    check("rupture marker gone", "rupture" not in labels, str(labels))
-
-    with_moduli = plot_utils.cell_schematic(
-        plot_utils.PlotStyle(force_unit="N"), epsilon=0.3,
-        break_1=0.15, break_2=0.40, Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True)
+    fig.update_yaxes(visible=False, range=[LABEL_Y - 26, PLATEN_Y + 34],
+                     fixedrange=True)
+    fig.update_layout(
+        height=height or max(340, int(style.height * 0.74)),
+        margin=dict(l=6, r=6, t=30, b=6),
+        plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+        title=dict(
+            text=f"<b>{subtitle}</b>",
+            font=dict(size=max(11, style.tick_size - 5), color="black"),
+            x=0.5, xanchor="center",
+        ),
     )
-    without = plot_utils.cell_schematic(
-        plot_utils.PlotStyle(force_unit="N", show_schematic_moduli=False),
-        epsilon=0.3, break_1=0.15, break_2=0.40,
-        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    return fig
+
+
+def exponent_profile_figure(profile, style: PlotStyle, break_1=None, break_2=None,
+                            title="What power law is the curve following?"):
+    """
+    Local log-log slope against deformation.
+
+    The two reference lines are the exponents the model assumes: 3 where the
+    membrane carries the load, 3/2 for a Hertzian contact. Where the measured
+    curve sits on one of them, that stage of the model is the right shape for
+    the data; where it wanders, it is not.
+    """
+    eps = np.asarray(profile.get("epsilon", []), dtype=float)
+    exponent = np.asarray(profile.get("exponent", []), dtype=float)
+    fig = go.Figure()
+    if eps.size:
+        fig.add_trace(
+            go.Scatter(
+                x=eps, y=exponent, mode="lines+markers",
+                name="measured exponent",
+                line=dict(color=style.data_color, width=style.line_width),
+                marker=dict(size=max(3, style.marker_size - 2)),
+                hovertemplate="ε = %{x:.3f}<br>exponent = %{y:.2f}<extra></extra>",
+            )
+        )
+    for value, label, colour in ((3.0, "ε³ membrane", "#2ca02c"),
+                                 (1.5, "ε³ᐟ² Hertzian", "#9467bd")):
+        # Inside the axes, not to the right of them: an annotation hung off the
+        # right edge is the first thing to be clipped.
+        fig.add_hline(
+            y=value, line=dict(color=colour, width=2, dash="dash"),
+            annotation_text=label, annotation_position="top left",
+            annotation_font_size=max(10, style.tick_size - 8),
+            annotation_font_color=colour,
+        )
+    for value, label, colour in ((break_1, "ε₁", "#2ca02c"), (break_2, "ε₂", "#e377c2")):
+        if value is not None:
+            fig.add_vline(
+                x=float(value), line=dict(color=colour, width=2, dash="dot"),
+                annotation_text=label, annotation_position="top",
+                annotation_font_size=max(10, style.tick_size - 6),
+            )
+    _base_layout(fig, style, title)
+    fig.update_layout(
+        height=max(360, int(style.height * 0.78)),
+        showlegend=False,
+        margin=dict(r=70),
     )
-
-    def caption(fig):
-        return " ".join(getattr(a, "text", "") or "" for a in fig.layout.annotations)
-
-    check("moduli printed by default", "E<sub>m</sub>" in caption(with_moduli))
-    check("moduli gone when switched off",
-          "E<sub>m</sub>" not in caption(without) and "E<sub>c</sub>" not in caption(without))
-    check("the diagram still says where it is",
-          "ε =" in caption(without), caption(without)[:80])
-
-
-if __name__ == "__main__":
-    for case in (
-        case_loads_clean,
-        case_legacy_record_refits,
-        case_companion_file_guard,
-        case_fit_quality,
-        case_guided_order_is_parts_then_work_it_out,
-        case_it_picks_the_arrangement,
-        case_work_it_out_applies_the_arrangement,
-        case_search_stays_fast,
-        case_png_is_not_rendered_every_run,
-        case_fit_statistics,
-        case_chi_squared_reaches_the_page,
-        case_axis_ranges,
-        case_nucleus_spring_is_shorter,
-        case_component_names_follow_the_cell_type,
-        case_cardiomyocyte_model_is_flagged_provisional,
-        case_not_reached_is_explained,
-        case_plain_language_helpers,
-        case_guided_mode_is_the_default,
-        case_full_control_shows_everything,
-        case_curve_saved_as_a_tab,
-        case_plot_options_are_under_the_plot,
-        case_save_the_plot,
-        case_fit_maths_box,
-        case_sheet_row_matches_the_header,
-        case_sheet_reorder_keeps_the_data,
-        case_fit_line_and_heights_toggle,
-        case_range_table_shows_zero_moduli,
-        case_all_three_moduli_always_reported,
-        case_load_share_table,
-        case_download_when_box_is_absent,
-        case_clear_cell_wins_over_dark_debris,
-        case_fit_survives_a_rerun,
-        case_database_section_without_a_fit,
-        case_send_without_a_video,
-        case_fit_stops_at_the_end_of_the_range,
-        case_plot_clutter_toggles,
-        case_preset_round_trip,
-        case_model_names,
-        case_range_starts_at_zero,
-        case_composition_radios,
-        case_highlight,
-        case_search_beats_the_old_grid,
-        case_search_flags_what_it_cannot_see,
-        case_search_applies_in_one_press,
-        case_bare_plot,
-        case_buttons_do_not_break_widgets,
-    ):
-        case()
-    print()
-    if FAILURES:
-        print(f"{len(FAILURES)} failing: {FAILURES}")
-        sys.exit(1)
-    print("all passing")
+    _style_axes(fig, style, "Relative deformation, ε", "Local exponent")
+    fig.update_yaxes(range=[0, 4.4], dtick=1)
+    return fig
