@@ -45,6 +45,24 @@ def start(**state):
     for key, value in state.items():
         app.session_state[key] = value
     app.run()
+    # Choosing a cell type applies that type's defaults, which is right in
+    # the app and wrong in a test that wanted to set one of those defaults by
+    # hand. Anything the caller asked for that the preset then overwrote is
+    # put back and the app run once more.
+    def current(key):
+        try:
+            return app.session_state[key]
+        except Exception:
+            return None
+
+    changed = {
+        key: value for key, value in state.items()
+        if key != "cell_type" and current(key) != value
+    }
+    if changed:
+        for key, value in changed.items():
+            app.session_state[key] = value
+        app.run()
     return app
 
 
@@ -1152,8 +1170,8 @@ def case_component_names_follow_the_cell_type():
               and any("Sarcomeric myofibrils" == v for v in listed), str(listed))
         check("and never calls anything a nucleus",
               not any("Nucleus" in v for v in listed), str(listed))
-        check("and both membrane springs are named",
-              sum("Membrane" in v for v in listed) == 2, str(listed))
+        check("the membrane is one term unless the extra one is asked for",
+              sum("Membrane" in v for v in listed) == 1, str(listed))
     check("the fit succeeds for a cardiomyocyte",
           app.session_state["_last_fit"] is not None
           and app.session_state["_last_fit"].get("success"))
@@ -1871,11 +1889,215 @@ def wt_model(q=1.25):
     )
 
 
+def case_switching_cell_type_and_back_changes_nothing():
+    print("a myoblast fitted after a cardiomyocyte is still a myoblast")
+    app = start(cell_name="myo-01")
+    if not no_exception(app, "myoblast first"):
+        return
+    before = app.session_state["_last_fit"]
+    check("it fits to start with", before and before.get("success"))
+    if not before:
+        return
+
+    picker = widget_by_label(app, "selectbox", "Cell type")
+    check("the cell type can be changed", picker is not None)
+    if picker is None:
+        return
+    picker.set_value("Cardiomyocyte").run()
+    if not no_exception(app, "switched to cardiomyocyte"):
+        return
+    check("the cardiomyocyte geometry is applied",
+          app.session_state["cell_height_um"] == 19.0
+          and app.session_state["confinement"] == 1.30,
+          f"{app.session_state['cell_height_um']} "
+          f"{app.session_state['confinement']}")
+
+    widget_by_label(app, "selectbox", "Cell type").set_value(
+        "Myoblast (C2C12)"
+    ).run()
+    if not no_exception(app, "switched back"):
+        return
+
+    # Geometry going back is the easy half. The composition is the half that
+    # was silently left behind: a myoblast was then fitted as though its
+    # membrane kept stiffening and its cytoskeleton loaded from zero, which
+    # still fits, still looks good, and gives the wrong modulus for every
+    # element.
+    check("the geometry comes back",
+          app.session_state["cell_height_um"] == 8.0
+          and app.session_state["confinement"] == 0.0
+          and app.session_state["membrane_thickness_nm"] == 4.0,
+          f"h {app.session_state['cell_height_um']} "
+          f"q {app.session_state['confinement']} "
+          f"hm {app.session_state['membrane_thickness_nm']}")
+    check("and so does the composition",
+          app.session_state["membrane_after_break"] == "holds what it reached"
+          and app.session_state["cyto_starts_at"] == "at ε₁",
+          f"{app.session_state['membrane_after_break']} / "
+          f"{app.session_state['cyto_starts_at']}")
+    check("the cardiomyocyte's extra spring does not follow it home",
+          app.session_state["use_tension"] is False)
+    check("nor does anything it measured",
+          app.session_state["component_search"] is None
+          and app.session_state["confinement_scan"] is None)
+
+    after = app.session_state["_last_fit"]
+    check("and the moduli are exactly what they were", (
+        after and after.get("success")
+        and abs(after["Em_MPa"] - before["Em_MPa"]) < 1e-9
+        and abs(after["Ei_kPa"] - before["Ei_kPa"]) < 1e-9
+        and abs(after["En_kPa"] - before["En_kPa"]) < 1e-9
+    ), f"{before['Em_MPa']:.4f}/{before['Ei_kPa']:.4f} -> "
+       f"{after['Em_MPa']:.4f}/{after['Ei_kPa']:.4f}" if after else "no fit")
+
+
+def case_no_nucleus_wording_for_a_cardiomyocyte():
+    print("the word nucleus never reaches a cardiomyocyte's screen")
+    import app as app_module
+    check("the component set has no nucleus name",
+          "Nucleus" not in [
+              v[0] for v in app_module.COMPONENT_SETS["Cardiomyocyte"].values()
+          ])
+    check("but a myoblast still has one",
+          app_module.term_name("nucleus", "Myoblast (C2C12)") == "Nucleus")
+    check("and the cardiomyocyte's third slot is myofibrils",
+          "myofibril" in app_module.term_name("nucleus", "Cardiomyocyte").lower(),
+          app_module.term_name("nucleus", "Cardiomyocyte"))
+    check("the stored model name no longer names a myoblast's parts",
+          not any("nucleus" in k.lower() for k in app_module.MODELS),
+          str(list(app_module.MODELS)[:1]))
+    check("and the old name still resolves, so old records load",
+          app_module.MODEL_KEYS_ANY.get(
+              "Segmented (membrane → cytoskeleton → nucleus)") == "segmented")
+
+    app = start(cell_name="WT", cell_type="Cardiomyocyte",
+                ui_mode="Full control · every setting")
+    if not no_exception(app, "cardiomyocyte page"):
+        return
+    shown = []
+    for kind in ("markdown", "caption", "metric", "expander", "checkbox",
+                 "selectbox", "slider", "number_input", "radio"):
+        for element in app.get(kind):
+            for attribute in ("value", "label"):
+                text = getattr(element, attribute, None)
+                # A radio's value is the stored key, which is not shown.
+                if isinstance(text, str) and not (
+                    kind == "radio" and attribute == "value"
+                ):
+                    shown.append(text)
+    offenders = [t for t in shown if "nucleus" in t.lower()]
+    check("nothing on the page says nucleus", not offenders,
+          str(offenders)[:200])
+
+    plain = start(cell_name="myo-01", ui_mode="Full control · every setting")
+    if no_exception(plain, "myoblast page"):
+        said = " ".join(
+            str(x.value) for kind in ("markdown", "caption")
+            for x in plain.get(kind)
+        ) + " ".join(m.label for m in plain.get("metric"))
+        check("a myoblast still does, because it has one",
+              "nucleus" in said.lower())
+
+
+def case_components_are_recommended():
+    print("the search says which components to use, and can apply them")
+    from lulevich_model import recommend_components
+    eps, force, model, _ = four_element_curve()
+
+    # A curve whose in-plane spring carries real force. The default one in
+    # four_element_curve carries about 5 % near contact, which the tie rule
+    # correctly calls indistinguishable from not having it at all, and that
+    # is tested below.
+    _, _, loud, _ = four_element_curve(T0=6.0e-3, seed=9)
+    found = recommend_components(
+        loud, 0.0, 0.65,
+        candidates=("membrane", "interior", "nucleus", "tension"),
+        e1=0.15, e2=0.40, membrane="continue", cyto_start="zero",
+        cv_repeats=2,
+    )
+    check("it runs", found.get("success"))
+    if not found.get("success"):
+        return
+    check("it tried every combination", len(found["candidates"]) == 8,
+          str(len(found["candidates"])))
+    check("the membrane is never dropped",
+          all("membrane" in r["terms"] for r in found["candidates"]))
+    check("a spring that carries real force is recommended",
+          "tension" in found["recommended"], str(found["recommended"]))
+    check("and so are the others it was built from",
+          {"membrane", "interior", "nucleus"} <= set(found["recommended"]),
+          str(found["recommended"]))
+    check("exactly one row is the recommendation",
+          sum(r["recommended"] for r in found["candidates"]) == 1)
+    check("they are ranked, best first",
+          found["candidates"] == sorted(found["candidates"],
+                                        key=lambda r: r["cv_rmse"]))
+
+    # The other direction, and the more important one: a term that earns
+    # almost nothing must not be sold as needed just because it fits.
+    quiet = recommend_components(
+        model, 0.0, 0.65,
+        candidates=("membrane", "interior", "nucleus", "tension"),
+        e1=0.15, e2=0.40, membrane="continue", cyto_start="zero",
+        cv_repeats=2,
+    )
+    check("a barely-there spring is left out rather than kept",
+          quiet.get("success") and "tension" not in quiet["recommended"],
+          str(quiet.get("recommended")))
+    check("and the app says it was a close call, not a clear one",
+          quiet.get("clear_cut") is False)
+
+    # A curve with nothing deep in it must not be told to include a deep term.
+    blank = LulevichModel(np.zeros_like(eps), eps, cell_height=14.0e-6,
+                          shell_thickness=200e-9, deep_uses_cell_radius=True)
+    basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
+    two = basis["membrane"] * 1.4e6 + basis["interior"] * 3.1e3
+    rng = np.random.default_rng(4)
+    simple = LulevichModel(two + rng.normal(0, 0.004 * two.max(), two.size), eps,
+                           cell_height=14.0e-6, shell_thickness=200e-9,
+                           deep_uses_cell_radius=True)
+    lean = recommend_components(
+        simple, 0.0, 0.65,
+        candidates=("membrane", "interior", "nucleus", "tension"),
+        e1=0.15, e2=0.40, membrane="continue", cyto_start="zero", cv_repeats=2,
+    )
+    check("a two-element curve is not sold four elements",
+          lean.get("success") and len(lean["recommended"]) <= 3,
+          str(lean.get("recommended")))
+    check("and the interior is kept", "interior" in lean["recommended"],
+          str(lean["recommended"]))
+
+    # It has to reach the page, with a way to act on it.
+    app = start(cell_name="WT", cell_type="Cardiomyocyte")
+    if not no_exception(app, "component search"):
+        return
+    work = button_by_label(app, "Work it out for me")
+    if work is None:
+        check("the button is there", False)
+        return
+    work.click().run()
+    if not no_exception(app, "after working it out"):
+        return
+    picked = app.session_state["component_search"]
+    check("the search ran with the button", picked and picked.get("success"))
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the recommendation is on the page, under its own heading",
+          "Recommended components" in text, text[:200])
+    said = " ".join(
+        [str(x.value) for x in app.get("success")]
+        + [str(x.value) for x in app.get("info")]
+    )
+    check("and it is stated in words", "Use " in said, said[:200])
+
+
 def case_dropped_spring_is_said_once_where_it_is_chosen():
     print("picking a model without T₀ is flagged at the selector, not after")
     def load(kind):
+        # The in-plane spring is optional and off by default, so it has to be
+        # switched on for this question to arise at all.
         app = start(cell_name="WT", cell_type="Cardiomyocyte",
-                    ui_mode="Full control · every setting", model_kind=kind)
+                    ui_mode="Full control · every setting", model_kind=kind,
+                    use_tension=True)
         return app, [str(w.value) for w in app.get("warning")]
 
     side, warned = load("Side by side (every element acts everywhere)")
@@ -1890,7 +2112,7 @@ def case_dropped_spring_is_said_once_where_it_is_chosen():
     check("and there is a button that makes the fix",
           button_by_label(side, "Switch to Segmented") is not None)
 
-    seg, clean = load("Segmented (membrane → cytoskeleton → nucleus)")
+    seg, clean = load("Segmented (each part takes over in turn)")
     if no_exception(seg, "segmented"):
         check("the segmented model says nothing, because it carries it",
               not [w for w in clean if "T₀" in w], str(clean)[:120])
@@ -2388,23 +2610,49 @@ def case_four_elements_reach_the_page():
     app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
     if not no_exception(app, "four elements"):
         return
-    check("the tension spring is on by default",
-          app.session_state["use_tension"] is True)
+    # The extra membrane protein is offered, not assumed. A term nobody
+    # asked for quietly takes force from the ones that were asked for.
+    check("the extra spring is off by default",
+          app.session_state["use_tension"] is False)
     fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
-    check("and it is in the fitted terms", "tension" in fitted, str(fitted))
-
-    labels = [c.label for c in app.checkbox]
-    check("both membrane springs have their own switch",
-          sum("Membrane" in (l or "") for l in labels) == 2, str(labels))
+    check("so it is not in the fitted terms", "tension" not in fitted, str(fitted))
+    check("but it is available for this cell type",
+          "tension" in app_module.terms_for("Cardiomyocyte"))
+    check("and it is named for what it is, not for one protein",
+          "prestin" in app_module.COMPONENT_SETS["Cardiomyocyte"]["tension"][1],
+          str(app_module.COMPONENT_SETS["Cardiomyocyte"]["tension"]))
 
     table = table_with(app, "Part of the cell")
-    check("the stiffness table lists four parts",
+    # The table lists every element this cell type has, with the ones not in
+    # the model reading zero and saying so. A blank row would be ambiguous
+    # between "zero" and "not measured".
+    check("the stiffness table lists every element the cell type has",
           table is not None and len(table) == 4,
           "none" if table is None else str(len(table)))
     if table is not None:
-        check("the tension is quoted in mN/m",
-              any("mN/m" in v for v in table["Stiffness"]),
-              str(list(table["Stiffness"])))
+        extra = table[table["Part of the cell"].str.contains("Extra")]
+        check("and marks the one that is switched off",
+              len(extra) == 1
+              and "not included" in extra.iloc[0]["Roughly"],
+              str(extra.to_dict("records")))
+
+    # Switched on, it appears everywhere it should.
+    with_extra = start(cell_name="cardio-02", cell_type="Cardiomyocyte",
+                       use_tension=True)
+    if no_exception(with_extra, "extra spring on"):
+        on_terms = (with_extra.session_state["_last_fit"] or {}).get("terms") or []
+        check("switching it on puts it in the fit", "tension" in on_terms,
+              str(on_terms))
+        bigger = table_with(with_extra, "Part of the cell")
+        check("and it is no longer marked as left out",
+              bigger is not None
+              and not bigger[bigger["Part of the cell"].str.contains("Extra")]
+              .iloc[0]["Roughly"].startswith("not included"),
+              "none" if bigger is None else str(bigger.to_dict("records")))
+        if bigger is not None:
+            check("quoted in mN/m, because it is a tension",
+                  any("mN/m" in v for v in bigger["Stiffness"]),
+                  str(list(bigger["Stiffness"])))
 
     # A myoblast must be untouched by any of this.
     plain = start(cell_name="myo-01")
@@ -2614,6 +2862,9 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_switching_cell_type_and_back_changes_nothing,
+        case_no_nucleus_wording_for_a_cardiomyocyte,
+        case_components_are_recommended,
         case_dropped_spring_is_said_once_where_it_is_chosen,
         case_search_says_when_a_winner_drops_a_spring,
         case_real_curve_is_steeper_than_any_fixed_power,
