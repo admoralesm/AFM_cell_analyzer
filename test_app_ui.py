@@ -1832,6 +1832,100 @@ def case_four_element_model():
     check("and is a term shorter", three["n_params"] == 5, str(three["n_params"]))
 
 
+def case_sarcomere_length():
+    print("the squash is reported as a sarcomere length")
+    eps, force, model, _ = four_element_curve()
+    check("the relaxed length is 2.1 um by default",
+          abs(model.L_sarcomere - 2.1e-6) < 1e-12, str(model.L_sarcomere))
+    check("unsquashed, the sarcomere is its relaxed length",
+          abs(model.sarcomere_at(0.0) - 2.1e-6) < 1e-15)
+
+    # The direction matters and is easy to get backwards: squashing a
+    # cardiomyocyte lengthens its sarcomeres, because the cell spreads
+    # sideways and the myofibrils run that way.
+    check("squashing lengthens them, it does not shorten them",
+          model.sarcomere_at(0.30) > model.sarcomere_at(0.0),
+          f"{model.sarcomere_at(0.30) * 1e9:.0f} nm")
+    check("constant volume gives the (1-e)^-1/2 stretch",
+          abs(model.sarcomere_at(0.30) - 2.1e-6 / np.sqrt(0.70)) < 1e-15,
+          f"{model.sarcomere_at(0.30) * 1e9:.1f} nm")
+    check("a cell held at its ends keeps them at rest length",
+          abs(model.sarcomere_at(0.50, spread=0.0) - 2.1e-6) < 1e-15)
+    check("and half the spreading gives half the exponent",
+          abs(model.sarcomere_at(0.30, spread=0.5)
+              - 2.1e-6 * 0.70 ** -0.25) < 1e-15)
+    check("it stays finite at full compression",
+          np.isfinite(model.sarcomere_at(1.0)))
+
+    report = model.sarcomere_report(0.65, onset=0.40)
+    check("the report gives the length at the top of the range",
+          abs(report["at_epsilon_max_nm"] - model.sarcomere_at(0.65) * 1e9) < 1e-6)
+    check("and where the myofibrils engage",
+          abs(report["at_onset_nm"] - model.sarcomere_at(0.40) * 1e9) < 1e-6)
+    check("the working limit follows the relaxed length",
+          abs(report["working_limit_nm"] - 2310.0) < 1e-6,
+          f"{report['working_limit_nm']:.1f} nm")
+    check("a deep squash is flagged as past it",
+          report["beyond_working_range"])
+    check("and it says where that started",
+          0.0 < report["epsilon_at_limit"] < 0.65,
+          f"{report['epsilon_at_limit']:.3f}")
+    check("the flag agrees with the length",
+          report["at_epsilon_max_nm"] > report["working_limit_nm"])
+
+    shallow = model.sarcomere_report(0.10, onset=0.40)
+    check("a shallow squash is not flagged", not shallow["beyond_working_range"],
+          f"{shallow['at_epsilon_max_nm']:.0f} nm")
+
+    check("it counts the sarcomeres along the cell",
+          abs(report["n_along_cell"] - (2 * model.R0) / 2.1e-6) < 1e-9,
+          f"{report['n_along_cell']:.1f}")
+
+    # None of this may touch the fit.
+    changed = LulevichModel(model.force, model.epsilon, cell_height=14.0e-6,
+                            shell_thickness=200e-9, deep_uses_cell_radius=True,
+                            sarcomere_length=1.8e-6)
+    a = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
+                              use_tension=True)
+    b = changed.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
+                                use_tension=True)
+    for key in ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa", "r_squared"):
+        check(f"changing the sarcomere length leaves {key} alone",
+              abs(a[key] - b[key]) < 1e-12, f"{a[key]!r} vs {b[key]!r}")
+    check("but the clone carries it", model._clone(
+        model.force, model.epsilon).L_sarcomere == model.L_sarcomere)
+
+    # And it has to reach the page, for cardiomyocytes only.
+    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "sarcomere panel"):
+        return
+    # Captions are their own element type in AppTest, not markdown.
+    def page_text(a):
+        return " ".join(
+            str(x.value) for kind in ("markdown", "caption")
+            for x in a.get(kind)
+        )
+
+    check("the sarcomere panel is shown for a cardiomyocyte",
+          any("sarcomere" in (e.label or "").lower()
+              for e in app.get("expander")),
+          str([e.label for e in app.get("expander")]))
+    labels = [m.label for m in app.get("metric")]
+    check("the relaxed length is on the page", "Relaxed" in labels, str(labels))
+    check("so is the length at the top of the range",
+          any(l.startswith("At ε =") for l in labels), str(labels))
+    check("it says which way the length goes",
+          "lengthens them" in page_text(app))
+
+    plain = start(cell_name="myo-01")
+    if no_exception(plain, "no sarcomere panel"):
+        check("and not for a myoblast",
+              not any("sarcomere" in (e.label or "").lower()
+                      for e in plain.get("expander")),
+              str([e.label for e in plain.get("expander")]))
+        check("nor in its text", "sarcomere" not in page_text(plain).lower())
+
+
 def case_extra_terms_never_crash_old_paths():
     print("a fourth spring reaching three-spring code is dropped, loudly")
     import lulevich_model as lm
@@ -2244,6 +2338,7 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_sarcomere_length,
         case_extra_terms_never_crash_old_paths,
         case_four_element_search,
         case_breakpoint_spread_is_the_real_error_bar,
