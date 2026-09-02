@@ -22,6 +22,7 @@ from lulevich_model import (
     LulevichModel,
     compare_couplings,
     dropped_term_warning,
+    recommend_components,
     search_arrangements,
 )
 from plot_utils import (
@@ -342,6 +343,7 @@ DEFAULTS = {
     "cell_shape": "Sphere (a rounded cell)",
     "confinement": 0.0,
     "confinement_scan": None,
+    "component_search": None,
     # Acquisition, recorded with the cell rather than used by the fit.
     "probe_diameter_um": 0.0,
     "approach_speed_um_s": 2.0,
@@ -360,7 +362,7 @@ DEFAULTS = {
     # Guided by default: most people opening this want a number, not a
     # spring network. Everything is still one expander away.
     "ui_mode": "Guided · plain language",
-    "model_kind": "Segmented (membrane → cytoskeleton → nucleus)",
+    "model_kind": "Segmented (each part takes over in turn)",
     "segment_break_1": 0.15,
     "segment_break_2": 0.40,
     # What each element does either side of the first boundary. These are the
@@ -471,7 +473,8 @@ if st.session_state.pop("_start_new_cell", False):
     for key in (
         "data", "results", "_last_fit", "_last_fit_signature", "_plot_png",
         "cell_name", "cell_notes", "exploration", "composition_search",
-        "arrangement_search", "video_path", "video_info", "video_track",
+        "arrangement_search", "component_search", "confinement_scan",
+        "video_path", "video_info", "video_track",
         "video_name", "video_link", "eps_percent_fix",
         "video_saved_frame", "video_saved_frame_index",
     ):
@@ -742,7 +745,8 @@ def show_fit_maths(fit, model):
     st.code(
         f"h0 = {model.cell_height:.4g} m        (cell height)\n"
         f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
-        f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        (nucleus radius)\n"
+        f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
+        f"({term_name('nucleus').lower()} radius)\n"
         f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
         f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
         f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa\n"
@@ -808,7 +812,8 @@ def show_fit_maths(fit, model):
     worst = fit.get("worst_pair")
     if worst and abs(fit.get("worst_correlation", 0.0) or 0.0) > 0.97:
         st.caption(
-            f"Over this range the {worst[0]} and {worst[1]} basis functions "
+            f"Over this range the {term_name(worst[0]).lower()} and "
+            f"{term_name(worst[1]).lower()} basis functions "
             f"have correlation {abs(fit['worst_correlation']):.4f}. Their sum "
             f"is well determined; the split between them is only as good as "
             f"that number is below 1. Widening the range, especially towards "
@@ -840,7 +845,7 @@ def settings_from_arrangement(best, epsilon_max):
         )
         pending.update(
             {
-                "model_kind": "Segmented (membrane → cytoskeleton → nucleus)",
+                "model_kind": "Segmented (each part takes over in turn)",
                 "segment_break_1": round(float(composition.get("break_1", 0.15)), 3),
                 "segment_break_2": round(float(composition.get("break_2", 0.40)), 3),
                 "membrane_after_break": membrane_label,
@@ -1073,7 +1078,7 @@ def plot_option_controls():
     )
     st.checkbox(
         "Element curves", key="show_components", disabled=bare,
-        help="The membrane, cytoskeleton and nucleus contributions drawn "
+        help="Each element's own contribution drawn "
         "apart. They are parts of the one fit, not separate fits.",
     )
     st.checkbox(
@@ -1354,7 +1359,7 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
         # the cell rather than a compact body at its centre. Both change the
         # prefactors, so both follow the cell type.
         shell_thickness=float(st.session_state["protein_coat_nm"]) * 1e-9,
-        deep_uses_cell_radius=st.session_state["cell_type"] in FOUR_ELEMENT_TYPES,
+        deep_uses_cell_radius=st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS,
         sarcomere_length=float(st.session_state["sarcomere_nm"]) * 1e-9,
         confinement=float(st.session_state["confinement"]),
         poisson_membrane=float(st.session_state["poisson_membrane"]),
@@ -1371,13 +1376,10 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
 
 # ============================================================ cell presets ==
 
-TERM_LABELS = {
-    "tension": "membrane tension (T₀)",
-    "membrane": "membrane (Eₘ)",
-    "interior": "cytoskeleton (Ec)",
-    "nucleus": "nucleus (Eₙ)",
+TERM_SYMBOLS = {
+    "tension": "T₀", "membrane": "Eₘ", "interior": "Ec", "nucleus": "Eₙ",
 }
-# The three classic elements. The tension spring is a fourth, offered only
+# The three classic elements. The in-plane spring is a fourth, offered only
 # where a cell type calls for it, and deliberately not in this tuple: every
 # loop that walks the classic model must keep walking exactly three.
 TERM_ORDER = ("membrane", "interior", "nucleus")
@@ -1385,14 +1387,50 @@ ALL_TERMS = ("tension", "membrane", "interior", "nucleus")
 
 
 def terms_for(cell_type):
-    """The elements this cell type is modelled with, outermost first."""
-    return ALL_TERMS if cell_type in FOUR_ELEMENT_TYPES else TERM_ORDER
+    """The elements this cell type can be fitted with, in display order."""
+    return OPTIONAL_TERMS.get(cell_type, TERM_ORDER)
+
+
+def term_name(term, cell_type=None):
+    """This cell type's name for one element.
+
+    Every label the app shows goes through here. A cardiomyocyte has no
+    nucleus term, and the way to make sure the word never appears is to have
+    no place where it is written down outside the component table.
+    """
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    names = COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS)
+    return names.get(term, DEFAULT_COMPONENTS.get(term, (term, "")))[0]
+
+
+def term_label(term, cell_type=None):
+    """Name plus symbol, e.g. "Sarcomeric myofibrils (Eₙ)"."""
+    return f"{term_name(term, cell_type)} ({TERM_SYMBOLS.get(term, term)})"
+
+
+def retell(text):
+    """Put this cell type's names into a sentence the model wrote.
+
+    The model layer has no idea what the cell is called, so it writes
+    "nucleus" for the deep element, which is the right word for a myoblast
+    and the wrong one for a cardiomyocyte. Translating at the boundary keeps
+    the model honest and generic while nothing on screen says a word that
+    does not belong to the cell in front of you.
+    """
+    if not isinstance(text, str):
+        return text
+    deep = term_name("nucleus")
+    if deep.lower() == "nucleus":
+        return text
+    return text.replace("nucleus", deep.lower()).replace("Nucleus", deep)
+
 
 # How the elements share the load. These are physics, not fitting procedure:
 # parallel and series here describe the spring network, while "All at once"
 # and "Stage by stage" describe how the fit is carried out.
 MODELS = {
-    "Segmented (membrane → cytoskeleton → nucleus)":
+    "Segmented (each part takes over in turn)":
         "Three stretches of deformation, each with different structures bearing "
         "the load. Continuous at the boundaries and linear in the moduli.",
     "Side by side (every element acts everywhere)":
@@ -1416,7 +1454,7 @@ MODELS = {
         "paper's equations.",
 }
 MODEL_KEYS = {
-    "Segmented (membrane → cytoskeleton → nucleus)": "segmented",
+    "Segmented (each part takes over in turn)": "segmented",
     "Side by side (every element acts everywhere)": "parallel",
     "Stacked (elements in line)": "series",
     "Side by side, then stacked": "hybrid_ps",
@@ -1430,6 +1468,9 @@ MODEL_KEYS = {
 # which nobody could read. They are kept here only so that an old record still
 # refits; nothing in the interface offers these names any more.
 LEGACY_MODEL_NAMES = {
+    # Named after a myoblast's three parts, which was wrong for every cell
+    # that does not have those three. Records written under it still load.
+    "Segmented (membrane → cytoskeleton → nucleus)": "segmented",
     "Parallel (forces add)": "parallel",
     "Series (deformations add)": "series",
     "Hybrid: parallel below, series above": "hybrid_ps",
@@ -1478,14 +1519,15 @@ COMPONENT_SETS = {
     # own elasticity only bites once the area strain is large. Inside, the
     # general scaffolding is engaged from first contact and the myofibrils
     # are met deeper in.
+    # A cardiomyocyte has no nucleus term. It has one, of course, but a cell
+    # this packed with myofibrils has nothing left for a nucleus term to
+    # describe that the myofibrils do not already: what the plates meet deep
+    # in is contractile machinery. The slot is the same slot; only the name
+    # and the meaning change, and the name is what the app shows.
     "Cardiomyocyte": {
-        "tension": (
-            "Membrane protein network",
-            "already taut, the horizontal spring",
-        ),
         "membrane": (
-            "Membrane elasticity",
-            "the shell itself resisting being stretched",
+            "Membrane and cortex",
+            "the shell around the cell, resisting being stretched",
         ),
         "interior": (
             "Non-sarcomeric cytoskeleton",
@@ -1495,19 +1537,35 @@ COMPONENT_SETS = {
             "Sarcomeric myofibrils",
             "the contractile machinery, reached deeper in",
         ),
+        # The optional fourth. Named for what it is mechanically rather than
+        # for one protein, because the point of it is to hold whichever
+        # membrane protein is being tested: it is an in-plane spring, taut
+        # from first contact, answering in proportion to ε where everything
+        # else answers to a power of it.
+        "tension": (
+            "Extra membrane protein",
+            "an in-plane spring: prestin, or anything taut in the membrane",
+        ),
     },
 }
 DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 
-# Cell types whose membrane is modelled as two springs rather than one.
-FOUR_ELEMENT_TYPES = ("Cardiomyocyte",)
+# Cell types whose deep element is myofibrils running the length of the cell
+# rather than a compact nucleus at its centre. Decides which radius the deep
+# prefactor uses, and it is also exactly the set with no nucleus term.
+DEEP_IS_MYOFIBRILS = ("Cardiomyocyte",)
 
-# Which terms a cell type is fitted with by default. All three for both,
-# but the third means different things: a nucleus in a myoblast, the
-# contractile apparatus in a cardiomyocyte.
+# Elements a cell type can be fitted with, in the order they are shown.
+# "tension" is offered but not assumed: see DEFAULT_TERMS_BY_TYPE.
+OPTIONAL_TERMS = {"Cardiomyocyte": ("membrane", "interior", "nucleus", "tension")}
+
+# Which of those are ticked when the cell type is chosen. The extra membrane
+# protein is off: a term nobody asked for is a term that quietly takes force
+# from the ones that were asked for, and the search can turn it on if the
+# curve wants it.
 DEFAULT_TERMS_BY_TYPE = {
     "Cardiomyocyte": {
-        "tension": True, "membrane": True, "interior": True, "nucleus": True,
+        "membrane": True, "interior": True, "nucleus": True, "tension": False,
     },
 }
 
@@ -1528,6 +1586,18 @@ DEFAULT_COMPOSITION_BY_TYPE = {
         "membrane_after_break": "keeps stiffening",
         "cyto_starts_at": "from the very start",
     },
+}
+
+# What every other cell type starts from, and what a cell type without an
+# entry above is reset TO. This is not decoration: switching to a
+# cardiomyocyte and back used to leave its composition behind, so a myoblast
+# was then fitted as though its membrane kept stiffening and its cytoskeleton
+# loaded from zero. The fit still succeeded and still looked good, and every
+# modulus was wrong. A default that only ever gets applied one way is not a
+# default, it is a one-way door.
+BASE_COMPOSITION = {
+    "membrane_after_break": "holds what it reached",
+    "cyto_starts_at": "at ε₁",
 }
 
 
@@ -1609,12 +1679,27 @@ def apply_cell_type(name):
     # with myofibrils and is treated as one stiff interior, so the nucleus
     # term is switched off: left on it has nothing distinct to describe and
     # simply trades off against the interior modulus, making both unstable.
-    for term, on in DEFAULT_TERMS_BY_TYPE.get(
-        name, {"membrane": True, "interior": True, "nucleus": True}
-    ).items():
-        st.session_state[f"use_{term}"] = bool(on)
-    for key, value in DEFAULT_COMPOSITION_BY_TYPE.get(name, {}).items():
+    # Every term, not only this cell type's, so one left switched on by the
+    # previous cell type cannot survive the change.
+    wanted = dict.fromkeys(ALL_TERMS, False)
+    wanted.update({"membrane": True, "interior": True, "nucleus": True})
+    wanted.update(DEFAULT_TERMS_BY_TYPE.get(name, {}))
+    for term in ALL_TERMS:
+        st.session_state[f"use_{term}"] = bool(
+            wanted.get(term, False) and term in terms_for(name)
+        )
+    # Composition too, and always to a known state rather than only where a
+    # cell type happens to override it.
+    composition = dict(BASE_COMPOSITION)
+    composition.update(DEFAULT_COMPOSITION_BY_TYPE.get(name, {}))
+    for key, value in composition.items():
         st.session_state[key] = value
+    # The boundaries and everything measured for the previous cell type.
+    st.session_state["segment_break_1"] = DEFAULTS["segment_break_1"]
+    st.session_state["segment_break_2"] = DEFAULTS["segment_break_2"]
+    for key in ("arrangement_search", "composition_search", "component_search",
+                "confinement_scan", "exploration"):
+        st.session_state[key] = None
     for key in list(st.session_state.keys()):
         if key.startswith("window_"):
             del st.session_state[key]
@@ -2035,7 +2120,7 @@ def send_cell_to_sheet(manager, fit, date_acquired):
     # Blank for a cell type without sarcomeres: a number in these columns
     # for a myoblast would claim a measurement of something it does not have.
     sarcomere = {"relaxed": "", "at_max": ""}
-    if st.session_state["cell_type"] in FOUR_ELEMENT_TYPES:
+    if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
         relaxed = float(st.session_state["sarcomere_nm"])
         stretch = (1.0 - min(float(hi), 0.999)) ** (
             -0.5 * float(st.session_state["sarcomere_spread"])
@@ -2164,7 +2249,7 @@ def model_from_record(record, curve):
         cell_radius=radius_m,
         membrane_thickness=float(settings.get("membrane_thickness_nm", 4.0)) * 1e-9,
         shell_thickness=float(settings.get("protein_coat_nm", 200.0)) * 1e-9,
-        deep_uses_cell_radius=settings.get("cell_type") in FOUR_ELEMENT_TYPES,
+        deep_uses_cell_radius=settings.get("cell_type") in DEEP_IS_MYOFIBRILS,
         sarcomere_length=float(settings.get("sarcomere_nm", 2100.0)) * 1e-9,
         confinement=float(settings.get("confinement", 0.0)),
         poisson_membrane=float(settings.get("poisson_membrane", 0.5)),
@@ -2400,7 +2485,7 @@ with st.sidebar:
             "assume 8 nm instead of 4 and Eₘ halves, with the data unchanged. The "
             "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
-        if st.session_state["cell_type"] in FOUR_ELEMENT_TYPES:
+        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
             st.number_input(
                 "Protein coat thickness h_p (nm)",
                 min_value=5.0,
@@ -2440,23 +2525,33 @@ with st.sidebar:
         st.slider("Poisson ratio, cytoskeleton νc", 0.0, 0.5, step=0.01, key="poisson_interior")
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
-    with st.expander("🟣 Nucleus"):
+    deep_name = term_name("nucleus")
+    with st.expander(f"🟣 {deep_name}"):
+        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+            st.caption(
+                f"{deep_name} run the length of the cell rather than sitting "
+                f"as a body at its centre, so the deep term uses the cell's "
+                f"own radius and the radius below is not used. It is left "
+                f"here because the geometry is stored with the cell."
+            )
         st.radio(
-            "Nucleus radius",
+            f"{deep_name} radius",
             ["From cell radius", "Manual"],
             key="nucleus_radius_mode",
             horizontal=True,
         )
         if st.session_state["nucleus_radius_mode"] == "From cell radius":
             st.slider(
-                "R_nucleus / R₀", 0.10, 0.90, step=0.01, key="nucleus_fraction"
+                f"{deep_name} radius / R₀", 0.10, 0.90, step=0.01,
+                key="nucleus_fraction"
             )
         else:
             st.number_input(
-                "Nucleus radius (μm)", min_value=0.1, max_value=50.0, step=0.05,
+                f"{deep_name} radius (μm)", min_value=0.1, max_value=50.0, step=0.05,
                 format="%.2f", key="nucleus_radius_um",
             )
-        st.slider("Poisson ratio, nucleus νₙ", 0.0, 0.5, step=0.01, key="poisson_nucleus")
+        st.slider(f"Poisson ratio, {deep_name.lower()} νₙ", 0.0, 0.5, step=0.01,
+                  key="poisson_nucleus")
         st.radio(
             "Onset deformation ε₀",
             ["Scan for best", "Set manually"],
@@ -3019,6 +3114,25 @@ with tab_analysis:
                         )
                     st.session_state["arrangement_search"] = found
                     st.session_state["composition_search"] = found.get("composition")
+
+                    # Which elements the curve actually needs, asked at the
+                    # boundaries the search just chose. Cheap (a fraction of
+                    # a second), and it is the question people most want
+                    # answered: not "how stiff is the nucleus" but "is there
+                    # anything there to measure".
+                    picked = (found.get("composition") or {}) if found.get("success") else {}
+                    st.session_state["component_search"] = recommend_components(
+                        model, 0.0, guided_hi,
+                        candidates=terms_for(st.session_state["cell_type"]),
+                        e1=float(picked.get("break_1",
+                                            st.session_state["segment_break_1"])),
+                        e2=float(picked.get("break_2",
+                                            st.session_state["segment_break_2"])),
+                        membrane=picked.get("membrane", "continue"),
+                        cyto_start=picked.get("cyto_start", "zero"),
+                        weighting=st.session_state["weighting"],
+                        cv_repeats=2,
+                    )
                     if found.get("success"):
                         pending = settings_from_arrangement(found["best"], guided_hi)
                         measured_q = st.session_state.pop(
@@ -3033,11 +3147,11 @@ with tab_analysis:
             with g2:
                 previous = st.session_state.get("arrangement_search")
                 if previous and previous.get("success"):
-                    st.success(previous["verdict"])
-                    rows = [
+                    st.success(retell(previous["verdict"]))
+                    arrangement_rows = [
                         {
-                            "arrangement": row["label"].split(":")[0],
-                            "what it means": row["detail"],
+                            "arrangement": retell(row["label"].split(":")[0]),
+                            "what it means": retell(row["detail"]),
                             "predicts held-out points": f"{row['cv_rmse']:.3g}",
                             "free numbers": row["n_params"],
                             "carries": (
@@ -3048,33 +3162,123 @@ with tab_analysis:
                         }
                         for row in previous["candidates"]
                     ]
-                    flat_table(
-                        pd.DataFrame(rows),
-                        align_right=["predicts held-out points", "free numbers"],
-                    )
-                    st.caption(
-                        "Lower is better in the middle column: it is how far "
-                        "the model misses points it never saw. Where two are "
-                        "close, the one with fewer free numbers wins, because "
-                        "a part the curve cannot see gives a number that will "
-                        "move from cell to cell."
-                    )
+                    with st.expander("How the arrangements compared"):
+                        flat_table(
+                            pd.DataFrame(arrangement_rows),
+                            align_right=["predicts held-out points",
+                                         "free numbers"],
+                        )
+                        st.caption(
+                            "Lower is better in the middle column: it is how "
+                            "far the model misses points it never saw. Where "
+                            "two are close, the one with fewer free numbers "
+                            "wins, because a part the curve cannot see gives "
+                            "a number that will move from cell to cell."
+                        )
                 else:
                     st.info(
                         "Press the button and the answer appears here, with "
                         "the fitted curve below."
                     )
 
+            # ------------------------------------ recommended components
+            # The first thing to read after pressing the button: not how
+            # stiff each part is, but which parts this curve can see at all.
+            picked = st.session_state.get("component_search")
+            if picked and picked.get("success"):
+                names_here = components_for(st.session_state["cell_type"])
+                wanted = picked["recommended"]
+                current = active_terms()
+                agrees = set(wanted) == set(current)
+
+                st.markdown("##### Recommended components")
+                listed = "  ·  ".join(
+                    f"**{names_here[t][0]}**" for t in wanted
+                )
+                if picked["clear_cut"]:
+                    st.success(
+                        f"Use {listed}."
+                        + ("" if not picked["dropped"] else
+                           "  Leave out "
+                           + ", ".join(names_here[t][0].lower()
+                                       for t in picked["dropped"])
+                           + ": this curve shows nothing there to measure.")
+                    )
+                else:
+                    st.info(
+                        f"Use {listed}. Other combinations predict this curve "
+                        f"about as well, so nothing in the data separates "
+                        f"them; this is the smallest of those, which is the "
+                        f"one whose numbers will be steadiest between cells."
+                        + ("" if not picked["dropped"] else
+                           "  Leave out "
+                           + ", ".join(names_here[t][0].lower()
+                                       for t in picked["dropped"]) + ".")
+                    )
+
+                if agrees:
+                    st.caption("That is what is ticked, so nothing to change.")
+                else:
+                    a1, a2 = st.columns([1, 2])
+                    with a1:
+                        if st.button("✓ Use the recommendation", type="primary",
+                                     **STRETCH):
+                            st.session_state["_pending_settings"] = {
+                                f"use_{t}": (t in wanted) for t in ALL_TERMS
+                            }
+                            st.rerun()
+                    with a2:
+                        st.caption(
+                            "Currently ticked: "
+                            + ", ".join(names_here[t][0] for t in current)
+                            + ". Pressing this changes the ticks in Step 2 "
+                            "and refits."
+                        )
+
+                with st.expander("Every combination it tried, and how each did"):
+                    rows = []
+                    for row in picked["candidates"]:
+                        note = []
+                        if row["recommended"]:
+                            note.append("recommended")
+                        elif row["tied_with_best"]:
+                            note.append("ties with it")
+                        for t in row["empty"]:
+                            note.append(f"{names_here[t][0].lower()} came out zero")
+                        rows.append({
+                            "components": " + ".join(
+                                names_here[t][0] for t in row["terms"]
+                            ),
+                            "misses held-out points by": f"{row['cv_rmse']:.3g}",
+                            "R²": f"{row['r_squared']:.5f}",
+                            "free numbers": row["n_params"],
+                            "note": " · ".join(note),
+                        })
+                    flat_table(
+                        pd.DataFrame(rows),
+                        align_right=["misses held-out points by", "R²",
+                                     "free numbers"],
+                    )
+                    st.caption(
+                        "Each row is a full fit with only those elements in "
+                        "it, all at the same boundaries, scored on points it "
+                        "was not fitted to. Adding an element can only ever "
+                        "improve the fit on the points it was fitted to, "
+                        "which is why that number cannot answer this question "
+                        "and held-out error can. An element that comes out at "
+                        "zero was in the fit and did nothing: same answer as "
+                        "leaving it out, one parameter more expensive."
+                    )
+                st.divider()
+
+
             # Everything the button used, under the button rather than in
             # front of it. Open on a curve that has not been fitted yet, shut
             # once there is an answer: by then these are things you change
             # occasionally, not things you read every time.
-            has_answer = bool(
-                (st.session_state.get("arrangement_search") or {}).get("success")
-            )
             with st.expander(
                 "Step 2 · What it used, and what to change",
-                expanded=not has_answer,
+                expanded=False,
             ):
                 st.caption(
                     "Cell height, spring constant, shape and the model "
@@ -3152,6 +3356,16 @@ with tab_analysis:
                 "fail on a curve that changes character partway along.",
             )
             st.caption(MODELS[st.session_state["model_kind"]])
+            if MODEL_KEYS[st.session_state["model_kind"]] == "segmented":
+                st.caption(
+                    "For this cell type, in order: "
+                    + " → ".join(
+                        term_name(t).lower()
+                        for t in terms_for(st.session_state["cell_type"])
+                        if t != "tension"
+                    )
+                    + "."
+                )
             # Only the segmented model implements the membrane's tension
             # spring. Saying so here, where the choice is made, is worth more
             # than saying it in a warning after the fit has already run
@@ -3171,7 +3385,7 @@ with tab_analysis:
                 if st.button("Switch to Segmented", **STRETCH):
                     st.session_state["_pending_settings"] = {
                         "model_kind":
-                            "Segmented (membrane → cytoskeleton → nucleus)"
+                            "Segmented (each part takes over in turn)"
                     }
                     st.rerun()
         with element_col:
@@ -3302,7 +3516,8 @@ with tab_analysis:
                 )
             st.caption(
                 f"→ {COMPOSITION_LABELS[(membrane_mode, cyto_mode)]}. "
-                "The nucleus always joins at ε₂. If you are not sure which of the "
+                f"The {term_name('nucleus').lower()} always joins at ε₂. If "
+                "you are not sure which of the "
                 "four is right, the combination search below tries them all."
             )
         else:
@@ -3635,7 +3850,7 @@ with tab_analysis:
 
             search = st.session_state.get("composition_search")
             if search and search.get("success"):
-                st.info(search["verdict"])
+                st.info(retell(search["verdict"]))
                 shows_tension = any(
                     row.get("use_tension") for row in search["candidates"]
                 )
@@ -3643,7 +3858,7 @@ with tab_analysis:
                     pd.DataFrame(
                         [
                             {
-                                "combination": row["label"],
+                                "combination": retell(row["label"]),
                                 "ε₁": f"{row['break_1']:.3f}",
                                 "ε₂": f"{row['break_2']:.3f}",
                                 **(
@@ -3688,13 +3903,19 @@ with tab_analysis:
                     "error says are not there."
                 )
                 best = search["best"]
-                choice_names = [row["label"] for row in search["candidates"]]
+                # Shown with this cell type's names; matched back on the
+                # model's own label, which is what the candidates carry.
+                shown_to_row = {
+                    retell(row["label"]): row for row in search["candidates"]
+                }
+                choice_names = list(shown_to_row)
+                best_shown = retell(best["label"])
                 a1, a2 = st.columns([2, 1])
                 with a1:
                     picked = st.selectbox(
                         "Override the pick", choice_names,
-                        index=choice_names.index(best["label"])
-                        if best["label"] in choice_names else 0,
+                        index=choice_names.index(best_shown)
+                        if best_shown in choice_names else 0,
                         key="composition_pick",
                         help="The winner is already applied. Use this only to try "
                         "one of the others.",
@@ -3703,15 +3924,14 @@ with tab_analysis:
                     st.markdown("<div style='height:1.7rem'></div>",
                                 unsafe_allow_html=True)
                     if st.button("✓ Use this one instead", **STRETCH):
-                        row = next(
-                            r for r in search["candidates"] if r["label"] == picked
-                        )
+                        row = shown_to_row[picked]
                         st.session_state["_pending_settings"] = stage_combination(row)
                         st.rerun()
                 st.caption(
                     f"Applied: ε₁ = {best['break_1']:.3f}, ε₂ = "
                     f"{best['break_2']:.3f}, "
-                    f"{'with' if best['use_nucleus'] else 'without'} the nucleus."
+                    f"{'with' if best['use_nucleus'] else 'without'} the "
+                    f"{term_name('nucleus').lower()}."
                 )
             elif search:
                 st.error(search.get("error", "The combination search failed."))
@@ -3753,11 +3973,11 @@ with tab_analysis:
                     )
                     with window_cols[i % len(window_cols)]:
                         lo, hi = st.slider(
-                            TERM_LABELS[term], min_value=eps_lo_data,
+                            term_label(term), min_value=eps_lo_data,
                             max_value=eps_hi_data, step=step, key=key,
                         )
                         term_windows[term] = (lo, hi)
-                        st.selectbox(f"Stage for {TERM_LABELS[term]}", [1, 2, 3],
+                        st.selectbox(f"Stage for {term_label(term)}", [1, 2, 3],
                                      key=f"stage_of_{term}", label_visibility="collapsed")
                 stage_plan = []
                 for stage_no, terms in stage_groups(active):
@@ -3779,13 +3999,13 @@ with tab_analysis:
         with r2:
             range_label = "End of the range" if segmented else "Fitted range"
             targets = ["(off)", range_label] + [
-                TERM_LABELS[t] for t in (active if staged else [])
+                term_label(t) for t in (active if staged else [])
             ]
             st.session_state["_drag_keys"] = {
                 range_label: "window_end" if segmented else "window_combined"
             }
             st.session_state["_drag_keys"].update(
-                {TERM_LABELS[t]: f"window_term_{t}" for t in (active if staged else [])}
+                {term_label(t): f"window_term_{t}" for t in (active if staged else [])}
             )
             st.selectbox("Drag on the plot to set", targets, key="drag_target")
 
@@ -3875,7 +4095,7 @@ with tab_analysis:
                                 "ε₂": pre.get("segment_break_2"),
                                 "cell type": pre.get("cell_type", "?"),
                                 "windows": " | ".join(
-                                    " + ".join(TERM_LABELS.get(t, t) for t in st_["terms"])
+                                    " + ".join(term_label(t) for t in st_["terms"])
                                     + f" {st_['range'][0]:.3f} to {st_['range'][1]:.3f}"
                                     for st_ in pre.get("stages", [])
                                 ),
@@ -4073,7 +4293,7 @@ with tab_analysis:
                 )
 
         if comparison and comparison.get("success"):
-            st.info(comparison["verdict"])
+            st.info(retell(comparison["verdict"]))
             flat_table(
                 pd.DataFrame(
                     [
@@ -4220,7 +4440,7 @@ with tab_analysis:
                 windows_for_plot = [
                         {
                             "range": tuple(s["range"]),
-                            "label": " + ".join(TERM_LABELS[t] for t in s["terms"]),
+                            "label": " + ".join(term_label(t) for t in s["terms"]),
                             "color": STAGE_COLORS[i % len(STAGE_COLORS)],
                         }
                         for i, s in enumerate(stage_plan)
@@ -4258,10 +4478,14 @@ with tab_analysis:
             here = terms_for(st.session_state["cell_type"])
             moduli_shown = [
                 row for row in (
-                    ("T₀ network", fit.get("T0_mN_m", 0.0), "mN/m", "tension"),
-                    ("Eₘ membrane", fit.get("Em_MPa", 0.0), "MPa", "membrane"),
-                    ("Ec cytoskeleton", fit.get("Ei_kPa", 0.0), "kPa", "interior"),
-                    ("Eₙ nucleus", fit.get("En_kPa", 0.0), "kPa", "nucleus"),
+                    (f"T₀ {term_name('tension').lower()}",
+                     fit.get("T0_mN_m", 0.0), "mN/m", "tension"),
+                    (f"Eₘ {term_name('membrane').lower()}",
+                     fit.get("Em_MPa", 0.0), "MPa", "membrane"),
+                    (f"Ec {term_name('interior').lower()}",
+                     fit.get("Ei_kPa", 0.0), "kPa", "interior"),
+                    (f"Eₙ {term_name('nucleus').lower()}",
+                     fit.get("En_kPa", 0.0), "kPa", "nucleus"),
                 ) if row[3] in here
             ]
             # Two more columns for the two goodness-of-fit numbers.
@@ -4326,7 +4550,7 @@ with tab_analysis:
             # but it is the check that says whether the myofibril modulus
             # describes muscle doing something muscle does.
             if (
-                st.session_state["cell_type"] in FOUR_ELEMENT_TYPES
+                st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS
                 and hasattr(model, "sarcomere_report")
             ):
                 free = model.sarcomere_report(
@@ -4523,10 +4747,7 @@ with tab_analysis:
                         "range": f"{lo:.3f} to {hi:.3f}",
                         "points": int(inside.sum()),
                     }
-                    short = {
-                        "tension": "tension", "membrane": "membrane",
-                        "interior": "cytoskeleton", "nucleus": "nucleus",
-                    }
+                    short = {t: term_name(t).lower() for t in ALL_TERMS}
                     for term, key, unit in (
                         ("tension", "T0_mN_m", "mN/m"),
                         ("membrane", "Em_MPa", "MPa"),
@@ -4835,7 +5056,7 @@ with tab_analysis:
                     else "n/a",
                 )
                 share_cols[2].metric(
-                    "Nucleus share",
+                    f"{term_name('nucleus')} share",
                     f"{100 * fit['nucleus_fraction_at_max']:.1f} %"
                     if np.isfinite(fit.get("nucleus_fraction_at_max", np.nan))
                     else "n/a",
@@ -4885,7 +5106,7 @@ with tab_analysis:
                                 {
                                     "stage": i + 1,
                                     "terms": ", ".join(
-                                        TERM_LABELS[t] for t in plan["terms"]
+                                        term_label(t) for t in plan["terms"]
                                     ),
                                     "ε window": f"{plan['range'][0]:.3f} to {plan['range'][1]:.3f}",
                                     "points": res["n_points"],
@@ -4930,7 +5151,7 @@ with tab_analysis:
                         st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
 
                 if scan and scan.get("success"):
-                    st.markdown("**Nucleus onset scan**")
+                    st.markdown(f"**{term_name('nucleus')} onset scan**")
                     st.caption(
                         "R² against the assumed onset. A sharp peak means the curve "
                         "locates the nucleus; a flat line means it does not."
