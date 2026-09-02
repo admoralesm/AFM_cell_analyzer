@@ -79,6 +79,7 @@ class PlotStyle:
     show_rupture_marker: bool = True
     show_schematic_moduli: bool = True
     show_legend: bool = True
+    show_data: bool = True
     show_fit_line: bool = True
     show_component_heights: bool = False
     # Axis limits. None means "let plotly decide from the data". x defaults to
@@ -203,7 +204,8 @@ def force_curve_figure(
     else:
         epsilon_plot, y_plot = epsilon, y
 
-    fig.add_trace(
+    if style.show_data:
+        fig.add_trace(
         go.Scatter(
             x=epsilon_plot,
             y=y_plot,
@@ -216,7 +218,7 @@ def force_curve_figure(
             ),
             hovertemplate="ε = %{x:.4f}<br>F = %{y:.4g} " + unit_label + "<extra></extra>",
         )
-    )
+        )
 
     if fit_force_N is not None and style.show_fit_line:
         fx = np.asarray(fit_epsilon if fit_epsilon is not None else epsilon, dtype=float)
@@ -510,13 +512,28 @@ def _hatched_ground(fig, x0, x1, y, depth, color="#2c3e50"):
         x += step
 
 
-def _zigzag(x, y_bottom, y_top, width, coils=6):
-    """Points for a spring drawn between two heights."""
+# One coil is always this tall, whatever the element. A spring drawn with a
+# fixed number of coils stretches its pitch to fill whatever height it has,
+# so a short element and a tall one look like different kinds of spring and
+# cannot be compared by eye. Constant pitch means a shorter element simply
+# has fewer coils, which is what the eye reads as "less travel".
+COIL_PITCH = 7.0
+
+
+def _zigzag(x, y_bottom, y_top, width, coils=None, pitch=COIL_PITCH):
+    """
+    Points for a spring drawn between two heights.
+
+    ``coils`` is derived from the height so every spring in a figure shares
+    the same pitch; pass a number only to override that.
+    """
     span = y_top - y_bottom
-    lead = span * 0.14
+    lead = span * 0.12
     body_bottom, body_top = y_bottom + lead, y_top - lead
+    if coils is None:
+        coils = int(round(max(2.0, (body_top - body_bottom) / max(pitch, 1e-9))))
     xs, ys = [x], [y_bottom]
-    steps = max(2, coils * 2)
+    steps = max(2, int(coils) * 2)
     for i in range(steps + 1):
         ys.append(body_bottom + (body_top - body_bottom) * i / steps)
         # The parentheses matter. Without them Python reads this as
@@ -675,8 +692,7 @@ def cell_schematic(
             note = "locked, no further force"
             top = y_top - block
 
-        xs, ys = _zigzag(x, y_bottom, top, width,
-                         coils=max(3, int(6 * (top - y_bottom) / (y_top - y_bottom))))
+        xs, ys = _zigzag(x, y_bottom, top, width)
         fig.add_trace(
             go.Scatter(
                 x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
