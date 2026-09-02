@@ -496,6 +496,42 @@ def _add_spring(fig, x_center, y_bottom, y_top, width, color, line_width, n_coil
     )
 
 
+def _hatched_ground(fig, x0, x1, y, depth, color="#2c3e50"):
+    """A fixed support drawn the way an engineering diagram draws one."""
+    fig.add_shape(type="line", x0=x0, x1=x1, y0=y, y1=y,
+                  line=dict(color=color, width=4))
+    step = (x1 - x0) / 26.0
+    x = x0
+    while x < x1:
+        fig.add_shape(
+            type="line", x0=x + step * 0.6, x1=x, y0=y, y1=y - depth,
+            line=dict(color=color, width=2),
+        )
+        x += step
+
+
+def _zigzag(x, y_bottom, y_top, width, coils=6):
+    """Points for a spring drawn between two heights."""
+    span = y_top - y_bottom
+    lead = span * 0.14
+    body_bottom, body_top = y_bottom + lead, y_top - lead
+    xs, ys = [x], [y_bottom]
+    steps = max(2, coils * 2)
+    for i in range(steps + 1):
+        ys.append(body_bottom + (body_top - body_bottom) * i / steps)
+        # The parentheses matter. Without them Python reads this as
+        # x + ((...) if 0 < i < steps else x), which appends 2x at the ends
+        # and draws the spring leaning across the page instead of hanging
+        # straight down. That was a real bug, visible as a slanted coil.
+        if 0 < i < steps:
+            xs.append(x + (width / 2 if i % 2 else -width / 2))
+        else:
+            xs.append(x)
+    xs.append(x)
+    ys.append(y_top)
+    return xs, ys
+
+
 def cell_schematic(
     style: PlotStyle,
     epsilon=0.0,
@@ -515,272 +551,186 @@ def cell_schematic(
     break_2=None,
     membrane_mode="freeze",
     cyto_start="break",
+    labels=None,
 ):
     """
-    A small side-on diagram of what is being modelled.
+    The model drawn as a mechanics schematic rather than a picture of a cell.
 
-    Draws the cantilever, the cell squashed to the current deformation, and
-    the parts the three terms describe. The cell is drawn to the real aspect
-    ratio implied by the geometry settings, so a wrong cell height or radius
-    is visible as a shape that does not look like the cell in the video.
-    Volume is held roughly constant as it flattens, which is why it widens.
+    A drawing of a squashed blob with springs in it looks like a cell but does
+    not say what the model computes. This says it: a fixed support, a rigid
+    platen carrying the applied force, and the elements between them in the
+    arrangement the fit actually used.
 
-    ``coupling`` changes the arrangement, because that is the whole point of
-    the setting: in parallel the cytoskeleton spring sits inside the membrane
-    balloon and both are squashed together, while in series the elements are
-    stacked between the plates and each takes its own slice of the squash.
-    ``shares`` maps element name to its fraction of the total deformation and
-    is used to size the stacked elements.
+    Two notations do the work that prose was doing before. An element the
+    plates have not reached yet is drawn with a **gap** above its spring,
+    which is how a contact that starts later is drawn anywhere in mechanics,
+    and the gap is labelled with the deformation at which it closes. An
+    element that has handed over and is holding what it reached is drawn with
+    a **locked block** in series with its spring, meaning it takes no further
+    extension.
 
-    With ``break_1`` and ``break_2`` given, the diagram also shows which
-    elements are carrying load at the deformation on display: the one that is
-    taking up the squash right now is drawn solid, one that has handed over
-    and is merely holding what it reached is greyed, and one that has not been
-    reached yet is faint and dashed. That is the difference between the first
-    two thirds of a compression and what happens once the nucleus is met.
+    ``labels`` maps term name to (title, description) so a cardiomyocyte's
+    parts are named as its own rather than as a generic cell's.
     """
+    names = labels or {
+        "membrane": ("Membrane", ""),
+        "interior": ("Cytoskeleton", ""),
+        "nucleus": ("Nucleus", ""),
+    }
     epsilon = float(np.clip(epsilon, 0.0, 0.95))
-    h = cell_height_um * (1.0 - epsilon)
-    # Constant volume for an oblate shape: R grows as 1/sqrt(1 - eps).
-    r = cell_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3))
-    nucleus_engaged = nucleus_onset is not None and epsilon >= nucleus_onset
 
-    # Keep the drawing filling the panel: the axes are aspect-locked, so an
-    # over-wide x range shrinks the cell into the middle of a lot of white.
-    span = max(cell_radius_um * 1.7, r * 1.35)
-    fig = go.Figure()
+    COLORS = {"membrane": "#1f77b4", "interior": "#e67e22", "nucleus": "#8e44ad"}
+    FADED = {"membrane": "#a9c4d8", "interior": "#f2cda6", "nucleus": "#c9b0d8"}
 
-    # Substrate.
-    fig.add_shape(
-        type="rect", x0=-span, x1=span, y0=-cell_height_um * 0.16, y1=0,
-        fillcolor="#7f8c8d", line=dict(width=0), layer="below",
-    )
-    # Cantilever, resting on top of the cell.
-    fig.add_shape(
-        type="rect", x0=-span * 0.75, x1=span * 0.75, y0=h, y1=h + cell_height_um * 0.13,
-        fillcolor="#566573", line=dict(width=0),
-    )
-
-    membrane_line = max(3, membrane_thickness_nm * 0.9)
-
-    # Which elements are doing what at this deformation. The two composition
-    # settings decide it: whether the membrane keeps stiffening past the first
-    # boundary, and whether the cytoskeleton was already loaded before it.
+    # What each element is doing at the deformation on display.
     if break_1 is not None and break_2 is not None:
         membrane_above = "loading" if membrane_mode == "continue" else "holding"
         cyto_below = "loading" if cyto_start == "zero" else "waiting"
         if epsilon <= break_1:
-            state = {"membrane": "loading", "interior": cyto_below, "nucleus": "waiting"}
-            stage_name = (
-                "Membrane and cytoskeleton" if cyto_below == "loading"
-                else "Membrane alone"
-            )
+            state = {"membrane": "loading", "interior": cyto_below,
+                     "nucleus": "waiting"}
         elif epsilon <= break_2:
-            state = {
-                "membrane": membrane_above, "interior": "loading", "nucleus": "waiting",
-            }
-            stage_name = (
-                "Membrane and cytoskeleton" if membrane_above == "loading"
-                else "Cytoskeleton, membrane holding"
-            )
+            state = {"membrane": membrane_above, "interior": "loading",
+                     "nucleus": "waiting"}
         else:
-            state = {
-                "membrane": membrane_above, "interior": "loading", "nucleus": "loading",
-            }
-            stage_name = (
-                "All three together" if membrane_above == "loading"
-                else "Cytoskeleton and nucleus together"
-            )
+            state = {"membrane": membrane_above, "interior": "loading",
+                     "nucleus": "loading"}
+        onset = {
+            "membrane": 0.0,
+            "interior": 0.0 if cyto_start == "zero" else break_1,
+            "nucleus": break_2,
+        }
     else:
-        state = {"membrane": "loading", "interior": "loading", "nucleus": "loading"}
-        stage_name = None
+        state = {k: "loading" for k in COLORS}
+        onset = {k: 0.0 for k in COLORS}
 
-    LOADING = {"membrane": "#1f77b4", "interior": "#e67e22", "nucleus": "#8e44ad"}
-    FADED = {"membrane": "#aebfcc", "interior": "#f0c9a0", "nucleus": "#cbb2d6"}
+    terms = ["membrane", "interior"] + (["nucleus"] if show_nucleus else [])
+    moduli = {
+        "membrane": (Em_MPa, "MPa", "E<sub>m</sub>"),
+        "interior": (Ei_kPa, "kPa", "E<sub>c</sub>"),
+        "nucleus": (En_kPa, "kPa", "E<sub>n</sub>"),
+    }
+    LAW = {"membrane": "ε³", "interior": "ε³ᐟ²", "nucleus": "ε³ᐟ²"}
 
-    def colour(name):
-        return LOADING[name] if state[name] == "loading" else FADED[name]
+    fig = go.Figure()
+    GROUND_Y, PLATEN_Y = 20.0, 78.0
+    # Labels sit below the hatching, not through it.
+    LABEL_Y = GROUND_Y - 11.0
+    label_size = max(10, style.tick_size - 8)
+    small = max(9, style.tick_size - 10)
 
-    def dash(name):
-        return "dot" if state[name] == "waiting" else None
+    _hatched_ground(fig, 4, 96, GROUND_Y, 8)
+    fig.add_shape(type="rect", x0=6, x1=94, y0=PLATEN_Y, y1=PLATEN_Y + 7,
+                  fillcolor="#566573", line=dict(width=0))
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 3.5, text="<b>cantilever</b>", showarrow=False,
+        font=dict(size=small, color="white"),
+    )
+
+    # Applied force, and how far the cell has been squashed.
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 8, ax=50, ay=PLATEN_Y + 22,
+        xref="x", yref="y", axref="x", ayref="y",
+        showarrow=True, arrowhead=2, arrowsize=1.1, arrowwidth=3,
+        arrowcolor="#2c3e50", text="",
+    )
+    fig.add_annotation(
+        x=53, y=PLATEN_Y + 17, text="<b>F</b>", showarrow=False,
+        font=dict(size=label_size + 2, color="#2c3e50"),
+    )
+    fig.add_annotation(
+        x=50, y=PLATEN_Y + 26,
+        text=f"squashed to <b>ε = {epsilon:.3f}</b>"
+             + (f"  ({epsilon * cell_height_um:.2f} µm of {cell_height_um:.1f})"
+                if cell_height_um else ""),
+        showarrow=False, font=dict(size=label_size, color="#2c3e50"),
+    )
+
+    def draw_element(term, x, y_bottom, y_top, width):
+        """One spring, with a gap or a lock when the model says so."""
+        colour = COLORS[term] if state[term] == "loading" else FADED[term]
+        # The spring itself is always drawn solid. A dotted zigzag reads as a
+        # skewed line rather than as "not engaged", and the gap symbol below
+        # already carries that meaning, which is what it is for.
+        top = y_top
+        note = ""
+
+        if state[term] == "waiting":
+            # A contact that has not closed yet: a real gap, labelled with
+            # the deformation that closes it.
+            gap = (y_top - y_bottom) * 0.22
+            for y in (y_top, y_top - gap):
+                fig.add_shape(type="line", x0=x - width * 0.5, x1=x + width * 0.5,
+                              y0=y, y1=y, line=dict(color=colour, width=3))
+            note = f"gap closes at ε = {onset[term]:.2f}"
+            top = y_top - gap
+        elif state[term] == "holding":
+            # Held at what it reached: a locked block takes no more travel.
+            block = (y_top - y_bottom) * 0.13
+            fig.add_shape(
+                type="rect", x0=x - width * 0.45, x1=x + width * 0.45,
+                y0=y_top - block, y1=y_top,
+                fillcolor=colour, line=dict(color=colour, width=2),
+            )
+            note = "locked, no further force"
+            top = y_top - block
+
+        xs, ys = _zigzag(x, y_bottom, top, width,
+                         coils=max(3, int(6 * (top - y_bottom) / (y_top - y_bottom))))
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+                line=dict(color=colour, width=3),
+            )
+        )
+
+        value, unit, symbol = moduli[term]
+        caption = f"<b>{names[term][0]}</b>"
+        if value is not None and style.show_schematic_moduli:
+            caption += f"<br>{symbol} = {value:.3g} {unit}"
+        caption += f"<br>{LAW[term]}"
+        if note:
+            caption += f"<br><i>{note}</i>"
+        fig.add_annotation(
+            x=x, y=LABEL_Y, text=caption, showarrow=False,
+            yanchor="top", font=dict(size=small, color=colour),
+        )
 
     if coupling == "series":
-        # Stacked between the plates: each element takes its own slice of the
-        # total squash, sized by its share of the deformation.
+        # One column: same force through each, the squashes adding.
         weights = shares or {}
-        order = [("membrane", "#1f77b4")]
-        if show_nucleus:
-            order.append(("nucleus", "#8e44ad"))
-        order.append(("interior", "#e67e22"))
-        total = sum(max(weights.get(k, 1.0 / len(order)), 0.02) for k, _ in order)
-        y = 0.0
-        for name, _ in order:
-            slice_h = h * max(weights.get(name, 1.0 / len(order)), 0.02) / total
-            if name == "membrane":
-                fig.add_shape(
-                    type="rect", x0=-r * 0.9, x1=r * 0.9, y0=y, y1=y + slice_h,
-                    fillcolor="rgba(214,234,248,0.95)",
-                    line=dict(color=colour("membrane"), width=membrane_line),
-                )
-            elif name == "interior":
-                _add_spring(fig, 0.0, y, y + slice_h, r * 0.85, colour("interior"), 4, n_coils=5)
-            else:
-                nr = min(nucleus_radius_um, r * 0.75)
-                fig.add_shape(
-                    type="circle", x0=-nr, x1=nr, y0=y, y1=y + slice_h,
-                    fillcolor="rgba(155,89,182,0.75)"
-                    if state["nucleus"] == "loading" else "rgba(155,89,182,0.25)",
-                    line=dict(color=colour("nucleus"), width=2),
-                )
+        total = sum(max(weights.get(t, 1.0 / len(terms)), 0.05) for t in terms)
+        y = GROUND_Y
+        for term in terms:
+            slice_h = (PLATEN_Y - GROUND_Y) * max(
+                weights.get(term, 1.0 / len(terms)), 0.05
+            ) / total
+            draw_element(term, 40, y, y + slice_h, 16)
             y += slice_h
+        subtitle = "Stacked: same force through each, squashes add"
     else:
-        # The membrane balloon, with one cytoskeleton spring inside it and the
-        # nucleus drawn as a spring of its own.
-        fig.add_shape(
-            type="circle", x0=-r, x1=r, y0=0, y1=h,
-            fillcolor="rgba(214,234,248,0.95)",
-            line=dict(color=colour("membrane"), width=membrane_line,
-                      dash=dash("membrane")),
-            layer="below",
-        )
-        # A spring is drawn only as long as the stretch of the squash it
-        # actually resists. A nucleus that is not met until 40 % of the way
-        # down gets a short spring high in the cell, because a full-height
-        # spring says it has been carrying load the whole time.
-        def spring_span(term):
-            """(bottom, top) for this element's spring, in cell-height units."""
-            if break_1 is None or break_2 is None:
-                return h * 0.15, h * 0.85
-            starts = {
-                "membrane": 0.0,
-                "interior": 0.0 if cyto_start == "zero" else break_1,
-                "nucleus": break_2,
-            }
-            begin = float(np.clip(starts.get(term, 0.0), 0.0, 0.95))
-            # An element that starts late is compressed over less of the
-            # cell's travel, so its spring occupies the top of that travel.
-            # The mapping is deliberately steep: a nucleus first met at 40 %
-            # has done well under half the work the membrane has, and a
-            # spring that looks nearly full length says otherwise.
-            top = h * 0.85
-            travel = h * 0.70 * max(1.0 - begin / 0.65, 0.18)
-            return top - travel, top
+        spacing = 80.0 / max(len(terms), 1)
+        for index, term in enumerate(terms):
+            x = 12 + spacing * (index + 0.5)
+            fig.add_shape(type="line", x0=x, x1=x, y0=PLATEN_Y, y1=PLATEN_Y - 3,
+                          line=dict(color="#2c3e50", width=2))
+            fig.add_shape(type="line", x0=x, x1=x, y0=GROUND_Y, y1=GROUND_Y + 3,
+                          line=dict(color="#2c3e50", width=2))
+            draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3, 13)
+        subtitle = "Side by side: same squash on each, forces add"
 
-        cyto_bottom, cyto_top = spring_span("interior")
-        _add_spring(fig, -r * 0.50, cyto_bottom, cyto_top, r * 0.30,
-                    colour("interior"), 3,
-                    n_coils=5 if cyto_bottom < h * 0.4 else 3)
-
-        if show_nucleus:
-            nr = min(nucleus_radius_um / np.sqrt(max(1.0 - epsilon, 1e-3)), r * 0.40)
-            nh = min(nucleus_radius_um * 2.0 * (1.0 - epsilon * 0.6), h * 0.72)
-            engaged = state["nucleus"] == "loading"
-            fig.add_shape(
-                type="circle",
-                x0=r * 0.16, x1=r * 0.16 + 2 * nr,
-                y0=h / 2 - nh / 2, y1=h / 2 + nh / 2,
-                fillcolor="rgba(155,89,182,0.30)" if engaged else "rgba(155,89,182,0.10)",
-                line=dict(color=colour("nucleus"), width=2, dash="dot"),
-                layer="below",
-            )
-            nucleus_bottom, nucleus_top = spring_span("nucleus")
-            # Keep the spring inside the nucleus outline: a coil poking out of
-            # the body it belongs to reads as a drawing mistake rather than as
-            # "this one engages late".
-            body_bottom, body_top = h / 2 - nh / 2, h / 2 + nh / 2
-            nucleus_top = min(nucleus_top, body_top - nh * 0.06)
-            nucleus_bottom = min(
-                max(nucleus_bottom, body_bottom + nh * 0.06),
-                nucleus_top - nh * 0.15,
-            )
-            fraction = (nucleus_top - nucleus_bottom) / max(nh * 0.88, 1e-9)
-            _add_spring(
-                fig, r * 0.16 + nr, nucleus_bottom, nucleus_top,
-                min(nr * 1.2, r * 0.34), colour("nucleus"), 3,
-                n_coils=max(2, int(round(5 * fraction))),
-            )
-
-    # Height marker.
-    fig.add_annotation(
-        x=r * 1.28, y=h / 2, ax=r * 1.28, ay=h,
-        xref="x", yref="y", axref="x", ayref="y",
-        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#2c3e50",
-        text="",
-    )
-    fig.add_annotation(
-        x=r * 1.28, y=h / 2, ax=r * 1.28, ay=0,
-        xref="x", yref="y", axref="x", ayref="y",
-        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=2, arrowcolor="#2c3e50",
-        text="",
-    )
-    fig.add_annotation(
-        x=r * 1.34, y=h / 2, text=f"<b>{h:.1f} µm</b>", showarrow=False,
-        xanchor="left", font=dict(size=max(10, style.tick_size - 6), color="#2c3e50"),
-    )
-
-    WORD = {"loading": "carrying load", "holding": "holding, no new force",
-            "waiting": "not reached yet"}
-    labels = []
-    if not style.show_schematic_moduli:
-        # The moduli are in the results table anyway; some people want the
-        # diagram to be a diagram and nothing else.
-        Em_MPa = Ei_kPa = En_kPa = None
-    if Em_MPa is not None:
-        labels.append(
-            f"<b>Membrane</b>  E<sub>m</sub> = {Em_MPa:.3g} MPa "
-            f"<i>({WORD[state['membrane']]})</i>"
-        )
-    if Ei_kPa is not None:
-        labels.append(
-            f"<b>Cytoskeleton</b>  E<sub>c</sub> = {Ei_kPa:.3g} kPa "
-            f"<i>({WORD[state['interior']]})</i>"
-        )
-    if show_nucleus and En_kPa is not None:
-        labels.append(
-            f"<b>Nucleus</b>  E<sub>n</sub> = {En_kPa:.3g} kPa "
-            f"<i>({WORD[state['nucleus']]})</i>"
-        )
-    caption = f"ε = {epsilon:.3f}"
-    if break_1 is not None and break_2 is not None and coupling == "parallel":
-        # Worth saying outright, because "segmented" sounds like the elements
-        # take turns in a line. They do not: every element is squashed by the
-        # same ε and their forces add. Segmenting decides when each one
-        # switches on, not how the load travels.
-        caption += (
-            "<br><i>Same squash on each, forces add. Not stacked.</i>"
-        )
-    if labels:
-        caption += "<br>" + "<br>".join(labels)
-
-    # Centred on the axes, not on x = 0: the drawing is offset to leave room
-    # for the height marker, so a caption centred at the origin runs off the
-    # left edge and loses its first characters.
-    fig.add_annotation(
-        x=span * 0.225, y=-cell_height_um * 0.24, text=caption, showarrow=False,
-        xanchor="center", yanchor="top", align="center",
-        font=dict(size=max(10, style.tick_size - 7), color="#2c3e50"),
-    )
-
-    fig.update_xaxes(
-        visible=False, range=[-span, span * 1.45],
-        scaleanchor="y", scaleratio=1, fixedrange=True,
-    )
-    fig.update_yaxes(
-        visible=False,
-        range=[-cell_height_um * 0.80, cell_height_um * 1.10],
-        fixedrange=True,
-    )
+    fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True)
+    fig.update_yaxes(visible=False, range=[LABEL_Y - 26, PLATEN_Y + 34],
+                     fixedrange=True)
     fig.update_layout(
-        height=height or max(300, int(style.height * 0.66)),
-        margin=dict(l=6, r=6, t=28, b=6),
+        height=height or max(340, int(style.height * 0.74)),
+        margin=dict(l=6, r=6, t=30, b=6),
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
-        title=dict(text="<b>%s</b>" % (
-            stage_name if stage_name
-            else "Stacked in a line: same force, squashes add" if coupling == "series"
-            else "Side by side: same squash, forces add" if coupling == "parallel"
-            else "Load path changes partway"),
-                   font=dict(size=max(12, style.tick_size - 4), color="black"), x=0.5,
-                   xanchor="center"),
+        title=dict(
+            text=f"<b>{subtitle}</b>",
+            font=dict(size=max(11, style.tick_size - 5), color="black"),
+            x=0.5, xanchor="center",
+        ),
     )
     return fig
 
