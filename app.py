@@ -335,6 +335,7 @@ DEFAULTS = {
     # The last successful fit, kept so a rerun (uploading a video, ticking a
     # box, changing tab) does not wipe the results off the page.
     "_last_fit": None,
+    "_plot_png": None,
     "_last_fit_signature": None,
     # video
     "video_path": None,
@@ -414,30 +415,15 @@ def save_plot_controls(figure, fit, date_acquired):
     """
     Offer the figure as a file, named after the cell.
 
-    PNG needs a headless browser, which is present on some deployments and
-    not others, so it is offered only when it actually works and HTML is
-    always there. An HTML figure keeps its vector text and stays zoomable,
-    which is usually the better thing to keep anyway.
+    HTML is always available and costs nothing: it is the figure object
+    serialised. PNG is not offered until asked for, because rendering one
+    means starting a headless browser, which takes seconds. Doing that on
+    every script run made the whole app feel slow, since Streamlit reruns
+    the script on every widget touch.
     """
     st.markdown("**Save the plot**")
-    png = None
-    try:
-        png = figure.to_image(format="png", width=1400, height=900, scale=2)
-    except Exception:
-        png = None
-
-    if png:
-        st.download_button(
-            "🖼️ Save as PNG",
-            data=png,
-            file_name=suggested_plot_name(
-                st.session_state["cell_name"], fit, date_acquired, ".png"
-            ),
-            mime="image/png",
-            **STRETCH,
-        )
     st.download_button(
-        "🖼️ Save as HTML" if png else "🖼️ Save the plot",
+        "🖼️ Save as HTML",
         data=figure.to_html(include_plotlyjs="cdn"),
         file_name=suggested_plot_name(
             st.session_state["cell_name"], fit, date_acquired, ".html"
@@ -445,13 +431,34 @@ def save_plot_controls(figure, fit, date_acquired):
         mime="text/html",
         **STRETCH,
     )
-    st.caption(
-        "Named after the cell, the date and the moduli."
-        if png else
-        "Named after the cell, the date and the moduli. PNG export is not "
-        "available on this deployment; the camera icon on the chart still "
-        "saves one, and the HTML keeps the text sharp at any size."
-    )
+
+    if st.button("🖼️ Prepare a PNG", **STRETCH):
+        try:
+            with st.spinner("Rendering…"):
+                st.session_state["_plot_png"] = figure.to_image(
+                    format="png", width=1400, height=900, scale=2
+                )
+        except Exception as exc:
+            st.session_state["_plot_png"] = None
+            st.caption(
+                "PNG export is not available on this deployment "
+                f"({type(exc).__name__}). The camera icon on the chart still "
+                "saves one, and the HTML keeps the text sharp at any size."
+            )
+
+    png = st.session_state.get("_plot_png")
+    if png:
+        st.download_button(
+            "⬇️ Download the PNG",
+            data=png,
+            file_name=suggested_plot_name(
+                st.session_state["cell_name"], fit, date_acquired, ".png"
+            ),
+            mime="image/png",
+            type="primary",
+            **STRETCH,
+        )
+    st.caption("Named after the cell, the date and the moduli.")
 
 
 def show_fit_maths(fit, model):
@@ -3502,45 +3509,37 @@ with tab_analysis:
                 panel_cols = []
 
             with plot_col:
-                st.plotly_chart(
-                    force_curve_figure(
-                        epsilon,
-                        force_N,
-                        style,
-                        **figure_kwargs(
-                            force_curve_figure,
-                            title=st.session_state["cell_name"]
-                            or "Force vs relative deformation",
-                            fit_force_N=fitted,
-                            membrane_N=membrane,
-                            interior_N=interior,
-                            nucleus_N=nucleus,
-                            fit_window=windows_for_plot,
-                            rupture_epsilon=rupture.get("epsilon")
-                            if rupture.get("method") == "force-drop"
-                            else None,
-                            highlight=highlight
-                            if (video_ready or show_schematic) else None,
-                            highlight_window=highlight_window,
-                        ),
+                # Built once and reused for the save button. Building it twice
+                # doubled the work on every rerun for two identical figures.
+                figure = force_curve_figure(
+                    epsilon,
+                    force_N,
+                    style,
+                    **figure_kwargs(
+                        force_curve_figure,
+                        title=st.session_state["cell_name"]
+                        or "Force vs relative deformation",
+                        fit_force_N=fitted,
+                        membrane_N=membrane,
+                        interior_N=interior,
+                        nucleus_N=nucleus,
+                        fit_window=windows_for_plot,
+                        rupture_epsilon=rupture.get("epsilon")
+                        if rupture.get("method") == "force-drop"
+                        else None,
+                        highlight=highlight
+                        if (video_ready or show_schematic) else None,
+                        highlight_window=highlight_window,
                     ),
+                )
+                st.plotly_chart(
+                    figure,
                     key="main_fit_plot",
                     **plot_selection_kwargs(),
                     **STRETCH,
                 )
                 apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
 
-                figure = force_curve_figure(
-                    epsilon, force_N, style,
-                    **figure_kwargs(
-                        force_curve_figure,
-                        title=st.session_state["cell_name"]
-                        or "Force vs relative deformation",
-                        fit_force_N=fitted,
-                        membrane_N=membrane, interior_N=interior,
-                        nucleus_N=nucleus, fit_window=windows_for_plot,
-                    ),
-                )
                 o1, o2 = st.columns([2, 1])
                 with o1:
                     with st.expander("🎛️ Plot options", expanded=False):
