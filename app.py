@@ -21,12 +21,14 @@ import streamlit as st
 from lulevich_model import (
     LulevichModel,
     compare_couplings,
+    compare_hypotheses,
     dropped_term_warning,
     recommend_components,
     search_arrangements,
 )
 from plot_utils import (
     FORCE_UNITS,
+    balloon_figure,
     INPUT_FORCE_UNITS,
     PlotStyle,
     autoscale_unit,
@@ -323,6 +325,7 @@ DEFAULTS = {
     "show_video_marker": True,
     "show_rupture_marker": True,
     "show_schematic": True,
+    "schematic_style": "Mechanics schematic",
     "show_schematic_moduli": True,
     "plot_width": 2.4,
     # geometry / model
@@ -344,6 +347,8 @@ DEFAULTS = {
     "confinement": 0.0,
     "confinement_scan": None,
     "component_search": None,
+    "hypothesis_search": None,
+    "guided_window_start": 0.0,
     # Acquisition, recorded with the cell rather than used by the fit.
     "probe_diameter_um": 0.0,
     "approach_speed_um_s": 2.0,
@@ -474,6 +479,7 @@ if st.session_state.pop("_start_new_cell", False):
         "data", "results", "_last_fit", "_last_fit_signature", "_plot_png",
         "cell_name", "cell_notes", "exploration", "composition_search",
         "arrangement_search", "component_search", "confinement_scan",
+        "hypothesis_search", "_auto_picked", "_auto_notes",
         "video_path", "video_info", "video_track",
         "video_name", "video_link", "eps_percent_fix",
         "video_saved_frame", "video_saved_frame_index",
@@ -726,6 +732,51 @@ def show_fit_maths(fit, model):
             r"\varepsilon^{3/2} + A_n E_n \langle \varepsilon - "
             r"\varepsilon_0 \rangle^{3/2}"
         )
+
+    # Every element, its law, and what that law does to the slope. The
+    # exponent is the checkable part: a log-log slope is something you can
+    # read off the curve yourself and hold the model to.
+    q = float(st.session_state.get("confinement", 0.0) or 0.0)
+    laws = []
+    for term, symbol, power, shape in (
+        ("tension", "T₀", 1.0, "A_t T₀ ε"),
+        ("membrane", "Eₘ", 3.0, "A_m Eₘ ε³"),
+        ("interior", "Ec", 1.5, "A_i Ec ε³ᐟ²"),
+        ("nucleus", "Eₙ", 1.5, "A_n Eₙ ⟨ε − ε₂⟩³ᐟ²"),
+    ):
+        if term not in terms:
+            continue
+        laws.append({
+            "element": term_name(term),
+            "what it contributes": shape + (f" × (1−ε)^−{q:g}" if q else ""),
+            "slope near contact": f"{power:g}",
+            "slope at ε = 0.6": (
+                f"{power + q * 0.6 / 0.4:.2f}" if q else f"{power:g}"
+            ),
+        })
+    if laws:
+        st.markdown("**1b · What each element does to the slope**")
+        flat_table(
+            pd.DataFrame(laws),
+            align_right=["slope near contact", "slope at ε = 0.6"],
+        )
+        st.caption(
+            "The slope is d(ln F)/d(ln ε), which is what you read off a "
+            "log-log plot, and it is the part of this you can check by hand: "
+            "measure the slope of your own curve near contact and it should "
+            "land between the smallest and largest listed here. Confinement "
+            "adds qε/(1−ε) to every one of them, which is why the measured "
+            "slope climbs along the curve instead of sitting on a constant. "
+            + (f"Here q = {q:g}." if q else "Here q = 0, so it does not.")
+        )
+        if any(t in terms for t in ("interior", "nucleus")) and "membrane" in terms:
+            st.caption(
+                "Two elements with the same exponent and the same starting "
+                "point cannot be separated by any fit, however good: they are "
+                "one element wearing two names. That is why the two interior "
+                "layers are given different onsets and the two membrane "
+                "springs different laws."
+            )
 
     st.markdown("**2 · The geometry, fixed before fitting**")
     st.latex(
@@ -1550,6 +1601,78 @@ COMPONENT_SETS = {
 }
 DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 
+# The pictures of the cell the app will actually test, in the words they
+# would be argued in. Each is a claim a person can agree or disagree with,
+# not a setting they have to translate, and the search reports which of them
+# the curve supports rather than reporting four abstract compositions.
+#
+# For a ventricular cardiomyocyte the claim is that the membrane and the
+# cortical actin under it are welded together through the costameres and
+# load as one layer from first contact, with the myofibrils met deeper in.
+# That is what an exponent near 1.7 at first contact means: not a membrane
+# alone, which would give 3, but a shell and a Hertzian network together.
+HYPOTHESES = {
+    "Cardiomyocyte": [
+        {
+            "key": "coupled",
+            "label": "Membrane and cortical actin together, then myofibrils",
+            "detail": "one outer layer from first contact, myofibrils at ε₂",
+            "terms": ("membrane", "interior", "nucleus"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "coupled_prestin",
+            "label": "…and a horizontal spring in the membrane (prestin)",
+            "detail": "the same, plus an in-plane spring taut from contact",
+            "terms": ("tension", "membrane", "interior", "nucleus"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "coupled_no_deep",
+            "label": "Membrane and cortical actin together, nothing deeper",
+            "detail": "no separate myofibril layer is reached",
+            "terms": ("membrane", "interior"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "handover",
+            "label": "Membrane alone first, then the cytoskeleton takes over",
+            "detail": "the myoblast picture, for comparison",
+            "terms": ("membrane", "interior", "nucleus"),
+            "membrane": "freeze", "cyto_start": "break",
+        },
+    ],
+    "Myoblast (C2C12)": [
+        {
+            "key": "handover",
+            "label": "Membrane first, then cytoskeleton, then nucleus",
+            "detail": "each takes over from the last",
+            "terms": ("membrane", "interior", "nucleus"),
+            "membrane": "freeze", "cyto_start": "break",
+        },
+        {
+            "key": "coupled",
+            "label": "Membrane and cytoskeleton together, then the nucleus",
+            "detail": "both load from first contact",
+            "terms": ("membrane", "interior", "nucleus"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "no_nucleus",
+            "label": "Membrane and cytoskeleton only",
+            "detail": "the nucleus is never reached",
+            "terms": ("membrane", "interior"),
+            "membrane": "freeze", "cyto_start": "break",
+        },
+    ],
+}
+
+
+def hypotheses_for(cell_type):
+    """The named pictures to test for this cell type, if any are defined."""
+    return HYPOTHESES.get(cell_type, [])
+
+
 # Cell types whose deep element is myofibrils running the length of the cell
 # rather than a compact nucleus at its centre. Decides which radius the deep
 # prefactor uses, and it is also exactly the set with no nucleus term.
@@ -1635,9 +1758,10 @@ CELL_TYPES = {
         "membrane_thickness_nm": 8.0,
         "nucleus_onset": 0.18,
         "cell_shape": "Belt cylinder (a rod lying down)",
-        # Fitted from that curve; see confinement_factor. Not a constant of
-        # nature, so the app offers to measure it per cell.
-        "confinement": 1.30,
+        # The mean of four corrected WT curves, which fitted at 0.85, 1.10,
+        # 1.20 and 1.20. Not a constant of nature, so the app measures it per
+        # cell; this is only where it starts.
+        "confinement": 1.10,
         "expected": {"Em": (5e4, 5e7), "Ei": (1e2, 1e5), "En": (5e2, 2e5)},
         "windows": {"membrane": (0.0, 0.35), "interior": (0.0, 0.35),
                     "nucleus": (0.35, 1.0)},
@@ -1698,8 +1822,9 @@ def apply_cell_type(name):
     st.session_state["segment_break_1"] = DEFAULTS["segment_break_1"]
     st.session_state["segment_break_2"] = DEFAULTS["segment_break_2"]
     for key in ("arrangement_search", "composition_search", "component_search",
-                "confinement_scan", "exploration"):
+                "confinement_scan", "hypothesis_search", "exploration"):
         st.session_state[key] = None
+    st.session_state.pop("_auto_picked", None)
     for key in list(st.session_state.keys()):
         if key.startswith("window_"):
             del st.session_state[key]
@@ -2618,8 +2743,19 @@ with st.sidebar:
         st.checkbox(
             "Cell diagram",
             key="show_schematic",
-            help="A side-on sketch of the membrane, cytoskeleton and nucleus at "
-            "the deformation you select.",
+            help="The model drawn as a mechanics schematic at the deformation "
+            "you select: a fixed support, the cantilever, and the elements "
+            "between them.",
+        )
+        st.radio(
+            "Draw it as",
+            ["Mechanics schematic", "Balloon with a spring inside"],
+            key="schematic_style", horizontal=True,
+            disabled=not st.session_state["show_schematic"],
+            help="The schematic says what the model computes. The balloon "
+            "says what it is about: a taut skin holding an interior, "
+            "flattened between two plates and spreading sideways because it "
+            "keeps its volume. Same numbers, same deformation.",
         )
         st.checkbox(
             "Moduli under the diagram", key="show_schematic_moduli",
@@ -3005,6 +3141,91 @@ with tab_analysis:
         auto_range = model.auto_detect_elastic_range()
         rupture = model.results.get("rupture", {})
 
+        eps_hi_data = float(epsilon.max())
+        # ---------------------------------------------------- pick it all
+        # As soon as a curve is loaded, choose the range, the elements and
+        # the picture of the cell, and say which was chosen. Waiting for a
+        # button meant every curve started from settings that belonged to
+        # the last one, and the first thing on screen was a fit nobody had
+        # asked for. Keyed on the data and the cell type, so it happens once
+        # per curve and never fights a choice made by hand afterwards.
+        auto_key = (
+            data["source"], int(epsilon.size), round(float(force_N[-1]), 15),
+            st.session_state["cell_type"],
+        )
+        if st.session_state.get("_auto_picked") != auto_key:
+            st.session_state["_auto_picked"] = auto_key
+            pending = {}
+            notes = []
+
+            window = (
+                model.suggest_window() if hasattr(model, "suggest_window") else {}
+            )
+            if window.get("success"):
+                pending["guided_window_end"] = round(window["epsilon_max"], 4)
+                pending["guided_window_start"] = (
+                    round(window["epsilon_min"], 4)
+                    if window.get("bad_contact") else 0.0
+                )
+                pending["window_end"] = round(window["epsilon_max"], 4)
+                pending["window_combined"] = (
+                    round(window["epsilon_min"], 4),
+                    round(window["epsilon_max"], 4),
+                )
+                notes.append(window["why_start"])
+                if window.get("bad_contact"):
+                    notes.append("**the approach misbehaved near contact**")
+
+            picks = hypotheses_for(st.session_state["cell_type"])
+            chosen = None
+            if picks and hasattr(model, "suggest_window"):
+                lo = window.get("epsilon_min", 0.0) if window.get("success") else 0.0
+                hi = window.get("epsilon_max", eps_hi_data) if window.get("success") \
+                    else eps_hi_data
+                if st.session_state["cell_shape"].startswith("Belt") and hasattr(
+                    model, "scan_confinement"
+                ):
+                    found_q = model.scan_confinement(
+                        lo, hi, e1=0.15, e2=0.40, membrane="continue",
+                        cyto_start="zero", use_nucleus=True,
+                        weighting=st.session_state["weighting"],
+                    )
+                    if found_q.get("success"):
+                        model.confinement = float(found_q["q"])
+                        pending["confinement"] = round(float(found_q["q"]), 2)
+                        st.session_state["confinement_scan"] = found_q
+                try:
+                    chosen = compare_hypotheses(
+                        model, lo, hi, picks,
+                        weighting=st.session_state["weighting"],
+                        cv_repeats=2, n_grid=8,
+                    )
+                except Exception:
+                    chosen = None
+            if chosen and chosen.get("success"):
+                st.session_state["hypothesis_search"] = chosen
+                winner = chosen["best"]
+                pending.update({
+                    "model_kind": "Segmented (each part takes over in turn)",
+                    "membrane_after_break": next(
+                        k for k, v in MEMBRANE_CHOICES.items()
+                        if v == winner["membrane"]
+                    ),
+                    "cyto_starts_at": next(
+                        k for k, v in CYTO_CHOICES.items()
+                        if v == winner["cyto_start"]
+                    ),
+                    "segment_break_1": round(float(winner["break_1"]), 4),
+                    "segment_break_2": round(float(winner["break_2"]), 4),
+                })
+                for term in ALL_TERMS:
+                    pending[f"use_{term}"] = term in winner["terms"]
+            if pending:
+                st.session_state["_auto_notes"] = notes
+                st.session_state["_pending_settings"] = pending
+                st.rerun()
+
+
         eps_lo_data = float(max(epsilon.min(), 0.0))
         eps_hi_data = float(epsilon.max())
         step = max((eps_hi_data - eps_lo_data) / 200.0, 1e-4)
@@ -3051,7 +3272,60 @@ with tab_analysis:
                 )
             )
             guided_hi = float(st.session_state["guided_window_end"])
+            # Normally zero, because the model describes a cell from first
+            # contact. It moves only when the approach itself misbehaved, and
+            # then it says so rather than quietly dropping the first third of
+            # the curve.
+            guided_lo = float(np.clip(
+                st.session_state.get("guided_window_start", 0.0),
+                0.0, max(guided_hi - float(step), 0.0),
+            ))
             chosen = active_terms()
+
+            # What was chosen for you, before anything was pressed.
+            guess = st.session_state.get("hypothesis_search")
+            if guess and guess.get("success"):
+                winner = guess["best"]
+                st.markdown("##### What this curve looks like")
+                (st.success if guess["clear_cut"] else st.info)(retell(guess["verdict"]))
+                notes = st.session_state.get("_auto_notes") or []
+                st.caption(
+                    "Chosen automatically when the curve loaded: the range "
+                    f"(ε = {guided_lo:.3f} to {guided_hi:.3f}, "
+                    f"{'; '.join(notes) if notes else 'the whole curve'}), "
+                    "the elements, and where each takes over. Press the "
+                    "button below to search harder, or change anything in "
+                    "Step 2."
+                )
+                rows = []
+                for row in guess["candidates"]:
+                    mark = []
+                    if row["chosen"]:
+                        mark.append("chosen")
+                    elif row["tied_with_best"]:
+                        mark.append("fits just as well")
+                    for t in row["empty"]:
+                        mark.append(f"{term_name(t).lower()} came out zero")
+                    rows.append({
+                        "picture of the cell": retell(row["label"]),
+                        "what it says": retell(row["detail"]),
+                        "misses held-out points by": f"{row['cv_rmse']:.3g}",
+                        "R²": f"{row['r_squared']:.5f}",
+                        "verdict": " · ".join(mark),
+                    })
+                with st.expander("The pictures it compared, and how each did"):
+                    flat_table(
+                        pd.DataFrame(rows),
+                        align_right=["misses held-out points by", "R²"],
+                    )
+                    st.caption(
+                        "Each row is a claim about the cell, fitted in full "
+                        "and scored on points it was not fitted to. The "
+                        "boundaries are fitted inside each one, since where "
+                        "a layer is met is not part of the claim."
+                    )
+                st.divider()
+
 
             st.markdown("#### Step 1 · Fit it")
             st.caption(
@@ -3080,7 +3354,7 @@ with tab_analysis:
                     ):
                         with st.spinner("Measuring how confined the cell is…"):
                             q_found = model.scan_confinement(
-                                0.0, guided_hi,
+                                guided_lo, guided_hi,
                                 e1=float(st.session_state["segment_break_1"]),
                                 e2=float(st.session_state["segment_break_2"]),
                                 membrane="continue", cyto_start="zero",
@@ -3099,7 +3373,7 @@ with tab_analysis:
                         "every way the parts can share the boundaries…"
                     ):
                         found = search_arrangements(
-                            model, 0.0, guided_hi, terms=chosen,
+                            model, guided_lo, guided_hi, terms=chosen,
                             weighting=st.session_state["weighting"],
                             # Where the cell type says the membrane is two
                             # springs, that is the structure to place the
@@ -3122,7 +3396,7 @@ with tab_analysis:
                     # anything there to measure".
                     picked = (found.get("composition") or {}) if found.get("success") else {}
                     st.session_state["component_search"] = recommend_components(
-                        model, 0.0, guided_hi,
+                        model, guided_lo, guided_hi,
                         candidates=terms_for(st.session_state["cell_type"]),
                         e1=float(picked.get("break_1",
                                             st.session_state["segment_break_1"])),
@@ -3135,6 +3409,7 @@ with tab_analysis:
                     )
                     if found.get("success"):
                         pending = settings_from_arrangement(found["best"], guided_hi)
+                        pending["window_combined"] = (guided_lo, guided_hi)
                         measured_q = st.session_state.pop(
                             "_confinement_from_search", None
                         )
@@ -3322,11 +3597,26 @@ with tab_analysis:
                     "be cut before the drop. Everything from 0 up to here is used."
                 )
                 st.slider(
-                    "Analyse from ε = 0 up to",
+                    f"Analyse from ε = {guided_lo:.3f} up to",
                     min_value=float(step), max_value=eps_hi_data, step=step,
                     key="guided_window_end",
                 )
-                inside = int(((epsilon >= 0.0) & (epsilon <= guided_hi)).sum())
+                if guided_lo > 0:
+                    st.warning(
+                        f"This curve is fitted from ε = {guided_lo:.3f}, not "
+                        f"from zero, because the approach misbehaved before "
+                        f"that: the force ran up and then fell back, which is "
+                        f"a probe catching or a cell slipping rather than a "
+                        f"soft cell. Fitting through it drives the membrane "
+                        f"modulus to zero. Set this to 0 to fit the whole "
+                        f"curve anyway and see for yourself.",
+                        icon="⚠️",
+                    )
+                    st.slider(
+                        "Start the fit at ε =", 0.0, min(0.5, guided_hi - float(step)),
+                        step=step, key="guided_window_start",
+                    )
+                inside = int(((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum())
                 st.caption(
                     f"{inside} of {epsilon.size} points. "
                     + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
@@ -3630,7 +3920,16 @@ with tab_analysis:
             # membrane term is ε³ measured from ε = 0, so a range that starts
             # anywhere else is fitting a curve the model does not describe.
             # Only the far end is yours to choose.
-            fit_lo = 0.0
+            #
+            # The exception is a curve where the approach itself misbehaved.
+            # Points from a probe that caught and slipped are not first
+            # contact, they are not the cell, and including them drives the
+            # membrane modulus to zero. That start is set once when the curve
+            # loads, is shown, and can be put back to zero.
+            fit_lo = float(np.clip(
+                st.session_state.get("guided_window_start", 0.0),
+                0.0, max(float(st.session_state["window_end"]) - step, 0.0),
+            )) if guided else 0.0
             st.session_state["window_end"] = float(
                 np.clip(
                     st.session_state.get("window_end", eps_hi_data),
@@ -4952,44 +5251,64 @@ with tab_analysis:
             panel_index = 0
             if show_schematic and panel_index < len(panel_cols):
                 with panel_cols[panel_index]:
-                    st.plotly_chart(
-                        cell_schematic(
-                            style,
-                            **figure_kwargs(
-                                cell_schematic,
-                                coupling=(
-                                    "series" if fitted_coupling == "series"
-                                    else "hybrid" if fitted_coupling == "hybrid"
-                                    else "parallel"
+                    if st.session_state["schematic_style"].startswith("Balloon"):
+                        st.plotly_chart(
+                            balloon_figure(
+                                style,
+                                **figure_kwargs(
+                                    balloon_figure,
+                                    epsilon=selected_eps,
+                                    cell_height_um=st.session_state["cell_height_um"],
+                                    labels=components_for(
+                                        st.session_state["cell_type"]
+                                    ),
+                                    show_nucleus="nucleus" in active,
+                                    show_tension="tension" in active,
+                                    deep_onset=fit.get("break_2"),
                                 ),
-                                shares=deformation_shares,
-                                epsilon=selected_eps,
-                                cell_height_um=st.session_state["cell_height_um"],
-                                cell_radius_um=fit["R0"] * 1e6,
-                                nucleus_radius_um=fit.get(
-                                    "R_nucleus", fit["R0"] * 0.35
-                                ) * 1e6,
-                                membrane_thickness_nm=st.session_state[
-                                    "membrane_thickness_nm"
-                                ],
-                                nucleus_onset=model.nucleus_onset
-                                if "nucleus" in active else None,
-                                break_1=fit.get("break_1"),
-                                break_2=fit.get("break_2"),
-                                membrane_mode=fit.get("membrane", "freeze"),
-                                cyto_start=fit.get("cyto_start", "break"),
-                                labels=components_for(st.session_state["cell_type"]),
-                                Em_MPa=fit["Em_MPa"],
-                                Ei_kPa=fit["Ei_kPa"],
-                                En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
-                                T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
-                                show_nucleus="nucleus" in active,
-                                show_tension="tension" in active,
                             ),
-                        ),
-                        key="schematic_plot",
-                        **STRETCH,
-                    )
+                            key="balloon_plot",
+                            **STRETCH,
+                        )
+                    else:
+                        st.plotly_chart(
+                            cell_schematic(
+                                style,
+                                **figure_kwargs(
+                                    cell_schematic,
+                                    coupling=(
+                                        "series" if fitted_coupling == "series"
+                                        else "hybrid" if fitted_coupling == "hybrid"
+                                        else "parallel"
+                                    ),
+                                    shares=deformation_shares,
+                                    epsilon=selected_eps,
+                                    cell_height_um=st.session_state["cell_height_um"],
+                                    cell_radius_um=fit["R0"] * 1e6,
+                                    nucleus_radius_um=fit.get(
+                                        "R_nucleus", fit["R0"] * 0.35
+                                    ) * 1e6,
+                                    membrane_thickness_nm=st.session_state[
+                                        "membrane_thickness_nm"
+                                    ],
+                                    nucleus_onset=model.nucleus_onset
+                                    if "nucleus" in active else None,
+                                    break_1=fit.get("break_1"),
+                                    break_2=fit.get("break_2"),
+                                    membrane_mode=fit.get("membrane", "freeze"),
+                                    cyto_start=fit.get("cyto_start", "break"),
+                                    labels=components_for(st.session_state["cell_type"]),
+                                    Em_MPa=fit["Em_MPa"],
+                                    Ei_kPa=fit["Ei_kPa"],
+                                    En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                                    T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
+                                    show_nucleus="nucleus" in active,
+                                    show_tension="tension" in active,
+                                ),
+                            ),
+                            key="schematic_plot",
+                            **STRETCH,
+                        )
                 panel_index += 1
 
             if video_ready and panel_index < len(panel_cols):
