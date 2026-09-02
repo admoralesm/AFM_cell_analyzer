@@ -205,6 +205,11 @@ class GoogleSheetsManager:
         ("experiment_date", "Experiment Date"),
         ("cell_height", "Cell Height (μm)"),
         ("spring_constant", "Spring Constant, K (N/m)"),
+        # The membrane's in-plane tension, written before the moduli because
+        # it is the first spring to answer. Blank for a cell type whose
+        # membrane is modelled as one spring, which is not the same as zero.
+        ("T0", "Membrane tension (T₀, mN/m)"),
+        ("T0_range", "T₀ range (ε)"),
         ("Em", "Young's Modulus (Em, MPa)"),
         ("Em_range", "Em range (ε)"),
         ("Ei", "Young's Modulus (Ei, kPa)"),
@@ -228,6 +233,7 @@ class GoogleSheetsManager:
         ("cell_radius", "Cell radius R₀ (μm)"),
         ("nucleus_radius", "Nucleus radius (μm)"),
         ("membrane_thickness", "Membrane thickness (nm)"),
+        ("protein_coat", "Protein coat thickness (nm)"),
         ("poisson", "Poisson (membrane / interior)"),
         ("force_curve_created", "Force Curve Created"),
         ("analysis_status", "Analysis Status"),
