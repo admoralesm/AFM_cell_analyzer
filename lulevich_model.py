@@ -1708,6 +1708,111 @@ class _CompositionMixin:
             )
         return [message]
 
+    def suggest_window(self, max_epsilon=None, drawdown=0.5, noise_multiple=8.0):
+        """
+        Where to start and stop fitting, from the curve itself.
+
+        Two different things go wrong at the two ends, so they are found two
+        different ways.
+
+        Near contact the trouble is not noise, it is the approach: the probe
+        catches, or the cell slips, or the contact point is wrong, and the
+        force runs up and then falls back. That is not a soft cell, it is a
+        bad contact, and no model should be asked to describe it. It shows as
+        a drawdown, a peak followed by a fall to well below it, and the fit
+        should start after the force has climbed back past that peak. On one
+        of the WT curves this is the difference between R² = 0.995 with the
+        membrane driven to zero and R² = 0.99999 with it at 2.5 MPa.
+
+        Where there is no such excursion the start is simply where the force
+        first clears the baseline noise, because below that there is nothing
+        to fit.
+
+        At the far end the trouble is rupture, which is already detected, and
+        past about 70 % the geometry stops describing a cell at all.
+
+        Parameters
+        ----------
+        drawdown : float
+            How far the force must fall below a preceding peak, as a
+            fraction of it, to count as a bad contact rather than noise.
+        noise_multiple : float
+            How far above the baseline scatter the force must be for the
+            curve to be carrying signal.
+        """
+        eps, force = self.epsilon, self.force
+        if eps.size < 20:
+            return {"success": False, "error": "Too few points."}
+        top = float(eps.max() if max_epsilon is None else max_epsilon)
+
+        # ---- baseline noise, from the flattest tenth nearest contact
+        head = force[eps <= max(eps.min() + 0.05, np.percentile(eps, 5))]
+        noise = (
+            float(np.median(np.abs(np.diff(head))) / np.sqrt(2))
+            if head.size > 4 else 0.0
+        )
+        floor = max(noise * noise_multiple, 0.0)
+        above = np.flatnonzero(force > floor)
+        start = float(eps[above[0]]) if above.size else float(eps.min())
+
+        # ---- a bad contact: a run-up followed by a fall
+        # Only looked for in the first half; a drop later on is rupture,
+        # which is a different thing found a different way.
+        look = eps <= min(0.5 * top, 0.35)
+        bad_contact = None
+        if look.sum() > 20:
+            e_head, f_head = eps[look], force[look]
+            peak_so_far = np.maximum.accumulate(f_head)
+            # Where the force sits well below the highest it has reached.
+            fallen = f_head < peak_so_far * (1.0 - float(drawdown))
+            # And that peak has to be real, not a single noisy point.
+            fallen &= peak_so_far > floor * 3.0
+            if fallen.any():
+                worst = int(np.flatnonzero(fallen)[-1])
+                recovered = np.flatnonzero(force > peak_so_far[worst])
+                recovered = recovered[eps[recovered] > e_head[worst]]
+                if recovered.size:
+                    bad_contact = {
+                        "epsilon": float(e_head[worst]),
+                        "peak_N": float(peak_so_far[worst]),
+                        "trough_N": float(f_head[worst]),
+                        "resume": float(eps[recovered[0]]),
+                    }
+                    start = max(start, bad_contact["resume"])
+
+        # ---- the far end
+        rupture = self.detect_rupture_point()
+        end = top
+        note_end = "the end of the curve"
+        if rupture.get("epsilon") is not None and rupture.get("method") == "force-drop":
+            end = min(end, float(rupture["epsilon"]) * 0.98)
+            note_end = f"just before the force drop at ε = {rupture['epsilon']:.3f}"
+        if end > 0.70:
+            end = min(end, 0.70)
+            note_end = "ε = 0.70, past which the geometry stops describing a cell"
+
+        if not (start < end):
+            start, end = float(eps.min()), top
+            bad_contact = None
+
+        inside = int(((eps >= start) & (eps <= end)).sum())
+        return {
+            "success": inside >= 20,
+            "epsilon_min": float(start),
+            "epsilon_max": float(end),
+            "n_points": inside,
+            "noise_N": noise,
+            "bad_contact": bad_contact,
+            "why_start": (
+                f"after the bad contact at ε = {bad_contact['epsilon']:.3f}, "
+                f"where the force fell from {bad_contact['peak_N'] * 1e9:.0f} "
+                f"to {bad_contact['trough_N'] * 1e9:.0f} nN"
+                if bad_contact else
+                "where the force first clears the baseline scatter"
+            ),
+            "why_end": note_end,
+        }
+
     def scan_confinement(
         self, epsilon_min, epsilon_max, e1=None, e2=None,
         membrane="continue", cyto_start="zero", use_nucleus=True,
@@ -3613,6 +3718,181 @@ def _aicc(ss_res, n, k):
     if n <= 0 or ss_res <= 0 or n - k - 1 <= 0:
         return float("nan")
     return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+
+
+def compare_hypotheses(
+    model, epsilon_min, epsilon_max, hypotheses, weighting="uniform",
+    n_folds=5, seed=0, cv_repeats=3, n_grid=9, refine_rounds=1,
+):
+    """
+    Score a list of named, stated pictures of the cell against the curve.
+
+    The composition search asks an abstract question: which of four ways of
+    sharing the boundaries fits best. This asks a concrete one: of these
+    particular stories about this particular cell, which does the curve
+    support. They are the same arithmetic and a different conversation, and
+    the second is the one worth having with a biologist, because each
+    candidate is a sentence they can agree or disagree with rather than a
+    setting they have to translate.
+
+    Each hypothesis is a dict with ``key``, ``label``, ``terms``, and the
+    composition it asserts (``membrane`` and ``cyto_start``). Its breakpoints
+    are fitted, since where the deeper layer is met is not part of the claim.
+
+    Scored on held-out error, and where two are indistinguishable the one
+    with fewer free moduli is returned, with the tie reported rather than
+    hidden: two stories the data cannot separate are two stories the data
+    cannot separate, and saying so is the answer.
+    """
+    lo, hi = float(epsilon_min), float(epsilon_max)
+    eps_all, force_all, _ = model._select(lo, hi)
+    n = eps_all.size
+    if n < 20:
+        return {"success": False, "error": f"Only {n} points; need at least 20."}
+
+    fold_sets = []
+    for repeat in range(max(1, int(cv_repeats))):
+        rng = np.random.default_rng(seed + repeat)
+        fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
+
+    rows = []
+    for spec in hypotheses:
+        terms = tuple(spec.get("terms") or ())
+        if not terms:
+            continue
+        flags = {
+            "use_membrane": "membrane" in terms,
+            "use_interior": "interior" in terms,
+            "use_nucleus": "nucleus" in terms,
+            "use_tension": "tension" in terms,
+        }
+        membrane = spec.get("membrane", "continue")
+        cyto_start = spec.get("cyto_start", "zero")
+
+        best = model._best_breakpoints(
+            lo, hi, membrane, cyto_start, flags["use_nucleus"], weighting,
+            n_grid, refine_rounds, use_tension=flags["use_tension"],
+        ) if flags["use_nucleus"] else model.fit_composition(
+            lo, hi, model.segment_break_1, model.segment_break_2,
+            membrane, cyto_start, weighting=weighting, **flags
+        )
+        if best is None or not best.get("success"):
+            continue
+        # _best_breakpoints only varies the two boundaries; the terms it was
+        # asked for are whatever the flags said, so refit once to be sure the
+        # winner carries exactly this hypothesis's elements.
+        whole = model.fit_composition(
+            lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
+            weighting=weighting, **flags
+        )
+        if not whole.get("success"):
+            continue
+
+        per_repeat = []
+        for folds in fold_sets:
+            errors = []
+            for fold in folds:
+                if fold.size == 0 or fold.size >= n - 3:
+                    continue
+                keep = np.ones(n, dtype=bool)
+                keep[fold] = False
+                sub = model._clone(force_all[keep], eps_all[keep])
+                trained = sub.fit_composition(
+                    lo, hi, whole["break_1"], whole["break_2"], membrane,
+                    cyto_start, weighting=weighting, with_stats=False, **flags
+                )
+                if not trained.get("success"):
+                    continue
+                basis = model.composition_basis(
+                    eps_all[fold], whole["break_1"], whole["break_2"],
+                    membrane, cyto_start,
+                )
+                predicted = (
+                    basis["membrane"] * trained["Em"]
+                    + basis["tension"] * trained.get("T0", 0.0)
+                    + basis["interior"] * trained["Ei"]
+                    + basis["nucleus"] * trained["En"]
+                    + trained.get("force_offset", 0.0)
+                )
+                errors.append(
+                    float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                )
+            if errors:
+                per_repeat.append(float(np.mean(errors)))
+
+        rows.append({
+            "key": spec.get("key", spec.get("label", "?")),
+            "label": spec.get("label", "?"),
+            "detail": spec.get("detail", ""),
+            "terms": terms,
+            "membrane": membrane,
+            "cyto_start": cyto_start,
+            "break_1": whole["break_1"],
+            "break_2": whole["break_2"],
+            "cv_rmse": float(np.mean(per_repeat)) if per_repeat else float("nan"),
+            "cv_spread": float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+            "r_squared": whole["r_squared"],
+            "n_params": whole["n_params"],
+            "T0_mN_m": whole.get("T0_mN_m", 0.0),
+            "Em_MPa": whole["Em_MPa"],
+            "Ec_kPa": whole["Ei_kPa"],
+            "En_kPa": whole["En_kPa"],
+            "empty": tuple(
+                t for t, v in (
+                    ("tension", whole.get("T0_mN_m", 0.0)),
+                    ("membrane", whole["Em_MPa"]),
+                    ("interior", whole["Ei_kPa"]),
+                    ("nucleus", whole["En_kPa"]),
+                ) if t in terms and v <= 0
+            ),
+            "fit": whole,
+        })
+
+    usable = [r for r in rows if np.isfinite(r["cv_rmse"])]
+    if not usable:
+        return {"success": False, "error": "No hypothesis produced a usable fit."}
+
+    usable.sort(key=lambda r: r["cv_rmse"])
+    lowest = usable[0]
+    tolerance = max(
+        0.05 * lowest["cv_rmse"],
+        lowest["cv_spread"] + max(r["cv_spread"] for r in usable),
+    )
+    tied = [r for r in usable[1:] if r["cv_rmse"] - lowest["cv_rmse"] <= tolerance]
+    best = min([lowest] + tied,
+               key=lambda r: (len(r["empty"]), r["n_params"], r["cv_rmse"]))
+    for row in usable:
+        row["chosen"] = row is best
+        row["tied_with_best"] = row is not best and (row in tied or row is lowest)
+
+    if tied:
+        others = ", ".join(f"“{r['label']}”" for r in [lowest] + tied
+                           if r is not best)
+        verdict = (
+            f"**{best['label']}** is the pick, but {others} predicts this "
+            f"curve just as well, so this curve cannot tell them apart. Of "
+            f"the ones it cannot separate this is the simplest."
+        )
+    else:
+        verdict = (
+            f"**{best['label']}** describes this curve better than the "
+            f"alternatives, clear of them all."
+        )
+    if best["empty"]:
+        verdict += (
+            " Note that " + " and ".join(best["empty"])
+            + " came out at zero inside it, so that element is carrying "
+            "nothing here."
+        )
+
+    return {
+        "success": True,
+        "candidates": usable,
+        "best": best,
+        "verdict": verdict,
+        "clear_cut": not tied,
+        "tie_tolerance": float(tolerance),
+    }
 
 
 def recommend_components(
