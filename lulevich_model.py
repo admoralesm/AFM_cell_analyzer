@@ -1207,13 +1207,20 @@ def noise_sigma(epsilon, force, window=21):
     # One difference per point: pad the last so lengths line up.
     diffs = np.append(diffs, diffs[-1] if diffs.size else np.nan)
 
+    # A rolling median, vectorised. The obvious Python loop over points is
+    # O(n * window) and this runs inside the breakpoint search, which fits
+    # hundreds of candidates: at three thousand points the loop turned a
+    # half-second search into well over a minute.
     half = max(2, int(window) // 2)
-    local = np.empty(n)
-    for index in range(n):
-        lo, hi = max(0, index - half), min(n, index + half + 1)
-        chunk = diffs[lo:hi]
-        chunk = chunk[np.isfinite(chunk)]
-        local[index] = np.median(chunk) if chunk.size else np.nan
+    filled = np.where(np.isfinite(diffs), diffs, np.nanmedian(diffs))
+    try:
+        from scipy.ndimage import median_filter
+
+        local = median_filter(filled, size=2 * half + 1, mode="nearest")
+    except Exception:  # pragma: no cover - scipy is a hard dependency
+        local = np.array(
+            [np.median(filled[max(0, i - half):i + half + 1]) for i in range(n)]
+        )
 
     local = local / 0.6745 / np.sqrt(2.0)
     finite = local[np.isfinite(local) & (local > 0)]
@@ -1312,6 +1319,7 @@ class _CompositionMixin:
         weighting="uniform",
         use_membrane=True,
         use_interior=True,
+        with_stats=True,
     ):
         """
         Exact linear fit of one composition at fixed breakpoints.
@@ -1320,6 +1328,11 @@ class _CompositionMixin:
         than fitted and ignored. That matters: an unwanted column still soaks
         up force, so leaving it in and hiding the answer would change the
         moduli that are reported.
+
+        ``with_stats=False`` skips chi-squared and the noise estimate. The
+        breakpoint search compares candidates on residual sum alone and calls
+        this hundreds of times, so it does not pay for statistics it will
+        throw away; the winner is refitted once with them.
         """
         eps, force, mask = self._select(epsilon_min, epsilon_max)
         wanted = {
@@ -1362,7 +1375,18 @@ class _CompositionMixin:
         ss_res = float(np.sum(residuals ** 2))
         # The two breakpoints are free parameters too, so they count against
         # the degrees of freedom that reduced chi-squared divides by.
-        stats = fit_statistics(force, predicted, n_params + 2, epsilon=eps)
+        if with_stats:
+            stats = fit_statistics(force, predicted, n_params + 2, epsilon=eps)
+        else:
+            ss_tot = float(np.sum((force - force.mean()) ** 2))
+            stats = {
+                "r_squared": 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
+                "adj_r_squared": float("nan"),
+                "chi_squared": float("nan"),
+                "chi_squared_reduced": float("nan"),
+                "noise_sigma": float("nan"),
+                "dof": int(eps.size - n_params - 2),
+            }
         r_squared = stats["r_squared"]
 
         return {
@@ -1434,7 +1458,8 @@ class _CompositionMixin:
                     if e2 <= e1 + gap:
                         continue
                     trial = self.fit_composition(
-                        lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+                        lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
+                        weighting, with_stats=False,
                     )
                     if not trial.get("success"):
                         continue
@@ -1454,6 +1479,12 @@ class _CompositionMixin:
                 max(lo + gap, best["break_2"] - step_2),
                 min(hi - 1e-4, best["break_2"] + step_2),
                 max(5, int(n_grid) // 2),
+            )
+        if best is not None:
+            # One full fit for the winner, so the caller gets the statistics.
+            best = self.fit_composition(
+                lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
+                use_nucleus, weighting,
             )
         return best
 
@@ -1533,6 +1564,7 @@ class _CompositionMixin:
                     moved = self.fit_composition(
                         lo, hi, e1_try, e2_try, composition["membrane"],
                         composition["cyto_start"], use_nucleus, weighting,
+                        with_stats=False,
                     )
                     if moved.get("success") and abs(
                         moved["ss_res"] - best_here["ss_res"]
@@ -1557,7 +1589,7 @@ class _CompositionMixin:
                         trained = sub.fit_composition(
                             lo, hi, best_here["break_1"], best_here["break_2"],
                             composition["membrane"], composition["cyto_start"],
-                            use_nucleus, weighting,
+                            use_nucleus, weighting, with_stats=False,
                         )
                         if not trained.get("success"):
                             continue
