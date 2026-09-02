@@ -1377,12 +1377,66 @@ class _CompositionMixin:
             np.minimum(eps, e1), 0.0, None
         )
         start = 0.0 if cyto_start == "zero" else float(e1)
+        # Confinement multiplies every term, because it is not a property of
+        # any one of them: it is the cell running out of room. See
+        # confinement_factor.
+        squeeze = self.confinement_factor(eps)
         return {
-            "membrane": self.Am * held ** 3,
-            "tension": self.At * held,
-            "interior": self.Ai * np.clip(eps - start, 0.0, None) ** 1.5,
-            "nucleus": self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5,
+            "membrane": self.Am * held ** 3 * squeeze,
+            "tension": self.At * held * squeeze,
+            "interior": (
+                self.Ai * np.clip(eps - start, 0.0, None) ** 1.5 * squeeze
+            ),
+            "nucleus": (
+                self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5 * squeeze
+            ),
         }
+
+    def confinement_factor(self, epsilon):
+        """
+        The stiffening that comes from the cell running out of room: (1-e)^-q.
+
+        Every term in the model is a small-strain law. They describe a cell
+        that is being deformed, not one that is being flattened into the
+        substrate, and past about half its height a real cell does something
+        none of them can: it stiffens faster than any fixed power of e. On
+        the WT cardiomyocyte curve the measured local exponent climbs from 3
+        near e = 0.2 to 5.3 by e = 0.7, and nothing built from e, e^1.5 and
+        e^3 can follow that.
+
+        What is happening is geometric. The cell keeps its volume, so as it
+        is flattened it has to go somewhere sideways, and how easily it can
+        is what sets how fast the force runs away. One factor (1-e)^-q on
+        every term carries it, and q is that "how easily":
+
+            q = 0    the classic Lulevich small-strain model: the cell gets
+                     out of the way freely and nothing runs away. Correct
+                     near contact, and what a sphere at small strain wants.
+            q = 1/2  a sphere at constant volume spreading equally in every
+                     in-plane direction, so its radius grows as (1-e)^-1/2.
+            q = 3    a cylinder whose cross-section is rigidly incompressible
+                     and whose length cannot change: the stadium limit, which
+                     is the stiffest the geometry allows.
+
+        A real attached cell lies between the last two: it is confined more
+        than a freely spreading sphere and less than a rigid cylinder,
+        because it sheds some volume as it is squeezed. The WT cardiomyocyte
+        here sits at q = 1.3, and finding q from the curve rather than
+        assuming it is what :meth:`scan_confinement` is for.
+
+        q multiplies every term rather than the membrane alone. That is not
+        a fitting convenience: running out of room is a property of the cell,
+        not of one spring inside it. Fitted both ways on the WT curve, on
+        every term is the better description (chi-squared per point 1163
+        against 1376).
+        """
+        if not self.confinement:
+            return 1.0
+        # Clipped short of 1: the factor is a description of a cell being
+        # flattened, not of one that has been flattened to nothing, and the
+        # pole at e = 1 is outside anything the model claims.
+        eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, 0.98)
+        return (1.0 - eps) ** (-float(self.confinement))
 
     def fit_composition(
         self,
@@ -1397,6 +1451,7 @@ class _CompositionMixin:
         use_membrane=True,
         use_interior=True,
         use_tension=False,
+        fit_offset=False,
         with_stats=True,
     ):
         """
@@ -1411,6 +1466,12 @@ class _CompositionMixin:
         breakpoint search compares candidates on residual sum alone and calls
         this hundreds of times, so it does not pay for statistics it will
         throw away; the winner is refitted once with them.
+
+        ``fit_offset`` adds a constant. Every term here is zero at zero
+        deformation, so a curve whose baseline sits a little off zero cannot
+        be matched near contact by any combination of them, and the solver
+        answers by tilting the moduli instead. The offset is the one column
+        allowed to go negative, because a baseline can err either way.
         """
         eps, force, mask = self._select(epsilon_min, epsilon_max)
         wanted = {
@@ -1419,8 +1480,8 @@ class _CompositionMixin:
             "interior": bool(use_interior),
             "nucleus": bool(use_nucleus),
         }
-        n_params = sum(wanted.values())
-        if n_params == 0:
+        n_params = sum(wanted.values()) + (1 if fit_offset else 0)
+        if sum(wanted.values()) == 0:
             return self._failure("No elements selected.")
         if eps.size < n_params + 1:
             return self._failure(f"Only {eps.size} points in the fitted range.")
@@ -1431,7 +1492,10 @@ class _CompositionMixin:
         c_basis = bases["interior"]
         n_basis = bases["nucleus"]
         order = [name for name in COMPOSITION_TERMS if wanted[name]]
-        design = np.column_stack([bases[name] for name in order])
+        columns = [bases[name] for name in order]
+        if fit_offset:
+            columns.append(np.ones_like(eps))
+        design = np.column_stack(columns)
 
         if weighting == "relative":
             scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
@@ -1441,10 +1505,15 @@ class _CompositionMixin:
         design_w, target_w = design * weights[:, None], force * weights
         col_norm = np.linalg.norm(design_w, axis=0)
         col_norm[col_norm == 0] = 1.0
+        # Moduli cannot be negative; a baseline offset can.
+        low = np.zeros(design.shape[1])
+        if fit_offset:
+            low[-1] = -np.inf
         solution = lsq_linear(
-            design_w / col_norm, target_w, bounds=(0.0, np.inf), method="bvls"
+            design_w / col_norm, target_w, bounds=(low, np.inf), method="bvls"
         )
         params = solution.x / col_norm
+        offset = float(params[-1]) if fit_offset else 0.0
         values = dict(zip(order, (float(v) for v in params)))
         Em = values.get("membrane", 0.0)
         T0 = values.get("tension", 0.0)
@@ -1472,7 +1541,9 @@ class _CompositionMixin:
                         worst_corr = float(corr[i, j])
                         worst_pair = (order[i], order[j])
 
-        predicted = m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En
+        predicted = (
+            m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En + offset
+        )
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
 
@@ -1490,12 +1561,21 @@ class _CompositionMixin:
                 try:
                     # A modulus pinned at the zero bound is not a free
                     # parameter; leaving it in makes the matrix singular.
-                    free = [i for i, v in enumerate(solution.x) if v > 0]
+                    # The offset is free whatever its sign; a modulus that
+                    # hit the zero bound is not a free parameter.
+                    free = [
+                        i for i, v in enumerate(solution.x)
+                        if v > 0 or (fit_offset and i == len(solution.x) - 1)
+                    ]
                     if free:
                         sub = scaled[:, free]
                         cov = (ss_res / dof_here) * np.linalg.inv(sub.T @ sub)
+                        # The design matrix can carry one column that is not
+                        # a term: the offset, appended last. Naming it here
+                        # rather than indexing past the end of `order`.
+                        names = list(order) + (["force_offset"] if fit_offset else [])
                         for slot, index in enumerate(free):
-                            errors[order[index]] = float(
+                            errors[names[index]] = float(
                                 np.sqrt(max(cov[slot, slot], 0.0)) / col_norm[index]
                             )
                 except np.linalg.LinAlgError:
@@ -1534,7 +1614,7 @@ class _CompositionMixin:
             "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
             "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
             "T0_mN_m_std": errors.get("tension", float("nan")) * 1e3,
-            "force_offset": 0.0,
+            "force_offset": offset,
             "break_1": float(e1), "break_2": float(e2),
             "Km": Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)),
             "Km_kT": (Em * self.h_membrane ** 3 / (12.0 * (1.0 - self.nu_m ** 2)))
@@ -1554,7 +1634,7 @@ class _CompositionMixin:
             "epsilon_range": [float(epsilon_min), float(epsilon_max)],
             "terms": list(order),
             "weighting": weighting,
-            "fit_offset": False,
+            "fit_offset": bool(fit_offset),
             "condition_number": condition,
             "corr_Em_Ei": float("nan"),
             "worst_pair": worst_pair,
@@ -1624,6 +1704,107 @@ class _CompositionMixin:
                 f"rather than each on its own."
             )
         return [message]
+
+    def scan_confinement(
+        self, epsilon_min, epsilon_max, e1=None, e2=None,
+        membrane="continue", cyto_start="zero", use_nucleus=True,
+        use_tension=False, weighting="uniform",
+        q_values=None, refine=True,
+    ):
+        """
+        Find the confinement exponent q from the curve.
+
+        q is the one number in the model that is not a modulus, and it cannot
+        be fitted alongside them in the same linear solve because it sits in
+        the exponent. So it is profiled: fit the moduli exactly at each
+        candidate q, and keep the q whose fit is best. That is cheap, because
+        each candidate is one bounded least-squares solve.
+
+        Returns the trials, the winner, and the range of q that fits the
+        curve about as well, which is the part worth reading. A minimum that
+        is 0.4 wide is a curve that does not really determine q.
+        """
+        lo, hi = float(epsilon_min), float(epsilon_max)
+        e1 = self.segment_break_1 if e1 is None else float(e1)
+        e2 = self.segment_break_2 if e2 is None else float(e2)
+        grid = (
+            np.arange(0.0, 3.01, 0.1) if q_values is None
+            else np.asarray(q_values, dtype=float)
+        )
+        original = self.confinement
+        rows = []
+        try:
+            for q in grid:
+                self.confinement = float(q)
+                trial = self.fit_composition(
+                    lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
+                    weighting, use_tension=use_tension, with_stats=False,
+                )
+                if trial.get("success"):
+                    rows.append({"q": float(q), "ss_res": trial["ss_res"],
+                                 "r_squared": trial["r_squared"]})
+            if not rows:
+                return {"success": False, "error": "No usable fit at any q."}
+            best = min(rows, key=lambda r: r["ss_res"])
+
+            if refine:
+                step = float(grid[1] - grid[0]) if grid.size > 1 else 0.1
+                fine = np.linspace(max(0.0, best["q"] - step),
+                                   best["q"] + step, 21)
+                for q in fine:
+                    self.confinement = float(q)
+                    trial = self.fit_composition(
+                        lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
+                        weighting, use_tension=use_tension, with_stats=False,
+                    )
+                    if trial.get("success"):
+                        rows.append({"q": float(q), "ss_res": trial["ss_res"],
+                                     "r_squared": trial["r_squared"]})
+                best = min(rows, key=lambda r: r["ss_res"])
+
+            # How well determined it is: every q whose residual is within
+            # what the noise allows of the best.
+            self.confinement = best["q"]
+            full = self.fit_composition(
+                lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+                use_tension=use_tension,
+            )
+        finally:
+            self.confinement = original
+
+        dof = max(int(full.get("dof") or 1), 1)
+        ceiling = best["ss_res"] * (1.0 + 2.0 / dof)
+        inside = [r["q"] for r in rows if r["ss_res"] <= ceiling]
+        rows.sort(key=lambda r: r["q"])
+        return {
+            "success": True,
+            "q": best["q"],
+            "q_low": float(min(inside)) if inside else best["q"],
+            "q_high": float(max(inside)) if inside else best["q"],
+            "trials": rows,
+            "fit": full,
+            "r_squared": full.get("r_squared"),
+            "chi_squared_reduced": full.get("chi_squared_reduced"),
+            # What the classic model would have managed, for comparison. The
+            # number that says whether q was worth introducing at all.
+            "baseline": self._confinement_baseline(
+                lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
+                weighting, use_tension,
+            ),
+        }
+
+    def _confinement_baseline(self, lo, hi, e1, e2, membrane, cyto_start,
+                              use_nucleus, weighting, use_tension):
+        """The same fit with q = 0, so the gain from q can be quoted."""
+        original = self.confinement
+        try:
+            self.confinement = 0.0
+            return self.fit_composition(
+                lo, hi, e1, e2, membrane, cyto_start, use_nucleus, weighting,
+                use_tension=use_tension,
+            )
+        finally:
+            self.confinement = original
 
     def breakpoint_spread(
         self, lo, hi, e1, e2, membrane, cyto_start, use_nucleus=True,
@@ -2076,6 +2257,7 @@ class _CompositionMixin:
             shell_thickness=self.h_shell,
             deep_uses_cell_radius=self.deep_uses_cell_radius,
             sarcomere_length=self.L_sarcomere,
+            confinement=self.confinement,
             poisson_membrane=self.nu_m,
             poisson_interior=self.nu_i,
             nucleus_radius=self.R_nucleus,
@@ -2108,6 +2290,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         poisson_nucleus=0.5,
         nucleus_onset=0.15,
         sarcomere_length=2.1e-6,
+        confinement=0.0,
         expected_ranges=None,
         active_windows=None,
         segment_break_1=0.15,
@@ -2139,6 +2322,10 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         sarcomere_length : float
             Relaxed sarcomere length in metres, 2.1 um for cardiac muscle.
             Used only by :meth:`sarcomere_at`, never by the fit.
+        confinement : float
+            Exponent q in the stiffening factor (1 - e)^-q applied to every
+            term. 0 is the classic small-strain Lulevich model. See
+            :meth:`confinement_factor`.
         nucleus_onset : float
             Relative deformation at which the plates begin to feel the nucleus.
             Below it the nucleus term is exactly zero. See
@@ -2205,6 +2392,9 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
         )
         self.nucleus_onset = float(nucleus_onset)
+        # See `confinement_factor` for what this is and why it is not zero
+        # for a cell that cannot get out of the way.
+        self.confinement = float(confinement)
         # Relaxed sarcomere length. Nothing in the fit uses it; it turns the
         # fitted deformation into a length a muscle physiologist can judge.
         self.L_sarcomere = float(sarcomere_length)
