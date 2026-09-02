@@ -1054,10 +1054,13 @@ def case_component_names_follow_the_cell_type():
     cardio = app_module.components_for("Cardiomyocyte")
     check("the myoblast interior is the cytoskeleton",
           myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
-    check("the cardiomyocyte interior is the myofibril bundle",
-          cardio["interior"][0].startswith("Myofibril"), str(cardio["interior"]))
-    check("and it is described as one stiff body",
-          "one stiff" in cardio["interior"][1], str(cardio["interior"]))
+    check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
+          "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
+    check("and a sarcomeric, contractile one",
+          "Sarcomeric" in cardio["nucleus"][0]
+          and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
+    check("the two are described as different things",
+          cardio["interior"][1] != cardio["nucleus"][1])
     check("the cardiomyocyte shell is named for holding fluid",
           "fluid" in cardio["membrane"][1], str(cardio["membrane"]))
     check("an unknown cell type still gets names",
@@ -1071,24 +1074,17 @@ def case_component_names_follow_the_cell_type():
     check("the plain-language table is there", len(parts) == 1)
     if parts:
         listed = list(parts[0]["Part of the cell"])
-        check("it says myofibrils, not cytoskeleton",
-              any(v.startswith("Myofibril") for v in listed)
-              and "Cytoskeleton" not in listed, str(listed))
-        row = parts[0][parts[0]["Part of the cell"] == "Nucleus"]
-        check("the nucleus is not fitted for a cardiomyocyte",
-              len(row) == 1 and str(row.iloc[0]["Stiffness"]).startswith("0"),
-              str(list(row.iloc[0])) if len(row) else "no nucleus row")
-    check("the nucleus term is switched off for a cardiomyocyte",
-          app.session_state["use_nucleus"] is False,
-          str(app.session_state["use_nucleus"]))
-    check("the fit still succeeds with two terms",
+        check("it lists both kinds of cytoskeleton",
+              any("Non-sarcomeric" in v for v in listed)
+              and any(v == "Sarcomeric cytoskeleton" for v in listed), str(listed))
+        check("and never calls anything a nucleus",
+              not any("Nucleus" in v for v in listed), str(listed))
+    check("the fit succeeds for a cardiomyocyte",
           app.session_state["_last_fit"] is not None
           and app.session_state["_last_fit"].get("success"))
     fit = app.session_state["_last_fit"]
     if fit:
-        check("only two terms were fitted",
-              set(fit["terms"]) == {"membrane", "interior"}, str(fit["terms"]))
-        check("and it still follows the data",
+        check("and it follows the data",
               fit["r_squared"] > 0.9, f"R2={fit['r_squared']:.4f}")
 
 
@@ -1260,6 +1256,125 @@ def case_png_is_not_rendered_every_run():
           str([d.label for d in app.get("download_button")]))
 
 
+def case_guided_order_is_parts_then_work_it_out():
+    print("Step 1 picks the parts, Step 2 works it out")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "guided order"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("Step 1 names the parts",
+          "Step 1 · Which parts of the cell" in text, text[:150])
+    check("Step 2 is the button",
+          "Step 2 · Work it out" in text, text[:150])
+    check("Step 1 comes before Step 2",
+          text.index("Step 1 ·") < text.index("Step 2 ·"))
+
+    # The part checkboxes must exist exactly once, in Step 1.
+    labels = [c.label for c in app.checkbox]
+    for term in ("Membrane", "Cytoskeleton", "Nucleus"):
+        matching = [l for l in labels if l and l.startswith(term)]
+        check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
+
+    # Unticking a part must disable the button rather than fail later.
+    for term in ("membrane", "interior", "nucleus"):
+        app.session_state[f"use_{term}"] = False
+    app.run()
+    if no_exception(app, "no parts selected"):
+        work = button_by_label(app, "Work it out for me")
+        check("with nothing ticked the button is disabled",
+              work is not None and work.disabled is True)
+
+
+def case_it_picks_the_arrangement():
+    print("the search chooses segmented, side by side or stacked")
+    from lulevich_model import LulevichModel as LM, search_arrangements
+
+    eps = np.linspace(0.001, 0.60, 300)
+
+    def segmented():
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+        return m * 0.6e6 + c * 1.2e3 + nu * 3e3
+
+    def side_by_side():
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        return g.combined_model(eps, 0.6e6, 1.2e3, 0.0, En=0.0)
+
+    for name, maker, expected in (
+        ("a segmented curve", segmented, "segmented"),
+        ("a side-by-side curve", side_by_side, "parallel"),
+    ):
+        force = maker() * (
+            1 + 0.01 * np.random.default_rng(0).standard_normal(eps.size)
+        )
+        model = LM(force, eps, cell_height=8.0e-6)
+        found = search_arrangements(model, 0.0, 0.60)
+        check(f"{name}: the search ran", found.get("success"),
+              str(found.get("error")))
+        if not found.get("success"):
+            continue
+        picked = found["best"]["arrangement"]
+        tied = {c["arrangement"] for c in found["candidates"]
+                if c.get("tied_with_best")} | {picked}
+        check(f"{name} is called {expected}", expected in tied,
+              f"picked {picked}, tied {tied}")
+        check(f"{name}: all three arrangements were tried",
+              len(found["candidates"]) == 3, str(len(found["candidates"])))
+        check(f"{name}: the verdict is in plain words",
+              "curve" in found["verdict"].lower(), found["verdict"][:80])
+
+    # The winner has to translate into settings the app can apply.
+    import app as app_module
+    for arrangement, expected_model in (
+        ("segmented", "Segmented"),
+        ("series", "Stacked"),
+        ("parallel", "Side by side"),
+    ):
+        pending = app_module.settings_from_arrangement(
+            {"arrangement": arrangement,
+             "composition": {"membrane": "freeze", "cyto_start": "break",
+                             "break_1": 0.15, "break_2": 0.40,
+                             "use_nucleus": True}},
+            0.6,
+        )
+        check(f"{arrangement} maps to a real model name",
+              pending["model_kind"].startswith(expected_model),
+              pending["model_kind"])
+        check(f"{arrangement} maps to a name the radio offers",
+              pending["model_kind"] in app_module.MODEL_KEYS,
+              pending["model_kind"])
+
+
+def case_work_it_out_applies_the_arrangement():
+    print("pressing it applies what it found")
+    app = start(cell_name="cell-01")
+    work = button_by_label(app, "Work it out for me")
+    check("the button is there", work is not None)
+    if work is None:
+        return
+    work.click().run()
+    if not no_exception(app, "work it out"):
+        return
+    found = app.session_state["arrangement_search"]
+    check("the arrangement search ran", bool(found and found.get("success")),
+          str(found.get("error") if found else None))
+    if not (found and found.get("success")):
+        return
+    check("the model on the page matches what it chose",
+          app.session_state["model_kind"]
+          == app_module_model_name(found["best"]["arrangement"]),
+          f"{app.session_state['model_kind']} vs {found['best']['arrangement']}")
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the answer is shown in words", "curve" in text.lower())
+
+
+def app_module_model_name(arrangement):
+    import app as app_module
+    return app_module.settings_from_arrangement(
+        {"arrangement": arrangement, "composition": {}}, 0.6
+    )["model_kind"]
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -1398,6 +1513,9 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_guided_order_is_parts_then_work_it_out,
+        case_it_picks_the_arrangement,
+        case_work_it_out_applies_the_arrangement,
         case_search_stays_fast,
         case_png_is_not_rendered_every_run,
         case_fit_statistics,
