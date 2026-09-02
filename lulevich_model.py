@@ -2979,6 +2979,194 @@ def _aicc(ss_res, n, k):
     return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
 
 
+def search_arrangements(
+    model,
+    epsilon_min,
+    epsilon_max,
+    terms=("membrane", "interior", "nucleus"),
+    weighting="uniform",
+    n_folds=5,
+    seed=0,
+    cv_repeats=3,
+):
+    """
+    Decide how the cell is arranged, then how its parts share the boundary.
+
+    The composition search asks which of four segmented stories fits best.
+    This asks the question above that one: is the cell segmented at all, or
+    do all its parts simply act everywhere at once (side by side), or in a
+    line (stacked)? Those are different physics, not different settings, and
+    picking between them by eye is exactly what a person new to mechanics
+    cannot do.
+
+    All three are scored the same way, by cross-validated error on the same
+    folds, so the comparison is fair. Where they tie the simplest wins, for
+    the same reason as in the composition search: a structure the curve
+    cannot see is one that will wander from cell to cell.
+    """
+    lo = float(epsilon_min)
+    hi = float(epsilon_max)
+    eps_all, force_all, _ = model._select(lo, hi)
+    n = eps_all.size
+    if n < 20:
+        return {"success": False, "error": f"Only {n} points; need at least 20."}
+
+    fold_sets = []
+    for repeat in range(max(1, int(cv_repeats))):
+        rng = np.random.default_rng(seed + repeat)
+        fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
+
+    def cross_validate(fit_on, predict_with):
+        """Mean held-out RMSE over every fold of every split."""
+        per_repeat = []
+        for folds in fold_sets:
+            errors = []
+            for fold in folds:
+                if fold.size == 0 or fold.size >= n - 3:
+                    continue
+                keep = np.ones(n, dtype=bool)
+                keep[fold] = False
+                sub = model._clone(force_all[keep], eps_all[keep])
+                trained = fit_on(sub)
+                if not (trained and trained.get("success")):
+                    continue
+                predicted = predict_with(trained, eps_all[fold])
+                if predicted is None:
+                    continue
+                errors.append(
+                    float(np.sqrt(np.mean((force_all[fold] - predicted) ** 2)))
+                )
+            if errors:
+                per_repeat.append(float(np.mean(errors)))
+        return (
+            float(np.mean(per_repeat)) if per_repeat else float("nan"),
+            float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+        )
+
+    candidates = []
+
+    # ---- segmented, including which of the four combinations ----
+    composition = model.search_compositions(
+        lo, hi, weighting=weighting, n_folds=n_folds, seed=seed,
+        cv_repeats=cv_repeats, include_no_nucleus="nucleus" in terms,
+    )
+    if composition.get("success"):
+        best = composition["best"]
+        candidates.append(
+            {
+                "arrangement": "segmented",
+                "label": "Segmented: the parts take over from each other",
+                "detail": best["label"],
+                "cv_rmse": best["cv_rmse"],
+                "cv_spread": best.get("cv_spread", 0.0),
+                "n_params": best["n_params"],
+                "fit": composition["fits"].get(best["key"]),
+                "composition": best,
+            }
+        )
+
+    # ---- side by side: every element acts across the whole curve ----
+    parallel = model.fit(
+        epsilon_min=lo, epsilon_max=hi, terms=terms, weighting=weighting
+    )
+    if parallel.get("success"):
+        def fit_parallel(sub):
+            return sub.fit(
+                epsilon_min=lo, epsilon_max=hi, terms=terms, weighting=weighting
+            )
+
+        def predict_parallel(trained, eps):
+            return model.combined_model(
+                eps, trained.get("Em", 0.0), trained.get("Ei", 0.0),
+                trained.get("force_offset", 0.0), En=trained.get("En", 0.0),
+            )
+
+        mean, spread = cross_validate(fit_parallel, predict_parallel)
+        candidates.append(
+            {
+                "arrangement": "parallel",
+                "label": "Side by side: every part resists the whole way",
+                "detail": "same squash on each, forces add",
+                "cv_rmse": mean, "cv_spread": spread,
+                "n_params": parallel.get("n_params", len(terms)),
+                "fit": parallel,
+            }
+        )
+
+    # ---- stacked: same force through each, squashes add ----
+    series = model.fit_series(lo, hi, terms=terms, weighting=weighting)
+    if series.get("success"):
+        def fit_series(sub):
+            return sub.fit_series(lo, hi, terms=terms, weighting=weighting)
+
+        def predict_series(trained, eps):
+            try:
+                return model.predict(
+                    eps,
+                    (trained.get("Em", 0.0), trained.get("Ei", 0.0),
+                     trained.get("En", 0.0)),
+                    "series",
+                )
+            except Exception:
+                return None
+
+        mean, spread = cross_validate(fit_series, predict_series)
+        candidates.append(
+            {
+                "arrangement": "series",
+                "label": "Stacked: the parts sit in a line",
+                "detail": "same force through each, squashes add",
+                "cv_rmse": mean, "cv_spread": spread,
+                "n_params": series.get("n_params", len(terms)),
+                "fit": series,
+            }
+        )
+
+    usable = [c for c in candidates if np.isfinite(c["cv_rmse"])]
+    if not usable:
+        return {
+            "success": False,
+            "error": "No arrangement produced a usable fit on this curve.",
+        }
+
+    usable.sort(key=lambda c: c["cv_rmse"])
+    lowest = usable[0]
+    tolerance = max(
+        0.05 * lowest["cv_rmse"],
+        lowest["cv_spread"] + max(c["cv_spread"] for c in usable),
+    )
+    tied = [c for c in usable[1:] if c["cv_rmse"] - lowest["cv_rmse"] <= tolerance]
+    best = min([lowest] + tied, key=lambda c: (c["n_params"], c["cv_rmse"]))
+    for candidate in usable:
+        candidate["tied_with_best"] = candidate is not best and (
+            candidate in tied or candidate is lowest
+        )
+
+    if tied:
+        others = ", ".join(
+            f"“{c['label'].split(':')[0]}”" for c in [lowest] + tied if c is not best
+        )
+        verdict = (
+            f"This curve looks **{best['label'].split(':')[0].lower()}**, though "
+            f"{others} predicts it about as well. Where nothing separates them "
+            f"the simpler arrangement is the safer one."
+        )
+    else:
+        verdict = (
+            f"This curve is clearly **{best['label'].split(':')[0].lower()}**: "
+            f"{best['detail']}."
+        )
+
+    return {
+        "success": True,
+        "candidates": usable,
+        "best": best,
+        "verdict": verdict,
+        "composition": composition if composition.get("success") else None,
+        "n_points": int(n),
+    }
+
+
 def compare_couplings(
     model,
     epsilon_min,
