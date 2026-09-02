@@ -1190,6 +1190,76 @@ def case_chi_squared_reaches_the_page():
         check(f"the sheet records {wanted}", wanted in names, str(names))
 
 
+def case_search_stays_fast():
+    print("the search does not crawl on a realistic curve")
+    import time
+    from lulevich_model import LulevichModel as LM
+
+    # A real .ibw curve has thousands of points, not a few hundred. The
+    # search fits hundreds of candidates, so anything expensive per fit is
+    # multiplied by that. This is the guard on that multiplication.
+    for n, budget in ((1000, 6.0), (3000, 12.0)):
+        eps = np.linspace(0.001, 0.60, n)
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+        force = (m * 0.6e6 + c * 1.2e3 + nu * 3e3) * (
+            1 + 0.01 * np.random.default_rng(0).standard_normal(n)
+        )
+        model = LM(force, eps, cell_height=8.0e-6)
+
+        start_time = time.time()
+        found = model.search_compositions(0.0, 0.60)
+        elapsed = time.time() - start_time
+        check(f"the search finishes on {n} points", found.get("success"))
+        check(f"and takes under {budget:.0f}s at {n} points ({elapsed:.1f}s)",
+              elapsed < budget, f"{elapsed:.1f}s")
+        if found.get("success"):
+            best = found["best"]
+            check(f"and is still right at {n} points",
+                  (best["membrane"], best["cyto_start"]) == ("freeze", "break"),
+                  f"{best['membrane']}/{best['cyto_start']}")
+
+    # The winner must still come back with its statistics, even though the
+    # candidates were fitted without them.
+    check("the winner carries chi squared",
+          np.isfinite(found["best"].get("chi_squared_reduced", np.nan))
+          or np.isfinite(
+              model.fit_composition(
+                  0.0, 0.60, found["best"]["break_1"], found["best"]["break_2"]
+              )["chi_squared_reduced"]
+          ))
+
+
+def case_png_is_not_rendered_every_run():
+    print("the plot is not re-rendered to PNG on every rerun")
+    import plot_utils
+    import app as app_module
+
+    calls = []
+    original = plot_utils.go.Figure.to_image
+
+    def counting(self, *args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("no chrome here")
+
+    plot_utils.go.Figure.to_image = counting
+    try:
+        app = start(cell_name="cell-01")
+        app.run()
+        app.run()
+    finally:
+        plot_utils.go.Figure.to_image = original
+
+    check("no PNG render happened without being asked",
+          len(calls) == 0, f"{len(calls)} renders")
+    check("a Prepare a PNG button is offered",
+          button_by_label(app, "Prepare a PNG") is not None)
+    check("HTML is still available without asking",
+          any("save as html" in (d.label or "").lower()
+              for d in app.get("download_button")),
+          str([d.label for d in app.get("download_button")]))
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -1328,6 +1398,8 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_search_stays_fast,
+        case_png_is_not_rendered_every_run,
         case_fit_statistics,
         case_chi_squared_reaches_the_page,
         case_axis_ranges,
