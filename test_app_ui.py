@@ -1,1148 +1,2232 @@
 """
-Compression-video analysis: find the cell, measure it, line it up with the
-force curve.
+Drive the app the way a person does: through the widgets.
 
-The job here is narrow. During an AFM whole-cell compression the camera sees
-the cell squashed between the substrate and the cantilever. Two things are
-worth extracting:
-
-1. A picture of the cell at a chosen point on the force curve, so a modulus
-   can be read next to the thing it was measured on.
-2. The cell's height in pixels frame by frame, which gives a relative
-   deformation derived from the video alone. Comparing that against the
-   deformation axis of the force curve is an independent check on the contact
-   point and the cell height, the two inputs the moduli are most sensitive to.
-
-OpenCV is imported lazily so the rest of the app runs without it.
+Setting session_state directly is not a test of a Streamlit app. Streamlit
+rejects a write to a widget key after that widget exists, so a bug of that
+kind only shows up when a button is actually clicked. Every case here clicks.
 """
-
-from __future__ import annotations
-
+import html.parser
+import pathlib
+import sys
 import numpy as np
+import pandas as pd
 
-try:
-    import cv2
+sys.path.insert(0, "/root/AFM_cell_analyzer")
+from streamlit.testing.v1 import AppTest  # noqa: E402
+from lulevich_model import LulevichModel  # noqa: E402
 
-    CV2_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on local install
-    cv2 = None
-    CV2_ERROR = str(exc)
-
-
-def available():
-    """True when OpenCV is importable."""
-    return cv2 is not None
+# Label -> the argument the model takes, mirroring app.py.
+MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
+CYTO_MODE = {"at ε₁": "break", "from the very start": "zero"}
 
 
-def _require_cv2():
-    if cv2 is None:
-        raise RuntimeError(
-            f"OpenCV is not available ({CV2_ERROR}). Add 'opencv-python-headless' "
-            f"to requirements.txt."
-        )
+def synthetic(membrane="freeze", cyto_start="break", En_kPa=3.0, n=260, noise=0.01):
+    """A curve built from a known composition, so the answer is known."""
+    eps = np.linspace(0.001, 0.60, n)
+    model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    m, c, nu = model.composition_terms(eps, 0.15, 0.40, membrane, cyto_start)
+    force = m * 0.6e6 + c * 1.2e3 + nu * En_kPa * 1e3
+    rng = np.random.default_rng(0)
+    force = force * (1.0 + noise * rng.standard_normal(n))
+    return eps, force
 
 
-# ------------------------------------------------------------------ probing
-
-
-def probe(path):
-    """Frame count, fps, size and duration of a video file."""
-    _require_cv2()
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 0.0
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    finally:
-        cap.release()
-
-    # Some containers report a bogus frame count; fall back to counting.
-    if n_frames <= 0:
-        n_frames = _count_frames(path)
-
-    return {
-        "fps": fps,
-        "n_frames": n_frames,
-        "width": width,
-        "height": height,
-        "duration_s": n_frames / fps if fps > 0 else float("nan"),
+def load(app, eps, force):
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "synthetic.csv", "n_dropped": 0,
     }
 
 
-def _count_frames(path):
-    cap = cv2.VideoCapture(str(path))
-    count = 0
-    while True:
-        ok = cap.grab()
-        if not ok:
-            break
-        count += 1
-    cap.release()
-    return count
-
-
-def read_frame(path, index):
-    """Return one frame as an RGB array, or None if it cannot be read."""
-    _require_cv2()
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        return None
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(index)))
-        ok, frame = cap.read()
-        if not ok:
-            return None
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    finally:
-        cap.release()
-
-
-# ---------------------------------------------------------------- detection
-
-
-def _strip_horizontal(mask, view_w, min_run_frac=0.55):
-    """
-    Delete pixels belonging to horizontal runs longer than the cell can be.
-
-    The substrate line and the cantilever span most of the frame; a cell does
-    not. Opening with a long, one-pixel-tall kernel keeps only those long runs,
-    and subtracting them leaves the cell standing alone.
-    """
-    length = max(9, int(view_w * min_run_frac))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (length, 1))
-    lines = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    lines = cv2.dilate(lines, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-    return cv2.subtract(mask, lines)
-
-
-def _candidate_masks(gray, sensitivity, view_w, view_h, strip_lines):
-    """
-    Several segmentations of the same frame.
-
-    No single rule works across brightfield, phase and DIC, so the cheap
-    approach is to generate a few plausible masks and let the scoring below
-    decide. Both intensity polarities are tried because a cell can read darker
-    or brighter than its background.
-    """
-    masks = []
-    k = max(3, (min(view_h, view_w) // 60) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-
-    # 1-2: Otsu, both polarities.
-    for flag in (cv2.THRESH_BINARY_INV, cv2.THRESH_BINARY):
-        _, mask = cv2.threshold(gray, 0, 255, flag + cv2.THRESH_OTSU)
-        masks.append(mask)
-
-    # 3: local background subtraction. A cell only slightly darker than the
-    # field is invisible to a global threshold but stands out clearly against
-    # a heavily blurred copy of the same frame, which is what illumination
-    # without the cell would look like.
-    blurred = cv2.GaussianBlur(gray, (0, 0), max(view_w, view_h) / 12.0)
-    for diff in (cv2.subtract(blurred, gray), cv2.subtract(gray, blurred)):
-        if diff.max() > 3:
-            _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            masks.append(mask)
-
-    # 4: edge magnitude, which catches cells that match the background level
-    # and are visible only by their outline.
-    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    magnitude = np.hypot(sobel_x, sobel_y)
-    if magnitude.max() > 0:
-        magnitude = (255 * magnitude / magnitude.max()).astype(np.uint8)
-        cutoff = float(np.clip(np.percentile(magnitude, 100 - 12 * sensitivity), 1, 254))
-        _, edge_mask = cv2.threshold(magnitude, cutoff, 255, cv2.THRESH_BINARY)
-        masks.append(edge_mask)
-
-    processed = []
-    for mask in masks:
-        if strip_lines:
-            mask = _strip_horizontal(mask, view_w)
-        # Close the outline into a solid blob, drop leftover speckle, then
-        # flood the interior so contourArea reflects the whole cell.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        filled = mask.copy()
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
-        processed.append(filled)
-    return processed
-
-
-def detect_cell(
-    frame_rgb,
-    roi=None,
-    min_area_frac=0.01,
-    max_area_frac=0.60,
-    sensitivity=1.0,
-    strip_lines=True,
-    probe=None,
-    cell_side="anywhere",
-    reject_dark=True,
-    dark_margin=0.35,
-    appearance="either",
-):
-    """
-    Find the cell in one frame.
-
-    Candidates come from edge density rather than plain thresholding, because
-    in brightfield the cell is often the same average brightness as its
-    background and only its outline stands out. Each candidate is scored on
-    size, circularity and how central it is, and the best one wins. The
-    cantilever tends to lose on circularity, the image border on size.
-
-    Parameters
-    ----------
-    frame_rgb : array
-        Frame in RGB.
-    roi : (x0, y0, x1, y1), optional
-        Fractional crop (0-1) to search inside. Use it to exclude the
-        cantilever or the edges of the field of view.
-    min_area_frac, max_area_frac : float
-        Acceptable blob area as a fraction of the searched region.
-    sensitivity : float
-        Scales the edge threshold. Raise it if the cell is faint, lower it if
-        texture in the background is being picked up.
-    strip_lines : bool
-        Remove long horizontal structures before looking for blobs. The
-        substrate and the cantilever are exactly that, and without this they
-        merge with the cell into one wide shapeless region.
-    probe : dict, optional
-        Result of :func:`detect_probe`. When given together with ``cell_side``,
-        candidates on the wrong side of the cantilever are discarded.
-    cell_side : {"anywhere", "right", "left", "above", "below"}
-        Where the cell sits relative to the probe.
-    reject_dark : bool
-        Discard candidates darker than ``dark_margin`` times the frame's median
-        brightness. The cantilever is nearly black, so this alone stops it
-        being mistaken for the cell even when it happens to look round. The
-        default margin is deliberately low: a cell is often legitimately darker
-        than its background, and a stricter cut throws the cell away too.
-    appearance : {"either", "clear", "dark"}
-        What the cell looks like against its background. Roundness and
-        solidity alone cannot separate a translucent cell from a dark blob of
-        debris of similar shape, and in phase contrast the cell is usually the
-        clear, bright object. Saying so adds a brightness term to the score
-        and discards candidates on the wrong side of the background level, so
-        the crop stored with the cell shows the cell rather than a dark patch
-        beside it.
-
-    Returns
-    -------
-    dict
-        ``found``; when found also ``bbox`` (x, y, w, h in full-frame pixels),
-        ``center``, ``height_px``, ``width_px``, ``area_px``, ``circularity``,
-        ``score``, ``ellipse`` and ``contour``.
-    """
-    _require_cv2()
-    frame = np.asarray(frame_rgb)
-    H, W = frame.shape[:2]
-
-    if probe is None and (reject_dark or cell_side != "anywhere"):
-        found_probe = detect_probe(frame)
-        probe = found_probe if found_probe.get("found") else None
-
-    if roi:
-        x0 = int(np.clip(roi[0], 0, 1) * W)
-        y0 = int(np.clip(roi[1], 0, 1) * H)
-        x1 = int(np.clip(roi[2], 0, 1) * W)
-        y1 = int(np.clip(roi[3], 0, 1) * H)
-        x0, x1 = min(x0, x1), max(x0, x1)
-        y0, y1 = min(y0, y1), max(y0, y1)
-        if x1 - x0 < 10 or y1 - y0 < 10:
-            x0, y0, x1, y1 = 0, 0, W, H
-    else:
-        x0, y0, x1, y1 = 0, 0, W, H
-
-    view = frame[y0:y1, x0:x1]
-    if view.size == 0:
-        return {"found": False, "reason": "empty region"}
-
-    gray = cv2.cvtColor(view, cv2.COLOR_RGB2GRAY)
-
-    # Paint the cantilever out before segmenting anything. Rejecting it after
-    # the fact is too late: it is near black against a bright field, so it
-    # dominates the Otsu split and sets the scale the gradient threshold is
-    # measured against, and a faint cell then falls below both. Replacing it
-    # with the background level removes it from the statistics entirely.
-    if probe and probe.get("found"):
-        px, py, pw, ph = probe["bbox"]
-        px, py = px - x0, py - y0
-        sx0, sy0 = max(0, px), max(0, py)
-        sx1, sy1 = min(gray.shape[1], px + pw), min(gray.shape[0], py + ph)
-        if sx1 > sx0 and sy1 > sy0:
-            outside = np.ones(gray.shape, dtype=bool)
-            outside[sy0:sy1, sx0:sx1] = False
-            fill = float(np.median(gray[outside])) if outside.any() else 255.0
-            gray = gray.copy()
-            gray[sy0:sy1, sx0:sx1] = fill
-
-    # Median first: it removes speckle without softening the cell outline,
-    # which is what the edge detector below is looking for.
-    gray = cv2.medianBlur(gray, 5)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    view_h, view_w = view.shape[:2]
-    view_area = float(view_h * view_w)
-    cx_view, cy_view = view_w / 2.0, view_h / 2.0
-    diag = float(np.hypot(view_w, view_h))
-
-    masks = _candidate_masks(gray, sensitivity, view_w, view_h, strip_lines)
-    contours = []
-    for mask in masks:
-        found, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours.extend(found)
-    if not contours:
-        return {"found": False, "reason": "no contours"}
-
-    background = float(np.median(gray))
-    probe_box = probe.get("bbox") if (probe and probe.get("found")) else None
-
-    def on_expected_side(bx, by, bw, bh):
-        """Reject a candidate that sits on the wrong side of the cantilever."""
-        if not probe_box or cell_side == "anywhere":
-            return True
-        px, py, pw, ph = probe_box
-        cx, cy = bx + bw / 2 + x0, by + bh / 2 + y0
-        if cell_side == "right":
-            return cx > px + pw * 0.5
-        if cell_side == "left":
-            return cx < px + pw * 0.5
-        if cell_side == "below":
-            return cy > py + ph * 0.5
-        if cell_side == "above":
-            return cy < py + ph * 0.5
-        return True
-
-    # An edge-derived outline is often a broken ring: filling it does nothing,
-    # and it scores terribly on solidity even though its convex hull is exactly
-    # the cell. So a ring-like contour is also judged as its hull. Only
-    # ring-like ones: taking the hull of an already-solid blob can bridge the
-    # cell to whatever else the mask caught and produce a region far taller
-    # than the cell really is.
-    candidates = []
-    for contour in contours:
-        candidates.append(contour)
-        if len(contour) < 5:
-            continue
-        hull = cv2.convexHull(contour)
-        area = float(cv2.contourArea(contour))
-        hull_area = float(cv2.contourArea(hull))
-        if hull_area <= 0:
-            continue
-        if area / hull_area < 0.5:  # genuinely ring-like or broken
-            candidates.append(hull)
-
-    best, best_score = None, -np.inf
-    rejected_dark = 0
-    rejected_side = 0
-    rejected_appearance = 0
-    for contour in candidates:
-        area = float(cv2.contourArea(contour))
-        if area < min_area_frac * view_area or area > max_area_frac * view_area:
-            continue
-        perimeter = float(cv2.arcLength(contour, True))
-        if perimeter <= 0:
-            continue
-
-        bx, by, bw, bh = cv2.boundingRect(contour)
-        # A blob spanning almost the whole field is the frame itself, not a cell.
-        if bw > 0.95 * view_w and bh > 0.95 * view_h:
-            continue
-
-        # Cells are convex. Ragged noise clusters are not, and this separates
-        # them far more reliably than area alone.
-        hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-        solidity = area / hull_area if hull_area > 0 else 0.0
-        if solidity < 0.5:
-            continue
-
-        if not on_expected_side(bx, by, bw, bh):
-            rejected_side += 1
-            continue
-
-        # Measured once and reused: the dark cut, the appearance filter and
-        # the brightness score all ask about the same number.
-        blob = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.drawContours(blob, [contour], -1, 255, thickness=cv2.FILLED)
-        mean_intensity = float(cv2.mean(gray, mask=blob)[0])
-        # Positive when the candidate is brighter than its surroundings.
-        contrast = (mean_intensity - background) / max(background, 1.0)
-
-        if reject_dark:
-            # The cantilever is close to black. Anything much darker than the
-            # frame's own median is the probe or its shadow, not a cell.
-            if mean_intensity < dark_margin * background:
-                rejected_dark += 1
-                continue
-
-        if appearance == "clear" and contrast < -0.02:
-            rejected_appearance += 1
-            continue
-        if appearance == "dark" and contrast > 0.02:
-            rejected_appearance += 1
-            continue
-
-        circularity = float(np.clip(4.0 * np.pi * area / perimeter ** 2, 0.0, 1.0))
-
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
-        centrality = 1.0 - float(np.hypot(cx - cx_view, cy - cy_view)) / (diag / 2.0)
-
-        # A blob running off the edge of the searched region is almost always
-        # the cell merged with something else, and its height is then wrong in
-        # a way nothing downstream can detect.
-        touches_edge = (
-            bx <= 1 or by <= 1 or bx + bw >= view_w - 1 or by + bh >= view_h - 1
-        )
-
-        # Roundness and solidity identify a cell; size breaks ties against
-        # small artefacts; centrality prefers the object being compressed.
-        # Roundness and solidity identify a cell; size breaks ties against
-        # small artefacts; centrality prefers the object being compressed;
-        # and where the cell's appearance is known, brightness separates it
-        # from debris of the same shape. Capped so a blown-out highlight
-        # cannot outscore a well-shaped cell on brightness alone.
-        appearance_bonus = 0.0
-        if appearance == "clear":
-            appearance_bonus = 1.4 * float(np.clip(contrast / 0.25, 0.0, 1.0))
-        elif appearance == "dark":
-            appearance_bonus = 1.4 * float(np.clip(-contrast / 0.25, 0.0, 1.0))
-
-        score = (
-            1.6 * circularity
-            + 1.2 * solidity
-            + 1.0 * centrality
-            + 1.5 * np.sqrt(area / view_area)
-            + appearance_bonus
-            - (1.5 if touches_edge else 0.0)
-        )
-        if score > best_score:
-            best_score, best = score, {
-                "contour": contour,
-                "area_px": area,
-                "circularity": circularity,
-                "solidity": solidity,
-                "centrality": centrality,
-                "score": float(score),
-                "centroid": (cx, cy),
-            }
-
-    if best is None:
-        reason = "no candidate of a plausible size and shape"
-        if rejected_dark:
-            reason += f"; {rejected_dark} rejected as too dark (probe)"
-        if rejected_side:
-            reason += f"; {rejected_side} rejected on the wrong side of the probe"
-        if rejected_appearance:
-            reason += (
-                f"; {rejected_appearance} rejected as the wrong brightness "
-                f"for a {appearance} cell"
-            )
-        return {"found": False, "reason": reason}
-
-    contour = best["contour"]
-    x, y, w, h = cv2.boundingRect(contour)
-    ellipse = None
-    if len(contour) >= 5:
-        (ex, ey), (maj, minor), angle = cv2.fitEllipse(contour)
-        ellipse = {
-            "center": (float(ex + x0), float(ey + y0)),
-            "axes": (float(maj), float(minor)),
-            "angle": float(angle),
-        }
-
-    # Height comes from the bounding box. An ellipse fit was tried here, but
-    # cv2.fitEllipse's axis ordering and angle convention make "which axis is
-    # vertical" ambiguous, and getting it backwards silently corrupts every
-    # deformation derived from the video. The box is cruder and honest.
-    height_px, width_px = float(h), float(w)
-
-    return {
-        "found": True,
-        "bbox": (int(x + x0), int(y + y0), int(w), int(h)),
-        "center": (float(best["centroid"][0] + x0), float(best["centroid"][1] + y0)),
-        "height_px": height_px,
-        "width_px": width_px,
-        "area_px": best["area_px"],
-        "circularity": best["circularity"],
-        "solidity": best["solidity"],
-        "score": best["score"],
-        "rejected_dark": rejected_dark,
-        "rejected_side": rejected_side,
-        "rejected_appearance": rejected_appearance,
-        "ellipse": ellipse,
-        "contour": contour + np.array([[x0, y0]]),
-        "roi_px": (x0, y0, x1, y1),
-    }
-
-
-def annotate(
-    frame_rgb,
-    detection,
-    label=None,
-    color=(255, 60, 60),
-    thickness=None,
-    nucleus=None,
-    probe=None,
-):
-    """
-    Draw what was found onto a copy of the frame.
-
-    Cell in red with its outline in green, nucleus in purple, cantilever in
-    grey. Drawing the probe as well as the cell is worth the clutter: when the
-    detector grabs the wrong object, seeing which box landed where says
-    immediately whether the problem is the side constraint or the contrast.
-    """
-    _require_cv2()
-    out = np.array(frame_rgb).copy()
-    t = thickness or max(1, int(round(min(out.shape[:2]) / 250)))
-
-    if probe and probe.get("found"):
-        px, py, pw, ph = probe["bbox"]
-        cv2.rectangle(out, (px, py), (px + pw, py + ph), (120, 120, 120), t)
-        cv2.putText(
-            out, "probe", (px, max(14, py - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-            max(0.35, min(out.shape[:2]) / 900.0), (120, 120, 120), t, cv2.LINE_AA,
-        )
-
-    if not detection or not detection.get("found"):
-        return out
-
-    x, y, w, h = detection["bbox"]
-    cv2.rectangle(out, (x, y), (x + w, y + h), color, t)
-    if detection.get("contour") is not None:
-        cv2.drawContours(out, [detection["contour"]], -1, (60, 220, 90), t)
-
-    # A vertical bar marking the measured height, which is the quantity that
-    # actually feeds the deformation estimate.
-    cx = x + w // 2
-    cv2.arrowedLine(out, (cx, y), (cx, y + h), (255, 220, 40), t, tipLength=0.08)
-    cv2.arrowedLine(out, (cx, y + h), (cx, y), (255, 220, 40), t, tipLength=0.08)
-
-    if nucleus and nucleus.get("found"):
-        nx, ny, nw, nh = nucleus["bbox"]
-        cv2.rectangle(out, (nx, ny), (nx + nw, ny + nh), (170, 90, 200), t)
-        if nucleus.get("contour") is not None:
-            cv2.drawContours(out, [nucleus["contour"]], -1, (170, 90, 200), t)
-        cv2.putText(
-            out, "nucleus", (nx, min(out.shape[0] - 4, ny + nh + 16)),
-            cv2.FONT_HERSHEY_SIMPLEX, max(0.35, min(out.shape[:2]) / 900.0),
-            (170, 90, 200), t, cv2.LINE_AA,
-        )
-
-    if label:
-        scale = max(0.4, min(out.shape[:2]) / 700.0)
-        cv2.putText(
-            out, label, (x, max(18, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, scale,
-            (0, 0, 0), t + 2, cv2.LINE_AA,
-        )
-        cv2.putText(
-            out, label, (x, max(18, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, scale,
-            (255, 255, 255), t, cv2.LINE_AA,
-        )
-    return out
-
-
-def manual_detection(frame_rgb, box_fraction):
-    """
-    Build a detection from a box the user drew instead of one found by code.
-
-    Automatic detection is a guess informed by shape and brightness, and on a
-    crowded or low-contrast field it guesses wrong. A person looking at the
-    frame does not. This makes their box a first-class detection so
-    everything downstream, the crop, the height, the tracking reference,
-    works from it unchanged.
-
-    Parameters
-    ----------
-    box_fraction : (x0, y0, x1, y1)
-        Fractions of the frame, left, top, right, bottom.
-    """
-    frame = np.asarray(frame_rgb)
-    H, W = frame.shape[:2]
-    x0, y0, x1, y1 = box_fraction
-    x0, x1 = sorted((float(np.clip(x0, 0, 1)), float(np.clip(x1, 0, 1))))
-    y0, y1 = sorted((float(np.clip(y0, 0, 1)), float(np.clip(y1, 0, 1))))
-    x, y = int(x0 * W), int(y0 * H)
-    w, h = max(1, int((x1 - x0) * W)), max(1, int((y1 - y0) * H))
-    return {
-        "found": True,
-        "manual": True,
-        "bbox": (x, y, w, h),
-        "center": (x + w / 2.0, y + h / 2.0),
-        "height_px": float(h),
-        "width_px": float(w),
-        "area_px": float(w * h),
-        "circularity": float("nan"),
-        "solidity": float("nan"),
-        "centrality": float("nan"),
-        "score": float("nan"),
-        "ellipse": None,
-        "contour": None,
-        "reason": "drawn by hand",
-    }
-
-
-def scale_from_probe(probe_box_fraction, frame_shape, probe_width_um):
-    """
-    Micrometres per pixel, from a cantilever of known width.
-
-    The probe is the one object in the field whose size is known exactly: a
-    tipless cantilever is specified to the micrometre. Measuring it in the
-    image gives the scale for everything else, which turns cell heights in
-    pixels into cell heights in micrometres without a separate calibration.
-
-    Returns
-    -------
-    (um_per_px, detail) : the scale and a sentence explaining it, or
-    (None, reason) when it cannot be worked out.
-    """
-    H, W = np.asarray(frame_shape)[:2]
-    x0, _, x1, _ = probe_box_fraction
-    width_px = abs(float(x1) - float(x0)) * float(W)
-    if width_px < 4:
-        return None, "The probe box is too narrow to measure."
-    if not probe_width_um or probe_width_um <= 0:
-        return None, "Set the probe width in micrometres."
-    scale = float(probe_width_um) / width_px
-    return scale, (
-        f"{width_px:.0f} px across a {probe_width_um:.0f} µm probe "
-        f"= {scale:.4f} µm per pixel"
-    )
-
-
-def crop(frame_rgb, detection, pad_frac=0.35):
-    """Crop tightly around the detection, with padding, for a side panel."""
-    frame = np.asarray(frame_rgb)
-    if not detection or not detection.get("found"):
-        return frame
-    H, W = frame.shape[:2]
-    x, y, w, h = detection["bbox"]
-    px, py = int(w * pad_frac), int(h * pad_frac)
-    x0, y0 = max(0, x - px), max(0, y - py)
-    x1, y1 = min(W, x + w + px), min(H, y + h + py)
-    return frame[y0:y1, x0:x1]
-
-
-# ----------------------------------------------------------------- tracking
-
-
-def track_cell(path, n_samples=60, roi=None, sensitivity=1.0, start=0, end=None,
-               enhance=None, cell_side="anywhere", reject_dark=True,
-               track_nucleus=False, appearance="either"):
-    """
-    Measure the cell across the video.
-
-    Returns
-    -------
-    dict
-        ``frames`` (sampled indices), ``height_px`` (NaN where detection
-        failed), ``width_px``, ``found`` and ``detections``.
-    """
-    _require_cv2()
-    info = probe(path)
-    total = info["n_frames"]
-    end = total - 1 if end is None else min(int(end), total - 1)
-    start = max(0, int(start))
-    if end <= start:
-        end = total - 1
-
-    indices = np.unique(
-        np.linspace(start, end, max(2, int(n_samples))).astype(int)
-    )
-
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-
-    heights, widths, found, detections = [], [], [], []
-    try:
-        for index in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
-            ok, frame = cap.read()
-            if not ok:
-                heights.append(np.nan)
-                widths.append(np.nan)
-                found.append(False)
-                detections.append(None)
-                continue
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if enhance:
-                rgb = enhance_frame(rgb, **enhance)
-            probe_here = detect_probe(rgb) if cell_side != "anywhere" else None
-            det = detect_cell(
-                rgb, roi=roi, sensitivity=sensitivity,
-                probe=probe_here, cell_side=cell_side, reject_dark=reject_dark,
-                appearance=appearance,
-            )
-            if track_nucleus and det.get("found"):
-                det["nucleus"] = detect_nucleus(rgb, det)
-            detections.append(det)
-            if det.get("found"):
-                heights.append(det["height_px"])
-                widths.append(det["width_px"])
-                found.append(True)
-            else:
-                heights.append(np.nan)
-                widths.append(np.nan)
-                found.append(False)
-    finally:
-        cap.release()
-
-    return {
-        "frames": indices,
-        "height_px": np.array(heights, dtype=float),
-        "width_px": np.array(widths, dtype=float),
-        "found": np.array(found, dtype=bool),
-        "detections": detections,
-        "info": info,
-    }
-
-
-def deformation_from_track(track, reference="first"):
-    """
-    Turn tracked cell heights into a relative deformation.
-
-        eps_video = 1 - h(frame) / h_reference
-
-    ``reference`` is either ``"first"`` (the first successful detection) or
-    ``"max"`` (the largest height seen, more robust when the first frames are
-    already slightly compressed).
-    """
-    heights = np.asarray(track["height_px"], dtype=float)
-    valid = np.isfinite(heights)
-    if not valid.any():
-        return np.full(heights.shape, np.nan), float("nan")
-
-    h_ref = float(np.nanmax(heights)) if reference == "max" else float(heights[valid][0])
-    if h_ref <= 0:
-        return np.full(heights.shape, np.nan), float("nan")
-    return 1.0 - heights / h_ref, h_ref
-
-
-# ------------------------------------------------- curve <-> video mapping
-
-
-def frame_for_epsilon(epsilon, contact_frame, end_frame, epsilon_at_end):
-    """
-    Map a point on the force curve to a frame index.
-
-    Assumes the piezo ramps at constant speed between the contact frame and
-    the end frame, so deformation grows linearly with frame number. That holds
-    for a standard constant-velocity approach.
-    """
-    if epsilon_at_end <= 0:
-        return int(contact_frame)
-    span = float(end_frame) - float(contact_frame)
-    frame = float(contact_frame) + span * (float(epsilon) / float(epsilon_at_end))
-    lo, hi = sorted((float(contact_frame), float(end_frame)))
-    return int(round(float(np.clip(frame, lo, hi))))
-
-
-def epsilon_for_frame(frame, contact_frame, end_frame, epsilon_at_end):
-    """Inverse of :func:`frame_for_epsilon`."""
-    span = float(end_frame) - float(contact_frame)
-    if span == 0:
-        return 0.0
-    return float(epsilon_at_end) * (float(frame) - float(contact_frame)) / span
-
-
-def align_scale(epsilon_video, epsilon_curve):
-    """
-    Least-squares scale factor between video-derived and curve deformation.
-
-    A factor near 1 means the cell height and contact point used for the force
-    curve agree with what the video shows. A factor of, say, 1.3 means the
-    curve's deformation axis is 30 % smaller than the cell actually deformed,
-    which usually points at the cell height being wrong by that factor.
-    """
-    a = np.asarray(epsilon_video, dtype=float)
-    b = np.asarray(epsilon_curve, dtype=float)
-    good = np.isfinite(a) & np.isfinite(b) & (np.abs(b) > 1e-9)
-    if good.sum() < 3:
-        return float("nan"), float("nan")
-    scale = float(np.sum(a[good] * b[good]) / np.sum(b[good] ** 2))
-    residual = a[good] - scale * b[good]
-    ss_tot = float(np.sum((a[good] - a[good].mean()) ** 2))
-    r2 = 1.0 - float(np.sum(residual ** 2)) / ss_tot if ss_tot > 0 else float("nan")
-    return scale, r2
-
-
-# ------------------------------------------------------- Google Drive fetch
-
-
-def drive_file_id(url):
-    """Pull the file id out of the usual Google Drive link shapes."""
-    import re
-
-    if not url:
-        return None
-    for pattern in (r"/file/d/([A-Za-z0-9_-]{10,})", r"[?&]id=([A-Za-z0-9_-]{10,})"):
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    # A bare id.
-    if re.fullmatch(r"[A-Za-z0-9_-]{20,}", url.strip()):
-        return url.strip()
+def start(**state):
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
+    app.run()
+    eps, force = synthetic()
+    load(app, eps, force)
+    for key, value in state.items():
+        app.session_state[key] = value
+    app.run()
+    return app
+
+
+def widget_by_label(app, kind, label):
+    for w in getattr(app, kind):
+        if label.lower() in (w.label or "").lower():
+            return w
     return None
 
 
-def download_drive_video(url, dest_path, max_bytes=512 * 1024 * 1024):
-    """
-    Best-effort download of a publicly shared Drive video.
+def button_by_label(app, label):
+    for b in app.button:
+        if label.lower() in (b.label or "").lower():
+            return b
+    return None
 
-    Only works for files shared with "anyone with the link". Anything else
-    (restricted files, sign-in walls, quota pages) raises, and the caller
-    should ask for a direct upload instead.
-    """
-    import urllib.request
-    import urllib.parse
-    import http.cookiejar
 
-    file_id = drive_file_id(url)
-    if not file_id:
-        raise ValueError("That does not look like a Google Drive file link.")
+class _FlatTableReader(html.parser.HTMLParser):
+    """Pull the app's HTML result tables back into DataFrames."""
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-    base = "https://drive.google.com/uc?export=download"
+    def __init__(self):
+        super().__init__()
+        self.tables, self._rows, self._cells, self._text = [], None, None, None
 
-    response = opener.open(f"{base}&id={file_id}", timeout=60)
-    payload = response.read(65536)
+    def handle_starttag(self, tag, attrs):
+        classes = dict(attrs).get("class", "")
+        if tag == "table" and "flat-table" in classes:
+            self._rows = []
+        elif tag == "tr" and self._rows is not None:
+            self._cells = []
+        elif tag in ("td", "th") and self._cells is not None:
+            self._text = []
 
-    # Large files return an interstitial page holding a confirm token.
-    if b"<html" in payload[:2048].lower():
-        import re
+    def handle_data(self, data):
+        if self._text is not None:
+            self._text.append(data)
 
-        text = payload.decode("utf-8", errors="ignore")
-        token = None
-        match = re.search(r"confirm=([0-9A-Za-z_-]+)", text)
-        if match:
-            token = match.group(1)
-        if token is None:
-            raise RuntimeError(
-                "Google Drive returned a web page instead of the file. The video is "
-                "probably not shared with 'anyone with the link'. Upload it directly."
-            )
-        response = opener.open(f"{base}&confirm={token}&id={file_id}", timeout=60)
-        payload = response.read(65536)
-        if b"<html" in payload[:2048].lower():
-            raise RuntimeError(
-                "Google Drive would not serve the file. Upload it directly instead."
-            )
-
-    written = 0
-    with open(dest_path, "wb") as handle:
-        handle.write(payload)
-        written += len(payload)
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > max_bytes:
-                raise RuntimeError(
-                    f"Video is larger than the {max_bytes / 1e6:.0f} MB limit; "
-                    f"trim it or upload a shorter clip."
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._text is not None:
+            self._cells.append("".join(self._text).strip())
+            self._text = None
+        elif tag == "tr" and self._cells is not None:
+            self._rows.append(self._cells)
+            self._cells = None
+        elif tag == "table" and self._rows is not None:
+            if len(self._rows) > 1:
+                self.tables.append(
+                    pd.DataFrame(self._rows[1:], columns=self._rows[0])
                 )
-            handle.write(chunk)
-
-    if written < 10_000:
-        raise RuntimeError("Downloaded file is too small to be a video.")
-    return dest_path
-
-# --------------------------------------------------------------- enhancement
+            self._rows = None
 
 
-def enhance_frame(frame_rgb, clahe_clip=0.0, gamma=1.0, brightness=0, contrast=1.0):
+def flat_tables(app):
+    """Every result table on the page, as DataFrames of strings.
+
+    The app draws these as plain HTML so that no column can be clipped off
+    the right-hand edge, which means AppTest sees markdown rather than a
+    dataframe element. Parsing it back is how a test still reads them.
     """
-    Adjust a frame before detection or display.
-
-    Cells in brightfield are often barely above the background, and the
-    detector can only find what is visible. CLAHE equalises local contrast,
-    which brings out a faint cell outline without blowing out the bright
-    field; gamma lifts the dark end where a cell sitting in the probe's shadow
-    lives.
-    """
-    _require_cv2()
-    out = np.asarray(frame_rgb).astype(np.float32)
-
-    if contrast != 1.0 or brightness:
-        out = out * float(contrast) + float(brightness)
-    out = np.clip(out, 0, 255).astype(np.uint8)
-
-    if gamma and gamma != 1.0:
-        table = (np.linspace(0, 1, 256) ** (1.0 / float(gamma)) * 255).astype(np.uint8)
-        out = cv2.LUT(out, table)
-
-    if clahe_clip and clahe_clip > 0:
-        lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
-        clahe = cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=(8, 8))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-    return out
+    reader = _FlatTableReader()
+    for element in app.get("markdown"):
+        text = str(element.value)
+        if "flat-table" in text:
+            reader.feed(text)
+    return reader.tables
 
 
-# ---------------------------------------------------------------- the probe
+def table_with(app, *columns):
+    """The one result table carrying all of these column names, or None."""
+    for frame in flat_tables(app):
+        if all(c in frame.columns for c in columns):
+            return frame
+    return None
 
 
-def detect_probe(frame_rgb, darkness_percentile=8.0, min_area_frac=0.01):
-    """
-    Find the cantilever, which is the large very dark object in the frame.
-
-    Worth locating for two reasons: it is the thing the cell detector keeps
-    grabbing by mistake, and once its position is known the search for the
-    cell can be restricted to the correct side of it.
-    """
-    _require_cv2()
-    frame = np.asarray(frame_rgb)
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    gray = cv2.medianBlur(gray, 5)
-
-    cutoff = float(np.percentile(gray, darkness_percentile))
-    mask = (gray <= cutoff).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    area_total = float(gray.size)
-    best, best_area = None, 0.0
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area_frac * area_total or area <= best_area:
-            continue
-        best, best_area = contour, area
-
-    if best is None:
-        return {"found": False, "reason": "no large dark object"}
-
-    x, y, w, h = cv2.boundingRect(best)
-    return {
-        "found": True,
-        "bbox": (int(x), int(y), int(w), int(h)),
-        "area_px": best_area,
-        "mean_intensity": float(gray[y : y + h, x : x + w].mean()),
-        "contour": best,
-    }
+FAILURES = []
 
 
-# --------------------------------------------------------------- the nucleus
-
-
-def detect_nucleus(frame_rgb, cell, min_area_frac=0.04, max_area_frac=0.75):
-    """
-    Find the nucleus inside an already-detected cell.
-
-    The nucleus is denser than the cytoplasm around it, so within the cell's
-    own bounding box it shows as a darker, roundish region. Searching only
-    inside the cell is what makes this tractable: the same threshold applied
-    to the whole frame would return the probe.
-    """
-    _require_cv2()
-    if not cell or not cell.get("found"):
-        return {"found": False, "reason": "no cell to look inside"}
-
-    frame = np.asarray(frame_rgb)
-    x, y, w, h = cell["bbox"]
-    pad_x, pad_y = int(w * 0.05), int(h * 0.05)
-    x0, y0 = max(0, x + pad_x), max(0, y + pad_y)
-    x1, y1 = min(frame.shape[1], x + w - pad_x), min(frame.shape[0], y + h - pad_y)
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return {"found": False, "reason": "cell too small to look inside"}
-
-    view = frame[y0:y1, x0:x1]
-    gray = cv2.medianBlur(cv2.cvtColor(view, cv2.COLOR_RGB2GRAY), 5)
-
-    # Otsu inside the cell, not a fixed percentile: the fraction of the box
-    # the nucleus occupies varies with how squashed the cell is, and a fixed
-    # cut either swallows the whole cytoplasm or misses the nucleus entirely.
-    k = max(3, (min(view.shape[:2]) // 20) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    candidates_masks = []
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    candidates_masks.append(otsu)
-    for percentile in (20.0, 30.0):
-        cutoff = float(np.percentile(gray, percentile))
-        candidates_masks.append((gray <= cutoff).astype(np.uint8) * 255)
-
-    contours = []
-    for mask in candidates_masks:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        found, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours.extend(found)
-    view_area = float(view.shape[0] * view.shape[1])
-
-    best, best_score = None, -np.inf
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area_frac * view_area or area > max_area_frac * view_area:
-            continue
-        perimeter = float(cv2.arcLength(contour, True))
-        if perimeter <= 0:
-            continue
-        circularity = float(np.clip(4 * np.pi * area / perimeter ** 2, 0, 1))
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
-        centrality = 1.0 - float(
-            np.hypot(cx - view.shape[1] / 2, cy - view.shape[0] / 2)
-        ) / (np.hypot(view.shape[1], view.shape[0]) / 2)
-        score = 1.5 * circularity + 1.0 * centrality + np.sqrt(area / view_area)
-        if score > best_score:
-            best_score, best = score, (contour, area, circularity, cx, cy)
-
-    if best is None:
-        return {"found": False, "reason": "no nucleus-like region inside the cell"}
-
-    contour, area, circularity, cx, cy = best
-    nx, ny, nw, nh = cv2.boundingRect(contour)
-    return {
-        "found": True,
-        "bbox": (int(nx + x0), int(ny + y0), int(nw), int(nh)),
-        "center": (float(cx + x0), float(cy + y0)),
-        "height_px": float(nh),
-        "width_px": float(nw),
-        "area_px": area,
-        "circularity": circularity,
-        "contour": contour + np.array([[x0, y0]]),
-        "area_fraction_of_cell": float(area / max(w * h, 1)),
-    }
-
-
-# ------------------------------------------------------------- Box fetch
-
-
-def box_shared_id(url):
-    """Pull the shared-link id out of a Box URL."""
-    import re
-
-    if not url:
-        return None
-    match = re.search(r"box\.com/s/([A-Za-z0-9]+)", url)
-    return match.group(1) if match else None
-
-
-def download_box_video(url, dest_path, access_token=None, max_bytes=512 * 1024 * 1024):
-    """
-    Download a video from Box.
-
-    With an ``access_token`` this goes through the Box API, which is the
-    reliable path: the shared link is resolved to a file id and the content
-    endpoint streams the file. Without a token it falls back to the public
-    download URL, which only works for links shared as "people with the link"
-    and no password.
-
-    Box tokens are short lived. Put a developer token in
-    ``.streamlit/secrets.toml`` as ``[box] access_token = "..."`` for occasional
-    use, or set up a service app if this needs to keep working unattended.
-    """
-    import json
-    import urllib.error
-    import urllib.request
-
-    if not url or "box.com" not in url:
-        raise ValueError("That does not look like a Box link.")
-
-    def fetch(request):
-        return urllib.request.urlopen(request, timeout=90)
-
-    response = None
-    if access_token:
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "BoxApi": f"shared_link={url}",
-        }
-        try:
-            info = fetch(
-                urllib.request.Request(
-                    "https://api.box.com/2.0/shared_items", headers=headers
-                )
-            )
-            item = json.loads(info.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"Box rejected the shared link ({exc.code}). Check that the token "
-                f"is current and that the link is shared with your account."
-            ) from exc
-
-        if item.get("type") != "file":
-            raise RuntimeError(
-                f"That Box link points to a {item.get('type', 'thing')}, not a file."
-            )
-        file_id = item["id"]
-        response = fetch(
-            urllib.request.Request(
-                f"https://api.box.com/2.0/files/{file_id}/content", headers=headers
-            )
-        )
+def check(name, condition, detail=""):
+    if condition:
+        print(f"  ok   {name}")
     else:
-        shared = box_shared_id(url)
-        if not shared:
-            raise ValueError(
-                "Could not read a shared-link id from that URL. It should look "
-                "like https://app.box.com/s/xxxxxxxx"
-            )
-        request = urllib.request.Request(
-            f"https://app.box.com/public/static/{shared}",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        try:
-            response = fetch(request)
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"Box refused the public download ({exc.code}). Either the link is "
-                f"not shared publicly, or it needs an access token. Add one under "
-                f"[box] in secrets, or download the file and upload it here."
-            ) from exc
-
-    written = 0
-    with open(dest_path, "wb") as handle:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            if written == 0 and chunk[:512].lstrip().lower().startswith(b"<!doctype html"):
-                raise RuntimeError(
-                    "Box returned a web page rather than the file, which means the "
-                    "link is not publicly downloadable. Use an access token or "
-                    "upload the file directly."
-                )
-            written += len(chunk)
-            if written > max_bytes:
-                raise RuntimeError(
-                    f"Video is larger than the {max_bytes / 1e6:.0f} MB limit; trim "
-                    f"it or upload a shorter clip."
-                )
-            handle.write(chunk)
-
-    if written < 10_000:
-        raise RuntimeError("Downloaded file is too small to be a video.")
-    return dest_path
+        print(f"  FAIL {name} {detail}")
+        FAILURES.append(name)
 
 
-def fetch_video(url, dest_path, box_token=None):
-    """Download from whichever service the URL points at."""
-    if not url:
-        raise ValueError("No link given.")
-    if "box.com" in url:
-        return download_box_video(url, dest_path, access_token=box_token)
-    if "drive.google.com" in url or "docs.google.com" in url:
-        return download_drive_video(url, dest_path)
-    raise ValueError(
-        "Only Google Drive and Box links are recognised. Upload the file directly "
-        "for anything else."
+def no_exception(app, name):
+    if app.exception:
+        print(f"  FAIL {name}: {app.exception[0].value}")
+        FAILURES.append(name)
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- cases ---
+
+def case_loads_clean():
+    print("app loads with a curve, no exception")
+    app = start()
+    no_exception(app, "clean load")
+    check("no old hybrid wording anywhere",
+          not any("parallel below" in str(r.value) for r in app.radio))
+
+
+def case_model_names():
+    print("every model choice runs")
+    app = start()
+    radio = widget_by_label(app, "radio", "how the cell is modelled")
+    check("model radio present", radio is not None)
+    if radio is None:
+        return
+    check("no confusing name",
+          not any("below" in o and "above" in o for o in radio.options),
+          str(radio.options))
+    for option in radio.options:
+        if option.startswith("Compare"):
+            continue  # slow, covered separately
+        app2 = start()
+        widget_by_label(app2, "radio", "how the cell is modelled").set_value(option).run()
+        no_exception(app2, f"model {option!r}")
+
+
+def case_composition_radios():
+    print("composition radios drive the fit")
+    seen = set()
+    for membrane in ("holds what it reached", "keeps stiffening"):
+        for cyto in ("at ε₁", "from the very start"):
+            app = start()
+            widget_by_label(app, "radio", "the membrane").set_value(membrane).run()
+            widget_by_label(app, "radio", "cytoskeleton starts").set_value(cyto).run()
+            if not no_exception(app, f"composition {membrane}/{cyto}"):
+                continue
+            state = app.session_state
+            seen.add((state["membrane_after_break"], state["cyto_starts_at"]))
+    check("all four combinations reachable", len(seen) == 4, str(seen))
+
+
+def case_highlight():
+    print("highlight selector")
+    app = start()
+    radio = widget_by_label(app, "radio", "highlight on the plot")
+    check("highlight radio present", radio is not None)
+    if radio is None:
+        return
+    for option in radio.options:
+        app2 = start()
+        widget_by_label(app2, "radio", "highlight on the plot").set_value(option).run()
+        no_exception(app2, f"highlight {option!r}")
+
+
+def case_search_applies_in_one_press():
+    print("one press searches and applies the winner")
+    app = start()
+    button = button_by_label(app, "Find the best combination and fit it")
+    check("search button present", button is not None)
+    if button is None:
+        return
+    before = (
+        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
+        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
     )
+    button.click().run()
+    if not no_exception(app, "combination search"):
+        return
+    search = app.session_state["composition_search"]
+    check("search succeeded", bool(search and search.get("success")),
+          str(search.get("error") if search else None))
+    if not (search and search.get("success")):
+        return
+    check("all four compositions ranked",
+          len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]}) == 4)
+
+    truth = ("freeze", "break")
+    best = search["best"]
+    picked = (best["membrane"], best["cyto_start"])
+    check("the true composition is the one picked", picked == truth,
+          f"picked {picked}")
+    check("ε₁ recovered", abs(best["break_1"] - 0.15) < 0.02,
+          f"{best['break_1']:.3f}")
+    check("ε₂ recovered", abs(best["break_2"] - 0.40) < 0.02,
+          f"{best['break_2']:.3f}")
+
+    # The winner should already be in the widgets: no second click needed.
+    after = (
+        app.session_state["segment_break_1"], app.session_state["segment_break_2"],
+        app.session_state["membrane_after_break"], app.session_state["cyto_starts_at"],
+    )
+    check("the winner was applied without a second click", after != before,
+          f"{before} -> {after}")
+    check("applied ε₁ matches the winner",
+          abs(after[0] - best["break_1"]) < 0.002, f"{after[0]} vs {best['break_1']}")
+    check("applied composition matches the winner",
+          MEMBRANE_MODE[after[2]] == best["membrane"]
+          and CYTO_MODE[after[3]] == best["cyto_start"])
+
+    override = button_by_label(app, "Use this one instead")
+    check("override button present", override is not None)
+    if override is not None:
+        override.click().run()
+        no_exception(app, "override the pick")
+    print(f"       picked {best['label']!r}, ε₁={after[0]}, ε₂={after[1]}")
+
+
+def case_search_beats_the_old_grid():
+    print("the refined search finds the breakpoints the coarse grid missed")
+    for membrane, cyto in (
+        ("freeze", "break"), ("freeze", "zero"), ("continue", "break"),
+    ):
+        eps, force = synthetic(membrane, cyto)
+        model = LulevichModel(force, eps, cell_height=8.0e-6)
+
+        coarse = model._best_breakpoints(
+            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=0
+        )
+        refined = model._best_breakpoints(
+            0.0, 0.60, membrane, cyto, True, "uniform", 12, rounds=2
+        )
+        check(f"refinement does not make {membrane}/{cyto} worse",
+              refined["ss_res"] <= coarse["ss_res"] * (1 + 1e-9),
+              f"{refined['ss_res']:.4g} vs {coarse['ss_res']:.4g}")
+        check(f"ε₁ within 0.02 of truth for {membrane}/{cyto}",
+              abs(refined["break_1"] - 0.15) < 0.02, f"{refined['break_1']:.4f}")
+
+
+def case_search_flags_what_it_cannot_see():
+    print("the search says when a term or a boundary does nothing")
+    eps, force = synthetic("continue", "zero")
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    found = model.search_compositions(0.0, 0.60)
+    check("search succeeded", found.get("success"))
+    if not found.get("success"):
+        return
+    row = next(
+        r for r in found["candidates"]
+        if r["membrane"] == "continue" and r["cyto_start"] == "zero" and r["use_nucleus"]
+    )
+    check("ε₁ flagged as unused when nothing depends on it",
+          "ε₁" in row.get("idle_breaks", []), str(row.get("idle_breaks")))
+
+    # A curve with no nucleus should be answered without one.
+    eps, force = synthetic("freeze", "zero", En_kPa=0.0)
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    found = model.search_compositions(0.0, 0.60)
+    check("a curve with no nucleus is answered without one",
+          found["best"]["use_nucleus"] is False
+          or found["best"]["En_kPa"] <= 0,
+          f"En={found['best']['En_kPa']:.4g}, "
+          f"use_nucleus={found['best']['use_nucleus']}")
+
+
+def case_bare_plot():
+    print("one switch strips the plot to data and fit")
+    app = start()
+    switch = None
+    for box in app.checkbox:
+        if "data and fit only" in (box.label or "").lower():
+            switch = box
+    check("bare-plot switch present", switch is not None)
+    if switch is None:
+        return
+    check("element curves off by default",
+          app.session_state["show_components"] is False)
+    switch.set_value(True).run()
+    if not no_exception(app, "bare plot"):
+        return
+
+    import app as app_module
+
+    everything_on = {name: True for name in app_module.PLOT_EXTRAS}
+    normal = app_module.plot_flags({**everything_on, "bare_plot": False})
+    check("individual boxes respected when not bare", all(normal.values()),
+          str(normal))
+
+    stripped = app_module.plot_flags({**everything_on, "bare_plot": True})
+    for flag, drawn in stripped.items():
+        check(f"{flag} forced off by the bare switch", drawn is False)
+
+    partial = app_module.plot_flags(
+        {**everything_on, "show_legend": False, "bare_plot": False}
+    )
+    check("one box off leaves the others on",
+          partial["show_legend"] is False and partial["show_components"] is True)
+
+    # And the app itself must still run with the switch on.
+    check("app runs with the bare switch on", not app.exception)
+
+
+def case_buttons_do_not_break_widgets():
+    print("every button in the segmented view clicks without a widget-key error")
+    app = start()
+    labels = [b.label for b in app.button]
+    for label in labels:
+        if any(word in label.lower() for word in ("box", "database", "send", "upload")):
+            continue
+        app2 = start()
+        target = button_by_label(app2, label)
+        if target is None:
+            continue
+        target.click().run()
+        no_exception(app2, f"button {label!r}")
+
+
+def case_preset_round_trip():
+    print("save a preset, then apply it back")
+    app = start()
+    widget_by_label(app, "radio", "the membrane").set_value("keeps stiffening").run()
+    name_box = None
+    for box in app.text_input:
+        if "preset" in (box.key or ""):
+            name_box = box
+    check("preset name box present", name_box is not None)
+    if name_box is None:
+        return
+    name_box.set_value("test preset").run()
+    save = button_by_label(app, "Save current")
+    check("save button present", save is not None)
+    if save is None:
+        return
+    save.click().run()
+    if not no_exception(app, "save preset"):
+        return
+    stored = app.session_state["range_presets"].get("test preset")
+    check("preset stored", stored is not None)
+    if stored is None:
+        return
+    check("preset carries the model name",
+          stored["coupling"].startswith("Segmented"), str(stored.get("coupling")))
+    check("preset carries the composition",
+          stored["membrane_after_break"] == "keeps stiffening",
+          str(stored.get("membrane_after_break")))
+    check("preset carries the boundaries",
+          "segment_break_1" in stored and "segment_break_2" in stored)
+
+    # Now switch away and apply the preset back.
+    widget_by_label(app, "radio", "the membrane").set_value(
+        "holds what it reached"
+    ).run()
+    apply = button_by_label(app, "Apply")
+    if apply is not None:
+        apply.click().run()
+        if no_exception(app, "apply preset"):
+            check("preset restored the composition",
+                  app.session_state["membrane_after_break"] == "keeps stiffening",
+                  str(app.session_state["membrane_after_break"]))
+
+
+def case_companion_file_guard():
+    print("mismatched companion files are named, not crashed on")
+    import app as app_module
+
+    check("no stale files in a matched tree", app_module.STALE_FILES == [],
+          str(app_module.STALE_FILES))
+
+    def old_signature(a, b, title=None):
+        return (a, b, title)
+
+    filtered = app_module.figure_kwargs(
+        old_signature, title="keep", highlight_window=(0.1, 0.2), fit_window=(0, 1)
+    )
+    check("unknown keywords dropped", filtered == {"title": "keep"}, str(filtered))
+
+    def new_signature(a, title=None, highlight_window=None):
+        return None
+
+    kept = app_module.figure_kwargs(
+        new_signature, title="keep", highlight_window=(0.1, 0.2)
+    )
+    check("known keywords kept", set(kept) == {"title", "highlight_window"}, str(kept))
+
+    def takes_anything(a, **kwargs):
+        return None
+
+    passthrough = app_module.figure_kwargs(takes_anything, anything=1, else_=2)
+    check("**kwargs passes everything through", len(passthrough) == 2)
+
+
+def case_fit_survives_a_rerun():
+    print("the fit survives a rerun with live refitting off")
+    app = start()
+    # Fit once, then take live refitting away, as uploading a video does.
+    check("a fit exists to begin with",
+          app.session_state["_last_fit"] is not None)
+    app.session_state["live_fit"] = False
+    app.run()
+    if not no_exception(app, "rerun with live refitting off"):
+        return
+    check("the fit is still there after a rerun",
+          app.session_state["_last_fit"] is not None)
+
+    # The database section must still be on the page, which is what actually
+    # vanished before: it lived inside the fit-succeeded branch.
+    uploader_labels = [u.label for u in app.get("file_uploader")]
+    check("the video uploader is still on the page",
+          any("compression video" in (l or "").lower() for l in uploader_labels),
+          str(uploader_labels))
+    check("the send button is still on the page",
+          button_by_label(app, "Send to OneDrive") is not None)
+
+
+def case_database_section_without_a_fit():
+    print("the database section is reachable before any fit")
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
+    app.run()
+    eps, force = synthetic()
+    load(app, eps, force)
+    app.session_state["live_fit"] = False
+    app.run()
+    if not no_exception(app, "no fit yet"):
+        return
+    check("no fit has been made", app.session_state["_last_fit"] is None)
+    uploader_labels = [u.label for u in app.get("file_uploader")]
+    check("the video uploader is reachable with no fit",
+          any("compression video" in (l or "").lower() for l in uploader_labels),
+          str(uploader_labels))
+    send = button_by_label(app, "Send to OneDrive")
+    check("the send button is shown with no fit", send is not None)
+    if send is not None:
+        check("and it is disabled until there is a fit", send.disabled is True)
+
+
+class FakeStore:
+    """Stands in for Box so the send path can be exercised for real."""
+
+    last = {}
+
+    def save_cell(self, record, curve_csv=None, thumbnail_png=None,
+                  video_bytes=None, video_name=None):
+        FakeStore.last = {
+            "record": record, "curve": curve_csv, "thumb": thumbnail_png,
+            "video": video_bytes, "video_name": video_name,
+        }
+        return {"cell_id": record["cell_id"], "video_url": ""}
+
+    def load_index(self):
+        return pd.DataFrame(columns=["cell_id", "date", "Em_MPa", "Ec_kPa"])
+
+    def check(self):
+        return {"ok": True, "detail": "fake store"}
+
+    def auth_method(self):
+        return "fake"
+
+
+def case_send_without_a_video():
+    print("a cell can be sent with no video at all")
+    FakeStore.last = {}
+    app = start(onedrive_store=FakeStore(), cell_name="cell-01")
+    check("no video is loaded", not app.session_state["video_path"])
+
+    send = button_by_label(app, "Send to OneDrive")
+    check("send button present", send is not None)
+    if send is None:
+        return
+    check("send button is enabled with a fit and no video", send.disabled is False)
+
+    send.click().run()
+    if not no_exception(app, "send with no video"):
+        return
+    check("no error was shown", not app.error, str([e.value for e in app.error]))
+    check("a success message was shown",
+          any("cell-01" in (m.value or "") for m in app.success),
+          str([m.value for m in app.success]))
+
+    saved = FakeStore.last
+    check("the cell reached the store", bool(saved))
+    check("no video bytes were sent", saved.get("video") is None)
+    check("no morphology frame was sent", saved.get("thumb") is None)
+    check("the curve went anyway", bool(saved.get("curve")))
+    check("the moduli went anyway",
+          "Em_MPa" in (saved.get("record") or {})
+          and "Ec_kPa" in (saved.get("record") or {}))
+    check("the fitted column is in the curve csv",
+          "fit_N" in (saved.get("curve") or ""))
+
+
+def case_clear_cell_wins_over_dark_debris():
+    print("the detector picks the clear cell, not a dark blob of the same shape")
+    try:
+        import cv2
+        import video_analysis as va
+    except Exception as exc:
+        print(f"  skip (no OpenCV: {exc})")
+        return
+
+    def scene():
+        """A dark blob that is bigger and more central than the real cell."""
+        f = np.full((300, 420, 3), 150, np.uint8)
+        cv2.ellipse(f, (210, 175), (52, 48), 0, 0, 360, (95, 95, 95), -1)
+        cv2.ellipse(f, (90, 175), (40, 37), 0, 0, 360, (205, 205, 205), -1)
+        cv2.rectangle(f, (0, 40), (420, 70), (18, 18, 18), -1)   # cantilever
+        rng = np.random.default_rng(0)
+        return np.clip(f.astype(int) + rng.normal(0, 4, f.shape), 0, 255).astype(np.uint8)
+
+    frame = scene()
+
+    on_shape = va.detect_cell(frame, appearance="either", min_area_frac=0.005)
+    check("without a hint the dark blob wins, which is the reported bug",
+          on_shape.get("found") and on_shape["center"][0] > 150,
+          str(on_shape.get("center")))
+
+    clear = va.detect_cell(frame, appearance="clear", min_area_frac=0.005)
+    check("told the cell is clear, it picks the clear one",
+          clear.get("found") and clear["center"][0] < 150,
+          str(clear.get("center")))
+
+    dark = va.detect_cell(frame, appearance="dark", min_area_frac=0.005)
+    check("told the cell is dark, it picks the dark one",
+          dark.get("found") and dark["center"][0] > 150,
+          str(dark.get("center")))
+
+    # The stored crop must actually contain the cell, not background.
+    crop = va.crop(frame, clear)
+    check("the crop is centred on the clear cell",
+          crop is not None and float(crop.mean()) > float(frame.mean()),
+          f"crop mean {float(crop.mean()):.0f} vs frame {float(frame.mean()):.0f}")
+
+
+def case_all_three_moduli_always_reported():
+    print("all three moduli appear even when a term is not in the model")
+    app = start(use_nucleus=False, use_interior=False)
+    if not no_exception(app, "membrane only"):
+        return
+    labels = [m.label for m in app.get("metric")]
+    for wanted in ("membrane", "cytoskeleton", "nucleus"):
+        check(f"{wanted} has a tile with only the membrane selected",
+              any(wanted in (l or "").lower() for l in labels), str(labels))
+    values = {m.label: (m.value, m.delta) for m in app.get("metric")}
+    # Only the modulus tiles, which are the ones named "Ec …" and "Eₙ …".
+    off = [
+        (label, values[label][0], values[label][1])
+        for label in ("Ec cytoskeleton", "E\u2099 nucleus") if label in values
+    ]
+    check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
+    for label, value, delta in off:
+        check(f"{label} reads zero", value.strip().startswith("0"), value)
+        check(f"{label} says it was not in the model",
+              "not in this model" in (delta or ""), str(delta))
+
+
+def case_load_share_table():
+    print("the range-by-range table says who carries the load")
+    app = start()
+    if not no_exception(app, "load share table"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the table has a heading", "share the load" in text, text[:120])
+
+
+def case_download_when_box_is_absent():
+    print("a cell can be saved with no Box account")
+    app = start(cell_name="cell-01")
+    drive = button_by_label(app, "Send to OneDrive")
+    check("the OneDrive button is present", drive is not None)
+    if drive is not None:
+        check("and disabled without a connection", drive.disabled is True)
+    check("Box is gone from the app",
+          button_by_label(app, "Send to Box") is None
+          and not any("Box" in (b.label or "") for b in app.button),
+          str([b.label for b in app.button]))
+
+    downloads = [d for d in app.get("download_button")
+                 if "download this cell" in (d.label or "").lower()]
+    check("a download is offered instead", len(downloads) == 1, str(len(downloads)))
+
+    import zipfile, io as _io, json as _json
+    import app as app_module
+    fit = app.session_state["_last_fit"]
+    eps, force = synthetic()
+    # Build the bundle through the app so session state is live.
+    check("there is a fit to package", fit is not None)
+
+
+class FakeWorksheet:
+    """A worksheet that records what would be written to the real sheet."""
+
+    def __init__(self, header):
+        self.header = list(header)
+        self.rows = []
+        self.updates = []
+        self.all_values = [list(header)]
+        self.written_rows = []
+        self.cleared = False
+
+    def row_values(self, index):
+        return list(self.header) if index == 1 else []
+
+    def get_all_values(self):
+        return [list(row) for row in self.all_values]
+
+    def clear(self):
+        self.cleared = True
+
+    def update(self, values=None, range_name=None, **kwargs):
+        self.header = list(values[0])
+        self.updates.append(list(values[0]))
+        if len(values) > 1:
+            self.written_rows = [list(r) for r in values[1:]]
+
+    def append_row(self, row, **kwargs):
+        self.rows.append(list(row))
+
+    def insert_row(self, row, index):
+        self.header = list(row)
+
+
+def case_sheet_row_matches_the_header():
+    print("the sheet row is built from the sheet's own header")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    # The user's real sheet as it stood before this change.
+    existing = [
+        "Cell ID", "Date Analyzed", "Cell Height (μm)",
+        "Cantilever Constant (pN/nm)", "Young's Modulus (Em, MPa)",
+        "Young's Modulus (Ei, kPa)", "Video Link", "Force Curve Created",
+        "Fit Quality (R²)", "Notes", "Analysis Status", "Timestamp",
+    ]
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet = FakeWorksheet(existing)
+    manager.worksheet = sheet
+
+    ok, message = manager.append_cell_data({
+        "cell_id": "cell-01", "Em": 0.605, "Ei": 1.196, "En": 3.027,
+        "Em_range": "0.000 to 0.151", "En_range": "0.403 to 0.600",
+        "break_1": 0.151, "break_2": 0.403, "fit_quality": 0.9997,
+        "cell_height": 8.0, "spring_constant": 0.08, "notes": "test",
+    })
+    check("the write succeeded", ok, message)
+
+    check("Date Analyzed was renamed, not duplicated",
+          "Experiment Date" in sheet.header
+          and "Date Analyzed" not in sheet.header, str(sheet.header))
+    check("Cantilever Constant became Spring Constant",
+          "Spring Constant, K (N/m)" in sheet.header
+          and "Cantilever Constant (pN/nm)" not in sheet.header, str(sheet.header))
+    check("renamed columns kept their position",
+          sheet.header[1] == "Experiment Date"
+          and sheet.header[3] == "Spring Constant, K (N/m)", str(sheet.header[:5]))
+    for wanted in ("Young's Modulus (En, kPa)", "Em range (ε)", "Ei range (ε)",
+                   "En range (ε)", "ε₁ membrane hands over", "RMSE (N)"):
+        check(f"{wanted} column present", wanted in sheet.header, str(sheet.header))
+
+    check("exactly one row was written", len(sheet.rows) == 1)
+    written = dict(zip(sheet.header, sheet.rows[0]))
+    check("cell id in the right column", written["Cell ID"] == "cell-01")
+    check("Em in the Em column",
+          abs(float(written["Young's Modulus (Em, MPa)"]) - 0.605) < 1e-6)
+    check("En in the nucleus column",
+          abs(float(written["Young's Modulus (En, kPa)"]) - 3.027) < 1e-6)
+    check("the Em range travelled with it",
+          written["Em range (ε)"] == "0.000 to 0.151", str(written["Em range (ε)"]))
+    check("spring constant in N/m, not converted",
+          abs(float(written["Spring Constant, K (N/m)"]) - 0.08) < 1e-9)
+    check("row length matches the header", len(sheet.rows[0]) == len(sheet.header))
+
+    # A reordered header must still be written correctly.
+    manager2 = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet2 = FakeWorksheet(list(reversed(existing)))
+    manager2.worksheet = sheet2
+    manager2.append_cell_data({"cell_id": "cell-02", "Em": 1.5})
+    written2 = dict(zip(sheet2.header, sheet2.rows[0]))
+    check("reordered header still gets the right cell id",
+          written2["Cell ID"] == "cell-02")
+    check("reordered header still gets Em in the Em column",
+          abs(float(written2["Young's Modulus (Em, MPa)"]) - 1.5) < 1e-6)
+
+
+def case_sheet_reorder_keeps_the_data():
+    print("reordering the columns does not lose a row")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    header = ["Cell ID", "Date Analyzed", "Video Link", "Notes", "Custom of mine"]
+    rows = [
+        ["cell-01", "2026-01-01", "http://v/1", "first", "keep me"],
+        ["cell-02", "2026-01-02", "http://v/2", "second", "keep me too"],
+    ]
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    sheet = FakeWorksheet(header)
+    sheet.all_values = [header] + rows
+    manager.worksheet = sheet
+
+    ok, message = manager.reorder_columns()
+    check("the reorder succeeded", ok, message)
+    new_header = sheet.header
+    check("video link is last", new_header[-1] == "Video Link"
+          or new_header[-2:] == ["Video Link", "Custom of mine"], str(new_header[-3:]))
+    check("a column the app does not know about was kept",
+          "Custom of mine" in new_header)
+    check("the header was renamed here too",
+          "Experiment Date" in new_header and "Date Analyzed" not in new_header)
+
+    written = [dict(zip(new_header, row)) for row in sheet.written_rows]
+    check("both rows survived", len(written) == 2, str(len(written)))
+    if len(written) == 2:
+        check("row values followed their column",
+              written[0]["Cell ID"] == "cell-01"
+              and written[0]["Notes"] == "first"
+              and written[0]["Video Link"] == "http://v/1",
+              str(written[0]))
+        check("the date moved to the renamed column",
+              written[1]["Experiment Date"] == "2026-01-02", str(written[1]))
+        check("the unknown column kept its value",
+              written[1]["Custom of mine"] == "keep me too")
+
+
+def case_fit_line_and_heights_toggle():
+    print("the fitted curve and the component heights each have a switch")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+
+    def build(**flags):
+        style = plot_utils.PlotStyle(force_unit="N", show_components=True, **flags)
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=fitted,
+            membrane_N=mb * fit["Em"], interior_N=cb * fit["Ei"],
+            nucleus_N=nb * fit["En"],
+        )
+
+    on = build()
+    check("the model line is drawn by default",
+          any(t.name == "Model" for t in on.data))
+    check("no height labels by default", len(on.layout.annotations) == 0)
+
+    off = build(show_fit_line=False)
+    check("switching the fit off removes the model line",
+          not any(t.name == "Model" for t in off.data))
+    check("the data is still there",
+          any(t.name == "Experimental data" for t in off.data))
+
+    labelled = build(show_component_heights=True)
+    texts = [a.text for a in labelled.layout.annotations]
+    check("a height label per component plus the total",
+          len(texts) == 4, str(texts))
+    check("the labels carry the force unit",
+          all("N" in (t or "") for t in texts), str(texts))
+
+
+def case_range_table_shows_zero_moduli():
+    print("each range lists the moduli active there, zero where not reached")
+    app = start()
+    if not no_exception(app, "range table"):
+        return
+    target = table_with(app, "range", "membrane")
+    check("the range table is on the page", target is not None)
+    if target is None:
+        return
+    for column in ("E membrane", "E cytoskeleton", "E nucleus"):
+        check(f"{column} column present", column in target.columns,
+              str(list(target.columns)))
+    first = target.iloc[0]
+    check("the first range carries only the membrane",
+          first["E cytoskeleton"].startswith("0")
+          and first["E nucleus"].startswith("0"),
+          f"{first['E cytoskeleton']!r} {first['E nucleus']!r}")
+    check("and the membrane is non-zero there",
+          not first["E membrane"].startswith("0 "), str(first["E membrane"]))
+    last = target.iloc[-1]
+    check("the last range carries the nucleus",
+          not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
+
+
+def case_plot_options_are_under_the_plot():
+    print("the plot switches are next to the plot, not buried in the sidebar")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "plot options"):
+        return
+    labels = [c.label for c in app.checkbox]
+    for wanted in ("Data and fit only", "The fitted curve", "Element curves",
+                   "Shaded segment bands", "Legend"):
+        check(f"“{wanted}” is on the page", wanted in labels, str(labels))
+
+    text = " ".join(
+        str(m.value) for m in list(app.get("markdown")) + list(app.get("caption"))
+    )
+    check("the sidebar points at the new place",
+          "Plot options" in text, "no pointer found")
+
+    # Ticking it must actually strip the plot.
+    switch = widget_by_label(app, "checkbox", "Data and fit only")
+    check("the switch is reachable", switch is not None)
+    if switch is not None:
+        switch.set_value(True).run()
+        no_exception(app, "bare plot from under the plot")
+        check("the switch stuck", app.session_state["bare_plot"] is True)
+
+
+def case_save_the_plot():
+    print("the plot can be saved with a sensible name")
+    import app as app_module
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+
+    app = start(cell_name="Cell 04 / trial 2")
+    downloads = [d for d in app.get("download_button")
+                 if "save" in (d.label or "").lower()]
+    check("a save button is offered", len(downloads) >= 1,
+          str([d.label for d in app.get("download_button")]))
+
+    import datetime as _dt
+    name = app_module.suggested_plot_name(
+        "Cell 04 / trial 2", fit, _dt.date(2026, 3, 4), ".png"
+    )
+    check("the name carries the cell", name.startswith("Cell_04___trial_2"), name)
+    check("the name carries the date", "2026-03-04" in name, name)
+    check("the name carries the moduli", "Em" in name and "Ec" in name, name)
+    check("the name has no path separators", "/" not in name and "\\" not in name, name)
+    check("the extension is kept", name.endswith(".png"), name)
+    blank = app_module.suggested_plot_name("", fit, _dt.date(2026, 3, 4), ".html")
+    check("an unnamed cell still gets a usable name",
+          blank.startswith("cell_") and blank.endswith(".html"), blank)
+
+
+def case_fit_maths_box():
+    print("the working behind the fit is shown")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "maths box"):
+        return
+    blocks = [str(b.value) for b in app.get("latex")]
+    check("equations are rendered", len(blocks) >= 3, str(len(blocks)))
+    joined = " ".join(blocks)
+    check("the model equation is there", "A_m E_m" in joined, joined[:120])
+    check("the least-squares statement is there",
+          "arg\\min" in joined or "argmin" in joined, joined[-160:])
+    code = " ".join(str(c.value) for c in app.get("code"))
+    check("the prefactors are printed with values", "Am =" in code, code[:160])
+    check("the fitted moduli are printed", "MPa" in code and "kPa" in code)
+
+
+def case_guided_mode_is_the_default():
+    print("guided mode: one button, an answer in words")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "guided load"):
+        return
+    check("guided is the default",
+          app.session_state["ui_mode"].startswith("Guided"),
+          app.session_state["ui_mode"])
+
+    work = button_by_label(app, "Work it out for me")
+    check("the one-press button is there", work is not None)
+
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    for phrase in ("What this cell did as it was squashed",
+                   "How stiff each part turned out to be",
+                   "Does the model match the measurement"):
+        check(f"“{phrase[:34]}…” is shown", phrase in text)
+    check("no bare jargon in the headline",
+          "coupling" not in text.lower(), "the word coupling leaked out")
+
+    # The plain-language table names the parts in everyday words.
+    parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
+    check("the stiffness table is there", len(parts) == 1, str(len(parts)))
+    if parts:
+        table = parts[0]
+        check("it names all three parts", len(table) == 3, str(len(table)))
+        check("it explains what each part is",
+              all(isinstance(v, str) and v for v in table["What it is"]))
+        check("it gives an everyday comparison",
+              any("as" in str(v) for v in table["Roughly"]), str(list(table["Roughly"])))
+
+    if work is not None:
+        work.click().run()
+        if no_exception(app, "work it out"):
+            found = app.session_state["composition_search"]
+            check("the search ran", bool(found and found.get("success")))
+            if found and found.get("success"):
+                best = found["best"]
+                check("the winner was applied",
+                      abs(app.session_state["segment_break_1"]
+                          - round(best["break_1"], 3)) < 0.002,
+                      f"{app.session_state['segment_break_1']} vs {best['break_1']}")
+
+
+def case_full_control_shows_everything():
+    print("full control puts the settings back on the page")
+    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
+    if not no_exception(app, "full control"):
+        return
+    check("the one-press button is hidden in full control",
+          button_by_label(app, "Work it out for me") is None)
+    check("the section headings are back",
+          any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
+    check("the expert search button is still there",
+          button_by_label(app, "Find the best combination and fit it") is not None)
+    check("the plain-language summary is not duplicated",
+          not any("What this cell did as it was squashed" in str(m.value)
+                  for m in app.get("markdown")))
+
+
+def case_plain_language_helpers():
+    print("the everyday wording is honest about scale")
+    import app as app_module
+
+    check("a jelly-soft modulus reads soft",
+          "jelly" in app_module.stiffness_in_words(1.2e3),
+          app_module.stiffness_in_words(1.2e3))
+    check("a rubbery modulus reads firm",
+          "rubber" in app_module.stiffness_in_words(6e5),
+          app_module.stiffness_in_words(6e5))
+    check("zero is called unmeasurable",
+          "not measurable" in app_module.stiffness_in_words(0.0))
+    check("a NaN is called unmeasurable",
+          "not measurable" in app_module.stiffness_in_words(float("nan")))
+    check("the comparisons increase with stiffness",
+          len({app_module.stiffness_in_words(v)
+               for v in (5e2, 5e3, 5e4, 5e5)}) == 4)
+
+    check("a good fit is described as close",
+          "exactly" in app_module.quality_in_words(0.999))
+    check("a bad fit is called out",
+          "wrong" in app_module.quality_in_words(0.5),
+          app_module.quality_in_words(0.5))
+
+
+def case_curve_saved_as_a_tab():
+    print("the force curve can be stored in the spreadsheet")
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception as exc:
+        print(f"  skip (gspread missing: {exc})")
+        return
+
+    class FakeSpreadsheet:
+        url = "https://docs.google.com/spreadsheets/d/abc/edit"
+
+        def __init__(self):
+            self.tabs = {}
+
+        def worksheet(self, title):
+            import gspread
+            if title not in self.tabs:
+                raise gspread.WorksheetNotFound(title)
+            return self.tabs[title]
+
+        def add_worksheet(self, title, rows, cols):
+            sheet = FakeWorksheet([])
+            sheet.id = 7
+            self.tabs[title] = sheet
+            return sheet
+
+        def worksheets(self):
+            return list(self.tabs.values())
+
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    book = FakeSpreadsheet()
+    manager.spreadsheet = book
+
+    eps, force = synthetic()
+    fitted = force * 0.99
+    fitted[:5] = np.nan          # outside the fitted range
+
+    ok, message, url = manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
+    check("the curve was saved", ok, message)
+    check("the tab is named after the cell",
+          "curve_Cell 04 _ trial 2" in book.tabs, str(list(book.tabs)))
+    check("the url points at the tab", "#gid=" in url, url)
+
+    sheet = list(book.tabs.values())[0]
+    written = sheet.written_rows if sheet.written_rows else []
+    header = sheet.header
+    check("the header names the columns",
+          header == ["relative_deformation", "force_N", "fit_N"], str(header))
+    check("every point was written", len(written) == len(eps), str(len(written)))
+    check("NaN outside the fit is written as blank",
+          written[0][2] == "", repr(written[0][2]))
+    check("a fitted point carries its value",
+          isinstance(written[-1][2], float), repr(written[-1][2]))
+
+    # Saving the same cell twice replaces the tab rather than adding another.
+    manager.save_curve("Cell 04 / trial 2", eps, force, fitted)
+    check("refitting replaces the tab, not duplicates it", len(book.tabs) == 1,
+          str(list(book.tabs)))
+    check("the tab was cleared before rewriting", sheet.cleared is True)
+
+
+def case_axis_ranges():
+    print("the axes can be pinned, and deformation defaults to 0-1")
+    import plot_utils
+    import app as app_module
+
+    check("0 to 1 is the default deformation axis",
+          app_module.DEFAULTS["x_axis_mode"].startswith("0 to 1"),
+          app_module.DEFAULTS["x_axis_mode"])
+
+    eps, force = synthetic()
+    style = plot_utils.PlotStyle(force_unit="N", x_range=(0.0, 1.0))
+    fig = plot_utils.force_curve_figure(eps, force, style)
+    check("the deformation axis is pinned to 0-1",
+          list(fig.layout.xaxis.range) == [0.0, 1.0], str(fig.layout.xaxis.range))
+    check("autorange is off so it stays pinned",
+          fig.layout.xaxis.autorange is False, str(fig.layout.xaxis.autorange))
+
+    style = plot_utils.PlotStyle(force_unit="N", y_range=(0.0, 5.0))
+    fig = plot_utils.force_curve_figure(eps, force, style)
+    check("the force axis can be pinned too",
+          list(fig.layout.yaxis.range) == [0.0, 5.0], str(fig.layout.yaxis.range))
+
+    loose = plot_utils.force_curve_figure(eps, force, plot_utils.PlotStyle(force_unit="N"))
+    check("no range means plotly decides", loose.layout.xaxis.range is None)
+
+    # A reversed or nonsense range must be ignored, not applied.
+    bad = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="N", x_range=(1.0, 0.0))
+    )
+    check("a reversed range is ignored", bad.layout.xaxis.range is None,
+          str(bad.layout.xaxis.range))
+
+    # Log axes take decades, so a linear pair must not be applied there.
+    logged = plot_utils.force_curve_figure(
+        eps, force,
+        plot_utils.PlotStyle(force_unit="N", log_scale=True, x_range=(0.0, 1.0)),
+    )
+    check("ranges are not applied on log axes",
+          logged.layout.xaxis.range is None, str(logged.layout.xaxis.range))
+
+
+def case_nucleus_spring_is_shorter():
+    print("a component met late gets a shorter spring")
+    import plot_utils
+
+    style = plot_utils.PlotStyle(force_unit="N")
+
+    def springs(cyto_start):
+        fig = plot_utils.cell_schematic(
+            style, epsilon=0.5, break_1=0.15, break_2=0.40,
+            membrane_mode="freeze", cyto_start=cyto_start,
+            Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+        )
+        # Springs are line traces; measure how far each spans vertically.
+        spans = []
+        for trace in fig.data:
+            ys = [v for v in (trace.y or []) if v is not None]
+            if len(ys) > 4:
+                spans.append(max(ys) - min(ys))
+        return sorted(spans)
+
+    late = springs("break")
+    early = springs("zero")
+    check("some springs were drawn", len(late) >= 2, str(late))
+    if len(late) >= 2 and len(early) >= 2:
+        check("the late component's spring is shorter than the earliest one",
+              min(late) < max(late) * 0.95, str(late))
+        check("starting at zero makes the interior spring full length",
+              max(early) >= max(late) * 0.99, f"{early} vs {late}")
+
+
+def case_component_names_follow_the_cell_type():
+    print("a cardiomyocyte is not described as a myoblast")
+    import app as app_module
+
+    myoblast = app_module.components_for("Myoblast (C2C12)")
+    cardio = app_module.components_for("Cardiomyocyte")
+    check("the myoblast interior is the cytoskeleton",
+          myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
+    check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
+          "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
+    check("and a sarcomeric, contractile one",
+          "Sarcomeric" in cardio["nucleus"][0]
+          and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
+    check("the two are described as different things",
+          cardio["interior"][1] != cardio["nucleus"][1])
+    # The membrane is two springs for this cell type, and they have to be
+    # named as two things, not one thing twice.
+    check("the taut protein network is one of them",
+          "taut" in cardio["tension"][1], str(cardio["tension"]))
+    check("the shell's own elasticity is the other",
+          "stretch" in cardio["membrane"][1], str(cardio["membrane"]))
+    check("a myoblast has no tension spring",
+          "tension" not in app_module.terms_for("Myoblast (C2C12)"))
+    check("a cardiomyocyte does",
+          "tension" in app_module.terms_for("Cardiomyocyte"))
+    check("an unknown cell type still gets names",
+          app_module.components_for("Something else")["interior"][0])
+
+    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "cardiomyocyte names"):
+        return
+    parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
+    check("the plain-language table is there", len(parts) == 1)
+    if parts:
+        listed = list(parts[0]["Part of the cell"])
+        check("it lists both kinds of cytoskeleton",
+              any("Non-sarcomeric" in v for v in listed)
+              and any("Sarcomeric myofibrils" == v for v in listed), str(listed))
+        check("and never calls anything a nucleus",
+              not any("Nucleus" in v for v in listed), str(listed))
+        check("and both membrane springs are named",
+              sum("Membrane" in v for v in listed) == 2, str(listed))
+    check("the fit succeeds for a cardiomyocyte",
+          app.session_state["_last_fit"] is not None
+          and app.session_state["_last_fit"].get("success"))
+    fit = app.session_state["_last_fit"]
+    if fit:
+        check("and it follows the data",
+              fit["r_squared"] > 0.9, f"R2={fit['r_squared']:.4f}")
+
+
+def case_cardiomyocyte_model_is_flagged_provisional():
+    print("the cardiomyocyte model says it is provisional")
+    app = start(cell_name="cell-01",
+                model_kind="Cardiomyocyte (Morales Maldonado)")
+    if not no_exception(app, "cardiomyocyte model"):
+        return
+    warnings = " ".join(str(w.value) for w in app.warning)
+    check("a provisional warning is shown", "provisional" in warnings.lower(),
+          warnings[:120])
+    check("it says the equations were not available",
+          "equations" in warnings.lower(), warnings[:200])
+    check("it asks for the paper's equation",
+          "send me" in warnings.lower(), warnings[:200])
+
+
+def case_not_reached_is_explained():
+    print("“not reached yet” is spelled out")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "range wording"):
+        return
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("the wording is explained",
+          "have not met it yet" in captions or "not been squashed far enough"
+          in captions, captions[:200])
+    check("it says this is not missing data",
+          "not missing data" in captions, "explanation absent")
+
+
+def case_fit_statistics():
+    print("chi squared catches what R-squared misses")
+    from lulevich_model import LulevichModel as LM, noise_sigma, fit_statistics
+
+    eps = np.linspace(0.001, 0.60, 260)
+    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+    clean = m * 0.6e6 + c * 1.2e3 + nu * 3e3
+
+    force = clean + 5e-11 * np.random.default_rng(0).standard_normal(260)
+    model = LM(force, eps, cell_height=8.0e-6)
+    right = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    check("the right model gives chi2/dof near 1",
+          0.2 < right["chi_squared_reduced"] < 3.0,
+          f"{right['chi_squared_reduced']:.2f}")
+
+    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, use_nucleus=False)
+    check("dropping a real term is caught by chi2",
+          wrong["chi_squared_reduced"] > 10 * right["chi_squared_reduced"],
+          f"{wrong['chi_squared_reduced']:.1f} vs {right['chi_squared_reduced']:.2f}")
+    check("R-squared alone would not have caught it",
+          wrong["r_squared"] > 0.97, f"R2={wrong['r_squared']:.4f}")
+
+    check("adjusted R-squared is reported",
+          np.isfinite(right["adj_r_squared"]))
+    check("adjusted is never above plain",
+          right["adj_r_squared"] <= right["r_squared"] + 1e-12)
+    check("degrees of freedom account for the parameters",
+          right["dof"] == right["n_points"] - right["n_params"],
+          f"{right['dof']} vs {right['n_points']}-{right['n_params']}")
+
+    # Noise that grows with force must not be read as the quiet end.
+    sigma, typical = noise_sigma(eps, clean * (1 + 0.02 *
+                                np.random.default_rng(0).standard_normal(260)))
+    check("the noise estimate is per point", np.size(sigma) == 260, str(np.size(sigma)))
+    check("and it grows where the force grows",
+          np.median(sigma[-50:]) > np.median(sigma[:50]) * 3,
+          f"{np.median(sigma[:50]):.2e} -> {np.median(sigma[-50:]):.2e}")
+    check("a typical value is reported", np.isfinite(typical))
+
+    # A curve too short to estimate noise must not crash.
+    stats = fit_statistics(np.array([1.0, 2.0]), np.array([1.0, 2.0]), 2,
+                           epsilon=np.array([0.1, 0.2]))
+    check("two points do not raise", np.isnan(stats["chi_squared"]))
+
+
+def case_chi_squared_reaches_the_page():
+    print("the fit statistics are shown and stored")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "chi squared on the page"):
+        return
+    labels = [m.label for m in app.get("metric")]
+    check("a chi-squared tile is shown",
+          any("χ²" in (l or "") for l in labels), str(labels))
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("it explains what about 1 means",
+          "as close to the points as the scatter" in captions, "no explanation")
+    check("it warns that R² can look fine",
+          "R² can still look excellent" in captions, "no warning")
+
+    try:
+        from google_sheets_manager import GoogleSheetsManager
+    except Exception:
+        return
+    names = [name for _, name in GoogleSheetsManager.COLUMNS]
+    for wanted in ("Chi squared", "Chi squared / dof", "Adjusted R²",
+                   "Measured noise σ (N)"):
+        check(f"the sheet records {wanted}", wanted in names, str(names))
+
+
+def case_search_stays_fast():
+    print("the search does not crawl on a realistic curve")
+    import time
+    from lulevich_model import LulevichModel as LM
+
+    # A real .ibw curve has thousands of points, not a few hundred. The
+    # search fits hundreds of candidates, so anything expensive per fit is
+    # multiplied by that. This is the guard on that multiplication.
+    for n, budget in ((1000, 6.0), (3000, 12.0)):
+        eps = np.linspace(0.001, 0.60, n)
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+        force = (m * 0.6e6 + c * 1.2e3 + nu * 3e3) * (
+            1 + 0.01 * np.random.default_rng(0).standard_normal(n)
+        )
+        model = LM(force, eps, cell_height=8.0e-6)
+
+        start_time = time.time()
+        found = model.search_compositions(0.0, 0.60)
+        elapsed = time.time() - start_time
+        check(f"the search finishes on {n} points", found.get("success"))
+        check(f"and takes under {budget:.0f}s at {n} points ({elapsed:.1f}s)",
+              elapsed < budget, f"{elapsed:.1f}s")
+        if found.get("success"):
+            best = found["best"]
+            check(f"and is still right at {n} points",
+                  (best["membrane"], best["cyto_start"]) == ("freeze", "break"),
+                  f"{best['membrane']}/{best['cyto_start']}")
+
+    # The winner must still come back with its statistics, even though the
+    # candidates were fitted without them.
+    check("the winner carries chi squared",
+          np.isfinite(found["best"].get("chi_squared_reduced", np.nan))
+          or np.isfinite(
+              model.fit_composition(
+                  0.0, 0.60, found["best"]["break_1"], found["best"]["break_2"]
+              )["chi_squared_reduced"]
+          ))
+
+
+def case_png_is_not_rendered_every_run():
+    print("the plot is not re-rendered to PNG on every rerun")
+    import plot_utils
+    import app as app_module
+
+    calls = []
+    original = plot_utils.go.Figure.to_image
+
+    def counting(self, *args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("no chrome here")
+
+    plot_utils.go.Figure.to_image = counting
+    try:
+        app = start(cell_name="cell-01")
+        app.run()
+        app.run()
+    finally:
+        plot_utils.go.Figure.to_image = original
+
+    check("no PNG render happened without being asked",
+          len(calls) == 0, f"{len(calls)} renders")
+    check("a Prepare a PNG button is offered",
+          button_by_label(app, "Prepare a PNG") is not None)
+    check("HTML is still available without asking",
+          any("save as html" in (d.label or "").lower()
+              for d in app.get("download_button")),
+          str([d.label for d in app.get("download_button")]))
+
+
+def case_guided_order_is_parts_then_work_it_out():
+    print("Step 1 picks the parts, Step 2 works it out")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "guided order"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("Step 1 names the parts",
+          "Step 1 · Which parts of the cell" in text, text[:150])
+    check("Step 2 is the range", "Step 2 · How far" in text, text[:200])
+    check("Step 3 is the button", "Step 3 · Work it out" in text, text[:200])
+    check("the steps are in order",
+          text.index("Step 1 ·") < text.index("Step 2 ·") < text.index("Step 3 ·"))
+
+    # The part checkboxes must exist exactly once, in Step 1.
+    labels = [c.label for c in app.checkbox]
+    for term in ("Membrane", "Cytoskeleton", "Nucleus"):
+        matching = [l for l in labels if l and l.startswith(term)]
+        check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
+
+    # Unticking a part must disable the button rather than fail later.
+    for term in ("membrane", "interior", "nucleus"):
+        app.session_state[f"use_{term}"] = False
+    app.run()
+    if no_exception(app, "no parts selected"):
+        work = button_by_label(app, "Work it out for me")
+        check("with nothing ticked the button is disabled",
+              work is not None and work.disabled is True)
+
+
+def case_it_picks_the_arrangement():
+    print("the search chooses segmented, side by side or stacked")
+    from lulevich_model import LulevichModel as LM, search_arrangements
+
+    eps = np.linspace(0.001, 0.60, 300)
+
+    def segmented():
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
+        return m * 0.6e6 + c * 1.2e3 + nu * 3e3
+
+    def side_by_side():
+        g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        return g.combined_model(eps, 0.6e6, 1.2e3, 0.0, En=0.0)
+
+    for name, maker, expected in (
+        ("a segmented curve", segmented, "segmented"),
+        ("a side-by-side curve", side_by_side, "parallel"),
+    ):
+        force = maker() * (
+            1 + 0.01 * np.random.default_rng(0).standard_normal(eps.size)
+        )
+        model = LM(force, eps, cell_height=8.0e-6)
+        found = search_arrangements(model, 0.0, 0.60)
+        check(f"{name}: the search ran", found.get("success"),
+              str(found.get("error")))
+        if not found.get("success"):
+            continue
+        picked = found["best"]["arrangement"]
+        tied = {c["arrangement"] for c in found["candidates"]
+                if c.get("tied_with_best")} | {picked}
+        check(f"{name} is called {expected}", expected in tied,
+              f"picked {picked}, tied {tied}")
+        check(f"{name}: all three arrangements were tried",
+              len(found["candidates"]) == 3, str(len(found["candidates"])))
+        check(f"{name}: the verdict is in plain words",
+              "curve" in found["verdict"].lower(), found["verdict"][:80])
+
+    # The winner has to translate into settings the app can apply.
+    import app as app_module
+    for arrangement, expected_model in (
+        ("segmented", "Segmented"),
+        ("series", "Stacked"),
+        ("parallel", "Side by side"),
+    ):
+        pending = app_module.settings_from_arrangement(
+            {"arrangement": arrangement,
+             "composition": {"membrane": "freeze", "cyto_start": "break",
+                             "break_1": 0.15, "break_2": 0.40,
+                             "use_nucleus": True}},
+            0.6,
+        )
+        check(f"{arrangement} maps to a real model name",
+              pending["model_kind"].startswith(expected_model),
+              pending["model_kind"])
+        check(f"{arrangement} maps to a name the radio offers",
+              pending["model_kind"] in app_module.MODEL_KEYS,
+              pending["model_kind"])
+
+
+def case_work_it_out_applies_the_arrangement():
+    print("pressing it applies what it found")
+    app = start(cell_name="cell-01")
+    work = button_by_label(app, "Work it out for me")
+    check("the button is there", work is not None)
+    if work is None:
+        return
+    work.click().run()
+    if not no_exception(app, "work it out"):
+        return
+    found = app.session_state["arrangement_search"]
+    check("the arrangement search ran", bool(found and found.get("success")),
+          str(found.get("error") if found else None))
+    if not (found and found.get("success")):
+        return
+    check("the model on the page matches what it chose",
+          app.session_state["model_kind"]
+          == app_module_model_name(found["best"]["arrangement"]),
+          f"{app.session_state['model_kind']} vs {found['best']['arrangement']}")
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the answer is shown in words", "curve" in text.lower())
+
+
+def app_module_model_name(arrangement):
+    import app as app_module
+    return app_module.settings_from_arrangement(
+        {"arrangement": arrangement, "composition": {}}, 0.6
+    )["model_kind"]
+
+
+def case_guided_range_is_settable():
+    print("the range can be set before working it out")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "guided range"):
+        return
+    slider = widget_by_label(app, "slider", "Analyse from")
+    check("a range slider sits before the button", slider is not None,
+          str([s.label for s in app.slider]))
+    if slider is None:
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("it is its own step",
+          "How far into the squash" in text, text[:150])
+
+    slider.set_value(0.35).run()
+    if not no_exception(app, "narrowed range"):
+        return
+    check("the slider holds the new end",
+          abs(app.session_state["guided_window_end"] - 0.35) < 0.01,
+          str(app.session_state["guided_window_end"]))
+
+    button_by_label(app, "Work it out for me").click().run()
+    if not no_exception(app, "search over the chosen range"):
+        return
+    fit = app.session_state["_last_fit"]
+    check("the fit stops where the range stopped",
+          fit is not None and abs(fit["epsilon_range"][1] - 0.35) < 0.02,
+          str(fit["epsilon_range"]) if fit else "no fit")
+
+
+def case_search_maths_is_shown():
+    print("the maths behind the button is available")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "search maths"):
+        return
+    blocks = [str(b.value) for b in app.get("latex")]
+    joined = " ".join(blocks)
+    check("the cross-validation formula is shown",
+          "mathrm{CV}" in joined, joined[-200:])
+    check("the tie tolerance is shown", "tau" in joined, joined[-200:])
+    check("the stacked form is shown", "F^{1/3}" in joined, joined[:200])
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("it says these are three arrangements",
+          "three arrangements" in text, "not found")
+
+
+def case_cardiomyocyte_starts_loaded_together():
+    print("a cardiomyocyte loads membrane and cytoskeleton together")
+    import app as app_module
+
+    defaults = app_module.DEFAULT_COMPOSITION_BY_TYPE["Cardiomyocyte"]
+    check("the cytoskeleton starts at zero",
+          defaults["cyto_starts_at"] == "from the very start",
+          str(defaults))
+
+    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "cardiomyocyte defaults"):
+        return
+    check("the app applied it",
+          app.session_state["cyto_starts_at"] == "from the very start",
+          app.session_state["cyto_starts_at"])
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("and explains it with the measured slope",
+          "1.7" in captions, "no explanation of the 1.7")
+
+    # The physics that justifies it: both loaded together gives a slope
+    # between 3/2 and 3, membrane alone gives 3.
+    from lulevich_model import LulevichModel as LM
+    eps = np.linspace(0.001, 0.60, 300)
+    g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    slopes = {}
+    for name, (m, c) in (("alone", ("freeze", "break")), ("together", ("freeze", "zero"))):
+        mb, cb, nb = g.composition_terms(eps, 0.15, 0.40, m, c)
+        force = mb * 0.6e6 + cb * 1.2e3 + nb * 3e3
+        near = (eps > 0.02) & (eps < 0.12)
+        slopes[name] = float(
+            np.polyfit(np.log(eps[near]), np.log(force[near]), 1)[0]
+        )
+    check("membrane alone gives a cube law",
+          abs(slopes["alone"] - 3.0) < 0.05, f"{slopes['alone']:.2f}")
+    check("loaded together gives well under 2",
+          slopes["together"] < 2.0, f"{slopes['together']:.2f}")
+
+
+def case_schematic_is_a_mechanics_diagram():
+    print("the diagram reads as a mechanics schematic")
+    import plot_utils
+    import app as app_module
+
+    style = plot_utils.PlotStyle(force_unit="nN")
+    fig = plot_utils.cell_schematic(
+        style, epsilon=0.28, break_1=0.15, break_2=0.40,
+        membrane_mode="freeze", cyto_start="break",
+        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+        labels=app_module.components_for("Cardiomyocyte"),
+    )
+    text = " ".join(str(getattr(a, "text", "")) for a in fig.layout.annotations)
+    check("the cantilever is drawn", "cantilever" in text, text[:120])
+    check("the applied force is labelled", "<b>F</b>" in text, text[:120])
+    check("the squash is stated", "ε = 0.280" in text, text[:160])
+    check("a component not yet reached shows its gap",
+          "gap closes at ε = 0.40" in text, text[-200:])
+    check("a component that handed over shows as locked",
+          "locked" in text, text[-260:])
+    check("it uses the cell type's own names",
+          "Sarcomeric myofibrils" in text and "Cytoskeleton<" not in text,
+          text[-260:])
+
+    # Springs must hang straight, not lean: a precedence bug once drew them
+    # diagonally across the page.
+    for trace in fig.data:
+        xs = [v for v in (trace.x or []) if v is not None]
+        if len(xs) > 5:
+            check("the spring hangs straight",
+                  abs(xs[0] - xs[-1]) < 1e-9 and max(xs) - min(xs) < 20,
+                  f"x from {min(xs):.1f} to {max(xs):.1f}")
+            break
+
+    stacked = plot_utils.cell_schematic(
+        style, epsilon=0.4, coupling="series", Em_MPa=0.6, Ei_kPa=1.2,
+        En_kPa=3.0, labels=app_module.components_for("Myoblast (C2C12)"),
+    )
+    check("the stacked arrangement says so",
+          "Stacked" in str(stacked.layout.title.text),
+          str(stacked.layout.title.text))
+
+
+def case_fit_only_plot():
+    print("the fit can be plotted without the data")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+
+    def names(**flags):
+        style = plot_utils.PlotStyle(force_unit="N", **flags)
+        fig = plot_utils.force_curve_figure(eps, force, style, fit_force_N=fitted)
+        return [t.name for t in fig.data]
+
+    check("both by default",
+          set(names()) == {"Experimental data", "Model"}, str(names()))
+    check("data off leaves only the model",
+          names(show_data=False) == ["Model"], str(names(show_data=False)))
+    check("fit off leaves only the data",
+          names(show_fit_line=False) == ["Experimental data"],
+          str(names(show_fit_line=False)))
+
+    app = start(cell_name="cell-01")
+    check("there is a checkbox for the points",
+          any("measured points" in (c.label or "").lower() for c in app.checkbox),
+          str([c.label for c in app.checkbox]))
+
+
+def case_springs_share_a_pitch():
+    print("springs can be compared because their coils match")
+    from plot_utils import _zigzag, COIL_PITCH
+
+    def pitch_of(y_bottom, y_top):
+        xs, ys = _zigzag(50, y_bottom, y_top, 12)
+        turns = sum(
+            1 for a, b, c in zip(xs, xs[1:], xs[2:])
+            if (b - a) * (c - b) < 0
+        )
+        return (max(ys) - min(ys)) / max(turns, 1)
+
+    tall, short = pitch_of(10, 70), pitch_of(30, 70)
+    check("a short spring keeps the pitch of a tall one",
+          abs(tall - short) / tall < 0.25, f"{tall:.2f} vs {short:.2f}")
+    check("the pitch is near the declared one",
+          abs(tall - COIL_PITCH) / COIL_PITCH < 0.6, f"{tall:.2f} vs {COIL_PITCH}")
+    check("a short element gets fewer coils, not tighter ones",
+          len(_zigzag(50, 30, 70, 12)[0]) < len(_zigzag(50, 10, 70, 12)[0]))
+
+
+def case_start_a_new_cell():
+    print("a new cell clears the last one but keeps the setup")
+    app = start(cell_name="cell-01", cell_notes="first cell")
+    check("there is a fit to clear", app.session_state["_last_fit"] is not None)
+    app.session_state["fit_color"] = "#123456"
+    app.session_state["cell_height_um"] = 11.5
+    app.run()
+
+    button = button_by_label(app, "Start a new cell")
+    check("the button is there", button is not None)
+    if button is None:
+        return
+    button.click().run()
+    if not no_exception(app, "start a new cell"):
+        return
+
+    for key in ("data", "_last_fit", "arrangement_search", "video_saved_frame"):
+        check(f"{key} was cleared", app.session_state[key] is None,
+              str(app.session_state[key])[:40])
+    check("the name was cleared", app.session_state["cell_name"] == "",
+          repr(app.session_state["cell_name"]))
+    check("the notes were cleared", app.session_state["cell_notes"] == "")
+    check("display settings survive", app.session_state["fit_color"] == "#123456")
+    check("the geometry survives", app.session_state["cell_height_um"] == 11.5)
+
+
+def case_manual_cell_and_probe_scale():
+    print("the cell can be drawn by hand and the probe sets the scale")
+    try:
+        import cv2
+        import video_analysis as va
+    except Exception as exc:
+        print(f"  skip (no OpenCV: {exc})")
+        return
+
+    frame = np.full((300, 420, 3), 150, np.uint8)
+    det = va.manual_detection(frame, (0.25, 0.30, 0.55, 0.70))
+    check("a hand-drawn box is a detection", det["found"] and det["manual"])
+    check("its height is the box height",
+          abs(det["height_px"] - 0.40 * 300) < 2, str(det["height_px"]))
+    check("its width is the box width",
+          abs(det["width_px"] - 0.30 * 420) < 2, str(det["width_px"]))
+    check("a reversed box is still read correctly",
+          va.manual_detection(frame, (0.55, 0.70, 0.25, 0.30))["bbox"]
+          == det["bbox"])
+
+    scale, detail = va.scale_from_probe((0.10, 0, 0.60, 0), frame.shape, 60.0)
+    check("the probe gives a scale", scale is not None)
+    if scale:
+        check("and it is right",
+              abs(scale - 60.0 / (0.5 * 420)) < 1e-9, f"{scale:.5f}")
+        check("the detail says how it was worked out",
+              "µm per pixel" in detail, detail)
+        # The whole point: pixels become micrometres.
+        check("the cell height converts to micrometres",
+              abs(det["height_px"] * scale - 120 * (60.0 / 210)) < 0.5,
+              f"{det['height_px'] * scale:.2f} µm")
+
+    check("too narrow a probe box is refused",
+          va.scale_from_probe((0.1, 0, 0.1, 0), frame.shape, 60.0)[0] is None)
+    check("a missing width is refused",
+          va.scale_from_probe((0.1, 0, 0.6, 0), frame.shape, 0)[0] is None)
+
+    # The switches live inside the video tab, which only draws its controls
+    # once a video is loaded, so AppTest cannot reach them from a bare
+    # start(). Check that the app is wired to them instead.
+    src = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("the manual switch is wired up",
+          'key="video_manual_cell"' in src)
+    check("the probe switch is wired up",
+          'key="video_use_probe_scale"' in src)
+    check("the app calls the hand-drawn detector",
+          "va.manual_detection(" in src)
+    check("the app calls the probe scale",
+          "va.scale_from_probe(" in src)
+
+    app = start(cell_name="cell-01")
+    check("the manual switch starts off",
+          app.session_state["video_manual_cell"] is False)
+    check("the probe switch starts off",
+          app.session_state["video_use_probe_scale"] is False)
+
+
+def case_zero_modulus_explains_itself():
+    print("a membrane driven to zero says why")
+    eps = np.linspace(0.001, 0.60, 300)
+    g = LulevichModel(np.zeros_like(eps), eps, cell_height=12.0e-6)
+    mb, cb, nb = g.composition_terms(eps, 0.15, 0.40, "continue", "zero")
+    force = mb * 1.4e6 + cb * 3.1e3 + nb * 9.0e3
+    model = LulevichModel(force, eps, cell_height=12.0e-6)
+
+    right = model.fit_composition(0.0, 0.60, 0.15, 0.40, "continue", "zero")
+    check("the right combination recovers the membrane",
+          abs(right["Em_MPa"] - 1.4) / 1.4 < 0.1, f"{right['Em_MPa']:.4f} MPa")
+
+    wrong = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "zero")
+    check("holding plus starting at zero kills the membrane",
+          wrong["Em_MPa"] <= 0, f"{wrong['Em_MPa']:.4f} MPa")
+
+    app = start(cell_name="cell-01", cell_type="Cardiomyocyte",
+                membrane_after_break="holds what it reached",
+                cyto_starts_at="from the very start")
+    if not no_exception(app, "zero membrane"):
+        return
+    warnings = " ".join(str(w.value) for w in app.warning)
+    if any("zero" in warnings for _ in [1]) and "Eₘ" in warnings:
+        check("the app says the two choices cancel",
+              "cancelling each other" in warnings, warnings[:200])
+        check("and names the fix",
+              "keeps stiffening" in warnings, warnings[:260])
+    else:
+        print("       (this curve did not zero the membrane; logic tested above)")
+
+
+def case_fit_quality():
+    print("the fit actually follows the data")
+    for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
+        eps, force = synthetic(membrane, cyto)
+        model = LulevichModel(force, eps, cell_height=8.0e-6)
+        fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, membrane, cyto)
+        check(f"R² > 0.99 for {membrane}/{cyto}",
+              fit["success"] and fit["r_squared"] > 0.99,
+              f"R²={fit.get('r_squared')}")
+        check(f"Eₘ recovered for {membrane}/{cyto}",
+              abs(fit["Em_MPa"] - 0.6) / 0.6 < 0.15, f"{fit['Em_MPa']:.3f} MPa")
+        check(f"E_c recovered for {membrane}/{cyto}",
+              abs(fit["Ei_kPa"] - 1.2) / 1.2 < 0.20, f"{fit['Ei_kPa']:.3f} kPa")
+
+
+def four_element_curve(T0=1.2e-3, seed=3, noise=0.003, n=500):
+    """A cardiomyocyte curve with all four springs in it."""
+    eps = np.linspace(0.002, 0.65, n)
+    geometry = dict(cell_height=14.0e-6, shell_thickness=200e-9,
+                    deep_uses_cell_radius=True)
+    blank = LulevichModel(np.zeros_like(eps), eps, **geometry)
+    basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
+    force = (
+        basis["tension"] * T0
+        + basis["membrane"] * 1.4e6
+        + basis["interior"] * 3.1e3
+        + basis["nucleus"] * 9.0e3
+    )
+    rng = np.random.default_rng(seed)
+    noisy = force + rng.normal(0.0, noise * force.max(), force.size)
+    return eps, noisy, LulevichModel(noisy, eps, **geometry), geometry
+
+
+def case_four_element_model():
+    print("the membrane is two springs and the fit can tell them apart")
+    eps, force, model, geometry = four_element_curve()
+
+    blank = LulevichModel(np.zeros_like(eps), eps, **geometry)
+    basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
+    check("there are four basis functions", len(basis) == 4, str(sorted(basis)))
+
+    # The two membrane laws must not be the same shape, or the split between
+    # them is arbitrary and the numbers wander from cell to cell.
+    a = basis["tension"] / max(basis["tension"].max(), 1e-30)
+    b = basis["membrane"] / max(basis["membrane"].max(), 1e-30)
+    check("the two membrane springs have different shapes",
+          abs(np.corrcoef(a, b)[0, 1]) < 0.95,
+          f"correlation {np.corrcoef(a, b)[0, 1]:.4f}")
+    # And the crossover is the point of the pair: the taut network answers
+    # first, the shell's elasticity takes over once the strain is large.
+    taut = basis["tension"] * 1.2e-3
+    elastic = basis["membrane"] * 1.4e6
+    check("the taut one leads near first contact",
+          taut[5] > elastic[5] * 10, f"{taut[5]:.3g} vs {elastic[5]:.3g}")
+    check("the elastic one leads deep in",
+          elastic[-1] > taut[-1], f"{elastic[-1]:.3g} vs {taut[-1]:.3g}")
+
+    fit = model.fit_composition(
+        0.0, 0.65, 0.15, 0.40, "continue", "zero", use_tension=True
+    )
+    check("the four-term fit succeeds", fit.get("success"))
+    check("T0 is recovered", abs(fit["T0_mN_m"] - 1.2) / 1.2 < 0.25,
+          f"{fit['T0_mN_m']:.3f} mN/m")
+    check("Em is recovered", abs(fit["Em_MPa"] - 1.4) / 1.4 < 0.12,
+          f"{fit['Em_MPa']:.3f} MPa")
+    check("Ec is recovered", abs(fit["Ei_kPa"] - 3.1) / 3.1 < 0.20,
+          f"{fit['Ei_kPa']:.3f} kPa")
+    check("En is recovered", abs(fit["En_kPa"] - 9.0) / 9.0 < 0.15,
+          f"{fit['En_kPa']:.3f} kPa")
+    check("it says which terms it used",
+          set(fit["terms"]) == {"tension", "membrane", "interior", "nucleus"},
+          str(fit["terms"]))
+    check("the breakpoints still count as parameters", fit["n_params"] == 6,
+          str(fit["n_params"]))
+
+    # A tension is a force per length. Turning it into a modulus needs the
+    # coat thickness, and the model must not pretend otherwise.
+    check("the tension prefactor has no thickness in it",
+          abs(model.At - 2 * np.pi * model.R0 ** 2 / model.cell_height)
+          < 1e-12 * model.At)
+    check("the equivalent modulus divides by the coat",
+          abs(fit["T0_as_modulus_kPa"]
+              - (fit["T0_mN_m"] * 1e-3 / 200e-9) / 1e3) < 1e-6)
+
+    # Switching the spring off must leave the classic model exactly as it was.
+    three = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero")
+    check("the classic three-term fit still runs", three.get("success"))
+    check("and reports no tension", three.get("T0_mN_m", 0.0) == 0.0)
+    check("and is a term shorter", three["n_params"] == 5, str(three["n_params"]))
+
+
+def case_four_element_search():
+    print("the search places the boundaries inside the four-spring model")
+    eps, force, model, _ = four_element_curve(seed=11)
+    found = model.search_compositions(0.0, 0.65, tension_mode="always", n_grid=10)
+    check("the search succeeded", found.get("success"))
+    if not found.get("success"):
+        return
+    best = found["best"]
+    check("every candidate keeps the tension spring",
+          all(row["use_tension"] for row in found["candidates"]))
+    check("the membrane is not made to hand over",
+          best["membrane"] == "continue", best["membrane"])
+    check("the deeper layer is found near where it was put",
+          abs(best["break_2"] - 0.40) < 0.05, f"{best['break_2']:.3f}")
+    check("Em survives the search", abs(best["Em_MPa"] - 1.4) / 1.4 < 0.15,
+          f"{best['Em_MPa']:.3f}")
+    check("En survives the search", abs(best["En_kPa"] - 9.0) / 9.0 < 0.15,
+          f"{best['En_kPa']:.3f}")
+
+    off = model.search_compositions(0.0, 0.65, n_grid=8)
+    check("with the spring off, no candidate carries it",
+          off.get("success")
+          and not any(row["use_tension"] for row in off["candidates"]))
+
+
+def case_breakpoint_spread_is_the_real_error_bar():
+    print("the boundaries are fitted too, and the numbers say how much that matters")
+    eps, force, model, _ = four_element_curve(seed=5, noise=0.004)
+
+    # Two boundary placements that fit this curve equally well give very
+    # different tensions. A standard error worked out at fixed boundaries
+    # cannot see that, which is the whole reason this exists.
+    a = model.fit_composition(0.0, 0.65, 0.024, 0.40, "continue", "break",
+                              use_tension=True)
+    b = model.fit_composition(0.0, 0.65, 0.0, 0.40, "continue", "zero",
+                              use_tension=True)
+    check("both placements fit about as well",
+          abs(a["ss_res"] - b["ss_res"]) / a["ss_res"] < 0.05,
+          f"{a['ss_res']:.3e} vs {b['ss_res']:.3e}")
+    check("but they disagree about the tension",
+          abs(a["T0_mN_m"] - b["T0_mN_m"]) / max(b["T0_mN_m"], 1e-12) > 0.5,
+          f"{a['T0_mN_m']:.3f} vs {b['T0_mN_m']:.3f}")
+    check("while the fixed-boundary error bar looks small",
+          a["T0_mN_m_std"] / a["T0_mN_m"] < 0.2,
+          f"± {a['T0_mN_m_std']:.3f} on {a['T0_mN_m']:.3f}")
+
+    spread = model.breakpoint_spread(0.0, 0.65, 0.024, 0.40, "continue",
+                                     "break", use_tension=True)
+    check("the spread is measurable", spread.get("success"))
+    if not spread.get("success"):
+        return
+    check("more than one placement is accepted", spread["n_accepted"] > 1,
+          str(spread["n_accepted"]))
+    bands = spread["ranges"]
+    for key in ("T0_mN_m", "Em_MPa", "Ei_kPa", "En_kPa"):
+        band = bands[key]
+        check(f"{key} is bracketed", band["low"] <= band["value"] <= band["high"],
+              f"{band['low']:.4g} .. {band['value']:.4g} .. {band['high']:.4g}")
+    check("the tension is the loose one here",
+          bands["T0_mN_m"]["relative"] > bands["Em_MPa"]["relative"],
+          f"T0 {bands['T0_mN_m']['relative']:.2f} vs "
+          f"Em {bands['Em_MPa']['relative']:.2f}")
+    check("and it is not cheap to compute",
+          spread["break_1_range"][0] <= 0.024 <= spread["break_1_range"][1])
+
+    # It has to reach the page, or it is a diagnostic nobody sees.
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("the app computes it once per fit",
+          'fit["breakpoint_spread"] = model.breakpoint_spread(' in source)
+    check("and shows it", "but anywhere in" in source)
+
+
+def case_error_bars_are_reported():
+    print("every modulus comes with a standard error")
+    eps, force = synthetic("freeze", "break")
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "break")
+    for key in ("Em_MPa_std", "Ei_kPa_std", "En_kPa_std"):
+        check(f"{key} is a number", np.isfinite(fit[key]), str(fit[key]))
+    check("a clean curve gets tight bars",
+          fit["Em_MPa_std"] / fit["Em_MPa"] < 0.1,
+          f"± {fit['Em_MPa_std']:.4g} on {fit['Em_MPa']:.4g}")
+    check("and no complaint about identifiability",
+          not fit["warnings"], str(fit["warnings"]))
+
+    # A term pinned at the zero bound is not free, and must not make the
+    # covariance singular or produce a bogus error bar for itself.
+    zeroed = model.fit_composition(0.0, 0.60, 0.15, 0.40, "continue", "zero")
+    check("a fit with a zeroed term still returns", zeroed.get("success"))
+    check("and the fast path skips the error bars entirely",
+          not np.isfinite(model.fit_composition(
+              0.0, 0.60, 0.15, 0.40, "freeze", "break", with_stats=False
+          )["Em_MPa_std"]))
+
+
+def case_clone_keeps_the_whole_geometry():
+    print("a cross-validation clone is the model it is standing in for")
+    eps, force, model, _ = four_element_curve()
+    twin = model._clone(model.force, model.epsilon)
+    for name in ("cell_height", "R0", "R_nucleus", "h_membrane", "h_shell",
+                 "Am", "Ai", "An", "At"):
+        mine, theirs = getattr(model, name), getattr(twin, name)
+        check(f"{name} survives the clone", abs(theirs - mine) <= abs(mine) * 1e-12,
+              f"{theirs!r} vs {mine!r}")
+    check("so does the myofibril radius choice",
+          twin.deep_uses_cell_radius is model.deep_uses_cell_radius)
+
+
+def case_four_elements_reach_the_page():
+    print("a cardiomyocyte shows four springs, a myoblast three")
+    import app as app_module
+    check("the myoblast has three",
+          len(app_module.terms_for("Myoblast (C2C12)")) == 3)
+    check("the cardiomyocyte has four",
+          len(app_module.terms_for("Cardiomyocyte")) == 4)
+
+    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "four elements"):
+        return
+    check("the tension spring is on by default",
+          app.session_state["use_tension"] is True)
+    fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
+    check("and it is in the fitted terms", "tension" in fitted, str(fitted))
+
+    labels = [c.label for c in app.checkbox]
+    check("both membrane springs have their own switch",
+          sum("Membrane" in (l or "") for l in labels) == 2, str(labels))
+
+    table = table_with(app, "Part of the cell")
+    check("the stiffness table lists four parts",
+          table is not None and len(table) == 4,
+          "none" if table is None else str(len(table)))
+    if table is not None:
+        check("the tension is quoted in mN/m",
+              any("mN/m" in v for v in table["Stiffness"]),
+              str(list(table["Stiffness"])))
+
+    # A myoblast must be untouched by any of this.
+    plain = start(cell_name="myo-01")
+    if no_exception(plain, "three elements"):
+        plain_table = table_with(plain, "Part of the cell")
+        check("a myoblast still lists three parts",
+              plain_table is not None and len(plain_table) == 3,
+              "none" if plain_table is None else str(len(plain_table)))
+        check("and fits without a tension term",
+              "tension" not in ((plain.session_state["_last_fit"] or {}).get(
+                  "terms") or []))
+
+
+def case_tables_are_not_clipped():
+    print("no table can lose a column off the right-hand edge")
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("the fixed-layout style is defined", "table-layout: fixed" in source)
+    check("cells wrap rather than overflow", "overflow-wrap: anywhere" in source)
+
+    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "tables"):
+        return
+    tables = flat_tables(app)
+    check("the result tables are drawn as flat tables", len(tables) >= 2,
+          str(len(tables)))
+    for frame in tables:
+        check(f"every column of the {len(frame.columns)}-column table is named",
+              all(str(c).strip() for c in frame.columns), str(list(frame.columns)))
+        check("no row is short of cells",
+              all(len(row) == len(frame.columns)
+                  for row in frame.itertuples(index=False)),
+              str(frame.shape))
+
+
+def case_one_video_two_doors():
+    print("uploading in either place loads the same video")
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("both uploaders go through one adopter",
+          source.count("adopt_video(") >= 3, str(source.count("adopt_video(")))
+    check("only the adopter and the link fetcher set the path",
+          source.count('st.session_state["video_path"] = ') == 2,
+          str(source.count('st.session_state["video_path"] = ')))
+    check("every frame is read through one place",
+          source.count("cached_detection(") == 2,
+          str(source.count("cached_detection(")))
+    check("the side panel no longer calls the detector directly",
+          "vframe, vdet, vnuc, vprobe, vscale = detection_at(" in source)
+
+    # The adopter must act only when its own box changes. Keyed on the loaded
+    # video's name instead, two boxes holding different files overwrite each
+    # other on alternate reruns, one winning per pass.
+    class Fake:
+        def __init__(self, name, data):
+            self.name, self._data, self.size = name, data, len(data)
+
+        def getvalue(self):
+            return self._data
+
+    seen, taken = {}, []
+
+    def adopt(uploaded, widget_key):
+        signature = None if uploaded is None else (uploaded.name, uploaded.size)
+        if signature == seen.get(widget_key):
+            return False
+        seen[widget_key] = signature
+        if uploaded is None:
+            return False
+        taken.append((widget_key, uploaded.name))
+        return True
+
+    a, b = Fake("a.mp4", b"aaa"), Fake("b.mp4", b"bbbb")
+    check("the first upload is taken", adopt(a, "main") is True)
+    check("the same box unchanged is ignored", adopt(a, "main") is False)
+    check("the other box with a new file is taken", adopt(b, "tab") is True)
+    check("and the first box does not grab it back", adopt(a, "main") is False)
+    check("only two adoptions happened", len(taken) == 2, str(taken))
+    check("starting a new cell forgets what each box handed over",
+          'st.session_state["_video_seen"] = {}' in source,
+          "otherwise re-uploading the same file is ignored")
+
+
+def case_legacy_record_refits():
+    print("a record saved under the old model names still resolves")
+    import app as app_module
+    for old, key in app_module.LEGACY_MODEL_NAMES.items():
+        check(f"{old!r} resolves", app_module.MODEL_KEYS_ANY.get(old) == key)
+    for new, key in app_module.MODEL_KEYS.items():
+        check(f"{new!r} resolves", app_module.MODEL_KEYS_ANY.get(new) == key)
+
+
+def case_range_starts_at_zero():
+    print("the segmented range always starts at zero")
+    app = start()
+    ends = [s for s in app.slider if "fit up to" in (s.label or "").lower()]
+    check("single end-of-range slider in the segmented view", len(ends) == 1)
+    pairs = [s for s in app.slider if (s.label or "").strip() == "Fitted range"]
+    check("no two-handle range slider in the segmented view", not pairs)
+    if ends:
+        ends[0].set_value(0.35).run()
+        no_exception(app, "moving the end of the range")
+        lo, hi = app.session_state["window_combined"]
+        check("range starts at zero", lo == 0.0, str(lo))
+        check("range ends where the slider was put", abs(hi - 0.35) < 0.01, str(hi))
+
+    # The other models keep the two-handle slider.
+    app2 = start()
+    widget_by_label(app2, "radio", "how the cell is modelled").set_value(
+        "Side by side (every element acts everywhere)"
+    ).run()
+    pairs = [s for s in app2.slider if (s.label or "").strip() == "Fitted range"]
+    check("two-handle slider still there for the other models", len(pairs) == 1)
+
+
+def case_fit_stops_at_the_end_of_the_range():
+    print("the model line stops where the range stops")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.35, 0.15, 0.30)
+    check("fit succeeded on a short range", fit.get("success"))
+    if not fit.get("success"):
+        return
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.30)
+    full = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+    lo, hi = fit["epsilon_range"]
+    clipped = np.array(full, dtype=float)
+    clipped[(eps < lo) | (eps > hi)] = np.nan
+
+    fig = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="N"), fit_force_N=clipped
+    )
+    line = next(t for t in fig.data if t.name == "Model")
+    drawn = np.asarray(line.y, dtype=float)
+    finite = np.isfinite(drawn)
+    check("nothing drawn past the end of the range",
+          not finite[eps > hi + 1e-9].any())
+    check("the whole range is drawn", finite[(eps >= lo) & (eps <= hi)].all())
+    check("the line reaches the end of the range",
+          abs(eps[finite].max() - hi) < 0.01, f"{eps[finite].max():.3f} vs {hi:.3f}")
+
+
+def case_plot_clutter_toggles():
+    print("each piece of clutter can be switched off")
+    import plot_utils
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+
+    def build(**flags):
+        style = plot_utils.PlotStyle(force_unit="N", **flags)
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=fitted,
+            fit_window=[{"range": (0.0, 0.6), "label": "fit"}],
+            highlight_window=(0.15, 0.40, "segment 2"),
+            highlight=(0.30, float(force[len(force) // 2])),
+            rupture_epsilon=0.55,
+        )
+
+    on = build()
+    check("shading on by default", len(on.layout.shapes) >= 2)
+    check("video marker on by default",
+          any(t.name == "video frame" for t in on.data))
+
+    off = build(show_fit_window=False)
+    check("shading gone", not [s for s in off.layout.shapes if s.type == "rect"])
+
+    off = build(show_video_marker=False)
+    check("video frame marker gone",
+          not any(t.name == "video frame" for t in off.data))
+
+    off = build(show_rupture_marker=False)
+    labels = [getattr(a, "text", "") for a in off.layout.annotations]
+    check("rupture marker gone", "rupture" not in labels, str(labels))
+
+    with_moduli = plot_utils.cell_schematic(
+        plot_utils.PlotStyle(force_unit="N"), epsilon=0.3,
+        break_1=0.15, break_2=0.40, Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    )
+    without = plot_utils.cell_schematic(
+        plot_utils.PlotStyle(force_unit="N", show_schematic_moduli=False),
+        epsilon=0.3, break_1=0.15, break_2=0.40,
+        Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+    )
+
+    def caption(fig):
+        return " ".join(getattr(a, "text", "") or "" for a in fig.layout.annotations)
+
+    check("moduli printed by default", "E<sub>m</sub>" in caption(with_moduli))
+    check("moduli gone when switched off",
+          "E<sub>m</sub>" not in caption(without) and "E<sub>c</sub>" not in caption(without))
+    check("the diagram still says where it is",
+          "ε =" in caption(without), caption(without)[:80])
+
+
+if __name__ == "__main__":
+    for case in (
+        case_loads_clean,
+        case_legacy_record_refits,
+        case_companion_file_guard,
+        case_fit_quality,
+        case_fit_only_plot,
+        case_springs_share_a_pitch,
+        case_start_a_new_cell,
+        case_manual_cell_and_probe_scale,
+        case_four_element_model,
+        case_four_element_search,
+        case_breakpoint_spread_is_the_real_error_bar,
+        case_error_bars_are_reported,
+        case_clone_keeps_the_whole_geometry,
+        case_four_elements_reach_the_page,
+        case_tables_are_not_clipped,
+        case_one_video_two_doors,
+        case_zero_modulus_explains_itself,
+        case_guided_range_is_settable,
+        case_search_maths_is_shown,
+        case_cardiomyocyte_starts_loaded_together,
+        case_schematic_is_a_mechanics_diagram,
+        case_guided_order_is_parts_then_work_it_out,
+        case_it_picks_the_arrangement,
+        case_work_it_out_applies_the_arrangement,
+        case_search_stays_fast,
+        case_png_is_not_rendered_every_run,
+        case_fit_statistics,
+        case_chi_squared_reaches_the_page,
+        case_axis_ranges,
+        case_nucleus_spring_is_shorter,
+        case_component_names_follow_the_cell_type,
+        case_cardiomyocyte_model_is_flagged_provisional,
+        case_not_reached_is_explained,
+        case_plain_language_helpers,
+        case_guided_mode_is_the_default,
+        case_full_control_shows_everything,
+        case_curve_saved_as_a_tab,
+        case_plot_options_are_under_the_plot,
+        case_save_the_plot,
+        case_fit_maths_box,
+        case_sheet_row_matches_the_header,
+        case_sheet_reorder_keeps_the_data,
+        case_fit_line_and_heights_toggle,
+        case_range_table_shows_zero_moduli,
+        case_all_three_moduli_always_reported,
+        case_load_share_table,
+        case_download_when_box_is_absent,
+        case_clear_cell_wins_over_dark_debris,
+        case_fit_survives_a_rerun,
+        case_database_section_without_a_fit,
+        case_send_without_a_video,
+        case_fit_stops_at_the_end_of_the_range,
+        case_plot_clutter_toggles,
+        case_preset_round_trip,
+        case_model_names,
+        case_range_starts_at_zero,
+        case_composition_radios,
+        case_highlight,
+        case_search_beats_the_old_grid,
+        case_search_flags_what_it_cannot_see,
+        case_search_applies_in_one_press,
+        case_bare_plot,
+        case_buttons_do_not_break_widgets,
+    ):
+        case()
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} failing: {FAILURES}")
+        sys.exit(1)
+    print("all passing")
