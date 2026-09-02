@@ -236,6 +236,15 @@ DEFAULTS = {
     # the model, to look at the data on its own.
     "show_fit_line": True,
     "show_component_heights": False,
+    # Relative deformation runs 0 to 1 by definition, so that is the honest
+    # default: two cells squashed to different depths then look different,
+    # which they are.
+    "x_axis_mode": "0 to 1 (full squash)",
+    "y_axis_mode": "Fit to the data",
+    "x_axis_min": 0.0,
+    "x_axis_max": 1.0,
+    "y_axis_min": 0.0,
+    "y_axis_max": 1.0,
     "show_fit_window": True,
     "show_video_marker": True,
     "show_rupture_marker": True,
@@ -623,29 +632,34 @@ def plain_language_summary(fit, model):
         held = fit.get("membrane") != "continue"
         early_cyto = fit.get("cyto_start") == "zero"
         story = []
+        names = components_for(st.session_state["cell_type"])
+        membrane_word = names["membrane"][0].lower()
+        interior_word = names["interior"][0].lower()
+        nucleus_word = names["nucleus"][0].lower()
         story.append(
             f"**Up to {e1 * 100:.0f} %** of the way down, "
-            + ("the outer membrane and the cytoskeleton resist together."
+            + (f"the {membrane_word} and the {interior_word} resist together."
                if early_cyto else
-               "only the outer membrane resists, stretching like a balloon "
-               "being pressed.")
+               f"only the {membrane_word} resists, stretching like a balloon "
+               f"being pressed.")
         )
         story.append(
             f"**From {e1 * 100:.0f} % to {e2 * 100:.0f} %**, "
-            + ("the membrane keeps stiffening and the cytoskeleton adds to it."
+            + (f"the {membrane_word} keeps stiffening and the "
+               f"{interior_word} adds to it."
                if not held else
-               "the membrane stops adding force and the cytoskeleton, the "
-               "scaffolding inside the cell, takes over.")
+               f"the {membrane_word} stops adding force and the "
+               f"{interior_word}, {names['interior'][1]}, takes over.")
         )
         if "nucleus" in terms and fit.get("En_kPa", 0.0) > 0:
             story.append(
-                f"**Past {e2 * 100:.0f} %**, the plates reach the nucleus and it "
-                f"starts pushing back as well."
+                f"**Past {e2 * 100:.0f} %**, the plates reach the "
+                f"{nucleus_word} and it starts pushing back as well."
             )
         else:
             story.append(
                 f"**Past {e2 * 100:.0f} %**, nothing new joins in: this curve "
-                f"shows no sign of the nucleus being reached."
+                f"shows no sign of the {nucleus_word} being reached."
             )
         for line in story:
             st.markdown(f"- {line}")
@@ -656,15 +670,14 @@ def plain_language_summary(fit, model):
         )
 
     st.markdown("#### How stiff each part turned out to be")
+    names = components_for(st.session_state["cell_type"])
     rows = []
-    for label, everyday, key, pa_factor, unit, term in (
-        ("Outer membrane", "the skin around the cell",
-         "Em_MPa", 1e6, "MPa", "membrane"),
-        ("Cytoskeleton", "the scaffolding filling the cell",
-         "Ei_kPa", 1e3, "kPa", "interior"),
-        ("Nucleus", "the dense body at the centre",
-         "En_kPa", 1e3, "kPa", "nucleus"),
+    for key, pa_factor, unit, term in (
+        ("Em_MPa", 1e6, "MPa", "membrane"),
+        ("Ei_kPa", 1e3, "kPa", "interior"),
+        ("En_kPa", 1e3, "kPa", "nucleus"),
     ):
+        label, everyday = names[term]
         used = term in terms
         value = float(fit.get(key, 0.0)) if used else 0.0
         rows.append(
@@ -748,6 +761,32 @@ def plot_option_controls():
     )
     st.checkbox("Legend", key="show_legend", disabled=bare)
 
+    st.markdown("**Axes**")
+    ax1, ax2 = st.columns(2)
+    with ax1:
+        st.selectbox(
+            "Deformation axis",
+            ["0 to 1 (full squash)", "Fit to the data", "Set my own"],
+            key="x_axis_mode",
+            help="Relative deformation runs from 0 to 1 by definition, so "
+            "showing all of it puts every cell on the same scale. Fitting to "
+            "the data zooms in on the part you measured.",
+        )
+        if st.session_state["x_axis_mode"] == "Set my own":
+            st.number_input("ε from", key="x_axis_min", step=0.05, format="%.3f")
+            st.number_input("ε to", key="x_axis_max", step=0.05, format="%.3f")
+    with ax2:
+        st.selectbox(
+            "Force axis",
+            ["Fit to the data", "Set my own"],
+            key="y_axis_mode",
+            help="Set your own to put several cells on the same force scale. "
+            "The numbers are in the display unit chosen in the sidebar.",
+        )
+        if st.session_state["y_axis_mode"] == "Set my own":
+            st.number_input("Force from", key="y_axis_min", step=0.5, format="%.4g")
+            st.number_input("Force to", key="y_axis_max", step=0.5, format="%.4g")
+
 
 
 # The extras that can be drawn on the force curve, all of which the single
@@ -760,6 +799,19 @@ PLOT_EXTRAS = (
     "show_legend",
     "show_component_heights",
 )
+
+
+def axis_range(axis):
+    """The limits for one axis, or None to let the data decide."""
+    mode = st.session_state[f"{axis}_axis_mode"]
+    if mode.startswith("Fit to"):
+        return None
+    if axis == "x" and mode.startswith("0 to 1"):
+        return (0.0, 1.0)
+    return (
+        float(st.session_state[f"{axis}_axis_min"]),
+        float(st.session_state[f"{axis}_axis_max"]),
+    )
 
 
 def plot_flags(state):
@@ -814,6 +866,8 @@ def current_style(force_N=None) -> PlotStyle:
         # Not a marking: the fitted curve is the result, so the bare switch
         # leaves it alone and only its own checkbox removes it.
         show_fit_line=bool(st.session_state["show_fit_line"]),
+        x_range=axis_range("x"),
+        y_range=axis_range("y"),
         show_schematic_moduli=st.session_state["show_schematic_moduli"],
     )
 
@@ -995,6 +1049,13 @@ MODELS = {
         "Stacked at small deformation, side by side once compressed.",
     "Compare these and rank them":
         "Fits the four above and ranks them by AICc and cross-validation.",
+    "Cardiomyocyte (Morales Maldonado)":
+        "A strong shell around fluid that does not compress. The shell carries "
+        "the load as ε³; there is no separate Hertzian interior, because an "
+        "incompressible fluid resists through pressure rather than as an "
+        "elastic solid. A second term is available for the myofibrils once "
+        "they are met. PROVISIONAL: built from your description, not from the "
+        "paper's equations.",
 }
 MODEL_KEYS = {
     "Segmented (membrane → cytoskeleton → nucleus)": "segmented",
@@ -1003,6 +1064,7 @@ MODEL_KEYS = {
     "Side by side, then stacked": "hybrid_ps",
     "Stacked, then side by side": "hybrid_sp",
     "Compare these and rank them": "auto",
+    "Cardiomyocyte (Morales Maldonado)": "segmented",
 }
 
 # Older saved presets and stored database records name the model with the
@@ -1041,6 +1103,31 @@ STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 # Starting points, not literature constants. They set the geometry, the
 # plausibility bands used for warnings, and the initial fit windows for a
 # cell type. Edit them for your own line and save the result as a preset.
+# What the three terms are called, per cell type. The maths is the same; the
+# names are not. A cardiomyocyte is not a myoblast with a different modulus:
+# it is packed with myofibrils and, on the Morales Maldonado picture, behaves
+# as a strong shell around fluid that does not compress, so calling the second
+# term "cytoskeleton" and the third "nucleus" would misdescribe it.
+COMPONENT_SETS = {
+    "Myoblast (C2C12)": {
+        "membrane": ("Membrane", "the skin around the cell"),
+        "interior": ("Cytoskeleton", "the scaffolding filling the cell"),
+        "nucleus": ("Nucleus", "the dense body at the centre"),
+    },
+    "Cardiomyocyte": {
+        "membrane": ("Membrane and cortex", "a strong shell holding fluid in"),
+        "interior": ("Myofibrils", "the contractile bundles running through it"),
+        "nucleus": ("Nucleus", "the dense body at the centre"),
+    },
+}
+DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
+
+
+def components_for(cell_type):
+    """Names for the three terms, falling back to the general ones."""
+    return COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS)
+
+
 CELL_TYPES = {
     "Myoblast (C2C12)": {
         "cell_height_um": 8.0,
@@ -2136,6 +2223,31 @@ with tab_analysis:
         kind = MODEL_KEYS[st.session_state["model_kind"]]
         segmented = kind == "segmented"
         coupling = kind
+        cardiomyocyte_model = st.session_state["model_kind"].startswith(
+            "Cardiomyocyte"
+        )
+
+        if cardiomyocyte_model:
+            st.warning(
+                "**This model is provisional.** It is built from your "
+                "description of the Morales Maldonado picture (a strong shell "
+                "around fluid that does not compress), not from the paper's "
+                "equations, which I could not reach: the STAR Protocols "
+                "full text is behind a block on every route I tried. Send me "
+                "the force-versus-deformation equation and I will replace this "
+                "with the real one. Until then, treat the shell modulus as "
+                "meaningful and the second term as descriptive only.",
+                icon="⚠️",
+            )
+            st.caption(
+                "What it does today: the shell carries the load as ε³, exactly "
+                "as the membrane term does, because a pressurised shell around "
+                "incompressible fluid gives that same cubic law. The Hertzian "
+                "interior term is switched off, since a fluid that does not "
+                "compress does not resist as an elastic solid. The third term "
+                "is available for whatever is met next, named myofibrils for "
+                "this cell type."
+            )
 
         if segmented:
             st.markdown("**3 · What each one does at the first boundary**")
@@ -3144,7 +3256,7 @@ with tab_analysis:
                         if term not in fitted_terms:
                             row[label] = "not in model"
                         elif word == "not yet":
-                            row[label] = "0 %  not reached"
+                            row[label] = "0 %  the plates have not met it yet"
                         else:
                             row[label] = f"{100 * share[term] / total:.0f} %  {word}"
                     rows.append(row)
@@ -3152,9 +3264,14 @@ with tab_analysis:
                 if rows:
                     st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
                     st.caption(
+                        "“The plates have not met it yet” means the cell has "
+                        "not been squashed far enough for that part to touch "
+                        "the cantilever, so it carries no load over that "
+                        "stretch and contributes exactly zero force. It is not "
+                        "missing data and not a failed fit. "
                         "Each range lists the modulus that element contributes "
                         "there, which is zero for an element the compression has "
-                        "not reached yet: below ε₁ only the membrane carries "
+                        "not reached: below ε₁ only the membrane carries "
                         "load, so E_c and Eₙ really are 0 over that stretch even "
                         "though the whole-curve fit reports a value for them. "
                         "Percentages are each element's share of the total force at "
