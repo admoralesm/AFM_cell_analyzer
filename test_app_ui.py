@@ -1331,20 +1331,30 @@ def case_png_is_not_rendered_every_run():
           str([d.label for d in app.get("download_button")]))
 
 
-def case_guided_order_is_parts_then_work_it_out():
-    print("Step 1 picks the parts, Step 2 works it out")
+def case_guided_order_is_fit_then_adjust():
+    print("Step 1 is the fit, Step 2 is everything it used")
     app = start(cell_name="cell-01")
     if not no_exception(app, "guided order"):
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("Step 1 names the parts",
-          "Step 1 · Which parts of the cell" in text, text[:150])
-    check("Step 2 is the range", "Step 2 · How far" in text, text[:200])
-    check("Step 3 is the button", "Step 3 · Work it out" in text, text[:200])
-    check("the steps are in order",
-          text.index("Step 1 ·") < text.index("Step 2 ·") < text.index("Step 3 ·"))
+    check("Step 1 is the fit", "Step 1 · Fit it" in text, text[:150])
+    labels_here = [e.label or "" for e in app.get("expander")]
+    check("Step 2 is what it used",
+          any("Step 2 · What it used" in l for l in labels_here),
+          str(labels_here))
+    check("and its label is not raw markdown",
+          not any(l.startswith("#") for l in labels_here), str(labels_here))
+    check("the fit comes before the settings it used",
+          text.index("Step 1 ·") < text.index("Step 2 ·")
+          if "Step 2 ·" in text else True)
 
-    # The part checkboxes must exist exactly once, in Step 1.
+    # The button has to be reachable without opening anything.
+    work = button_by_label(app, "Work it out for me")
+    check("the button is on the page", work is not None)
+    check("and it is the primary action",
+          work is not None and work.proto.type == "primary")
+
+    # The part checkboxes must exist exactly once, in Step 2.
     labels = [c.label for c in app.checkbox]
     for term in ("Membrane", "Cytoskeleton", "Nucleus"):
         matching = [l for l in labels if l and l.startswith(term)]
@@ -1859,6 +1869,79 @@ def wt_model(q=1.25):
         membrane_thickness=8.0e-9, shell_thickness=200e-9,
         deep_uses_cell_radius=True, sarcomere_length=2.1e-6, confinement=q,
     )
+
+
+def case_dropped_spring_is_said_once_where_it_is_chosen():
+    print("picking a model without T₀ is flagged at the selector, not after")
+    def load(kind):
+        app = start(cell_name="WT", cell_type="Cardiomyocyte",
+                    ui_mode="Full control · every setting", model_kind=kind)
+        return app, [str(w.value) for w in app.get("warning")]
+
+    side, warned = load("Side by side (every element acts everywhere)")
+    if not no_exception(side, "side by side"):
+        return
+    about = [w for w in warned if "T₀" in w]
+    check("choosing it says so", len(about) >= 1, str(warned)[:120])
+    check("and says it exactly once, not twice",
+          len(about) == 1, f"{len(about)} messages")
+    check("the message is at the choice, naming the fix",
+          any("Segmented" in w for w in about), str(about)[:160])
+    check("and there is a button that makes the fix",
+          button_by_label(side, "Switch to Segmented") is not None)
+
+    seg, clean = load("Segmented (membrane → cytoskeleton → nucleus)")
+    if no_exception(seg, "segmented"):
+        check("the segmented model says nothing, because it carries it",
+              not [w for w in clean if "T₀" in w], str(clean)[:120])
+        check("and its fit really does carry it",
+              "tension" in ((seg.session_state["_last_fit"] or {}).get("terms") or []))
+
+    # Pressing the button has to actually switch it.
+    fix = button_by_label(side, "Switch to Segmented")
+    if fix is not None:
+        fix.click().run()
+        if no_exception(side, "switching"):
+            check("the model is now segmented",
+                  side.session_state["model_kind"].startswith("Segmented"),
+                  side.session_state["model_kind"])
+            check("and the message is gone",
+                  not [w for w in (str(x.value) for x in side.get("warning"))
+                       if "T₀" in w])
+
+    # A myoblast has no tension spring at all, so none of this applies to it.
+    plain = start(cell_name="myo", ui_mode="Full control · every setting",
+                  model_kind="Side by side (every element acts everywhere)")
+    if no_exception(plain, "myoblast side by side"):
+        check("a myoblast is never nagged about a spring it does not have",
+              not [w for w in (str(x.value) for x in plain.get("warning"))
+                   if "T₀" in w])
+
+
+def case_search_says_when_a_winner_drops_a_spring():
+    print("an arrangement that cannot carry every element admits it")
+    from lulevich_model import search_arrangements
+    eps, force, model, _ = four_element_curve()
+    found = search_arrangements(
+        model, 0.0, 0.65, terms=("tension", "membrane", "interior", "nucleus"),
+        tension_mode="always", n_folds=4, cv_repeats=1,
+    )
+    check("the search runs", found.get("success"))
+    if not found.get("success"):
+        return
+    by_name = {c["arrangement"]: c for c in found["candidates"]}
+    check("segmented carries everything",
+          by_name.get("segmented", {}).get("dropped") == ())
+    for name in ("parallel", "series"):
+        if name in by_name:
+            check(f"{name} admits it drops the tension spring",
+                  by_name[name].get("dropped") == ("tension",),
+                  str(by_name[name].get("dropped")))
+    if found["best"].get("dropped"):
+        check("and the verdict says so when such a one wins",
+              "T₀" in found["verdict"], found["verdict"][-160:])
+    else:
+        check("the winner here carries everything", True)
 
 
 def case_real_curve_is_steeper_than_any_fixed_power():
@@ -2531,6 +2614,8 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_dropped_spring_is_said_once_where_it_is_chosen,
+        case_search_says_when_a_winner_drops_a_spring,
         case_real_curve_is_steeper_than_any_fixed_power,
         case_confinement_earns_its_place_on_real_data,
         case_real_curve_gives_believable_numbers,
@@ -2550,7 +2635,7 @@ if __name__ == "__main__":
         case_search_maths_is_shown,
         case_cardiomyocyte_starts_loaded_together,
         case_schematic_is_a_mechanics_diagram,
-        case_guided_order_is_parts_then_work_it_out,
+        case_guided_order_is_fit_then_adjust,
         case_it_picks_the_arrangement,
         case_work_it_out_applies_the_arrangement,
         case_search_stays_fast,
