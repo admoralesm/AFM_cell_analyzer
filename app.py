@@ -331,6 +331,19 @@ DEFAULTS = {
     # The sub-membranous protein layer, two orders thicker than the bilayer.
     # Only used to express a fitted tension as an equivalent modulus.
     "protein_coat_nm": 200.0,
+    # Relaxed sarcomere length, and how freely the cell spreads sideways as
+    # it is squashed. Neither enters the fit; they turn a deformation into a
+    # sarcomere length that can be judged against what a sarcomere can do.
+    "sarcomere_nm": 2100.0,
+    "sarcomere_spread": 1.0,
+    # Shape, and the stiffening that follows from it. q = 0 is the classic
+    # small-strain Lulevich model; see confinement_factor in lulevich_model.
+    "cell_shape": "Sphere (a rounded cell)",
+    "confinement": 0.0,
+    "confinement_scan": None,
+    # Acquisition, recorded with the cell rather than used by the fit.
+    "probe_diameter_um": 0.0,
+    "approach_speed_um_s": 2.0,
     "poisson_membrane": 0.50,
     "poisson_interior": 0.50,
     # cell type
@@ -1341,6 +1354,8 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
         # prefactors, so both follow the cell type.
         shell_thickness=float(st.session_state["protein_coat_nm"]) * 1e-9,
         deep_uses_cell_radius=st.session_state["cell_type"] in FOUR_ELEMENT_TYPES,
+        sarcomere_length=float(st.session_state["sarcomere_nm"]) * 1e-9,
+        confinement=float(st.session_state["confinement"]),
         poisson_membrane=float(st.session_state["poisson_membrane"]),
         poisson_interior=float(st.session_state["poisson_interior"]),
         nucleus_radius=nucleus_m,
@@ -1527,6 +1542,8 @@ CELL_TYPES = {
         "nucleus_fraction": 0.35,
         "membrane_thickness_nm": 4.0,
         "nucleus_onset": 0.20,
+        "cell_shape": "Sphere (a rounded cell)",
+        "confinement": 0.0,
         # expected bands in pascals
         "expected": {"Em": (2e5, 2e7), "Ei": (2e2, 1e4), "En": (1e3, 5e4)},
         # The membrane carries load from the very start of the compression, so
@@ -1534,13 +1551,23 @@ CELL_TYPES = {
         "windows": {"membrane": (0.0, 0.40), "interior": (0.0, 0.40),
                     "nucleus": (0.40, 1.0)},
     },
+    # Set from a measured WT curve rather than from round numbers: an adult
+    # cardiomyocyte lying on the dish is about 19 um tall, and it lies there
+    # as a rod, so its radius is half its height (aspect 0.5) rather than the
+    # 0.55 of a rounded-up cell. The membrane is taken as 8 nm, not the 4 nm
+    # of a bare bilayer, because what carries load here is the bilayer plus
+    # the protein coat welded to it.
     "Cardiomyocyte": {
-        "cell_height_um": 12.0,
-        "radius_aspect": 0.60,
+        "cell_height_um": 19.0,
+        "radius_aspect": 0.50,
         "nucleus_fraction": 0.32,
-        "membrane_thickness_nm": 4.5,
+        "membrane_thickness_nm": 8.0,
         "nucleus_onset": 0.18,
-        "expected": {"Em": (5e5, 5e7), "Ei": (1e3, 1e5), "En": (2e3, 2e5)},
+        "cell_shape": "Belt cylinder (a rod lying down)",
+        # Fitted from that curve; see confinement_factor. Not a constant of
+        # nature, so the app offers to measure it per cell.
+        "confinement": 1.30,
+        "expected": {"Em": (5e4, 5e7), "Ei": (1e2, 1e5), "En": (5e2, 2e5)},
         "windows": {"membrane": (0.0, 0.35), "interior": (0.0, 0.35),
                     "nucleus": (0.35, 1.0)},
     },
@@ -1550,6 +1577,8 @@ CELL_TYPES = {
         "nucleus_fraction": 0.35,
         "membrane_thickness_nm": 4.0,
         "nucleus_onset": 0.15,
+        "cell_shape": "Sphere (a rounded cell)",
+        "confinement": 0.0,
         "expected": {"Em": (1e3, 1e9), "Ei": (1e0, 1e7), "En": (1e1, 1e7)},
         "windows": {"membrane": (0.0, 0.40), "interior": (0.0, 0.40),
                     "nucleus": (0.40, 1.0)},
@@ -1568,8 +1597,11 @@ def apply_cell_type(name):
         "nucleus_fraction",
         "membrane_thickness_nm",
         "nucleus_onset",
+        "cell_shape",
+        "confinement",
     ):
-        st.session_state[key] = preset[key]
+        if key in preset:
+            st.session_state[key] = preset[key]
     for term, window in preset["windows"].items():
         st.session_state[f"celltype_window_{term}"] = tuple(window)
     # Which terms this cell type is modelled with. A cardiomyocyte is packed
@@ -1749,6 +1781,12 @@ def current_fit_settings():
         "nucleus_fraction": float(st.session_state["nucleus_fraction"]),
         "membrane_thickness_nm": float(st.session_state["membrane_thickness_nm"]),
         "protein_coat_nm": float(st.session_state["protein_coat_nm"]),
+        "sarcomere_nm": float(st.session_state["sarcomere_nm"]),
+        "sarcomere_spread": float(st.session_state["sarcomere_spread"]),
+        "cell_shape": st.session_state["cell_shape"],
+        "confinement": float(st.session_state["confinement"]),
+        "probe_diameter_um": float(st.session_state["probe_diameter_um"]),
+        "approach_speed_um_s": float(st.session_state["approach_speed_um_s"]),
         "poisson_membrane": float(st.session_state["poisson_membrane"]),
         "poisson_interior": float(st.session_state["poisson_interior"]),
         "term_windows": {
@@ -1993,6 +2031,19 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             else "cytoskeleton from ε₁",
         )
 
+    # Blank for a cell type without sarcomeres: a number in these columns
+    # for a myoblast would claim a measurement of something it does not have.
+    sarcomere = {"relaxed": "", "at_max": ""}
+    if st.session_state["cell_type"] in FOUR_ELEMENT_TYPES:
+        relaxed = float(st.session_state["sarcomere_nm"])
+        stretch = (1.0 - min(float(hi), 0.999)) ** (
+            -0.5 * float(st.session_state["sarcomere_spread"])
+        )
+        sarcomere = {
+            "relaxed": round(relaxed, 1),
+            "at_max": round(relaxed * stretch, 1),
+        }
+
     def span(term):
         """The stretch of deformation this modulus was actually measured on."""
         if term not in terms:
@@ -2064,6 +2115,10 @@ def send_cell_to_sheet(manager, fit, date_acquired):
                 round(float(st.session_state["protein_coat_nm"]), 2)
                 if "tension" in terms_for(st.session_state["cell_type"]) else ""
             ),
+            # Only for cell types that have sarcomeres. A number here for a
+            # myoblast would be a measurement of something it does not have.
+            "sarcomere_relaxed": sarcomere["relaxed"],
+            "sarcomere_at_max": sarcomere["at_max"],
             "poisson": "{:.2f} / {:.2f}".format(
                 float(st.session_state["poisson_membrane"]),
                 float(st.session_state["poisson_interior"]),
@@ -2109,6 +2164,8 @@ def model_from_record(record, curve):
         membrane_thickness=float(settings.get("membrane_thickness_nm", 4.0)) * 1e-9,
         shell_thickness=float(settings.get("protein_coat_nm", 200.0)) * 1e-9,
         deep_uses_cell_radius=settings.get("cell_type") in FOUR_ELEMENT_TYPES,
+        sarcomere_length=float(settings.get("sarcomere_nm", 2100.0)) * 1e-9,
+        confinement=float(settings.get("confinement", 0.0)),
         poisson_membrane=float(settings.get("poisson_membrane", 0.5)),
         poisson_interior=float(settings.get("poisson_interior", 0.5)),
         nucleus_radius=radius_m * float(settings.get("nucleus_fraction", 0.35)),
@@ -2158,6 +2215,7 @@ def refit_stored_cell(store, cell_id, settings):
             use_nucleus="nucleus" in terms,
             use_tension="tension" in terms,
             weighting=settings.get("weighting", "uniform"),
+            fit_offset=bool(settings.get("fit_offset", False)),
         )
     elif coupling == "series":
         fit = model.fit_series(lo, hi, terms=terms, weighting=settings.get("weighting", "uniform"))
@@ -2267,6 +2325,61 @@ with st.sidebar:
                 key="cell_radius_um",
             )
 
+    with st.expander("📐 Cell shape and confinement", expanded=False):
+        st.selectbox(
+            "What shape is the cell",
+            ["Sphere (a rounded cell)", "Belt cylinder (a rod lying down)"],
+            key="cell_shape",
+            help="A cell rounded up on the dish is a sphere. An adult "
+            "cardiomyocyte is a rod lying on its side, which is a different "
+            "problem: it has less room to spread as it is flattened, so it "
+            "stiffens faster.",
+        )
+        st.number_input(
+            "Confinement q",
+            min_value=0.0, max_value=3.0, step=0.05, format="%.2f",
+            key="confinement",
+            help="Every term is multiplied by (1−ε)^−q. q = 0 is the classic "
+            "Lulevich model, right near contact and too soft deep in. "
+            "q = 0.5 is a sphere spreading freely at constant volume. q = 3 "
+            "is a rod whose cross-section cannot deform at all. A real "
+            "attached cell sits between, because it sheds some volume as it "
+            "is squeezed. Measure it rather than assume it.",
+        )
+        st.caption(
+            "**Why this exists.** Every spring in the model is a small-strain "
+            "law, and past about half the cell's height a real cell stiffens "
+            "faster than any of them can. On the WT cardiomyocyte curve the "
+            "measured exponent climbs from 3 near ε = 0.2 to 5.3 by ε = 0.7, "
+            "and nothing built from ε, ε³ᐟ² and ε³ follows that. What is "
+            "happening is geometric: the cell keeps its volume, so it has to "
+            "go somewhere sideways, and q is how easily it can. Fitting that "
+            "curve with q free instead of q = 0 improves χ²/dof about "
+            "200-fold."
+        )
+        if st.session_state.get("data") is not None:
+            found = st.session_state.get("confinement_scan")
+            if st.button("📐 Measure q from this curve", **STRETCH):
+                st.session_state["_want_confinement_scan"] = True
+                st.rerun()
+            if found and found.get("success"):
+                st.success(
+                    f"q = {found['q']:.2f} "
+                    f"(anything from {found['q_low']:.2f} to "
+                    f"{found['q_high']:.2f} fits about as well)"
+                )
+                st.caption(
+                    f"R² {found['r_squared']:.6f} against "
+                    f"{found['baseline']['r_squared']:.6f} at q = 0; "
+                    f"χ²/dof {found['chi_squared_reduced']:.4g} against "
+                    f"{found['baseline']['chi_squared_reduced']:.4g}."
+                )
+                if st.button("Use it", **STRETCH):
+                    st.session_state["_pending_settings"] = {
+                        "confinement": round(float(found["q"]), 2)
+                    }
+                    st.rerun()
+
     with st.expander("🧬 Model constants"):
         st.number_input(
             "Lipid bilayer thickness hₘ (nm)",
@@ -2292,6 +2405,28 @@ with st.sidebar:
                 "in N/m and is what the data actually determines. This only "
                 "converts that tension into an equivalent modulus T₀/h_p for "
                 "comparison with the other three.",
+            )
+            st.number_input(
+                "Relaxed sarcomere length (nm)",
+                min_value=500.0,
+                max_value=5000.0,
+                step=50.0,
+                key="sarcomere_nm",
+                help="2100 nm for cardiac muscle. Nothing in the fit uses "
+                "it. It converts the deformation into a sarcomere length, "
+                "which is what says whether the myofibrils were still in "
+                "their working range over the stretch you fitted.",
+            )
+            st.slider(
+                "How freely the cell spreads sideways", 0.0, 1.0, step=0.05,
+                key="sarcomere_spread",
+                help="A squashed cell keeps its volume, so it spreads. How "
+                "much of that spreading runs along the myofibrils decides "
+                "how far the sarcomeres are pulled out. 1 is a cell free to "
+                "spread in every direction, the most they can lengthen; 0 "
+                "is a cell held at its ends, where they do not lengthen at "
+                "all. An attached cell is somewhere between, so read the "
+                "two ends as bounds.",
             )
         st.slider("Poisson ratio, membrane νₘ", 0.0, 0.5, step=0.01, key="poisson_membrane")
         st.slider("Poisson ratio, cytoskeleton νc", 0.0, 0.5, step=0.01, key="poisson_interior")
@@ -2617,12 +2752,42 @@ with tab_analysis:
             help="Deflection sensitivity from the calibration ramp. Recorded so "
             "the numbers can be traced back to the calibration they came from.",
         )
-    c5, c6 = st.columns([1, 3])
+    c5, c6, c7 = st.columns(3)
     with c5:
-        st.text_input("Operator", placeholder="initials", key="operator")
+        st.number_input(
+            "Probe sphere diameter (µm)",
+            min_value=0.0, max_value=200.0, step=1.0, format="%.1f",
+            key="probe_diameter_um",
+            help="The microsphere glued to the cantilever. Recorded with the "
+            "cell, not used by the fit: a sphere several times wider than "
+            "the cell presses on it as a flat plate, which is the geometry "
+            "this model assumes. 0 means not recorded.",
+        )
     with c6:
-        st.text_input("Notes", placeholder="passage, treatment, anything worth keeping",
-                      key="cell_notes")
+        st.number_input(
+            "Approach speed (µm/s)",
+            min_value=0.0, max_value=500.0, step=0.5, format="%.2f",
+            key="approach_speed_um_s",
+            help="Recorded with the cell. A cell is viscoelastic, so the "
+            "moduli belong to the speed they were measured at and only "
+            "compare with cells squashed at the same one.",
+        )
+    with c7:
+        st.text_input("Operator", placeholder="initials", key="operator")
+    st.text_input("Notes", placeholder="passage, treatment, anything worth keeping",
+                  key="cell_notes")
+    if (
+        st.session_state["probe_diameter_um"]
+        and st.session_state["probe_diameter_um"] < 2 * st.session_state["cell_height_um"]
+    ):
+        st.caption(
+            f"⚠️ A {st.session_state['probe_diameter_um']:.0f} µm sphere on a "
+            f"{st.session_state['cell_height_um']:.0f} µm cell is not a flat "
+            f"plate. This model assumes the cell is squashed between two "
+            f"flat surfaces; with a sphere this size the contact is curved "
+            f"and the moduli will be overestimates. A sphere of 40 µm or "
+            f"more on a cell this tall is close enough to flat."
+        )
     hint(
         f"Cell height h₀ = {st.session_state['cell_height_um']:.2f} μm — set it in the "
         "sidebar under **Cell geometry**, it directly scales both moduli."
@@ -2836,6 +3001,30 @@ with tab_analysis:
                     "🔬 Work it out for me", type="primary",
                     disabled=not chosen, **STRETCH,
                 ):
+                    # Confinement first, because it changes the shape of
+                    # every basis function and therefore which arrangement
+                    # looks best. Searching arrangements at the wrong q asks
+                    # which of several wrong models is least wrong.
+                    if (
+                        st.session_state["cell_shape"].startswith("Belt")
+                        and hasattr(model, "scan_confinement")
+                    ):
+                        with st.spinner("Measuring how confined the cell is…"):
+                            q_found = model.scan_confinement(
+                                0.0, guided_hi,
+                                e1=float(st.session_state["segment_break_1"]),
+                                e2=float(st.session_state["segment_break_2"]),
+                                membrane="continue", cyto_start="zero",
+                                use_nucleus="nucleus" in chosen,
+                                use_tension="tension" in chosen,
+                                weighting=st.session_state["weighting"],
+                            )
+                        if q_found.get("success"):
+                            st.session_state["confinement_scan"] = q_found
+                            model.confinement = float(q_found["q"])
+                            st.session_state["_confinement_from_search"] = round(
+                                float(q_found["q"]), 2
+                            )
                     with st.spinner(
                         "Comparing segmented, side by side and stacked, then "
                         "every way the parts can share the boundaries…"
@@ -2857,9 +3046,13 @@ with tab_analysis:
                     st.session_state["arrangement_search"] = found
                     st.session_state["composition_search"] = found.get("composition")
                     if found.get("success"):
-                        st.session_state["_pending_settings"] = (
-                            settings_from_arrangement(found["best"], guided_hi)
+                        pending = settings_from_arrangement(found["best"], guided_hi)
+                        measured_q = st.session_state.pop(
+                            "_confinement_from_search", None
                         )
+                        if measured_q is not None:
+                            pending["confinement"] = measured_q
+                        st.session_state["_pending_settings"] = pending
                         st.rerun()
                     else:
                         st.error(found.get("error", "Could not analyse this curve."))
@@ -3181,6 +3374,32 @@ with tab_analysis:
                 help="The stretch of the curve the fit is measured on.",
             )
         st.caption(f"{int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())} points")
+
+        # The sidebar button only asks for the scan; it runs here, where the
+        # model, the chosen range and the composition all exist. A sidebar
+        # widget is built before any of them.
+        if st.session_state.pop("_want_confinement_scan", False):
+            if hasattr(model, "scan_confinement"):
+                with st.spinner("Refitting across a range of q…"):
+                    st.session_state["confinement_scan"] = model.scan_confinement(
+                        fit_lo, fit_hi,
+                        e1=float(st.session_state["segment_break_1"]),
+                        e2=float(st.session_state["segment_break_2"]),
+                        membrane=MEMBRANE_CHOICES.get(
+                            st.session_state["membrane_after_break"], "freeze"
+                        ),
+                        cyto_start=CYTO_CHOICES.get(
+                            st.session_state["cyto_starts_at"], "break"
+                        ),
+                        use_nucleus="nucleus" in active,
+                        use_tension="tension" in active,
+                        weighting=st.session_state["weighting"],
+                    )
+            else:
+                st.session_state["confinement_scan"] = {
+                    "success": False,
+                    "error": "This needs an up to date lulevich_model.py.",
+                }
 
         term_windows = {}
         stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
@@ -3694,6 +3913,7 @@ with tab_analysis:
                         use_nucleus="nucleus" in active,
                         use_tension="tension" in active,
                         weighting=st.session_state["weighting"],
+                        fit_offset=st.session_state["fit_offset"],
                     )
                 else:
                     fit = model.fit_segmented(
@@ -4033,6 +4253,80 @@ with tab_analysis:
                 "estimated from the curve itself, so read χ²/dof as an "
                 "order of magnitude, not to two decimal places."
             )
+
+            # What the squash did to the sarcomeres. Geometry rather than a
+            # fitted result, and only meaningful where there are sarcomeres,
+            # but it is the check that says whether the myofibril modulus
+            # describes muscle doing something muscle does.
+            if (
+                st.session_state["cell_type"] in FOUR_ELEMENT_TYPES
+                and hasattr(model, "sarcomere_report")
+            ):
+                free = model.sarcomere_report(
+                    fit["epsilon_range"][1], onset=fit.get("break_2"),
+                    spread=float(st.session_state["sarcomere_spread"]),
+                )
+                held = model.sarcomere_report(
+                    fit["epsilon_range"][1], onset=fit.get("break_2"), spread=0.0,
+                )
+                with st.expander(
+                    "🧬 What the squash did to the sarcomeres",
+                    expanded=free["beyond_working_range"],
+                ):
+                    s1, s2, s3 = st.columns(3)
+                    s1.metric(
+                        "Relaxed", f"{free['relaxed_nm']:.0f} nm",
+                        delta=f"about {free['n_along_cell']:.0f} along the cell",
+                        delta_color="off",
+                    )
+                    s2.metric(
+                        f"At ε = {free['epsilon_max']:.2f}",
+                        f"{free['at_epsilon_max_nm']:.0f} nm",
+                        delta=f"{100 * (free['stretch'] - 1):+.0f} %",
+                        delta_color="off",
+                    )
+                    if "at_onset_nm" in free:
+                        s3.metric(
+                            f"Where they engage, ε₂ = {free['onset']:.2f}",
+                            f"{free['at_onset_nm']:.0f} nm",
+                        )
+                    st.caption(
+                        "Squashing a cardiomyocyte does not shorten its "
+                        "sarcomeres, it lengthens them. The myofibrils run "
+                        "along the cell, across the direction of the squash, "
+                        "and a cell that keeps its volume has to spread "
+                        "sideways by as much as it loses in height, which "
+                        "pulls them out: L = L₀ (1 − ε)^(−s∕2), where s is "
+                        "how much of that spreading runs along the "
+                        "myofibrils, set in the sidebar. This is geometry, "
+                        "not a fitted number, and nothing above depends on it."
+                    )
+                    if float(st.session_state["sarcomere_spread"]) > 0:
+                        st.caption(
+                            f"Held at its ends instead, the same cell would "
+                            f"keep its sarcomeres at "
+                            f"{held['at_epsilon_max_nm']:.0f} nm throughout. "
+                            f"A real attached cell lies between, so read "
+                            f"{held['at_epsilon_max_nm']:.0f} to "
+                            f"{free['at_epsilon_max_nm']:.0f} nm as the "
+                            f"bounds at ε = {free['epsilon_max']:.2f}."
+                        )
+                    if free["beyond_working_range"]:
+                        st.warning(
+                            f"Past ε = {free['epsilon_at_limit']:.2f} the "
+                            f"sarcomeres are longer than "
+                            f"{free['working_limit_nm']:.0f} nm, where actin "
+                            f"and myosin overlap stops improving and force "
+                            f"falls away with further stretch. Your fitted "
+                            f"range reaches ε = {free['epsilon_max']:.2f}, "
+                            f"which is {free['at_epsilon_max_nm']:.0f} nm. "
+                            f"Over that stretch the myofibril modulus "
+                            f"measures passive structure pulled beyond its "
+                            f"working length, not contractile machinery at a "
+                            f"length it ever works at. That may be exactly "
+                            f"what you mean to measure; it is worth saying "
+                            f"which."
+                        )
 
             # How much each number depends on where the boundaries landed.
             # A standard error is computed with the boundaries held fixed, so
