@@ -18,7 +18,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from lulevich_model import LulevichModel, compare_couplings
+from lulevich_model import (
+    LulevichModel,
+    compare_couplings,
+    search_arrangements,
+)
 from plot_utils import (
     FORCE_UNITS,
     INPUT_FORCE_UNITS,
@@ -292,6 +296,7 @@ DEFAULTS = {
     "cyto_starts_at": "at ε₁",
     "highlight_segment": "(none)",
     "composition_search": None,
+    "arrangement_search": None,
     # The segmented model always starts at zero, so only the far end is set.
     "window_end": 0.60,
     "procedure": "All at once",
@@ -323,6 +328,7 @@ DEFAULTS = {
     "box_store": None,
     "onedrive_store": None,
     "onedrive_root": "AFM cells",
+    "onedrive_account": "personal",
     "onedrive_index": None,
     "_device_login": None,
     "box_index": None,
@@ -573,6 +579,45 @@ def show_fit_maths(fit, model):
         "assumed membrane thickness, so it moves with that assumption while "
         "the measurement does not."
     )
+
+
+def settings_from_arrangement(best, epsilon_max):
+    """
+    Turn the winning arrangement into the widget values that reproduce it.
+
+    Written as staged settings rather than applied directly, because these
+    are widget keys and Streamlit rejects a write to one after its widget
+    exists. The caller reruns and they land at the top of the next pass.
+    """
+    pending = {"window_end": round(float(epsilon_max), 4)}
+    arrangement = best.get("arrangement")
+
+    if arrangement == "segmented":
+        composition = best.get("composition") or {}
+        labels = {
+            (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
+            for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
+        }
+        key = (composition.get("membrane", "freeze"),
+               composition.get("cyto_start", "break"))
+        membrane_label, cyto_label = labels.get(
+            key, ("holds what it reached", "at ε₁")
+        )
+        pending.update(
+            {
+                "model_kind": "Segmented (membrane → cytoskeleton → nucleus)",
+                "segment_break_1": round(float(composition.get("break_1", 0.15)), 3),
+                "segment_break_2": round(float(composition.get("break_2", 0.40)), 3),
+                "membrane_after_break": membrane_label,
+                "cyto_starts_at": cyto_label,
+                "use_nucleus": bool(composition.get("use_nucleus", True)),
+            }
+        )
+    elif arrangement == "series":
+        pending["model_kind"] = "Stacked (elements in line)"
+    else:
+        pending["model_kind"] = "Side by side (every element acts everywhere)"
+    return pending
 
 
 def open_panel(title, guided, expanded=False):
@@ -1149,23 +1194,29 @@ COMPONENT_SETS = {
     },
     "Cardiomyocyte": {
         "membrane": ("Membrane and cortex", "a strong shell holding fluid in"),
+        # A cardiomyocyte has two kinds of cytoskeleton and they are not the
+        # same material. The non-sarcomeric network is the general scaffolding
+        # every cell has; the sarcomeric apparatus is the contractile
+        # machinery, stiffer and reached later as the cell is flattened onto
+        # it. The third slot holds the sarcomeric one rather than a nucleus,
+        # which in a cell this packed has nothing distinct left to describe.
         "interior": (
-            "Myofibril bundle",
-            "the contractile machinery, treated as one stiff body",
+            "Non-sarcomeric cytoskeleton",
+            "the general scaffolding, not contractile",
         ),
-        # Listed so the term has a name if anyone switches it on, but a
-        # cardiomyocyte is modelled without it: the cell is packed with
-        # myofibrils and behaves as one stiff interior, so a separate nucleus
-        # term has nothing distinct left to describe and only trades off
-        # against the interior modulus.
-        "nucleus": ("Nucleus", "not modelled separately in a cardiomyocyte"),
+        "nucleus": (
+            "Sarcomeric cytoskeleton",
+            "the contractile machinery, the myofibrils",
+        ),
     },
 }
 DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 
-# Which terms a cell type is fitted with by default.
+# Which terms a cell type is fitted with by default. All three for both,
+# but the third means different things: a nucleus in a myoblast, the
+# contractile apparatus in a cardiomyocyte.
 DEFAULT_TERMS_BY_TYPE = {
-    "Cardiomyocyte": {"membrane": True, "interior": True, "nucleus": False},
+    "Cardiomyocyte": {"membrane": True, "interior": True, "nucleus": True},
 }
 
 
@@ -1914,11 +1965,30 @@ with st.sidebar:
                 "Storage you already have, and you can authorise it yourself. "
                 "Files go to a folder per cell."
             )
+            st.selectbox(
+                "Account type",
+                list(onedrive_store.ACCOUNTS.keys()),
+                key="onedrive_account",
+                format_func=lambda key: onedrive_store.ACCOUNTS[key]["label"],
+                help="This decides both the sign-in endpoint and the "
+                "permissions asked for, and the two are not interchangeable. "
+                "A personal account does not live in a directory, so it "
+                "cannot sign in against a tenant id, and it uses "
+                "Files.ReadWrite rather than the work-account "
+                "Files.ReadWrite.All.",
+            )
             st.text_input("Folder for the cells", key="onedrive_root")
             if st.button("🔌 Connect to OneDrive", **STRETCH):
                 store = onedrive_store.store_from_secrets(
                     st, st.session_state["onedrive_root"] or None
                 )
+                if store is not None:
+                    # The picker wins over whatever is in secrets, so the fix
+                    # is one dropdown rather than an edit and a reboot.
+                    store.account = st.session_state["onedrive_account"]
+                    chosen = onedrive_store.settings_for(store.account)
+                    store.tenant = chosen["tenant"]
+                    store.scopes = chosen["scopes"]
                 if store is None:
                     st.error(
                         "No [onedrive] section in secrets. Add client_id and "
@@ -1946,7 +2016,7 @@ with st.sidebar:
                         config = dict(st.secrets.get("onedrive", {}))
                         flow = onedrive_store.begin_device_login(
                             config.get("client_id"),
-                            config.get("tenant", "common"),
+                            account=st.session_state["onedrive_account"],
                         )
                         st.session_state["_device_login"] = flow
                     except Exception as exc:
@@ -1964,7 +2034,7 @@ with st.sidebar:
                             payload = onedrive_store.poll_device_login(
                                 config.get("client_id"),
                                 flow.get("device_code"),
-                                config.get("tenant", "common"),
+                                account=st.session_state["onedrive_account"],
                             )
                         except Exception as exc:
                             payload = None
@@ -1976,7 +2046,7 @@ with st.sidebar:
                             st.success("Signed in. Copy this into your secrets:")
                             st.code(
                                 "[onedrive]\n"
-                                f'tenant = "{dict(st.secrets.get("onedrive", {})).get("tenant", "common")}"\n'
+                                f'account = "{st.session_state["onedrive_account"]}"\n'
                                 f'client_id = "{dict(st.secrets.get("onedrive", {})).get("client_id", "")}"\n'
                                 f'refresh_token = "{payload.get("refresh_token", "")}"\n'
                                 f'root_folder = "{st.session_state["onedrive_root"] or "AFM cells"}"',
@@ -2294,56 +2364,84 @@ with tab_analysis:
         guided = st.session_state["ui_mode"].startswith("Guided")
 
         if guided:
-            st.markdown("#### Analyse this cell")
+            names = components_for(st.session_state["cell_type"])
+
+            st.markdown("#### Step 1 · Which parts of the cell are in the model")
             st.caption(
-                "One press works out which parts of the cell resist the "
-                "squash, where each one takes over, and how stiff each is. "
-                "Nothing below needs touching unless you want to."
+                "Leave all three ticked unless you have a reason not to. The "
+                "names follow the cell type chosen in the sidebar, because a "
+                f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
+                "not built like every other cell."
+            )
+            p1, p2, p3 = st.columns(3)
+            for column, term in zip((p1, p2, p3), TERM_ORDER):
+                label, everyday = names[term]
+                with column:
+                    st.checkbox(label, key=f"use_{term}")
+                    st.caption(everyday)
+
+            chosen = active_terms()
+            if not chosen:
+                st.warning("Tick at least one part before analysing.")
+
+            st.markdown("#### Step 2 · Work it out")
+            st.caption(
+                "This decides how the parts are arranged, whether the cell is "
+                "segmented, side by side or stacked, then where each part "
+                "takes over, then how stiff each one is. It fits every "
+                "possibility and keeps the one that best predicts points it "
+                "was not fitted on."
             )
             g1, g2 = st.columns([1, 2])
             with g1:
-                if st.button("🔬 Work it out for me", type="primary", **STRETCH):
+                if st.button(
+                    "🔬 Work it out for me", type="primary",
+                    disabled=not chosen, **STRETCH,
+                ):
                     with st.spinner(
-                        "Trying every way the parts of the cell can share the "
-                        "load, and keeping the one that predicts best…"
+                        "Comparing segmented, side by side and stacked, then "
+                        "every way the parts can share the boundaries…"
                     ):
-                        found = model.search_compositions(
-                            0.0, eps_hi_data,
+                        found = search_arrangements(
+                            model, 0.0, eps_hi_data, terms=chosen,
                             weighting=st.session_state["weighting"],
                         )
-                    st.session_state["composition_search"] = found
+                    st.session_state["arrangement_search"] = found
+                    st.session_state["composition_search"] = found.get("composition")
                     if found.get("success"):
-                        best = found["best"]
-                        labels = {
-                            (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
-                            for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
-                        }
-                        m_label, c_label = labels[
-                            (best["membrane"], best["cyto_start"])
-                        ]
-                        st.session_state["_pending_settings"] = {
-                            "segment_break_1": round(float(best["break_1"]), 3),
-                            "segment_break_2": round(float(best["break_2"]), 3),
-                            "membrane_after_break": m_label,
-                            "cyto_starts_at": c_label,
-                            "use_nucleus": bool(best["use_nucleus"]),
-                            "use_membrane": True,
-                            "use_interior": True,
-                            "model_kind": (
-                                "Segmented (membrane → cytoskeleton → nucleus)"
-                            ),
-                            "window_end": round(float(eps_hi_data), 4),
-                        }
+                        st.session_state["_pending_settings"] = (
+                            settings_from_arrangement(found["best"], eps_hi_data)
+                        )
                         st.rerun()
                     else:
                         st.error(found.get("error", "Could not analyse this curve."))
             with g2:
-                previous = st.session_state.get("composition_search")
+                previous = st.session_state.get("arrangement_search")
                 if previous and previous.get("success"):
                     st.success(previous["verdict"])
+                    rows = [
+                        {
+                            "arrangement": row["label"].split(":")[0],
+                            "what it means": row["detail"],
+                            "predicts held-out points": f"{row['cv_rmse']:.3g}",
+                            "free numbers": row["n_params"],
+                            "": "← chosen" if row is previous["best"]
+                            else ("ties" if row.get("tied_with_best") else ""),
+                        }
+                        for row in previous["candidates"]
+                    ]
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+                    st.caption(
+                        "Lower is better in the middle column: it is how far "
+                        "the model misses points it never saw. Where two are "
+                        "close, the one with fewer free numbers wins, because "
+                        "a part the curve cannot see gives a number that will "
+                        "move from cell to cell."
+                    )
                 else:
                     st.info(
-                        "Press the button and the results appear below the plot."
+                        "Press the button and the answer appears here, with "
+                        "the fitted curve below."
                     )
             st.divider()
 
@@ -2367,9 +2465,20 @@ with tab_analysis:
             st.caption(MODELS[st.session_state["model_kind"]])
         with element_col:
             st.markdown("**1 · Which components**")
-            st.checkbox("Membrane · Eₘ", key="use_membrane")
-            st.checkbox("Cytoskeleton · Ec", key="use_interior")
-            st.checkbox("Nucleus · Eₙ", key="use_nucleus")
+            if guided:
+                # The same checkboxes already exist in Step 1 above. Building
+                # them twice is a duplicate widget key, which Streamlit
+                # refuses outright.
+                picked = components_for(st.session_state["cell_type"])
+                for term in TERM_ORDER:
+                    mark = "☑" if st.session_state[f"use_{term}"] else "☐"
+                    st.caption(f"{mark} {picked[term][0]}")
+                st.caption("Change these in **Step 1** above.")
+            else:
+                names = components_for(st.session_state["cell_type"])
+                st.checkbox(f"{names['membrane'][0]} · Eₘ", key="use_membrane")
+                st.checkbox(f"{names['interior'][0]} · Ec", key="use_interior")
+                st.checkbox(f"{names['nucleus'][0]} · Eₙ", key="use_nucleus")
 
         active = active_terms()
         kind = MODEL_KEYS[st.session_state["model_kind"]]
@@ -2394,11 +2503,13 @@ with tab_analysis:
             st.caption(
                 "What it does today: the shell carries the load as ε³, "
                 "because a pressurised shell around incompressible fluid "
-                "gives that cubic law, and one interior term stands for the "
-                "whole myofibril bundle. There is no separate nucleus: a "
-                "cardiomyocyte is packed with contractile machinery, so the "
-                "interior is treated as one stiff body and a third term would "
-                "only trade off against it."
+                "gives that cubic law. The two interior terms are the two "
+                "kinds of cytoskeleton a cardiomyocyte has: the "
+                "non-sarcomeric network, which is the general scaffolding, "
+                "and the sarcomeric apparatus, the contractile myofibrils, "
+                "which is stiffer and met later as the cell flattens onto it. "
+                "There is no separate nucleus term: in a cell this packed it "
+                "has nothing distinct left to describe."
             )
 
         if segmented:
