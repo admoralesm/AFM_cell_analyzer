@@ -975,6 +975,132 @@ def case_curve_saved_as_a_tab():
     check("the tab was cleared before rewriting", sheet.cleared is True)
 
 
+def case_axis_ranges():
+    print("the axes can be pinned, and deformation defaults to 0-1")
+    import plot_utils
+    import app as app_module
+
+    check("0 to 1 is the default deformation axis",
+          app_module.DEFAULTS["x_axis_mode"].startswith("0 to 1"),
+          app_module.DEFAULTS["x_axis_mode"])
+
+    eps, force = synthetic()
+    style = plot_utils.PlotStyle(force_unit="N", x_range=(0.0, 1.0))
+    fig = plot_utils.force_curve_figure(eps, force, style)
+    check("the deformation axis is pinned to 0-1",
+          list(fig.layout.xaxis.range) == [0.0, 1.0], str(fig.layout.xaxis.range))
+    check("autorange is off so it stays pinned",
+          fig.layout.xaxis.autorange is False, str(fig.layout.xaxis.autorange))
+
+    style = plot_utils.PlotStyle(force_unit="N", y_range=(0.0, 5.0))
+    fig = plot_utils.force_curve_figure(eps, force, style)
+    check("the force axis can be pinned too",
+          list(fig.layout.yaxis.range) == [0.0, 5.0], str(fig.layout.yaxis.range))
+
+    loose = plot_utils.force_curve_figure(eps, force, plot_utils.PlotStyle(force_unit="N"))
+    check("no range means plotly decides", loose.layout.xaxis.range is None)
+
+    # A reversed or nonsense range must be ignored, not applied.
+    bad = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="N", x_range=(1.0, 0.0))
+    )
+    check("a reversed range is ignored", bad.layout.xaxis.range is None,
+          str(bad.layout.xaxis.range))
+
+    # Log axes take decades, so a linear pair must not be applied there.
+    logged = plot_utils.force_curve_figure(
+        eps, force,
+        plot_utils.PlotStyle(force_unit="N", log_scale=True, x_range=(0.0, 1.0)),
+    )
+    check("ranges are not applied on log axes",
+          logged.layout.xaxis.range is None, str(logged.layout.xaxis.range))
+
+
+def case_nucleus_spring_is_shorter():
+    print("a component met late gets a shorter spring")
+    import plot_utils
+
+    style = plot_utils.PlotStyle(force_unit="N")
+
+    def springs(cyto_start):
+        fig = plot_utils.cell_schematic(
+            style, epsilon=0.5, break_1=0.15, break_2=0.40,
+            membrane_mode="freeze", cyto_start=cyto_start,
+            Em_MPa=0.6, Ei_kPa=1.2, En_kPa=3.0,
+        )
+        # Springs are line traces; measure how far each spans vertically.
+        spans = []
+        for trace in fig.data:
+            ys = [v for v in (trace.y or []) if v is not None]
+            if len(ys) > 4:
+                spans.append(max(ys) - min(ys))
+        return sorted(spans)
+
+    late = springs("break")
+    early = springs("zero")
+    check("some springs were drawn", len(late) >= 2, str(late))
+    if len(late) >= 2 and len(early) >= 2:
+        check("the late component's spring is shorter than the earliest one",
+              min(late) < max(late) * 0.95, str(late))
+        check("starting at zero makes the interior spring full length",
+              max(early) >= max(late) * 0.99, f"{early} vs {late}")
+
+
+def case_component_names_follow_the_cell_type():
+    print("a cardiomyocyte is not described as a myoblast")
+    import app as app_module
+
+    myoblast = app_module.components_for("Myoblast (C2C12)")
+    cardio = app_module.components_for("Cardiomyocyte")
+    check("the myoblast interior is the cytoskeleton",
+          myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
+    check("the cardiomyocyte interior is the myofibrils",
+          cardio["interior"][0] == "Myofibrils", str(cardio["interior"]))
+    check("the cardiomyocyte shell is named for holding fluid",
+          "fluid" in cardio["membrane"][1], str(cardio["membrane"]))
+    check("an unknown cell type still gets names",
+          app_module.components_for("Something else")["interior"][0])
+
+    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "cardiomyocyte names"):
+        return
+    frames = [f.value for f in app.get("dataframe")]
+    parts = [f for f in frames if "Part of the cell" in list(getattr(f, "columns", []))]
+    check("the plain-language table is there", len(parts) == 1)
+    if parts:
+        listed = list(parts[0]["Part of the cell"])
+        check("it says myofibrils, not cytoskeleton",
+              "Myofibrils" in listed and "Cytoskeleton" not in listed, str(listed))
+
+
+def case_cardiomyocyte_model_is_flagged_provisional():
+    print("the cardiomyocyte model says it is provisional")
+    app = start(cell_name="cell-01",
+                model_kind="Cardiomyocyte (Morales Maldonado)")
+    if not no_exception(app, "cardiomyocyte model"):
+        return
+    warnings = " ".join(str(w.value) for w in app.warning)
+    check("a provisional warning is shown", "provisional" in warnings.lower(),
+          warnings[:120])
+    check("it says the equations were not available",
+          "equations" in warnings.lower(), warnings[:200])
+    check("it asks for the paper's equation",
+          "send me" in warnings.lower(), warnings[:200])
+
+
+def case_not_reached_is_explained():
+    print("“not reached yet” is spelled out")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "range wording"):
+        return
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("the wording is explained",
+          "have not met it yet" in captions or "not been squashed far enough"
+          in captions, captions[:200])
+    check("it says this is not missing data",
+          "not missing data" in captions, "explanation absent")
+
+
 def case_fit_quality():
     print("the fit actually follows the data")
     for membrane, cyto in (("freeze", "break"), ("continue", "zero")):
@@ -1113,6 +1239,11 @@ if __name__ == "__main__":
         case_legacy_record_refits,
         case_companion_file_guard,
         case_fit_quality,
+        case_axis_ranges,
+        case_nucleus_spring_is_shorter,
+        case_component_names_follow_the_cell_type,
+        case_cardiomyocyte_model_is_flagged_provisional,
+        case_not_reached_is_explained,
         case_plain_language_helpers,
         case_guided_mode_is_the_default,
         case_full_control_shows_everything,
