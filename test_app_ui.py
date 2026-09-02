@@ -333,18 +333,26 @@ def case_bare_plot():
 
 
 def case_buttons_do_not_break_widgets():
-    print("every button in the segmented view clicks without a widget-key error")
-    app = start()
-    labels = [b.label for b in app.button]
-    for label in labels:
-        if any(word in label.lower() for word in ("box", "database", "send", "upload")):
-            continue
-        app2 = start()
-        target = button_by_label(app2, label)
-        if target is None:
-            continue
-        target.click().run()
-        no_exception(app2, f"button {label!r}")
+    print("every button clicks cleanly, for every cell type")
+    # Both cell types, because they build different models out of different
+    # numbers of terms, and a button that only ever ran under the default
+    # one is a button that has only been half tested. "Find the segments"
+    # passed a four-term list into the three-term segmented machinery and
+    # raised a KeyError on the fourth, for every cardiomyocyte, and this
+    # case did not catch it because it only ever ran as a myoblast.
+    for cell_type in ("Myoblast (C2C12)", "Cardiomyocyte"):
+        app = start(cell_type=cell_type)
+        labels = [b.label for b in app.button]
+        for label in labels:
+            if any(word in label.lower()
+                   for word in ("box", "database", "send", "upload")):
+                continue
+            app2 = start(cell_type=cell_type)
+            target = button_by_label(app2, label)
+            if target is None:
+                continue
+            target.click().run()
+            no_exception(app2, f"{cell_type}: button {label!r}")
 
 
 def case_preset_round_trip():
@@ -1824,6 +1832,73 @@ def case_four_element_model():
     check("and is a term shorter", three["n_params"] == 5, str(three["n_params"]))
 
 
+def case_extra_terms_never_crash_old_paths():
+    print("a fourth spring reaching three-spring code is dropped, loudly")
+    import lulevich_model as lm
+    eps, force, model, _ = four_element_curve()
+    four = ("tension", "membrane", "interior", "nucleus")
+
+    kept, dropped = lm.classic_terms(four)
+    check("the classic paths keep three", kept == lm.CLASSIC_TERMS, str(kept))
+    check("and report what they could not take", dropped == ("tension",),
+          str(dropped))
+    check("an all-classic list is untouched",
+          lm.classic_terms(("membrane", "interior"))[0] == ("membrane", "interior"))
+    check("an empty list falls back to all three",
+          lm.classic_terms(())[0] == lm.CLASSIC_TERMS)
+
+    # This is the exact path that raised a KeyError on Streamlit Cloud for
+    # every cardiomyocyte: the "Find the segments" button.
+    explored = model.explore_segments(0.0, 0.65, terms=four, n_grid=8)
+    check("exploring the curve survives the extra term",
+          explored.get("success"), str(explored.get("error")))
+
+    for name, call in (
+        ("fit", lambda: model.fit(0.0, 0.65, terms=four)),
+        ("fit_segmented",
+         lambda: model.fit_segmented(0.0, 0.65, 0.15, 0.40, terms=four)),
+        ("fit_series", lambda: model.fit_series(0.01, 0.65, terms=four)),
+        ("fit_staged", lambda: model.fit_staged([
+            {"terms": ("tension", "membrane"), "range": (0.20, 0.65)},
+            {"terms": ("interior", "nucleus"), "range": (0.00, 0.20)},
+        ])),
+    ):
+        try:
+            out = call()
+        except Exception as exc:
+            check(f"{name} survives the extra term", False,
+                  f"{type(exc).__name__}: {exc}")
+            continue
+        check(f"{name} survives the extra term", out.get("success"))
+        check(f"{name} reports only the terms it really used",
+              "tension" not in (out.get("terms") or []), str(out.get("terms")))
+        check(f"{name} says the spring was left out",
+              any("T₀" in w for w in (out.get("warnings") or [])),
+              str(out.get("warnings"))[:120])
+
+    # Scans go through those same fits and must not raise either.
+    for name, call in (
+        ("scan_segment_breaks",
+         lambda: model.scan_segment_breaks(0.0, 0.65, terms=four, n_grid=6)),
+        ("scan_nucleus_onset",
+         lambda: model.scan_nucleus_onset(0.0, 0.65, terms=four, n_trials=5)),
+        ("scan_crossover",
+         lambda: model.scan_crossover(0.02, 0.65, terms=four, n_trials=4)),
+    ):
+        try:
+            check(f"{name} survives the extra term", call().get("success"))
+        except Exception as exc:
+            check(f"{name} survives the extra term", False,
+                  f"{type(exc).__name__}: {exc}")
+
+    # And the composition fit, which does implement it, still does.
+    real = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
+                                 use_tension=True)
+    check("the segmented fit still carries the spring",
+          "tension" in real["terms"] and real["T0_mN_m"] > 0,
+          str(real["terms"]))
+
+
 def case_four_element_search():
     print("the search places the boundaries inside the four-spring model")
     eps, force, model, _ = four_element_curve(seed=11)
@@ -2169,6 +2244,7 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_extra_terms_never_crash_old_paths,
         case_four_element_search,
         case_breakpoint_spread_is_the_real_error_bar,
         case_error_bars_are_reported,
