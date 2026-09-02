@@ -21,6 +21,7 @@ import streamlit as st
 from lulevich_model import (
     LulevichModel,
     compare_couplings,
+    dropped_term_warning,
     search_arrangements,
 )
 from plot_utils import (
@@ -2286,6 +2287,13 @@ with st.sidebar:
         apply_cell_type(st.session_state["cell_type"])
         st.session_state["_applied_cell_type"] = st.session_state["cell_type"]
 
+    st.caption(
+        "**Set once per session.** Everything in this sidebar describes the "
+        "cell and the instrument, not this particular fit: choosing a cell "
+        "type fills it in, and you normally leave it alone from there. What "
+        "changes from curve to curve lives on the page, under the fit button."
+    )
+
     with st.expander("📐 Cell geometry", expanded=True):
         st.number_input(
             "Cell height h₀ (μm)",
@@ -2465,6 +2473,10 @@ with st.sidebar:
                 f"ε₀ = {found:.3f}." if found is not None
                 else "The slider is ignored while scanning; the fit finds ε₀ itself."
             )
+
+    st.caption(
+        "Below here is presentation and plumbing, not physics."
+    )
 
     with st.expander("📈 Fitting", expanded=False):
         hint(
@@ -2928,72 +2940,34 @@ with tab_analysis:
 
         if guided:
             names = components_for(st.session_state["cell_type"])
-
             here = terms_for(st.session_state["cell_type"])
-            st.markdown("#### Step 1 · Which parts of the cell are in the model")
-            st.caption(
-                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
-                "unless you have a reason not to. The names follow the cell "
-                "type chosen in the sidebar, because a "
-                f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
-                "not built like every other cell."
-            )
-            for column, term in zip(st.columns(len(here)), here):
-                label, everyday = names[term]
-                with column:
-                    st.checkbox(label, key=f"use_{term}")
-                    st.caption(everyday)
-            if len(here) == 4:
-                st.caption(
-                    "The first two are both the membrane. A cardiomyocyte's "
-                    "membrane carries a protein network that is already taut, "
-                    "so it pushes back from the very first contact in "
-                    "proportion to how far it is pushed (a law in ε); the "
-                    "shell's own elasticity only bites once the cell has been "
-                    "flattened enough to stretch it (a law in ε³). They are "
-                    "one piece of material answering two ways, which is why "
-                    "they start and stop together."
-                )
 
-            chosen = active_terms()
-            if not chosen:
-                st.warning("Tick at least one part before analysing.")
-
-            st.markdown("#### Step 2 · How far into the squash to look")
-            st.caption(
-                "The model describes a cell being flattened, not one being "
-                "burst. Past about 60 % the geometry it assumes stops "
-                "describing a real cell, and a curve that has ruptured should "
-                "be cut before the drop. Everything from 0 up to here is used."
-            )
+            # Read the settings before drawing the widgets that set them, so
+            # the button can come first on the page. These are all keyed
+            # widgets, so their values are in session state from the previous
+            # run (and from DEFAULTS on the first), and the widgets below
+            # write the same keys. Fitting is what you came here to do; the
+            # things you might change afterwards belong under it, not in
+            # front of it.
             st.session_state["guided_window_end"] = float(
                 np.clip(
                     st.session_state.get("guided_window_end", eps_hi_data),
                     float(step), eps_hi_data,
                 )
             )
-            guided_hi = st.slider(
-                "Analyse from ε = 0 up to",
-                min_value=float(step), max_value=eps_hi_data, step=step,
-                key="guided_window_end",
-            )
-            inside = int(((epsilon >= 0.0) & (epsilon <= guided_hi)).sum())
-            st.caption(
-                f"{inside} of {epsilon.size} points. "
-                + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
-                   f"stop before that."
-                   if rupture.get("method") == "force-drop"
-                   and rupture.get("epsilon") is not None
-                   else "No sudden force drop was detected in this curve.")
-            )
+            guided_hi = float(st.session_state["guided_window_end"])
+            chosen = active_terms()
 
-            st.markdown("#### Step 3 · Work it out")
+            st.markdown("#### Step 1 · Fit it")
             st.caption(
-                "This decides how the parts are arranged, whether the cell is "
-                "segmented, side by side or stacked, then where each part "
-                "takes over, then how stiff each one is. It fits every "
-                "possibility and keeps the one that best predicts points it "
-                "was not fitted on."
+                "One button. It decides how the parts are arranged, whether "
+                "the cell is segmented, side by side or stacked, then where "
+                "each part takes over, then how stiff each one is, fitting "
+                "every possibility and keeping the one that best predicts "
+                "points it was not fitted on. The settings it uses are "
+                "underneath, already set for "
+                f"**{st.session_state['cell_type'].split(' (')[0]}**; change "
+                "one and press the button again."
             )
             g1, g2 = st.columns([1, 2])
             with g1:
@@ -3066,6 +3040,9 @@ with tab_analysis:
                             "what it means": row["detail"],
                             "predicts held-out points": f"{row['cv_rmse']:.3g}",
                             "free numbers": row["n_params"],
+                            "carries": (
+                                "no T₀" if row.get("dropped") else "all of them"
+                            ),
                             "": "← chosen" if row is previous["best"]
                             else ("ties" if row.get("tied_with_best") else ""),
                         }
@@ -3087,7 +3064,75 @@ with tab_analysis:
                         "Press the button and the answer appears here, with "
                         "the fitted curve below."
                     )
-            st.divider()
+
+            # Everything the button used, under the button rather than in
+            # front of it. Open on a curve that has not been fitted yet, shut
+            # once there is an answer: by then these are things you change
+            # occasionally, not things you read every time.
+            has_answer = bool(
+                (st.session_state.get("arrangement_search") or {}).get("success")
+            )
+            with st.expander(
+                "Step 2 · What it used, and what to change",
+                expanded=not has_answer,
+            ):
+                st.caption(
+                    "Cell height, spring constant, shape and the model "
+                    "constants are in the sidebar. Those are properties of "
+                    "the cell and the instrument: set them once for the "
+                    "session. What is here belongs to this particular fit."
+                )
+                st.markdown("**Which parts of the cell are in the model**")
+                st.caption(
+                    f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
+                    "unless you have a reason not to. The names follow the cell "
+                    "type chosen in the sidebar, because a "
+                    f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
+                    "not built like every other cell."
+                )
+                for column, term in zip(st.columns(len(here)), here):
+                    label, everyday = names[term]
+                    with column:
+                        st.checkbox(label, key=f"use_{term}")
+                        st.caption(everyday)
+                if len(here) == 4:
+                    st.caption(
+                        "The first two are both the membrane. A cardiomyocyte's "
+                        "membrane carries a protein network that is already taut, "
+                        "so it pushes back from the very first contact in "
+                        "proportion to how far it is pushed (a law in ε); the "
+                        "shell's own elasticity only bites once the cell has been "
+                        "flattened enough to stretch it (a law in ε³). They are "
+                        "one piece of material answering two ways, which is why "
+                        "they start and stop together."
+                    )
+
+                if not chosen:
+                    st.warning("Tick at least one part before analysing.")
+
+                st.markdown("**How far into the squash to look**")
+                st.caption(
+                    "The model describes a cell being flattened, not one being "
+                    "burst. Past about 60 % the geometry it assumes stops "
+                    "describing a real cell, and a curve that has ruptured should "
+                    "be cut before the drop. Everything from 0 up to here is used."
+                )
+                st.slider(
+                    "Analyse from ε = 0 up to",
+                    min_value=float(step), max_value=eps_hi_data, step=step,
+                    key="guided_window_end",
+                )
+                inside = int(((epsilon >= 0.0) & (epsilon <= guided_hi)).sum())
+                st.caption(
+                    f"{inside} of {epsilon.size} points. "
+                    + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
+                       f"stop before that."
+                       if rupture.get("method") == "force-drop"
+                       and rupture.get("epsilon") is not None
+                       else "No sudden force drop was detected in this curve.")
+                )
+
+        st.divider()
 
         model_panel = open_panel(
             "⚙️ Which parts of the cell, and how they share the load", guided
@@ -3107,6 +3152,28 @@ with tab_analysis:
                 "fail on a curve that changes character partway along.",
             )
             st.caption(MODELS[st.session_state["model_kind"]])
+            # Only the segmented model implements the membrane's tension
+            # spring. Saying so here, where the choice is made, is worth more
+            # than saying it in a warning after the fit has already run
+            # without it.
+            if (
+                "tension" in terms_for(st.session_state["cell_type"])
+                and st.session_state["use_tension"]
+                and MODEL_KEYS[st.session_state["model_kind"]] != "segmented"
+            ):
+                st.warning(
+                    "This model has no place for the membrane's in-plane "
+                    "tension T₀, so choosing it drops that spring and lets "
+                    "the membrane modulus absorb what it was carrying. Only "
+                    "**Segmented** carries all four.",
+                    icon="⚠️",
+                )
+                if st.button("Switch to Segmented", **STRETCH):
+                    st.session_state["_pending_settings"] = {
+                        "model_kind":
+                            "Segmented (membrane → cytoskeleton → nucleus)"
+                    }
+                    st.rerun()
         with element_col:
             st.markdown("**1 · Which components**")
             if guided:
@@ -4568,7 +4635,15 @@ with tab_analysis:
                     )
                 st.warning(message)
 
+            # The dropped-spring sentence is already on the page, next to
+            # the model selector that caused it, with a button that fixes it.
+            # Repeating it here reads as a second, different problem.
+            said_already = set()
+            if fit.get("dropped_terms"):
+                said_already = set(dropped_term_warning(fit["dropped_terms"]))
             for message in fit["warnings"]:
+                if message in said_already:
+                    continue
                 st.warning(message)
 
             # ------------------------------------------------ plot + panel
