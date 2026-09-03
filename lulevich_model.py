@@ -1227,6 +1227,87 @@ COMPOSITIONS = [
 ]
 
 
+# --------------------------------------------------------------- orderings --
+# The Lulevich picture has two pieces and one question about them: which one
+# meets the plates first. A balloon (the membrane, e^3) and a Hertzian spring
+# (the network filling the cell, e^1.5). In Lulevich's own cells the balloon
+# answers first and the spring joins later, which is the order every textbook
+# drawing shows. A cardiomyocyte need not do that: its membrane is tied to a
+# cortex through the costameres and its interior is packed, so the spring can
+# perfectly well be the thing that answers first while the shell stays slack
+# until the cell has been flattened enough to stretch it.
+#
+# These four are that question written out. They are the same two springs
+# every time; only the order changes, and each order has a signature near
+# first contact that the data can be read against:
+#
+#     balloon alone      F ~ e^3        slope 3
+#     spring alone       F ~ e^1.5      slope 3/2
+#     both together      in between     slope about 1.7 to 2
+#
+# so the measured slope at the start of the curve is not a diagnostic anyone
+# has to take on trust. It is a number, and it is printed next to them.
+ORDERINGS = [
+    {
+        "key": "membrane_first",
+        "label": "Balloon first, then the spring",
+        "short": "membrane first",
+        "detail": "the membrane carries it alone, then holds what it reached "
+                  "while the cytoskeleton takes over at ε₁",
+        "membrane": "freeze", "cyto_start": "break",
+        "near_contact": 3.0,
+        "story": "Lulevich's original order, and the one most cells follow. "
+                 "The shell is the first thing the plates meet, so the curve "
+                 "starts as a cube law.",
+    },
+    {
+        "key": "membrane_then_both",
+        "label": "Balloon first, spring joins it",
+        "short": "membrane first, both after ε₁",
+        "detail": "the membrane keeps stiffening underneath while the "
+                  "cytoskeleton joins at ε₁",
+        "membrane": "continue", "cyto_start": "break",
+        "near_contact": 3.0,
+        "story": "The same start, but nothing hands over: the shell goes on "
+                 "stretching under the network rather than stopping.",
+    },
+    {
+        "key": "together",
+        "label": "Balloon and spring together from first contact",
+        "short": "both from the start",
+        "detail": "both loaded from ε = 0, nothing waits",
+        "membrane": "continue", "cyto_start": "zero",
+        "near_contact": 1.9,
+        "story": "What a membrane welded to its cortex does. Neither can move "
+                 "without the other, so there is no stretch where one of them "
+                 "is on its own, and the curve starts between the two laws.",
+    },
+    {
+        "key": "cyto_first",
+        "label": "Spring first, then the balloon starts stretching",
+        "short": "cytoskeleton first",
+        "detail": "the cytoskeleton carries it from ε = 0; the membrane's "
+                  "cube law is measured from ε₁",
+        "membrane": "late", "cyto_start": "zero",
+        "near_contact": 1.5,
+        "story": "The order a strong, slack shell gives. A membrane that is "
+                 "stiff once stretched still contributes nothing before it "
+                 "is stretched, so the network answers first and the shell "
+                 "arrives later and hard.",
+    },
+]
+
+ORDERING_BY_KEY = {row["key"]: row for row in ORDERINGS}
+
+
+def ordering_of(membrane, cyto_start):
+    """Which named ordering a (membrane, cyto_start) pair is, if any."""
+    for row in ORDERINGS:
+        if row["membrane"] == membrane and row["cyto_start"] == cyto_start:
+            return row
+    return None
+
+
 def composition_weights(epsilon, force, weighting):
     """
     How much each point counts in the fit.
@@ -1445,6 +1526,36 @@ class _CompositionMixin:
                 self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5 * squeeze
             ),
         }
+
+    def composition_curve(self, epsilon, fit):
+        """
+        The force a finished composition fit predicts, at any deformations.
+
+        The fit already carries everything the prediction needs: where its
+        boundaries went, which way it shared them, and the modulus of each
+        spring. Rebuilding the curve from those rather than storing it means
+        a fit can be drawn on a grid finer than the data, which is what makes
+        a corner at e1 visible instead of implied.
+        """
+        eps = np.asarray(epsilon, dtype=float)
+        basis = self.composition_basis(
+            eps,
+            float(fit.get("break_1", self.segment_break_1)),
+            float(fit.get("break_2", self.segment_break_2)),
+            fit.get("membrane", "continue"),
+            fit.get("cyto_start", "zero"),
+        )
+        total = np.full(eps.shape, float(fit.get("force_offset", 0.0) or 0.0))
+        for term, modulus in (
+            ("tension", fit.get("T0", 0.0)),
+            ("membrane", fit.get("Em", 0.0)),
+            ("interior", fit.get("Ei", 0.0)),
+            ("nucleus", fit.get("En", 0.0)),
+        ):
+            value = float(modulus or 0.0)
+            if value > 0:
+                total = total + basis[term] * value
+        return total
 
     def confinement_factor(self, epsilon):
         """
@@ -2040,7 +2151,7 @@ class _CompositionMixin:
 
     def _best_breakpoints(
         self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
-        rounds=2, use_tension=False,
+        rounds=2, use_tension=False, search_e2=None,
     ):
         """
         The breakpoints that fit best for one composition.
@@ -2055,7 +2166,16 @@ class _CompositionMixin:
         span = hi - lo
         gap = 0.02 * span
         first = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
-        second = np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+        # With no deep layer in the fit, e2 is not in the model at all: every
+        # value of it gives the same design matrix, so gridding it is n_grid
+        # identical fits. One value, and the search is n_grid instead of
+        # n_grid squared.
+        if search_e2 is None:
+            search_e2 = bool(use_nucleus)
+        second = (
+            np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+            if search_e2 else np.array([hi])
+        )
         best = None
 
         for round_index in range(int(rounds) + 1):
@@ -2081,10 +2201,13 @@ class _CompositionMixin:
                 min(hi - gap, best["break_1"] + step_1),
                 max(5, int(n_grid) // 2),
             )
-            second = np.linspace(
-                max(lo + gap, best["break_2"] - step_2),
-                min(hi - 1e-4, best["break_2"] + step_2),
-                max(5, int(n_grid) // 2),
+            second = (
+                np.linspace(
+                    max(lo + gap, best["break_2"] - step_2),
+                    min(hi - 1e-4, best["break_2"] + step_2),
+                    max(5, int(n_grid) // 2),
+                )
+                if search_e2 else second
             )
         if best is not None:
             # One full fit for the winner, so the caller gets the statistics.
@@ -3845,10 +3968,16 @@ def compare_hypotheses(
         membrane = spec.get("membrane", "continue")
         cyto_start = spec.get("cyto_start", "zero")
 
+        # ε₁ has to be searched whenever it is in the model, and it is in the
+        # model whenever the membrane's law is measured from it or the
+        # cytoskeleton waits for it, not only when there is a deep layer.
+        # Leaving it at whatever the last fit happened to use made two of
+        # these candidates carry a boundary chosen for a different question.
+        needs_e1 = membrane != "continue" or cyto_start != "zero"
         best = model._best_breakpoints(
             lo, hi, membrane, cyto_start, flags["use_nucleus"], weighting,
             n_grid, refine_rounds, use_tension=flags["use_tension"],
-        ) if flags["use_nucleus"] else model.fit_composition(
+        ) if (flags["use_nucleus"] or needs_e1) else model.fit_composition(
             lo, hi, model.segment_break_1, model.segment_break_2,
             membrane, cyto_start, weighting=weighting, **flags
         )
@@ -3969,6 +4098,128 @@ def compare_hypotheses(
         "clear_cut": not tied,
         "tie_tolerance": float(tolerance),
     }
+
+
+def near_contact_exponent(model, epsilon_min, epsilon_max, fraction=0.30):
+    """
+    The power law the curve follows over its first stretch.
+
+    This is the one measurement that speaks directly to the ordering question,
+    because the two Lulevich springs have different exponents and only one of
+    them is loaded at the very start. Fitted over the lowest ``fraction`` of
+    the analysed range, which is far enough in to have signal above the noise
+    and not so far as to include whatever takes over later.
+
+    Returns ``(exponent, r_squared, epsilon_upper)``.
+    """
+    lo, hi = float(epsilon_min), float(epsilon_max)
+    cut = lo + max(float(fraction), 0.05) * (hi - lo)
+    eps, force, _ = model._select(lo, cut)
+    if eps.size < 8:
+        eps, force, _ = model._select(lo, hi)
+        cut = hi
+    if eps.size < 6:
+        return float("nan"), float("nan"), cut
+    sigma, typical = noise_sigma(eps, force)
+    noise = typical if np.isfinite(typical) else 0.0
+    slope, r2 = model._power_law_exponent(eps, force, noise=noise)
+    return slope, r2, cut
+
+
+def compare_orderings(
+    model, epsilon_min, epsilon_max, terms=("membrane", "interior"),
+    weighting="uniform", orderings=None, **kwargs
+):
+    """
+    Which of the springs meets the plates first, asked of this curve.
+
+    ``compare_hypotheses`` scores stories about which *elements* are present.
+    This scores stories about the *order* they load in, with the elements held
+    fixed at whatever is ticked, so that only one thing varies between the
+    candidates and the answer means what it says.
+
+    Two readings come back and they are independent of each other. The fit
+    says which order predicts held-out points best. The measured exponent over
+    the first stretch of the curve says which spring is carrying the load
+    there, straight from the data with no model in the way. When they agree
+    the answer is worth believing; when they do not, that disagreement is the
+    result, and it is reported rather than smoothed over.
+    """
+    picks = list(orderings if orderings is not None else ORDERINGS)
+    keep = tuple(t for t in COMPOSITION_TERMS if t in tuple(terms))
+    if "membrane" not in keep or "interior" not in keep:
+        return {
+            "success": False,
+            "error": "The ordering question needs both the membrane and the "
+                     "cytoskeleton ticked: it is a question about which of "
+                     "those two loads first.",
+        }
+
+    specs = [dict(row, terms=keep) for row in picks]
+    scored = compare_hypotheses(
+        model, epsilon_min, epsilon_max, specs, weighting=weighting, **kwargs
+    )
+    if not scored.get("success"):
+        return scored
+
+    slope, slope_r2, slope_to = near_contact_exponent(
+        model, epsilon_min, epsilon_max
+    )
+    for row in scored["candidates"]:
+        source = ORDERING_BY_KEY.get(row["key"], {})
+        row["near_contact"] = source.get("near_contact", float("nan"))
+        row["story"] = source.get("story", "")
+        row["short"] = source.get("short", row["label"])
+        row["slope_gap"] = (
+            abs(row["near_contact"] - slope)
+            if np.isfinite(slope) and np.isfinite(row["near_contact"])
+            else float("nan")
+        )
+
+    # What the raw slope points at, decided without reference to any fit.
+    by_slope = [r for r in scored["candidates"] if np.isfinite(r["slope_gap"])]
+    slope_pick = min(by_slope, key=lambda r: r["slope_gap"]) if by_slope else None
+
+    best = scored["best"]
+    if slope_pick is None:
+        reading = (
+            "The curve was too short or too noisy near contact to measure a "
+            "slope there, so the fit is the only evidence here."
+        )
+    elif np.isclose(slope_pick["near_contact"], best["near_contact"]):
+        reading = (
+            f"The curve rises as ε^{slope:.2f} over its first stretch "
+            f"(up to ε = {slope_to:.3f}), and that is what "
+            f"**{best['short']}** predicts. The fit and the raw slope agree."
+        )
+    else:
+        reading = (
+            f"The curve rises as ε^{slope:.2f} over its first stretch "
+            f"(up to ε = {slope_to:.3f}), which on its own looks like "
+            f"**{slope_pick['short']}**, while the fit over the whole range "
+            f"prefers **{best['short']}**. Read that as the start of the "
+            f"curve and the rest of it saying different things, which is "
+            f"worth knowing rather than resolving by picking one."
+        )
+
+    # If the analysed range does not begin at contact, the "first stretch" is
+    # not the first stretch of the cell. Saying so matters: on a curve whose
+    # approach misbehaved, the slope measured here belongs to the middle of
+    # the compression and reads high for that reason alone.
+    if float(epsilon_min) > 0.02:
+        reading += (
+            f" One caution: this range starts at ε = {float(epsilon_min):.3f} "
+            f"rather than at contact, so that slope is measured part-way into "
+            f"the squash and cannot say which spring answered first."
+        )
+
+    scored["near_contact_exponent"] = float(slope)
+    scored["near_contact_r_squared"] = float(slope_r2)
+    scored["near_contact_upto"] = float(slope_to)
+    scored["slope_pick"] = slope_pick
+    scored["reading"] = reading
+    scored["terms"] = keep
+    return scored
 
 
 def recommend_components(
