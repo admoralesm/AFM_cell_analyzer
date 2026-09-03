@@ -194,6 +194,23 @@ def force_curve_figure(
     y, unit_label = from_newtons(force_N, style.force_unit)
 
     log_mode = style.log_scale
+
+    def annotation_y(value):
+        """Where to put an annotation, in the axis's own coordinates.
+
+        Plotly places annotations in *axis* coordinates, and on a log axis
+        those are log10 of the value, not the value. Passing a force of
+        1.6e-8 to a log axis asks for 10^(1.6e-8), which is 1 — off the top
+        of every real curve, and enough to leave the whole chart blank
+        rather than merely misplaced. A value at or below zero has no place
+        on a log axis at all, so it is refused instead of drawn.
+        """
+        value = float(value)
+        if not log_mode:
+            return value
+        if not np.isfinite(value) or value <= 0:
+            return None
+        return float(np.log10(value))
     fig = go.Figure()
 
     if log_mode:
@@ -240,15 +257,18 @@ def force_curve_figure(
             finite = np.isfinite(fy)
             if finite.any():
                 end = int(np.max(np.flatnonzero(finite)))
-                fig.add_annotation(
-                    x=float(fx[end]), y=float(fy[end]),
-                    text=f"<b>{fy[end]:.3g} {unit_label}</b>",
-                    showarrow=False, xanchor="left", yanchor="middle", xshift=6,
-                    font=dict(
-                        size=max(10, style.tick_size - 6), color=style.fit_color,
-                        family=REGULAR_FAMILY,
-                    ),
-                )
+                where = annotation_y(fy[end])
+                if where is not None:
+                    fig.add_annotation(
+                        x=float(fx[end]), y=where,
+                        text=f"<b>{fy[end]:.3g} {unit_label}</b>",
+                        showarrow=False, xanchor="left", yanchor="middle",
+                        xshift=6,
+                        font=dict(
+                            size=max(10, style.tick_size - 6),
+                            color=style.fit_color, family=REGULAR_FAMILY,
+                        ),
+                    )
 
         if style.show_components:
             for comp, label, dash, color in (
@@ -280,16 +300,18 @@ def force_curve_figure(
                     finite = np.isfinite(cy)
                     if finite.any():
                         end = int(np.max(np.flatnonzero(finite)))
-                        fig.add_annotation(
-                            x=float(cx[end]), y=float(cy[end]),
-                            text=f"<b>{cy[end]:.3g} {unit_label}</b>",
-                            showarrow=False,
-                            xanchor="left", yanchor="middle", xshift=6,
-                            font=dict(
-                                size=max(10, style.tick_size - 6), color=color,
-                                family=REGULAR_FAMILY,
-                            ),
-                        )
+                        where = annotation_y(cy[end])
+                        if where is not None:
+                            fig.add_annotation(
+                                x=float(cx[end]), y=where,
+                                text=f"<b>{cy[end]:.3g} {unit_label}</b>",
+                                showarrow=False,
+                                xanchor="left", yanchor="middle", xshift=6,
+                                font=dict(
+                                    size=max(10, style.tick_size - 6),
+                                    color=color, family=REGULAR_FAMILY,
+                                ),
+                            )
 
     if fit_window is not None and style.show_fit_window and not log_mode:
         # Accept a single (lo, hi) or a list of windows, each optionally
@@ -765,7 +787,7 @@ def cell_schematic(
                 x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
                 # Thicker, because four of these across a narrow panel with a
                 # 3 px line read as hairlines.
-                line=dict(color=colour, width=5, shape="spline"),
+                line=dict(color=colour, width=7, shape="spline"),
             )
         )
 
@@ -799,7 +821,7 @@ def cell_schematic(
             slice_h = (PLATEN_Y - GROUND_Y) * max(
                 weights.get(term, 1.0 / len(terms)), 0.05
             ) / total
-            draw_element(term, 40, y, y + slice_h, 20)
+            draw_element(term, 40, y, y + slice_h, 12)
             y += slice_h
         subtitle = "Stacked: same force through each, squashes add"
     else:
@@ -817,7 +839,7 @@ def cell_schematic(
             # a coil needs amplitude to read as a coil. The room comes from
             # the spacing instead.
             draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
-                         16 if len(terms) < 4 else 13,
+                         10 if len(terms) < 4 else 8,
                          row=index % 2 if len(terms) > 2 else 0)
         subtitle = "Side by side: same squash on each, forces add"
 
