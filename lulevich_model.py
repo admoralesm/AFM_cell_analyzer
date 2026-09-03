@@ -1660,6 +1660,9 @@ class _CompositionMixin:
             "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
             "T0_mN_m": T0 * 1e3,
             "T0_as_modulus_kPa": (T0 / self.h_shell) / 1e3 if self.h_shell else float("nan"),
+            # The same measurement read as shell bending instead. Same
+            # column, same number, different name for it.
+            "T0_as_bending_MPa": (T0 * self.At / self.Ab) / 1e6 if self.Ab else float("nan"),
             "Em_MPa_std": errors.get("membrane", float("nan")) / 1e6,
             "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
             "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
@@ -2661,6 +2664,32 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             out["onset"] = float(onset)
             out["at_onset_nm"] = float(self.sarcomere_at(onset, spread)) * 1e9
         return out
+
+    @property
+    def Ab(self):
+        """
+        Shell bending prefactor: F_bending = Ab * E_bend * e  [N/Pa].
+
+        Reissner's thin spherical shell: F = 4 E h^2 d / (R sqrt(3(1-nu^2))).
+
+        Note what this is, and what it is not. It is linear in e, and so is
+        the in-plane tension term, which means the two are the SAME column of
+        the design matrix. No fit can separate them, because there is nothing
+        to separate: they differ only in what the fitted number is called and
+        how it is converted back into a material property. A fitted in-plane
+        tension T0 is the same measurement as a bending modulus
+        E_bend = T0 * At / Ab, and which one you quote is a claim about the
+        cell, not a result from the curve.
+
+        That is worth stating plainly, because "add a bending term" sounds
+        like it would give the model somewhere new to go, and it does not.
+        The only way to add a genuinely new element is to add a new *shape*:
+        a different power of e, or the same power starting somewhere else.
+        """
+        return (
+            4.0 * self.h_shell ** 2 * self.cell_height
+            / (self.R0 * np.sqrt(3.0 * (1.0 - self.nu_m ** 2)))
+        )
 
     @property
     def At(self):
