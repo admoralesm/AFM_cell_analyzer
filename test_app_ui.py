@@ -1533,16 +1533,9 @@ def case_cardiomyocyte_starts_loaded_together():
           defaults["cyto_starts_at"] == "from the very start",
           str(defaults))
 
-    app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "cardiomyocyte defaults"):
-        return
-    check("the app applied it",
-          app.session_state["cyto_starts_at"] == "from the very start",
-          app.session_state["cyto_starts_at"])
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("and explains it with the measured slope",
-          "1.7" in captions, "no explanation of the 1.7")
-
+    # On a real cardiomyocyte curve. The synthetic one used elsewhere was
+    # generated as a myoblast, and the app now picks the picture that fits
+    # the curve in front of it rather than the cell type's starting guess,
     # The physics that justifies it: both loaded together gives a slope
     # between 3/2 and 3, membrane alone gives 3.
     from lulevich_model import LulevichModel as LM
@@ -1889,6 +1882,367 @@ def wt_model(q=1.25):
     )
 
 
+def vcm_curves():
+    """The four corrected WT ventricular cardiomyocyte curves, thinned.
+
+    Real measurements, and the reason the cardiomyocyte model looks the way
+    it does. Cell 3 carries a bad contact near ε = 0.2, which is not a defect
+    in the file: it is what the automatic range picker exists to find.
+    """
+    path = pathlib.Path(__file__).with_name("reference_WT_vcm_four.csv")
+    if not path.exists():
+        return {}
+    frame = pd.read_csv(path)
+    out = {}
+    for n in (3, 5, 11, 14):
+        eps = frame[f"eps_{n}"].to_numpy(float)
+        force = frame[f"force_{n}"].to_numpy(float)
+        good = np.isfinite(eps) & np.isfinite(force)
+        out[n] = (eps[good], force[good])
+    return out
+
+
+def vcm_model(eps, force, q=1.10):
+    return LulevichModel(
+        force, eps, cell_height=19.0e-6, cell_radius=9.5e-6,
+        membrane_thickness=8.0e-9, deep_uses_cell_radius=True,
+        sarcomere_length=2.1e-6, confinement=q,
+    )
+
+
+def case_the_fit_never_softens():
+    print("no combination of elements can make the cell soften under load")
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    eps, force = curves[11]
+    model = vcm_model(eps, force, q=1.2)
+    fit = model.fit_composition(0.0, 0.65, 0.15, 0.42, "continue", "zero",
+                                use_tension=True, weighting="relative")
+    basis = model.composition_basis(eps, 0.15, 0.42, "continue", "zero")
+    predicted = (
+        basis["membrane"] * fit["Em"] + basis["tension"] * fit["T0"]
+        + basis["interior"] * fit["Ei"] + basis["nucleus"] * fit["En"]
+    )
+    order = np.argsort(eps)
+    e, f = eps[order], predicted[order]
+    check("the force never falls as the cell is squashed",
+          np.all(np.diff(f) >= -1e-18), f"{np.min(np.diff(f)):.3g} N")
+    slope = np.diff(f) / np.maximum(np.diff(e), 1e-12)
+    check("and the stiffness never falls either",
+          np.min(np.diff(slope)) >= -abs(np.max(slope)) * 1e-6,
+          f"{np.min(np.diff(slope)):.3g}")
+
+    # Each basis function on its own, which is where the guarantee comes from.
+    for name, values in model.composition_basis(
+        np.linspace(0.001, 0.7, 400), 0.15, 0.42, "continue", "zero"
+    ).items():
+        check(f"the {name} basis is non-decreasing",
+              np.all(np.diff(values) >= -1e-18),
+              f"{np.min(np.diff(values)):.3g}")
+    check("and confinement can only stiffen, never soften",
+          model.confinement >= 0
+          and np.all(np.diff(model.confinement_factor(
+              np.linspace(0.0, 0.9, 200))) >= 0))
+
+
+def case_weighting_decides_where_the_fit_is_good():
+    print("weighting is what trades the top of the curve against the bottom")
+    from lulevich_model import composition_weights
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    eps, force = curves[11]
+
+    flat = composition_weights(eps, force, "uniform")
+    check("uniform weights everything the same", float(np.ptp(flat)) == 0.0)
+    rel = composition_weights(eps, force, "relative")
+    check("relative gives the small forces far more weight",
+          rel[np.argmin(force)] > rel[np.argmax(force)] * 100,
+          f"{rel[np.argmin(force)] / rel[np.argmax(force)]:.3g}")
+    noisy = composition_weights(eps, force, "noise")
+    check("noise weighting is finite everywhere", np.all(np.isfinite(noisy)))
+    check("and never zero, which would drop a point entirely",
+          np.all(noisy > 0))
+
+    def miss_below(weighting, edge=0.10):
+        model = vcm_model(eps, force, q=1.2)
+        fit = model.fit_composition(0.0, 0.65, 0.15, 0.42, "continue", "zero",
+                                    use_tension=True, weighting=weighting)
+        e, y, _ = model._select(0.0, 0.65)
+        basis = model.composition_basis(e, 0.15, 0.42, "continue", "zero")
+        predicted = (
+            basis["membrane"] * fit["Em"] + basis["tension"] * fit["T0"]
+            + basis["interior"] * fit["Ei"] + basis["nucleus"] * fit["En"]
+        )
+        low = (e > 0.02) & (e < edge)
+        return abs(float(np.mean(predicted[low] - y[low]) / np.mean(np.abs(y[low]))))
+
+    uniform_miss, relative_miss = miss_below("uniform"), miss_below("relative")
+    check("uniform misses the low-force end badly on a real curve",
+          uniform_miss > 0.10, f"{100 * uniform_miss:.1f} %")
+    check("and relative brings it back",
+          relative_miss < uniform_miss * 0.7,
+          f"{100 * uniform_miss:.1f} % -> {100 * relative_miss:.1f} %")
+
+    import app as app_module
+    check("so a cardiomyocyte is fitted with relative by default",
+          app_module.CELL_TYPES["Cardiomyocyte"]["weighting"] == "relative")
+    check("and a myoblast, whose curve spans far less, is not",
+          app_module.CELL_TYPES["Myoblast (C2C12)"]["weighting"] == "uniform")
+
+
+def case_the_whole_range_is_used_and_fits():
+    print("the full range is fitted, and it fits, band by band")
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    for n, (eps, force) in curves.items():
+        model = vcm_model(eps, force)
+        window = model.suggest_window()
+        # Everything from the start it chose to the end of the usable curve.
+        check(f"cell {n} uses the whole usable range",
+              window["epsilon_max"] >= float(eps.max()) - 0.02,
+              f"{window['epsilon_max']:.3f} of {eps.max():.3f}")
+
+        # The same path the app takes: measure the confinement, then let the
+        # named pictures fit their own boundaries. Fitting at a guessed
+        # boundary would be testing something the app never does.
+        import app as app_module
+        from lulevich_model import compare_hypotheses
+        scan = model.scan_confinement(
+            window["epsilon_min"], window["epsilon_max"], e1=0.15, e2=0.42,
+            membrane="continue", cyto_start="zero", use_tension=True,
+            weighting="relative",
+        )
+        if not scan.get("success"):
+            check(f"cell {n} fits", False)
+            continue
+        check(f"cell {n} needs a positive confinement",
+              scan["q"] > 0.5, f"q = {scan['q']:.2f}")
+        model.confinement = scan["q"]
+        picks_here = app_module.cardiomyocyte_hypotheses("Not known — test for it")
+        found = compare_hypotheses(
+            model, window["epsilon_min"], window["epsilon_max"], picks_here,
+            weighting="relative", cv_repeats=1, n_grid=8,
+        )
+        if not found.get("success"):
+            check(f"cell {n} gets a picture", False)
+            continue
+        # The refinement pass the app does: q was measured at guessed
+        # boundaries, so re-measure it where they actually landed.
+        first = found["best"]
+        again = model.scan_confinement(
+            window["epsilon_min"], window["epsilon_max"],
+            e1=first["break_1"], e2=first["break_2"],
+            membrane=first["membrane"], cyto_start=first["cyto_start"],
+            use_nucleus="nucleus" in first["terms"],
+            use_tension="tension" in first["terms"], weighting="relative",
+        )
+        if again.get("success"):
+            model.confinement = again["q"]
+            found = compare_hypotheses(
+                model, window["epsilon_min"], window["epsilon_max"], picks_here,
+                weighting="relative", cv_repeats=1, n_grid=8,
+            ) or found
+        fit = found["best"]["fit"]
+        check(f"cell {n} reaches R² above 0.9999",
+              fit["r_squared"] > 0.9999, f"{fit['r_squared']:.6f}")
+
+        e, y, _ = model._select(window["epsilon_min"], window["epsilon_max"])
+        basis = model.composition_basis(e, fit["break_1"], fit["break_2"],
+                                        "continue", "zero")
+        predicted = (
+            basis["membrane"] * fit["Em"] + basis["tension"] * fit.get("T0", 0.0)
+            + basis["interior"] * fit["Ei"] + basis["nucleus"] * fit["En"]
+        )
+        worst = 0.0
+        for lo_b, hi_b in ((0.05, 0.10), (0.10, 0.20), (0.20, 0.35),
+                           (0.35, 0.50), (0.50, 1.01)):
+            band = (e >= lo_b) & (e < hi_b)
+            if band.sum() < 10:
+                continue
+            scale = float(np.mean(np.abs(y[band])))
+            if scale <= 0:
+                continue
+            worst = max(worst, abs(float(np.mean(predicted[band] - y[band]) / scale)))
+        # Above the first hundredth of the curve, where a few hundred pN of
+        # contact-point error is the whole signal, it should track to a few
+        # per cent everywhere rather than only at the top.
+        check(f"cell {n} tracks the curve to better than 8 % throughout",
+              worst < 0.08, f"worst band {100 * worst:.1f} %")
+
+
+def case_real_vcm_curves_start_near_three_halves():
+    print("the corrected VCM curves start near 1.7, not 3")
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    for n, (eps, force) in curves.items():
+        good = (eps > 0.05) & (force > 0)
+        e, f = eps[good], force[good]
+
+        def slope(lo, hi):
+            m = (e >= lo) & (e < hi)
+            if m.sum() < 6:
+                return float("nan")
+            return float(np.polyfit(np.log(e[m]), np.log(f[m]), 1)[0])
+
+        early, late = slope(0.15, 0.30), slope(0.50, 0.62)
+        # 1.5 is a Hertzian network alone, 3 is a membrane alone. Between
+        # them is both together, which is the claim the model makes.
+        check(f"cell {n} starts between 3/2 and 3", 1.4 < early < 3.0,
+              f"{early:.2f}")
+        check(f"cell {n} is far steeper deep in", late > 3.3, f"{late:.2f}")
+
+
+def case_the_range_is_picked_and_a_bad_contact_is_found():
+    print("the range is chosen from the curve, artefacts and all")
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    for n, (eps, force) in curves.items():
+        window = vcm_model(eps, force).suggest_window()
+        check(f"cell {n} gets a window", window.get("success"), str(window))
+        if not window.get("success"):
+            continue
+        check(f"cell {n} stops at or before the data ends",
+              window["epsilon_max"] <= eps.max() + 1e-9)
+        if n == 3:
+            # The one with a probe that caught and let go near ε = 0.2.
+            check("cell 3's bad contact is found",
+                  window.get("bad_contact") is not None, str(window["why_start"]))
+            check("and the fit is started after it",
+                  window["epsilon_min"] > 0.2, f"{window['epsilon_min']:.3f}")
+        else:
+            check(f"cell {n} starts at first contact",
+                  window["epsilon_min"] < 0.05, f"{window['epsilon_min']:.3f}")
+
+    # And it matters: fitting through the artefact ruins the answer.
+    eps, force = curves[3]
+    model = vcm_model(eps, force, q=0.9)
+    window = model.suggest_window()
+    through = model.fit_composition(0.0, window["epsilon_max"], 0.15, 0.45,
+                                    "continue", "zero")
+    around = model.fit_composition(window["epsilon_min"], window["epsilon_max"],
+                                   0.15, 0.45, "continue", "zero")
+    check("fitting through the bad contact is visibly worse",
+          around["r_squared"] > through["r_squared"],
+          f"{through['r_squared']:.6f} -> {around['r_squared']:.6f}")
+    # And not by a little: on the full 7290-point curve fitting through it
+    # drove the membrane modulus to exactly zero. Thinned, it survives, but
+    # every modulus still moves by more than the artefact is worth.
+    check("and it moves the answer, not just the residual",
+          abs(around["En_kPa"] - through["En_kPa"])
+          > 0.5 * max(around["En_kPa"], through["En_kPa"]),
+          f"En {through['En_kPa']:.3f} -> {around['En_kPa']:.3f} kPa")
+
+
+def case_named_hypotheses_are_compared():
+    print("the guess is a named picture of the cell, not a setting")
+    import app as app_module
+    from lulevich_model import compare_hypotheses
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+
+    picks = app_module.hypotheses_for("Cardiomyocyte")
+    check("there are named hypotheses for a cardiomyocyte", len(picks) >= 3)
+    # Coupling is not one of the things that varies. The membrane and the
+    # cortical actin are tied through the costameres and the measured slope
+    # near contact says so, so every picture asserts it and what varies is
+    # which further elements are there, which is what an experiment changes.
+    check("every one has them loading together from first contact",
+          all(p["membrane"] == "continue" and p["cyto_start"] == "zero"
+              for p in picks), str([p["key"] for p in picks]))
+    check("the first names them", "cortical actin" in picks[0]["label"],
+          picks[0]["label"])
+    check("one of them adds the horizontal spring",
+          any("tension" in p["terms"] for p in picks))
+    check("and one has no deep layer, for a curve that never reaches it",
+          any("nucleus" not in p["terms"] for p in picks))
+
+    # The genotype decides what is worth comparing.
+    knockout = app_module.cardiomyocyte_hypotheses("Deleted (knockout)")
+    check("a knockout is never offered the spring",
+          not any("tension" in p["terms"] for p in knockout),
+          str([p["key"] for p in knockout]))
+    wild = app_module.cardiomyocyte_hypotheses("Present (wild type)")
+    check("a wild type leads with it",
+          "tension" in wild[0]["terms"], str(wild[0]["key"]))
+    unknown = app_module.cardiomyocyte_hypotheses("Not known — test for it")
+    check("and not knowing tries both",
+          any("tension" in p["terms"] for p in unknown)
+          and any("tension" not in p["terms"] for p in unknown))
+
+    for n, (eps, force) in curves.items():
+        model = vcm_model(eps, force)
+        window = model.suggest_window()
+        found = compare_hypotheses(
+            model, window["epsilon_min"], window["epsilon_max"], picks,
+            weighting="relative", cv_repeats=1, n_grid=6,
+        )
+        check(f"cell {n} gets a verdict", found.get("success"))
+        if not found.get("success"):
+            continue
+        check(f"cell {n} names its pick", bool(found["best"]["label"]))
+        check(f"cell {n} keeps the coupling",
+              found["best"]["membrane"] == "continue"
+              and found["best"]["cyto_start"] == "zero")
+
+
+def case_springs_are_round_and_the_balloon_exists():
+    print("the springs are coils, and there is a balloon to look at instead")
+    import plot_utils
+
+    xs, ys = plot_utils._zigzag(50.0, 10.0, 70.0, 14.0)
+    check("a spring is drawn with enough points to be smooth", len(xs) > 60,
+          str(len(xs)))
+    check("it hangs straight: it starts and ends on its own axis",
+          abs(xs[0] - 50.0) < 1e-9 and abs(xs[-1] - 50.0) < 1e-9)
+    check("it stays inside its width",
+          max(abs(x - 50.0) for x in xs) <= 7.0 + 1e-9,
+          f"{max(abs(x - 50.0) for x in xs):.3f}")
+    inner = xs[len(xs) // 4: 3 * len(xs) // 4]
+    check("and it really oscillates rather than zigzagging once",
+          sum(1 for a, b in zip(inner, inner[1:]) if (a - 50) * (b - 50) < 0) > 3)
+
+    style = plot_utils.PlotStyle()
+    figure = plot_utils.balloon_figure(
+        style, epsilon=0.35, cell_height_um=19.0, deep_onset=0.45,
+        show_tension=True,
+    )
+    check("the balloon renders", len(figure.data) >= 2)
+    text = " ".join(str(getattr(a, "text", "")) for a in figure.layout.annotations)
+    check("it says how far the cell was squashed", "ε = 0.350" in text, text[:120])
+    check("and that it spreads because it keeps its volume",
+          "keeping its volume" in text, text[:200])
+
+    # A squashed balloon must actually get wider, not just shorter.
+    def width_of(eps):
+        fig = plot_utils.balloon_figure(style, epsilon=eps, cell_height_um=19.0)
+        outline = fig.data[0]
+        return max(outline.x) - min(outline.x)
+
+    check("squashing it makes it wider", width_of(0.5) > width_of(0.0),
+          f"{width_of(0.0):.1f} -> {width_of(0.5):.1f}")
+
+    # The deeper element is drawn as not yet reached below its onset.
+    early = plot_utils.balloon_figure(style, epsilon=0.10, deep_onset=0.45)
+    late = plot_utils.balloon_figure(style, epsilon=0.60, deep_onset=0.45)
+    check("and the deeper layer says when it has not been reached",
+          "not reached yet" in " ".join(
+              str(getattr(a, "text", "")) for a in early.layout.annotations)
+          and "not reached yet" not in " ".join(
+              str(getattr(a, "text", "")) for a in late.layout.annotations))
+
+
 def case_switching_cell_type_and_back_changes_nothing():
     print("a myoblast fitted after a cardiomyocyte is still a myoblast")
     app = start(cell_name="myo-01")
@@ -1907,10 +2261,8 @@ def case_switching_cell_type_and_back_changes_nothing():
     if not no_exception(app, "switched to cardiomyocyte"):
         return
     check("the cardiomyocyte geometry is applied",
-          app.session_state["cell_height_um"] == 19.0
-          and app.session_state["confinement"] == 1.30,
-          f"{app.session_state['cell_height_um']} "
-          f"{app.session_state['confinement']}")
+          app.session_state["cell_height_um"] == 19.0,
+          str(app.session_state["cell_height_um"]))
 
     widget_by_label(app, "selectbox", "Cell type").set_value(
         "Myoblast (C2C12)"
@@ -2280,14 +2632,22 @@ def case_cardiomyocyte_defaults_match_the_experiment():
     check("shaped as a belt cylinder",
           preset["cell_shape"].startswith("Belt"))
     check("and confined, not free", preset["confinement"] > 1.0)
+    check("at roughly what four corrected WT curves measured",
+          0.9 <= preset["confinement"] <= 1.4, str(preset["confinement"]))
     check("a myoblast is unconfined",
           app_module.CELL_TYPES["Myoblast (C2C12)"]["confinement"] == 0.0)
 
     app = start(cell_name="WT_2", cell_type="Cardiomyocyte")
     if not no_exception(app, "cardiomyocyte defaults"):
         return
+    # Confinement is the exception: it starts from the preset and is then
+    # measured from the curve, which is what should happen.
+    check("confinement starts from the cell type",
+          app_module.CELL_TYPES["Cardiomyocyte"]["confinement"] == 1.10)
+    check("and is then measured from the curve",
+          (app.session_state["confinement_scan"] or {}).get("success") is True)
     for key, want in (("cell_height_um", 19.0), ("radius_aspect", 0.50),
-                      ("membrane_thickness_nm", 8.0), ("confinement", 1.30)):
+                      ("membrane_thickness_nm", 8.0)):
         check(f"{key} reaches the page as {want}",
               app.session_state[key] == want, str(app.session_state[key]))
     check("the shape selector is set", app.session_state["cell_shape"].startswith("Belt"))
@@ -2862,6 +3222,13 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_the_fit_never_softens,
+        case_weighting_decides_where_the_fit_is_good,
+        case_the_whole_range_is_used_and_fits,
+        case_real_vcm_curves_start_near_three_halves,
+        case_the_range_is_picked_and_a_bad_contact_is_found,
+        case_named_hypotheses_are_compared,
+        case_springs_are_round_and_the_balloon_exists,
         case_switching_cell_type_and_back_changes_nothing,
         case_no_nucleus_wording_for_a_cardiomyocyte,
         case_components_are_recommended,
