@@ -11,9 +11,46 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "/root/AFM_cell_analyzer")
+# Everything here is found relative to this file, never by absolute path.
+# A hard-coded "/root/..." works on exactly one machine, and when this file
+# is copied somewhere else it fails with a traceback that names a directory
+# the reader has never heard of.
+HERE = pathlib.Path(__file__).resolve().parent
+APP = str(HERE / "app.py")
+
+sys.path.insert(0, str(HERE))
 from streamlit.testing.v1 import AppTest  # noqa: E402
 from lulevich_model import LulevichModel  # noqa: E402
+
+
+def _refuse_to_be_the_app():
+    """Say so plainly if this file is deployed as the Streamlit app.
+
+    Four files travel together and they are easy to mix up when saving
+    them. Deployed under the name app.py, this one used to fail somewhere
+    deep in the standard library with a traceback that named neither file,
+    which is a long way to go to be told the wrong file was copied.
+    """
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # pragma: no cover - streamlit not installed
+        return
+    if get_script_run_ctx() is None:
+        return
+    st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
+    st.error(
+        "**This is `tests_app_ui.py`, the test suite, not the app.**\n\n"
+        "It has been deployed under the app's name. Copy the real `app.py` "
+        "over it, keep `lulevich_model.py`, `plot_utils.py` and this file "
+        "beside it under their own names, and reboot.\n\n"
+        "Nothing is broken: the four files simply got mixed up on the way "
+        "into the repository."
+    )
+    st.stop()
+
+
+_refuse_to_be_the_app()
 
 # Label -> the argument the model takes, mirroring app.py.
 MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
@@ -39,7 +76,7 @@ def load(app, eps, force):
 
 
 def start(**state):
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
+    app = AppTest.from_file(APP, default_timeout=180)
     app.run()
     eps, force = synthetic()
     load(app, eps, force)
@@ -145,7 +182,7 @@ def table_with(app, *columns):
     return None
 
 
-SOURCE = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+SOURCE = pathlib.Path(APP).read_text()
 
 def app_module_terms():
     """The materials the current cell type is fitted with."""
@@ -477,7 +514,7 @@ def case_a_half_updated_deploy_says_so():
     import shutil
     import tempfile
 
-    here = pathlib.Path("/root/AFM_cell_analyzer")
+    here = HERE
     # A deploy that picked up app.py but left an older plot_utils.py behind.
     # This used to die on the import line, and Streamlit Cloud shows that as
     # a truncated traceback with the reason cut out: the one thing the person
@@ -560,7 +597,7 @@ def case_fit_survives_a_rerun():
 
 def case_database_section_without_a_fit():
     print("the database section is reachable before any fit")
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=180)
+    app = AppTest.from_file(APP, default_timeout=180)
     app.run()
     eps, force = synthetic()
     load(app, eps, force)
@@ -678,7 +715,30 @@ def case_clear_cell_wins_over_dark_debris():
 
 def case_all_three_moduli_always_reported():
     print("all three moduli appear even when a term is not in the model")
-    app = start(use_nucleus=False, use_interior=False)
+    # Switched off after the curve has been read, because the app picks the
+    # materials for you when a curve loads and would simply turn them back
+    # on. What is being tested is the reporting, not the picking.
+    app = start()
+    if not no_exception(app, "loaded"):
+        return
+    # Unticked through the widgets, the way a person does it, and refitted
+    # with them off: the tiles report the fit rather than the checkboxes, so
+    # a tile that changed the moment a box was unticked would be claiming a
+    # fit that had not happened.
+    import app as app_module
+    names = app_module.components_for("Myoblast (C2C12)")
+    # One widget interaction per run: AppTest applies the last one only, so
+    # unticking three boxes in one pass silently leaves two ticked.
+    for term in ("interior", "nucleus", "nucleus_shell"):
+        box = next(
+            (c for c in app.checkbox
+             if (c.label or "").startswith(names[term][0])), None
+        )
+        if box is not None:
+            box.uncheck().run()
+    fit_button = button_by_label(app, "Fit curve")
+    if fit_button is not None:
+        fit_button.click().run()
     if not no_exception(app, "membrane only"):
         return
     labels = [m.label for m in app.get("metric")]
@@ -928,23 +988,32 @@ def case_range_table_shows_zero_moduli():
     check("the range table is on the page in full control", target is not None)
     if target is None:
         return
+    # One stiffness column per material the cell type is fitted with,
+    # headed by that material's own symbol and name.
     import app as app_module
-    deep = "E " + app_module.plain_name("nucleus", "Myoblast (C2C12)").lower()
-    for column in ("E membrane", "E cytoskeleton", deep):
-        check(f"{column} column present", column in target.columns,
+    here = app_module.terms_for("Myoblast (C2C12)")
+    columns = {
+        term: f"{app_module.TERM_SYMBOLS[term]} "
+              f"{app_module.plain_name(term, 'Myoblast (C2C12)').lower()}"
+        for term in here
+    }
+    for term, column in columns.items():
+        check(f"{term} has a stiffness column", column in target.columns,
               str(list(target.columns)))
-    if deep not in target.columns:
+    if not set(columns.values()) <= set(target.columns):
         return
     first = target.iloc[0]
     check("the first range carries only the membrane",
-          first["E cytoskeleton"].startswith("0")
-          and first[deep].startswith("0"),
-          f"{first['E cytoskeleton']!r} {first[deep]!r}")
+          all(first[columns[term]].startswith("0")
+              for term in here if term != "membrane"),
+          str({t: first[columns[t]] for t in here}))
     check("and the membrane is non-zero there",
-          not first["E membrane"].startswith("0 "), str(first["E membrane"]))
+          not first[columns["membrane"]].startswith("0 "),
+          str(first[columns["membrane"]]))
     last = target.iloc[-1]
     check("the last range carries what is inside the nucleus",
-          not last[deep].startswith("0 "), str(last[deep]))
+          not last[columns["nucleus"]].startswith("0 "),
+          str(last[columns["nucleus"]]))
 
 
 def case_plot_options_are_under_the_plot():
@@ -1319,10 +1388,9 @@ def case_not_reached_is_explained():
         return
     captions = " ".join(str(c.value) for c in app.get("caption"))
     check("the wording is explained",
-          "have not met it yet" in captions or "not been squashed far enough"
-          in captions, captions[:200])
-    check("it says this is not missing data",
-          "not missing data" in captions, "explanation absent")
+          "not reached" in captions, captions[-300:])
+    check("and says a zero there is a real zero, not a gap",
+          "contributes exactly zero" in captions, captions[:200])
 
 
 def case_fit_statistics():
@@ -1477,18 +1545,21 @@ def case_guided_order_follows_the_work():
     order = " | ".join(headings)
     # Range first, because it decides which points the rest is about, then
     # the parts and how they share the load, then the fit.
-    check("Step 1 is the range",
-          any("Step 1 · How far" in h for h in headings), order)
-    check("Step 2 covers the materials",
-          any("Step 2 · Which materials" in h for h in headings), order)
-    check("Step 3 works it out",
-          any("Step 3 · Fit" in h for h in headings), order)
+    # Choices first, in one place and made once; then the fit; then
+    # everything the fit produced.
+    check("step 1 is what to fit",
+          any("1 · What to fit" in h for h in headings), order)
+    check("step 2 is the fit itself",
+          any("2 · Fit" in h for h in headings), order)
     positions = [
         next(i for i, h in enumerate(headings) if key in h)
-        for key in ("Step 1 ·", "Step 2 ·", "Step 3 ·")
+        for key in ("1 · What to fit", "2 · Fit")
     ]
     check("and they are in that order", positions == sorted(positions),
           str(positions))
+    check("the results come after both",
+          all(positions[-1] < i for i, h in enumerate(headings)
+              if "turned out to be" in h), order)
     check("no expander labels are raw markdown",
           not any((e.label or "").startswith("#") for e in app.get("expander")),
           str([e.label for e in app.get("expander")]))
@@ -1507,7 +1578,8 @@ def case_guided_order_follows_the_work():
         check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
 
     # Unticking a part must disable the button rather than fail later.
-    for term in ("membrane", "interior", "nucleus"):
+    import app as app_module
+    for term in app_module.terms_for("Myoblast (C2C12)"):
         app.session_state[f"use_{term}"] = False
     app.run()
     if no_exception(app, "no parts selected"):
@@ -1627,14 +1699,15 @@ def case_guided_range_is_settable():
     app = start(cell_name="cell-01")
     if not no_exception(app, "guided range"):
         return
-    slider = widget_by_label(app, "slider", "Analyse from")
+    slider = widget_by_label(app, "slider", "up to")
     check("a range slider sits before the button", slider is not None,
           str([s.label for s in app.slider]))
     if slider is None:
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("it is its own step",
-          "How far into the squash" in text, text[:150])
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("it is labelled",
+          "How far into the squash" in captions, captions[:200])
 
     slider.set_value(0.35).run()
     if not no_exception(app, "narrowed range"):
@@ -2156,9 +2229,8 @@ def case_sharing_controls_sit_with_the_parts():
         str(m.value).strip() for m in app.get("markdown")
         if str(m.value).strip().startswith("####")
     ]
-    check("Step 2 covers the materials",
-          any("Which materials carry the load" in h for h in headings),
-          str(headings))
+    check("the materials and the range are chosen in one place",
+          any("1 · What to fit" in h for h in headings), str(headings))
 
     radios = [r.label for r in app.get("radio")]
     for wanted in ("How the cell is modelled", "After ε₁ the membrane…",
@@ -2250,9 +2322,12 @@ def case_the_curve_comes_first():
 
     # The curve is drawn into a container staked out before the settings,
     # so it appears above them however far down the code that builds it is.
-    check("a slot is reserved for the curve before the model section",
+    # The plot is staked out after the choices, so the page reads choose,
+    # fit, look rather than look, scroll, choose.
+    check("the curve is staked out after the choices",
           source.index("curve_slot = st.container()")
-          < source.index('section("3 · Model")'), "curve_slot is too late")
+          > source.index('st.markdown("#### 1 · What to fit")'),
+          "curve_slot is too early")
     check("and the plot is drawn into it",
           "plot_col = curve_slot" in source)
     check("the diagram goes with the question it answers, not beside the plot",
@@ -2261,11 +2336,12 @@ def case_the_curve_comes_first():
     check("and the video frame goes under the curve",
           "video_target = video_slot" in source)
 
-    check("there is a fit button beside the curve",
-          button_by_label(app, "Fit this curve") is not None,
+    check("the fit button sits with the choices",
+          button_by_label(app, "Fit this cell") is not None,
           str([b.label for b in app.button]))
-    check("and it is the same fit, not a second one",
-          '_fit_from_curve' in source)
+    check("and there is exactly one fit button in guided mode",
+          source.count('"🔬 Fit this cell"') == 1,
+          str(source.count('"🔬 Fit this cell"')))
 
     # Explore the curve is gone from the guided flow.
     labels = [e.label or "" for e in app.get("expander")]
@@ -3051,14 +3127,15 @@ def case_components_are_recommended():
         return
     picked = app.session_state["component_search"]
     check("the search ran with the button", picked and picked.get("success"))
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the recommendation is on the page, under its own heading",
-          "Recommended components" in text, text[:200])
-    said = " ".join(
-        [str(x.value) for x in app.get("success")]
-        + [str(x.value) for x in app.get("info")]
-    )
-    check("and it is stated in words", "Use " in said, said[:200])
+    # It is a caption now, not a section: advice beside the choices rather
+    # than a heading to scroll past.
+    said = " ".join(str(c.value) for c in app.get("caption"))
+    check("the recommendation is on the page",
+          "Materials this curve can see" in said, said[-400:])
+    check("and the picture chosen can be changed by hand",
+          any("Which picture of the cell" in (r.label or "")
+              for r in app.get("radio")),
+          str([r.label for r in app.get("radio")]))
 
 
 def case_a_model_that_cannot_carry_a_term_says_so():
@@ -3227,12 +3304,21 @@ def case_cardiomyocyte_defaults_match_the_experiment():
     import app as app_module
     preset = app_module.CELL_TYPES["Cardiomyocyte"]
     check("19 um tall", preset["cell_height_um"] == 19.0)
-    check("a rod lying down, so the radius is half the height",
-          preset["radius_aspect"] == 0.50)
-    check("membrane plus its protein coat, 8 nm",
-          preset["membrane_thickness_nm"] == 8.0)
-    check("shaped as a belt cylinder",
-          preset["cell_shape"].startswith("Belt"))
+    # Everything shared with a myoblast is shared. A parameter invented for
+    # one cell type is a difference that turns up in the answer and cannot
+    # be traced back, so the only ones that differ are the two that really
+    # do: the cell is taller and the sarcolemma is twice a bare bilayer.
+    myoblast = app_module.CELL_TYPES["Myoblast (C2C12)"]
+    for key in ("radius_aspect", "nucleus_fraction", "nucleus_onset",
+                "cell_shape"):
+        check(f"{key} is the same as a myoblast's",
+              preset[key] == myoblast[key],
+              f"{preset[key]!r} against {myoblast[key]!r}")
+    check("the sarcolemma is twice a bare bilayer",
+          preset["membrane_thickness_nm"]
+          == 2 * myoblast["membrane_thickness_nm"],
+          f"{preset['membrane_thickness_nm']} against "
+          f"{myoblast['membrane_thickness_nm']}")
     check("and confined, not free", preset["confinement"] > 1.0)
     check("at roughly what four corrected WT curves measured",
           0.9 <= preset["confinement"] <= 1.4, str(preset["confinement"]))
@@ -3248,11 +3334,10 @@ def case_cardiomyocyte_defaults_match_the_experiment():
           app_module.CELL_TYPES["Cardiomyocyte"]["confinement"] == 1.10)
     check("and is then measured from the curve",
           (app.session_state["confinement_scan"] or {}).get("success") is True)
-    for key, want in (("cell_height_um", 19.0), ("radius_aspect", 0.50),
+    for key, want in (("cell_height_um", 19.0), ("radius_aspect", 0.55),
                       ("membrane_thickness_nm", 8.0)):
         check(f"{key} reaches the page as {want}",
               app.session_state[key] == want, str(app.session_state[key]))
-    check("the shape selector is set", app.session_state["cell_shape"].startswith("Belt"))
     check("the approach speed is recorded",
           app.session_state["approach_speed_um_s"] == 2.0)
     check("and there is somewhere to put the probe diameter",
@@ -3670,7 +3755,7 @@ def case_q_and_the_boundaries_are_searched_together():
 
 def case_one_fitting_routine():
     print("what loads and what the button does are the same routine")
-    source = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+    source = pathlib.Path(APP).read_text()
     check("there is one routine", source.count("def analyse_curve(") == 1)
     check("and both paths call it", source.count("analyse_curve(") == 3,
           str(source.count("analyse_curve(")))
@@ -3684,7 +3769,7 @@ def case_one_fitting_routine():
         check("the VCM reference curves are in the repository", False)
         return
     eps, force = curves[11]
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=900)
+    app = AppTest.from_file(APP, default_timeout=900)
     app.run()
     app.session_state["cell_type"] = "Cardiomyocyte"
     app.session_state["cell_name"] = "vcm-11"
@@ -3727,8 +3812,8 @@ def case_one_fitting_routine():
     table = table_with(app, "Picture of the cell", "Predicts held-out points")
     check("the pictures compared are on the page", table is not None)
     if table is not None:
-        check("one of them is marked chosen",
-              any("chosen" in str(v) for v in table["Verdict"]),
+        check("one of them is marked best",
+              any("best" in str(v) for v in table["Verdict"]),
               str(list(table["Verdict"])))
 
 
@@ -3854,7 +3939,7 @@ def case_the_myoblast_nucleus_reaches_the_page():
     rng = np.random.default_rng(0)
     force = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
 
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=900)
+    app = AppTest.from_file(APP, default_timeout=900)
     app.run()
     app.session_state["cell_name"] = "myo-nucleus"
     app.session_state["data"] = {
@@ -4013,7 +4098,7 @@ def case_the_cardiomyocyte_curves_fit_better_with_four():
         return
     import app as app_module
     for n, (eps, force) in curves.items():
-        app = AppTest.from_file("/root/AFM_cell_analyzer/app.py",
+        app = AppTest.from_file(APP,
                                 default_timeout=900)
         app.run()
         app.session_state["cell_type"] = "Cardiomyocyte"
@@ -4416,7 +4501,7 @@ def case_ordering_reads_the_real_cardiomyocytes():
 
 def case_balloon_and_spring_tab_answers_by_itself():
     print("the Balloon and spring tab answers without being asked twice")
-    source = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+    source = pathlib.Path(APP).read_text()
     check("the tab exists on the bar", "🎈 Balloon and spring" in source)
     check("the hidden-tab indices were moved with it",
           "((3, SHOW_VIDEO_TAB), (5, SHOW_DATABASE_TAB))" in source)
@@ -4428,7 +4513,7 @@ def case_balloon_and_spring_tab_answers_by_itself():
         check("the VCM reference curves are in the repository", False)
         return
     eps, force = curves[11]
-    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=600)
+    app = AppTest.from_file(APP, default_timeout=600)
     app.run()
     app.session_state["cell_type"] = "Cardiomyocyte"
     app.session_state["data"] = {
