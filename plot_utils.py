@@ -177,6 +177,8 @@ def force_curve_figure(
     membrane_N=None,
     interior_N=None,
     nucleus_N=None,
+    nucleus_shell_N=None,
+    deep_label="deep",
     fit_window=None,
     rupture_epsilon=None,
     highlight=None,
@@ -253,28 +255,34 @@ def force_curve_figure(
                 hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
+        # Every "how high does this reach" label is collected first and
+        # placed together, because several of them land within a few pixels
+        # of each other at the right-hand end and a stack of overlapping
+        # labels is no more readable than none at all.
+        height_labels = []
         if style.show_component_heights and fy.size:
             finite = np.isfinite(fy)
             if finite.any():
                 end = int(np.max(np.flatnonzero(finite)))
                 where = annotation_y(fy[end])
                 if where is not None:
-                    fig.add_annotation(
-                        x=float(fx[end]), y=where,
-                        text=f"<b>{fy[end]:.3g} {unit_label}</b>",
-                        showarrow=False, xanchor="left", yanchor="middle",
-                        xshift=6,
-                        font=dict(
-                            size=max(10, style.tick_size - 6),
-                            color=style.fit_color, family=REGULAR_FAMILY,
-                        ),
-                    )
+                    # Anchored inside the axes, not off the right-hand end
+                    # of them. Hung outside with xanchor="left" every one of
+                    # these labels was clipped by the plot area, so ticking
+                    # the box appeared to do nothing at all.
+                    height_labels.append((
+                        float(fx[end]), where,
+                        f"<b>{fy[end]:.3g} {unit_label}</b>", style.fit_color,
+                    ))
 
         if style.show_components:
             for comp, label, dash, color in (
                 (membrane_N, "· membrane contribution", "dash", "#2ca02c"),
                 (interior_N, "· cytoskeleton contribution", "dot", "#9467bd"),
-                (nucleus_N, "· nucleus contribution", "dashdot", "#e377c2"),
+                (nucleus_shell_N, "· nuclear envelope contribution",
+                 "longdash", "#6c3483"),
+                (nucleus_N, f"· {deep_label} contribution", "dashdot",
+                 "#e377c2"),
             ):
                 if comp is None or not np.any(np.asarray(comp)):
                     continue
@@ -302,16 +310,50 @@ def force_curve_figure(
                         end = int(np.max(np.flatnonzero(finite)))
                         where = annotation_y(cy[end])
                         if where is not None:
-                            fig.add_annotation(
-                                x=float(cx[end]), y=where,
-                                text=f"<b>{cy[end]:.3g} {unit_label}</b>",
-                                showarrow=False,
-                                xanchor="left", yanchor="middle", xshift=6,
-                                font=dict(
-                                    size=max(10, style.tick_size - 6),
-                                    color=color, family=REGULAR_FAMILY,
-                                ),
-                            )
+                            height_labels.append((
+                                float(cx[end]), where,
+                                f"<b>{cy[end]:.3g} {unit_label}</b>", color,
+                            ))
+
+        if height_labels:
+            # Push them apart in axis units, smallest first. On a log axis
+            # these are log10 values, so one rule serves both scales.
+            height_labels.sort(key=lambda row: row[1])
+            # The gap has to be a pixel height converted into axis units, not
+            # a fraction of the labels' own spread: four labels crowded into
+            # a tenth of the axis are still four labels on top of each other.
+            visible = np.asarray(
+                [v for v in np.concatenate([y, fy]) if np.isfinite(v)],
+                dtype=float,
+            )
+            if log_mode:
+                visible = visible[visible > 0]
+                axis_span = (
+                    float(np.log10(visible.max()) - np.log10(visible.min()))
+                    if visible.size else 1.0
+                )
+            else:
+                axis_span = (
+                    float(visible.max() - visible.min()) if visible.size else 1.0
+                )
+            plot_px = max(140.0, float(style.height) - 150.0)
+            label_px = max(18.0, style.tick_size + 8.0)
+            gap = axis_span * label_px / plot_px if axis_span > 0 else 0.0
+            placed, last = [], None
+            for x, y, text, colour in height_labels:
+                if last is not None and y - last < gap:
+                    y = last + gap
+                placed.append((x, y, text, colour))
+                last = y
+            for x, y, text, colour in placed:
+                fig.add_annotation(
+                    x=x, y=y, text=text, showarrow=False,
+                    xanchor="right", yanchor="middle", xshift=-4,
+                    bgcolor="rgba(255,255,255,0.82)",
+                    bordercolor=colour, borderwidth=1, borderpad=2,
+                    font=dict(size=max(10, style.tick_size - 6),
+                              color=colour, family=REGULAR_FAMILY),
+                )
 
     if fit_window is not None and style.show_fit_window and not log_mode:
         # Accept a single (lo, hi) or a list of windows, each optionally
@@ -516,6 +558,7 @@ DEFAULT_PART_NAMES = {
     "tension": ("In-plane spring", ""),
     "membrane": ("Membrane", ""),
     "interior": ("Cytoskeleton", ""),
+    "nucleus_shell": ("Nuclear envelope", ""),
     "nucleus": ("Deep element", ""),
 }
 
@@ -619,8 +662,10 @@ def cell_schematic(
     Em_MPa=None,
     Ei_kPa=None,
     En_kPa=None,
+    Ene_MPa=None,
     T0_mN_m=None,
     show_nucleus=True,
+    show_nucleus_shell=False,
     show_tension=False,
     height=None,
     coupling="parallel",
@@ -660,10 +705,15 @@ def cell_schematic(
     # The two membrane springs share a hue: they are one piece of material
     # answering two ways, and colouring them as unrelated parts would say the
     # opposite of what the model means.
+    # The two membrane springs share a hue, and so do the two nucleus
+    # springs: each pair is one piece of the cell answering two ways, and
+    # colouring them as unrelated parts would say the opposite.
     COLORS = {"tension": "#5dade2", "membrane": "#1f77b4",
-              "interior": "#e67e22", "nucleus": "#8e44ad"}
+              "interior": "#e67e22", "nucleus_shell": "#6c3483",
+              "nucleus": "#8e44ad"}
     FADED = {"tension": "#bcdcf0", "membrane": "#a9c4d8",
-             "interior": "#f2cda6", "nucleus": "#c9b0d8"}
+             "interior": "#f2cda6", "nucleus_shell": "#b9a2c9",
+             "nucleus": "#c9b0d8"}
 
     # What each element is doing at the deformation on display.
     if break_1 is not None and break_2 is not None:
@@ -678,6 +728,9 @@ def cell_schematic(
         else:
             state = {"membrane": membrane_above, "interior": "loading",
                      "nucleus": "loading"}
+        # The envelope and what it contains are the same body, met at the
+        # same moment, so they do the same thing at every deformation.
+        state["nucleus_shell"] = state["nucleus"]
         # The taut network is the same shell as the elastic term, so it does
         # exactly what that one does, including going slack together with it.
         state["tension"] = state["membrane"]
@@ -685,6 +738,7 @@ def cell_schematic(
             "tension": 0.0,
             "membrane": 0.0,
             "interior": 0.0 if cyto_start == "zero" else break_1,
+            "nucleus_shell": break_2,
             "nucleus": break_2,
         }
     else:
@@ -694,16 +748,18 @@ def cell_schematic(
     terms = (
         (["tension"] if show_tension else [])
         + ["membrane", "interior"]
+        + (["nucleus_shell"] if show_nucleus_shell else [])
         + (["nucleus"] if show_nucleus else [])
     )
     moduli = {
         "tension": (T0_mN_m, "mN/m", "T<sub>0</sub>"),
         "membrane": (Em_MPa, "MPa", "E<sub>m</sub>"),
         "interior": (Ei_kPa, "kPa", "E<sub>c</sub>"),
+        "nucleus_shell": (Ene_MPa, "MPa", "E<sub>ne</sub>"),
         "nucleus": (En_kPa, "kPa", "E<sub>n</sub>"),
     }
-    LAW = {"tension": "ε", "membrane": "ε³",
-           "interior": "ε³ᐟ²", "nucleus": "ε³ᐟ²"}
+    LAW = {"tension": "ε", "membrane": "ε³", "interior": "ε³ᐟ²",
+           "nucleus_shell": "ε³", "nucleus": "ε³ᐟ²"}
 
     fig = go.Figure()
     GROUND_Y, PLATEN_Y = 20.0, 78.0
@@ -760,7 +816,10 @@ def cell_schematic(
 
     # How wide a caption may be, and how far it may drop, both follow from
     # how many elements have to share the width.
-    caption_limit = 22 if len(terms) < 3 else (16 if len(terms) == 3 else 13)
+    caption_limit = (
+        22 if len(terms) < 3 else 16 if len(terms) == 3
+        else 13 if len(terms) == 4 else 11
+    )
 
     def draw_element(term, x, y_bottom, y_top, width, row=0):
         """One spring, with a gap or a lock when the model says so."""
@@ -849,7 +908,7 @@ def cell_schematic(
             # a coil needs amplitude to read as a coil. The room comes from
             # the spacing instead.
             draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
-                         10 if len(terms) < 4 else 8,
+                         10 if len(terms) < 4 else 8 if len(terms) == 4 else 7,
                          row=index % 2 if len(terms) > 2 else 0)
         subtitle = "Side by side: same squash on each, forces add"
 
@@ -882,6 +941,7 @@ def balloon_figure(
     cell_height_um=8.0,
     labels=None,
     show_nucleus=True,
+    show_nucleus_shell=False,
     show_tension=False,
     deep_onset=None,
     interior="spring",
@@ -912,6 +972,10 @@ def balloon_figure(
     """
     names = dict(DEFAULT_PART_NAMES, **(labels or {}))
     eps = float(np.clip(epsilon, 0.0, 0.9))
+    # ``show_nucleus`` asks for the filling, ``show_nucleus_shell`` for the
+    # envelope around it. Either one on means there is a nucleus to draw.
+    show_nucleus_inside = bool(show_nucleus)
+    show_nucleus = bool(show_nucleus) or bool(show_nucleus_shell)
     fig = go.Figure()
 
     GROUND_Y, CEILING = 12.0, 86.0
@@ -921,7 +985,7 @@ def balloon_figure(
     width = max(
         0.0, (np.pi * R0 ** 2 - np.pi * half_height ** 2) / (2 * 2 * half_height)
     )
-    centre_y = GROUND_Y + 14.0 + half_height
+    centre_y = GROUND_Y + 17.0 + half_height
     centre_x = 50.0
 
     # ---- the plates
@@ -976,11 +1040,22 @@ def balloon_figure(
     else:
         inner_bottom = centre_y - half_height + 3.0
         inner_top = centre_y + half_height - 3.0
-        xs, ys = _zigzag(centre_x, inner_bottom, inner_top, 15.0)
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
-            line=dict(color="#e67e22", width=5, shape="spline"),
-        ))
+        # With a nucleus drawn in the middle, the cytoskeleton is drawn as
+        # two coils flanking it rather than one through it. A spring drawn
+        # straight through the nucleus says the two are the same material,
+        # which is the one thing this picture exists to deny.
+        if show_nucleus:
+            offset = width * 0.55 + half_height * 0.45
+            columns = (centre_x - offset, centre_x + offset)
+            coil = 9.0
+        else:
+            columns, coil = (centre_x,), 15.0
+        for column in columns:
+            xs, ys = _zigzag(column, inner_bottom, inner_top, coil)
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+                line=dict(color="#e67e22", width=5, shape="spline"),
+            ))
 
     # ---- the deeper element, met only once the plates get down to it
     if show_nucleus:
@@ -1001,21 +1076,58 @@ def balloon_figure(
                               dash="solid" if reached else "dot"),
                 ))
         else:
-            deep_h = min(7.0, half_height * 0.45)
-            fig.add_shape(
-                type="circle",
-                x0=centre_x - deep_h * 1.6, x1=centre_x + deep_h * 1.6,
-                y0=centre_y - deep_h, y1=centre_y + deep_h,
-                fillcolor="rgba(142, 68, 173, 0.55)" if reached
-                else "rgba(201, 176, 216, 0.30)",
-                line=dict(color=colour, width=4,
-                          dash="solid" if reached else "dot"),
+            # The nucleus is a balloon inside the balloon: its own skin
+            # around its own filling, and it is squashed by the same
+            # deformation, so it is drawn shorter and wider exactly as the
+            # cell is. A circle said it was a rigid bead; this says what the
+            # model now says, an envelope in e^3 around a Hertzian filling.
+            n_R0 = R0 * 0.40
+            n_half = max(2.5, min(n_R0 * (1.0 - eps), half_height - 4.0))
+            n_width = max(
+                0.0,
+                (np.pi * n_R0 ** 2 - np.pi * n_half ** 2) / (4.0 * n_half),
             )
+            n_width = min(n_width, max(0.0, width + half_height - n_half - 4.0))
+            n_angle = np.linspace(-np.pi / 2, np.pi / 2, 40)
+            n_right_x = centre_x + n_width + n_half * np.cos(n_angle)
+            n_right_y = centre_y + n_half * np.sin(n_angle)
+            n_left_x = centre_x - n_width - n_half * np.cos(n_angle)
+            n_left_y = centre_y - n_half * np.sin(n_angle)
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([n_right_x, n_left_x, n_right_x[:1]]),
+                y=np.concatenate([n_right_y, n_left_y, n_right_y[:1]]),
+                mode="lines", fill="toself", showlegend=False,
+                hoverinfo="skip",
+                fillcolor="rgba(142, 68, 173, 0.22)" if reached
+                else "rgba(201, 176, 216, 0.12)",
+                line=dict(color=strong if (reached and show_nucleus_shell)
+                          else colour,
+                          width=5 if show_nucleus_shell else 3,
+                          dash="solid" if reached else "dot"),
+            ))
+            if show_nucleus_inside and n_half > 4.0:
+                inner = _zigzag(
+                    centre_x, centre_y - n_half + 1.6,
+                    centre_y + n_half - 1.6, min(8.0, n_half * 0.9),
+                )
+                fig.add_trace(go.Scatter(
+                    x=inner[0], y=inner[1], mode="lines", showlegend=False,
+                    hoverinfo="skip",
+                    line=dict(color=strong if reached else faint, width=4,
+                              shape="spline"),
+                ))
+        # Two names for the two things, when the model carries both.
+        if interior == "fluid" or not (show_nucleus_shell and show_nucleus_inside):
+            deep_label = names["nucleus"][0] if not show_nucleus_shell \
+                else names["nucleus_shell"][0]
+        else:
+            deep_label = (f"{names['nucleus_shell'][0]}"
+                          f"<br>around {names['nucleus'][0].lower()}")
         fig.add_annotation(
-            x=centre_x, y=centre_y - half_height - 7,
-            text=f"<b>{names['nucleus'][0]}</b>"
+            x=centre_x, y=centre_y - half_height - 2.5,
+            text=f"<b>{deep_label}</b>"
                  + ("" if reached else "<br><i>not reached yet</i>"),
-            showarrow=False, font=dict(size=max(9, style.tick_size - 9),
+            showarrow=False, font=dict(size=max(9, style.tick_size - 10),
                                        color=colour),
             yanchor="top",
         )
