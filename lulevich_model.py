@@ -530,6 +530,7 @@ class _CouplingMixin:
             "nucleus_fraction_at_max": float("nan"),
             "nucleus_onset": self.nucleus_onset,
             "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "An_shell": self.An_shell, "h_envelope": self.h_envelope,
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An,
             "mask": mask,
@@ -764,6 +765,7 @@ class _SegmentedMixin:
             "nucleus_fraction_at_max": f_nuc / total if total > 0 else float("nan"),
             "nucleus_onset": e2,
             "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "An_shell": self.An_shell, "h_envelope": self.h_envelope,
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An,
             "mask": mask,
@@ -1191,7 +1193,9 @@ class _ExploreMixin:
 # one order
 # everywhere is what lets the design matrix, the tables and the schematic be
 # read against each other without translating.
-COMPOSITION_TERMS = ("tension", "membrane", "interior", "nucleus")
+COMPOSITION_TERMS = (
+    "tension", "membrane", "interior", "nucleus_shell", "nucleus",
+)
 
 COMPOSITIONS = [
     {
@@ -1484,10 +1488,11 @@ class _CompositionMixin:
 
         Four of them, and the exponents are what keep them apart:
 
-        ``tension``   At e              a taut protein network, horizontal spring
-        ``membrane``  Am e^3            elastic dilation of the same shell
-        ``interior``  Ai <e - s>^1.5    a network filling the cell
-        ``nucleus``   An <e - e2>^1.5   a stiffer layer reached deeper in
+        ``tension``       At e                   a taut protein network
+        ``membrane``      Am e^3                 dilation of the same shell
+        ``interior``      Ai <e - s>^1.5         a network filling the cell
+        ``nucleus_shell`` An_shell <e - e2>^3    the envelope around the nucleus
+        ``nucleus``       An <e - e2>^1.5        what the envelope contains
 
         A fit can only separate terms whose shapes differ. Two networks with
         the same exponent and the same onset are one term wearing two names,
@@ -1525,6 +1530,14 @@ class _CompositionMixin:
             "nucleus": (
                 self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5 * squeeze
             ),
+            # The nucleus as a balloon of its own: an envelope that resists
+            # being stretched, met at the same deformation as its contents
+            # and told apart from them by its exponent, exactly as the
+            # cell's membrane is told apart from its cytoskeleton.
+            "nucleus_shell": (
+                self.An_shell * np.clip(eps - float(e2), 0.0, None) ** 3
+                * squeeze
+            ),
         }
 
     def composition_curve(self, epsilon, fit):
@@ -1550,6 +1563,7 @@ class _CompositionMixin:
             ("tension", fit.get("T0", 0.0)),
             ("membrane", fit.get("Em", 0.0)),
             ("interior", fit.get("Ei", 0.0)),
+            ("nucleus_shell", fit.get("Ene", 0.0)),
             ("nucleus", fit.get("En", 0.0)),
         ):
             value = float(modulus or 0.0)
@@ -1616,6 +1630,7 @@ class _CompositionMixin:
         use_membrane=True,
         use_interior=True,
         use_tension=False,
+        use_nucleus_shell=False,
         fit_offset=False,
         with_stats=True,
     ):
@@ -1644,6 +1659,7 @@ class _CompositionMixin:
             "tension": bool(use_tension),
             "interior": bool(use_interior),
             "nucleus": bool(use_nucleus),
+            "nucleus_shell": bool(use_nucleus_shell),
         }
         n_params = sum(wanted.values()) + (1 if fit_offset else 0)
         if sum(wanted.values()) == 0:
@@ -1656,6 +1672,7 @@ class _CompositionMixin:
         t_basis = bases["tension"]
         c_basis = bases["interior"]
         n_basis = bases["nucleus"]
+        ne_basis = bases["nucleus_shell"]
         order = [name for name in COMPOSITION_TERMS if wanted[name]]
         columns = [bases[name] for name in order]
         if fit_offset:
@@ -1680,6 +1697,7 @@ class _CompositionMixin:
         T0 = values.get("tension", 0.0)
         Ec = values.get("interior", 0.0)
         En = values.get("nucleus", 0.0)
+        Ene = values.get("nucleus_shell", 0.0)
 
         # How badly the chosen terms imitate each other over this range. Two
         # nearly parallel columns still fit, but the split between them is
@@ -1703,7 +1721,8 @@ class _CompositionMixin:
                         worst_pair = (order[i], order[j])
 
         predicted = (
-            m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En + offset
+            m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En
+            + ne_basis * Ene + offset
         )
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
@@ -1767,8 +1786,10 @@ class _CompositionMixin:
             "use_membrane": bool(use_membrane),
             "use_interior": bool(use_interior),
             "use_tension": bool(use_tension),
-            "Em": Em, "Ei": Ec, "En": En, "T0": T0,
+            "Em": Em, "Ei": Ec, "En": En, "T0": T0, "Ene": Ene,
             "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
+            "Ene_MPa": Ene / 1e6,
+            "use_nucleus_shell": bool(use_nucleus_shell),
             "T0_mN_m": T0 * 1e3,
             "T0_as_modulus_kPa": (T0 / self.h_shell) / 1e3 if self.h_shell else float("nan"),
             # The same measurement read as shell bending instead. Same
@@ -1777,6 +1798,7 @@ class _CompositionMixin:
             "Em_MPa_std": errors.get("membrane", float("nan")) / 1e6,
             "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
             "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
+            "Ene_MPa_std": errors.get("nucleus_shell", float("nan")) / 1e6,
             "T0_mN_m_std": errors.get("tension", float("nan")) * 1e3,
             "force_offset": offset,
             "break_1": float(e1), "break_2": float(e2),
@@ -1809,11 +1831,12 @@ class _CompositionMixin:
                 name: (errors[name] / value if value > 0 else float("nan"))
                 for name, value in (
                     ("tension", T0), ("membrane", Em),
-                    ("interior", Ec), ("nucleus", En),
+                    ("interior", Ec), ("nucleus_shell", Ene), ("nucleus", En),
                 ) if name in errors
             },
             "nucleus_onset": float(e2),
             "R0": self.R0, "R_nucleus": self.R_nucleus,
+            "An_shell": self.An_shell, "h_envelope": self.h_envelope,
             "cell_height": self.cell_height,
             "Am": self.Am, "Ai": self.Ai, "An": self.An, "At": self.At,
             "h_shell": self.h_shell,
@@ -1821,7 +1844,7 @@ class _CompositionMixin:
             "warnings": self._identifiability_warnings(
                 {name: errors[name] / v for name, v in (
                     ("tension", T0), ("membrane", Em),
-                    ("interior", Ec), ("nucleus", En),
+                    ("interior", Ec), ("nucleus_shell", Ene), ("nucleus", En),
                 ) if name in errors and v > 0},
                 worst_pair, worst_corr,
             ),
@@ -1977,6 +2000,7 @@ class _CompositionMixin:
     def best_confinement_and_breaks(
         self, epsilon_min, epsilon_max, membrane="continue", cyto_start="zero",
         use_nucleus=True, use_tension=False, weighting="uniform", n_grid=6,
+        use_nucleus_shell=False,
     ):
         """
         Search q and the boundaries together, rather than one after the other.
@@ -2006,6 +2030,7 @@ class _CompositionMixin:
                     trial = self._best_breakpoints(
                         lo, hi, membrane, cyto_start, use_nucleus, weighting,
                         int(grid), int(rounds), use_tension=use_tension,
+                        use_nucleus_shell=use_nucleus_shell,
                     )
                     if trial is None or not trial.get("success"):
                         continue
@@ -2031,7 +2056,7 @@ class _CompositionMixin:
         self, epsilon_min, epsilon_max, e1=None, e2=None,
         membrane="continue", cyto_start="zero", use_nucleus=True,
         use_tension=False, weighting="uniform",
-        q_values=None, refine=True,
+        q_values=None, refine=True, use_nucleus_shell=False,
     ):
         """
         Find the confinement exponent q from the curve.
@@ -2060,7 +2085,8 @@ class _CompositionMixin:
                 self.confinement = float(q)
                 trial = self.fit_composition(
                     lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
-                    weighting, use_tension=use_tension, with_stats=False,
+                    weighting, use_tension=use_tension,
+                    use_nucleus_shell=use_nucleus_shell, with_stats=False,
                 )
                 if trial.get("success"):
                     rows.append({"q": float(q), "ss_res": trial["ss_res"],
@@ -2077,7 +2103,8 @@ class _CompositionMixin:
                     self.confinement = float(q)
                     trial = self.fit_composition(
                         lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
-                        weighting, use_tension=use_tension, with_stats=False,
+                        weighting, use_tension=use_tension,
+                        use_nucleus_shell=use_nucleus_shell, with_stats=False,
                     )
                     if trial.get("success"):
                         rows.append({"q": float(q), "ss_res": trial["ss_res"],
@@ -2204,7 +2231,7 @@ class _CompositionMixin:
 
     def _best_breakpoints(
         self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
-        rounds=2, use_tension=False, search_e2=None,
+        rounds=2, use_tension=False, search_e2=None, use_nucleus_shell=False,
     ):
         """
         The breakpoints that fit best for one composition.
@@ -2224,7 +2251,7 @@ class _CompositionMixin:
         # identical fits. One value, and the search is n_grid instead of
         # n_grid squared.
         if search_e2 is None:
-            search_e2 = bool(use_nucleus)
+            search_e2 = bool(use_nucleus) or bool(use_nucleus_shell)
         second = (
             np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
             if search_e2 else np.array([hi])
@@ -2238,7 +2265,8 @@ class _CompositionMixin:
                         continue
                     trial = self.fit_composition(
                         lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
-                        weighting, use_tension=use_tension, with_stats=False,
+                        weighting, use_tension=use_tension,
+                        use_nucleus_shell=use_nucleus_shell, with_stats=False,
                     )
                     if not trial.get("success"):
                         continue
@@ -2267,6 +2295,7 @@ class _CompositionMixin:
             best = self.fit_composition(
                 lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
                 use_nucleus, weighting, use_tension=use_tension,
+                use_nucleus_shell=use_nucleus_shell,
             )
         return best
 
@@ -2604,6 +2633,7 @@ class _CompositionMixin:
             poisson_interior=self.nu_i,
             nucleus_radius=self.R_nucleus,
             poisson_nucleus=self.nu_n,
+            envelope_thickness=self.h_envelope,
             nucleus_onset=self.nucleus_onset,
             segment_break_1=self.segment_break_1,
             segment_break_2=self.segment_break_2,
@@ -2630,6 +2660,7 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         nucleus_radius=None,
         nucleus_from_radius=0.35,
         poisson_nucleus=0.5,
+        envelope_thickness=40e-9,
         nucleus_onset=0.15,
         sarcomere_length=2.1e-6,
         confinement=0.0,
@@ -2730,6 +2761,11 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             raise ValueError("cell_radius must be positive")
 
         self.nu_n = float(poisson_nucleus)
+        # The nuclear envelope: two membranes and the lamina under them,
+        # tens of nanometres rather than the 4 nm of a bare bilayer. It is
+        # the shell of the balloon the nucleus is, and the reason a nucleus
+        # can be stiffer than what it contains.
+        self.h_envelope = float(envelope_thickness)
         self.R_nucleus = (
             float(nucleus_radius) if nucleus_radius else self.R0 * float(nucleus_from_radius)
         )
@@ -2914,6 +2950,27 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
             * np.sqrt(radius)
             * self.cell_height ** 1.5
             / (3.0 * (1.0 - self.nu_n ** 2))
+        )
+
+    @property
+    def An_shell(self):
+        """
+        Nuclear envelope prefactor: F = An_shell * E_ne * <e - e2>^3  [N/Pa].
+
+        The same shell law as the cell's own membrane, with the nucleus's
+        radius and the envelope's thickness in place of the cell's. A nucleus
+        met by the plates is a balloon inside a balloon: an envelope that
+        resists being stretched, around a filling that resists being
+        squeezed. Giving it only the Hertzian term said it was a lump of
+        jelly with no skin.
+
+        It is separable from the filling for the same reason the cell's
+        membrane is separable from its cytoskeleton, and only for that
+        reason: the two share an onset, so the exponents have to differ. They
+        do, 3 against 3/2.
+        """
+        return (
+            2.0 * np.pi * self.h_envelope * self.R_nucleus / (1.0 - self.nu_n)
         )
 
     def nucleus_model(self, epsilon, En, onset=None):
@@ -4025,6 +4082,7 @@ def compare_hypotheses(
             "use_interior": "interior" in terms,
             "use_nucleus": "nucleus" in terms,
             "use_tension": "tension" in terms,
+            "use_nucleus_shell": "nucleus_shell" in terms,
         }
         membrane = spec.get("membrane", "continue")
         cyto_start = spec.get("cyto_start", "zero")
@@ -4044,8 +4102,9 @@ def compare_hypotheses(
             q_here, _, _ = model.best_confinement_and_breaks(
                 lo, hi, membrane=membrane, cyto_start=cyto_start,
                 use_nucleus=flags["use_nucleus"],
-                use_tension=flags["use_tension"], weighting=weighting,
-                n_grid=max(5, int(n_grid) // 2),
+                use_tension=flags["use_tension"],
+                use_nucleus_shell=flags["use_nucleus_shell"],
+                weighting=weighting, n_grid=max(5, int(n_grid) // 2),
             )
             local = model._clone(force_all, eps_all)
             local.confinement = float(q_here)
@@ -4056,10 +4115,12 @@ def compare_hypotheses(
         # Leaving it at whatever the last fit happened to use made two of
         # these candidates carry a boundary chosen for a different question.
         needs_e1 = membrane != "continue" or cyto_start != "zero"
+        deep_here = flags["use_nucleus"] or flags["use_nucleus_shell"]
         best = local._best_breakpoints(
             lo, hi, membrane, cyto_start, flags["use_nucleus"], weighting,
             n_grid, refine_rounds, use_tension=flags["use_tension"],
-        ) if (flags["use_nucleus"] or needs_e1) else local.fit_composition(
+            use_nucleus_shell=flags["use_nucleus_shell"],
+        ) if (deep_here or needs_e1) else local.fit_composition(
             lo, hi, local.segment_break_1, local.segment_break_2,
             membrane, cyto_start, weighting=weighting, **flags
         )
@@ -4098,6 +4159,7 @@ def compare_hypotheses(
                     basis["membrane"] * trained["Em"]
                     + basis["tension"] * trained.get("T0", 0.0)
                     + basis["interior"] * trained["Ei"]
+                    + basis["nucleus_shell"] * trained.get("Ene", 0.0)
                     + basis["nucleus"] * trained["En"]
                     + trained.get("force_offset", 0.0)
                 )
@@ -4125,11 +4187,13 @@ def compare_hypotheses(
             "Em_MPa": whole["Em_MPa"],
             "Ec_kPa": whole["Ei_kPa"],
             "En_kPa": whole["En_kPa"],
+            "Ene_MPa": whole.get("Ene_MPa", 0.0),
             "empty": tuple(
                 t for t, v in (
                     ("tension", whole.get("T0_mN_m", 0.0)),
                     ("membrane", whole["Em_MPa"]),
                     ("interior", whole["Ei_kPa"]),
+                    ("nucleus_shell", whole.get("Ene_MPa", 0.0)),
                     ("nucleus", whole["En_kPa"]),
                 ) if t in terms and v <= 0
             ),
@@ -4360,6 +4424,7 @@ def recommend_components(
             "use_interior": "interior" in subset,
             "use_nucleus": "nucleus" in subset,
             "use_tension": "tension" in subset,
+            "use_nucleus_shell": "nucleus_shell" in subset,
         }
         whole = model.fit_composition(
             lo, hi, e1, e2, membrane, cyto_start, weighting=weighting, **flags
@@ -4389,6 +4454,7 @@ def recommend_components(
                     basis["membrane"] * trained["Em"]
                     + basis["tension"] * trained.get("T0", 0.0)
                     + basis["interior"] * trained["Ei"]
+                    + basis["nucleus_shell"] * trained.get("Ene", 0.0)
                     + basis["nucleus"] * trained["En"]
                     + trained.get("force_offset", 0.0)
                 )
