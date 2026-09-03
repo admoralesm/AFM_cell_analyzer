@@ -474,6 +474,10 @@ DEFAULTS = {
     "use_membrane": True,
     "use_interior": True,
     "use_nucleus": True,
+    # The nucleus is a balloon of its own: an envelope around a filling.
+    # Offered wherever there is a nucleus at all, and on by default there,
+    # because a nucleus without a skin is not a nucleus.
+    "use_nucleus_shell": True,
     # Only offered for cell types whose membrane is two springs, so off here
     # and switched on by the cell type's own defaults.
     "use_tension": False,
@@ -1181,13 +1185,25 @@ MATERIAL_LAWS = {
                      "curve starting near 1.7 means this and the shell "
                      "together",
     },
+    "nucleus_shell": {
+        "role": "the envelope around the nucleus: a shell resisting being "
+                "stretched, met only once the plates reach it",
+        "energy": "elastic energy in the envelope's area strain",
+        "law": "F = A_ne·E_ne·⟨ε − ε₂⟩³",
+        "exponent": "3",
+        "separable": "shares its onset with what it contains, so the "
+                     "exponents have to differ, and they do: 3 against 3/2, "
+                     "the same pairing as the cell's own membrane and "
+                     "cytoskeleton",
+    },
     "nucleus": {
-        "role": "a stiffer body the plates only reach deeper in",
+        "role": "what the envelope contains, squeezed like any elastic "
+                "filling once the plates reach it",
         "energy": "the same Hertzian contact, met later",
         "law": "F = A_n·E_n·⟨ε − ε₂⟩³ᐟ²",
         "exponent": "3/2",
-        "separable": "the same law as the interior, so **only** its onset ε₂ "
-                     "tells them apart: no onset, no separation",
+        "separable": "the same law as the cell's interior, so **only** its "
+                     "onset ε₂ tells them apart: no onset, no separation",
     },
 }
 
@@ -1227,6 +1243,9 @@ def materials_table(terms, membrane_mode="continue", cyto_start="zero",
                 "from first contact" if cyto_start == "zero"
                 else f"from ε₁ = {e1:.3f}" if e1 is not None else "from ε₁"
             )
+        elif term == "nucleus_shell":
+            when = (f"from ε₂ = {e2:.3f}, with what it contains"
+                    if e2 is not None else "from ε₂, with what it contains")
         else:
             when = f"from ε₂ = {e2:.3f}" if e2 is not None else "from ε₂"
         rows.append({
@@ -1816,13 +1835,15 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
 # ============================================================ cell presets ==
 
 TERM_SYMBOLS = {
-    "tension": "T₀", "membrane": "Eₘ", "interior": "Ec", "nucleus": "Eₙ",
+    "tension": "T₀", "membrane": "Eₘ", "interior": "Ec",
+    "nucleus_shell": "E_ne", "nucleus": "Eₙ",
 }
-# The three classic elements. The in-plane spring is a fourth, offered only
-# where a cell type calls for it, and deliberately not in this tuple: every
-# loop that walks the classic model must keep walking exactly three.
+# The three classic elements. The in-plane spring and the nuclear envelope
+# are extras, offered only where a cell type calls for them, and deliberately
+# not in this tuple: every loop that walks the classic model must keep
+# walking exactly three.
 TERM_ORDER = ("membrane", "interior", "nucleus")
-ALL_TERMS = ("tension", "membrane", "interior", "nucleus")
+ALL_TERMS = ("tension", "membrane", "interior", "nucleus_shell", "nucleus")
 
 
 def terms_for(cell_type):
@@ -1975,10 +1996,23 @@ STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 # as a strong shell around fluid that does not compress, so calling the second
 # term "cytoskeleton" and the third "nucleus" would misdescribe it.
 COMPONENT_SETS = {
+    # A myoblast's nucleus is a balloon inside a balloon. It has an envelope,
+    # two membranes and the lamina under them, and that envelope is a shell
+    # that resists being stretched exactly as the cell's own membrane does;
+    # what it contains resists being squeezed. Modelling the whole nucleus as
+    # one Hertzian lump said it was jelly with no skin, which is the one
+    # thing a nucleus is known not to be.
     "Myoblast (C2C12)": {
         "membrane": ("🫧 Membrane", "the skin around the cell"),
         "interior": ("🕸️ Cytoskeleton", "the scaffolding filling the cell"),
-        "nucleus": ("🔵 Nucleus", "the dense body at the centre"),
+        "nucleus_shell": (
+            "🔵 Nuclear envelope",
+            "the skin around the nucleus, stretched as it is squashed",
+        ),
+        "nucleus": (
+            "🟣 Inside the nucleus",
+            "what the envelope contains, squeezed like everything else",
+        ),
     },
     # A cardiomyocyte is modelled as a shell around one incompressible
     # interior, and that is three springs, not four.
@@ -2011,9 +2045,17 @@ COMPONENT_SETS = {
         # membrane protein is being tested: it is an in-plane spring, taut
         # from first contact, answering in proportion to ε where everything
         # else answers to a power of it.
+        # Never fitted: "nucleus" is not in this cell type's terms. It is
+        # named anyway so that no code path anywhere can fall back to the
+        # generic word and put "nucleus" on a cardiomyocyte's screen.
+        "nucleus": (
+            "🧵 Myofibrils",
+            "the contractile machinery, part of the one interior",
+        ),
         "tension": (
-            "↔️ Extra membrane protein",
-            "an in-plane spring: prestin, or anything taut in the membrane",
+            "↔️ Membrane spring protein",
+            "an in-plane spring in the membrane: prestin, or whichever "
+            "protein the knockout removes",
         ),
     },
 }
@@ -2029,16 +2071,21 @@ DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 # load in and whether the membrane carries an in-plane spring as well, which
 # are the two things an experiment can actually change.
 # What the sample is, which decides which pictures are worth testing.
+# What the sample is. The in-plane spring belongs to the wild-type membrane
+# and the experiment takes it away, so this is not a switch for adding a
+# term: it is which cell is on the stage.
 MEMBRANE_PROTEIN_STATES = {
     "Present (wild type)":
-        "The in-plane spring is expected. It is offered in every picture and "
-        "the fit is allowed to find it.",
-    "Deleted (knockout)":
-        "The in-plane spring is not offered at all. If the curve still needs "
-        "one, that is a result worth knowing rather than a term to fit away.",
+        "The spring is part of this membrane, so every picture carries it "
+        "and the fit measures its tension T₀.",
+    "Removed (knockout)":
+        "The spring has been taken out of the cell, so it is taken out of "
+        "the model: no picture is offered one. If the curve still needs a "
+        "term linear in ε, that is a result worth knowing rather than a "
+        "term to fit away.",
     "Not known — test for it":
         "Both are tried and the curve decides, which is the comparison that "
-        "tells you whether the protein is contributing mechanically.",
+        "says whether the spring is still contributing mechanically.",
 }
 
 
@@ -2098,15 +2145,45 @@ def cardiomyocyte_hypotheses(state="Not known — test for it"):
             "terms": ("tension", "membrane", "interior"), **coupled,
         },
     ]
-    if state.startswith("Deleted"):
+    if state.startswith("Removed") or state.startswith("Deleted"):
+        # The protein is not in the cell, so it is not in any picture of it.
         return base
     if state.startswith("Present"):
-        return withspring + base
+        # It is in the cell, so it is in every picture. Offering a
+        # spring-free picture alongside would be asking the curve whether
+        # the wild type is a knockout, which is not the question.
+        return withspring
     return [base[0], withspring[0], base[1], withspring[1]]
 
 
 HYPOTHESES = {
     "Myoblast (C2C12)": [
+        {
+            "key": "handover_with_envelope",
+            "label": "Membrane, then cytoskeleton, then the nucleus with its "
+                     "envelope",
+            "detail": "the nucleus is a balloon of its own, a skin around a "
+                      "filling",
+            "terms": ("membrane", "interior", "nucleus_shell", "nucleus"),
+            "membrane": "freeze", "cyto_start": "break",
+        },
+        {
+            "key": "coupled_with_envelope",
+            "label": "Membrane and cytoskeleton together, then the nucleus "
+                     "with its envelope",
+            "detail": "both load from first contact; the nucleus has a skin",
+            "terms": ("membrane", "interior", "nucleus_shell", "nucleus"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "envelope_only",
+            "label": "Membrane, then cytoskeleton, then the nuclear envelope "
+                     "alone",
+            "detail": "the plates feel the skin of the nucleus but not what "
+                      "is inside it",
+            "terms": ("membrane", "interior", "nucleus_shell"),
+            "membrane": "freeze", "cyto_start": "break",
+        },
         {
             "key": "handover",
             "label": "Membrane first, then cytoskeleton, then nucleus",
@@ -2158,17 +2235,30 @@ HAS_SARCOMERES = ("Cardiomyocyte",)
 # the cell uses the cell's own.
 DEEP_USES_CELL_RADIUS = ("Cardiomyocyte",)
 
-# Elements a cell type can be fitted with, in the order they are shown.
-# "tension" is offered but not assumed: see DEFAULT_TERMS_BY_TYPE.
-OPTIONAL_TERMS = {"Cardiomyocyte": ("membrane", "interior", "tension")}
+# Elements a cell type can be fitted with, in the order they are shown,
+# always outside inwards.
+OPTIONAL_TERMS = {
+    # The membrane's in-plane spring is part of a wild-type cardiomyocyte,
+    # not an extra bolted on: the experiment removes it. See
+    # MEMBRANE_PROTEIN_STATES.
+    "Cardiomyocyte": ("tension", "membrane", "interior"),
+    # The nucleus is two elements, an envelope and what it contains.
+    "Myoblast (C2C12)": ("membrane", "interior", "nucleus_shell", "nucleus"),
+    "Custom": ("membrane", "interior", "nucleus_shell", "nucleus"),
+}
 
-# Which of those are ticked when the cell type is chosen. The extra membrane
-# protein is off: a term nobody asked for is a term that quietly takes force
-# from the ones that were asked for, and the search can turn it on if the
-# curve wants it.
+# Which of those are ticked when the cell type is chosen.
 DEFAULT_TERMS_BY_TYPE = {
+    # A wild-type cardiomyocyte has the in-plane spring, so it is on. The
+    # knockout is the experiment that takes it away, and choosing that
+    # genotype in the sidebar is what removes it from the model.
     "Cardiomyocyte": {
-        "membrane": True, "interior": True, "nucleus": False, "tension": False,
+        "membrane": True, "interior": True, "nucleus": False,
+        "nucleus_shell": False, "tension": True,
+    },
+    "Myoblast (C2C12)": {
+        "membrane": True, "interior": True, "nucleus": True,
+        "nucleus_shell": True, "tension": False,
     },
 }
 
@@ -2320,7 +2410,8 @@ def apply_cell_type(name):
     # Every term, not only this cell type's, so one left switched on by the
     # previous cell type cannot survive the change.
     wanted = dict.fromkeys(ALL_TERMS, False)
-    wanted.update({"membrane": True, "interior": True, "nucleus": True})
+    wanted.update({"membrane": True, "interior": True, "nucleus": True,
+                   "nucleus_shell": True})
     wanted.update(DEFAULT_TERMS_BY_TYPE.get(name, {}))
     for term in ALL_TERMS:
         st.session_state[f"use_{term}"] = bool(
@@ -2347,12 +2438,20 @@ def apply_cell_type(name):
 def active_terms():
     """Terms currently switched on, always outermost first.
 
-    Walks every term the current cell type has, so a four-element cell type
-    reports its tension spring and a three-element one never can, whatever is
-    left behind in session state from an earlier cell.
+    Walks every term the current cell type has, so a cell type with an
+    in-plane spring reports it and one without never can, whatever is left
+    behind in session state from an earlier cell.
+
+    A knockout is enforced here rather than by unticking a box. The
+    experiment removed that protein from the cell, so the model must not
+    have it either, and a genotype is not something a stray tick should be
+    able to overrule.
     """
     available = terms_for(st.session_state.get("cell_type"))
-    return tuple(t for t in available if st.session_state.get(f"use_{t}", False))
+    on = tuple(t for t in available if st.session_state.get(f"use_{t}", False))
+    if str(st.session_state.get("membrane_protein", "")).startswith("Removed"):
+        on = tuple(t for t in on if t != "tension")
+    return on
 
 
 def stage_groups(terms):
@@ -2939,6 +3038,7 @@ def refit_stored_cell(store, cell_id, settings):
             use_interior="interior" in terms,
             use_nucleus="nucleus" in terms,
             use_tension="tension" in terms,
+            use_nucleus_shell="nucleus_shell" in terms,
             weighting=settings.get("weighting", "uniform"),
             fit_offset=bool(settings.get("fit_offset", False)),
         )
@@ -3138,15 +3238,16 @@ with st.sidebar:
         )
         if st.session_state["cell_type"] in HAS_SARCOMERES:
             st.selectbox(
-                "Membrane protein that acts as a horizontal spring",
+                "The membrane's in-plane spring protein",
                 list(MEMBRANE_PROTEIN_STATES),
                 key="membrane_protein",
-                help="Prestin, or whichever in-plane protein is being "
-                "tested. This decides which pictures of the cell are worth "
-                "comparing, so set it before loading the curve. A knockout "
-                "is not the same experiment as a wild type with the spring "
-                "fitted to zero: the first asks whether the curve needs one, "
-                "the second has already assumed it might.",
+                help="Prestin, or whichever membrane protein this experiment "
+                "removes. A wild-type membrane has it, so the model has it; "
+                "the knockout has had it taken out, so the model does not "
+                "offer one at all. That is not the same as fitting it and "
+                "getting zero: one asks whether the curve needs a spring, "
+                "the other has already assumed it might. Set this before "
+                "loading the curve.",
             )
             st.caption(MEMBRANE_PROTEIN_STATES[st.session_state["membrane_protein"]])
             st.number_input(
@@ -4090,11 +4191,10 @@ with tab_analysis:
                 st.caption("Change these in **Step 1** above.")
             else:
                 names = components_for(st.session_state["cell_type"])
-                symbols = {"tension": "T₀", "membrane": "Eₘ",
-                           "interior": "Ec", "nucleus": "Eₙ"}
                 for term in terms_for(st.session_state["cell_type"]):
                     st.checkbox(
-                        f"{names[term][0]} · {symbols[term]}", key=f"use_{term}"
+                        f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
+                        key=f"use_{term}",
                     )
 
         active = active_terms()
@@ -4245,6 +4345,7 @@ with tab_analysis:
                         cyto_start=cyto_mode,
                         labels=components_for(st.session_state["cell_type"]),
                         show_nucleus="nucleus" in active,
+                        show_nucleus_shell="nucleus_shell" in active,
                         show_tension="tension" in active,
                         height=330,
                     ),
@@ -5162,6 +5263,7 @@ with tab_analysis:
                         use_interior="interior" in active,
                         use_nucleus="nucleus" in active,
                         use_tension="tension" in active,
+                        use_nucleus_shell="nucleus_shell" in active,
                         weighting=st.session_state["weighting"],
                         fit_offset=st.session_state["fit_offset"],
                     )
@@ -5291,6 +5393,10 @@ with tab_analysis:
             T0_value = float(fit.get("T0", 0.0) or 0.0)
             if not np.isfinite(T0_value):
                 T0_value = 0.0
+            Ene_value = float(fit.get("Ene", 0.0) or 0.0)
+            if not np.isfinite(Ene_value):
+                Ene_value = 0.0
+            envelope = None
 
             if fitted_coupling == "segmented":
                 # Draw the components with the same basis the fit used, or the
@@ -5305,6 +5411,7 @@ with tab_analysis:
                     cyto_basis = basis["interior"]
                     nucleus_basis = basis["nucleus"]
                     tension_basis = basis["tension"]
+                    envelope_basis = basis["nucleus_shell"]
                 elif hasattr(model, "composition_terms"):
                     membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
                         epsilon, fit["break_1"], fit["break_2"],
@@ -5318,11 +5425,16 @@ with tab_analysis:
                     tension_basis * T0_value
                     if (tension_basis is not None and T0_value) else None
                 )
+                envelope = (
+                    envelope_basis * Ene_value
+                    if (envelope_basis is not None and Ene_value) else None
+                )
                 fitted = (
                     membrane_basis * params[0]
                     + cyto_basis * params[1]
                     + nucleus_basis * params[2]
                     + (tension if tension is not None else 0.0)
+                    + (envelope if envelope is not None else 0.0)
                     + fit.get("force_offset", 0.0)
                 )
                 membrane = membrane_basis * params[0]
@@ -5349,7 +5461,7 @@ with tab_analysis:
                 # In series every element carries the whole force, so there are
                 # no separate force curves to draw; what differs between them is
                 # how much of the deformation each one takes.
-                membrane = interior = nucleus = tension = None
+                membrane = interior = nucleus = tension = envelope = None
 
             # The model is only claimed over the range it was fitted on.
             # Drawn past that it is extrapolation, and a power law far outside
@@ -5372,6 +5484,7 @@ with tab_analysis:
             membrane = clip_to_window(membrane)
             interior = clip_to_window(interior)
             nucleus = clip_to_window(nucleus)
+            envelope = clip_to_window(envelope)
 
             deformation_shares = None
             if fitted_coupling in ("series", "hybrid"):
@@ -5795,7 +5908,8 @@ with tab_analysis:
                     share = {}
                     for term, curve in (
                         ("tension", tension), ("membrane", membrane),
-                        ("interior", interior), ("nucleus", nucleus),
+                        ("interior", interior), ("nucleus_shell", envelope),
+                        ("nucleus", nucleus),
                     ):
                         if curve is None:
                             share[term] = 0.0
@@ -5812,6 +5926,7 @@ with tab_analysis:
                         ("tension", "T0_mN_m", "mN/m"),
                         ("membrane", "Em_MPa", "MPa"),
                         ("interior", "Ei_kPa", "kPa"),
+                        ("nucleus_shell", "Ene_MPa", "MPa"),
                         ("nucleus", "En_kPa", "kPa"),
                     ):
                         if term not in terms_for(st.session_state["cell_type"]):
@@ -5991,6 +6106,8 @@ with tab_analysis:
                         membrane_N=membrane,
                         interior_N=interior,
                         nucleus_N=nucleus,
+                        nucleus_shell_N=envelope,
+                        deep_label=plain_name("nucleus").lower(),
                         fit_window=windows_for_plot,
                         rupture_epsilon=rupture.get("epsilon")
                         if rupture.get("method") == "force-drop"
@@ -6038,6 +6155,7 @@ with tab_analysis:
                                         st.session_state["cell_type"]
                                     ),
                                     show_nucleus="nucleus" in active,
+                                    show_nucleus_shell="nucleus_shell" in active,
                                     show_tension="tension" in active,
                                     deep_onset=(
                                         fit.get("break_2")
@@ -6090,8 +6208,13 @@ with tab_analysis:
                                     Em_MPa=fit["Em_MPa"],
                                     Ei_kPa=fit["Ei_kPa"],
                                     En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                                    Ene_MPa=(
+                                        fit.get("Ene_MPa")
+                                        if "nucleus_shell" in active else None
+                                    ),
                                     T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
                                     show_nucleus="nucleus" in active,
+                                    show_nucleus_shell="nucleus_shell" in active,
                                     show_tension="tension" in active,
                                 ),
                             ),
@@ -6517,21 +6640,57 @@ with tab_explore:
             "which is why the shapes have to do the separating."
         )
     with intro_right:
+        # Both pictures, because they are two views of one model and each
+        # answers a question the other cannot. The balloon says what the
+        # cell is; the spring diagram says what the fit computes.
+        here_terms = terms_for(st.session_state["cell_type"])
+        fluid_inside = st.session_state["cell_type"] in INCOMPRESSIBLE_INTERIOR
         if balloon_figure is not None:
             st.plotly_chart(
                 balloon_figure(
                     current_style(),
                     **figure_kwargs(
-                        balloon_figure, epsilon=0.35, interior="fluid",
-                        height=330,
+                        balloon_figure, epsilon=0.35,
+                        interior="fluid" if fluid_inside else "spring",
+                        labels=components_for(st.session_state["cell_type"]),
+                        show_nucleus="nucleus" in here_terms,
+                        show_nucleus_shell="nucleus_shell" in here_terms,
+                        show_tension="tension" in here_terms,
+                        cell_height_um=st.session_state["cell_height_um"],
+                        height=340,
                     ),
                 ),
                 key="explore_balloon", **STRETCH,
             )
         st.caption(
-            "A shell holding fluid. The fluid does not compress, so "
-            "everything the plates do goes into the shell and into whatever "
-            "network is strung across it."
+            "A shell holding fluid that does not compress, so everything the "
+            "plates do goes into the shell and into the network strung "
+            "across it."
+            if fluid_inside else
+            "A balloon with a spring inside it, and inside that a shorter "
+            "balloon with a spring of its own: the nucleus has a skin too. "
+            "Each balloon resists being stretched, each spring resists being "
+            "squeezed, and the four are told apart by the laws they follow."
+        )
+        st.plotly_chart(
+            cell_schematic(
+                current_style(),
+                **figure_kwargs(
+                    cell_schematic, epsilon=0.35, coupling="parallel",
+                    cell_height_um=st.session_state["cell_height_um"],
+                    labels=components_for(st.session_state["cell_type"]),
+                    show_nucleus="nucleus" in here_terms,
+                    show_nucleus_shell="nucleus_shell" in here_terms,
+                    show_tension="tension" in here_terms,
+                    height=330,
+                ),
+            ),
+            key="explore_schematic", **STRETCH,
+        )
+        st.caption(
+            "The same cell as a mechanics diagram: a fixed dish, a platen "
+            "carrying the force, and one spring per material between them. "
+            "This is what the fit actually solves."
         )
 
     st.divider()
