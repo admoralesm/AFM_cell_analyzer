@@ -832,21 +832,24 @@ def show_fit_maths(fit, model):
             "2πR₀²T₀ε/h₀. Note there is no thickness in it: a tension is a "
             "force per unit length and the curve measures it directly."
         )
+    deep_here = "nucleus" in terms
     st.code(
         f"h0 = {model.cell_height:.4g} m        (cell height)\n"
         f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
         + (
-            f"Rn = {fit.get('R0', 0.0):.4g} m        "
-            f"({term_name('nucleus').lower()} run the length of the cell, so "
-            f"the deep term uses the cell's own radius)\n"
-            if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS else
-            f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
-            f"({term_name('nucleus').lower()} radius)\n"
+            (
+                f"Rn = {fit.get('R0', 0.0):.4g} m        "
+                f"({term_name('nucleus').lower()} run the length of the "
+                f"cell, so the deep term uses the cell's own radius)\n"
+                if st.session_state["cell_type"] in DEEP_USES_CELL_RADIUS else
+                f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
+                f"({term_name('nucleus').lower()} radius)\n"
+            ) if deep_here else ""
         ) +
         f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
         f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
-        f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa\n"
-        f"An = {fit.get('An', float('nan')):.6g} N/Pa"
+        f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa"
+        + (f"\nAn = {fit.get('An', float('nan')):.6g} N/Pa" if deep_here else "")
         + (f"\nAt = {fit.get('At', float('nan')):.6g} m        "
            f"(F = At*T0*eps)" if "tension" in terms else ""),
         language="text",
@@ -855,9 +858,14 @@ def show_fit_maths(fit, model):
     st.markdown("**3 · Why this is a linear solve**")
     st.latex(
         r"\mathbf{F} = \mathbf{X}\,\boldsymbol{\theta}, \qquad "
-        + (r"\boldsymbol{\theta} = (T_0,\ E_m,\ E_c,\ E_n)"
-           if "tension" in terms
-           else r"\boldsymbol{\theta} = (E_m,\ E_c,\ E_n)")
+        + r"\boldsymbol{\theta} = ("
+        + ",\ ".join(
+            s for s, on in (
+                (r"T_0", "tension" in terms), (r"E_m", "membrane" in terms),
+                (r"E_c", "interior" in terms), (r"E_n", deep_here),
+            ) if on
+        )
+        + r")"
     )
     st.latex(
         r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta}\ \ge\ 0}"
@@ -917,6 +925,125 @@ def show_fit_maths(fit, model):
         )
 
 
+def settings_from_hypothesis(winner, epsilon_max=None, q=None):
+    """
+    Turn a winning picture of the cell into the widget values that make it.
+
+    Written as staged settings rather than applied directly, because these
+    are widget keys and Streamlit rejects a write to one after its widget
+    exists. The caller reruns and they land at the top of the next pass.
+    """
+    pending = {
+        "model_kind": "Segmented (each part takes over in turn)",
+        "membrane_after_break": next(
+            k for k, v in MEMBRANE_CHOICES.items() if v == winner["membrane"]
+        ),
+        "cyto_starts_at": next(
+            k for k, v in CYTO_CHOICES.items() if v == winner["cyto_start"]
+        ),
+        "segment_break_1": round(float(winner["break_1"]), 4),
+        "segment_break_2": round(float(winner["break_2"]), 4),
+    }
+    for term in ALL_TERMS:
+        pending[f"use_{term}"] = term in winner["terms"]
+    if epsilon_max is not None:
+        pending["window_end"] = round(float(epsilon_max), 4)
+    if q is not None:
+        pending["confinement"] = round(float(q), 2)
+    return pending
+
+
+def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
+                  n_grid=8, cv_repeats=2, passes=2):
+    """
+    The one fitting routine. Everything that fits a curve comes through here.
+
+    There used to be two: the curve was read one way when it loaded and
+    another way when the button was pressed, they used different candidate
+    sets, and on a real cardiomyocyte they disagreed by two orders of
+    magnitude in chi-squared. Two answers on one page is not a feature, it
+    is a bug that looks like a feature, so there is one routine and the
+    button is a harder setting of it.
+
+    What it does, in the order the quantities depend on each other:
+
+    1. Every picture of the cell is fitted with its own boundaries **and its
+       own confinement q**. q multiplies every basis function, so a picture
+       fitted at another picture's q is not that picture; profiling it per
+       candidate is also what stops the answer depending on which was fitted
+       first.
+    2. They are scored on points they were not fitted to, and the winner
+       brings its q back with it.
+    3. Which materials the curve needs at all is asked once, at the
+       boundaries the winner chose.
+    """
+    out = {"q": None, "q_scan": None, "hypotheses": None, "components": None}
+    try:
+        chosen = compare_hypotheses(
+            model, lo, hi, picks, weighting=weighting, cv_repeats=cv_repeats,
+            n_grid=n_grid, refine_rounds=max(1, int(passes) - 1),
+            scan_q=bool(measure_q),
+        )
+    except Exception:  # pragma: no cover - defensive
+        return out
+    if not chosen.get("success"):
+        return out
+
+    out["hypotheses"] = chosen
+    best = chosen["best"]
+    e1, e2 = float(best["break_1"]), float(best["break_2"])
+    if measure_q:
+        out["q"] = float(best.get("confinement", model.confinement))
+        model.confinement = out["q"]
+        # One last pass over q, now at the boundaries the winner actually
+        # chose rather than the rough ones it was profiled at. This is the
+        # closing step of the same coordinate descent and it is the reason
+        # the number the page reports is the number that fits: on the WT
+        # curves it moves q by a few tenths and χ²/dof by a third. It also
+        # produces the profile the page needs to say how well q is
+        # determined, rather than only what it came out at.
+        if hasattr(model, "scan_confinement"):
+            try:
+                again = model.scan_confinement(
+                    lo, hi, e1=e1, e2=e2, membrane=best["membrane"],
+                    cyto_start=best["cyto_start"],
+                    use_nucleus="nucleus" in best["terms"],
+                    use_tension="tension" in best["terms"],
+                    weighting=weighting,
+                )
+            except Exception:  # pragma: no cover - defensive
+                again = None
+            if again and again.get("success"):
+                out["q_scan"] = again
+                out["q"] = float(again["q"])
+                model.confinement = out["q"]
+                # And the boundaries once more at that q, because they were
+                # chosen at the old one.
+                refit = model._best_breakpoints(
+                    lo, hi, best["membrane"], best["cyto_start"],
+                    "nucleus" in best["terms"], weighting, n_grid,
+                    max(1, int(passes) - 1),
+                    use_tension="tension" in best["terms"],
+                )
+                if refit and refit.get("success"):
+                    e1, e2 = float(refit["break_1"]), float(refit["break_2"])
+                    best["break_1"], best["break_2"] = e1, e2
+                    best["r_squared"] = refit["r_squared"]
+                    best["fit"] = refit
+
+    try:
+        out["components"] = recommend_components(
+            model, lo, hi,
+            candidates=terms_for(st.session_state["cell_type"]),
+            e1=e1, e2=e2, membrane=best["membrane"],
+            cyto_start=best["cyto_start"], weighting=weighting,
+            cv_repeats=cv_repeats,
+        )
+    except Exception:  # pragma: no cover - defensive
+        out["components"] = None
+    return out
+
+
 def settings_from_arrangement(best, epsilon_max):
     """
     Turn the winning arrangement into the widget values that reproduce it.
@@ -955,6 +1082,129 @@ def settings_from_arrangement(best, epsilon_max):
     else:
         pending["model_kind"] = "Side by side (every element acts everywhere)"
     return pending
+
+
+# What each material is, mechanically, and the law that follows from it.
+# One row per term, and the last column is the one that matters: a fit can
+# only separate materials whose force laws differ in shape or in when they
+# start. Everything about how this model is built follows from that line.
+MATERIAL_LAWS = {
+    "tension": {
+        "role": "a network already under tension, resisting the area the "
+                "cell must gain as it flattens",
+        "energy": "T₀·ΔA, and the area gained goes as ε²",
+        "law": "F = A_t·T₀·ε",
+        "exponent": "1",
+        "separable": "the only term linear in ε, so it dominates at first "
+                     "contact where the powers have all but vanished",
+    },
+    "membrane": {
+        "role": "a thin shell resisting being stretched, the balloon",
+        "energy": "elastic energy in the area strain, which goes as ε²",
+        "law": "F = Aₘ·Eₘ·ε³",
+        "exponent": "3",
+        "separable": "the steepest law here, so it is negligible at contact "
+                     "and dominant deep in",
+    },
+    "interior": {
+        "role": "the material filling the cell, squeezed between two flat "
+                "plates: a Hertzian contact",
+        "energy": "Hertz contact between a sphere and a plane",
+        "law": "F = Aᵢ·E_c·⟨ε − s⟩³ᐟ²",
+        "exponent": "3/2",
+        "separable": "between the other two in steepness, which is why a "
+                     "curve starting near 1.7 means this and the shell "
+                     "together",
+    },
+    "nucleus": {
+        "role": "a stiffer body the plates only reach deeper in",
+        "energy": "the same Hertzian contact, met later",
+        "law": "F = A_n·E_n·⟨ε − ε₂⟩³ᐟ²",
+        "exponent": "3/2",
+        "separable": "the same law as the interior, so **only** its onset ε₂ "
+                     "tells them apart: no onset, no separation",
+    },
+}
+
+
+def materials_table(terms, membrane_mode="continue", cyto_start="zero",
+                    e1=None, e2=None, caption=None):
+    """
+    The materials in this fit, the law each obeys, and when it engages.
+
+    The point of the table is the last two columns. Where a material starts
+    and how steeply it rises are the only two things that let a fit tell it
+    from another one, so they are what a reader should be looking at when
+    deciding whether to believe a modulus.
+    """
+    if not terms:
+        return
+    rows = []
+    for term in ALL_TERMS:
+        if term not in terms:
+            continue
+        law = MATERIAL_LAWS[term]
+        if term == "tension":
+            when = ("from first contact" if membrane_mode != "late"
+                    else f"from first contact (ε₁ = {e1:.3f} for the shell)"
+                    if e1 is not None else "from first contact")
+        elif term == "membrane":
+            when = (
+                f"from ε₁ = {e1:.3f}" if membrane_mode == "late" and e1 is not None
+                else "from ε₁" if membrane_mode == "late"
+                else "from first contact"
+            )
+            if membrane_mode == "freeze":
+                when += (f", frozen after ε₁ = {e1:.3f}" if e1 is not None
+                         else ", frozen after ε₁")
+        elif term == "interior":
+            when = (
+                "from first contact" if cyto_start == "zero"
+                else f"from ε₁ = {e1:.3f}" if e1 is not None else "from ε₁"
+            )
+        else:
+            when = f"from ε₂ = {e2:.3f}" if e2 is not None else "from ε₂"
+        rows.append({
+            "Material": plain_name(term),
+            "Symbol": TERM_SYMBOLS.get(term, term),
+            "What it is, mechanically": law["role"],
+            "Force law": law["law"],
+            "Rises as": f"ε^{law['exponent']}",
+            "Carries load": when,
+            "What makes it separable": law["separable"],
+        })
+    flat_table(
+        pd.DataFrame(rows),
+        align_right=["Rises as"],
+        caption=caption,
+    )
+
+
+def separation_rule(q=None):
+    """The one sentence the whole model rests on, said plainly."""
+    st.info(
+        "**How materials are separated.** A fit cannot see materials. It "
+        "sees one curve, and it can only split that curve between two terms "
+        "if those terms have **different shapes**: a different power of ε, "
+        "or a different deformation at which they start. Two terms with the "
+        "same power and the same start are one material wearing two names, "
+        "and the solver will divide them arbitrarily, giving two numbers "
+        "that wander from cell to cell while their sum stays put.\n\n"
+        "That rule is why this model looks the way it does. The membrane's "
+        "two springs are given the two laws a taut shell really has, ε and "
+        "ε³, rather than two cube laws. Where two networks share the "
+        "Hertzian 3/2, one of them has to start later or they cannot be "
+        "told apart. And nothing is added because it exists in the cell; it "
+        "is added only if the curve has a shape for it."
+        + (
+            f"\n\nThe confinement (1−ε)^−q, here q = {float(q):.2f}, is not "
+            f"a material and is not fitted as one. It multiplies every term, "
+            f"because it is the cell running out of room rather than "
+            f"anything pushing back."
+            if q is not None else ""
+        ),
+        icon="🔍",
+    )
 
 
 def open_panel(title, guided, expanded=False):
@@ -1060,10 +1310,23 @@ def plain_language_summary(fit, model):
                 f"**Past {e2 * 100:.0f} %**, the plates reach the "
                 f"{nucleus_word} and it starts pushing back as well."
             )
-        else:
+        elif "nucleus" in terms:
             story.append(
                 f"**Past {e2 * 100:.0f} %**, nothing new joins in: this curve "
                 f"shows no sign of the {nucleus_word} being reached."
+            )
+        else:
+            # No deep element in the model at all, so nothing was looked for
+            # deeper in and nothing can be said to be missing. What happens
+            # deep in the squash is the interior running out of room.
+            q_here = float(st.session_state.get("confinement", 0.0) or 0.0)
+            story.append(
+                "**Deeper than that**, no new material joins in. The cell is "
+                "a shell around one interior that does not compress, so what "
+                "the plates feel from here on is the same two materials "
+                "having less and less room"
+                + (f", which is the confinement exponent q = {q_here:.2f}."
+                   if q_here > 0 else ".")
             )
         for line in story:
             st.markdown(f"- {line}")
@@ -1128,9 +1391,24 @@ def plain_language_summary(fit, model):
         st.warning(
             f"The line looks close, but it misses the points by about "
             f"{np.sqrt(chi_red):.0f} times the scatter in the measurement. "
-            f"That usually means a part of the cell is missing from the "
-            f"model, or the boundaries are in the wrong place. R² alone "
-            f"would not have told you."
+            f"That usually means a material is missing from the model, or "
+            f"the boundaries are in the wrong place. R² alone would not "
+            f"have told you."
+        )
+    # Chi-squared per point divides by the noise, so it only means what it
+    # says when the fit was weighted by the noise too. Under any other
+    # weighting the fit was deliberately asked to trade some accuracy where
+    # the noise is small for accuracy where it is not, and chi-squared reads
+    # that trade as a failure. Saying so is the difference between a number
+    # and a number a reader can use.
+    if np.isfinite(chi_red) and fit.get("weighting") not in (None, "noise"):
+        st.caption(
+            f"χ²/dof divides by the measurement noise, and this fit was "
+            f"weighted **{fit.get('weighting')}** rather than by that noise, "
+            f"so read it as a rough guide only. Weighted by the noise it "
+            f"would be smaller, at the cost of following the low-force half "
+            f"of the curve less closely. R², and the per-material error bars "
+            f"below, do not depend on that choice."
         )
     if float(fit.get("r_squared", 0.0)) < 0.9:
         st.warning(
@@ -1455,7 +1733,7 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
         # the cell rather than a compact body at its centre. Both change the
         # prefactors, so both follow the cell type.
         shell_thickness=float(st.session_state["protein_coat_nm"]) * 1e-9,
-        deep_uses_cell_radius=st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS,
+        deep_uses_cell_radius=st.session_state["cell_type"] in DEEP_USES_CELL_RADIUS,
         sarcomere_length=float(st.session_state["sarcomere_nm"]) * 1e-9,
         confinement=float(st.session_state["confinement"]),
         poisson_membrane=float(st.session_state["poisson_membrane"]),
@@ -1637,31 +1915,33 @@ COMPONENT_SETS = {
         "interior": ("🕸️ Cytoskeleton", "the scaffolding filling the cell"),
         "nucleus": ("🔵 Nucleus", "the dense body at the centre"),
     },
-    # Four layers, not three. The membrane of a cardiomyocyte is not one
-    # spring: a protein network runs through it that is already taut, and it
-    # answers a push in proportion to how far it is pushed, while the shell's
-    # own elasticity only bites once the area strain is large. Inside, the
-    # general scaffolding is engaged from first contact and the myofibrils
-    # are met deeper in.
-    # A cardiomyocyte has no nucleus term. It has one, of course, but a cell
-    # this packed with myofibrils has nothing left for a nucleus term to
-    # describe that the myofibrils do not already: what the plates meet deep
-    # in is contractile machinery. The slot is the same slot; only the name
-    # and the meaning change, and the name is what the app shows.
+    # A cardiomyocyte is modelled as a shell around one incompressible
+    # interior, and that is three springs, not four.
+    #
+    # There is no nucleus term. Not renamed, not switched off by default:
+    # absent. A nucleus cannot be told apart from the rest of the interior of
+    # a cardiomyocyte, by the plates or by anyone looking down a microscope,
+    # so a term claiming to measure one measures nothing. The myofibrils are
+    # not a separate deep spring either: they fill the cell, and together
+    # with the cytoskeleton around them they are treated as a single
+    # incompressible material.
+    #
+    # What that costs is nothing. Fitting the four measured WT curves with
+    # the deep spring removed changes chi-squared per point by less than a
+    # tenth (cell 11: 1.34 against 1.32; cell 5: identical), because what the
+    # deep spring was really absorbing was the cell running out of room, and
+    # running out of room is what an incompressible interior does. It is
+    # described by the confinement exponent q instead, where it belongs.
     "Cardiomyocyte": {
         "membrane": (
             "🎈 Membrane and cortex",
             "the shell around the cell, resisting being stretched",
         ),
         "interior": (
-            "🕸️ Non-sarcomeric cytoskeleton",
-            "the general scaffolding, not contractile",
+            "🕸️ Cytoskeleton and myofibrils",
+            "the packed interior, one incompressible material",
         ),
-        "nucleus": (
-            "🧵 Sarcomeric myofibrils",
-            "the contractile machinery, reached deeper in",
-        ),
-        # The optional fourth. Named for what it is mechanically rather than
+        # The optional third. Named for what it is mechanically rather than
         # for one protein, because the point of it is to hold whichever
         # membrane protein is being tested: it is an in-plane spring, taut
         # from first contact, answering in proportion to ε where everything
@@ -1679,11 +1959,10 @@ DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 # not a setting they have to translate, and the search reports which of them
 # the curve supports rather than reporting four abstract compositions.
 #
-# For a ventricular cardiomyocyte the claim is that the membrane and the
-# cortical actin under it are welded together through the costameres and
-# load as one layer from first contact, with the myofibrils met deeper in.
-# That is what an exponent near 1.7 at first contact means: not a membrane
-# alone, which would give 3, but a shell and a Hertzian network together.
+# For a ventricular cardiomyocyte every picture is a shell around one
+# incompressible interior. What varies between them is the order the two
+# load in and whether the membrane carries an in-plane spring as well, which
+# are the two things an experiment can actually change.
 # What the sample is, which decides which pictures are worth testing.
 MEMBRANE_PROTEIN_STATES = {
     "Present (wild type)":
@@ -1702,53 +1981,55 @@ def cardiomyocyte_hypotheses(state="Not known — test for it"):
     """
     The pictures worth testing for a ventricular cardiomyocyte.
 
-    Every one of them has the membrane and the cortical actin loading
-    together from first contact. That is not a variable here: the two are
-    tied through the costameres, and the measured slope near contact says so
-    — about 1.7 on all four WT curves, where a membrane on its own gives 3
-    and a Hertzian network on its own gives 3/2. So what varies between
-    these is only which further elements are present, which is the question
-    an experiment can actually change.
+    Three springs at most, never four. The cell is a shell around a single
+    incompressible interior: no nucleus, because nothing in a cardiomyocyte
+    tells one apart from the rest of the interior, and no separate myofibril
+    layer, because the myofibrils fill the cell rather than waiting deep
+    inside it. What a deep spring used to absorb is the interior refusing to
+    be compressed, and that is the confinement exponent q.
+
+    So what varies here is only the order the two layers load in, and
+    whether the membrane carries an in-plane spring. Both are claims about
+    the cell that an experiment can change, which is what makes them worth
+    comparing.
     """
+    # The shell and the cortex under it are welded through the costameres,
+    # so they load as one layer. Whether that layer answers before or after
+    # the interior is the question; both are offered.
     coupled = {"membrane": "continue", "cyto_start": "zero"}
-    # The cortical network takes the load first on its own, and the shell
-    # only begins to stretch once the cell has been flattened enough to
-    # stretch it. Near contact that is a slope of 3/2, the shell taking over
-    # is what carries it up past 3, and it is a different claim from the two
-    # loading together from the start even though both start soft.
+    # The interior takes the load first on its own and the shell only begins
+    # to stretch once the cell has been flattened enough to stretch it. Near
+    # contact that is a slope of 3/2, and the shell taking over is what
+    # carries it up past 3.
     cyto_first = {"membrane": "late", "cyto_start": "zero"}
     base = [
         {
-            "key": "coupled",
-            "label": "Membrane and cortical actin together, then myofibrils",
-            "detail": "one outer layer from first contact, myofibrils at ε₂",
-            "terms": ("membrane", "interior", "nucleus"), **coupled,
-        },
-        {
             "key": "cyto_first",
-            "label": "Cortical actin first, then the membrane stretches, "
-                     "then myofibrils",
+            "label": "Interior first, then the membrane starts stretching",
             "detail": "the shell only starts stretching at ε₁",
-            "terms": ("membrane", "interior", "nucleus"), **cyto_first,
+            "terms": ("membrane", "interior"), **cyto_first,
         },
         {
-            "key": "coupled_no_deep",
-            "label": "Membrane and cortical actin together, nothing deeper",
-            "detail": "the myofibrils are never reached in this range",
+            "key": "coupled",
+            "label": "Membrane and interior together from first contact",
+            "detail": "one outer layer and the interior, both from ε = 0",
             "terms": ("membrane", "interior"), **coupled,
         },
     ]
     withspring = [
         {
-            "key": "coupled_spring",
-            "label": "…and a horizontal spring in the membrane",
-            "detail": "the same, plus an in-plane spring taut from contact",
-            "terms": ("tension", "membrane", "interior", "nucleus"), **coupled,
+            "key": "cyto_first_spring",
+            "label": "Interior first, then the membrane, with a horizontal "
+                     "spring in it",
+            "detail": "the same order, plus an in-plane spring taut from "
+                      "contact",
+            "terms": ("tension", "membrane", "interior"), **cyto_first,
         },
         {
-            "key": "coupled_spring_no_deep",
-            "label": "Membrane, cortical actin and a horizontal spring only",
-            "detail": "an in-plane spring, but no myofibril layer reached",
+            "key": "coupled_spring",
+            "label": "Membrane and interior together, with a horizontal "
+                     "spring in the membrane",
+            "detail": "both from ε = 0, plus an in-plane spring",
             "terms": ("tension", "membrane", "interior"), **coupled,
         },
     ]
@@ -1756,7 +2037,7 @@ def cardiomyocyte_hypotheses(state="Not known — test for it"):
         return base
     if state.startswith("Present"):
         return withspring + base
-    return base[:1] + withspring + base[1:]
+    return [base[0], withspring[0], base[1], withspring[1]]
 
 
 HYPOTHESES = {
@@ -1788,21 +2069,33 @@ HYPOTHESES = {
 
 def hypotheses_for(cell_type):
     """The named pictures to test for this cell type, if any are defined."""
-    if cell_type in DEEP_IS_MYOFIBRILS:
+    if cell_type in INCOMPRESSIBLE_INTERIOR:
         return cardiomyocyte_hypotheses(
             st.session_state.get("membrane_protein", "Not known — test for it")
         )
     return HYPOTHESES.get(cell_type, [])
 
 
-# Cell types whose deep element is myofibrils running the length of the cell
-# rather than a compact nucleus at its centre. Decides which radius the deep
-# prefactor uses, and it is also exactly the set with no nucleus term.
-DEEP_IS_MYOFIBRILS = ("Cardiomyocyte",)
+# Cell types whose interior is one incompressible material rather than a
+# soft filling with something denser in the middle. For these there is no
+# deep spring at all: the interior does not compress, so past about half the
+# cell's height the resistance is the cell running out of room, which is the
+# confinement exponent q and not a third modulus. q is measured per cell.
+INCOMPRESSIBLE_INTERIOR = ("Cardiomyocyte",)
+
+# Cell types with sarcomeres. Only for the geometry read-out and for the
+# in-plane membrane protein, both of which are about muscle; neither of them
+# puts a spring in the fit.
+HAS_SARCOMERES = ("Cardiomyocyte",)
+
+# Where a deep term does exist, whose radius its prefactor uses: a nucleus is
+# a body at the centre with its own radius, anything running the length of
+# the cell uses the cell's own.
+DEEP_USES_CELL_RADIUS = ("Cardiomyocyte",)
 
 # Elements a cell type can be fitted with, in the order they are shown.
 # "tension" is offered but not assumed: see DEFAULT_TERMS_BY_TYPE.
-OPTIONAL_TERMS = {"Cardiomyocyte": ("membrane", "interior", "nucleus", "tension")}
+OPTIONAL_TERMS = {"Cardiomyocyte": ("membrane", "interior", "tension")}
 
 # Which of those are ticked when the cell type is chosen. The extra membrane
 # protein is off: a term nobody asked for is a term that quietly takes force
@@ -1810,9 +2103,32 @@ OPTIONAL_TERMS = {"Cardiomyocyte": ("membrane", "interior", "nucleus", "tension"
 # curve wants it.
 DEFAULT_TERMS_BY_TYPE = {
     "Cardiomyocyte": {
-        "membrane": True, "interior": True, "nucleus": True, "tension": False,
+        "membrane": True, "interior": True, "nucleus": False, "tension": False,
     },
 }
+
+
+def wants_confinement(cell_type=None):
+    """Whether q should be measured from the curve for this cell.
+
+    Two reasons to measure it, and either is enough. A cell that is not a
+    free sphere has less room to spread as it is flattened. And a cell whose
+    interior does not compress has to put that volume somewhere. Both show up
+    as the same factor, so both are answered by the same measurement.
+    """
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    return (
+        cell_type in INCOMPRESSIBLE_INTERIOR
+        or str(st.session_state.get("cell_shape", "")).startswith("Belt")
+    )
+
+
+def has_deep_term(cell_type=None):
+    """Whether this cell type is modelled with a deep element at all."""
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    return "nucleus" in terms_for(cell_type)
 
 # How each cell type is expected to behave at the first boundary.
 #
@@ -2378,7 +2694,7 @@ def send_cell_to_sheet(manager, fit, date_acquired):
     # Blank for a cell type without sarcomeres: a number in these columns
     # for a myoblast would claim a measurement of something it does not have.
     sarcomere = {"relaxed": "", "at_max": ""}
-    if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+    if st.session_state["cell_type"] in HAS_SARCOMERES:
         relaxed = float(st.session_state["sarcomere_nm"])
         stretch = (1.0 - min(float(hi), 0.999)) ** (
             -0.5 * float(st.session_state["sarcomere_spread"])
@@ -2507,7 +2823,7 @@ def model_from_record(record, curve):
         cell_radius=radius_m,
         membrane_thickness=float(settings.get("membrane_thickness_nm", 4.0)) * 1e-9,
         shell_thickness=float(settings.get("protein_coat_nm", 200.0)) * 1e-9,
-        deep_uses_cell_radius=settings.get("cell_type") in DEEP_IS_MYOFIBRILS,
+        deep_uses_cell_radius=settings.get("cell_type") in DEEP_USES_CELL_RADIUS,
         sarcomere_length=float(settings.get("sarcomere_nm", 2100.0)) * 1e-9,
         confinement=float(settings.get("confinement", 0.0)),
         poisson_membrane=float(settings.get("poisson_membrane", 0.5)),
@@ -2676,7 +2992,9 @@ with st.sidebar:
                 key="cell_radius_um",
             )
 
-    with st.expander("📐 Cell shape and confinement", expanded=False):
+    with st.expander(
+        "📐 Cell shape and the incompressible interior", expanded=False
+    ):
         st.selectbox(
             "What shape is the cell",
             ["Sphere (a rounded cell)", "Belt cylinder (a rod lying down)"],
@@ -2687,7 +3005,7 @@ with st.sidebar:
             "stiffens faster.",
         )
         st.number_input(
-            "Confinement q",
+            "Confinement exponent q",
             min_value=0.0, max_value=3.0, step=0.05, format="%.2f",
             key="confinement",
             help="Every term is multiplied by (1−ε)^−q. q = 0 is the classic "
@@ -2698,15 +3016,25 @@ with st.sidebar:
             "is squeezed. Measure it rather than assume it.",
         )
         st.caption(
-            "**Why this exists.** Every spring in the model is a small-strain "
-            "law, and past about half the cell's height a real cell stiffens "
-            "faster than any of them can. On the WT cardiomyocyte curve the "
-            "measured exponent climbs from 3 near ε = 0.2 to 5.3 by ε = 0.7, "
-            "and nothing built from ε, ε³ᐟ² and ε³ follows that. What is "
-            "happening is geometric: the cell keeps its volume, so it has to "
-            "go somewhere sideways, and q is how easily it can. Fitting that "
-            "curve with q free instead of q = 0 improves χ²/dof about "
-            "200-fold."
+            "**What q is.** It is the interior refusing to be compressed. "
+            "Every spring in the model is a small-strain law, and past about "
+            "half the cell's height a real cell stiffens faster than any of "
+            "them can: on the WT cardiomyocyte curve the measured exponent "
+            "climbs from 3 near ε = 0.2 to 5.3 by ε = 0.7, and nothing built "
+            "from ε, ε³ᐟ² and ε³ follows that. The cause is not a new "
+            "material. The cell keeps its volume, so what the plates take out "
+            "of its height has to go somewhere sideways, and q says how "
+            "easily it can go. Fitting with q free instead of q = 0 improves "
+            "χ²/dof about 200-fold."
+        )
+        st.caption(
+            "**Why it replaces a deep spring.** A stiff layer switching on "
+            "part-way and an interior running out of room look alike on a "
+            "curve, and only one of them is a material. Fitting the four "
+            "measured WT curves with the deep spring removed and q measured "
+            "instead changes χ²/dof by less than a tenth. So the deep spring "
+            "is not in the cardiomyocyte model: it was describing "
+            "incompressibility under another name."
         )
         if st.session_state.get("data") is not None:
             found = st.session_state.get("confinement_scan")
@@ -2743,7 +3071,7 @@ with st.sidebar:
             "assume 8 nm instead of 4 and Eₘ halves, with the data unchanged. The "
             "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
-        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+        if st.session_state["cell_type"] in HAS_SARCOMERES:
             st.selectbox(
                 "Membrane protein that acts as a horizontal spring",
                 list(MEMBRANE_PROTEIN_STATES),
@@ -2796,48 +3124,58 @@ with st.sidebar:
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
     deep_name = plain_name("nucleus")
-    with st.expander(f"🟣 {deep_name}"):
-        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+    # A cell type with no deep element has nothing to set here, and a panel
+    # of settings for a term that is not in the model is not a harmless
+    # extra: it is four numbers a reader will assume were measured.
+    with st.expander(
+        f"🟣 {deep_name}" if has_deep_term()
+        else "🫗 One incompressible interior (no deep element)"
+    ):
+        if not has_deep_term():
             st.caption(
-                f"{deep_name} run the length of the cell rather than sitting "
-                f"as a body at its centre, so the deep term uses the cell's "
-                f"own radius and the radius below is not used. It is left "
-                f"here because the geometry is stored with the cell."
+                f"A {st.session_state['cell_type'].split(' (')[0].lower()} is "
+                f"modelled as a shell around a single incompressible "
+                f"interior, so there is no deep spring and nothing to set "
+                f"here. What a deep spring would have absorbed is the cell "
+                f"running out of room, and that is the confinement exponent "
+                f"q under **Cell shape**, measured from the curve rather "
+                f"than assumed."
             )
-        st.radio(
-            f"{deep_name} radius",
-            ["From cell radius", "Manual"],
-            key="nucleus_radius_mode",
-            horizontal=True,
-        )
-        if st.session_state["nucleus_radius_mode"] == "From cell radius":
-            st.slider(
-                f"{deep_name} radius / R₀", 0.10, 0.90, step=0.01,
-                key="nucleus_fraction"
+        if has_deep_term():
+            st.radio(
+                f"{deep_name} radius",
+                ["From cell radius", "Manual"],
+                key="nucleus_radius_mode",
+                horizontal=True,
             )
-        else:
-            st.number_input(
-                f"{deep_name} radius (μm)", min_value=0.1, max_value=50.0, step=0.05,
-                format="%.2f", key="nucleus_radius_um",
+            if st.session_state["nucleus_radius_mode"] == "From cell radius":
+                st.slider(
+                    f"{deep_name} radius / R₀", 0.10, 0.90, step=0.01,
+                    key="nucleus_fraction"
+                )
+            else:
+                st.number_input(
+                    f"{deep_name} radius (μm)", min_value=0.1, max_value=50.0, step=0.05,
+                    format="%.2f", key="nucleus_radius_um",
+                )
+            st.slider(f"Poisson ratio, {deep_name.lower()} νₙ", 0.0, 0.5, step=0.01,
+                      key="poisson_nucleus")
+            st.radio(
+                "Onset deformation ε₀",
+                ["Scan for best", "Set manually"],
+                key="onset_mode",
+                help="The deformation at which the plates start to feel the nucleus. "
+                "Below it the nucleus term is exactly zero, which is what keeps it "
+                "distinguishable from the cytoskeleton term.",
             )
-        st.slider(f"Poisson ratio, {deep_name.lower()} νₙ", 0.0, 0.5, step=0.01,
-                  key="poisson_nucleus")
-        st.radio(
-            "Onset deformation ε₀",
-            ["Scan for best", "Set manually"],
-            key="onset_mode",
-            help="The deformation at which the plates start to feel the nucleus. "
-            "Below it the nucleus term is exactly zero, which is what keeps it "
-            "distinguishable from the cytoskeleton term.",
-        )
-        st.slider("ε₀", 0.0, 0.6, step=0.01, key="nucleus_onset")
-        if st.session_state["onset_mode"] == "Scan for best":
-            found = st.session_state.get("_scanned_onset")
-            st.caption(
-                f"The slider is ignored while scanning. Last scan found "
-                f"ε₀ = {found:.3f}." if found is not None
-                else "The slider is ignored while scanning; the fit finds ε₀ itself."
-            )
+            st.slider("ε₀", 0.0, 0.6, step=0.01, key="nucleus_onset")
+            if st.session_state["onset_mode"] == "Scan for best":
+                found = st.session_state.get("_scanned_onset")
+                st.caption(
+                    f"The slider is ignored while scanning. Last scan found "
+                    f"ε₀ = {found:.3f}." if found is not None
+                    else "The slider is ignored while scanning; the fit finds ε₀ itself."
+                )
 
     st.caption(
         "Below here is presentation and plumbing, not physics."
@@ -3370,82 +3708,31 @@ with tab_analysis:
                     notes.append("**the approach misbehaved near contact**")
 
             picks = hypotheses_for(st.session_state["cell_type"])
-            chosen = None
             if picks and hasattr(model, "suggest_window"):
                 lo = window.get("epsilon_min", 0.0) if window.get("success") else 0.0
                 hi = window.get("epsilon_max", eps_hi_data) if window.get("success") \
                     else eps_hi_data
-                if st.session_state["cell_shape"].startswith("Belt") and hasattr(
-                    model, "scan_confinement"
-                ):
-                    found_q = model.scan_confinement(
-                        lo, hi, e1=0.15, e2=0.40, membrane="continue",
-                        cyto_start="zero", use_nucleus=True,
-                        weighting=st.session_state["weighting"],
-                    )
-                    if found_q.get("success"):
-                        model.confinement = float(found_q["q"])
-                        pending["confinement"] = round(float(found_q["q"]), 2)
-                        st.session_state["confinement_scan"] = found_q
-                try:
-                    chosen = compare_hypotheses(
-                        model, lo, hi, picks,
-                        weighting=st.session_state["weighting"],
-                        cv_repeats=2, n_grid=8,
-                    )
-                except Exception:
-                    chosen = None
-            if chosen and chosen.get("success"):
-                # One refinement pass. The confinement was measured at a
-                # guessed pair of boundaries and the winning picture then
-                # fitted its own, so the two disagree; re-measuring q where
-                # the boundaries actually landed and re-running the
-                # comparison is a single step of coordinate descent, it
-                # costs a fraction of a second, and on one of the WT curves
-                # it is the difference between R² = 0.9994 and 0.99999.
-                if hasattr(model, "scan_confinement") and st.session_state[
-                    "cell_shape"
-                ].startswith("Belt"):
-                    first = chosen["best"]
-                    again = model.scan_confinement(
-                        lo, hi, e1=first["break_1"], e2=first["break_2"],
-                        membrane=first["membrane"],
-                        cyto_start=first["cyto_start"],
-                        use_nucleus="nucleus" in first["terms"],
-                        use_tension="tension" in first["terms"],
-                        weighting=st.session_state["weighting"],
-                    )
-                    if again.get("success"):
-                        model.confinement = float(again["q"])
-                        pending["confinement"] = round(float(again["q"]), 2)
-                        st.session_state["confinement_scan"] = again
-                        try:
-                            better = compare_hypotheses(
-                                model, lo, hi, picks,
-                                weighting=st.session_state["weighting"],
-                                cv_repeats=2, n_grid=8,
-                            )
-                            if better.get("success"):
-                                chosen = better
-                        except Exception:
-                            pass
-                st.session_state["hypothesis_search"] = chosen
-                winner = chosen["best"]
-                pending.update({
-                    "model_kind": "Segmented (each part takes over in turn)",
-                    "membrane_after_break": next(
-                        k for k, v in MEMBRANE_CHOICES.items()
-                        if v == winner["membrane"]
-                    ),
-                    "cyto_starts_at": next(
-                        k for k, v in CYTO_CHOICES.items()
-                        if v == winner["cyto_start"]
-                    ),
-                    "segment_break_1": round(float(winner["break_1"]), 4),
-                    "segment_break_2": round(float(winner["break_2"]), 4),
-                })
-                for term in ALL_TERMS:
-                    pending[f"use_{term}"] = term in winner["terms"]
+                # The same routine the Fit button runs, at its quick setting.
+                # One engine, so what appears when the curve loads and what
+                # appears when the button is pressed can differ in how hard
+                # they looked and in nothing else.
+                outcome = analyse_curve(
+                    model, lo, hi, picks,
+                    weighting=st.session_state["weighting"],
+                    measure_q=wants_confinement(),
+                    terms_hint=terms_for(st.session_state["cell_type"]),
+                    n_grid=8, cv_repeats=2, passes=2,
+                )
+                if outcome["q_scan"] is not None:
+                    st.session_state["confinement_scan"] = outcome["q_scan"]
+                if outcome["components"] is not None:
+                    st.session_state["component_search"] = outcome["components"]
+                chosen = outcome["hypotheses"]
+                if chosen and chosen.get("success"):
+                    st.session_state["hypothesis_search"] = chosen
+                    pending.update(settings_from_hypothesis(
+                        chosen["best"], q=outcome["q"],
+                    ))
             if pending:
                 st.session_state["_auto_notes"] = notes
                 st.session_state["_pending_settings"] = pending
@@ -3521,35 +3808,34 @@ with tab_analysis:
                     term_name(t) for t in ALL_TERMS if t in winner["terms"]
                 ]
                 deep_in = "nucleus" in winner["terms"]
+                order_now = ordering_of(winner["membrane"],
+                                        winner["cyto_start"])
                 st.markdown(
-                    "**Components:** " + " + ".join(chosen_now)
-                    + "  ·  **Segmentation:** "
-                    + (
-                        f"one stretch, ε = {guided_lo:.3f} to {guided_hi:.3f}, "
-                        f"everything loading together"
-                        if not deep_in else
-                        f"ε = {guided_lo:.3f} to {winner['break_2']:.3f} the "
-                        f"outer layer alone, then "
-                        f"{term_name('nucleus').lower()} from "
-                        f"ε = {winner['break_2']:.3f} to {guided_hi:.3f}"
-                    )
+                    "**Materials:** " + " + ".join(chosen_now)
+                    + "  ·  **Order:** "
+                    + (order_now["short"] if order_now else
+                       composition_label(winner["membrane"],
+                                         winner["cyto_start"]))
+                    + (f", from ε = {guided_lo:.3f} to {guided_hi:.3f}"
+                       if not deep_in else
+                       f", with the deep element from ε = "
+                       f"{winner['break_2']:.3f}")
                 )
-                if deep_in and st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+                if not deep_in and st.session_state["cell_type"] in \
+                        INCOMPRESSIBLE_INTERIOR:
                     st.caption(
-                        f"**Why a third element appears part-way along.** It "
-                        f"is not a nucleus: this model does not separate one "
-                        f"from the rest of the interior, and the cell is "
-                        f"treated as a shell holding fluid that does not "
-                        f"compress. What switches on at ε = "
-                        f"{winner['break_2']:.3f} is the "
-                        f"{term_name('nucleus').lower()}, which run the "
-                        f"length of the cell. They are stiffer than what "
-                        f"surrounds them and the plates only feel them once "
-                        f"the softer scaffolding above has been squeezed "
-                        f"down onto them, so their term is exactly zero "
-                        f"until then and rises from there. If the curve "
-                        f"shows no such change the search says so and picks "
-                        f"“nothing deeper” instead."
+                        f"**No deep element, and that is deliberate.** A "
+                        f"{st.session_state['cell_type'].split(' (')[0].lower()}"
+                        f" is a shell around one incompressible interior. "
+                        f"There is no nucleus term, because nothing here "
+                        f"tells a nucleus apart from the rest of the "
+                        f"interior, and no separate myofibril spring, "
+                        f"because the myofibrils fill the cell rather than "
+                        f"waiting deep inside it. What a deep spring would "
+                        f"absorb is the interior refusing to be compressed, "
+                        f"and that is carried by the confinement exponent "
+                        f"q = {float(st.session_state['confinement']):.2f}, "
+                        f"measured from this curve."
                     )
                 notes = st.session_state.get("_auto_notes") or []
                 st.caption(
@@ -3608,11 +3894,11 @@ with tab_analysis:
                    else "No sudden force drop was detected in this curve.")
             )
 
-            st.markdown("#### Step 2 · Which parts, and how they share the load")
+            st.markdown("#### Step 2 · Which materials carry the load")
             st.caption(
-                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
-                "unless you have a reason not to. The names follow the cell "
-                "type chosen in the sidebar, because a "
+                f"Leave all {len(here)} ticked unless you have a reason not "
+                "to. The names follow the cell type chosen in the sidebar, "
+                f"because a "
                 f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
                 "not built like every other cell."
             )
@@ -3621,20 +3907,43 @@ with tab_analysis:
                 with column:
                     st.checkbox(label, key=f"use_{term}")
                     st.caption(everyday)
-            if len(here) == 4:
+            if "tension" in here:
                 st.caption(
-                    "The first two are both the membrane. A cardiomyocyte's "
-                    "membrane carries a protein network that is already taut, "
-                    "so it pushes back from the very first contact in "
-                    "proportion to how far it is pushed (a law in ε); the "
-                    "shell's own elasticity only bites once the cell has been "
-                    "flattened enough to stretch it (a law in ε³). They are "
-                    "one piece of material answering two ways, which is why "
-                    "they start and stop together."
+                    "The first two are both the membrane, one piece of "
+                    "material answering two ways. A protein network running "
+                    "through it is already taut, so it pushes back from the "
+                    "very first contact in proportion to how far it is "
+                    "pushed, a law in ε. The shell's own elasticity only "
+                    "bites once the cell has been flattened enough to "
+                    "stretch it, a law in ε³. That is why they start and "
+                    "stop together and still count as two terms."
                 )
 
             if not chosen:
-                st.warning("Tick at least one part before analysing.")
+                st.warning("Tick at least one material before fitting.")
+            else:
+                # The pedagogic centre of the page: what each ticked material
+                # is mechanically, the law that follows, and the thing that
+                # lets the fit tell it from the others.
+                materials_table(
+                    chosen,
+                    membrane_mode=MEMBRANE_CHOICES[
+                        st.session_state["membrane_after_break"]
+                    ],
+                    cyto_start=CYTO_CHOICES[st.session_state["cyto_starts_at"]],
+                    e1=float(st.session_state["segment_break_1"]),
+                    e2=float(st.session_state["segment_break_2"]),
+                    caption=(
+                        "Prefactors (Aₘ, Aᵢ, A_t, A_n) are geometry and are "
+                        "not fitted. Only one number per material is: its "
+                        "modulus."
+                    ),
+                )
+                with st.expander("🔍 How these are told apart"):
+                    separation_rule(
+                        q=float(st.session_state["confinement"])
+                        if wants_confinement() else None
+                    )
 
 
         # The sharing controls run for every mode, so the guided
@@ -3647,7 +3956,7 @@ with tab_analysis:
         st.divider()
 
         model_panel = open_panel(
-            "⚙️ How the elements share the load", guided
+            "⚙️ Step 2b · How the materials share the load", guided
         )
         if guided:
             st.caption(
@@ -3818,22 +4127,23 @@ with tab_analysis:
                 )
             membrane_mode = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
             cyto_mode = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
-            if st.session_state["cell_type"] == "Cardiomyocyte":
+            if st.session_state["cell_type"] in INCOMPRESSIBLE_INTERIOR:
                 st.caption(
-                    "For a cardiomyocyte the cytoskeleton is set to start from "
-                    "the very start. The measured slope near contact is about "
-                    "1.7, between the membrane's cube law and the "
-                    "cytoskeleton's 3/2, which only happens if both are "
-                    "loaded together: the cortex and the myofibrils are "
-                    "anchored to the membrane, so there is no stretch where "
-                    "the membrane deforms alone. A pure membrane start would "
-                    "read close to 3."
+                    "The interior of this cell type is anchored to the "
+                    "membrane through the costameres, so it is never left "
+                    "unloaded while the shell deforms on its own: it starts "
+                    "from the very start. What the curve then decides is "
+                    "whether the shell answers with it from contact or only "
+                    "begins to stretch at ε₁, and the measured slope near "
+                    "contact is what settles that. Around 3 is a shell "
+                    "answering first, around 3/2 the interior on its own."
                 )
             st.caption(
-                f"→ {composition_label(membrane_mode, cyto_mode)}. "
-                f"The {term_name('nucleus').lower()} always joins at ε₂. If "
-                "you are not sure which of the "
-                "four is right, the combination search below tries them all."
+                f"→ {composition_label(membrane_mode, cyto_mode)}."
+                + (f" The {term_name('nucleus').lower()} always joins at ε₂."
+                   if has_deep_term() else
+                   " There is no deep element in this model, so ε₂ is not "
+                   "used.")
             )
         else:
             membrane_mode, cyto_mode = "freeze", "break"
@@ -3892,120 +4202,95 @@ with tab_analysis:
         sharing_slot = st.container()
 
         if guided:
-            st.markdown("#### Step 3 · Work it out for me")
+            st.markdown("#### Step 3 · Fit")
             st.caption(
-                "One button. It decides how the parts are arranged, whether "
-                "the cell is segmented, side by side or stacked, then where "
-                "each part takes over, then how stiff each one is, fitting "
-                "every possibility and keeping the one that best predicts "
-                "points it was not fitted on. The settings it uses are "
-                "underneath, already set for "
-                f"**{st.session_state['cell_type'].split(' (')[0]}**; change "
-                "one and press the button again."
+                "One button, and it works in the order the quantities depend "
+                "on each other. **1.** Measure how confined the cell is, the "
+                "exponent q, because it multiplies every term and comparing "
+                "pictures at the wrong q asks which of several wrong models "
+                "is least wrong. **2.** Compare the pictures of this cell "
+                "below, each one fitting its own boundaries, scored by how "
+                "well it predicts points it was not fitted to. **3.** "
+                "Re-measure q where the winner put its boundaries and compare "
+                "again. **4.** Ask which materials the curve needs at all. "
+                "Everything on the page under this comes from that one fit."
             )
             g1, g2 = st.columns([1, 2])
             with g1:
                 if st.button(
-                    "🔬 Work it out for me", type="primary",
+                    "🔬 Fit this cell", type="primary",
                     disabled=not chosen, **STRETCH,
                 ):
-                    # Confinement first, because it changes the shape of
-                    # every basis function and therefore which arrangement
-                    # looks best. Searching arrangements at the wrong q asks
-                    # which of several wrong models is least wrong.
-                    if (
-                        st.session_state["cell_shape"].startswith("Belt")
-                        and hasattr(model, "scan_confinement")
-                    ):
-                        with st.spinner("Measuring how confined the cell is…"):
-                            q_found = model.scan_confinement(
-                                guided_lo, guided_hi,
-                                e1=float(st.session_state["segment_break_1"]),
-                                e2=float(st.session_state["segment_break_2"]),
-                                membrane="continue", cyto_start="zero",
-                                use_nucleus="nucleus" in chosen,
-                                use_tension="tension" in chosen,
-                                weighting=st.session_state["weighting"],
-                            )
-                        if q_found.get("success"):
-                            st.session_state["confinement_scan"] = q_found
-                            model.confinement = float(q_found["q"])
-                            st.session_state["_confinement_from_search"] = round(
-                                float(q_found["q"]), 2
-                            )
+                    picks_now = hypotheses_for(st.session_state["cell_type"])
                     with st.spinner(
-                        "Comparing segmented, side by side and stacked, then "
-                        "every way the parts can share the boundaries…"
+                        "Measuring the confinement, then comparing the "
+                        "pictures of this cell…"
                     ):
-                        found = search_arrangements(
-                            model, guided_lo, guided_hi, terms=chosen,
+                        # The same routine as on load, searched harder: a
+                        # finer boundary grid, more cross-validation repeats
+                        # and one more pass between q and the composition.
+                        outcome = analyse_curve(
+                            model, guided_lo, guided_hi, picks_now,
                             weighting=st.session_state["weighting"],
-                            # Where the cell type says the membrane is two
-                            # springs, that is the structure to place the
-                            # boundaries inside, not a hypothesis to test. A
-                            # linear term is flexible enough to help a wrong
-                            # composition imitate the right one, so letting
-                            # the search drop it buys a worse story for a
-                            # better number.
-                            tension_mode=(
-                                "always" if "tension" in chosen else "off"
-                            ),
+                            measure_q=wants_confinement(),
+                            terms_hint=chosen,
+                            n_grid=12, cv_repeats=3, passes=3,
                         )
-                    st.session_state["arrangement_search"] = found
-                    st.session_state["composition_search"] = found.get("composition")
-
-                    # Which elements the curve actually needs, asked at the
-                    # boundaries the search just chose. Cheap (a fraction of
-                    # a second), and it is the question people most want
-                    # answered: not "how stiff is the nucleus" but "is there
-                    # anything there to measure".
-                    picked = (found.get("composition") or {}) if found.get("success") else {}
-                    st.session_state["component_search"] = recommend_components(
-                        model, guided_lo, guided_hi,
-                        candidates=terms_for(st.session_state["cell_type"]),
-                        e1=float(picked.get("break_1",
-                                            st.session_state["segment_break_1"])),
-                        e2=float(picked.get("break_2",
-                                            st.session_state["segment_break_2"])),
-                        membrane=picked.get("membrane", "continue"),
-                        cyto_start=picked.get("cyto_start", "zero"),
-                        weighting=st.session_state["weighting"],
-                        cv_repeats=2,
-                    )
-                    if found.get("success"):
-                        pending = settings_from_arrangement(found["best"], guided_hi)
+                    found = outcome["hypotheses"]
+                    if outcome["q_scan"] is not None:
+                        st.session_state["confinement_scan"] = outcome["q_scan"]
+                    if outcome["components"] is not None:
+                        st.session_state["component_search"] = outcome["components"]
+                    if found and found.get("success"):
+                        st.session_state["hypothesis_search"] = found
+                        pending = settings_from_hypothesis(
+                            found["best"], epsilon_max=guided_hi, q=outcome["q"],
+                        )
                         pending["window_combined"] = (guided_lo, guided_hi)
-                        measured_q = st.session_state.pop(
-                            "_confinement_from_search", None
-                        )
-                        if measured_q is not None:
-                            pending["confinement"] = measured_q
                         st.session_state["_pending_settings"] = pending
                         st.rerun()
                     else:
-                        st.error(found.get("error", "Could not analyse this curve."))
+                        st.error(
+                            "Could not fit this curve with any of the "
+                            "pictures of this cell type. Try widening the "
+                            "range in Step 1."
+                        )
             with g2:
-                previous = st.session_state.get("arrangement_search")
+                previous = st.session_state.get("hypothesis_search")
                 if previous and previous.get("success"):
-                    st.success(retell(previous["verdict"]))
-                    arrangement_rows = [
-                        {
-                            "arrangement": retell(row["label"].split(":")[0]),
-                            "what it means": retell(row["detail"]),
-                            "predicts held-out points": f"{row['cv_rmse']:.3g}",
-                            "free numbers": row["n_params"],
-                            "carries": (
-                                "no T₀" if row.get("dropped") else "all of them"
-                            ),
-                            "": "← chosen" if row is previous["best"]
-                            else ("ties" if row.get("tied_with_best") else ""),
-                        }
-                        for row in previous["candidates"]
-                    ]
+                    (st.success if previous["clear_cut"] else st.info)(
+                        retell(previous["verdict"])
+                    )
+                    st.caption(
+                        "Every picture below was fitted to this curve with "
+                        "its own boundaries. They are scored on points they "
+                        "were not fitted to, because adding a term can only "
+                        "ever lower the residual on the points it was given."
+                    )
+                    flat_table(
+                        pd.DataFrame([
+                            {
+                                "Picture of the cell": retell(row["label"]),
+                                "Materials": " + ".join(
+                                    plain_name(term) for term in ALL_TERMS
+                                    if term in row["terms"]
+                                ),
+                                "ε₁": f"{row['break_1']:.3f}",
+                                "R²": f"{row['r_squared']:.5f}",
+                                "Predicts held-out points":
+                                    f"{row['cv_rmse']:.3g}",
+                                "Verdict": "← chosen" if row.get("chosen")
+                                else ("ties" if row.get("tied_with_best")
+                                      else ""),
+                            }
+                            for row in previous["candidates"]
+                        ]),
+                        align_right=["ε₁", "R²", "Predicts held-out points"],
+                    )
                 else:
                     st.info(
                         "Press the button and the answer appears here, with "
-                        "the fitted curve below."
+                        "the fitted curve above."
                     )
 
             # ------------------------------------ recommended components
@@ -4155,7 +4440,9 @@ with tab_analysis:
             close_panel(explore_panel)
 
         # --------------------------------------------------------- ranges ---
-        range_panel = open_panel("📏 Where each part takes over", guided)
+        range_panel = open_panel(
+            "📏 Step 4 · Where each material takes over", guided
+        )
         if not guided:
             section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
         st.caption(
@@ -4404,7 +4691,7 @@ with tab_analysis:
                     "segment_break_2": round(float(row["break_2"]), 3),
                     "membrane_after_break": m_label,
                     "cyto_starts_at": c_label,
-                    "use_nucleus": bool(row["use_nucleus"]),
+                    "use_nucleus": bool(row["use_nucleus"]) and has_deep_term(),
                 }
 
             with b2:
@@ -4420,6 +4707,13 @@ with tab_analysis:
                         found = model.search_compositions(
                             fit_lo, fit_hi,
                             weighting=st.session_state["weighting"],
+                            # A cell type with no deep element must not be
+                            # offered one here either. Two searches on one
+                            # page that disagree about what the cell is made
+                            # of is worse than having only one of them.
+                            nucleus_mode=(
+                                "search" if has_deep_term() else "off"
+                            ),
                         )
                     st.session_state["composition_search"] = found
                     if found.get("success"):
@@ -4732,7 +5026,7 @@ with tab_analysis:
         # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
         close_panel(range_panel)
 
-        fit_panel = open_panel("🚀 Fitting options", guided)
+        fit_panel = open_panel("🔧 Step 5 · Fitting options", guided)
         if not guided:
             section("6 · Fit" if segmented else "5 · Fit")
 
@@ -5238,19 +5532,28 @@ with tab_analysis:
                             )
 
             # What the squash did to the sarcomeres. Geometry rather than a
-            # fitted result, and only meaningful where there are sarcomeres,
-            # but it is the check that says whether the myofibril modulus
-            # describes muscle doing something muscle does.
+            # fitted result: the sarcomeres are not a spring in this model,
+            # they are part of the one incompressible interior. This is the
+            # check that says whether the cell was squashed through a range
+            # where muscle still behaves like muscle.
             if (
-                st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS
+                st.session_state["cell_type"] in HAS_SARCOMERES
                 and hasattr(model, "sarcomere_report")
             ):
+                # An onset belongs to a deep spring. Without one there is
+                # nothing switching on, so the read-out covers the whole
+                # fitted range rather than quoting a boundary that is not in
+                # the model.
+                deep_onset = (
+                    fit.get("break_2") if "nucleus" in (fit.get("terms") or ())
+                    else None
+                )
                 free = model.sarcomere_report(
-                    fit["epsilon_range"][1], onset=fit.get("break_2"),
+                    fit["epsilon_range"][1], onset=deep_onset,
                     spread=float(st.session_state["sarcomere_spread"]),
                 )
                 held = model.sarcomere_report(
-                    fit["epsilon_range"][1], onset=fit.get("break_2"), spread=0.0,
+                    fit["epsilon_range"][1], onset=deep_onset, spread=0.0,
                 )
                 with st.expander(
                     "🧬 What the squash did to the sarcomeres",
@@ -5303,7 +5606,7 @@ with tab_analysis:
                             f"falls away with further stretch. Your fitted "
                             f"range reaches ε = {free['epsilon_max']:.2f}, "
                             f"which is {free['at_epsilon_max_nm']:.0f} nm. "
-                            f"Over that stretch the myofibril modulus "
+                            f"Over that stretch the interior modulus "
                             f"measures passive structure pulled beyond its "
                             f"working length, not contractile machinery at a "
                             f"length it ever works at. That may be exactly "
@@ -5671,7 +5974,11 @@ with tab_analysis:
                                     ),
                                     show_nucleus="nucleus" in active,
                                     show_tension="tension" in active,
-                                    deep_onset=fit.get("break_2"),
+                                    deep_onset=(
+                                        fit.get("break_2")
+                                        if "nucleus" in (fit.get("terms") or ())
+                                        else None
+                                    ),
                                     # A cardiomyocyte is a shell holding
                                     # fluid, and the model does not
                                     # discriminate a nucleus from the rest
@@ -5680,7 +5987,7 @@ with tab_analysis:
                                     interior=(
                                         "fluid"
                                         if st.session_state["cell_type"]
-                                        in DEEP_IS_MYOFIBRILS else "spring"
+                                        in INCOMPRESSIBLE_INTERIOR else "spring"
                                     ),
                                 ),
                             ),
@@ -5786,29 +6093,29 @@ with tab_analysis:
 
             # ------------------------------------------------- diagnostics
             with st.expander("🔍 Fit diagnostics"):
-                share_cols = st.columns(4)
-                share_cols[0].metric(
-                    "Membrane share at ε_max",
-                    f"{100 * fit['membrane_fraction_at_max']:.1f} %"
-                    if np.isfinite(fit.get("membrane_fraction_at_max", np.nan))
-                    else "n/a",
-                )
-                share_cols[1].metric(
-                    "Cytoskeleton share",
-                    f"{100 * fit['interior_fraction_at_max']:.1f} %"
-                    if np.isfinite(fit.get("interior_fraction_at_max", np.nan))
-                    else "n/a",
-                )
-                share_cols[2].metric(
-                    f"{plain_name('nucleus')} share",
-                    f"{100 * fit['nucleus_fraction_at_max']:.1f} %"
-                    if np.isfinite(fit.get("nucleus_fraction_at_max", np.nan))
-                    else "n/a",
-                )
+                # One column per material actually in the fit, and never a
+                # column for one that is not: a share of the load reported
+                # for a material the model does not have reads as a
+                # measurement of it.
+                shares = [
+                    (f"{plain_name('membrane')} share at ε_max",
+                     fit.get("membrane_fraction_at_max", np.nan)),
+                    (f"{plain_name('interior')} share",
+                     fit.get("interior_fraction_at_max", np.nan)),
+                ]
+                if "nucleus" in (fit.get("terms") or ()):
+                    shares.append((f"{plain_name('nucleus')} share",
+                                   fit.get("nucleus_fraction_at_max", np.nan)))
+                share_cols = st.columns(len(shares) + 1)
+                for column, (label, value) in zip(share_cols, shares):
+                    column.metric(
+                        label,
+                        f"{100 * value:.1f} %" if np.isfinite(value) else "n/a",
+                    )
                 if fit.get("mode") == "staged":
-                    share_cols[3].metric("Refinement passes", fit["n_iterations"])
+                    share_cols[-1].metric("Refinement passes", fit["n_iterations"])
                 else:
-                    share_cols[3].metric(
+                    share_cols[-1].metric(
                         "Condition number",
                         f"{fit['condition_number']:.1f}"
                         if np.isfinite(fit.get("condition_number", np.nan))
@@ -5913,7 +6220,7 @@ with tab_analysis:
                         f"R_deep = {fit.get('R0', 0.0) * 1e6:.3f} um   "
                         f"(the cell's own, since the deep layer runs its "
                         f"length)\n"
-                        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS
+                        if st.session_state["cell_type"] in HAS_SARCOMERES
                         else f"R_deep = "
                              f"{fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
                     ) +
@@ -6195,6 +6502,17 @@ with tab_explore:
         "order changes, so any difference in how well they fit is a "
         "difference about the order and nothing else."
     )
+
+    with st.expander("📋 The materials, the law each obeys, and why they separate"):
+        materials_table(
+            terms_for(st.session_state["cell_type"]),
+            caption=(
+                "Every material this cell type can be fitted with. The last "
+                "column is the one that decides whether a modulus means "
+                "anything."
+            ),
+        )
+        separation_rule()
 
     st.divider()
     section("What this curve says")
