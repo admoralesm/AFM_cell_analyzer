@@ -680,8 +680,8 @@ def cell_schematic(
     label_size = max(10, style.tick_size - 8)
     small = max(9, style.tick_size - 10)
 
-    _hatched_ground(fig, 4, 96, GROUND_Y, 8)
-    fig.add_shape(type="rect", x0=6, x1=94, y0=PLATEN_Y, y1=PLATEN_Y + 7,
+    _hatched_ground(fig, 6, 94, GROUND_Y, 8)
+    fig.add_shape(type="rect", x0=8, x1=92, y0=PLATEN_Y, y1=PLATEN_Y + 7,
                   fillcolor="#566573", line=dict(width=0))
     fig.add_annotation(
         x=50, y=PLATEN_Y + 3.5, text="<b>cantilever</b>", showarrow=False,
@@ -707,7 +707,30 @@ def cell_schematic(
         showarrow=False, font=dict(size=label_size, color="#2c3e50"),
     )
 
-    def draw_element(term, x, y_bottom, y_top, width):
+    def wrap(text, limit):
+        """Break a name at spaces so a caption is a column, not a banner.
+
+        Every caption is centred on its own spring, so a long one written on
+        one line reaches into its neighbour's. Wrapping is what stops four
+        elements' labels from lying on top of each other.
+        """
+        words, lines, line = str(text).split(), [], ""
+        for word in words:
+            trial = f"{line} {word}".strip()
+            if len(trial) > limit and line:
+                lines.append(line)
+                line = word
+            else:
+                line = trial
+        if line:
+            lines.append(line)
+        return "<br>".join(lines)
+
+    # How wide a caption may be, and how far it may drop, both follow from
+    # how many elements have to share the width.
+    caption_limit = 22 if len(terms) < 3 else (16 if len(terms) == 3 else 13)
+
+    def draw_element(term, x, y_bottom, y_top, width, row=0):
         """One spring, with a gap or a lock when the model says so."""
         colour = COLORS[term] if state[term] == "loading" else FADED[term]
         # The spring itself is always drawn solid. A dotted zigzag reads as a
@@ -747,16 +770,25 @@ def cell_schematic(
         )
 
         value, unit, symbol = moduli[term]
-        caption = f"<b>{names[term][0]}</b>"
+        caption = f"<b>{wrap(names[term][0], caption_limit)}</b>"
         if value is not None and style.show_schematic_moduli:
             caption += f"<br>{symbol} = {value:.3g} {unit}"
         caption += f"<br>{LAW[term]}"
         if note:
-            caption += f"<br><i>{note}</i>"
+            caption += f"<br><i>{wrap(note, caption_limit + 4)}</i>"
+        # Alternating rows. Even wrapped, four captions side by side are
+        # tight; dropping every other one clears the gap entirely and costs
+        # only vertical space, which this figure has.
         fig.add_annotation(
-            x=x, y=LABEL_Y, text=caption, showarrow=False,
+            x=x, y=LABEL_Y - row * 13.0, text=caption, showarrow=False,
             yanchor="top", font=dict(size=small, color=colour),
         )
+        if row:
+            fig.add_shape(
+                type="line", x0=x, x1=x, y0=LABEL_Y - row * 13.0 + 1.0,
+                y1=LABEL_Y - 1.0,
+                line=dict(color=colour, width=1, dash="dot"),
+            )
 
     if coupling == "series":
         # One column: same force through each, the squashes adding.
@@ -771,9 +803,12 @@ def cell_schematic(
             y += slice_h
         subtitle = "Stacked: same force through each, squashes add"
     else:
-        spacing = 88.0 / max(len(terms), 1)
+        # Inset from the axis edges, so a caption centred on the outermost
+        # spring still has half its width inside the figure.
+        margin = 9.0 if len(terms) > 2 else 14.0
+        spacing = (100.0 - 2 * margin) / max(len(terms), 1)
         for index, term in enumerate(terms):
-            x = 6 + spacing * (index + 0.5)
+            x = margin + spacing * (index + 0.5)
             fig.add_shape(type="line", x0=x, x1=x, y0=PLATEN_Y, y1=PLATEN_Y - 3,
                           line=dict(color="#2c3e50", width=2))
             fig.add_shape(type="line", x0=x, x1=x, y0=GROUND_Y, y1=GROUND_Y + 3,
@@ -782,15 +817,23 @@ def cell_schematic(
             # a coil needs amplitude to read as a coil. The room comes from
             # the spacing instead.
             draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
-                         16 if len(terms) < 4 else 13)
+                         16 if len(terms) < 4 else 13,
+                         row=index % 2 if len(terms) > 2 else 0)
         subtitle = "Side by side: same squash on each, forces add"
 
     fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True)
-    fig.update_yaxes(visible=False, range=[LABEL_Y - 26, PLATEN_Y + 34],
+    # Room for the dropped row of captions, when there is one.
+    drop = 13.0 if (coupling != "series" and len(terms) > 2) else 0.0
+    fig.update_yaxes(visible=False,
+                     range=[LABEL_Y - 30 - drop, PLATEN_Y + 34],
                      fixedrange=True)
+    # Taller when there is more to fit. The panel beside the curve is
+    # narrow, so the drawing gains room by growing downwards rather than by
+    # shrinking everything until the labels are unreadable.
+    crowd = max(0, len(terms) - 2)
     fig.update_layout(
-        height=height or max(340, int(style.height * 0.74)),
-        margin=dict(l=6, r=6, t=30, b=6),
+        height=height or max(340 + 40 * crowd, int(style.height * 0.74) + 30 * crowd),
+        margin=dict(l=4, r=4, t=28, b=4),
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
         title=dict(
             text=f"<b>{subtitle}</b>",
@@ -809,6 +852,7 @@ def balloon_figure(
     show_nucleus=True,
     show_tension=False,
     deep_onset=None,
+    interior="spring",
     height=None,
 ):
     """
@@ -822,8 +866,17 @@ def balloon_figure(
     Drawn from the same numbers as everything else. The outline is a stadium
     of constant area, which is what a squashed cylinder's cross-section
     actually is, so the widening is the real widening rather than a
-    suggestion of one, and the spring inside shortens by exactly the
-    deformation on display.
+    suggestion of one.
+
+    ``interior`` says what is inside, and the two are different cells.
+
+    ``"spring"``  a scaffolding that resists on its own, with a distinct
+                  body at the centre. A rounded-up cell with a nucleus.
+    ``"fluid"``   a shell holding fluid that does not compress, with
+                  myofibrils running the length of the cell. Nothing at the
+                  centre is singled out, because in a cardiomyocyte nothing
+                  is: the model does not discriminate a nucleus from the
+                  rest of the interior, and drawing one would claim it does.
     """
     names = labels or {
         "membrane": ("Membrane", ""), "interior": ("Cytoskeleton", ""),
@@ -870,34 +923,71 @@ def balloon_figure(
         hoverinfo="skip", line=dict(color="#1f77b4", width=6),
     ))
 
-    # ---- the spring inside, standing between the plates
-    inner_bottom = centre_y - half_height + 3.0
-    inner_top = centre_y + half_height - 3.0
-    xs, ys = _zigzag(centre_x, inner_bottom, inner_top, 15.0)
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
-        line=dict(color="#e67e22", width=5, shape="spline"),
-    ))
+    # ---- what is inside
+    if interior == "fluid":
+        # Fluid that does not compress. It is drawn as fill and arrows
+        # rather than as a spring, because it does not resist by being
+        # elastic: it resists by having nowhere to go, which is why the
+        # force runs away as the cell is flattened.
+        for side in (-1, 1):
+            fig.add_annotation(
+                x=centre_x + side * (width + half_height * 0.35),
+                y=centre_y,
+                ax=centre_x + side * (width * 0.25 + half_height * 0.1),
+                ay=centre_y,
+                xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=2, arrowsize=1.0, arrowwidth=3,
+                arrowcolor="#e67e22", text="",
+            )
+        fig.add_annotation(
+            x=centre_x, y=centre_y + half_height * 0.06,
+            text="<i>fluid, does not compress</i>", showarrow=False,
+            font=dict(size=max(8, style.tick_size - 11), color="#b9770e"),
+        )
+    else:
+        inner_bottom = centre_y - half_height + 3.0
+        inner_top = centre_y + half_height - 3.0
+        xs, ys = _zigzag(centre_x, inner_bottom, inner_top, 15.0)
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="#e67e22", width=5, shape="spline"),
+        ))
 
     # ---- the deeper element, met only once the plates get down to it
     if show_nucleus:
         reached = deep_onset is None or eps >= float(deep_onset)
-        deep_h = min(7.0, half_height * 0.45)
-        fig.add_shape(
-            type="circle",
-            x0=centre_x - deep_h * 1.6, x1=centre_x + deep_h * 1.6,
-            y0=centre_y - deep_h, y1=centre_y + deep_h,
-            fillcolor="rgba(142, 68, 173, 0.55)" if reached
-            else "rgba(201, 176, 216, 0.30)",
-            line=dict(color="#8e44ad" if reached else "#c9b0d8",
-                      width=4, dash="solid" if reached else "dot"),
-        )
+        strong, faint = "#8e44ad", "#c9b0d8"
+        colour = strong if reached else faint
+        if interior == "fluid":
+            # Myofibrils run the length of the cell, so they are drawn as
+            # bundles lying along it rather than as a body at the centre.
+            # Nothing here is a nucleus, and nothing should look like one.
+            reach = width + half_height * 0.55
+            for level in (-0.45, 0.0, 0.45):
+                y = centre_y + half_height * level * 0.9
+                fig.add_trace(go.Scatter(
+                    x=[centre_x - reach, centre_x + reach], y=[y, y],
+                    mode="lines", showlegend=False, hoverinfo="skip",
+                    line=dict(color=colour, width=6,
+                              dash="solid" if reached else "dot"),
+                ))
+        else:
+            deep_h = min(7.0, half_height * 0.45)
+            fig.add_shape(
+                type="circle",
+                x0=centre_x - deep_h * 1.6, x1=centre_x + deep_h * 1.6,
+                y0=centre_y - deep_h, y1=centre_y + deep_h,
+                fillcolor="rgba(142, 68, 173, 0.55)" if reached
+                else "rgba(201, 176, 216, 0.30)",
+                line=dict(color=colour, width=4,
+                          dash="solid" if reached else "dot"),
+            )
         fig.add_annotation(
             x=centre_x, y=centre_y - half_height - 7,
             text=f"<b>{names['nucleus'][0]}</b>"
                  + ("" if reached else "<br><i>not reached yet</i>"),
             showarrow=False, font=dict(size=max(9, style.tick_size - 9),
-                                       color="#8e44ad" if reached else "#c9b0d8"),
+                                       color=colour),
             yanchor="top",
         )
 
@@ -908,7 +998,7 @@ def balloon_figure(
         font=dict(size=max(9, style.tick_size - 9), color="#1f77b4"),
     )
     fig.add_annotation(
-        x=centre_x - 10, y=centre_y + half_height * 0.55,
+        x=centre_x - width - half_height - 3, y=centre_y - half_height * 0.45,
         text=f"<b>{names['interior'][0]}</b>", showarrow=False, xanchor="right",
         font=dict(size=max(9, style.tick_size - 9), color="#e67e22"),
     )
@@ -950,7 +1040,8 @@ def balloon_figure(
         height=height or max(340, int(style.height * 0.74)),
         margin=dict(l=6, r=6, t=28, b=6),
         plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
-        title=dict(text="<b>A balloon with a spring inside</b>",
+        title=dict(text=("<b>A balloon holding fluid</b>" if interior == "fluid"
+                         else "<b>A balloon with a spring inside</b>"),
                    font=dict(size=max(11, style.tick_size - 5), color="black"),
                    x=0.5, xanchor="center"),
     )
