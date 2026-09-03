@@ -1119,3 +1119,155 @@ def exponent_profile_figure(profile, style: PlotStyle, break_1=None, break_2=Non
     _style_axes(fig, style, "Relative deformation, ε", "Local exponent")
     fig.update_yaxes(range=[0, 4.4], dtick=1)
     return fig
+
+
+# Colours for the ordering candidates, in the order ORDERINGS lists them.
+# Fixed by position rather than picked per figure so that "the green one" is
+# the same claim in the chart, the table and the slope panel.
+ORDER_COLORS = ("#2ca02c", "#8c564b", "#1f77b4", "#d62728", "#9467bd", "#ff7f0e")
+
+
+def ordering_figure(epsilon, force_N, style: PlotStyle, curves,
+                    title="Which spring answers first?"):
+    """
+    The measured curve with one predicted curve per ordering laid over it.
+
+    ``curves`` is a list of dicts with ``label``, ``epsilon``, ``force_N``,
+    optionally ``break_1`` and ``chosen``. They are all fits of the same data
+    with the same elements, differing only in which spring is loaded when, so
+    drawing them together is the comparison: where they separate is where the
+    curve carries information about the order, and where they lie on top of
+    each other is where it does not.
+
+    Log force by default, because the orderings differ near contact, and on a
+    linear axis the first third of a whole-cell compression curve is a flat
+    line along the bottom.
+    """
+    epsilon = np.asarray(epsilon, dtype=float)
+    y, unit_label = from_newtons(force_N, style.force_unit)
+    positive = y > 0
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=epsilon, y=y, mode="markers", name="measured",
+            marker=dict(size=style.marker_size, color=style.data_color,
+                        opacity=0.55),
+            hovertemplate="ε = %{x:.3f}<br>F = %{y:.3f} "
+                          + unit_label + "<extra></extra>",
+        )
+    )
+    for index, curve in enumerate(curves or []):
+        colour = ORDER_COLORS[index % len(ORDER_COLORS)]
+        chosen = bool(curve.get("chosen"))
+        fitted, _ = from_newtons(curve.get("force_N", []), style.force_unit)
+        fig.add_trace(
+            go.Scatter(
+                x=np.asarray(curve.get("epsilon", []), dtype=float),
+                y=fitted,
+                mode="lines",
+                name=curve.get("label", f"ordering {index + 1}")
+                + (" ← best" if chosen else ""),
+                line=dict(
+                    color=colour,
+                    width=style.line_width + (2 if chosen else 0),
+                    dash="solid" if chosen else "dot",
+                ),
+                hovertemplate="ε = %{x:.3f}<br>F = %{y:.3f} "
+                              + unit_label + "<extra></extra>",
+            )
+        )
+        # Where this ordering says the second spring arrives. Only for the
+        # chosen one: four vertical lines on one chart is a fence.
+        mark = curve.get("break_1")
+        if chosen and mark is not None:
+            fig.add_vline(
+                x=float(mark),
+                line=dict(color=colour, width=2, dash="dot"),
+                annotation_text="ε₁",
+                annotation_position="top",
+                annotation_font_size=max(10, style.tick_size - 6),
+                annotation_font_color=colour,
+            )
+
+    _base_layout(fig, style, title)
+    fig.update_layout(showlegend=True)
+    _style_axes(
+        fig, style, "Relative deformation, ε", f"Force ({unit_label})",
+        log_y=True,
+    )
+    if positive.any():
+        floor = float(np.min(y[positive]))
+        ceiling = float(np.max(y[positive]))
+        if floor > 0 and ceiling > floor:
+            fig.update_yaxes(
+                range=[np.log10(floor * 0.6), np.log10(ceiling * 1.8)]
+            )
+    return fig
+
+
+def ordering_slope_figure(profile, style: PlotStyle, measured=None,
+                          upto=None, expected=(),
+                          title="What the start of the curve says"):
+    """
+    The measured local exponent, with the exponent each ordering predicts.
+
+    The whole ordering question reduces to one readable number: a balloon
+    alone rises as ε³, a Hertzian spring alone as ε³ᐟ², and both together sit
+    between. This panel puts the curve's own slope against those three lines
+    so the reader can decide before any fitting is mentioned.
+    """
+    eps = np.asarray(profile.get("epsilon", []), dtype=float)
+    exponent = np.asarray(profile.get("exponent", []), dtype=float)
+    fig = go.Figure()
+    if eps.size:
+        fig.add_trace(
+            go.Scatter(
+                x=eps, y=exponent, mode="lines",
+                name="measured slope",
+                line=dict(color=style.data_color, width=style.line_width),
+                hovertemplate="ε = %{x:.3f}<br>slope = %{y:.2f}<extra></extra>",
+            )
+        )
+    for value, label, colour in (
+        (3.0, "3 · balloon alone (ε³)", "#2ca02c"),
+        (1.5, "3/2 · spring alone (ε³ᐟ²)", "#9467bd"),
+    ):
+        fig.add_hline(
+            y=value, line=dict(color=colour, width=2, dash="dash"),
+            annotation_text=label, annotation_position="top left",
+            annotation_font_size=max(10, style.tick_size - 8),
+            annotation_font_color=colour,
+        )
+    for value, label in expected:
+        if value is None or not np.isfinite(float(value)):
+            continue
+        if float(value) in (3.0, 1.5):
+            continue
+        fig.add_hline(
+            y=float(value), line=dict(color="#7f7f7f", width=1.5, dash="dot"),
+            annotation_text=label, annotation_position="bottom left",
+            annotation_font_size=max(10, style.tick_size - 8),
+            annotation_font_color="#7f7f7f",
+        )
+    if measured is not None and np.isfinite(float(measured)):
+        fig.add_trace(
+            go.Scatter(
+                x=[eps.min() if eps.size else 0.0,
+                   float(upto) if upto is not None else
+                   (eps.max() if eps.size else 1.0)],
+                y=[float(measured), float(measured)],
+                mode="lines", name=f"first stretch: ε^{float(measured):.2f}",
+                line=dict(color=style.fit_color, width=style.line_width + 1),
+                hovertemplate="fitted over the first stretch<extra></extra>",
+            )
+        )
+    _base_layout(fig, style, title)
+    fig.update_layout(
+        height=max(320, int(style.height * 0.65)),
+        showlegend=True,
+        margin=dict(r=70),
+    )
+    _style_axes(fig, style, "Relative deformation, ε", "Local exponent")
+    fig.update_yaxes(range=[0, 4.4], dtick=1)
+    return fig
