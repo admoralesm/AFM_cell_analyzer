@@ -919,19 +919,23 @@ def case_range_table_shows_zero_moduli():
     check("the range table is on the page in full control", target is not None)
     if target is None:
         return
-    for column in ("E membrane", "E cytoskeleton", "E nucleus"):
+    import app as app_module
+    deep = "E " + app_module.plain_name("nucleus", "Myoblast (C2C12)").lower()
+    for column in ("E membrane", "E cytoskeleton", deep):
         check(f"{column} column present", column in target.columns,
               str(list(target.columns)))
+    if deep not in target.columns:
+        return
     first = target.iloc[0]
     check("the first range carries only the membrane",
           first["E cytoskeleton"].startswith("0")
-          and first["E nucleus"].startswith("0"),
-          f"{first['E cytoskeleton']!r} {first['E nucleus']!r}")
+          and first[deep].startswith("0"),
+          f"{first['E cytoskeleton']!r} {first[deep]!r}")
     check("and the membrane is non-zero there",
           not first["E membrane"].startswith("0 "), str(first["E membrane"]))
     last = target.iloc[-1]
-    check("the last range carries the nucleus",
-          not last["E nucleus"].startswith("0 "), str(last["E nucleus"]))
+    check("the last range carries what is inside the nucleus",
+          not last[deep].startswith("0 "), str(last[deep]))
 
 
 def case_plot_options_are_under_the_plot():
@@ -1237,15 +1241,18 @@ def case_component_names_follow_the_cell_type():
           str(cardio["interior"]))
     check("and it is described as incompressible",
           "incompressible" in cardio["interior"][1], str(cardio["interior"]))
-    check("there is no deep element to name",
-          "nucleus" not in cardio, str(list(cardio)))
+    check("there is no deep element to fit",
+          "nucleus" not in app_module.OPTIONAL_TERMS["Cardiomyocyte"],
+          str(app_module.OPTIONAL_TERMS["Cardiomyocyte"]))
+    check("and the deep slot is named myofibrils, never a nucleus",
+          "myofibril" in cardio["nucleus"][0].lower(), str(cardio["nucleus"]))
     check("every element carries an emoji, so the labels can be told apart",
           all(bare(v[0]) != v[0] for v in cardio.values()),
           str([v[0] for v in cardio.values()]))
     # The membrane is two springs for this cell type, and they have to be
     # named as two things, not one thing twice.
-    check("the taut protein network is one of them",
-          "taut" in cardio["tension"][1], str(cardio["tension"]))
+    check("the in-plane spring is one of them",
+          "in-plane spring" in cardio["tension"][1], str(cardio["tension"]))
     check("the shell's own elasticity is the other",
           "stretch" in cardio["membrane"][1], str(cardio["membrane"]))
     check("a myoblast has no tension spring",
@@ -1266,8 +1273,8 @@ def case_component_names_follow_the_cell_type():
               any("myofibril" in v.lower() for v in listed), str(listed))
         check("and never calls anything a nucleus",
               not any("Nucleus" in v for v in listed), str(listed))
-        check("the membrane is one term unless the extra one is asked for",
-              sum("Membrane" in v for v in listed) == 1, str(listed))
+        check("the membrane's two springs are listed as two",
+              sum("Membrane" in v for v in listed) == 2, str(listed))
     check("the fit succeeds for a cardiomyocyte",
           app.session_state["_last_fit"] is not None
           and app.session_state["_last_fit"].get("success"))
@@ -1483,7 +1490,8 @@ def case_guided_order_follows_the_work():
 
     # The part checkboxes must exist exactly once, in Step 2.
     labels = [c.label for c in app.checkbox]
-    for term in ("Membrane", "Cytoskeleton", "Nucleus"):
+    for term in ("Membrane", "Cytoskeleton", "Nuclear envelope",
+                 "Inside the nucleus"):
         matching = [l for l in labels if bare(l).startswith(term)]
         check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
 
@@ -1930,7 +1938,7 @@ def case_four_element_model():
 
     blank = LulevichModel(np.zeros_like(eps), eps, **geometry)
     basis = blank.composition_basis(eps, 0.15, 0.40, "continue", "zero")
-    check("there are four basis functions", len(basis) == 4, str(sorted(basis)))
+    check("there are five basis functions", len(basis) == 5, str(sorted(basis)))
 
     # The two membrane laws must not be the same shape, or the split between
     # them is arbitrary and the numbers wander from cell to cell.
@@ -2439,8 +2447,25 @@ def case_the_cardiomyocyte_picture_holds_fluid():
     )
     check("a myoblast still gets a spring inside",
           "spring inside" in str(spring.layout.title.text))
-    check("and a body at its centre",
-          any(sh.type == "circle" for sh in spring.layout.shapes))
+    # Not a bead at the centre any more: a shorter balloon with a spring of
+    # its own, because that is what the model now says a nucleus is.
+    closed = [
+        tr for tr in spring.data
+        if getattr(tr, "fill", None) == "toself" and tr.x is not None
+    ]
+    check("and a balloon of its own inside it", len(closed) >= 2,
+          str(len(closed)))
+    inner = plot_utils.balloon_figure(
+        style, epsilon=0.5, cell_height_um=8.0, deep_onset=0.40,
+        interior="spring", show_nucleus=True, show_nucleus_shell=True,
+    )
+    coils = [
+        tr for tr in inner.data
+        if tr.x is not None and len(tr.x) > 20
+        and getattr(tr, "fill", None) != "toself"
+    ]
+    check("with a spring drawn inside that one too", len(coils) >= 3,
+          str(len(coils)))
 
     import app as app_module
     check("a cardiomyocyte is drawn as the balloon by default",
@@ -2761,7 +2786,7 @@ def case_named_hypotheses_are_compared():
           str([p["terms"] for p in picks]))
 
     # The genotype decides what is worth comparing.
-    knockout = app_module.cardiomyocyte_hypotheses("Deleted (knockout)")
+    knockout = app_module.cardiomyocyte_hypotheses("Removed (knockout)")
     check("a knockout is never offered the spring",
           not any("tension" in p["terms"] for p in knockout),
           str([p["key"] for p in knockout]))
@@ -2902,8 +2927,9 @@ def case_no_nucleus_wording_for_a_cardiomyocyte():
           "Nucleus" not in [
               v[0] for v in app_module.COMPONENT_SETS["Cardiomyocyte"].values()
           ])
-    check("but a myoblast still has one",
-          app_module.plain_name("nucleus", "Myoblast (C2C12)") == "Nucleus",
+    check("but a myoblast still names one",
+          "nucleus" in app_module.plain_name(
+              "nucleus", "Myoblast (C2C12)").lower(),
           app_module.term_name("nucleus", "Myoblast (C2C12)"))
     check("and a cardiomyocyte has no deep slot at all",
           "nucleus" not in app_module.OPTIONAL_TERMS["Cardiomyocyte"],
@@ -3559,8 +3585,9 @@ def case_clone_keeps_the_whole_geometry():
 def case_the_cardiomyocyte_has_three_springs():
     print("a cardiomyocyte is a shell around one incompressible interior")
     import app as app_module
-    check("the myoblast has three",
-          len(app_module.terms_for("Myoblast (C2C12)")) == 3)
+    check("the myoblast has four: its nucleus is an envelope and a filling",
+          len(app_module.terms_for("Myoblast (C2C12)")) == 4,
+          str(app_module.terms_for("Myoblast (C2C12)")))
     # Three, not four. There is no deep element: a nucleus cannot be told
     # apart from the rest of a cardiomyocyte's interior, and the myofibrils
     # fill the cell rather than waiting deep inside it.
@@ -3575,8 +3602,14 @@ def case_the_cardiomyocyte_has_three_springs():
           str(app_module.COMPONENT_SETS["Cardiomyocyte"]["interior"]))
     check("the deep spring is off in its defaults",
           app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["nucleus"] is False)
-    check("and so is the extra membrane protein, until asked for",
-          app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["tension"] is False)
+    # The in-plane spring is part of a wild-type membrane, so it is on. The
+    # experiment is the knockout that removes it, not an extra that gets
+    # added.
+    check("the in-plane spring is on, because the wild type has one",
+          app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["tension"] is True)
+    check("and choosing the knockout takes it out of the model",
+          not any("tension" in p["terms"] for p in
+                  app_module.cardiomyocyte_hypotheses("Removed (knockout)")))
     check("its interior is treated as incompressible",
           "Cardiomyocyte" in app_module.INCOMPRESSIBLE_INTERIOR)
 
@@ -4285,6 +4318,216 @@ def case_materials_are_explained_by_their_law():
           "different shapes" in everything or "wearing two names" in everything)
 
 
+def case_the_nucleus_is_a_balloon_too():
+    print("the nucleus is an envelope around a filling, and both are found")
+    eps = np.linspace(0.002, 0.62, 320)
+    seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    basis = seed.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    check("the envelope has a basis function of its own",
+          "nucleus_shell" in basis)
+    # It must not be the same shape as what it contains, or the split
+    # between them is arbitrary. Same onset, so the exponents do the work.
+    shell = basis["nucleus_shell"] / max(basis["nucleus_shell"].max(), 1e-30)
+    inside = basis["nucleus"] / max(basis["nucleus"].max(), 1e-30)
+    # Normalised to the same peak, u^3 and u^1.5 differ by exactly 0.25 at
+    # their furthest apart. That gap is the whole reason a fit can split
+    # them, so it is checked rather than assumed.
+    check("it is a cube law where the filling is Hertzian",
+          float(np.max(np.abs(shell - inside))) > 0.2,
+          f"largest difference {float(np.max(np.abs(shell - inside))):.3f}")
+    check("both start at ε₂ and not before",
+          float(np.max(np.abs(shell[eps < 0.40]))) == 0.0
+          and float(np.max(np.abs(inside[eps < 0.40]))) == 0.0)
+
+    truth = {"Em": 0.6e6, "Ec": 1.2e3, "Ene": 0.4e6, "En": 3.0e3}
+    force = (basis["membrane"] * truth["Em"] + basis["interior"] * truth["Ec"]
+             + basis["nucleus_shell"] * truth["Ene"]
+             + basis["nucleus"] * truth["En"])
+    rng = np.random.default_rng(0)
+    noisy = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
+    model = LulevichModel(noisy, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(
+        0.0, 0.62, 0.15, 0.40, "freeze", "break",
+        use_nucleus=True, use_nucleus_shell=True, weighting="uniform",
+    )
+    for key, want, tol in (("Em_MPa", 0.6, 0.05), ("Ei_kPa", 1.2, 0.1),
+                           ("Ene_MPa", 0.4, 0.05), ("En_kPa", 3.0, 0.3)):
+        check(f"{key} is recovered", abs(fit[key] - want) < tol,
+              f"{fit[key]:.4g} against {want}")
+    # The one that catches a term left out of the predicted sum: a modulus
+    # can come back right while the curve drawn from it is wrong.
+    check("and the fit follows the curve it was given",
+          fit["r_squared"] > 0.999, f"R2 {fit['r_squared']:.6f}")
+    rebuilt = model.composition_curve(eps, fit)
+    check("the rebuilt curve carries the envelope too",
+          float(np.max(np.abs(rebuilt - force))) < 0.02 * float(force.max()),
+          f"worst gap {float(np.max(np.abs(rebuilt - force))):.3e}")
+
+    # And the search finds the whole picture on its own.
+    import app as app_module
+    from lulevich_model import compare_hypotheses
+    scored = compare_hypotheses(
+        model, 0.0, 0.62, app_module.HYPOTHESES["Myoblast (C2C12)"],
+        weighting="uniform", cv_repeats=2, n_grid=8,
+    )
+    check("the comparison ran", scored.get("success"), str(scored.get("error")))
+    if scored.get("success"):
+        best = scored["best"]
+        check("it picks the picture the curve was built from",
+              best["key"] == "handover_with_envelope", best["key"])
+        check("with ε₁ where it belongs", abs(best["break_1"] - 0.15) < 0.03,
+              f"{best['break_1']:.3f}")
+        check("and ε₂ where it belongs", abs(best["break_2"] - 0.40) < 0.03,
+              f"{best['break_2']:.3f}")
+        check("and the envelope carrying load",
+              best.get("Ene_MPa", 0.0) > 0.2, str(best.get("Ene_MPa")))
+
+
+def case_the_myoblast_nucleus_reaches_the_page():
+    print("a myoblast is fitted with four materials, envelope included")
+    import app as app_module
+    check("the myoblast has four materials",
+          len(app_module.terms_for("Myoblast (C2C12)")) == 4,
+          str(app_module.terms_for("Myoblast (C2C12)")))
+    names = app_module.components_for("Myoblast (C2C12)")
+    check("the envelope is named as a skin",
+          "skin" in names["nucleus_shell"][1], str(names["nucleus_shell"]))
+    check("and what it contains is named separately",
+          names["nucleus"][0] != names["nucleus_shell"][0])
+    check("the envelope has a law of its own",
+          app_module.MATERIAL_LAWS["nucleus_shell"]["exponent"] == "3")
+
+    eps = np.linspace(0.002, 0.62, 300)
+    seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    basis = seed.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    force = (basis["membrane"] * 0.6e6 + basis["interior"] * 1.2e3
+             + basis["nucleus_shell"] * 0.4e6 + basis["nucleus"] * 3.0e3)
+    rng = np.random.default_rng(0)
+    force = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
+
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=900)
+    app.run()
+    app.session_state["cell_name"] = "myo-nucleus"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "myo.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "a myoblast with an envelope"):
+        return
+    fit = app.session_state["_last_fit"]
+    check("it is fitted", fit and fit.get("success"))
+    if not (fit and fit.get("success")):
+        return
+    check("the envelope is one of the fitted terms",
+          "nucleus_shell" in fit["terms"], str(fit["terms"]))
+    check("and it carries load", fit.get("Ene_MPa", 0.0) > 0.1,
+          str(fit.get("Ene_MPa")))
+    check("the fit follows the curve", fit["r_squared"] > 0.999,
+          f"R2 {fit['r_squared']:.6f}")
+    table = table_with(app, "Material", "Force law")
+    check("both halves of the nucleus are in the materials table",
+          table is not None and len(table) == 4,
+          "none" if table is None else str(len(table)))
+
+
+def case_component_heights_are_readable():
+    print("the height labels land inside the axes and do not sit on each other")
+    import plot_utils
+    eps = np.linspace(0.002, 0.60, 260)
+    seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    basis = seed.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    force = (basis["membrane"] * 0.6e6 + basis["interior"] * 1.2e3
+             + basis["nucleus_shell"] * 0.4e6 + basis["nucleus"] * 3.0e3)
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "break",
+                                use_nucleus=True, use_nucleus_shell=True)
+
+    def build(log):
+        style = plot_utils.PlotStyle(
+            force_unit="nN", show_components=True,
+            show_component_heights=True, log_scale=log, height=520,
+        )
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=model.composition_curve(eps, fit),
+            membrane_N=basis["membrane"] * fit["Em"],
+            interior_N=basis["interior"] * fit["Ei"],
+            nucleus_shell_N=basis["nucleus_shell"] * fit["Ene"],
+            nucleus_N=basis["nucleus"] * fit["En"],
+            deep_label="inside the nucleus",
+        )
+
+    for log in (True, False):
+        fig = build(log)
+        labels = [a for a in fig.layout.annotations
+                  if a.text and " nN" in str(a.text)]
+        check(f"{'log' if log else 'linear'}: every curve is labelled",
+              len(labels) == 5, str(len(labels)))
+        # Anchored inside the axes. Hung off the right-hand end with
+        # xanchor="left" they were clipped by the plot area, and ticking the
+        # box appeared to do nothing at all.
+        check(f"{'log' if log else 'linear'}: they sit inside the axes",
+              all(a.xanchor == "right" and (a.xshift or 0) <= 0
+                  for a in labels),
+              str([(a.xanchor, a.xshift) for a in labels]))
+        ys = sorted(float(a.y) for a in labels)
+        gaps = [b - a for a, b in zip(ys, ys[1:])]
+        check(f"{'log' if log else 'linear'}: none lands on another",
+              all(g > 0 for g in gaps), str([round(g, 4) for g in gaps]))
+        check(f"{'log' if log else 'linear'}: each is boxed to be readable",
+              all(a.bgcolor for a in labels))
+
+    # With the heights off, no labels at all.
+    plain = plot_utils.PlotStyle(force_unit="nN", show_components=True,
+                                 show_component_heights=False)
+    quiet = plot_utils.force_curve_figure(
+        eps, force, plain, fit_force_N=model.composition_curve(eps, fit),
+        membrane_N=basis["membrane"] * fit["Em"],
+    )
+    check("switched off, nothing is labelled",
+          not [a for a in quiet.layout.annotations
+               if a.text and " nN" in str(a.text)])
+
+
+def case_the_knockout_removes_a_spring():
+    print("the experiment removes a membrane spring rather than adding one")
+    import app as app_module
+    check("the states are present and removed, not present and added",
+          set(app_module.MEMBRANE_PROTEIN_STATES) == {
+              "Present (wild type)", "Removed (knockout)",
+              "Not known — test for it"},
+          str(list(app_module.MEMBRANE_PROTEIN_STATES)))
+    check("the wild type carries it by default",
+          app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["tension"] is True)
+    check("it is named for the protein the knockout removes",
+          "knockout" in app_module.COMPONENT_SETS[
+              "Cardiomyocyte"]["tension"][1],
+          str(app_module.COMPONENT_SETS["Cardiomyocyte"]["tension"]))
+    wild = app_module.cardiomyocyte_hypotheses("Present (wild type)")
+    check("every wild-type picture has the spring",
+          all("tension" in p["terms"] for p in wild),
+          str([p["key"] for p in wild]))
+    gone = app_module.cardiomyocyte_hypotheses("Removed (knockout)")
+    check("no knockout picture has one",
+          not any("tension" in p["terms"] for p in gone),
+          str([p["key"] for p in gone]))
+
+    # And the genotype wins over a tick left behind, because the protein is
+    # not in the cell.
+    app = start(cell_name="ko-01", cell_type="Cardiomyocyte",
+                membrane_protein="Removed (knockout)", use_tension=True)
+    if not no_exception(app, "a knockout"):
+        return
+    fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
+    check("a knockout is fitted without the spring",
+          "tension" not in fitted, str(fitted))
+    wt = start(cell_name="wt-01", cell_type="Cardiomyocyte",
+               membrane_protein="Present (wild type)")
+    if no_exception(wt, "a wild type"):
+        wt_terms = (wt.session_state["_last_fit"] or {}).get("terms") or []
+        check("and a wild type is fitted with it", "tension" in wt_terms,
+              str(wt_terms))
+
+
 if __name__ == "__main__":
     for case in (
         case_loads_clean,
@@ -4331,6 +4574,10 @@ if __name__ == "__main__":
         case_error_bars_are_reported,
         case_clone_keeps_the_whole_geometry,
         case_the_cardiomyocyte_has_three_springs,
+        case_the_nucleus_is_a_balloon_too,
+        case_the_myoblast_nucleus_reaches_the_page,
+        case_component_heights_are_readable,
+        case_the_knockout_removes_a_spring,
         case_no_deep_spring_costs_nothing,
         case_q_and_the_boundaries_are_searched_together,
         case_one_fitting_routine,
