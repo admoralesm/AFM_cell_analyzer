@@ -1974,6 +1974,59 @@ class _CompositionMixin:
             "why_end": note_end,
         }
 
+    def best_confinement_and_breaks(
+        self, epsilon_min, epsilon_max, membrane="continue", cyto_start="zero",
+        use_nucleus=True, use_tension=False, weighting="uniform", n_grid=6,
+    ):
+        """
+        Search q and the boundaries together, rather than one after the other.
+
+        They are not independent. Where a boundary sits changes which q fits
+        best, and q changes the shape of every term and so where the boundary
+        wants to be. Measuring one at a guess of the other and stopping lands
+        on whichever local optimum the guess was nearest, and on a real
+        cardiomyocyte curve those differ by a third in chi-squared per point
+        with no sign on the page that a better one existed.
+
+        So q is profiled properly: at every candidate q the boundaries are
+        re-found, and the pair with the lowest weighted residual wins. Coarse
+        first, then finer around the winner. Every evaluation is one bounded
+        least-squares solve, which is why this is affordable.
+
+        Returns ``(q, e1, e2)``.
+        """
+        lo, hi = float(epsilon_min), float(epsilon_max)
+        original = self.confinement
+        best = None
+        try:
+            def sweep(values, grid, rounds):
+                found = None
+                for q in values:
+                    self.confinement = float(q)
+                    trial = self._best_breakpoints(
+                        lo, hi, membrane, cyto_start, use_nucleus, weighting,
+                        int(grid), int(rounds), use_tension=use_tension,
+                    )
+                    if trial is None or not trial.get("success"):
+                        continue
+                    if found is None or trial["ss_res"] < found[0]:
+                        found = (trial["ss_res"], float(q),
+                                 float(trial["break_1"]), float(trial["break_2"]))
+                return found
+
+            best = sweep(np.arange(0.0, 3.01, 0.25), n_grid, 0)
+            if best is not None:
+                best = sweep(
+                    np.linspace(max(0.0, best[1] - 0.25), best[1] + 0.25, 9),
+                    n_grid, 1,
+                ) or best
+        finally:
+            self.confinement = original
+        if best is None:
+            return float(original), float(self.segment_break_1), \
+                float(self.segment_break_2)
+        return best[1], best[2], best[3]
+
     def scan_confinement(
         self, epsilon_min, epsilon_max, e1=None, e2=None,
         membrane="continue", cyto_start="zero", use_nucleus=True,
@@ -2229,6 +2282,7 @@ class _CompositionMixin:
         refine_rounds=2,
         cv_repeats=3,
         tension_mode="off",
+        nucleus_mode="search",
     ):
         """
         Fit every composition at its own best breakpoints and pick one.
@@ -2267,7 +2321,14 @@ class _CompositionMixin:
             fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
 
         rows, fits = [], {}
-        nucleus_options = [True, False] if include_no_nucleus else [True]
+        # ``include_no_nucleus`` says whether a candidate without the deep
+        # element is worth trying. ``nucleus_mode="off"`` says the cell type
+        # has no deep element at all, which is a different statement: there
+        # is nothing to offer, so nothing is offered.
+        nucleus_options = (
+            [False] if str(nucleus_mode) == "off"
+            else [True, False] if include_no_nucleus else [True]
+        )
         # Three ways to treat the second membrane spring.
         #
         # "off"     the classic three-element model, tension not considered.
@@ -3921,7 +3982,7 @@ def _aicc(ss_res, n, k):
 
 def compare_hypotheses(
     model, epsilon_min, epsilon_max, hypotheses, weighting="uniform",
-    n_folds=5, seed=0, cv_repeats=3, n_grid=9, refine_rounds=1,
+    n_folds=5, seed=0, cv_repeats=3, n_grid=9, refine_rounds=1, scan_q=False,
 ):
     """
     Score a list of named, stated pictures of the cell against the curve.
@@ -3968,17 +4029,38 @@ def compare_hypotheses(
         membrane = spec.get("membrane", "continue")
         cyto_start = spec.get("cyto_start", "zero")
 
+        # Each picture gets its own confinement, if asked for.
+        #
+        # q is not a nuisance parameter shared between the candidates: it
+        # multiplies every basis function, so a picture fitted at another
+        # picture's q is not that picture. Measuring it once and comparing
+        # everything against it also makes the answer depend on the order
+        # things were done in, which is how a comparison drifts into a worse
+        # joint optimum without saying so. Here every candidate is profiled
+        # at its own boundaries and competes at its own best q, and the
+        # winner's q comes back with it.
+        local = model
+        if scan_q and hasattr(model, "best_confinement_and_breaks"):
+            q_here, _, _ = model.best_confinement_and_breaks(
+                lo, hi, membrane=membrane, cyto_start=cyto_start,
+                use_nucleus=flags["use_nucleus"],
+                use_tension=flags["use_tension"], weighting=weighting,
+                n_grid=max(5, int(n_grid) // 2),
+            )
+            local = model._clone(force_all, eps_all)
+            local.confinement = float(q_here)
+
         # ε₁ has to be searched whenever it is in the model, and it is in the
         # model whenever the membrane's law is measured from it or the
         # cytoskeleton waits for it, not only when there is a deep layer.
         # Leaving it at whatever the last fit happened to use made two of
         # these candidates carry a boundary chosen for a different question.
         needs_e1 = membrane != "continue" or cyto_start != "zero"
-        best = model._best_breakpoints(
+        best = local._best_breakpoints(
             lo, hi, membrane, cyto_start, flags["use_nucleus"], weighting,
             n_grid, refine_rounds, use_tension=flags["use_tension"],
-        ) if (flags["use_nucleus"] or needs_e1) else model.fit_composition(
-            lo, hi, model.segment_break_1, model.segment_break_2,
+        ) if (flags["use_nucleus"] or needs_e1) else local.fit_composition(
+            lo, hi, local.segment_break_1, local.segment_break_2,
             membrane, cyto_start, weighting=weighting, **flags
         )
         if best is None or not best.get("success"):
@@ -3986,7 +4068,7 @@ def compare_hypotheses(
         # _best_breakpoints only varies the two boundaries; the terms it was
         # asked for are whatever the flags said, so refit once to be sure the
         # winner carries exactly this hypothesis's elements.
-        whole = model.fit_composition(
+        whole = local.fit_composition(
             lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
             weighting=weighting, **flags
         )
@@ -4001,14 +4083,14 @@ def compare_hypotheses(
                     continue
                 keep = np.ones(n, dtype=bool)
                 keep[fold] = False
-                sub = model._clone(force_all[keep], eps_all[keep])
+                sub = local._clone(force_all[keep], eps_all[keep])
                 trained = sub.fit_composition(
                     lo, hi, whole["break_1"], whole["break_2"], membrane,
                     cyto_start, weighting=weighting, with_stats=False, **flags
                 )
                 if not trained.get("success"):
                     continue
-                basis = model.composition_basis(
+                basis = local.composition_basis(
                     eps_all[fold], whole["break_1"], whole["break_2"],
                     membrane, cyto_start,
                 )
@@ -4036,6 +4118,7 @@ def compare_hypotheses(
             "break_2": whole["break_2"],
             "cv_rmse": float(np.mean(per_repeat)) if per_repeat else float("nan"),
             "cv_spread": float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+            "confinement": float(local.confinement),
             "r_squared": whole["r_squared"],
             "n_params": whole["n_params"],
             "T0_mN_m": whole.get("T0_mN_m", 0.0),
@@ -4320,6 +4403,7 @@ def recommend_components(
             "n_terms": len(subset),
             "cv_rmse": float(np.mean(per_repeat)) if per_repeat else float("nan"),
             "cv_spread": float(np.std(per_repeat)) if len(per_repeat) > 1 else 0.0,
+            "confinement": float(model.confinement),
             "r_squared": whole["r_squared"],
             "n_params": whole["n_params"],
             "aicc": _aicc(whole["ss_res"], n, whole["n_params"]),
