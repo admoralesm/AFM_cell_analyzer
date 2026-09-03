@@ -580,6 +580,27 @@ def _add_spring(fig, x_center, y_bottom, y_top, width, color, line_width, n_coil
     )
 
 
+def _dish(fig, x0, x1, y, thickness=6.0, color="#566573", label=None,
+          font_size=10):
+    """
+    The dish the cell rests on, drawn as a plate like the cantilever above.
+
+    A hatched support is the right notation in a mechanics schematic, where
+    the point is that the ground does not move. In the picture of the cell
+    it is only clutter: a row of two dozen little strokes under a drawing
+    that is otherwise clean, competing for attention with the thing being
+    squashed. Two plates, one above and one below, say the same thing and
+    look like the instrument.
+    """
+    fig.add_shape(type="rect", x0=x0, x1=x1, y0=y - thickness, y1=y,
+                  fillcolor=color, line=dict(width=0))
+    if label:
+        fig.add_annotation(
+            x=(x0 + x1) / 2.0, y=y - thickness / 2.0, text=f"<b>{label}</b>",
+            showarrow=False, font=dict(size=font_size, color="white"),
+        )
+
+
 def _hatched_ground(fig, x0, x1, y, depth, color="#2c3e50"):
     """A fixed support drawn the way an engineering diagram draws one."""
     fig.add_shape(type="line", x0=x0, x1=x1, y0=y, y1=y,
@@ -869,9 +890,11 @@ def cell_schematic(
         fig.add_trace(
             go.Scatter(
                 x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
-                # Thicker, because four of these across a narrow panel with a
-                # 3 px line read as hairlines.
-                line=dict(color=colour, width=7, shape="spline"),
+                # Slim. These are read against each other, one per material,
+                # and what has to be visible is where each one starts and
+                # stops, not how bold it is. A heavy coil fills its column
+                # and hides the gap above a spring that has not been reached.
+                line=dict(color=colour, width=4, shape="spline"),
             )
         )
 
@@ -923,7 +946,7 @@ def cell_schematic(
             # a coil needs amplitude to read as a coil. The room comes from
             # the spacing instead.
             draw_element(term, x, GROUND_Y + 3, PLATEN_Y - 3,
-                         10 if len(terms) < 4 else 8 if len(terms) == 4 else 7,
+                         8 if len(terms) < 4 else 6 if len(terms) == 4 else 5,
                          row=index % 2 if len(terms) > 2 else 0)
         subtitle = "Side by side: same squash on each, forces add"
 
@@ -1023,7 +1046,8 @@ def balloon_figure(
     centre_x = 50.0
 
     # ---- the plates
-    _hatched_ground(fig, 8, 92, GROUND_Y, 7)
+    _dish(fig, 10, 90, GROUND_Y, 6.0, label="dish",
+          font_size=max(9, style.tick_size - 10))
     platen_y = centre_y + half_height
     fig.add_shape(type="rect", x0=10, x1=90, y0=platen_y, y1=platen_y + 6,
                   fillcolor="#566573", line=dict(width=0))
