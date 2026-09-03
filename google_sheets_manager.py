@@ -212,8 +212,13 @@ class GoogleSheetsManager:
         ("T0_range", "T₀ range (ε)"),
         ("Em", "Young's Modulus (Em, MPa)"),
         ("Em_range", "Em range (ε)"),
+        # The cortical layer, for cell types that have one. Blank where the
+        # cell type does not, which is not the same as zero.
+        ("Ecx", "Young's Modulus (Ecx cortex, kPa)"),
         ("Ei", "Young's Modulus (Ei, kPa)"),
         ("Ei_range", "Ei range (ε)"),
+        # The nuclear envelope, likewise.
+        ("Ene", "Young's Modulus (Ene envelope, MPa)"),
         ("En", "Young's Modulus (En, kPa)"),
         ("En_range", "En range (ε)"),
         ("membrane_areal", "Membrane Em·h (mN/m)"),
