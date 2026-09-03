@@ -941,7 +941,7 @@ def case_guided_mode_is_the_default():
           app.session_state["ui_mode"].startswith("Guided"),
           app.session_state["ui_mode"])
 
-    work = button_by_label(app, "Work it out for me")
+    work = button_by_label(app, "Fit this cell")
     check("the one-press button is there", work is not None)
 
     text = " ".join(str(m.value) for m in app.get("markdown"))
@@ -965,14 +965,14 @@ def case_guided_mode_is_the_default():
 
     if work is not None:
         work.click().run()
-        if no_exception(app, "work it out"):
-            found = app.session_state["composition_search"]
+        if no_exception(app, "fitting"):
+            found = app.session_state["hypothesis_search"]
             check("the search ran", bool(found and found.get("success")))
             if found and found.get("success"):
                 best = found["best"]
                 check("the winner was applied",
                       abs(app.session_state["segment_break_1"]
-                          - round(best["break_1"], 3)) < 0.002,
+                          - round(best["break_1"], 4)) < 0.002,
                       f"{app.session_state['segment_break_1']} vs {best['break_1']}")
 
 
@@ -982,7 +982,7 @@ def case_full_control_shows_everything():
     if not no_exception(app, "full control"):
         return
     check("the one-press button is hidden in full control",
-          button_by_label(app, "Work it out for me") is None)
+          button_by_label(app, "Fit this cell") is None)
     check("the section headings are back",
           any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
     check("the expert search button is still there",
@@ -1157,16 +1157,20 @@ def case_component_names_follow_the_cell_type():
     cardio = app_module.components_for("Cardiomyocyte")
     check("the myoblast interior is the cytoskeleton",
           bare(myoblast["interior"][0]) == "Cytoskeleton", str(myoblast["interior"]))
-    check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
-          "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
-    check("every element carries an emoji, so four labels can be told apart",
+    # One interior, and its name says what is in it. The cytoskeleton and
+    # the myofibrils are not two springs: they are one incompressible
+    # material, because nothing in the curve separates them.
+    check("the cardiomyocyte interior is cytoskeleton and myofibrils together",
+          "myofibril" in cardio["interior"][0].lower()
+          and "cytoskeleton" in cardio["interior"][0].lower(),
+          str(cardio["interior"]))
+    check("and it is described as incompressible",
+          "incompressible" in cardio["interior"][1], str(cardio["interior"]))
+    check("there is no deep element to name",
+          "nucleus" not in cardio, str(list(cardio)))
+    check("every element carries an emoji, so the labels can be told apart",
           all(bare(v[0]) != v[0] for v in cardio.values()),
           str([v[0] for v in cardio.values()]))
-    check("and a sarcomeric, contractile one",
-          "Sarcomeric" in cardio["nucleus"][0]
-          and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
-    check("the two are described as different things",
-          cardio["interior"][1] != cardio["nucleus"][1])
     # The membrane is two springs for this cell type, and they have to be
     # named as two things, not one thing twice.
     check("the taut protein network is one of them",
@@ -1187,10 +1191,8 @@ def case_component_names_follow_the_cell_type():
     check("the plain-language table is there", len(parts) == 1)
     if parts:
         listed = list(parts[0]["Part of the cell"])
-        check("it lists both kinds of cytoskeleton",
-              any("Non-sarcomeric" in v for v in listed)
-              and any(bare(v) == "Sarcomeric myofibrils" for v in listed),
-              str(listed))
+        check("it lists the interior as one material",
+              any("myofibril" in v.lower() for v in listed), str(listed))
         check("and never calls anything a nucleus",
               not any("Nucleus" in v for v in listed), str(listed))
         check("the membrane is one term unless the extra one is asked for",
@@ -1388,10 +1390,10 @@ def case_guided_order_follows_the_work():
     # the parts and how they share the load, then the fit.
     check("Step 1 is the range",
           any("Step 1 · How far" in h for h in headings), order)
-    check("Step 2 is the parts and how they share the load",
-          any("Step 2 · Which parts" in h for h in headings), order)
+    check("Step 2 covers the materials",
+          any("Step 2 · Which materials" in h for h in headings), order)
     check("Step 3 works it out",
-          any("Step 3 · Work it out" in h for h in headings), order)
+          any("Step 3 · Fit" in h for h in headings), order)
     positions = [
         next(i for i, h in enumerate(headings) if key in h)
         for key in ("Step 1 ·", "Step 2 ·", "Step 3 ·")
@@ -1403,7 +1405,7 @@ def case_guided_order_follows_the_work():
           str([e.label for e in app.get("expander")]))
 
     # The button has to be reachable without opening anything.
-    work = button_by_label(app, "Work it out for me")
+    work = button_by_label(app, "Fit this cell")
     check("the button is on the page", work is not None)
     check("and it is the primary action",
           work is not None and work.proto.type == "primary")
@@ -1419,7 +1421,7 @@ def case_guided_order_follows_the_work():
         app.session_state[f"use_{term}"] = False
     app.run()
     if no_exception(app, "no parts selected"):
-        work = button_by_label(app, "Work it out for me")
+        work = button_by_label(app, "Fit this cell")
         check("with nothing ticked the button is disabled",
               work is not None and work.disabled is True)
 
@@ -1484,25 +1486,41 @@ def case_it_picks_the_arrangement():
               pending["model_kind"])
 
 
-def case_work_it_out_applies_the_arrangement():
-    print("pressing it applies what it found")
+def case_fitting_applies_what_it_found():
+    print("pressing fit applies the picture it chose")
     app = start(cell_name="cell-01")
-    work = button_by_label(app, "Work it out for me")
+    work = button_by_label(app, "Fit this cell")
     check("the button is there", work is not None)
     if work is None:
         return
     work.click().run()
-    if not no_exception(app, "work it out"):
+    if not no_exception(app, "fitting"):
         return
-    found = app.session_state["arrangement_search"]
-    check("the arrangement search ran", bool(found and found.get("success")),
+    found = app.session_state["hypothesis_search"]
+    check("the comparison ran", bool(found and found.get("success")),
           str(found.get("error") if found else None))
     if not (found and found.get("success")):
         return
-    check("the model on the page matches what it chose",
-          app.session_state["model_kind"]
-          == app_module_model_name(found["best"]["arrangement"]),
-          f"{app.session_state['model_kind']} vs {found['best']['arrangement']}")
+    winner = found["best"]
+    check("the composition on the page is the one it chose",
+          MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]]
+          == winner["membrane"]
+          and CYTO_MODE[app.session_state["cyto_starts_at"]]
+          == winner["cyto_start"],
+          f"{app.session_state['membrane_after_break']} / "
+          f"{app.session_state['cyto_starts_at']} vs "
+          f"{winner['membrane']} / {winner['cyto_start']}")
+    check("and so are the boundaries",
+          abs(float(app.session_state["segment_break_1"])
+              - winner["break_1"]) < 1e-3,
+          f"{app.session_state['segment_break_1']} vs {winner['break_1']:.4f}")
+    check("the materials ticked are the ones it chose",
+          all((t in winner["terms"]) == app.session_state[f"use_{t}"]
+              for t in ("membrane", "interior", "nucleus")),
+          str(winner["terms"]))
+    check("it is fitted as a hand-over, which is the only model with an order",
+          app.session_state["model_kind"].startswith("Segmented"),
+          app.session_state["model_kind"])
     text = " ".join(str(m.value) for m in app.get("markdown"))
     check("the answer is shown in words", "curve" in text.lower())
 
@@ -1535,7 +1553,7 @@ def case_guided_range_is_settable():
           abs(app.session_state["guided_window_end"] - 0.35) < 0.01,
           str(app.session_state["guided_window_end"]))
 
-    button_by_label(app, "Work it out for me").click().run()
+    button_by_label(app, "Fit this cell").click().run()
     if not no_exception(app, "search over the chosen range"):
         return
     fit = app.session_state["_last_fit"]
@@ -1615,7 +1633,8 @@ def case_schematic_is_a_mechanics_diagram():
     check("a component that handed over shows as locked",
           "locked" in text, text[-260:])
     check("it uses the cell type's own names",
-          "Sarcomeric myofibrils" in flat and "Cytoskeleton<" not in text,
+          "Cytoskeleton and myofibrils" in flat
+          and "Membrane and cortex" in flat,
           flat[-260:])
 
     # Springs must hang straight, not lean: a precedence bug once drew them
@@ -2041,8 +2060,8 @@ def case_sharing_controls_sit_with_the_parts():
         str(m.value).strip() for m in app.get("markdown")
         if str(m.value).strip().startswith("####")
     ]
-    check("Step 2 covers both",
-          any("Which parts, and how they share the load" in h for h in headings),
+    check("Step 2 covers the materials",
+          any("Which materials carry the load" in h for h in headings),
           str(headings))
 
     radios = [r.label for r in app.get("radio")]
@@ -2659,12 +2678,16 @@ def case_named_hypotheses_are_compared():
           str([(p["key"], p["membrane"]) for p in picks]))
     check("one picture has the cortical network carrying it alone at first",
           any(p["membrane"] == "late" for p in picks))
-    check("the first names them", "cortical actin" in picks[0]["label"],
-          picks[0]["label"])
+    check("the first names the order in words",
+          "first" in picks[0]["label"].lower(), picks[0]["label"])
     check("one of them adds the horizontal spring",
           any("tension" in p["terms"] for p in picks))
-    check("and one has no deep layer, for a curve that never reaches it",
-          any("nucleus" not in p["terms"] for p in picks))
+    # No picture of a cardiomyocyte carries a deep spring: it is a shell
+    # around one incompressible interior, and a term for a nucleus nobody
+    # can see is a term that measures nothing.
+    check("and none of them has a deep layer",
+          not any("nucleus" in p["terms"] for p in picks),
+          str([p["terms"] for p in picks]))
 
     # The genotype decides what is worth comparing.
     knockout = app_module.cardiomyocyte_hypotheses("Deleted (knockout)")
@@ -2787,9 +2810,9 @@ def case_switching_cell_type_and_back_changes_nothing():
           f"{app.session_state['cyto_starts_at']}")
     check("the cardiomyocyte's extra spring does not follow it home",
           app.session_state["use_tension"] is False)
-    check("nor does anything it measured",
-          app.session_state["component_search"] is None
-          and app.session_state["confinement_scan"] is None)
+    check("nor does its measured confinement",
+          float(app.session_state["confinement"]) == 0.0,
+          str(app.session_state["confinement"]))
 
     after = app.session_state["_last_fit"]
     check("and the moduli are exactly what they were", (
@@ -2811,9 +2834,13 @@ def case_no_nucleus_wording_for_a_cardiomyocyte():
     check("but a myoblast still has one",
           app_module.plain_name("nucleus", "Myoblast (C2C12)") == "Nucleus",
           app_module.term_name("nucleus", "Myoblast (C2C12)"))
-    check("and the cardiomyocyte's third slot is myofibrils",
-          "myofibril" in app_module.term_name("nucleus", "Cardiomyocyte").lower(),
-          app_module.term_name("nucleus", "Cardiomyocyte"))
+    check("and a cardiomyocyte has no deep slot at all",
+          "nucleus" not in app_module.OPTIONAL_TERMS["Cardiomyocyte"],
+          str(app_module.OPTIONAL_TERMS["Cardiomyocyte"]))
+    check("its interior is one material, cytoskeleton and myofibrils together",
+          "myofibril" in app_module.term_name(
+              "interior", "Cardiomyocyte").lower(),
+          app_module.term_name("interior", "Cardiomyocyte"))
     check("the stored model name no longer names a myoblast's parts",
           not any("nucleus" in k.lower() for k in app_module.MODELS),
           str(list(app_module.MODELS)[:1]))
@@ -2922,7 +2949,7 @@ def case_components_are_recommended():
     app = start(cell_name="WT", cell_type="Cardiomyocyte")
     if not no_exception(app, "component search"):
         return
-    work = button_by_label(app, "Work it out for me")
+    work = button_by_label(app, "Fit this cell")
     if work is None:
         check("the button is there", False)
         return
@@ -3458,44 +3485,54 @@ def case_clone_keeps_the_whole_geometry():
           twin.deep_uses_cell_radius is model.deep_uses_cell_radius)
 
 
-def case_four_elements_reach_the_page():
-    print("a cardiomyocyte shows four springs, a myoblast three")
+def case_the_cardiomyocyte_has_three_springs():
+    print("a cardiomyocyte is a shell around one incompressible interior")
     import app as app_module
     check("the myoblast has three",
           len(app_module.terms_for("Myoblast (C2C12)")) == 3)
-    check("the cardiomyocyte has four",
-          len(app_module.terms_for("Cardiomyocyte")) == 4)
+    # Three, not four. There is no deep element: a nucleus cannot be told
+    # apart from the rest of a cardiomyocyte's interior, and the myofibrils
+    # fill the cell rather than waiting deep inside it.
+    check("the cardiomyocyte has three",
+          len(app_module.terms_for("Cardiomyocyte")) == 3,
+          str(app_module.terms_for("Cardiomyocyte")))
+    check("and none of them is a deep element",
+          "nucleus" not in app_module.terms_for("Cardiomyocyte"))
+    check("its interior is named as one material",
+          "myofibril" in app_module.COMPONENT_SETS[
+              "Cardiomyocyte"]["interior"][0].lower(),
+          str(app_module.COMPONENT_SETS["Cardiomyocyte"]["interior"]))
+    check("the deep spring is off in its defaults",
+          app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["nucleus"] is False)
+    check("and so is the extra membrane protein, until asked for",
+          app_module.DEFAULT_TERMS_BY_TYPE["Cardiomyocyte"]["tension"] is False)
+    check("its interior is treated as incompressible",
+          "Cardiomyocyte" in app_module.INCOMPRESSIBLE_INTERIOR)
 
     app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "four elements"):
+    if not no_exception(app, "three elements"):
         return
-    # The extra membrane protein is offered, not assumed. A term nobody
-    # asked for quietly takes force from the ones that were asked for.
-    check("the extra spring is off by default",
-          app.session_state["use_tension"] is False)
+    check("no deep term is ticked",
+          app.session_state["use_nucleus"] is False)
     fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
-    check("so it is not in the fitted terms", "tension" not in fitted, str(fitted))
-    check("but it is available for this cell type",
+    check("and none is fitted", "nucleus" not in fitted, str(fitted))
+    check("the extra spring is available for this cell type",
           "tension" in app_module.terms_for("Cardiomyocyte"))
     check("and it is named for what it is, not for one protein",
           "prestin" in app_module.COMPONENT_SETS["Cardiomyocyte"]["tension"][1],
           str(app_module.COMPONENT_SETS["Cardiomyocyte"]["tension"]))
 
     table = table_with(app, "Part of the cell")
-    # The table lists every element this cell type has, with the ones not in
-    # the model reading zero and saying so. A blank row would be ambiguous
-    # between "zero" and "not measured".
     check("the stiffness table lists every element the cell type has",
-          table is not None and len(table) == 4,
+          table is not None and len(table) == 3,
           "none" if table is None else str(len(table)))
     if table is not None:
-        extra = table[table["Part of the cell"].str.contains("Extra")]
-        check("and marks the one that is switched off",
-              len(extra) == 1
-              and "not included" in extra.iloc[0]["Roughly"],
-              str(extra.to_dict("records")))
+        check("and none of its rows is a nucleus",
+              not any("nucleus" in str(v).lower()
+                      for v in table["Part of the cell"]),
+              str(list(table["Part of the cell"])))
 
-    # Switched on, it appears everywhere it should.
+    # Switched on, the in-plane spring appears everywhere it should.
     with_extra = start(cell_name="cardio-02", cell_type="Cardiomyocyte",
                        use_tension=True)
     if no_exception(with_extra, "extra spring on"):
@@ -3503,23 +3540,25 @@ def case_four_elements_reach_the_page():
         check("switching it on puts it in the fit", "tension" in on_terms,
               str(on_terms))
         bigger = table_with(with_extra, "Part of the cell")
-        check("and it is no longer marked as left out",
-              bigger is not None
-              and not bigger[bigger["Part of the cell"].str.contains("Extra")]
-              .iloc[0]["Roughly"].startswith("not included"),
-              "none" if bigger is None else str(bigger.to_dict("records")))
         if bigger is not None:
             check("quoted in mN/m, because it is a tension",
                   any("mN/m" in v for v in bigger["Stiffness"]),
                   str(list(bigger["Stiffness"])))
 
-    # A myoblast must be untouched by any of this.
+    # A myoblast must be untouched by any of this: it has a nucleus and the
+    # model still measures one.
     plain = start(cell_name="myo-01")
     if no_exception(plain, "three elements"):
         plain_table = table_with(plain, "Part of the cell")
         check("a myoblast still lists three parts",
               plain_table is not None and len(plain_table) == 3,
               "none" if plain_table is None else str(len(plain_table)))
+        check("one of which is its nucleus",
+              plain_table is not None
+              and any("nucleus" in str(v).lower()
+                      for v in plain_table["Part of the cell"]),
+              "none" if plain_table is None
+              else str(list(plain_table["Part of the cell"])))
         check("and fits without a tension term",
               "tension" not in ((plain.session_state["_last_fit"] or {}).get(
                   "terms") or []))
@@ -3981,6 +4020,200 @@ def case_balloon_and_spring_tab_answers_by_itself():
           str(now and now["key"]))
 
 
+def case_no_deep_spring_costs_nothing():
+    print("removing the deep spring does not cost the fit anything real")
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+    # The claim the cardiomyocyte model now rests on: what a deep spring was
+    # absorbing is the interior refusing to be compressed. If that is true,
+    # dropping the spring and re-measuring q must leave chi-squared per
+    # point essentially where it was. If it is false, this test says so.
+    for n, (eps, force) in curves.items():
+        model = vcm_model(eps, force)
+        window = model.suggest_window()
+        lo = window["epsilon_min"] if window.get("success") else 0.0
+        hi = window["epsilon_max"] if window.get("success") else float(eps.max())
+
+        def best(use_nucleus):
+            q, e1, e2 = model.best_confinement_and_breaks(
+                lo, hi, membrane="late", cyto_start="zero",
+                use_nucleus=use_nucleus, use_tension=True,
+                weighting="relative", n_grid=8,
+            )
+            twin = vcm_model(eps, force, q=q)
+            return twin.fit_composition(
+                lo, hi, e1, e2, "late", "zero", use_nucleus=use_nucleus,
+                weighting="relative", use_tension=True,
+            )
+
+        with_deep, without = best(True), best(False)
+        check(f"cell {n}: both fit", with_deep.get("success")
+              and without.get("success"))
+        if not (with_deep.get("success") and without.get("success")):
+            continue
+        check(f"cell {n}: three springs still fit the curve",
+              without["r_squared"] > 0.9998,
+              f"R2 {without['r_squared']:.6f}")
+        # Either the three-spring fit is already inside the noise, where a
+        # further improvement is not a measurement of anything, or it is
+        # within a factor of two of the four-spring one. Not "as good as":
+        # noise on a real curve would never grant that, and it is not what
+        # the claim needs. The claim is that the extra modulus is not
+        # measuring a material.
+        alone = without["chi_squared_reduced"]
+        ratio = alone / with_deep["chi_squared_reduced"]
+        check(f"cell {n}: the deep spring buys almost nothing",
+              alone < 1.0 or ratio < 2.0,
+              f"chi2/dof {alone:.3g} vs "
+              f"{with_deep['chi_squared_reduced']:.3g}")
+
+
+def case_q_and_the_boundaries_are_searched_together():
+    print("the confinement and the boundaries are found jointly, not in turn")
+    eps = np.linspace(0.002, 0.62, 340)
+    seed = LulevichModel(np.zeros_like(eps), eps, cell_height=19.0e-6,
+                         cell_radius=9.5e-6, confinement=1.4)
+    basis = seed.composition_basis(eps, 0.18, 0.50, "late", "zero")
+    force = basis["membrane"] * 1.5e6 + basis["interior"] * 2.0e3
+    model = LulevichModel(force, eps, cell_height=19.0e-6, cell_radius=9.5e-6,
+                          confinement=0.0)
+    q, e1, e2 = model.best_confinement_and_breaks(
+        0.0, 0.62, membrane="late", cyto_start="zero", use_nucleus=False,
+        weighting="relative", n_grid=8,
+    )
+    check("q is recovered", abs(q - 1.4) < 0.25, f"{q:.2f}")
+    check("and so is the boundary", abs(e1 - 0.18) < 0.04, f"{e1:.3f}")
+    check("the model's own q is left alone", model.confinement == 0.0,
+          str(model.confinement))
+    fitted = LulevichModel(force, eps, cell_height=19.0e-6,
+                           cell_radius=9.5e-6, confinement=q).fit_composition(
+        0.0, 0.62, e1, e2, "late", "zero", use_nucleus=False,
+        weighting="relative")
+    check("and the pair fits the curve", fitted["r_squared"] > 0.9999,
+          f"R2 {fitted['r_squared']:.6f}")
+
+    # Each picture must be allowed its own q inside a comparison, or the one
+    # fitted first sets the terms of the argument for the rest.
+    from lulevich_model import compare_hypotheses
+    scored = compare_hypotheses(
+        model, 0.0, 0.62,
+        [{"key": "cyto_first", "label": "interior first",
+          "terms": ("membrane", "interior"),
+          "membrane": "late", "cyto_start": "zero"},
+         {"key": "together", "label": "together",
+          "terms": ("membrane", "interior"),
+          "membrane": "continue", "cyto_start": "zero"}],
+        weighting="relative", cv_repeats=2, n_grid=8, scan_q=True,
+    )
+    check("the comparison ran with q scanned per picture", scored.get("success"),
+          str(scored.get("error")))
+    if scored.get("success"):
+        check("every candidate reports the q it competed at",
+              all(np.isfinite(r.get("confinement", np.nan))
+                  for r in scored["candidates"]))
+        check("and the built-in ordering is the one that wins",
+              scored["best"]["key"] == "cyto_first", scored["best"]["key"])
+
+
+def case_one_fitting_routine():
+    print("what loads and what the button does are the same routine")
+    source = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+    check("there is one routine", source.count("def analyse_curve(") == 1)
+    check("and both paths call it", source.count("analyse_curve(") == 3,
+          str(source.count("analyse_curve(")))
+    check("the arrangement search no longer competes with it",
+          "search_arrangements(" not in source.split("def analyse_curve")[-1]
+          or source.count("search_arrangements(") <= 1,
+          str(source.count("search_arrangements(")))
+
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+    eps, force = curves[11]
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=900)
+    app.run()
+    app.session_state["cell_type"] = "Cardiomyocyte"
+    app.session_state["cell_name"] = "vcm-11"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "vcm_11.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "loading a cardiomyocyte"):
+        return
+    on_load = app.session_state["_last_fit"]
+    check("a curve that loads is already fitted",
+          on_load and on_load.get("success"))
+    if not (on_load and on_load.get("success")):
+        return
+    check("with no deep spring", "nucleus" not in on_load["terms"],
+          str(on_load["terms"]))
+    check("and it fits the measured curve", on_load["r_squared"] > 0.9995,
+          f"R2 {on_load['r_squared']:.6f}")
+
+    work = button_by_label(app, "Fit this cell")
+    check("the fit button is there", work is not None)
+    if work is None:
+        return
+    work.click().run()
+    if not no_exception(app, "pressing fit"):
+        return
+    after = app.session_state["_last_fit"]
+    check("pressing it fits at least as well, not worse",
+          after["r_squared"] >= on_load["r_squared"] - 1e-4,
+          f"{on_load['r_squared']:.6f} -> {after['r_squared']:.6f}")
+    check("and the answer is still a fit of this curve",
+          after["r_squared"] > 0.9995, f"R2 {after['r_squared']:.6f}")
+    # The one number that says the search did not wander somewhere silly.
+    check("chi-squared per point stays in a sane range",
+          0.02 < after["chi_squared_reduced"] < 20.0,
+          f"{after['chi_squared_reduced']:.3g}")
+
+    table = table_with(app, "Picture of the cell", "Predicts held-out points")
+    check("the pictures compared are on the page", table is not None)
+    if table is not None:
+        check("one of them is marked chosen",
+              any("chosen" in str(v) for v in table["Verdict"]),
+              str(list(table["Verdict"])))
+
+
+def case_materials_are_explained_by_their_law():
+    print("every material on the page says what law it obeys and why it separates")
+    import app as app_module
+    for term in ("tension", "membrane", "interior", "nucleus"):
+        law = app_module.MATERIAL_LAWS[term]
+        for field in ("role", "law", "exponent", "separable"):
+            check(f"{term} has a {field}", bool(law.get(field)))
+    check("the two Hertzian terms are separated by onset alone",
+          "onset" in app_module.MATERIAL_LAWS["nucleus"]["separable"],
+          app_module.MATERIAL_LAWS["nucleus"]["separable"])
+    check("and the in-plane spring by being linear",
+          "linear" in app_module.MATERIAL_LAWS["tension"]["separable"])
+
+    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
+    if not no_exception(app, "the materials table"):
+        return
+    table = table_with(app, "Material", "Force law", "What makes it separable")
+    check("the table of materials is on the page", table is not None)
+    if table is not None:
+        ticked = [t for t in app_module.terms_for("Cardiomyocyte")
+                  if app.session_state[f"use_{t}"]]
+        check("one row per ticked material", len(table) == len(ticked),
+              f"{len(table)} rows for {ticked}")
+        check("each row carries its exponent",
+              all("ε^" in str(v) for v in table["Rises as"]),
+              str(list(table["Rises as"])))
+        check("and says when it starts carrying load",
+              all(str(v).strip() for v in table["Carries load"]),
+              str(list(table["Carries load"])))
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    everything = text + " ".join(str(i.value) for i in app.get("info"))
+    check("the separation rule is stated in words",
+          "different shapes" in everything or "wearing two names" in everything)
+
+
 if __name__ == "__main__":
     for case in (
         case_loads_clean,
@@ -4025,7 +4258,11 @@ if __name__ == "__main__":
         case_breakpoint_spread_is_the_real_error_bar,
         case_error_bars_are_reported,
         case_clone_keeps_the_whole_geometry,
-        case_four_elements_reach_the_page,
+        case_the_cardiomyocyte_has_three_springs,
+        case_no_deep_spring_costs_nothing,
+        case_q_and_the_boundaries_are_searched_together,
+        case_one_fitting_routine,
+        case_materials_are_explained_by_their_law,
         case_tables_are_not_clipped,
         case_one_video_two_doors,
         case_zero_modulus_explains_itself,
@@ -4035,7 +4272,7 @@ if __name__ == "__main__":
         case_schematic_is_a_mechanics_diagram,
         case_guided_order_follows_the_work,
         case_it_picks_the_arrangement,
-        case_work_it_out_applies_the_arrangement,
+        case_fitting_applies_what_it_found,
         case_search_stays_fast,
         case_png_is_not_rendered_every_run,
         case_fit_statistics,
