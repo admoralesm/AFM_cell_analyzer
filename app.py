@@ -326,6 +326,7 @@ DEFAULTS = {
     "show_rupture_marker": True,
     "show_schematic": True,
     "schematic_style": "Mechanics schematic",
+    "sharing_preview_eps": 0.10,
     "show_schematic_moduli": True,
     "plot_width": 2.4,
     # geometry / model
@@ -3068,6 +3069,13 @@ with head_left:
 with head_right:
     st.markdown("<div style='text-align:right;color:#6b7785'>v6.0</div>", unsafe_allow_html=True)
 
+# Every tab is still built and still filled, so none of that code can rot.
+# The two that are not wanted on the bar for now are hidden by hiding their
+# buttons: a tab whose button is gone cannot be opened, and the code that
+# fills it goes on working untouched. Set these to True to bring them back.
+SHOW_VIDEO_TAB = False
+SHOW_DATABASE_TAB = False
+
 tab_analysis, tab_video, tab_igor, tab_db, tab_results, tab_export = st.tabs(
     [
         "📊 Force curve analysis",
@@ -3078,6 +3086,21 @@ tab_analysis, tab_video, tab_igor, tab_db, tab_results, tab_export = st.tabs(
         "💾 Export",
     ]
 )
+
+_hidden = [
+    index for index, wanted in ((2, SHOW_VIDEO_TAB), (4, SHOW_DATABASE_TAB))
+    if not wanted
+]
+if _hidden:
+    st.markdown(
+        "<style>"
+        + "".join(
+            f'button[data-baseweb="tab"]:nth-of-type({n}) {{display: none;}}'
+            for n in _hidden
+        )
+        + "</style>",
+        unsafe_allow_html=True,
+    )
 
 
 # ================================================ TAB 1: analysis workflow ==
@@ -3513,56 +3536,12 @@ with tab_analysis:
                     "button below to search harder, or change anything in "
                     "Step 2."
                 )
-                rows = []
-                for row in guess["candidates"]:
-                    mark = []
-                    if row["chosen"]:
-                        mark.append("chosen")
-                    elif row["tied_with_best"]:
-                        mark.append("fits just as well")
-                    for t in row["empty"]:
-                        mark.append(f"{term_name(t).lower()} came out zero")
-                    rows.append({
-                        "picture of the cell": retell(row["label"]),
-                        "what it says": retell(row["detail"]),
-                        "misses held-out points by": f"{row['cv_rmse']:.3g}",
-                        "R²": f"{row['r_squared']:.5f}",
-                        "verdict": " · ".join(mark),
-                    })
                 st.divider()
 
 
 
 
-            st.markdown("#### Step 1 · Which parts of the cell")
-            st.caption(
-                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
-                "unless you have a reason not to. The names follow the cell "
-                "type chosen in the sidebar, because a "
-                f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
-                "not built like every other cell."
-            )
-            for column, term in zip(st.columns(len(here)), here):
-                label, everyday = names[term]
-                with column:
-                    st.checkbox(label, key=f"use_{term}")
-                    st.caption(everyday)
-            if len(here) == 4:
-                st.caption(
-                    "The first two are both the membrane. A cardiomyocyte's "
-                    "membrane carries a protein network that is already taut, "
-                    "so it pushes back from the very first contact in "
-                    "proportion to how far it is pushed (a law in ε); the "
-                    "shell's own elasticity only bites once the cell has been "
-                    "flattened enough to stretch it (a law in ε³). They are "
-                    "one piece of material answering two ways, which is why "
-                    "they start and stop together."
-                )
-
-            if not chosen:
-                st.warning("Tick at least one part before analysing.")
-
-            st.markdown("#### Step 2 · How far into the squash to look")
+            st.markdown("#### Step 1 · How far into the squash to look")
             st.caption(
                 "The model describes a cell being flattened, not one being "
                 "burst. Past about 60 % the geometry it assumes stops "
@@ -3599,175 +3578,38 @@ with tab_analysis:
                    else "No sudden force drop was detected in this curve.")
             )
 
-            st.markdown("#### Step 3 · Work it out for me")
+            st.markdown("#### Step 2 · Which parts, and how they share the load")
             st.caption(
-                "One button. It decides how the parts are arranged, whether "
-                "the cell is segmented, side by side or stacked, then where "
-                "each part takes over, then how stiff each one is, fitting "
-                "every possibility and keeping the one that best predicts "
-                "points it was not fitted on. The settings it uses are "
-                "underneath, already set for "
-                f"**{st.session_state['cell_type'].split(' (')[0]}**; change "
-                "one and press the button again."
+                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
+                "unless you have a reason not to. The names follow the cell "
+                "type chosen in the sidebar, because a "
+                f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
+                "not built like every other cell."
             )
-            g1, g2 = st.columns([1, 2])
-            with g1:
-                if st.button(
-                    "🔬 Work it out for me", type="primary",
-                    disabled=not chosen, **STRETCH,
-                ):
-                    # Confinement first, because it changes the shape of
-                    # every basis function and therefore which arrangement
-                    # looks best. Searching arrangements at the wrong q asks
-                    # which of several wrong models is least wrong.
-                    if (
-                        st.session_state["cell_shape"].startswith("Belt")
-                        and hasattr(model, "scan_confinement")
-                    ):
-                        with st.spinner("Measuring how confined the cell is…"):
-                            q_found = model.scan_confinement(
-                                guided_lo, guided_hi,
-                                e1=float(st.session_state["segment_break_1"]),
-                                e2=float(st.session_state["segment_break_2"]),
-                                membrane="continue", cyto_start="zero",
-                                use_nucleus="nucleus" in chosen,
-                                use_tension="tension" in chosen,
-                                weighting=st.session_state["weighting"],
-                            )
-                        if q_found.get("success"):
-                            st.session_state["confinement_scan"] = q_found
-                            model.confinement = float(q_found["q"])
-                            st.session_state["_confinement_from_search"] = round(
-                                float(q_found["q"]), 2
-                            )
-                    with st.spinner(
-                        "Comparing segmented, side by side and stacked, then "
-                        "every way the parts can share the boundaries…"
-                    ):
-                        found = search_arrangements(
-                            model, guided_lo, guided_hi, terms=chosen,
-                            weighting=st.session_state["weighting"],
-                            # Where the cell type says the membrane is two
-                            # springs, that is the structure to place the
-                            # boundaries inside, not a hypothesis to test. A
-                            # linear term is flexible enough to help a wrong
-                            # composition imitate the right one, so letting
-                            # the search drop it buys a worse story for a
-                            # better number.
-                            tension_mode=(
-                                "always" if "tension" in chosen else "off"
-                            ),
-                        )
-                    st.session_state["arrangement_search"] = found
-                    st.session_state["composition_search"] = found.get("composition")
-
-                    # Which elements the curve actually needs, asked at the
-                    # boundaries the search just chose. Cheap (a fraction of
-                    # a second), and it is the question people most want
-                    # answered: not "how stiff is the nucleus" but "is there
-                    # anything there to measure".
-                    picked = (found.get("composition") or {}) if found.get("success") else {}
-                    st.session_state["component_search"] = recommend_components(
-                        model, guided_lo, guided_hi,
-                        candidates=terms_for(st.session_state["cell_type"]),
-                        e1=float(picked.get("break_1",
-                                            st.session_state["segment_break_1"])),
-                        e2=float(picked.get("break_2",
-                                            st.session_state["segment_break_2"])),
-                        membrane=picked.get("membrane", "continue"),
-                        cyto_start=picked.get("cyto_start", "zero"),
-                        weighting=st.session_state["weighting"],
-                        cv_repeats=2,
-                    )
-                    if found.get("success"):
-                        pending = settings_from_arrangement(found["best"], guided_hi)
-                        pending["window_combined"] = (guided_lo, guided_hi)
-                        measured_q = st.session_state.pop(
-                            "_confinement_from_search", None
-                        )
-                        if measured_q is not None:
-                            pending["confinement"] = measured_q
-                        st.session_state["_pending_settings"] = pending
-                        st.rerun()
-                    else:
-                        st.error(found.get("error", "Could not analyse this curve."))
-            with g2:
-                previous = st.session_state.get("arrangement_search")
-                if previous and previous.get("success"):
-                    st.success(retell(previous["verdict"]))
-                    arrangement_rows = [
-                        {
-                            "arrangement": retell(row["label"].split(":")[0]),
-                            "what it means": retell(row["detail"]),
-                            "predicts held-out points": f"{row['cv_rmse']:.3g}",
-                            "free numbers": row["n_params"],
-                            "carries": (
-                                "no T₀" if row.get("dropped") else "all of them"
-                            ),
-                            "": "← chosen" if row is previous["best"]
-                            else ("ties" if row.get("tied_with_best") else ""),
-                        }
-                        for row in previous["candidates"]
-                    ]
-                else:
-                    st.info(
-                        "Press the button and the answer appears here, with "
-                        "the fitted curve below."
-                    )
-
-            # ------------------------------------ recommended components
-            # The first thing to read after pressing the button: not how
-            # stiff each part is, but which parts this curve can see at all.
-            picked = st.session_state.get("component_search")
-            if picked and picked.get("success"):
-                names_here = components_for(st.session_state["cell_type"])
-                wanted = picked["recommended"]
-                current = active_terms()
-                agrees = set(wanted) == set(current)
-
-                st.markdown("##### Recommended components")
-                listed = "  ·  ".join(
-                    f"**{names_here[t][0]}**" for t in wanted
+            for column, term in zip(st.columns(len(here)), here):
+                label, everyday = names[term]
+                with column:
+                    st.checkbox(label, key=f"use_{term}")
+                    st.caption(everyday)
+            if len(here) == 4:
+                st.caption(
+                    "The first two are both the membrane. A cardiomyocyte's "
+                    "membrane carries a protein network that is already taut, "
+                    "so it pushes back from the very first contact in "
+                    "proportion to how far it is pushed (a law in ε); the "
+                    "shell's own elasticity only bites once the cell has been "
+                    "flattened enough to stretch it (a law in ε³). They are "
+                    "one piece of material answering two ways, which is why "
+                    "they start and stop together."
                 )
-                if picked["clear_cut"]:
-                    st.success(
-                        f"Use {listed}."
-                        + ("" if not picked["dropped"] else
-                           "  Leave out "
-                           + ", ".join(names_here[t][0].lower()
-                                       for t in picked["dropped"])
-                           + ": this curve shows nothing there to measure.")
-                    )
-                else:
-                    st.info(
-                        f"Use {listed}. Other combinations predict this curve "
-                        f"about as well, so nothing in the data separates "
-                        f"them; this is the smallest of those, which is the "
-                        f"one whose numbers will be steadiest between cells."
-                        + ("" if not picked["dropped"] else
-                           "  Leave out "
-                           + ", ".join(names_here[t][0].lower()
-                                       for t in picked["dropped"]) + ".")
-                    )
 
-                if agrees:
-                    st.caption("That is what is ticked, so nothing to change.")
-                else:
-                    a1, a2 = st.columns([1, 2])
-                    with a1:
-                        if st.button("✓ Use the recommendation", type="primary",
-                                     **STRETCH):
-                            st.session_state["_pending_settings"] = {
-                                f"use_{t}": (t in wanted) for t in ALL_TERMS
-                            }
-                            st.rerun()
-                    with a2:
-                        st.caption(
-                            "Currently ticked: "
-                            + ", ".join(names_here[t][0] for t in current)
-                            + ". Pressing this changes the ticks in Step 2 "
-                            "and refits."
-                        )
+            if not chosen:
+                st.warning("Tick at least one part before analysing.")
+
+
+        # The sharing controls run for every mode, so the guided
+        # block closes here and opens again under them.
+
 
                 st.divider()
 
@@ -3966,11 +3808,229 @@ with tab_analysis:
         else:
             membrane_mode, cyto_mode = "freeze", "break"
 
-        # The picture of how they share it, drawn where the question is
-        # asked rather than in a column beside the curve.
-        sharing_slot = st.container()
+        # The picture, drawn from the choices immediately above it and
+        # redrawn the moment one of them changes. It is the point of putting
+        # the controls and the diagram together: a radio labelled "the
+        # cytoskeleton starts at ε₁" means very little until you watch the
+        # gap appear under its spring.
+        if guided:
+            live = current_style(force_N)
+            # Swept by hand, because the choices above only differ at some
+            # deformations: whether the cytoskeleton starts at ε₁ or at zero
+            # is invisible above ε₁, where it is loading either way. Sliding
+            # this down below ε₁ is what makes the difference appear.
+            preview_at = st.slider(
+                "Show the cell at ε =", 0.0,
+                float(min(1.0, max(0.05, st.session_state["guided_window_end"]))),
+                step=0.01, key="sharing_preview_eps",
+            )
+            st.plotly_chart(
+                cell_schematic(
+                    live,
+                    **figure_kwargs(
+                        cell_schematic,
+                        coupling=("series" if coupling == "series"
+                                  else "hybrid" if coupling.startswith("hybrid")
+                                  else "parallel"),
+                        epsilon=float(preview_at),
+                        cell_height_um=st.session_state["cell_height_um"],
+                        break_1=float(st.session_state["segment_break_1"]),
+                        break_2=float(st.session_state["segment_break_2"]),
+                        membrane_mode=membrane_mode,
+                        cyto_start=cyto_mode,
+                        labels=components_for(st.session_state["cell_type"]),
+                        show_nucleus="nucleus" in active,
+                        show_tension="tension" in active,
+                        height=330,
+                    ),
+                ),
+                key="sharing_preview",
+                **STRETCH,
+            )
+            st.caption(
+                "Drawn from the choices above, and redrawn as you change "
+                "them. A gap over a spring means that element is not "
+                "carrying load yet; a locked block means it has stopped "
+                "taking more. Nothing here is fitted — it is what you are "
+                "about to ask the fit to assume."
+            )
 
         close_panel(model_panel)
+
+        # Kept so the plot code below has something to write the diagram
+        # into when it is not drawn here.
+        sharing_slot = st.container()
+
+        if guided:
+            st.markdown("#### Step 3 · Work it out for me")
+            st.caption(
+                "One button. It decides how the parts are arranged, whether "
+                "the cell is segmented, side by side or stacked, then where "
+                "each part takes over, then how stiff each one is, fitting "
+                "every possibility and keeping the one that best predicts "
+                "points it was not fitted on. The settings it uses are "
+                "underneath, already set for "
+                f"**{st.session_state['cell_type'].split(' (')[0]}**; change "
+                "one and press the button again."
+            )
+            g1, g2 = st.columns([1, 2])
+            with g1:
+                if st.button(
+                    "🔬 Work it out for me", type="primary",
+                    disabled=not chosen, **STRETCH,
+                ):
+                    # Confinement first, because it changes the shape of
+                    # every basis function and therefore which arrangement
+                    # looks best. Searching arrangements at the wrong q asks
+                    # which of several wrong models is least wrong.
+                    if (
+                        st.session_state["cell_shape"].startswith("Belt")
+                        and hasattr(model, "scan_confinement")
+                    ):
+                        with st.spinner("Measuring how confined the cell is…"):
+                            q_found = model.scan_confinement(
+                                guided_lo, guided_hi,
+                                e1=float(st.session_state["segment_break_1"]),
+                                e2=float(st.session_state["segment_break_2"]),
+                                membrane="continue", cyto_start="zero",
+                                use_nucleus="nucleus" in chosen,
+                                use_tension="tension" in chosen,
+                                weighting=st.session_state["weighting"],
+                            )
+                        if q_found.get("success"):
+                            st.session_state["confinement_scan"] = q_found
+                            model.confinement = float(q_found["q"])
+                            st.session_state["_confinement_from_search"] = round(
+                                float(q_found["q"]), 2
+                            )
+                    with st.spinner(
+                        "Comparing segmented, side by side and stacked, then "
+                        "every way the parts can share the boundaries…"
+                    ):
+                        found = search_arrangements(
+                            model, guided_lo, guided_hi, terms=chosen,
+                            weighting=st.session_state["weighting"],
+                            # Where the cell type says the membrane is two
+                            # springs, that is the structure to place the
+                            # boundaries inside, not a hypothesis to test. A
+                            # linear term is flexible enough to help a wrong
+                            # composition imitate the right one, so letting
+                            # the search drop it buys a worse story for a
+                            # better number.
+                            tension_mode=(
+                                "always" if "tension" in chosen else "off"
+                            ),
+                        )
+                    st.session_state["arrangement_search"] = found
+                    st.session_state["composition_search"] = found.get("composition")
+
+                    # Which elements the curve actually needs, asked at the
+                    # boundaries the search just chose. Cheap (a fraction of
+                    # a second), and it is the question people most want
+                    # answered: not "how stiff is the nucleus" but "is there
+                    # anything there to measure".
+                    picked = (found.get("composition") or {}) if found.get("success") else {}
+                    st.session_state["component_search"] = recommend_components(
+                        model, guided_lo, guided_hi,
+                        candidates=terms_for(st.session_state["cell_type"]),
+                        e1=float(picked.get("break_1",
+                                            st.session_state["segment_break_1"])),
+                        e2=float(picked.get("break_2",
+                                            st.session_state["segment_break_2"])),
+                        membrane=picked.get("membrane", "continue"),
+                        cyto_start=picked.get("cyto_start", "zero"),
+                        weighting=st.session_state["weighting"],
+                        cv_repeats=2,
+                    )
+                    if found.get("success"):
+                        pending = settings_from_arrangement(found["best"], guided_hi)
+                        pending["window_combined"] = (guided_lo, guided_hi)
+                        measured_q = st.session_state.pop(
+                            "_confinement_from_search", None
+                        )
+                        if measured_q is not None:
+                            pending["confinement"] = measured_q
+                        st.session_state["_pending_settings"] = pending
+                        st.rerun()
+                    else:
+                        st.error(found.get("error", "Could not analyse this curve."))
+            with g2:
+                previous = st.session_state.get("arrangement_search")
+                if previous and previous.get("success"):
+                    st.success(retell(previous["verdict"]))
+                    arrangement_rows = [
+                        {
+                            "arrangement": retell(row["label"].split(":")[0]),
+                            "what it means": retell(row["detail"]),
+                            "predicts held-out points": f"{row['cv_rmse']:.3g}",
+                            "free numbers": row["n_params"],
+                            "carries": (
+                                "no T₀" if row.get("dropped") else "all of them"
+                            ),
+                            "": "← chosen" if row is previous["best"]
+                            else ("ties" if row.get("tied_with_best") else ""),
+                        }
+                        for row in previous["candidates"]
+                    ]
+                else:
+                    st.info(
+                        "Press the button and the answer appears here, with "
+                        "the fitted curve below."
+                    )
+
+            # ------------------------------------ recommended components
+            # The first thing to read after pressing the button: not how
+            # stiff each part is, but which parts this curve can see at all.
+            picked = st.session_state.get("component_search")
+            if picked and picked.get("success"):
+                names_here = components_for(st.session_state["cell_type"])
+                wanted = picked["recommended"]
+                current = active_terms()
+                agrees = set(wanted) == set(current)
+
+                st.markdown("##### Recommended components")
+                listed = "  ·  ".join(
+                    f"**{names_here[t][0]}**" for t in wanted
+                )
+                if picked["clear_cut"]:
+                    st.success(
+                        f"Use {listed}."
+                        + ("" if not picked["dropped"] else
+                           "  Leave out "
+                           + ", ".join(names_here[t][0].lower()
+                                       for t in picked["dropped"])
+                           + ": this curve shows nothing there to measure.")
+                    )
+                else:
+                    st.info(
+                        f"Use {listed}. Other combinations predict this curve "
+                        f"about as well, so nothing in the data separates "
+                        f"them; this is the smallest of those, which is the "
+                        f"one whose numbers will be steadiest between cells."
+                        + ("" if not picked["dropped"] else
+                           "  Leave out "
+                           + ", ".join(names_here[t][0].lower()
+                                       for t in picked["dropped"]) + ".")
+                    )
+
+                if agrees:
+                    st.caption("That is what is ticked, so nothing to change.")
+                else:
+                    a1, a2 = st.columns([1, 2])
+                    with a1:
+                        if st.button("✓ Use the recommendation", type="primary",
+                                     **STRETCH):
+                            st.session_state["_pending_settings"] = {
+                                f"use_{t}": (t in wanted) for t in ALL_TERMS
+                            }
+                            st.rerun()
+                    with a2:
+                        st.caption(
+                            "Currently ticked: "
+                            + ", ".join(names_here[t][0] for t in current)
+                            + ". Pressing this changes the ticks in Step 2 "
+                            "and refits."
+                        )
 
         # ---------------------------------------------------- exploration ---
         # Only in full control. In guided mode the boundaries are found and
@@ -4245,6 +4305,23 @@ with tab_analysis:
                             fit_lo, fit_hi, terms=active or ("membrane", "interior"),
                             weighting=st.session_state["weighting"],
                         )
+                        # And where the curve's own power law changes, which
+                        # is a second opinion arrived at a different way:
+                        # the scan above asks which boundaries fit best, this
+                        # asks where the log-log slope stops being one thing
+                        # and starts being another. When they agree the
+                        # boundary is real; when they do not, that is worth
+                        # knowing before quoting a modulus either side of it.
+                        try:
+                            grid_e, grid_slope = model.local_exponent(
+                                window_frac=0.18
+                            )
+                            st.session_state["_power_law_check"] = {
+                                "epsilon": list(map(float, grid_e)),
+                                "exponent": list(map(float, grid_slope)),
+                            }
+                        except Exception:
+                            st.session_state["_power_law_check"] = None
                     if scan_breaks.get("success"):
                         st.session_state["_pending_settings"] = {
                             "segment_break_1": round(float(scan_breaks["best_break_1"]), 3),
@@ -4255,8 +4332,32 @@ with tab_analysis:
                         st.error(scan_breaks.get("error", "Boundary scan failed."))
                 st.caption(
                     "Moves the two boundaries only, keeping the combination you "
-                    "picked above."
+                    "picked above, and checks them against the curve's own "
+                    "power law."
                 )
+                profile = st.session_state.get("_power_law_check")
+                if profile and len(profile.get("epsilon", [])) > 4:
+                    grid = np.asarray(profile["epsilon"], dtype=float)
+                    slope = np.asarray(profile["exponent"], dtype=float)
+                    good = np.isfinite(slope)
+                    if good.sum() > 4:
+                        def slope_at(where):
+                            index = int(np.argmin(np.abs(grid[good] - where)))
+                            return float(slope[good][index])
+                        e1_now = float(st.session_state["segment_break_1"])
+                        e2_now = float(st.session_state["segment_break_2"])
+                        st.caption(
+                            f"Measured log-log slope: "
+                            f"{slope_at(grid[good][0]):.2f} near contact, "
+                            f"{slope_at(e1_now):.2f} at ε₁ = {e1_now:.3f}, "
+                            f"{slope_at(e2_now):.2f} at ε₂ = {e2_now:.3f}, "
+                            f"{slope_at(grid[good][-1]):.2f} at the far end. "
+                            "3 is a membrane on its own, 3/2 a Hertzian "
+                            "network on its own, and anything above 3 is the "
+                            "cell running out of room. A boundary should sit "
+                            "where that number is changing, not where it is "
+                            "flat."
+                        )
             # Applying a winning combination means writing four widget keys,
             # which Streamlit only allows before those widgets exist. So both
             # the search button and the table's apply button stage the values
@@ -5261,7 +5362,7 @@ with tab_analysis:
                 f"thickness doubles Eₘ while the measurement is unchanged."
             )
 
-            if fitted_coupling == "segmented" and fitted is not None:
+            if fitted_coupling == "segmented" and fitted is not None and not guided:
                 # What each element is doing in each stretch, and how much of
                 # the force it carries there. This is the question the moduli
                 # alone do not answer: a modulus says how stiff, not how much
@@ -5458,7 +5559,10 @@ with tab_analysis:
             plot_weight = float(st.session_state["plot_width"])
             if guided:
                 plot_col = curve_slot
-                panel_cols = [sharing_slot] if show_schematic else []
+                # The diagram is already drawn live in Step 2, from the same
+                # settings. Drawing it again here would be the same picture
+                # twice on one page.
+                panel_cols = []
             else:
                 side_panels = int(bool(video_ready)) + int(bool(show_schematic))
                 if side_panels:
