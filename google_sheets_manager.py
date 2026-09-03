@@ -220,7 +220,7 @@ class GoogleSheetsManager:
         ("model", "Model"),
         ("combination", "Combination"),
         ("break_1", "ε₁ membrane hands over"),
-        ("break_2", "ε₂ nucleus engages"),
+        ("break_2", "ε₂ deep layer engages"),
         ("fit_range", "Fitted range (ε)"),
         ("fit_quality", "Fit Quality (R²)"),
         ("adj_r_squared", "Adjusted R²"),
@@ -231,7 +231,7 @@ class GoogleSheetsManager:
         ("n_points", "Points fitted"),
         ("weighting", "Weighting"),
         ("cell_radius", "Cell radius R₀ (μm)"),
-        ("nucleus_radius", "Nucleus radius (μm)"),
+        ("nucleus_radius", "Deep layer radius (μm)"),
         ("membrane_thickness", "Membrane thickness (nm)"),
         ("protein_coat", "Protein coat thickness (nm)"),
         ("sarcomere_relaxed", "Relaxed sarcomere (nm)"),
@@ -249,6 +249,10 @@ class GoogleSheetsManager:
     # name would look like a missing column and be appended alongside the old
     # one, leaving two half-filled columns saying the same thing.
     RENAMED = {
+        # Named after a myoblast's anatomy, which is wrong for a cell that
+        # has no nucleus term. The data under them is unchanged.
+        "ε₂ nucleus engages": "ε₂ deep layer engages",
+        "Nucleus radius (μm)": "Deep layer radius (μm)",
         "Date Analyzed": "Experiment Date",
         "Cantilever Constant (pN/nm)": "Spring Constant, K (N/m)",
         "Fitted range": "Fitted range (ε)",
