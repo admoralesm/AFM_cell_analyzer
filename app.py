@@ -797,8 +797,14 @@ def show_fit_maths(fit, model):
     st.code(
         f"h0 = {model.cell_height:.4g} m        (cell height)\n"
         f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
-        f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
-        f"({term_name('nucleus').lower()} radius)\n"
+        + (
+            f"Rn = {fit.get('R0', 0.0):.4g} m        "
+            f"({term_name('nucleus').lower()} run the length of the cell, so "
+            f"the deep term uses the cell's own radius)\n"
+            if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS else
+            f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
+            f"({term_name('nucleus').lower()} radius)\n"
+        ) +
         f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
         f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
         f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa\n"
@@ -1537,6 +1543,7 @@ MODEL_KEYS_ANY = {**LEGACY_MODEL_NAMES, **MODEL_KEYS}
 MEMBRANE_CHOICES = {
     "holds what it reached": "freeze",
     "keeps stiffening": "continue",
+    "starts stretching at ε₁": "late",
 }
 CYTO_CHOICES = {
     "at ε₁": "break",
@@ -1547,7 +1554,22 @@ COMPOSITION_LABELS = {
     ("freeze", "zero"): "Both from the start, membrane holds after ε₁",
     ("continue", "break"): "Membrane throughout, cytoskeleton joins at ε₁",
     ("continue", "zero"): "Membrane and cytoskeleton both throughout",
+    ("late", "zero"): "Cytoskeleton alone, then the membrane starts stretching at ε₁",
+    ("late", "break"): "Neither carries load until ε₁, which is not a model of anything",
 }
+
+
+def composition_label(membrane, cyto_start):
+    """Plain words for a composition, and never a crash for a new one.
+
+    A dict lookup here was a KeyError waiting for the next composition to be
+    added, which is exactly what happened.
+    """
+    return COMPOSITION_LABELS.get(
+        (membrane, cyto_start),
+        f"membrane {membrane}, cytoskeleton from "
+        f"{'zero' if cyto_start == 'zero' else 'ε₁'}",
+    )
 
 STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 
@@ -1639,12 +1661,25 @@ def cardiomyocyte_hypotheses(state="Not known — test for it"):
     an experiment can actually change.
     """
     coupled = {"membrane": "continue", "cyto_start": "zero"}
+    # The cortical network takes the load first on its own, and the shell
+    # only begins to stretch once the cell has been flattened enough to
+    # stretch it. Near contact that is a slope of 3/2, the shell taking over
+    # is what carries it up past 3, and it is a different claim from the two
+    # loading together from the start even though both start soft.
+    cyto_first = {"membrane": "late", "cyto_start": "zero"}
     base = [
         {
             "key": "coupled",
             "label": "Membrane and cortical actin together, then myofibrils",
             "detail": "one outer layer from first contact, myofibrils at ε₂",
             "terms": ("membrane", "interior", "nucleus"), **coupled,
+        },
+        {
+            "key": "cyto_first",
+            "label": "Cortical actin first, then the membrane stretches, "
+                     "then myofibrils",
+            "detail": "the shell only starts stretching at ε₁",
+            "terms": ("membrane", "interior", "nucleus"), **cyto_first,
         },
         {
             "key": "coupled_no_deep",
@@ -1776,6 +1811,7 @@ CELL_TYPES = {
         "cell_shape": "Sphere (a rounded cell)",
         "confinement": 0.0,
         "weighting": "uniform",
+        "schematic_style": "Mechanics schematic",
         # expected bands in pascals
         "expected": {"Em": (2e5, 2e7), "Ei": (2e2, 1e4), "En": (1e3, 5e4)},
         # The membrane carries load from the very start of the compression, so
@@ -1796,6 +1832,7 @@ CELL_TYPES = {
         "membrane_thickness_nm": 8.0,
         "nucleus_onset": 0.18,
         "cell_shape": "Belt cylinder (a rod lying down)",
+        "schematic_style": "Balloon with a spring inside",
         # These curves span four decades of force. Weighted uniformly the
         # fit is decided by the last tenth of the curve and misses the first
         # half by tens of per cent; weighted by 1/|F| it holds to a few per
@@ -1839,6 +1876,7 @@ def apply_cell_type(name):
         "cell_shape",
         "confinement",
         "weighting",
+        "schematic_style",
     ):
         if key in preset:
             st.session_state[key] = preset[key]
@@ -2809,10 +2847,14 @@ with st.sidebar:
             ["Mechanics schematic", "Balloon with a spring inside"],
             key="schematic_style", horizontal=True,
             disabled=not st.session_state["show_schematic"],
-            help="The schematic says what the model computes. The balloon "
-            "says what it is about: a taut skin holding an interior, "
-            "flattened between two plates and spreading sideways because it "
-            "keeps its volume. Same numbers, same deformation.",
+            help="The schematic says what the model computes: a support, a "
+            "cantilever, and the elements between them. The balloon says "
+            "what it is about: a taut skin holding an interior, flattened "
+            "between two plates and spreading sideways because it keeps its "
+            "volume. Same numbers, same deformation. For a cardiomyocyte "
+            "the balloon holds fluid rather than a spring, and the "
+            "myofibrils lie along the cell, because nothing in that model "
+            "singles out a nucleus.",
         )
         st.checkbox(
             "Moduli under the diagram", key="show_schematic_moduli",
@@ -3398,6 +3440,23 @@ with tab_analysis:
                         f"ε = {winner['break_2']:.3f} to {guided_hi:.3f}"
                     )
                 )
+                if deep_in and st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+                    st.caption(
+                        f"**Why a third element appears part-way along.** It "
+                        f"is not a nucleus: this model does not separate one "
+                        f"from the rest of the interior, and the cell is "
+                        f"treated as a shell holding fluid that does not "
+                        f"compress. What switches on at ε = "
+                        f"{winner['break_2']:.3f} is the "
+                        f"{term_name('nucleus').lower()}, which run the "
+                        f"length of the cell. They are stiffer than what "
+                        f"surrounds them and the plates only feel them once "
+                        f"the softer scaffolding above has been squeezed "
+                        f"down onto them, so their term is exactly zero "
+                        f"until then and rises from there. If the curve "
+                        f"shows no such change the search says so and picks "
+                        f"“nothing deeper” instead."
+                    )
                 notes = st.session_state.get("_auto_notes") or []
                 st.caption(
                     "Chosen automatically when the curve loaded: the range "
@@ -3915,7 +3974,7 @@ with tab_analysis:
                     "read close to 3."
                 )
             st.caption(
-                f"→ {COMPOSITION_LABELS[(membrane_mode, cyto_mode)]}. "
+                f"→ {composition_label(membrane_mode, cyto_mode)}. "
                 f"The {term_name('nucleus').lower()} always joins at ε₂. If "
                 "you are not sure which of the "
                 "four is right, the combination search below tries them all."
@@ -5469,6 +5528,16 @@ with tab_analysis:
                                     show_nucleus="nucleus" in active,
                                     show_tension="tension" in active,
                                     deep_onset=fit.get("break_2"),
+                                    # A cardiomyocyte is a shell holding
+                                    # fluid, and the model does not
+                                    # discriminate a nucleus from the rest
+                                    # of the interior, so nothing in the
+                                    # picture should look like one.
+                                    interior=(
+                                        "fluid"
+                                        if st.session_state["cell_type"]
+                                        in DEEP_IS_MYOFIBRILS else "spring"
+                                    ),
                                 ),
                             ),
                             key="balloon_plot",
@@ -5688,12 +5757,19 @@ with tab_analysis:
                 st.code(
                     f"h0 = {fit['cell_height'] * 1e6:.3f} um\n"
                     f"R0 = {fit['R0'] * 1e6:.3f} um\n"
-                    f"R_nucleus = {fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
+                    + (
+                        f"R_deep = {fit.get('R0', 0.0) * 1e6:.3f} um   "
+                        f"(the cell's own, since the deep layer runs its "
+                        f"length)\n"
+                        if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS
+                        else f"R_deep = "
+                             f"{fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
+                    ) +
                     f"h_membrane = {st.session_state['membrane_thickness_nm']:.2f} nm\n"
                     f"Am = {fit['Am']:.4e} N/Pa   (F_membrane = Am*Em*eps^3)\n"
                     f"Ai = {fit['Ai']:.4e} N/Pa   (F_cyto = Ai*Ec*eps^1.5)\n"
                     f"An = {fit.get('An', float('nan')):.4e} N/Pa   "
-                    f"(F_nucleus = An*En*<eps-eps0>^1.5)",
+                    f"(F_deep = An*En*<eps-eps2>^1.5)",
                     language="text",
                 )
 
