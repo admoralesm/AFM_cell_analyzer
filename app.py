@@ -788,6 +788,23 @@ def show_fit_maths(fit, model):
     if "tension" in terms:
         st.latex(r"A_t = \frac{2\pi R_0^{2}}{h_0}")
         st.caption(
+            "**Is there a bending term?** There is, and it is this same "
+            "column. A thin shell resisting being bent gives Reissner's "
+            "F = 4 E h² δ / (R√(3(1−ν²))), which is linear in ε — and the "
+            "in-plane spring is linear in ε too. They are not two terms, "
+            "they are one term with two names, and no fit can separate them "
+            "because there is nothing to separate. Only the conversion back "
+            "to a material property differs: on this cell a fitted T₀ of "
+            f"1 mN/m is the same measurement as a bending modulus of "
+            f"{fit.get('T0_as_bending_MPa', 0.0) / max(fit.get('T0_mN_m', 1.0), 1e-12):.3g} MPa. "
+            "Which you quote is a claim about the cell, not a result from "
+            "the curve.\n\nThe only way to add a genuinely new element is "
+            "to add a new **shape**: a different power of ε, or the same "
+            "power starting somewhere else. That is why the cortical "
+            "network works where a bending term would not — it is ε³ᐟ², a "
+            "shape nothing else in the model has."
+        )
+        st.caption(
             "A_t comes from the area a flattening sphere gains, ΔA ≈ πR₀²ε². "
             "At a fixed tension the stored energy is T₀ΔA, and the force is "
             "its derivative with respect to the travel δ = εh₀, which gives "
@@ -1001,7 +1018,7 @@ def plain_language_summary(fit, model):
         names = components_for(st.session_state["cell_type"])
         membrane_word = names["membrane"][0].lower()
         interior_word = names["interior"][0].lower()
-        nucleus_word = names["nucleus"][0].lower()
+        nucleus_word = plain_name("nucleus").lower()
         story.append(
             f"**Up to {e1 * 100:.0f} %** of the way down, "
             + (f"the {membrane_word} and the {interior_word} resist together."
@@ -1462,6 +1479,18 @@ def term_name(term, cell_type=None):
     return names.get(term, DEFAULT_COMPONENTS.get(term, (term, "")))[0]
 
 
+def plain_name(term, cell_type=None):
+    """The element's name without its emoji.
+
+    The emoji earns its place on a checkbox, where it makes four similar
+    labels tellable apart at a glance. It does not belong in a table header,
+    a spreadsheet column or a sentence, so those go through here.
+    """
+    name = term_name(term, cell_type)
+    head, _, rest = name.partition(" ")
+    return rest.strip() if rest and not head[:1].isalnum() else name
+
+
 def term_label(term, cell_type=None):
     """Name plus symbol, e.g. "Sarcomeric myofibrils (Eₙ)"."""
     return f"{term_name(term, cell_type)} ({TERM_SYMBOLS.get(term, term)})"
@@ -1583,9 +1612,9 @@ STAGE_COLORS = ("#2ca02c", "#9467bd", "#e377c2", "#ff7f0e")
 # term "cytoskeleton" and the third "nucleus" would misdescribe it.
 COMPONENT_SETS = {
     "Myoblast (C2C12)": {
-        "membrane": ("Membrane", "the skin around the cell"),
-        "interior": ("Cytoskeleton", "the scaffolding filling the cell"),
-        "nucleus": ("Nucleus", "the dense body at the centre"),
+        "membrane": ("🫧 Membrane", "the skin around the cell"),
+        "interior": ("🕸️ Cytoskeleton", "the scaffolding filling the cell"),
+        "nucleus": ("🔵 Nucleus", "the dense body at the centre"),
     },
     # Four layers, not three. The membrane of a cardiomyocyte is not one
     # spring: a protein network runs through it that is already taut, and it
@@ -1600,15 +1629,15 @@ COMPONENT_SETS = {
     # and the meaning change, and the name is what the app shows.
     "Cardiomyocyte": {
         "membrane": (
-            "Membrane and cortex",
+            "🎈 Membrane and cortex",
             "the shell around the cell, resisting being stretched",
         ),
         "interior": (
-            "Non-sarcomeric cytoskeleton",
+            "🕸️ Non-sarcomeric cytoskeleton",
             "the general scaffolding, not contractile",
         ),
         "nucleus": (
-            "Sarcomeric myofibrils",
+            "🧵 Sarcomeric myofibrils",
             "the contractile machinery, reached deeper in",
         ),
         # The optional fourth. Named for what it is mechanically rather than
@@ -1617,7 +1646,7 @@ COMPONENT_SETS = {
         # from first contact, answering in proportion to ε where everything
         # else answers to a power of it.
         "tension": (
-            "Extra membrane protein",
+            "↔️ Extra membrane protein",
             "an in-plane spring: prestin, or anything taut in the membrane",
         ),
     },
@@ -2745,7 +2774,7 @@ with st.sidebar:
         st.slider("Poisson ratio, cytoskeleton νc", 0.0, 0.5, step=0.01, key="poisson_interior")
         st.caption("0.5 = incompressible, the usual choice for living cells.")
 
-    deep_name = term_name("nucleus")
+    deep_name = plain_name("nucleus")
     with st.expander(f"🟣 {deep_name}"):
         if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
             st.caption(
@@ -3233,7 +3262,25 @@ with tab_analysis:
             st.info(
                 f"{int((epsilon < 0).sum())} points have ε < 0 (pre-contact). They are "
                 "kept for the plot but excluded from any fit window starting at ε ≥ 0."
-            )        # ----------------------------------------------------------- model ---
+            )
+
+        # The curve, first. Everything below is about this picture, so it
+        # belongs above them rather than at the end of a page of settings.
+        # Streamlit runs top to bottom and the fit does not exist yet, so a
+        # container is staked out here and filled in once it does.
+        # `guided` is settled further down, where its radio is drawn; the
+        # value it will take is already in session state.
+        guided_now = st.session_state["ui_mode"].startswith("Guided")
+        curve_slot = st.container()
+        if guided_now:
+            with curve_slot:
+                if st.button("🚀 Fit this curve", type="primary",
+                             key="fit_beside_curve", **STRETCH):
+                    st.session_state["_fit_from_curve"] = True
+                    st.rerun()
+        video_slot = st.container()
+
+        # ----------------------------------------------------------- model ---
         section("3 · Model")
 
         model = build_model(epsilon, force_N)
@@ -3482,21 +3529,77 @@ with tab_analysis:
                         "R²": f"{row['r_squared']:.5f}",
                         "verdict": " · ".join(mark),
                     })
-                with st.expander("The pictures it compared, and how each did"):
-                    flat_table(
-                        pd.DataFrame(rows),
-                        align_right=["misses held-out points by", "R²"],
-                    )
-                    st.caption(
-                        "Each row is a claim about the cell, fitted in full "
-                        "and scored on points it was not fitted to. The "
-                        "boundaries are fitted inside each one, since where "
-                        "a layer is met is not part of the claim."
-                    )
                 st.divider()
 
 
-            st.markdown("#### Step 1 · Fit it")
+
+
+            st.markdown("#### Step 1 · Which parts of the cell")
+            st.caption(
+                f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
+                "unless you have a reason not to. The names follow the cell "
+                "type chosen in the sidebar, because a "
+                f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
+                "not built like every other cell."
+            )
+            for column, term in zip(st.columns(len(here)), here):
+                label, everyday = names[term]
+                with column:
+                    st.checkbox(label, key=f"use_{term}")
+                    st.caption(everyday)
+            if len(here) == 4:
+                st.caption(
+                    "The first two are both the membrane. A cardiomyocyte's "
+                    "membrane carries a protein network that is already taut, "
+                    "so it pushes back from the very first contact in "
+                    "proportion to how far it is pushed (a law in ε); the "
+                    "shell's own elasticity only bites once the cell has been "
+                    "flattened enough to stretch it (a law in ε³). They are "
+                    "one piece of material answering two ways, which is why "
+                    "they start and stop together."
+                )
+
+            if not chosen:
+                st.warning("Tick at least one part before analysing.")
+
+            st.markdown("#### Step 2 · How far into the squash to look")
+            st.caption(
+                "The model describes a cell being flattened, not one being "
+                "burst. Past about 60 % the geometry it assumes stops "
+                "describing a real cell, and a curve that has ruptured should "
+                "be cut before the drop. Everything from 0 up to here is used."
+            )
+            st.slider(
+                f"Analyse from ε = {guided_lo:.3f} up to",
+                min_value=float(step), max_value=eps_hi_data, step=step,
+                key="guided_window_end",
+            )
+            if guided_lo > 0:
+                st.warning(
+                    f"This curve is fitted from ε = {guided_lo:.3f}, not "
+                    f"from zero, because the approach misbehaved before "
+                    f"that: the force ran up and then fell back, which is "
+                    f"a probe catching or a cell slipping rather than a "
+                    f"soft cell. Fitting through it drives the membrane "
+                    f"modulus to zero. Set this to 0 to fit the whole "
+                    f"curve anyway and see for yourself.",
+                    icon="⚠️",
+                )
+                st.slider(
+                    "Start the fit at ε =", 0.0, min(0.5, guided_hi - float(step)),
+                    step=step, key="guided_window_start",
+                )
+            inside = int(((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum())
+            st.caption(
+                f"{inside} of {epsilon.size} points. "
+                + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
+                   f"stop before that."
+                   if rupture.get("method") == "force-drop"
+                   and rupture.get("epsilon") is not None
+                   else "No sudden force drop was detected in this curve.")
+            )
+
+            st.markdown("#### Step 3 · Work it out for me")
             st.caption(
                 "One button. It decides how the parts are arranged, whether "
                 "the cell is segmented, side by side or stacked, then where "
@@ -3606,19 +3709,6 @@ with tab_analysis:
                         }
                         for row in previous["candidates"]
                     ]
-                    with st.expander("How the arrangements compared"):
-                        flat_table(
-                            pd.DataFrame(arrangement_rows),
-                            align_right=["predicts held-out points",
-                                         "free numbers"],
-                        )
-                        st.caption(
-                            "Lower is better in the middle column: it is how "
-                            "far the model misses points it never saw. Where "
-                            "two are close, the one with fewer free numbers "
-                            "wins, because a part the curve cannot see gives "
-                            "a number that will move from cell to cell."
-                        )
                 else:
                     st.info(
                         "Press the button and the answer appears here, with "
@@ -3679,127 +3769,21 @@ with tab_analysis:
                             "and refits."
                         )
 
-                with st.expander("Every combination it tried, and how each did"):
-                    rows = []
-                    for row in picked["candidates"]:
-                        note = []
-                        if row["recommended"]:
-                            note.append("recommended")
-                        elif row["tied_with_best"]:
-                            note.append("ties with it")
-                        for t in row["empty"]:
-                            note.append(f"{names_here[t][0].lower()} came out zero")
-                        rows.append({
-                            "components": " + ".join(
-                                names_here[t][0] for t in row["terms"]
-                            ),
-                            "misses held-out points by": f"{row['cv_rmse']:.3g}",
-                            "R²": f"{row['r_squared']:.5f}",
-                            "free numbers": row["n_params"],
-                            "note": " · ".join(note),
-                        })
-                    flat_table(
-                        pd.DataFrame(rows),
-                        align_right=["misses held-out points by", "R²",
-                                     "free numbers"],
-                    )
-                    st.caption(
-                        "Each row is a full fit with only those elements in "
-                        "it, all at the same boundaries, scored on points it "
-                        "was not fitted to. Adding an element can only ever "
-                        "improve the fit on the points it was fitted to, "
-                        "which is why that number cannot answer this question "
-                        "and held-out error can. An element that comes out at "
-                        "zero was in the fit and did nothing: same answer as "
-                        "leaving it out, one parameter more expensive."
-                    )
                 st.divider()
 
-
-            # Everything the button used, under the button rather than in
-            # front of it. Open on a curve that has not been fitted yet, shut
-            # once there is an answer: by then these are things you change
-            # occasionally, not things you read every time.
-            with st.expander(
-                "Step 2 · What it used, and what to change",
-                expanded=False,
-            ):
-                st.caption(
-                    "Cell height, spring constant, shape and the model "
-                    "constants are in the sidebar. Those are properties of "
-                    "the cell and the instrument: set them once for the "
-                    "session. What is here belongs to this particular fit."
-                )
-                st.markdown("**Which parts of the cell are in the model**")
-                st.caption(
-                    f"Leave all {'four' if len(here) == 4 else 'three'} ticked "
-                    "unless you have a reason not to. The names follow the cell "
-                    "type chosen in the sidebar, because a "
-                    f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
-                    "not built like every other cell."
-                )
-                for column, term in zip(st.columns(len(here)), here):
-                    label, everyday = names[term]
-                    with column:
-                        st.checkbox(label, key=f"use_{term}")
-                        st.caption(everyday)
-                if len(here) == 4:
-                    st.caption(
-                        "The first two are both the membrane. A cardiomyocyte's "
-                        "membrane carries a protein network that is already taut, "
-                        "so it pushes back from the very first contact in "
-                        "proportion to how far it is pushed (a law in ε); the "
-                        "shell's own elasticity only bites once the cell has been "
-                        "flattened enough to stretch it (a law in ε³). They are "
-                        "one piece of material answering two ways, which is why "
-                        "they start and stop together."
-                    )
-
-                if not chosen:
-                    st.warning("Tick at least one part before analysing.")
-
-                st.markdown("**How far into the squash to look**")
-                st.caption(
-                    "The model describes a cell being flattened, not one being "
-                    "burst. Past about 60 % the geometry it assumes stops "
-                    "describing a real cell, and a curve that has ruptured should "
-                    "be cut before the drop. Everything from 0 up to here is used."
-                )
-                st.slider(
-                    f"Analyse from ε = {guided_lo:.3f} up to",
-                    min_value=float(step), max_value=eps_hi_data, step=step,
-                    key="guided_window_end",
-                )
-                if guided_lo > 0:
-                    st.warning(
-                        f"This curve is fitted from ε = {guided_lo:.3f}, not "
-                        f"from zero, because the approach misbehaved before "
-                        f"that: the force ran up and then fell back, which is "
-                        f"a probe catching or a cell slipping rather than a "
-                        f"soft cell. Fitting through it drives the membrane "
-                        f"modulus to zero. Set this to 0 to fit the whole "
-                        f"curve anyway and see for yourself.",
-                        icon="⚠️",
-                    )
-                    st.slider(
-                        "Start the fit at ε =", 0.0, min(0.5, guided_hi - float(step)),
-                        step=step, key="guided_window_start",
-                    )
-                inside = int(((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum())
-                st.caption(
-                    f"{inside} of {epsilon.size} points. "
-                    + (f"Rupture looks to be near ε = {rupture['epsilon']:.3f}, so "
-                       f"stop before that."
-                       if rupture.get("method") == "force-drop"
-                       and rupture.get("epsilon") is not None
-                       else "No sudden force drop was detected in this curve.")
-                )
 
         st.divider()
 
         model_panel = open_panel(
-            "⚙️ Which parts of the cell, and how they share the load", guided
+            "⚙️ How the elements share the load", guided
         )
+        if guided:
+            st.caption(
+                "The elements chosen above: "
+                + "  ·  ".join(term_name(t) for t in active_terms())
+                + ".  What follows is how they carry the load between them, "
+                "drawn as a spring diagram underneath."
+            )
 
         element_col, model_col = st.columns([1, 1.5])
         with model_col:
@@ -3982,10 +3966,17 @@ with tab_analysis:
         else:
             membrane_mode, cyto_mode = "freeze", "break"
 
+        # The picture of how they share it, drawn where the question is
+        # asked rather than in a column beside the curve.
+        sharing_slot = st.container()
+
         close_panel(model_panel)
 
         # ---------------------------------------------------- exploration ---
-        if segmented:
+        # Only in full control. In guided mode the boundaries are found and
+        # applied automatically, so a second, manual way of finding them was
+        # a section to scroll past rather than a step to take.
+        if segmented and not guided:
             explore_panel = open_panel("🔬 Explore the curve", guided)
             if not guided:
                 section("4 · Explore the curve")
@@ -4070,7 +4061,7 @@ with tab_analysis:
                     **STRETCH,
                 )
 
-        if segmented:
+        if segmented and not guided:
             close_panel(explore_panel)
 
         # --------------------------------------------------------- ranges ---
@@ -4634,7 +4625,15 @@ with tab_analysis:
                         "well, so this curve does not locate the nucleus."
                     )
 
-        run = st.session_state["live_fit"] or st.button("🚀 Fit curve", type="primary")
+        # Two ways to press it, one button. A flag set beside the curve is
+        # read here, where the fit actually happens: a second st.button with
+        # the same job would be a duplicate widget key, and Streamlit
+        # refuses those outright.
+        run = (
+            st.session_state["live_fit"]
+            or st.button("🚀 Fit curve", type="primary")
+            or st.session_state.pop("_fit_from_curve", False)
+        )
 
         # A fit has to survive a rerun. Uploading a video, ticking a checkbox
         # or opening a tab all rerun the script, and with live refitting off
@@ -4952,13 +4951,13 @@ with tab_analysis:
             here = terms_for(st.session_state["cell_type"])
             moduli_shown = [
                 row for row in (
-                    (f"T₀ {term_name('tension').lower()}",
+                    (f"T₀ {plain_name('tension').lower()}",
                      fit.get("T0_mN_m", 0.0), "mN/m", "tension"),
-                    (f"Eₘ {term_name('membrane').lower()}",
+                    (f"Eₘ {plain_name('membrane').lower()}",
                      fit.get("Em_MPa", 0.0), "MPa", "membrane"),
-                    (f"Ec {term_name('interior').lower()}",
+                    (f"Ec {plain_name('interior').lower()}",
                      fit.get("Ei_kPa", 0.0), "kPa", "interior"),
-                    (f"Eₙ {term_name('nucleus').lower()}",
+                    (f"Eₙ {plain_name('nucleus').lower()}",
                      fit.get("En_kPa", 0.0), "kPa", "nucleus"),
                 ) if row[3] in here
             ]
@@ -5309,7 +5308,7 @@ with tab_analysis:
                         "range": f"{lo:.3f} to {hi:.3f}",
                         "points": int(inside.sum()),
                     }
-                    short = {t: term_name(t).lower() for t in ALL_TERMS}
+                    short = {t: plain_name(t).lower() for t in ALL_TERMS}
                     for term, key, unit in (
                         ("tension", "T0_mN_m", "mN/m"),
                         ("membrane", "Em_MPa", "MPa"),
@@ -5451,18 +5450,29 @@ with tab_analysis:
             nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
             highlight = (float(epsilon[nearest]), float(force_N[nearest]))
 
-            side_panels = int(bool(video_ready)) + int(bool(show_schematic))
+            # The curve goes into the slot staked out at the top of the
+            # page. The cell diagram no longer sits beside it: it belongs
+            # with the question it answers, which is how the elements share
+            # the load, and squeezing both into a side column is what made
+            # them illegible.
             plot_weight = float(st.session_state["plot_width"])
-            if side_panels:
-                widths = [plot_weight] + [1.0] * side_panels
-                columns = st.columns(widths)
-                plot_col = columns[0]
-                panel_cols = columns[1:]
+            if guided:
+                plot_col = curve_slot
+                panel_cols = [sharing_slot] if show_schematic else []
             else:
-                # Even with no side panel, keep the chart from spanning the
-                # whole page; the spare column is left empty on purpose.
-                plot_col, spare = st.columns([plot_weight, max(0.01, 4.0 - plot_weight)])
-                panel_cols = []
+                side_panels = int(bool(video_ready)) + int(bool(show_schematic))
+                if side_panels:
+                    widths = [plot_weight] + [1.0] * side_panels
+                    columns = st.columns(widths)
+                    plot_col = columns[0]
+                    panel_cols = columns[1:]
+                else:
+                    # Even with no side panel, keep the chart from spanning
+                    # the whole page; the spare column is left empty.
+                    plot_col, spare = st.columns(
+                        [plot_weight, max(0.01, 4.0 - plot_weight)]
+                    )
+                    panel_cols = []
 
             with plot_col:
                 # Built once and reused for the save button. Building it twice
@@ -5584,8 +5594,16 @@ with tab_analysis:
                         )
                 panel_index += 1
 
-            if video_ready and panel_index < len(panel_cols):
-                with panel_cols[panel_index]:
+            # In guided mode the video frame goes under the curve rather
+            # than beside it, for the same reason as the diagram.
+            video_target = None
+            if video_ready:
+                if guided:
+                    video_target = video_slot
+                elif panel_index < len(panel_cols):
+                    video_target = panel_cols[panel_index]
+            if video_target is not None:
+                with video_target:
                     vinfo = st.session_state["video_info"]
                     frame_index = va.frame_for_epsilon(
                         selected_eps,
@@ -5648,7 +5666,7 @@ with tab_analysis:
                     else "n/a",
                 )
                 share_cols[2].metric(
-                    f"{term_name('nucleus')} share",
+                    f"{plain_name('nucleus')} share",
                     f"{100 * fit['nucleus_fraction_at_max']:.1f} %"
                     if np.isfinite(fit.get("nucleus_fraction_at_max", np.nan))
                     else "n/a",
@@ -5743,7 +5761,7 @@ with tab_analysis:
                         st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
 
                 if scan and scan.get("success"):
-                    st.markdown(f"**{term_name('nucleus')} onset scan**")
+                    st.markdown(f"**{plain_name('nucleus')} onset scan**")
                     st.caption(
                         "R² against the assumed onset. A sharp peak means the curve "
                         "locates the nucleus; a flat line means it does not."
