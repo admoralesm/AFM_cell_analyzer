@@ -112,7 +112,11 @@ def dropped_term_warning(dropped):
     """One sentence naming what was left out, and where it does work."""
     if not dropped:
         return []
-    names = {"tension": "the membrane's in-plane tension, T₀"}
+    names = {
+        "tension": "the membrane's in-plane tension, T₀",
+        "cortex": "the cortical layer, E_cx",
+        "nucleus_shell": "the nuclear envelope, E_ne",
+    }
     listed = " and ".join(names.get(t, t) for t in dropped)
     return [
         f"This model does not have {listed}, so it was left out. The moduli "
@@ -1194,7 +1198,7 @@ class _ExploreMixin:
 # everywhere is what lets the design matrix, the tables and the schematic be
 # read against each other without translating.
 COMPOSITION_TERMS = (
-    "tension", "membrane", "interior", "nucleus_shell", "nucleus",
+    "tension", "membrane", "cortex", "interior", "nucleus_shell", "nucleus",
 )
 
 COMPOSITIONS = [
@@ -1490,9 +1494,18 @@ class _CompositionMixin:
 
         ``tension``       At e                   a taut protein network
         ``membrane``      Am e^3                 dilation of the same shell
+        ``cortex``        Ai e^1.5               the layer just under the shell
         ``interior``      Ai <e - s>^1.5         a network filling the cell
         ``nucleus_shell`` An_shell <e - e2>^3    the envelope around the nucleus
         ``nucleus``       An <e - e2>^1.5        what the envelope contains
+
+        Three of those are the same Hertzian law, and that is deliberate:
+        cortex, interior and the deepest layer are all networks being
+        squeezed, so they can only be told apart by *when* they start. The
+        cortex is loaded from first contact, the interior from e1, the deep
+        layer from e2. Give two of them the same onset and they become one
+        term with two names, which is why the app forces the interior to
+        start at e1 whenever the cortex is in the fit.
 
         A fit can only separate terms whose shapes differ. Two networks with
         the same exponent and the same onset are one term wearing two names,
@@ -1527,6 +1540,10 @@ class _CompositionMixin:
             "interior": (
                 self.Ai * np.clip(eps - start, 0.0, None) ** 1.5 * squeeze
             ),
+            # The cortical layer just under the shell. Same Hertzian law and
+            # the same geometry as the interior, always loaded from first
+            # contact: it is the onset that separates them, nothing else.
+            "cortex": self.Ai * positive ** 1.5 * squeeze,
             "nucleus": (
                 self.An * np.clip(eps - float(e2), 0.0, None) ** 1.5 * squeeze
             ),
@@ -1562,6 +1579,7 @@ class _CompositionMixin:
         for term, modulus in (
             ("tension", fit.get("T0", 0.0)),
             ("membrane", fit.get("Em", 0.0)),
+            ("cortex", fit.get("Ecx", 0.0)),
             ("interior", fit.get("Ei", 0.0)),
             ("nucleus_shell", fit.get("Ene", 0.0)),
             ("nucleus", fit.get("En", 0.0)),
@@ -1631,6 +1649,7 @@ class _CompositionMixin:
         use_interior=True,
         use_tension=False,
         use_nucleus_shell=False,
+        use_cortex=False,
         fit_offset=False,
         with_stats=True,
     ):
@@ -1660,6 +1679,7 @@ class _CompositionMixin:
             "interior": bool(use_interior),
             "nucleus": bool(use_nucleus),
             "nucleus_shell": bool(use_nucleus_shell),
+            "cortex": bool(use_cortex),
         }
         n_params = sum(wanted.values()) + (1 if fit_offset else 0)
         if sum(wanted.values()) == 0:
@@ -1673,6 +1693,7 @@ class _CompositionMixin:
         c_basis = bases["interior"]
         n_basis = bases["nucleus"]
         ne_basis = bases["nucleus_shell"]
+        cx_basis = bases["cortex"]
         order = [name for name in COMPOSITION_TERMS if wanted[name]]
         columns = [bases[name] for name in order]
         if fit_offset:
@@ -1698,6 +1719,7 @@ class _CompositionMixin:
         Ec = values.get("interior", 0.0)
         En = values.get("nucleus", 0.0)
         Ene = values.get("nucleus_shell", 0.0)
+        Ecx = values.get("cortex", 0.0)
 
         # How badly the chosen terms imitate each other over this range. Two
         # nearly parallel columns still fit, but the split between them is
@@ -1722,7 +1744,7 @@ class _CompositionMixin:
 
         predicted = (
             m_basis * Em + t_basis * T0 + c_basis * Ec + n_basis * En
-            + ne_basis * Ene + offset
+            + ne_basis * Ene + cx_basis * Ecx + offset
         )
         residuals = force - predicted
         ss_res = float(np.sum(residuals ** 2))
@@ -1787,6 +1809,7 @@ class _CompositionMixin:
             "use_interior": bool(use_interior),
             "use_tension": bool(use_tension),
             "Em": Em, "Ei": Ec, "En": En, "T0": T0, "Ene": Ene,
+            "Ecx": Ecx, "Ecx_kPa": Ecx / 1e3, "use_cortex": bool(use_cortex),
             "Em_MPa": Em / 1e6, "Ei_kPa": Ec / 1e3, "En_kPa": En / 1e3,
             "Ene_MPa": Ene / 1e6,
             "use_nucleus_shell": bool(use_nucleus_shell),
@@ -1799,6 +1822,7 @@ class _CompositionMixin:
             "Ei_kPa_std": errors.get("interior", float("nan")) / 1e3,
             "En_kPa_std": errors.get("nucleus", float("nan")) / 1e3,
             "Ene_MPa_std": errors.get("nucleus_shell", float("nan")) / 1e6,
+            "Ecx_kPa_std": errors.get("cortex", float("nan")) / 1e3,
             "T0_mN_m_std": errors.get("tension", float("nan")) * 1e3,
             "force_offset": offset,
             "break_1": float(e1), "break_2": float(e2),
@@ -1830,7 +1854,7 @@ class _CompositionMixin:
             "relative_errors": {
                 name: (errors[name] / value if value > 0 else float("nan"))
                 for name, value in (
-                    ("tension", T0), ("membrane", Em),
+                    ("tension", T0), ("membrane", Em), ("cortex", Ecx),
                     ("interior", Ec), ("nucleus_shell", Ene), ("nucleus", En),
                 ) if name in errors
             },
@@ -1843,7 +1867,7 @@ class _CompositionMixin:
             "mask": mask,
             "warnings": self._identifiability_warnings(
                 {name: errors[name] / v for name, v in (
-                    ("tension", T0), ("membrane", Em),
+                    ("tension", T0), ("membrane", Em), ("cortex", Ecx),
                     ("interior", Ec), ("nucleus_shell", Ene), ("nucleus", En),
                 ) if name in errors and v > 0},
                 worst_pair, worst_corr,
@@ -2000,7 +2024,7 @@ class _CompositionMixin:
     def best_confinement_and_breaks(
         self, epsilon_min, epsilon_max, membrane="continue", cyto_start="zero",
         use_nucleus=True, use_tension=False, weighting="uniform", n_grid=6,
-        use_nucleus_shell=False,
+        use_nucleus_shell=False, use_cortex=False,
     ):
         """
         Search q and the boundaries together, rather than one after the other.
@@ -2031,6 +2055,7 @@ class _CompositionMixin:
                         lo, hi, membrane, cyto_start, use_nucleus, weighting,
                         int(grid), int(rounds), use_tension=use_tension,
                         use_nucleus_shell=use_nucleus_shell,
+                        use_cortex=use_cortex,
                     )
                     if trial is None or not trial.get("success"):
                         continue
@@ -2056,7 +2081,7 @@ class _CompositionMixin:
         self, epsilon_min, epsilon_max, e1=None, e2=None,
         membrane="continue", cyto_start="zero", use_nucleus=True,
         use_tension=False, weighting="uniform",
-        q_values=None, refine=True, use_nucleus_shell=False,
+        q_values=None, refine=True, use_nucleus_shell=False, use_cortex=False,
     ):
         """
         Find the confinement exponent q from the curve.
@@ -2086,7 +2111,8 @@ class _CompositionMixin:
                 trial = self.fit_composition(
                     lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
                     weighting, use_tension=use_tension,
-                    use_nucleus_shell=use_nucleus_shell, with_stats=False,
+                    use_nucleus_shell=use_nucleus_shell,
+                    use_cortex=use_cortex, with_stats=False,
                 )
                 if trial.get("success"):
                     rows.append({"q": float(q), "ss_res": trial["ss_res"],
@@ -2104,7 +2130,8 @@ class _CompositionMixin:
                     trial = self.fit_composition(
                         lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
                         weighting, use_tension=use_tension,
-                        use_nucleus_shell=use_nucleus_shell, with_stats=False,
+                        use_nucleus_shell=use_nucleus_shell,
+                        use_cortex=use_cortex, with_stats=False,
                     )
                     if trial.get("success"):
                         rows.append({"q": float(q), "ss_res": trial["ss_res"],
@@ -2232,6 +2259,7 @@ class _CompositionMixin:
     def _best_breakpoints(
         self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
         rounds=2, use_tension=False, search_e2=None, use_nucleus_shell=False,
+        use_cortex=False,
     ):
         """
         The breakpoints that fit best for one composition.
@@ -2266,7 +2294,8 @@ class _CompositionMixin:
                     trial = self.fit_composition(
                         lo, hi, e1, e2, membrane, cyto_start, use_nucleus,
                         weighting, use_tension=use_tension,
-                        use_nucleus_shell=use_nucleus_shell, with_stats=False,
+                        use_nucleus_shell=use_nucleus_shell,
+                        use_cortex=use_cortex, with_stats=False,
                     )
                     if not trial.get("success"):
                         continue
@@ -2295,7 +2324,7 @@ class _CompositionMixin:
             best = self.fit_composition(
                 lo, hi, best["break_1"], best["break_2"], membrane, cyto_start,
                 use_nucleus, weighting, use_tension=use_tension,
-                use_nucleus_shell=use_nucleus_shell,
+                use_nucleus_shell=use_nucleus_shell, use_cortex=use_cortex,
             )
         return best
 
@@ -4083,6 +4112,7 @@ def compare_hypotheses(
             "use_nucleus": "nucleus" in terms,
             "use_tension": "tension" in terms,
             "use_nucleus_shell": "nucleus_shell" in terms,
+            "use_cortex": "cortex" in terms,
         }
         membrane = spec.get("membrane", "continue")
         cyto_start = spec.get("cyto_start", "zero")
@@ -4104,6 +4134,7 @@ def compare_hypotheses(
                 use_nucleus=flags["use_nucleus"],
                 use_tension=flags["use_tension"],
                 use_nucleus_shell=flags["use_nucleus_shell"],
+                use_cortex=flags["use_cortex"],
                 weighting=weighting, n_grid=max(5, int(n_grid) // 2),
             )
             local = model._clone(force_all, eps_all)
@@ -4120,6 +4151,7 @@ def compare_hypotheses(
             lo, hi, membrane, cyto_start, flags["use_nucleus"], weighting,
             n_grid, refine_rounds, use_tension=flags["use_tension"],
             use_nucleus_shell=flags["use_nucleus_shell"],
+            use_cortex=flags["use_cortex"],
         ) if (deep_here or needs_e1) else local.fit_composition(
             lo, hi, local.segment_break_1, local.segment_break_2,
             membrane, cyto_start, weighting=weighting, **flags
@@ -4159,6 +4191,7 @@ def compare_hypotheses(
                     basis["membrane"] * trained["Em"]
                     + basis["tension"] * trained.get("T0", 0.0)
                     + basis["interior"] * trained["Ei"]
+                    + basis["cortex"] * trained.get("Ecx", 0.0)
                     + basis["nucleus_shell"] * trained.get("Ene", 0.0)
                     + basis["nucleus"] * trained["En"]
                     + trained.get("force_offset", 0.0)
@@ -4188,10 +4221,12 @@ def compare_hypotheses(
             "Ec_kPa": whole["Ei_kPa"],
             "En_kPa": whole["En_kPa"],
             "Ene_MPa": whole.get("Ene_MPa", 0.0),
+            "Ecx_kPa": whole.get("Ecx_kPa", 0.0),
             "empty": tuple(
                 t for t, v in (
                     ("tension", whole.get("T0_mN_m", 0.0)),
                     ("membrane", whole["Em_MPa"]),
+                    ("cortex", whole.get("Ecx_kPa", 0.0)),
                     ("interior", whole["Ei_kPa"]),
                     ("nucleus_shell", whole.get("Ene_MPa", 0.0)),
                     ("nucleus", whole["En_kPa"]),
@@ -4294,6 +4329,23 @@ def compare_orderings(
     """
     picks = list(orderings if orderings is not None else ORDERINGS)
     keep = tuple(t for t in COMPOSITION_TERMS if t in tuple(terms))
+
+    # With a cortex in the fit, the cortex is the Hertzian term loaded from
+    # first contact and the scaffolding under it must wait for e1, or the
+    # two are one term with two names. So the orderings that differ only in
+    # when the scaffolding starts are not different orderings here: they are
+    # collapsed onto the one composition that is well posed, and duplicates
+    # are dropped rather than compared against themselves.
+    if "cortex" in keep:
+        collapsed, seen = [], set()
+        for row in picks:
+            here = dict(row, cyto_start="break")
+            signature = (here["membrane"], here["cyto_start"])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            collapsed.append(here)
+        picks = collapsed
     if "membrane" not in keep or "interior" not in keep:
         return {
             "success": False,
@@ -4425,6 +4477,7 @@ def recommend_components(
             "use_nucleus": "nucleus" in subset,
             "use_tension": "tension" in subset,
             "use_nucleus_shell": "nucleus_shell" in subset,
+            "use_cortex": "cortex" in subset,
         }
         whole = model.fit_composition(
             lo, hi, e1, e2, membrane, cyto_start, weighting=weighting, **flags
@@ -4454,6 +4507,7 @@ def recommend_components(
                     basis["membrane"] * trained["Em"]
                     + basis["tension"] * trained.get("T0", 0.0)
                     + basis["interior"] * trained["Ei"]
+                    + basis["cortex"] * trained.get("Ecx", 0.0)
                     + basis["nucleus_shell"] * trained.get("Ene", 0.0)
                     + basis["nucleus"] * trained["En"]
                     + trained.get("force_offset", 0.0)
