@@ -178,7 +178,10 @@ def force_curve_figure(
     interior_N=None,
     nucleus_N=None,
     nucleus_shell_N=None,
+    cortex_N=None,
     deep_label="deep",
+    cortex_label="cortex",
+    interior_label="cytoskeleton",
     fit_window=None,
     rupture_epsilon=None,
     highlight=None,
@@ -278,7 +281,9 @@ def force_curve_figure(
         if style.show_components:
             for comp, label, dash, color in (
                 (membrane_N, "· membrane contribution", "dash", "#2ca02c"),
-                (interior_N, "· cytoskeleton contribution", "dot", "#9467bd"),
+                (cortex_N, f"· {cortex_label} contribution", "dot", "#17becf"),
+                (interior_N, f"· {interior_label} contribution", "dot",
+                 "#9467bd"),
                 (nucleus_shell_N, "· nuclear envelope contribution",
                  "longdash", "#6c3483"),
                 (nucleus_N, f"· {deep_label} contribution", "dashdot",
@@ -557,6 +562,7 @@ def _spring_path(x_center, y_bottom, y_top, width, n_coils=6):
 DEFAULT_PART_NAMES = {
     "tension": ("In-plane spring", ""),
     "membrane": ("Membrane", ""),
+    "cortex": ("Cortex", ""),
     "interior": ("Cytoskeleton", ""),
     "nucleus_shell": ("Nuclear envelope", ""),
     "nucleus": ("Deep element", ""),
@@ -663,9 +669,11 @@ def cell_schematic(
     Ei_kPa=None,
     En_kPa=None,
     Ene_MPa=None,
+    Ecx_kPa=None,
     T0_mN_m=None,
     show_nucleus=True,
     show_nucleus_shell=False,
+    show_cortex=False,
     show_tension=False,
     height=None,
     coupling="parallel",
@@ -709,11 +717,11 @@ def cell_schematic(
     # springs: each pair is one piece of the cell answering two ways, and
     # colouring them as unrelated parts would say the opposite.
     COLORS = {"tension": "#5dade2", "membrane": "#1f77b4",
-              "interior": "#e67e22", "nucleus_shell": "#6c3483",
-              "nucleus": "#8e44ad"}
+              "cortex": "#17becf", "interior": "#e67e22",
+              "nucleus_shell": "#6c3483", "nucleus": "#8e44ad"}
     FADED = {"tension": "#bcdcf0", "membrane": "#a9c4d8",
-             "interior": "#f2cda6", "nucleus_shell": "#b9a2c9",
-             "nucleus": "#c9b0d8"}
+             "cortex": "#a9e3ea", "interior": "#f2cda6",
+             "nucleus_shell": "#b9a2c9", "nucleus": "#c9b0d8"}
 
     # What each element is doing at the deformation on display.
     if break_1 is not None and break_2 is not None:
@@ -731,12 +739,16 @@ def cell_schematic(
         # The envelope and what it contains are the same body, met at the
         # same moment, so they do the same thing at every deformation.
         state["nucleus_shell"] = state["nucleus"]
+        # The cortex is loaded from first contact, always: that is what
+        # separates it from the scaffolding under it.
+        state["cortex"] = "loading"
         # The taut network is the same shell as the elastic term, so it does
         # exactly what that one does, including going slack together with it.
         state["tension"] = state["membrane"]
         onset = {
             "tension": 0.0,
             "membrane": 0.0,
+            "cortex": 0.0,
             "interior": 0.0 if cyto_start == "zero" else break_1,
             "nucleus_shell": break_2,
             "nucleus": break_2,
@@ -747,19 +759,22 @@ def cell_schematic(
 
     terms = (
         (["tension"] if show_tension else [])
-        + ["membrane", "interior"]
+        + ["membrane"]
+        + (["cortex"] if show_cortex else [])
+        + ["interior"]
         + (["nucleus_shell"] if show_nucleus_shell else [])
         + (["nucleus"] if show_nucleus else [])
     )
     moduli = {
         "tension": (T0_mN_m, "mN/m", "T<sub>0</sub>"),
         "membrane": (Em_MPa, "MPa", "E<sub>m</sub>"),
+        "cortex": (Ecx_kPa, "kPa", "E<sub>cx</sub>"),
         "interior": (Ei_kPa, "kPa", "E<sub>c</sub>"),
         "nucleus_shell": (Ene_MPa, "MPa", "E<sub>ne</sub>"),
         "nucleus": (En_kPa, "kPa", "E<sub>n</sub>"),
     }
-    LAW = {"tension": "ε", "membrane": "ε³", "interior": "ε³ᐟ²",
-           "nucleus_shell": "ε³", "nucleus": "ε³ᐟ²"}
+    LAW = {"tension": "ε", "membrane": "ε³", "cortex": "ε³ᐟ²",
+           "interior": "ε³ᐟ²", "nucleus_shell": "ε³", "nucleus": "ε³ᐟ²"}
 
     fig = go.Figure()
     GROUND_Y, PLATEN_Y = 20.0, 78.0
@@ -935,6 +950,25 @@ def cell_schematic(
     return fig
 
 
+def _coil(x, bottom, top, width, pitch=3.0, min_turns=3):
+    """
+    A wide spring, with enough turns that a wide one still reads as a spring.
+
+    Width is what makes a coil look like a coil rather than a squiggle, so
+    these are drawn wide. What stops a wide coil reading as a lightning bolt
+    is not narrowing it but adding turns: a spring squashed between two
+    plates has its coils close together, which is exactly the picture here.
+    Turns therefore follow the span at a fixed pitch, so the same spring
+    tightens as the cell is flattened instead of stretching out.
+    """
+    span = max(float(top) - float(bottom), 1e-6)
+    # Wide, but never much wider than it is tall: past that the turns run
+    # into each other and the coil fills in solid.
+    width = min(float(width), span * 0.85)
+    turns = max(int(min_turns), int(round(span / max(float(pitch), 1e-6))))
+    return _zigzag(x, bottom, top, width, coils=turns)
+
+
 def balloon_figure(
     style: PlotStyle,
     epsilon=0.0,
@@ -979,13 +1013,13 @@ def balloon_figure(
     fig = go.Figure()
 
     GROUND_Y, CEILING = 12.0, 86.0
-    R0 = 26.0                     # resting half-height, in figure units
+    R0 = 27.0                     # resting half-height, in figure units
     half_height = R0 * (1.0 - eps)
     # Constant area: pi R0^2 = pi h^2 + 2 h w, with h the half-height.
     width = max(
         0.0, (np.pi * R0 ** 2 - np.pi * half_height ** 2) / (2 * 2 * half_height)
     )
-    centre_y = GROUND_Y + 17.0 + half_height
+    centre_y = GROUND_Y + 14.0 + half_height
     centre_x = 50.0
 
     # ---- the plates
@@ -1016,6 +1050,19 @@ def balloon_figure(
         hoverinfo="skip", line=dict(color="#1f77b4", width=6),
     ))
 
+    # The nucleus's size is needed before the cytoskeleton spring is drawn,
+    # so that the spring can be put where the nucleus is not.
+    n_R0_guess = R0 * 0.40
+    n_half_guess = max(2.5, min(n_R0_guess * (1.0 - eps), half_height - 4.0))
+    n_width_guess = max(
+        0.0,
+        (np.pi * n_R0_guess ** 2 - np.pi * n_half_guess ** 2)
+        / (4.0 * n_half_guess),
+    )
+    n_width_guess = min(
+        n_width_guess, max(0.0, width + half_height - n_half_guess - 4.0)
+    )
+
     # ---- what is inside
     if interior == "fluid":
         # Fluid that does not compress. It is drawn as fill and arrows
@@ -1040,22 +1087,30 @@ def balloon_figure(
     else:
         inner_bottom = centre_y - half_height + 3.0
         inner_top = centre_y + half_height - 3.0
-        # With a nucleus drawn in the middle, the cytoskeleton is drawn as
-        # two coils flanking it rather than one through it. A spring drawn
-        # straight through the nucleus says the two are the same material,
-        # which is the one thing this picture exists to deny.
+        # One spring, and a wide one: it is a single material, and a wide
+        # coil reads as a spring where a narrow one reads as a squiggle.
+        # With a nucleus present it is moved off to the side rather than
+        # split in two, because a spring drawn through the nucleus says the
+        # two are the same material.
+        column = centre_x
+        room = (width + half_height) * 1.6
         if show_nucleus:
-            offset = width * 0.55 + half_height * 0.45
-            columns = (centre_x - offset, centre_x + offset)
-            coil = 9.0
-        else:
-            columns, coil = (centre_x,), 15.0
-        for column in columns:
-            xs, ys = _zigzag(column, inner_bottom, inner_top, coil)
-            fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
-                line=dict(color="#e67e22", width=5, shape="spline"),
-            ))
+            # The room between the left edge of the cell and the left edge
+            # of the nucleus, computed rather than guessed: at small ε the
+            # cell is round and narrow and a coil placed by eye lands on top
+            # of the nucleus.
+            cell_left = centre_x - width - half_height + 4.0
+            nucleus_left = centre_x - n_width_guess - n_half_guess
+            room = max(8.0, nucleus_left - cell_left)
+            column = cell_left + room / 2.0
+        xs, ys = _coil(
+            column, inner_bottom, inner_top,
+            min(20.0, room * 0.85), pitch=4.6,
+        )
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="#e67e22", width=4, shape="spline"),
+        ))
 
     # ---- the deeper element, met only once the plates get down to it
     if show_nucleus:
@@ -1081,18 +1136,18 @@ def balloon_figure(
             # deformation, so it is drawn shorter and wider exactly as the
             # cell is. A circle said it was a rigid bead; this says what the
             # model now says, an envelope in e^3 around a Hertzian filling.
-            n_R0 = R0 * 0.40
-            n_half = max(2.5, min(n_R0 * (1.0 - eps), half_height - 4.0))
-            n_width = max(
-                0.0,
-                (np.pi * n_R0 ** 2 - np.pi * n_half ** 2) / (4.0 * n_half),
-            )
-            n_width = min(n_width, max(0.0, width + half_height - n_half - 4.0))
+            n_half, n_width = n_half_guess, n_width_guess
+            # A nucleus sits on the dish, it does not float in the middle of
+            # the cell. Resting it on the bottom is also what makes the
+            # picture agree with the model: the plates reach it when the
+            # cytoplasm above it has been squashed away, which is what the
+            # onset ε₂ means.
+            n_centre_y = centre_y - half_height + n_half + 2.0
             n_angle = np.linspace(-np.pi / 2, np.pi / 2, 40)
             n_right_x = centre_x + n_width + n_half * np.cos(n_angle)
-            n_right_y = centre_y + n_half * np.sin(n_angle)
+            n_right_y = n_centre_y + n_half * np.sin(n_angle)
             n_left_x = centre_x - n_width - n_half * np.cos(n_angle)
-            n_left_y = centre_y - n_half * np.sin(n_angle)
+            n_left_y = n_centre_y - n_half * np.sin(n_angle)
             fig.add_trace(go.Scatter(
                 x=np.concatenate([n_right_x, n_left_x, n_right_x[:1]]),
                 y=np.concatenate([n_right_y, n_left_y, n_right_y[:1]]),
@@ -1106,14 +1161,16 @@ def balloon_figure(
                           dash="solid" if reached else "dot"),
             ))
             if show_nucleus_inside and n_half > 4.0:
-                inner = _zigzag(
-                    centre_x, centre_y - n_half + 1.6,
-                    centre_y + n_half - 1.6, min(8.0, n_half * 0.9),
+                inner = _coil(
+                    centre_x, n_centre_y - n_half + 1.6,
+                    n_centre_y + n_half - 1.6,
+                    min(2.0 * n_width + n_half, 18.0),
+                    pitch=4.0, min_turns=2,
                 )
                 fig.add_trace(go.Scatter(
                     x=inner[0], y=inner[1], mode="lines", showlegend=False,
                     hoverinfo="skip",
-                    line=dict(color=strong if reached else faint, width=4,
+                    line=dict(color=strong if reached else faint, width=3.5,
                               shape="spline"),
                 ))
         # Two names for the two things, when the model carries both.
@@ -1149,7 +1206,8 @@ def balloon_figure(
         # along y and then laid on its side by swapping the axes.
         band_y = centre_y + half_height * 0.72
         span = (width + half_height) * 0.72
-        along, across = _zigzag(0.0, centre_x - span, centre_x + span, 9.0)
+        along, across = _coil(0.0, centre_x - span, centre_x + span, 13.0,
+                              pitch=6.0)
         fig.add_trace(go.Scatter(
             x=across, y=[band_y + v for v in along],
             mode="lines", showlegend=False, hoverinfo="skip",
@@ -1161,13 +1219,15 @@ def balloon_figure(
             font=dict(size=max(9, style.tick_size - 10), color="#5dade2"),
         )
 
-    # ---- how far it has been squashed, and how far it has spread
+    # ---- how far it has been squashed, and how far it has spread.
+    # Under the dish, because above it is where the cantilever, the arrow
+    # and a barely-squashed cell all want to be at once.
     fig.add_annotation(
-        x=50, y=CEILING - 2,
+        x=50, y=GROUND_Y - 9,
         text=f"squashed to <b>ε = {eps:.3f}</b>"
              + (f"  ({eps * cell_height_um:.2f} µm of {cell_height_um:.1f})"
                 if cell_height_um else "")
-             + f"<br>keeping its volume, so it spreads to "
+             + f"  ·  keeps its volume, so it spreads to "
              f"{(width + half_height) / R0:.2f}× its resting width",
         showarrow=False, font=dict(size=max(9, style.tick_size - 9),
                                    color="#2c3e50"),
@@ -1175,7 +1235,7 @@ def balloon_figure(
 
     fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True,
                      scaleanchor="y", scaleratio=1)
-    fig.update_yaxes(visible=False, range=[GROUND_Y - 14, CEILING + 6],
+    fig.update_yaxes(visible=False, range=[GROUND_Y - 16, CEILING + 6],
                      fixedrange=True)
     fig.update_layout(
         height=height or max(340, int(style.height * 0.74)),
