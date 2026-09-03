@@ -145,6 +145,8 @@ def table_with(app, *columns):
     return None
 
 
+SOURCE = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+
 FAILURES = []
 
 
@@ -456,6 +458,75 @@ def case_companion_file_guard():
 
     passthrough = app_module.figure_kwargs(takes_anything, anything=1, else_=2)
     check("**kwargs passes everything through", len(passthrough) == 2)
+
+    check("nothing this app needs is imported with a bare from-import",
+          "\nfrom plot_utils import" not in SOURCE
+          and "\nfrom lulevich_model import" not in SOURCE)
+    check("and every name it needs is pulled by hand instead",
+          SOURCE.count("_pull(") >= 4, str(SOURCE.count("_pull(")))
+
+
+def case_a_half_updated_deploy_says_so():
+    print("a companion file that is behind names itself instead of crashing")
+    import shutil
+    import tempfile
+
+    here = pathlib.Path("/root/AFM_cell_analyzer")
+    # A deploy that picked up app.py but left an older plot_utils.py behind.
+    # This used to die on the import line, and Streamlit Cloud shows that as
+    # a truncated traceback with the reason cut out: the one thing the person
+    # needed to know was the one thing they could not see.
+    with tempfile.TemporaryDirectory() as folder:
+        stale = pathlib.Path(folder)
+        for name in ("app.py", "lulevich_model.py", "baseline_correction.py",
+                     "video_analysis.py", "video_processor.py",
+                     "igor_parser.py", "google_sheets_manager.py",
+                     "google_drive.py", "onedrive_store.py"):
+            source = here / name
+            if source.exists():
+                shutil.copy(source, stale / name)
+        for name in ("reference_WT_cardiomyocyte.csv",
+                     "reference_WT_vcm_four.csv"):
+            if (here / name).exists():
+                shutil.copy(here / name, stale / name)
+
+        text = (here / "plot_utils.py").read_text()
+        cut = text.index("def balloon_figure(")
+        resume = text.index("def exponent_profile_figure(")
+        older = text[:cut] + text[resume:]
+        older = older[:older.index("def ordering_figure(")]
+        (stale / "plot_utils.py").write_text(older)
+
+        sys.path.insert(0, str(stale))
+        for name in ("app", "plot_utils", "lulevich_model"):
+            sys.modules.pop(name, None)
+        try:
+            app = AppTest.from_file(str(stale / "app.py"), default_timeout=300)
+            app.run()
+            check("a half-updated deploy does not raise",
+                  not app.exception,
+                  str(app.exception[0].value) if app.exception else "")
+            shown = " ".join(str(e.value) for e in app.get("error"))
+            check("it says the deploy is half updated",
+                  "half updated" in shown, shown[:120])
+            check("it names the file that is behind",
+                  "plot_utils.py" in shown, shown[:200])
+            check("and the piece that is missing",
+                  "balloon_figure" in shown, shown[:200])
+            check("it does not carry on into a broken page",
+                  not app.get("tabs"), str(len(app.get("tabs"))))
+        finally:
+            sys.path.remove(str(stale))
+            for name in ("app", "plot_utils", "lulevich_model"):
+                sys.modules.pop(name, None)
+
+    # And an optional piece missing switches that feature off rather than
+    # taking the app with it.
+    import app as app_module
+    check("the app is back to the matched tree",
+          app_module.STALE_FILES == [], str(app_module.STALE_FILES))
+    check("the ordering explorer is available here",
+          app_module.HAS_ORDERINGS and app_module.HAS_ORDER_PLOTS)
 
 
 def case_fit_survives_a_rerun():
@@ -4219,6 +4290,7 @@ if __name__ == "__main__":
         case_loads_clean,
         case_legacy_record_refits,
         case_companion_file_guard,
+        case_a_half_updated_deploy_says_so,
         case_fit_quality,
         case_fit_only_plot,
         case_springs_share_a_pitch,
