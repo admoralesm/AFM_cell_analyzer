@@ -115,6 +115,12 @@ class _FlatTableReader(html.parser.HTMLParser):
             self._rows = None
 
 
+def bare(name):
+    """A component name with any leading emoji taken off, for matching."""
+    head, _, rest = str(name or "").partition(" ")
+    return rest.strip() if rest and not head[:1].isalnum() else str(name or "")
+
+
 def flat_tables(app):
     """Every result table on the page, as DataFrames of strings.
 
@@ -602,10 +608,13 @@ def case_all_three_moduli_always_reported():
         check(f"{wanted} has a tile with only the membrane selected",
               any(wanted in (l or "").lower() for l in labels), str(labels))
     values = {m.label: (m.value, m.delta) for m in app.get("metric")}
-    # Only the modulus tiles, which are the ones named "Ec …" and "Eₙ …".
+    # Only the modulus tiles. "Ec spread" is a diagnostic, not a modulus,
+    # and matching it here is how this check started counting three.
     off = [
-        (label, values[label][0], values[label][1])
-        for label in ("Ec cytoskeleton", "E\u2099 nucleus") if label in values
+        (label, value, delta)
+        for label, (value, delta) in values.items()
+        if (label.startswith("Ec ") or label.startswith("E\u2099 "))
+        and not label.endswith("spread")
     ]
     check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
     for label, value, delta in off:
@@ -1141,9 +1150,12 @@ def case_component_names_follow_the_cell_type():
     myoblast = app_module.components_for("Myoblast (C2C12)")
     cardio = app_module.components_for("Cardiomyocyte")
     check("the myoblast interior is the cytoskeleton",
-          myoblast["interior"][0] == "Cytoskeleton", str(myoblast["interior"]))
+          bare(myoblast["interior"][0]) == "Cytoskeleton", str(myoblast["interior"]))
     check("the cardiomyocyte has a non-sarcomeric cytoskeleton",
           "Non-sarcomeric" in cardio["interior"][0], str(cardio["interior"]))
+    check("every element carries an emoji, so four labels can be told apart",
+          all(bare(v[0]) != v[0] for v in cardio.values()),
+          str([v[0] for v in cardio.values()]))
     check("and a sarcomeric, contractile one",
           "Sarcomeric" in cardio["nucleus"][0]
           and "contractile" in cardio["nucleus"][1], str(cardio["nucleus"]))
@@ -1171,7 +1183,8 @@ def case_component_names_follow_the_cell_type():
         listed = list(parts[0]["Part of the cell"])
         check("it lists both kinds of cytoskeleton",
               any("Non-sarcomeric" in v for v in listed)
-              and any("Sarcomeric myofibrils" == v for v in listed), str(listed))
+              and any(bare(v) == "Sarcomeric myofibrils" for v in listed),
+              str(listed))
         check("and never calls anything a nucleus",
               not any("Nucleus" in v for v in listed), str(listed))
         check("the membrane is one term unless the extra one is asked for",
@@ -1353,22 +1366,31 @@ def case_png_is_not_rendered_every_run():
           str([d.label for d in app.get("download_button")]))
 
 
-def case_guided_order_is_fit_then_adjust():
-    print("Step 1 is the fit, Step 2 is everything it used")
+def case_guided_order_follows_the_work():
+    print("parts, then range, then work it out, in that order")
     app = start(cell_name="cell-01")
     if not no_exception(app, "guided order"):
         return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("Step 1 is the fit", "Step 1 · Fit it" in text, text[:150])
-    labels_here = [e.label or "" for e in app.get("expander")]
-    check("Step 2 is what it used",
-          any("Step 2 · What it used" in l for l in labels_here),
-          str(labels_here))
-    check("and its label is not raw markdown",
-          not any(l.startswith("#") for l in labels_here), str(labels_here))
-    check("the fit comes before the settings it used",
-          text.index("Step 1 ·") < text.index("Step 2 ·")
-          if "Step 2 ·" in text else True)
+    headings = [
+        str(m.value).strip() for m in app.get("markdown")
+        if str(m.value).strip().startswith("####")
+    ]
+    order = " | ".join(headings)
+    check("Step 1 picks the parts",
+          any("Step 1 · Which parts" in h for h in headings), order)
+    check("Step 2 is the range",
+          any("Step 2 · How far" in h for h in headings), order)
+    check("Step 3 works it out",
+          any("Step 3 · Work it out" in h for h in headings), order)
+    positions = [
+        next(i for i, h in enumerate(headings) if key in h)
+        for key in ("Step 1 ·", "Step 2 ·", "Step 3 ·")
+    ]
+    check("and they are in that order", positions == sorted(positions),
+          str(positions))
+    check("no expander labels are raw markdown",
+          not any((e.label or "").startswith("#") for e in app.get("expander")),
+          str([e.label for e in app.get("expander")]))
 
     # The button has to be reachable without opening anything.
     work = button_by_label(app, "Work it out for me")
@@ -1379,7 +1401,7 @@ def case_guided_order_is_fit_then_adjust():
     # The part checkboxes must exist exactly once, in Step 2.
     labels = [c.label for c in app.checkbox]
     for term in ("Membrane", "Cytoskeleton", "Nucleus"):
-        matching = [l for l in labels if l and l.startswith(term)]
+        matching = [l for l in labels if bare(l).startswith(term)]
         check(f"{term} has exactly one checkbox", len(matching) == 1, str(matching))
 
     # Unticking a part must disable the button rather than fail later.
@@ -1915,6 +1937,111 @@ def vcm_model(eps, force, q=1.10):
         membrane_thickness=8.0e-9, deep_uses_cell_radius=True,
         sarcomere_length=2.1e-6, confinement=q,
     )
+
+
+def case_the_curve_comes_first():
+    print("the curve is at the top, and the diagram is with its own question")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "layout"):
+        return
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+
+    # The curve is drawn into a container staked out before the settings,
+    # so it appears above them however far down the code that builds it is.
+    check("a slot is reserved for the curve before the model section",
+          source.index("curve_slot = st.container()")
+          < source.index('section("3 · Model")'), "curve_slot is too late")
+    check("and the plot is drawn into it",
+          "plot_col = curve_slot" in source)
+    check("the diagram goes with the question it answers, not beside the plot",
+          "panel_cols = [sharing_slot] if show_schematic else []" in source)
+    check("and the video frame goes under the curve",
+          "video_target = video_slot" in source)
+
+    check("there is a fit button beside the curve",
+          button_by_label(app, "Fit this curve") is not None,
+          str([b.label for b in app.button]))
+    check("and it is the same fit, not a second one",
+          '_fit_from_curve' in source)
+
+    # Explore the curve is gone from the guided flow.
+    labels = [e.label or "" for e in app.get("expander")]
+    check("Explore the curve is not in the guided flow",
+          not any("Explore the curve" in l for l in labels), str(labels))
+    full = start(cell_name="cell-01", ui_mode="Full control · every setting")
+    if no_exception(full, "full control"):
+        check("but it is still there in full control",
+              any("Explore" in (e.label or "")
+                  for e in full.get("expander"))
+              or any("Explore" in str(m.value)
+                     for m in full.get("markdown")),
+              str([e.label for e in full.get("expander")]))
+
+    # The three tables that were asked to go.
+    for gone in ("The pictures it compared", "How the arrangements compared",
+                 "Every combination it tried"):
+        check(f"“{gone}…” is gone", gone not in source, gone)
+
+
+def case_elements_carry_emojis_but_tables_do_not():
+    print("emojis where you choose, plain names where you read")
+    import app as app_module
+    for cell_type in ("Myoblast (C2C12)", "Cardiomyocyte"):
+        for term in app_module.terms_for(cell_type):
+            name = app_module.term_name(term, cell_type)
+            plain = app_module.plain_name(term, cell_type)
+            check(f"{cell_type} {term} has an emoji", plain != name, name)
+            check(f"and a plain form under it", plain and plain[0].isalpha(),
+                  plain)
+    check("two cell types do not share an emoji for the same slot",
+          app_module.term_name("membrane", "Myoblast (C2C12)")
+          != app_module.term_name("membrane", "Cardiomyocyte"))
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "emoji labels"):
+        return
+    ticks = [c.label for c in app.checkbox if bare(c.label) != (c.label or "")]
+    check("the checkboxes carry them", len(ticks) >= 3, str(ticks))
+    tiles = [m.label for m in app.get("metric")
+             if m.label.startswith(("Eₘ ", "Ec ", "Eₙ ", "T₀ "))]
+    check("the modulus tiles do not", tiles and all(bare(t) == t for t in tiles),
+          str(tiles))
+    table = table_with(app, "range", "membrane")
+    if table is not None:
+        check("nor do the table headers",
+              all(bare(c) == c for c in table.columns), str(list(table.columns)))
+
+
+def case_bending_is_the_same_column_as_the_spring():
+    print("a bending term is the in-plane spring under another name")
+    eps, force, model, _ = four_element_curve()
+    check("the model can state the bending prefactor", model.Ab > 0)
+    check("and it is far smaller than the tension one",
+          model.At > model.Ab * 1e6, f"{model.At / model.Ab:.4g}")
+
+    # Both laws are linear in eps, so they are the same column: whatever one
+    # can fit, the other fits identically, with a rescaled coefficient.
+    basis = model.composition_basis(np.linspace(0.01, 0.6, 60), 0.15, 0.40,
+                                    "continue", "zero")
+    spring = basis["tension"]
+    bending = spring * (model.Ab / model.At)
+    ratio = bending / np.maximum(spring, 1e-300)
+    check("one is an exact multiple of the other",
+          float(np.ptp(ratio)) < 1e-12, f"{float(np.ptp(ratio)):.3g}")
+
+    fit = model.fit_composition(0.0, 0.65, 0.15, 0.40, "continue", "zero",
+                                use_tension=True)
+    check("so the fit reports both readings of the same number",
+          np.isfinite(fit["T0_as_bending_MPa"]) and fit["T0_as_bending_MPa"] > 0,
+          str(fit.get("T0_as_bending_MPa")))
+    check("and they are related by exactly At/Ab",
+          abs(fit["T0_as_bending_MPa"] * 1e6
+              - fit["T0"] * model.At / model.Ab) < 1e-6,
+          f"{fit['T0_as_bending_MPa']:.6g}")
+
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("and the app says so where the maths is shown",
+          "Is there a bending term?" in source)
 
 
 def case_cortical_actin_can_carry_it_first():
@@ -2496,7 +2623,8 @@ def case_no_nucleus_wording_for_a_cardiomyocyte():
               v[0] for v in app_module.COMPONENT_SETS["Cardiomyocyte"].values()
           ])
     check("but a myoblast still has one",
-          app_module.term_name("nucleus", "Myoblast (C2C12)") == "Nucleus")
+          app_module.plain_name("nucleus", "Myoblast (C2C12)") == "Nucleus",
+          app_module.term_name("nucleus", "Myoblast (C2C12)"))
     check("and the cardiomyocyte's third slot is myofibrils",
           "myofibril" in app_module.term_name("nucleus", "Cardiomyocyte").lower(),
           app_module.term_name("nucleus", "Cardiomyocyte"))
@@ -3407,6 +3535,9 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_the_curve_comes_first,
+        case_elements_carry_emojis_but_tables_do_not,
+        case_bending_is_the_same_column_as_the_spring,
         case_cortical_actin_can_carry_it_first,
         case_the_cardiomyocyte_picture_holds_fluid,
         case_schematic_labels_do_not_collide,
@@ -3441,7 +3572,7 @@ if __name__ == "__main__":
         case_search_maths_is_shown,
         case_cardiomyocyte_starts_loaded_together,
         case_schematic_is_a_mechanics_diagram,
-        case_guided_order_is_fit_then_adjust,
+        case_guided_order_follows_the_work,
         case_it_picks_the_arrangement,
         case_work_it_out_applies_the_arrangement,
         case_search_stays_fast,
