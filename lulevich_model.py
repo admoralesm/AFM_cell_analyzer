@@ -668,11 +668,7 @@ class _SegmentedMixin:
             names.append("F0")
         design = np.column_stack(columns)
 
-        if weighting == "relative":
-            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
-            weights = 1.0 / scale
-        else:
-            weights = np.ones_like(force)
+        weights = composition_weights(eps, force, weighting)
         design_w, target_w = design * weights[:, None], force * weights
 
         col_norm = np.linalg.norm(design_w, axis=0)
@@ -1225,6 +1221,46 @@ COMPOSITIONS = [
 ]
 
 
+def composition_weights(epsilon, force, weighting):
+    """
+    How much each point counts in the fit.
+
+    This is not a detail. A whole-cell compression curve spans four orders of
+    magnitude in force, so with every point weighted equally the last tenth
+    of the curve is essentially the whole fit and the first half is decor:
+    the model can miss by 40 % near contact and the residual sum will barely
+    notice. That is exactly where the membrane's cube law and any in-plane
+    spring live, so it is exactly the region whose moduli are being asked
+    about.
+
+    ``uniform``   every point counts the same. Fits the top of the curve.
+    ``relative``  every point counts by 1/|F|, so every decade of force
+                  counts the same. Fits the shape everywhere, and is right
+                  when the error is a percentage of the reading.
+    ``noise``     every point counts by 1/sigma, sigma measured from the
+                  curve itself. This is the maximum-likelihood weighting and
+                  the one chi-squared already assumes, so it is the only one
+                  for which chi-squared per point means what it says.
+
+    Where the noise really is constant, "noise" and "uniform" agree.
+    """
+    force = np.asarray(force, dtype=float)
+    if weighting == "relative":
+        scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
+        return 1.0 / scale
+    if weighting == "noise":
+        sigma, typical = noise_sigma(epsilon, force)
+        floor = typical if np.isfinite(typical) and typical > 0 else None
+        if floor is None:
+            good = sigma[np.isfinite(sigma) & (sigma > 0)]
+            floor = float(np.median(good)) if good.size else 1.0
+        # A point whose local noise estimate collapsed to zero would
+        # otherwise be given unbounded weight and drag the fit onto itself.
+        sigma = np.where(np.isfinite(sigma) & (sigma > 0), sigma, floor)
+        return 1.0 / np.maximum(sigma, floor * 0.1)
+    return np.ones_like(force)
+
+
 def noise_sigma(epsilon, force, window=21):
     """
     Estimate the measurement noise along a force curve, point by point.
@@ -1500,11 +1536,7 @@ class _CompositionMixin:
             columns.append(np.ones_like(eps))
         design = np.column_stack(columns)
 
-        if weighting == "relative":
-            scale = np.maximum(np.abs(force), np.percentile(np.abs(force), 10) or 1e-15)
-            weights = 1.0 / scale
-        else:
-            weights = np.ones_like(force)
+        weights = composition_weights(eps, force, weighting)
         design_w, target_w = design * weights[:, None], force * weights
         col_norm = np.linalg.norm(design_w, axis=0)
         col_norm[col_norm == 0] = 1.0
