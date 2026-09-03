@@ -232,8 +232,12 @@ def case_search_applies_in_one_press():
           str(search.get("error") if search else None))
     if not (search and search.get("success")):
         return
-    check("all four compositions ranked",
-          len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]}) == 4)
+    import lulevich_model as lm
+    check("every composition is ranked",
+          len({(r["membrane"], r["cyto_start"]) for r in search["candidates"]})
+          == len(lm.COMPOSITIONS),
+          f"{len({(r['membrane'], r['cyto_start']) for r in search['candidates']})} "
+          f"of {len(lm.COMPOSITIONS)}")
 
     truth = ("freeze", "break")
     best = search["best"]
@@ -1571,13 +1575,16 @@ def case_schematic_is_a_mechanics_diagram():
     check("the cantilever is drawn", "cantilever" in text, text[:120])
     check("the applied force is labelled", "<b>F</b>" in text, text[:120])
     check("the squash is stated", "ε = 0.280" in text, text[:160])
+    # Wrapped captions can break inside a phrase, so compare with the line
+    # breaks taken out rather than demanding one particular wrapping.
+    flat = text.replace("<br>", " ")
     check("a component not yet reached shows its gap",
-          "gap closes at ε = 0.40" in text, text[-200:])
+          "gap closes at ε = 0.40" in flat, flat[-200:])
     check("a component that handed over shows as locked",
           "locked" in text, text[-260:])
     check("it uses the cell type's own names",
-          "Sarcomeric myofibrils" in text and "Cytoskeleton<" not in text,
-          text[-260:])
+          "Sarcomeric myofibrils" in flat and "Cytoskeleton<" not in text,
+          flat[-260:])
 
     # Springs must hang straight, not lean: a precedence bug once drew them
     # diagonally across the page.
@@ -1910,6 +1917,174 @@ def vcm_model(eps, force, q=1.10):
     )
 
 
+def case_cortical_actin_can_carry_it_first():
+    print("the cortical network can carry the load before the membrane stretches")
+    from lulevich_model import compare_hypotheses
+    import app as app_module
+    eps = np.linspace(0.002, 0.65, 400)
+    blank = LulevichModel(np.zeros_like(eps), eps, cell_height=19.0e-6,
+                          cell_radius=9.5e-6, membrane_thickness=8.0e-9,
+                          deep_uses_cell_radius=True, confinement=1.1)
+
+    # The membrane's cube law measured from ε₁, not from first contact.
+    late = blank.composition_basis(eps, 0.09, 0.42, "late", "zero")
+    early = blank.composition_basis(eps, 0.09, 0.42, "continue", "zero")
+    check("a late membrane contributes nothing before ε₁",
+          float(np.max(late["membrane"][eps < 0.09])) == 0.0)
+    check("and something after it",
+          float(late["membrane"][-1]) > 0)
+    check("while a membrane loading from the start does contribute before it",
+          float(np.max(early["membrane"][eps < 0.09])) > 0)
+    check("the late one is always the softer of the two",
+          np.all(late["membrane"] <= early["membrane"] + 1e-30))
+    check("and it still only ever stiffens",
+          np.all(np.diff(late["membrane"]) >= -1e-30))
+
+    # Near contact a late membrane must read as a Hertzian network alone.
+    force = (late["membrane"] * 1.4e6 + late["interior"] * 2.0e3
+             + late["nucleus"] * 4.0e3)
+    good = (eps > 0.02) & (eps < 0.08)
+    slope = float(np.polyfit(np.log(eps[good]), np.log(force[good]), 1)[0])
+    check("which reads as a slope near 3/2, not 3, near contact",
+          1.3 < slope < 2.2, f"{slope:.2f}")
+
+    # The evidence for it is the real curves, not a synthetic. A synthetic
+    # built from these same basis functions is too forgiving: the other
+    # terms absorb a late membrane and every picture ties.
+    curves = vcm_curves()
+    if not curves:
+        print("  skip (no reference curves)")
+        return
+    preferred = 0
+    for n in (11, 14):
+        if n not in curves:
+            continue
+        eps_n, force_n = curves[n]
+        model = vcm_model(eps_n, force_n)
+        window = model.suggest_window()
+        scan = model.scan_confinement(
+            window["epsilon_min"], window["epsilon_max"], e1=0.15, e2=0.42,
+            membrane="continue", cyto_start="zero", use_tension=True,
+            weighting="relative",
+        )
+        if scan.get("success"):
+            model.confinement = scan["q"]
+        found = compare_hypotheses(
+            model, window["epsilon_min"], window["epsilon_max"],
+            app_module.cardiomyocyte_hypotheses("Not known — test for it"),
+            weighting="relative", cv_repeats=1, n_grid=8,
+        )
+        if not found.get("success"):
+            continue
+        rows = {r["key"]: r for r in found["candidates"]}
+        if ("cyto_first" in rows and "coupled" in rows
+                and rows["cyto_first"]["cv_rmse"] < rows["coupled"]["cv_rmse"]):
+            preferred += 1
+            check(f"cell {n} hands over part-way in, not at contact",
+                  0.02 < rows["cyto_first"]["break_1"] < 0.30,
+                  f"ε₁ = {rows['cyto_first']['break_1']:.3f}")
+    check("the two cleanest curves prefer the cortical network carrying it first",
+          preferred == 2, f"{preferred} of 2")
+
+    check("and it is offered as a named picture",
+          any(p["membrane"] == "late"
+              for p in app_module.cardiomyocyte_hypotheses("Present (wild type)")))
+    check("with a plain-words label rather than a crash",
+          "stretch" in app_module.composition_label("late", "zero").lower(),
+          app_module.composition_label("late", "zero"))
+    check("and an unknown composition still gets words, not a KeyError",
+          bool(app_module.composition_label("something-new", "zero")))
+
+
+def case_the_cardiomyocyte_picture_holds_fluid():
+    print("a cardiomyocyte is a balloon of fluid, with nothing called a nucleus")
+    import plot_utils
+    style = plot_utils.PlotStyle()
+    labels = {
+        "tension": ("Extra membrane protein", ""),
+        "membrane": ("Membrane and cortex", ""),
+        "interior": ("Non-sarcomeric cytoskeleton", ""),
+        "nucleus": ("Sarcomeric myofibrils", ""),
+    }
+
+    fluid = plot_utils.balloon_figure(
+        style, epsilon=0.5, cell_height_um=19.0, deep_onset=0.40,
+        labels=labels, interior="fluid",
+    )
+    text = " ".join(str(getattr(a, "text", "")) for a in fluid.layout.annotations)
+    check("it says the inside is fluid that does not compress",
+          "does not compress" in text, text[:160])
+    check("and the deep layer is named for what it is",
+          "Sarcomeric myofibrils" in text)
+    check("nothing in it is called a nucleus", "nucleus" not in text.lower(),
+          text[:200])
+    # A body at the centre would claim the model separates one, and it does
+    # not: the myofibrils are drawn lying along the cell instead.
+    check("there is no round body drawn at the centre",
+          not any(sh.type == "circle" for sh in fluid.layout.shapes))
+    lying = [
+        t for t in fluid.data
+        if t.y is not None and len(t.y) == 2 and t.y[0] == t.y[1]
+    ]
+    check("the myofibrils are drawn lying along the cell", len(lying) >= 3,
+          str(len(lying)))
+
+    # A myoblast keeps its spring and its nucleus, because it has both.
+    spring = plot_utils.balloon_figure(
+        style, epsilon=0.5, cell_height_um=8.0, deep_onset=0.40,
+        interior="spring",
+    )
+    check("a myoblast still gets a spring inside",
+          "spring inside" in str(spring.layout.title.text))
+    check("and a body at its centre",
+          any(sh.type == "circle" for sh in spring.layout.shapes))
+
+    import app as app_module
+    check("a cardiomyocyte is drawn as the balloon by default",
+          app_module.CELL_TYPES["Cardiomyocyte"]["schematic_style"]
+          .startswith("Balloon"))
+    check("and a myoblast as the schematic",
+          app_module.CELL_TYPES["Myoblast (C2C12)"]["schematic_style"]
+          .startswith("Mechanics"))
+
+
+def case_schematic_labels_do_not_collide():
+    print("four elements' labels do not land on top of each other")
+    import plot_utils
+    labels = {
+        "tension": ("Extra membrane protein", ""),
+        "membrane": ("Membrane and cortex", ""),
+        "interior": ("Non-sarcomeric cytoskeleton", ""),
+        "nucleus": ("Sarcomeric myofibrils", ""),
+    }
+    figure = plot_utils.cell_schematic(
+        plot_utils.PlotStyle(), epsilon=0.30, labels=labels,
+        show_tension=True, show_nucleus=True, Em_MPa=1.4, Ei_kPa=3.1,
+        En_kPa=9.0, T0_mN_m=1.2, break_1=0.15, break_2=0.40,
+        membrane_mode="continue", cyto_start="zero",
+    )
+    captions = [a for a in figure.layout.annotations if a.yanchor == "top"]
+    check("every element gets a caption", len(captions) == 4, str(len(captions)))
+    rows = sorted({round(float(a.y), 3) for a in captions})
+    check("they are staggered onto two rows", len(rows) == 2, str(rows))
+    check("with real space between the rows",
+          abs(rows[1] - rows[0]) >= 10.0, f"{abs(rows[1] - rows[0]):.1f}")
+
+    # Neighbours on the same row must be far apart; wrapped names keep each
+    # caption narrow enough that they are.
+    for row in rows:
+        same = sorted(float(a.x) for a in captions if round(float(a.y), 3) == row)
+        for left, right in zip(same, same[1:]):
+            check("captions sharing a row are well separated",
+                  right - left >= 30.0, f"{left:.1f} and {right:.1f}")
+    check("long names are wrapped rather than run on",
+          all("<br>" in a.text for a in captions
+              if "Non-sarcomeric" in a.text or "Extra membrane" in a.text))
+    check("and the figure makes room for the dropped row",
+          figure.layout.yaxis.range[0] <= min(rows) - 12,
+          f"{figure.layout.yaxis.range[0]} vs {min(rows)}")
+
+
 def case_the_fit_never_softens():
     print("no combination of elements can make the cell soften under load")
     curves = vcm_curves()
@@ -2053,8 +2228,12 @@ def case_the_whole_range_is_used_and_fits():
               fit["r_squared"] > 0.9999, f"{fit['r_squared']:.6f}")
 
         e, y, _ = model._select(window["epsilon_min"], window["epsilon_max"])
-        basis = model.composition_basis(e, fit["break_1"], fit["break_2"],
-                                        "continue", "zero")
+        # With the winner's own composition, not an assumed one: the
+        # membrane may have been fitted as starting late.
+        basis = model.composition_basis(
+            e, fit["break_1"], fit["break_2"],
+            found["best"]["membrane"], found["best"]["cyto_start"],
+        )
         predicted = (
             basis["membrane"] * fit["Em"] + basis["tension"] * fit.get("T0", 0.0)
             + basis["interior"] * fit["Ei"] + basis["nucleus"] * fit["En"]
@@ -2154,13 +2333,19 @@ def case_named_hypotheses_are_compared():
 
     picks = app_module.hypotheses_for("Cardiomyocyte")
     check("there are named hypotheses for a cardiomyocyte", len(picks) >= 3)
-    # Coupling is not one of the things that varies. The membrane and the
-    # cortical actin are tied through the costameres and the measured slope
-    # near contact says so, so every picture asserts it and what varies is
-    # which further elements are there, which is what an experiment changes.
-    check("every one has them loading together from first contact",
-          all(p["membrane"] == "continue" and p["cyto_start"] == "zero"
-              for p in picks), str([p["key"] for p in picks]))
+    # The cortical network loading from first contact is not one of the
+    # things that varies: it is tied to the membrane through the costameres
+    # and the measured slope near contact says so. What the membrane does is
+    # a real question, though — it can load with it from the start, or only
+    # begin to stretch once the cell has been flattened enough to stretch it.
+    check("the cortical network always loads from first contact",
+          all(p["cyto_start"] == "zero" for p in picks),
+          str([(p["key"], p["cyto_start"]) for p in picks]))
+    check("and the membrane either loads with it or starts stretching later",
+          all(p["membrane"] in ("continue", "late") for p in picks),
+          str([(p["key"], p["membrane"]) for p in picks]))
+    check("one picture has the cortical network carrying it alone at first",
+          any(p["membrane"] == "late" for p in picks))
     check("the first names them", "cortical actin" in picks[0]["label"],
           picks[0]["label"])
     check("one of them adds the horizontal spring",
@@ -2192,9 +2377,9 @@ def case_named_hypotheses_are_compared():
         if not found.get("success"):
             continue
         check(f"cell {n} names its pick", bool(found["best"]["label"]))
-        check(f"cell {n} keeps the coupling",
-              found["best"]["membrane"] == "continue"
-              and found["best"]["cyto_start"] == "zero")
+        check(f"cell {n} keeps the cortical network from first contact",
+              found["best"]["cyto_start"] == "zero",
+              found["best"]["cyto_start"])
 
 
 def case_springs_are_round_and_the_balloon_exists():
@@ -3222,6 +3407,9 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_cortical_actin_can_carry_it_first,
+        case_the_cardiomyocyte_picture_holds_fluid,
+        case_schematic_labels_do_not_collide,
         case_the_fit_never_softens,
         case_weighting_decides_where_the_fit_is_good,
         case_the_whole_range_is_used_and_fits,
