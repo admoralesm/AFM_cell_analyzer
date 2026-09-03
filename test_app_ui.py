@@ -17,6 +17,7 @@ from lulevich_model import LulevichModel  # noqa: E402
 
 # Label -> the argument the model takes, mirroring app.py.
 MEMBRANE_MODE = {"holds what it reached": "freeze", "keeps stiffening": "continue"}
+MEMBRANE_MODE_ALL = dict(MEMBRANE_MODE, **{"starts stretching at ε₁": "late"})
 CYTO_MODE = {"at ε₁": "break", "from the very start": "zero"}
 
 
@@ -838,8 +839,13 @@ def case_range_table_shows_zero_moduli():
     app = start()
     if not no_exception(app, "range table"):
         return
+    # A full-control diagnostic: too much to meet on the way to a number,
+    # but still the honest answer to "who was carrying what, where".
+    app = start(ui_mode="Full control · every setting")
+    if not no_exception(app, "range table"):
+        return
     target = table_with(app, "range", "membrane")
-    check("the range table is on the page", target is not None)
+    check("the range table is on the page in full control", target is not None)
     if target is None:
         return
     for column in ("E membrane", "E cytoskeleton", "E nucleus"):
@@ -1215,7 +1221,9 @@ def case_cardiomyocyte_model_is_flagged_provisional():
 
 def case_not_reached_is_explained():
     print("“not reached yet” is spelled out")
-    app = start(cell_name="cell-01")
+    # It appears with the range-by-range table, which is a full-control
+    # diagnostic rather than something to meet on the way to a number.
+    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
     if not no_exception(app, "range wording"):
         return
     captions = " ".join(str(c.value) for c in app.get("caption"))
@@ -1376,10 +1384,12 @@ def case_guided_order_follows_the_work():
         if str(m.value).strip().startswith("####")
     ]
     order = " | ".join(headings)
-    check("Step 1 picks the parts",
-          any("Step 1 · Which parts" in h for h in headings), order)
-    check("Step 2 is the range",
-          any("Step 2 · How far" in h for h in headings), order)
+    # Range first, because it decides which points the rest is about, then
+    # the parts and how they share the load, then the fit.
+    check("Step 1 is the range",
+          any("Step 1 · How far" in h for h in headings), order)
+    check("Step 2 is the parts and how they share the load",
+          any("Step 2 · Which parts" in h for h in headings), order)
     check("Step 3 works it out",
           any("Step 3 · Work it out" in h for h in headings), order)
     positions = [
@@ -1939,6 +1949,181 @@ def vcm_model(eps, force, q=1.10):
     )
 
 
+def case_component_heights_survive_a_log_axis():
+    print("component height labels do not blank the plot on a log axis")
+    import plot_utils
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    basis = model.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    fitted = (basis["membrane"] * fit["Em"] + basis["interior"] * fit["Ei"]
+              + basis["nucleus"] * fit["En"])
+
+    def build(log):
+        style = plot_utils.PlotStyle(
+            force_unit="nN", show_components=True,
+            show_component_heights=True, log_scale=log,
+        )
+        return plot_utils.force_curve_figure(
+            eps, force, style, fit_force_N=fitted,
+            membrane_N=basis["membrane"] * fit["Em"],
+            interior_N=basis["interior"] * fit["Ei"],
+            nucleus_N=basis["nucleus"] * fit["En"],
+        )
+
+    linear, logged = build(False), build(True)
+
+    def heights(figure):
+        return [
+            (float(a.y), a.text) for a in figure.layout.annotations
+            if a.text and a.text.startswith("<b>") and "N" in a.text
+        ]
+
+    flat, curved = heights(linear), heights(logged)
+    check("labels are drawn on a linear axis", len(flat) >= 3, str(len(flat)))
+    check("and on a log one too", len(curved) >= 3, str(len(curved)))
+
+    # Plotly places annotations in axis coordinates, and on a log axis those
+    # are log10 of the value. Passing 1.6e-8 asks for 10^(1.6e-8), which is
+    # 1 — off the top of any real curve, and enough to blank the chart.
+    for y, text in curved:
+        check(f"{text} sits at log10 of its value, not at the value itself",
+              -12 < y < 6, f"y = {y:.4g}")
+    pairs = dict(flat)
+    for y, text in curved:
+        if text in pairs:
+            check(f"{text} is exactly log10 of the linear position",
+                  abs(y - np.log10(pairs[text])) < 1e-9,
+                  f"{y:.6g} vs {np.log10(pairs[text]):.6g}")
+
+    # A value at or below zero has no place on a log axis, and must be
+    # dropped rather than drawn at minus infinity.
+    style = plot_utils.PlotStyle(force_unit="nN", show_components=True,
+                                 show_component_heights=True, log_scale=True)
+    zeroed = plot_utils.force_curve_figure(
+        eps, force, style, fit_force_N=np.zeros_like(fitted),
+        membrane_N=basis["membrane"] * fit["Em"],
+    )
+    check("a zero height is left off a log axis rather than drawn at -inf",
+          all(np.isfinite(float(a.y)) for a in zeroed.layout.annotations))
+
+
+def case_the_tab_is_stripped_back():
+    print("the analysis tab is down to the work, and the extras are off the bar")
+    import app as app_module
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("the video tab is off the bar for now",
+          app_module.SHOW_VIDEO_TAB is False)
+    check("and the database tab too",
+          app_module.SHOW_DATABASE_TAB is False)
+    # Hidden, not deleted: the code that fills them still runs, so it cannot
+    # rot while it is out of sight.
+    check("but their code still runs",
+          "with tab_video:" in source and "with tab_db:" in source)
+    check("they are hidden by hiding their buttons",
+          'button[data-baseweb="tab"]' in source)
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "stripped tab"):
+        return
+    labels = [e.label or "" for e in app.get("expander")]
+    for gone in ("Explore the curve",):
+        check(f"“{gone}” is not in the guided flow",
+              not any(gone in l for l in labels), str(labels))
+
+
+def case_sharing_controls_sit_with_the_parts():
+    print("how they share the load is chosen where the parts are chosen")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "sharing controls"):
+        return
+    headings = [
+        str(m.value).strip() for m in app.get("markdown")
+        if str(m.value).strip().startswith("####")
+    ]
+    check("Step 2 covers both",
+          any("Which parts, and how they share the load" in h for h in headings),
+          str(headings))
+
+    radios = [r.label for r in app.get("radio")]
+    for wanted in ("How the cell is modelled", "After ε₁ the membrane…",
+                   "The cytoskeleton starts…"):
+        check(f"“{wanted[:28]}…” is on the page", wanted in radios, str(radios))
+
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("and a diagram is drawn from those choices, next to them",
+          'key="sharing_preview"' in source)
+    check("there is no separate load-sharing section left",
+          source.count('open_panel(\n            "⚙️ How the elements share') <= 1)
+
+    # Changing a sharing choice must change the diagram, or putting them
+    # together achieves nothing.
+    import plot_utils
+    style = plot_utils.PlotStyle()
+
+    def caption_for(term, cyto_start, at):
+        figure = plot_utils.cell_schematic(
+            style, epsilon=at, break_1=0.15, break_2=0.40,
+            membrane_mode="continue", cyto_start=cyto_start,
+            Em_MPa=1.0, Ei_kPa=1.0, En_kPa=1.0,
+        )
+        wanted = {"membrane": "Membrane", "interior": "Cytoskeleton",
+                  "nucleus": "Nucleus"}[term]
+        for a in figure.layout.annotations:
+            text = str(getattr(a, "text", ""))
+            if text.startswith(f"<b>{wanted}</b>"):
+                return text
+        return ""
+
+    # Below ε₁ the two choices differ; above it they cannot, because the
+    # cytoskeleton is loading either way. That is exactly why the preview
+    # has a slider rather than one fixed deformation.
+    early_break = caption_for("interior", "break", 0.08)
+    early_zero = caption_for("interior", "zero", 0.08)
+    check("below ε₁, starting at ε₁ draws a gap under the cytoskeleton",
+          "gap closes" in early_break, early_break)
+    check("and starting at zero does not",
+          "gap closes" not in early_zero, early_zero)
+    late_break = caption_for("interior", "break", 0.30)
+    check("above ε₁ the two look the same, as they should",
+          "gap closes" not in late_break, late_break)
+
+    source = pathlib.Path(__file__).with_name("app.py").read_text()
+    check("so the preview can be swept through the squash",
+          'key="sharing_preview_eps"' in source)
+
+
+def case_boundaries_are_checked_against_the_power_law():
+    print("the boundary scan is checked against the curve's own slope")
+    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
+    button = button_by_label(app, "Find the boundaries from the data")
+    check("the button is there", button is not None)
+    if button is None:
+        return
+    button.click().run()
+    if not no_exception(app, "boundary scan"):
+        return
+    try:
+        profile = app.session_state["_power_law_check"]
+    except Exception:
+        profile = None
+    check("a power-law profile was measured", profile is not None
+          and len(profile["epsilon"]) > 10,
+          str(len(profile["epsilon"]) if profile else None))
+    said = " ".join(str(c.value) for c in app.get("caption"))
+    check("and reported next to the boundaries it chose",
+          "log-log slope" in said, said[:160])
+    check("with what the numbers mean",
+          "3 is a membrane on its own" in said, said[:200])
+    # The two are arrived at differently on purpose: one asks which
+    # boundaries fit best, the other where the curve's shape changes.
+    check("the scan and the slope are separate measurements",
+          "scan_segment_breaks(" in pathlib.Path(__file__)
+          .with_name("app.py").read_text()
+          and "local_exponent(" in pathlib.Path(__file__)
+          .with_name("app.py").read_text())
+
+
 def case_the_curve_comes_first():
     print("the curve is at the top, and the diagram is with its own question")
     app = start(cell_name="cell-01")
@@ -1954,7 +2139,8 @@ def case_the_curve_comes_first():
     check("and the plot is drawn into it",
           "plot_col = curve_slot" in source)
     check("the diagram goes with the question it answers, not beside the plot",
-          "panel_cols = [sharing_slot] if show_schematic else []" in source)
+          'key="sharing_preview"' in source
+          and "panel_cols = []" in source)
     check("and the video frame goes under the curve",
           "video_target = video_slot" in source)
 
@@ -3524,6 +3710,277 @@ def case_plot_clutter_toggles():
           "ε =" in caption(without), caption(without)[:80])
 
 
+def case_ordering_is_a_question_about_two_springs():
+    print("the ordering comparison separates the balloon from the spring")
+    from lulevich_model import (
+        ORDERINGS, compare_orderings, near_contact_exponent, ordering_of,
+    )
+
+    check("four orderings are offered", len(ORDERINGS) == 4,
+          f"got {len(ORDERINGS)}")
+    keys = {row["key"] for row in ORDERINGS}
+    check("membrane first and cytoskeleton first are both there",
+          {"membrane_first", "cyto_first", "together"} <= keys, str(keys))
+    # Each has to be a distinct composition, or two of them are the same fit
+    # under two names and the comparison means nothing.
+    pairs = {(row["membrane"], row["cyto_start"]) for row in ORDERINGS}
+    check("no two orderings are the same composition",
+          len(pairs) == len(ORDERINGS), str(pairs))
+    for row in ORDERINGS:
+        found = ordering_of(row["membrane"], row["cyto_start"])
+        check(f"ordering_of finds {row['key']}",
+              found is not None and found["key"] == row["key"])
+
+    # A curve built as a pure Hertzian contact with the membrane switched on
+    # late must be read as cytoskeleton first, and one built the classic way
+    # as membrane first. This is the arithmetic, checked on curves whose
+    # answer is known by construction.
+    for membrane, cyto_start, expect in (
+        ("late", "zero", "cyto_first"),
+        ("freeze", "break", "membrane_first"),
+    ):
+        eps = np.linspace(0.002, 0.60, 320)
+        model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+        basis = model.composition_basis(eps, 0.18, 0.42, membrane, cyto_start)
+        force = basis["membrane"] * 0.6e6 + basis["interior"] * 1.5e3
+        built = LulevichModel(force, eps, cell_height=8.0e-6)
+        out = compare_orderings(
+            built, 0.0, 0.60, terms=("membrane", "interior"),
+            weighting="relative", cv_repeats=2, n_grid=8,
+        )
+        check(f"a curve built {membrane}/{cyto_start} is read as {expect}",
+              out.get("success") and out["best"]["key"] == expect,
+              str(out.get("best", {}).get("key")))
+        if out.get("success"):
+            check(f"  and it fits it well ({expect})",
+                  out["best"]["r_squared"] > 0.999,
+                  f"R2 {out['best']['r_squared']:.5f}")
+
+    # The near-contact slope is the model-free half of the answer, so it has
+    # to read 3/2 on a Hertzian start and 3 on a membrane start.
+    eps = np.linspace(0.002, 0.60, 320)
+    model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    hertz = LulevichModel(
+        model.composition_basis(eps, 0.18, 0.42, "late", "zero")["interior"] * 1.5e3,
+        eps, cell_height=8.0e-6,
+    )
+    slope, r2, upto = near_contact_exponent(hertz, 0.0, 0.60)
+    check("a Hertzian start reads about 3/2", 1.35 < slope < 1.65,
+          f"{slope:.2f}")
+    shell = LulevichModel(
+        model.composition_basis(eps, 0.18, 0.42, "freeze", "break")["membrane"] * 0.6e6,
+        eps, cell_height=8.0e-6,
+    )
+    slope_m, _, _ = near_contact_exponent(shell, 0.0, 0.60)
+    check("a membrane start reads about 3", 2.7 < slope_m < 3.3, f"{slope_m:.2f}")
+
+    # And it refuses the question when it cannot be asked.
+    refused = compare_orderings(
+        hertz, 0.0, 0.60, terms=("membrane",), weighting="relative",
+    )
+    check("one spring alone is refused, with a reason",
+          not refused.get("success") and "membrane" in refused.get("error", ""),
+          str(refused.get("error"))[:60])
+
+
+def case_ordering_reads_the_real_cardiomyocytes():
+    print("the four measured VCM curves are read the way the data says")
+    from lulevich_model import compare_orderings
+
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+
+    verdicts = {}
+    for n, (eps, force) in curves.items():
+        model = vcm_model(eps, force)
+        window = model.suggest_window()
+        lo = window["epsilon_min"] if window.get("success") else 0.0
+        hi = window["epsilon_max"] if window.get("success") else float(eps.max())
+        out = compare_orderings(
+            model, lo, hi, terms=("membrane", "interior", "nucleus"),
+            weighting="relative", cv_repeats=2, n_grid=8,
+        )
+        if not out.get("success"):
+            check(f"cell {n} produced an answer", False, str(out.get("error")))
+            continue
+        verdicts[n] = out
+        check(f"cell {n}: every ordering was fitted",
+              len(out["candidates"]) == 4, str(len(out["candidates"])))
+        check(f"cell {n}: the winner fits it",
+              out["best"]["r_squared"] > 0.999,
+              f"R2 {out['best']['r_squared']:.5f}")
+        check(f"cell {n}: the near-contact slope was measured",
+              np.isfinite(out["near_contact_exponent"]))
+
+    # Cells 11 and 14 are the clean ones: they start at contact and their
+    # first stretch is a Hertzian slope, so both halves of the answer have to
+    # come out cytoskeleton first. This is the finding the tab exists to
+    # show, and it is checked against measured data rather than asserted.
+    for n in (11, 14):
+        if n not in verdicts:
+            continue
+        out = verdicts[n]
+        check(f"cell {n} is read as cytoskeleton first",
+              out["best"]["key"] == "cyto_first", out["best"]["key"])
+        check(f"cell {n} starts on the Hertzian slope",
+              1.3 < out["near_contact_exponent"] < 1.9,
+              f"{out['near_contact_exponent']:.2f}")
+        check(f"cell {n}: the slope and the fit agree",
+              "agree" in out["reading"], out["reading"][:70])
+        beaten = [r for r in out["candidates"] if r["key"] == "membrane_first"]
+        check(f"cell {n} beats the classic membrane-first order",
+              beaten and beaten[0]["cv_rmse"] > out["best"]["cv_rmse"] * 1.5,
+              "")
+
+    # Cell 3 has a bad contact, so its range does not start at contact and
+    # the slope measured inside it cannot answer the question. Saying so is
+    # the point: a number quoted from the middle of a squash as if it were
+    # the start is how a wrong answer looks right.
+    if 3 in verdicts:
+        check("a range that misses contact says the slope cannot answer",
+              "cannot say which spring answered first" in verdicts[3]["reading"],
+              verdicts[3]["reading"][-90:])
+
+
+def case_composition_curve_rebuilds_the_fit():
+    print("a finished fit can be redrawn at any deformations")
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40, "freeze", "break")
+    basis = model.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    by_hand = (basis["membrane"] * fit["Em"] + basis["interior"] * fit["Ei"]
+               + basis["nucleus"] * fit["En"])
+    rebuilt = model.composition_curve(eps, fit)
+    check("the rebuilt curve is the fitted curve",
+          np.allclose(rebuilt, by_hand, rtol=1e-10, atol=0.0),
+          f"max gap {float(np.max(np.abs(rebuilt - by_hand))):.3e}")
+    # And on a grid finer than the data, which is what it is for.
+    fine = np.linspace(0.0, 0.60, 1000)
+    smooth = model.composition_curve(fine, fit)
+    check("it works on a grid the data does not have",
+          smooth.size == fine.size and np.all(np.isfinite(smooth)))
+    check("it rises the whole way", np.all(np.diff(smooth) >= -1e-18))
+
+
+def case_breakpoints_are_searched_when_they_matter():
+    print("ε₁ is fitted whenever it is in the model, not only with a deep layer")
+    from lulevich_model import compare_hypotheses
+
+    eps = np.linspace(0.002, 0.60, 300)
+    seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    basis = seed.composition_basis(eps, 0.22, 0.45, "freeze", "break")
+    force = basis["membrane"] * 0.6e6 + basis["interior"] * 1.5e3
+    # A model whose stored boundary is nowhere near the truth. If the search
+    # is skipped for a two-term hypothesis, this is the number that comes
+    # back, and the fit is poor for a reason nobody can see.
+    model = LulevichModel(force, eps, cell_height=8.0e-6,
+                          segment_break_1=0.05, segment_break_2=0.55)
+    out = compare_hypotheses(
+        model, 0.0, 0.60,
+        [{"key": "handover", "label": "handover",
+          "terms": ("membrane", "interior"),
+          "membrane": "freeze", "cyto_start": "break"}],
+        weighting="relative", cv_repeats=2, n_grid=8,
+    )
+    check("the two-term hypothesis was fitted", out.get("success"),
+          str(out.get("error")))
+    if out.get("success"):
+        found = out["best"]["break_1"]
+        check("ε₁ moved off the stored value", abs(found - 0.05) > 0.02,
+              f"{found:.3f}")
+        check("and landed near the truth", abs(found - 0.22) < 0.05,
+              f"{found:.3f}")
+        check("so the fit is good", out["best"]["r_squared"] > 0.9995,
+              f"R2 {out['best']['r_squared']:.5f}")
+
+
+def case_balloon_and_spring_tab_answers_by_itself():
+    print("the Balloon and spring tab answers without being asked twice")
+    source = pathlib.Path("/root/AFM_cell_analyzer/app.py").read_text()
+    check("the tab exists on the bar", "🎈 Balloon and spring" in source)
+    check("the hidden-tab indices were moved with it",
+          "((3, SHOW_VIDEO_TAB), (5, SHOW_DATABASE_TAB))" in source)
+    check("both laws are named on the page",
+          "ε³ᐟ²" in source and "balloon" in source)
+
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+    eps, force = curves[11]
+    app = AppTest.from_file("/root/AFM_cell_analyzer/app.py", default_timeout=600)
+    app.run()
+    app.session_state["cell_type"] = "Cardiomyocyte"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "vcm_11.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "the explorer tab runs"):
+        return
+
+    found = app.session_state["ordering_search"]
+    check("an answer was worked out on load, with no button pressed",
+          found.get("success"), str(found.get("error")))
+    if not found.get("success"):
+        return
+    check("cell 11 is read as cytoskeleton first",
+          found["best"]["key"] == "cyto_first", found["best"]["key"])
+    check("the raw slope is reported next to the fit",
+          "over its first stretch" in found["reading"])
+
+    table = table_with(app, "Order", "R²", "Predicts held-out points")
+    check("the fitting results are on the page", table is not None)
+    if table is not None:
+        check("every ordering has a row", len(table) == 4, str(len(table)))
+        check("one of them is marked best",
+              any("best" in str(v) for v in table["Verdict"]),
+              str(list(table["Verdict"])))
+        check("the boundary each one found is shown", "ε₁" in table.columns,
+              str(list(table.columns)))
+
+    # Pressing "use this" has to move the analysis tab onto the winner, or
+    # the tab is a demonstration rather than a tool.
+    from lulevich_model import ordering_of
+
+    # Knock the analysis tab off the winning ordering by hand, the way a
+    # person disagreeing with it would, so the button has something to do.
+    knocked = app.radio(key="membrane_after_break")
+    if knocked is not None:
+        knocked.set_value("holds what it reached").run()
+        no_exception(app, "changing the ordering by hand")
+
+    adopt = None
+    for b in app.button:
+        if b.label and b.label.startswith("✓ Use "):
+            adopt = b
+    settled = ordering_of(
+        MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]],
+        CYTO_MODE[app.session_state["cyto_starts_at"]],
+    )
+    if adopt is None:
+        # No button because the analysis tab is already on the winner, which
+        # is the other correct outcome and has to say so rather than offering
+        # a button that would change nothing.
+        check("no button is offered when nothing needs changing",
+              settled is not None and settled["key"] == found["best"]["key"],
+              str(settled and settled["key"]))
+        check("and the page says it is already set",
+              any("already set to" in str(e.value) for e in app.get("success")))
+        return
+    adopt.click().run()
+    if not no_exception(app, "adopting the ordering"):
+        return
+    now = ordering_of(
+        MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]],
+        CYTO_MODE[app.session_state["cyto_starts_at"]],
+    )
+    check("the analysis tab is set to the ordering that won",
+          now is not None and now["key"] == "cyto_first",
+          str(now and now["key"]))
+
+
 if __name__ == "__main__":
     for case in (
         case_loads_clean,
@@ -3535,6 +3992,10 @@ if __name__ == "__main__":
         case_start_a_new_cell,
         case_manual_cell_and_probe_scale,
         case_four_element_model,
+        case_component_heights_survive_a_log_axis,
+        case_the_tab_is_stripped_back,
+        case_sharing_controls_sit_with_the_parts,
+        case_boundaries_are_checked_against_the_power_law,
         case_the_curve_comes_first,
         case_elements_carry_emojis_but_tables_do_not,
         case_bending_is_the_same_column_as_the_spring,
@@ -3614,6 +4075,11 @@ if __name__ == "__main__":
         case_search_applies_in_one_press,
         case_bare_plot,
         case_buttons_do_not_break_widgets,
+        case_ordering_is_a_question_about_two_springs,
+        case_ordering_reads_the_real_cardiomyocytes,
+        case_composition_curve_rebuilds_the_fit,
+        case_breakpoints_are_searched_when_they_matter,
+        case_balloon_and_spring_tab_answers_by_itself,
     ):
         case()
     print()
