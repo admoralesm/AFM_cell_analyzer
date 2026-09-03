@@ -344,6 +344,7 @@ DEFAULTS = {
     # Shape, and the stiffening that follows from it. q = 0 is the classic
     # small-strain Lulevich model; see confinement_factor in lulevich_model.
     "cell_shape": "Sphere (a rounded cell)",
+    "membrane_protein": "Not known — test for it",
     "confinement": 0.0,
     "confinement_scan": None,
     "component_search": None,
@@ -1611,37 +1612,69 @@ DEFAULT_COMPONENTS = COMPONENT_SETS["Myoblast (C2C12)"]
 # load as one layer from first contact, with the myofibrils met deeper in.
 # That is what an exponent near 1.7 at first contact means: not a membrane
 # alone, which would give 3, but a shell and a Hertzian network together.
-HYPOTHESES = {
-    "Cardiomyocyte": [
+# What the sample is, which decides which pictures are worth testing.
+MEMBRANE_PROTEIN_STATES = {
+    "Present (wild type)":
+        "The in-plane spring is expected. It is offered in every picture and "
+        "the fit is allowed to find it.",
+    "Deleted (knockout)":
+        "The in-plane spring is not offered at all. If the curve still needs "
+        "one, that is a result worth knowing rather than a term to fit away.",
+    "Not known — test for it":
+        "Both are tried and the curve decides, which is the comparison that "
+        "tells you whether the protein is contributing mechanically.",
+}
+
+
+def cardiomyocyte_hypotheses(state="Not known — test for it"):
+    """
+    The pictures worth testing for a ventricular cardiomyocyte.
+
+    Every one of them has the membrane and the cortical actin loading
+    together from first contact. That is not a variable here: the two are
+    tied through the costameres, and the measured slope near contact says so
+    — about 1.7 on all four WT curves, where a membrane on its own gives 3
+    and a Hertzian network on its own gives 3/2. So what varies between
+    these is only which further elements are present, which is the question
+    an experiment can actually change.
+    """
+    coupled = {"membrane": "continue", "cyto_start": "zero"}
+    base = [
         {
             "key": "coupled",
             "label": "Membrane and cortical actin together, then myofibrils",
             "detail": "one outer layer from first contact, myofibrils at ε₂",
-            "terms": ("membrane", "interior", "nucleus"),
-            "membrane": "continue", "cyto_start": "zero",
-        },
-        {
-            "key": "coupled_prestin",
-            "label": "…and a horizontal spring in the membrane (prestin)",
-            "detail": "the same, plus an in-plane spring taut from contact",
-            "terms": ("tension", "membrane", "interior", "nucleus"),
-            "membrane": "continue", "cyto_start": "zero",
+            "terms": ("membrane", "interior", "nucleus"), **coupled,
         },
         {
             "key": "coupled_no_deep",
             "label": "Membrane and cortical actin together, nothing deeper",
-            "detail": "no separate myofibril layer is reached",
-            "terms": ("membrane", "interior"),
-            "membrane": "continue", "cyto_start": "zero",
+            "detail": "the myofibrils are never reached in this range",
+            "terms": ("membrane", "interior"), **coupled,
+        },
+    ]
+    withspring = [
+        {
+            "key": "coupled_spring",
+            "label": "…and a horizontal spring in the membrane",
+            "detail": "the same, plus an in-plane spring taut from contact",
+            "terms": ("tension", "membrane", "interior", "nucleus"), **coupled,
         },
         {
-            "key": "handover",
-            "label": "Membrane alone first, then the cytoskeleton takes over",
-            "detail": "the myoblast picture, for comparison",
-            "terms": ("membrane", "interior", "nucleus"),
-            "membrane": "freeze", "cyto_start": "break",
+            "key": "coupled_spring_no_deep",
+            "label": "Membrane, cortical actin and a horizontal spring only",
+            "detail": "an in-plane spring, but no myofibril layer reached",
+            "terms": ("tension", "membrane", "interior"), **coupled,
         },
-    ],
+    ]
+    if state.startswith("Deleted"):
+        return base
+    if state.startswith("Present"):
+        return withspring + base
+    return base[:1] + withspring + base[1:]
+
+
+HYPOTHESES = {
     "Myoblast (C2C12)": [
         {
             "key": "handover",
@@ -1670,6 +1703,10 @@ HYPOTHESES = {
 
 def hypotheses_for(cell_type):
     """The named pictures to test for this cell type, if any are defined."""
+    if cell_type in DEEP_IS_MYOFIBRILS:
+        return cardiomyocyte_hypotheses(
+            st.session_state.get("membrane_protein", "Not known — test for it")
+        )
     return HYPOTHESES.get(cell_type, [])
 
 
@@ -1738,6 +1775,7 @@ CELL_TYPES = {
         "nucleus_onset": 0.20,
         "cell_shape": "Sphere (a rounded cell)",
         "confinement": 0.0,
+        "weighting": "uniform",
         # expected bands in pascals
         "expected": {"Em": (2e5, 2e7), "Ei": (2e2, 1e4), "En": (1e3, 5e4)},
         # The membrane carries load from the very start of the compression, so
@@ -1758,6 +1796,12 @@ CELL_TYPES = {
         "membrane_thickness_nm": 8.0,
         "nucleus_onset": 0.18,
         "cell_shape": "Belt cylinder (a rod lying down)",
+        # These curves span four decades of force. Weighted uniformly the
+        # fit is decided by the last tenth of the curve and misses the first
+        # half by tens of per cent; weighted by 1/|F| it holds to a few per
+        # cent everywhere, which is what "it fits the curve" has to mean
+        # when the curve is plotted on a log axis.
+        "weighting": "relative",
         # The mean of four corrected WT curves, which fitted at 0.85, 1.10,
         # 1.20 and 1.20. Not a constant of nature, so the app measures it per
         # cell; this is only where it starts.
@@ -1794,6 +1838,7 @@ def apply_cell_type(name):
         "nucleus_onset",
         "cell_shape",
         "confinement",
+        "weighting",
     ):
         if key in preset:
             st.session_state[key] = preset[key]
@@ -2611,6 +2656,18 @@ with st.sidebar:
             "app reports Eₘ·hₘ alongside Eₘ for that reason.",
         )
         if st.session_state["cell_type"] in DEEP_IS_MYOFIBRILS:
+            st.selectbox(
+                "Membrane protein that acts as a horizontal spring",
+                list(MEMBRANE_PROTEIN_STATES),
+                key="membrane_protein",
+                help="Prestin, or whichever in-plane protein is being "
+                "tested. This decides which pictures of the cell are worth "
+                "comparing, so set it before loading the curve. A knockout "
+                "is not the same experiment as a wild type with the spring "
+                "fitted to zero: the first asks whether the curve needs one, "
+                "the second has already assumed it might.",
+            )
+            st.caption(MEMBRANE_PROTEIN_STATES[st.session_state["membrane_protein"]])
             st.number_input(
                 "Protein coat thickness h_p (nm)",
                 min_value=5.0,
@@ -3203,6 +3260,39 @@ with tab_analysis:
                 except Exception:
                     chosen = None
             if chosen and chosen.get("success"):
+                # One refinement pass. The confinement was measured at a
+                # guessed pair of boundaries and the winning picture then
+                # fitted its own, so the two disagree; re-measuring q where
+                # the boundaries actually landed and re-running the
+                # comparison is a single step of coordinate descent, it
+                # costs a fraction of a second, and on one of the WT curves
+                # it is the difference between R² = 0.9994 and 0.99999.
+                if hasattr(model, "scan_confinement") and st.session_state[
+                    "cell_shape"
+                ].startswith("Belt"):
+                    first = chosen["best"]
+                    again = model.scan_confinement(
+                        lo, hi, e1=first["break_1"], e2=first["break_2"],
+                        membrane=first["membrane"],
+                        cyto_start=first["cyto_start"],
+                        use_nucleus="nucleus" in first["terms"],
+                        use_tension="tension" in first["terms"],
+                        weighting=st.session_state["weighting"],
+                    )
+                    if again.get("success"):
+                        model.confinement = float(again["q"])
+                        pending["confinement"] = round(float(again["q"]), 2)
+                        st.session_state["confinement_scan"] = again
+                        try:
+                            better = compare_hypotheses(
+                                model, lo, hi, picks,
+                                weighting=st.session_state["weighting"],
+                                cv_repeats=2, n_grid=8,
+                            )
+                            if better.get("success"):
+                                chosen = better
+                        except Exception:
+                            pass
                 st.session_state["hypothesis_search"] = chosen
                 winner = chosen["best"]
                 pending.update({
@@ -3288,6 +3378,26 @@ with tab_analysis:
                 winner = guess["best"]
                 st.markdown("##### What this curve looks like")
                 (st.success if guess["clear_cut"] else st.info)(retell(guess["verdict"]))
+                # Say exactly what was chosen, in one line: the elements and
+                # where the boundaries went. "It picked something" is not an
+                # answer anyone can check.
+                chosen_now = [
+                    term_name(t) for t in ALL_TERMS if t in winner["terms"]
+                ]
+                deep_in = "nucleus" in winner["terms"]
+                st.markdown(
+                    "**Components:** " + " + ".join(chosen_now)
+                    + "  ·  **Segmentation:** "
+                    + (
+                        f"one stretch, ε = {guided_lo:.3f} to {guided_hi:.3f}, "
+                        f"everything loading together"
+                        if not deep_in else
+                        f"ε = {guided_lo:.3f} to {winner['break_2']:.3f} the "
+                        f"outer layer alone, then "
+                        f"{term_name('nucleus').lower()} from "
+                        f"ε = {winner['break_2']:.3f} to {guided_hi:.3f}"
+                    )
+                )
                 notes = st.session_state.get("_auto_notes") or []
                 st.caption(
                     "Chosen automatically when the curve loaded: the range "
@@ -4312,10 +4422,16 @@ with tab_analysis:
             a1, a2 = st.columns(2)
             with a1:
                 st.selectbox(
-                    "Weighting", ["uniform", "relative"], key="weighting",
-                    help="uniform minimises absolute residuals, so the high-force "
-                    "end dominates. relative weights each point by 1/|F| so the "
-                    "small-ε region counts too.",
+                    "Weighting", ["uniform", "relative", "noise"], key="weighting",
+                    help="How much each point counts. A whole-cell curve "
+                    "spans four decades of force, so **uniform** is decided "
+                    "almost entirely by its last tenth and can miss the "
+                    "first half by tens of per cent without the residual sum "
+                    "noticing. **relative** weights by 1/|F|, so every decade "
+                    "counts the same and the fit holds everywhere; it is the "
+                    "default for a cardiomyocyte. **noise** weights by 1/σ "
+                    "measured from the curve, the maximum-likelihood choice "
+                    "and the one χ²/dof assumes.",
                 )
                 st.checkbox("Fit a constant force offset", key="fit_offset")
             with a2:
@@ -4843,6 +4959,94 @@ with tab_analysis:
                 "estimated from the curve itself, so read χ²/dof as an "
                 "order of magnitude, not to two decimal places."
             )
+
+            # The model must never soften. Every basis function has a
+            # non-decreasing slope and every modulus is bounded at zero, so
+            # this holds by construction; it is checked rather than asserted
+            # because a future term could break it silently, and a cell that
+            # appeared to soften under load would be a physical claim nobody
+            # meant to make.
+            if fitted is not None:
+                drawn = np.isfinite(fitted)
+                if drawn.sum() > 5:
+                    e_drawn, f_drawn = epsilon[drawn], fitted[drawn]
+                    slope = np.diff(f_drawn) / np.maximum(np.diff(e_drawn), 1e-12)
+                    softening = float(np.min(np.diff(slope))) if slope.size > 2 else 0.0
+                    falls = float(np.min(np.diff(f_drawn))) if f_drawn.size > 1 else 0.0
+                    if falls < -1e-15 or softening < -abs(np.max(slope)) * 1e-6:
+                        st.warning(
+                            "The fitted curve is not stiffening monotonically, "
+                            "which no combination of these elements should be "
+                            "able to do. Treat this fit as suspect and tell "
+                            "whoever maintains the app.",
+                            icon="⚠️",
+                        )
+
+            # How well it fits, band by band, as a percentage. R² and the
+            # residual sum are both dominated by the last tenth of a curve
+            # that spans four decades, so both can look perfect while the
+            # first half is out by a third. This is the number that says
+            # whether the model follows the curve where you are looking.
+            if fitted is not None:
+                inside = (epsilon >= fit["epsilon_range"][0]) & (
+                    epsilon <= fit["epsilon_range"][1]
+                )
+                bands, worst_band = [], 0.0
+                edges = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 1.01])
+                for lo_b, hi_b in zip(edges[:-1], edges[1:]):
+                    here = inside & (epsilon >= lo_b) & (epsilon < hi_b)
+                    here &= np.isfinite(fitted)
+                    if here.sum() < 5:
+                        continue
+                    measured = force_N[here]
+                    scale = np.mean(np.abs(measured))
+                    if scale <= 0:
+                        continue
+                    miss = float(np.mean(fitted[here] - measured) / scale)
+                    worst_band = max(worst_band, abs(miss))
+                    bands.append({
+                        "ε from": f"{lo_b:.2f}",
+                        "to": f"{min(hi_b, 1.0):.2f}",
+                        "points": int(here.sum()),
+                        "typical force there": (
+                            f"{float(from_newtons(scale, style.force_unit)[0]):.3g} "
+                            f"{style.force_unit}"
+                        ),
+                        "model is out by": f"{100 * miss:+.1f} %",
+                    })
+                if bands:
+                    with st.expander(
+                        f"📊 How well it fits, stretch by stretch "
+                        f"(worst {100 * worst_band:.1f} %)",
+                        expanded=worst_band > 0.15,
+                    ):
+                        flat_table(
+                            pd.DataFrame(bands),
+                            align_right=["points", "typical force there",
+                                         "model is out by"],
+                        )
+                        st.caption(
+                            "The percentage is the average signed miss in "
+                            "that stretch, as a fraction of the force there. "
+                            "R² and χ² are both dominated by the largest "
+                            "forces, so a curve spanning four decades can "
+                            "read R² = 0.99999 while the first half is out "
+                            "by a third; this table is where that shows. "
+                            "Weighting, in Advanced fitting options, is what "
+                            "trades one end against the other: **uniform** "
+                            "buys the top of the curve, **relative** spreads "
+                            "the error evenly."
+                        )
+                        if worst_band > 0.15 and st.session_state["weighting"] == "uniform":
+                            st.warning(
+                                f"The model is out by {100 * worst_band:.0f} % "
+                                f"somewhere, and the fit is weighted "
+                                f"uniformly, which means the low-force end "
+                                f"was barely counted. Switching the weighting "
+                                f"to **relative** usually brings this under "
+                                f"5 % everywhere without hurting the top of "
+                                f"the curve."
+                            )
 
             # What the squash did to the sarcomeres. Geometry rather than a
             # fitted result, and only meaningful where there are sarcomeres,
