@@ -1195,6 +1195,12 @@ COMPOSITION_TERMS = ("tension", "membrane", "interior", "nucleus")
 
 COMPOSITIONS = [
     {
+        "key": "cyto_first",
+        "membrane": "late",
+        "cyto_start": "zero",
+        "label": "Cytoskeleton first, then the membrane starts stretching",
+    },
+    {
         "key": "freeze_late",
         "membrane": "freeze",
         "cyto_start": "break",
@@ -1412,9 +1418,18 @@ class _CompositionMixin:
         positive = np.clip(eps, 0.0, None)
         # A ruptured membrane holds what it reached: both of its springs stop
         # taking up more, because they are the same piece of material.
-        held = positive if membrane == "continue" else np.clip(
-            np.minimum(eps, e1), 0.0, None
-        )
+        if membrane == "continue":
+            held = positive
+        elif membrane == "late":
+            # The shell only starts to stretch once the cell has been
+            # flattened enough to make it, so its cube law is measured from
+            # e1 rather than from first contact. Before that the interior
+            # network carries the load on its own, which is a slope of 3/2
+            # near contact rather than 3 — and the shell taking over is what
+            # carries it up towards 3 and beyond.
+            held = np.clip(eps - float(e1), 0.0, None)
+        else:
+            held = np.clip(np.minimum(eps, e1), 0.0, None)
         start = 0.0 if cyto_start == "zero" else float(e1)
         # Confinement multiplies every term, because it is not a property of
         # any one of them: it is the cell running out of room. See
