@@ -8,6 +8,7 @@ with the diagnostics needed to tell a real measurement from a bad window.
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import os
@@ -18,42 +19,106 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from lulevich_model import (
-    LulevichModel,
-    compare_couplings,
-    compare_hypotheses,
-    dropped_term_warning,
-    recommend_components,
-    search_arrangements,
-)
+# ------------------------------------------------------ companion imports ---
+#
+# Nothing here is imported with a bare `from x import y`, and that is not
+# style. app.py, lulevich_model.py and plot_utils.py are updated together,
+# and a deploy that picks up one but not the others used to die on the
+# import line itself, before a single line of the app had run. Streamlit
+# Cloud shows that as a truncated traceback with the reason cut out of it,
+# so the one thing the person needed to know, which file is behind and
+# which piece of it is missing, was exactly what they could not see.
+#
+# So each name is fetched by hand, whatever is missing is remembered, and
+# the app either carries on without an optional piece or stops with a
+# message that names the file and the missing names.
 
-# Newest first, and imported softly. A deploy that picks up app.py but not
-# lulevich_model.py would otherwise die on the import line with a message
-# Streamlit Cloud redacts; this way the app runs and says which file is
-# behind. See the companion file check below.
-try:
-    from lulevich_model import ORDERINGS, compare_orderings, ordering_of
-except ImportError:  # pragma: no cover - only on a half-updated deploy
-    ORDERINGS, compare_orderings, ordering_of = [], None, lambda *a: None
-from plot_utils import (
-    FORCE_UNITS,
-    balloon_figure,
-    INPUT_FORCE_UNITS,
-    PlotStyle,
-    autoscale_unit,
-    cell_schematic,
-    exponent_profile_figure,
-    force_curve_figure,
-    from_newtons,
-    residual_figure,
-    sensitivity_figure,
-    to_newtons,
-)
+MISSING_PIECES = []
 
-try:
-    from plot_utils import ordering_figure, ordering_slope_figure
-except ImportError:  # pragma: no cover - only on a half-updated deploy
-    ordering_figure = ordering_slope_figure = None
+
+def _companion(name):
+    """Import a companion module, or remember that it could not be."""
+    try:
+        return importlib.import_module(name)
+    except Exception as exc:  # pragma: no cover - only on a broken deploy
+        MISSING_PIECES.append((f"{name}.py", [f"the file itself ({exc})"]))
+        return None
+
+
+_model_module = _companion("lulevich_model")
+_plot_module = _companion("plot_utils")
+
+
+def _pull(module, filename, names, required=True):
+    """Bind ``names`` from ``module`` into this one, remembering any gaps."""
+    if module is None:
+        for name in names:
+            globals()[name] = None
+        return False
+    missing = []
+    for name in names:
+        value = getattr(module, name, None)
+        if value is None and not hasattr(module, name):
+            missing.append(name)
+        globals()[name] = value
+    if missing and required:
+        MISSING_PIECES.append((filename, missing))
+    return not missing
+
+
+_pull(_model_module, "lulevich_model.py", (
+    "LulevichModel",
+    "compare_couplings",
+    "compare_hypotheses",
+    "dropped_term_warning",
+    "recommend_components",
+    "search_arrangements",
+))
+_pull(_plot_module, "plot_utils.py", (
+    "FORCE_UNITS",
+    "INPUT_FORCE_UNITS",
+    "PlotStyle",
+    "autoscale_unit",
+    "balloon_figure",
+    "cell_schematic",
+    "exponent_profile_figure",
+    "force_curve_figure",
+    "from_newtons",
+    "residual_figure",
+    "sensitivity_figure",
+    "to_newtons",
+))
+
+# Optional: newer pieces the app can run without, each switched off by the
+# companion file check below rather than taking the whole app down.
+HAS_ORDERINGS = _pull(_model_module, "lulevich_model.py",
+                      ("ORDERINGS", "compare_orderings", "ordering_of"),
+                      required=False)
+if not HAS_ORDERINGS:
+    ORDERINGS, compare_orderings = [], None
+
+    def ordering_of(*_args, **_kwargs):
+        return None
+
+HAS_ORDER_PLOTS = _pull(_plot_module, "plot_utils.py",
+                        ("ordering_figure", "ordering_slope_figure"),
+                        required=False)
+
+if MISSING_PIECES:
+    st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
+    st.error(
+        "**This deploy is half updated, so the app cannot start.**\n\n"
+        + "\n".join(
+            f"`{name}` is missing " + ", ".join(f"`{p}`" for p in pieces)
+            for name, pieces in MISSING_PIECES
+        )
+        + "\n\nCopy the current "
+        + " and ".join(f"`{name}`" for name, _ in MISSING_PIECES)
+        + " into the repository next to `app.py`, then reboot the app. "
+        "These files are a set and have to travel together."
+    )
+    st.stop()
+
 
 # --------------------------------------------------- companion file check ---
 #
