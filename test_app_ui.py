@@ -1314,21 +1314,25 @@ def case_component_names_follow_the_cell_type():
     # One interior, and its name says what is in it. The cytoskeleton and
     # the myofibrils are not two springs: they are one incompressible
     # material, because nothing in the curve separates them.
-    check("the cardiomyocyte interior is the non-sarcomeric scaffolding",
+    check("the cardiomyocyte interior is the non-sarcomeric cytoskeleton",
           "non-sarcomeric" in cardio["interior"][0].lower(),
           str(cardio["interior"]))
-    check("with a cortex above it and myofibrils below",
-          "cortical" in cardio["cortex"][0].lower()
+    check("with the sarcolemma outside it and myofibrils below",
+          "sarcolemma" in cardio["membrane"][0].lower()
           and "myofibril" in cardio["nucleus"][0].lower(),
-          str([cardio["cortex"][0], cardio["nucleus"][0]]))
+          str([cardio["membrane"][0], cardio["nucleus"][0]]))
     check("the deep slot is myofibrils, never a nucleus",
           "myofibril" in cardio["nucleus"][0].lower(), str(cardio["nucleus"]))
     check("and nothing in its component set says nucleus",
           not any("nucleus" in v[0].lower() for v in cardio.values()),
           str([v[0] for v in cardio.values()]))
-    check("every element carries an emoji, so the labels can be told apart",
-          all(bare(v[0]) != v[0] for v in cardio.values()),
-          str([v[0] for v in cardio.values()]))
+    # Only the slots this cell type actually has. The rest carry neutral
+    # fallback names so that nothing reaching for one gets a KeyError, and
+    # those are never shown.
+    check("every material it has carries an emoji",
+          all(bare(cardio[term][0]) != cardio[term][0]
+              for term in app_module.terms_for("Cardiomyocyte")),
+          str([cardio[t2][0] for t2 in app_module.terms_for("Cardiomyocyte")]))
     check("the membrane is the shell resisting being stretched",
           "stretch" in cardio["membrane"][1], str(cardio["membrane"]))
     # No in-plane spring anywhere at the moment: the plain cardiomyocyte is
@@ -1347,14 +1351,15 @@ def case_component_names_follow_the_cell_type():
     check("the plain-language table is there", len(parts) == 1)
     if parts:
         listed = list(parts[0]["Part of the cell"])
-        check("it lists the cortex, the scaffolding and the myofibrils",
-              any("cortical" in v.lower() for v in listed)
+        check("it lists the sarcolemma and both cytoskeletons",
+              any("sarcolemma" in v.lower() for v in listed)
               and any("non-sarcomeric" in v.lower() for v in listed)
-              and any("myofibril" in v.lower() for v in listed), str(listed))
+              and any("myofibril" in v.lower() for v in listed),
+              str(listed))
         check("and never calls anything a nucleus",
               not any("Nucleus" in v for v in listed), str(listed))
-        check("the membrane is listed once",
-              sum("Membrane" in v for v in listed) == 1, str(listed))
+        check("the shell is listed once, as the sarcolemma",
+              sum("Sarcolemma" in v for v in listed) == 1, str(listed))
     check("the fit succeeds for a cardiomyocyte",
           app.session_state["_last_fit"] is not None
           and app.session_state["_last_fit"].get("success"))
@@ -1400,7 +1405,10 @@ def case_fit_statistics():
     eps = np.linspace(0.001, 0.60, 260)
     g = LM(np.zeros_like(eps), eps, cell_height=8.0e-6)
     m, c, nu = g.composition_terms(eps, 0.15, 0.40, "freeze", "break")
-    clean = m * 0.6e6 + c * 1.2e3 + nu * 3e3
+    # A deep element that really carries something. Its prefactor uses the
+    # nucleus radius squared (Lulevich eq 6), so at 3 kPa its force is a
+    # rounding error and "dropping a real term" would not be dropping one.
+    clean = m * 0.6e6 + c * 1.2e3 + nu * 15e3
 
     force = clean + 5e-11 * np.random.default_rng(0).standard_normal(260)
     model = LM(force, eps, cell_height=8.0e-6)
@@ -1749,8 +1757,8 @@ def case_the_cortex_carries_the_start():
     # The cortex is the term loaded from ε = 0, so the scaffolding under it
     # has to wait for ε₁. Both from zero and they are one Hertzian term
     # with two names, split arbitrarily by the solver.
-    check("the scaffolding waits for the cortex to hand over",
-          defaults["cyto_starts_at"] == "at ε₁", str(defaults))
+    check("the interior carries the load from first contact",
+          defaults["cyto_starts_at"] == "from the very start", str(defaults))
     check("and the membrane starts stretching at ε₁ by default",
           defaults["membrane_after_break"] == "starts stretching at ε₁",
           str(defaults))
@@ -1803,7 +1811,7 @@ def case_schematic_is_a_mechanics_diagram():
     check("a component that handed over shows as locked",
           "locked" in text, text[-260:])
     check("it uses the cell type's own names",
-          "Non-sarcomeric cytoskeleton" in flat and "Myofibrils" in flat,
+          "Sarcolemma" in flat and "myofibrils" in flat.lower(),
           flat[-260:])
 
     # Springs must hang straight, not lean: a precedence bug once drew them
@@ -2483,16 +2491,16 @@ def case_cortical_actin_can_carry_it_first():
         fitted += 1
         rows = {r["key"]: r for r in found["candidates"]}
         check(f"cell {n} was offered both orders",
-              {"cortex_first", "coupled"} <= set(rows), str(sorted(rows)))
+              {"interior_first", "coupled"} <= set(rows), str(sorted(rows)))
         best = found["best"]
         check(f"cell {n}: the winner follows the curve",
               best["r_squared"] > 0.9995, f"{best['r_squared']:.6f}")
         check(f"cell {n} hands over part-way in, not at either end",
               window["epsilon_min"] < best["break_1"] < window["epsilon_max"],
               f"ε₁ = {best['break_1']:.3f}")
-        check(f"cell {n}: the cortex is carrying load",
-              best["fit"].get("Ecx_kPa", 0.0) > 0.0,
-              str(best["fit"].get("Ecx_kPa")))
+        check(f"cell {n}: the interior is carrying load",
+              best["fit"].get("Ei_kPa", 0.0) > 0.0,
+              str(best["fit"].get("Ei_kPa")))
     check("both clean curves were fitted", fitted == 2, f"{fitted} of 2")
 
     check("and a late membrane is offered as a named picture",
@@ -2842,11 +2850,11 @@ def case_named_hypotheses_are_compared():
     # and the measured slope near contact says so. What the membrane does is
     # a real question, though — it can load with it from the start, or only
     # begin to stretch once the cell has been flattened enough to stretch it.
-    check("the scaffolding always waits for ε₁, because the cortex is there",
-          all(p["cyto_start"] == "break" for p in picks),
+    check("the interior always carries the load from first contact",
+          all(p["cyto_start"] == "zero" for p in picks),
           str([(p["key"], p["cyto_start"]) for p in picks]))
-    check("and every picture carries the cortex",
-          all("cortex" in p["terms"] for p in picks),
+    check("and every picture carries the interior",
+          all("interior" in p["terms"] for p in picks),
           str([p["terms"] for p in picks]))
     check("and the membrane either loads with it or starts stretching later",
           all(p["membrane"] in ("continue", "late") for p in picks),
@@ -2878,9 +2886,9 @@ def case_named_hypotheses_are_compared():
         if not found.get("success"):
             continue
         check(f"cell {n} names its pick", bool(found["best"]["label"]))
-        check(f"cell {n} keeps the cortex carrying it from first contact",
-              "cortex" in found["best"]["terms"],
-              str(found["best"]["terms"]))
+        check(f"cell {n} keeps the interior carrying it from first contact",
+              found["best"]["cyto_start"] == "zero",
+              str(found["best"]["cyto_start"]))
 
 
 def case_springs_are_round_and_the_balloon_exists():
@@ -3001,15 +3009,16 @@ def case_no_nucleus_wording_for_a_cardiomyocyte():
               "nucleus", "Myoblast (C2C12)").lower(),
           app_module.term_name("nucleus", "Myoblast (C2C12)"))
     check("and a cardiomyocyte's deep slot is its myofibrils",
-          app_module.plain_name("nucleus", "Cardiomyocyte") == "Myofibrils",
+          "myofibril" in app_module.plain_name(
+              "nucleus", "Cardiomyocyte").lower(),
           app_module.term_name("nucleus", "Cardiomyocyte"))
-    check("its interior is split into a cortex, a scaffolding and myofibrils",
+    check("its materials are a sarcolemma and two cytoskeletons",
           [app_module.plain_name(term, "Cardiomyocyte")
-           for term in ("cortex", "interior", "nucleus")]
-          == ["Cortical cytoskeleton", "Non-sarcomeric cytoskeleton",
-              "Myofibrils"],
+           for term in app_module.terms_for("Cardiomyocyte")]
+          == ["Sarcolemma", "Non-sarcomeric cytoskeleton",
+              "Sarcomeric cytoskeleton (myofibrils)"],
           str([app_module.plain_name(t2, "Cardiomyocyte")
-               for t2 in ("cortex", "interior", "nucleus")]))
+               for t2 in app_module.terms_for("Cardiomyocyte")]))
     check("the stored model name no longer names a myoblast's parts",
           not any("nucleus" in k.lower() for k in app_module.MODELS),
           str(list(app_module.MODELS)[:1]))
@@ -3082,8 +3091,11 @@ def case_components_are_recommended():
 
     # The other direction, and the more important one: a term that earns
     # almost nothing must not be sold as needed just because it fits.
+    # A spring an order of magnitude smaller than the one above: it fits,
+    # because any extra column fits, and it must still be left out.
+    _, _, faint, _ = four_element_curve(T0=1.5e-4, seed=9)
     quiet = recommend_components(
-        model, 0.0, 0.65,
+        faint, 0.0, 0.65,
         candidates=("membrane", "interior", "nucleus", "tension"),
         e1=0.15, e2=0.40, membrane="continue", cyto_start="zero",
         cv_repeats=2,
@@ -3646,44 +3658,39 @@ def case_clone_keeps_the_whole_geometry():
           twin.deep_uses_cell_radius is model.deep_uses_cell_radius)
 
 
-def case_the_cardiomyocyte_has_four_materials():
-    print("a cardiomyocyte is a shell, a cortex, a scaffolding and myofibrils")
+def case_the_cardiomyocyte_has_three_materials():
+    print("a cardiomyocyte is a sarcolemma, a packed interior and myofibrils")
     import app as app_module
     here = app_module.terms_for("Cardiomyocyte")
-    check("four materials", len(here) == 4, str(here))
-    check("and they are the four asked for",
-          here == ("membrane", "cortex", "interior", "nucleus"), str(here))
-    check("no in-plane spring, so the plain cell is settled first",
-          "tension" not in here, str(here))
+    check("three materials", len(here) == 3, str(here))
+    check("and they are the three asked for",
+          here == ("membrane", "interior", "nucleus"), str(here))
+    check("no cortical layer of its own", "cortex" not in here, str(here))
+    check("no in-plane spring either", "tension" not in here, str(here))
     names = app_module.components_for("Cardiomyocyte")
-    for term, word in (("membrane", "membrane"), ("cortex", "cortical"),
-                       ("interior", "non-sarcomeric"),
-                       ("nucleus", "myofibril")):
-        check(f"{term} is named for what it is",
-              word in names[term][0].lower(), str(names[term]))
-    # Three of the four are Hertzian, so only their onsets separate them.
-    laws = app_module.MATERIAL_LAWS
-    hertzian = [term for term in here if laws[term]["exponent"] == "3/2"]
-    check("three of them share the Hertzian law", len(hertzian) == 3,
-          str(hertzian))
-    check("and the cortex says its onset is what separates it",
-          "onset" in laws["cortex"]["separable"], laws["cortex"]["separable"])
-    check("the scaffolding therefore starts at ε₁, not at zero",
+    check("the membrane is named the sarcolemma",
+          "sarcolemma" in names["membrane"][0].lower(), str(names["membrane"]))
+    check("the interior is the non-sarcomeric cytoskeleton",
+          "non-sarcomeric" in names["interior"][0].lower(),
+          str(names["interior"]))
+    check("and the deep layer is the myofibrils",
+          "myofibril" in names["nucleus"][0].lower(), str(names["nucleus"]))
+    check("nothing anywhere in its names says nucleus",
+          not any("nucleus" in v[0].lower() for v in names.values()),
+          str([v[0] for v in names.values()]))
+    check("the interior carries the load from first contact",
           app_module.DEFAULT_COMPOSITION_BY_TYPE["Cardiomyocyte"][
-              "cyto_starts_at"] == "at ε₁")
-    check("its interior is treated as incompressible",
-          "Cardiomyocyte" in app_module.INCOMPRESSIBLE_INTERIOR)
+              "cyto_starts_at"] == "from the very start")
 
     app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
-    if not no_exception(app, "four materials"):
+    if not no_exception(app, "three materials"):
         return
     fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
-    check("all four are fitted",
-          set(fitted) == {"membrane", "cortex", "interior", "nucleus"},
-          str(fitted))
+    check("all three are fitted",
+          set(fitted) == {"membrane", "interior", "nucleus"}, str(fitted))
     table = table_with(app, "Part of the cell")
-    check("the stiffness table lists all four",
-          table is not None and len(table) == 4,
+    check("the stiffness table lists all three",
+          table is not None and len(table) == 3,
           "none" if table is None else str(len(table)))
     if table is not None:
         check("and none of its rows is a nucleus",
@@ -3691,19 +3698,12 @@ def case_the_cardiomyocyte_has_four_materials():
                       for v in table["Part of the cell"]),
               str(list(table["Part of the cell"])))
 
-    # A myoblast keeps its own four, which are not these.
     plain = start(cell_name="myo-01")
     if no_exception(plain, "a myoblast"):
         plain_table = table_with(plain, "Part of the cell")
-        check("a myoblast lists four of its own",
+        check("a myoblast still lists four of its own",
               plain_table is not None and len(plain_table) == 4,
               "none" if plain_table is None else str(len(plain_table)))
-        check("one of which is its nucleus",
-              plain_table is not None
-              and any("nucleus" in str(v).lower()
-                      for v in plain_table["Part of the cell"]),
-              "none" if plain_table is None
-              else str(list(plain_table["Part of the cell"])))
 
 
 def case_q_and_the_boundaries_are_searched_together():
@@ -3784,9 +3784,8 @@ def case_one_fitting_routine():
           on_load and on_load.get("success"))
     if not (on_load and on_load.get("success")):
         return
-    check("with all four materials",
-          set(on_load["terms"]) == {"membrane", "cortex", "interior",
-                                    "nucleus"},
+    check("with all three materials",
+          set(on_load["terms"]) == {"membrane", "interior", "nucleus"},
           str(on_load["terms"]))
     check("and it fits the measured curve", on_load["r_squared"] > 0.9995,
           f"R2 {on_load['r_squared']:.6f}")
@@ -3934,8 +3933,12 @@ def case_the_myoblast_nucleus_reaches_the_page():
     eps = np.linspace(0.002, 0.62, 300)
     seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
     basis = seed.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    # 30 kPa inside the nucleus, not 3. Its prefactor is the nucleus radius
+    # squared (Lulevich eq 6), and at 3 kPa a body that size contributes
+    # less than the noise: the search would be right to drop it, so a test
+    # that demanded it be kept would be demanding a wrong answer.
     force = (basis["membrane"] * 0.6e6 + basis["interior"] * 1.2e3
-             + basis["nucleus_shell"] * 0.4e6 + basis["nucleus"] * 3.0e3)
+             + basis["nucleus_shell"] * 0.4e6 + basis["nucleus"] * 30.0e3)
     rng = np.random.default_rng(0)
     force = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
 
@@ -4051,47 +4054,42 @@ def case_the_membrane_protein_is_put_aside():
           "spring protein" not in labels.lower(), labels[:200])
 
 
-def case_the_cortex_is_separated_by_its_onset():
-    print("cortex, scaffolding and myofibrils are told apart by when they start")
+def case_the_interior_carries_first_contact():
+    print("the interior is loaded from contact and the sarcolemma may wait")
     eps = np.linspace(0.002, 0.62, 340)
     seed = LulevichModel(np.zeros_like(eps), eps, cell_height=19.0e-6,
-                         cell_radius=9.5e-6, confinement=1.1,
+                         cell_radius=10.45e-6, confinement=1.1,
                          deep_uses_cell_radius=True)
-    basis = seed.composition_basis(eps, 0.18, 0.45, "late", "break")
-    check("the cortex has a basis function", "cortex" in basis)
-    # All three are the same law. Only the onsets differ, and that has to be
-    # visible in the columns or the fit is splitting one term three ways.
-    check("the cortex is loaded from first contact",
-          float(basis["cortex"][0]) > 0.0)
-    check("the scaffolding waits for ε₁",
-          float(np.max(basis["interior"][eps < 0.18])) == 0.0)
-    check("the myofibrils wait for ε₂",
+    basis = seed.composition_basis(eps, 0.18, 0.45, "late", "zero")
+    check("the interior is loaded from first contact",
+          float(basis["interior"][0]) > 0.0)
+    check("a late sarcolemma contributes nothing before ε₁",
+          float(np.max(basis["membrane"][eps < 0.18])) == 0.0)
+    check("and the myofibrils wait for ε₂",
           float(np.max(basis["nucleus"][eps < 0.45])) == 0.0)
 
-    truth = {"Em": 1.5e6, "Ecx": 2.0e3, "Ec": 1.0e3, "En": 3.0e3}
-    force = (basis["membrane"] * truth["Em"] + basis["cortex"] * truth["Ecx"]
-             + basis["interior"] * truth["Ec"] + basis["nucleus"] * truth["En"])
+    truth = {"Em": 1.5e6, "Ec": 2.0e3, "En": 3.0e3}
+    force = (basis["membrane"] * truth["Em"] + basis["interior"] * truth["Ec"]
+             + basis["nucleus"] * truth["En"])
     rng = np.random.default_rng(1)
     noisy = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
-    model = LulevichModel(noisy, eps, cell_height=19.0e-6, cell_radius=9.5e-6,
-                          confinement=1.1, deep_uses_cell_radius=True)
+    model = LulevichModel(noisy, eps, cell_height=19.0e-6,
+                          cell_radius=10.45e-6, confinement=1.1,
+                          deep_uses_cell_radius=True)
     fit = model.fit_composition(
-        0.0, 0.62, 0.18, 0.45, "late", "break", use_nucleus=True,
-        use_cortex=True, weighting="relative",
+        0.0, 0.62, 0.18, 0.45, "late", "zero", use_nucleus=True,
+        weighting="relative",
     )
-    for key, want, tol in (("Em_MPa", 1.5, 0.15), ("Ecx_kPa", 2.0, 0.3),
-                           ("Ei_kPa", 1.0, 0.3), ("En_kPa", 3.0, 0.4)):
+    for key, want, tol in (("Em_MPa", 1.5, 0.15), ("Ei_kPa", 2.0, 0.3),
+                           ("En_kPa", 3.0, 0.4)):
         check(f"{key} is recovered", abs(fit[key] - want) < tol,
               f"{fit[key]:.4g} against {want}")
     check("and the curve is followed", fit["r_squared"] > 0.999,
           f"R2 {fit['r_squared']:.6f}")
-    check("the rebuilt curve carries the cortex too",
-          float(np.max(np.abs(model.composition_curve(eps, fit) - force)))
-          < 0.03 * float(force.max()))
 
 
-def case_the_cardiomyocyte_curves_fit_better_with_four():
-    print("the four-material cardiomyocyte fits the measured curves")
+def case_the_cardiomyocyte_curves_fit():
+    print("the cardiomyocyte model fits the measured curves")
     curves = vcm_curves()
     if not curves:
         check("the VCM reference curves are in the repository", False)
@@ -4121,8 +4119,8 @@ def case_the_cardiomyocyte_curves_fit_better_with_four():
         check(f"cell {n}: chi-squared per point is near one",
               fit["chi_squared_reduced"] < 3.0,
               f"{fit['chi_squared_reduced']:.3g}")
-        check(f"cell {n}: the cortex carries load",
-              fit.get("Ecx_kPa", 0.0) > 0.0, str(fit.get("Ecx_kPa")))
+        check(f"cell {n}: the interior carries load",
+              fit.get("Ei_kPa", 0.0) > 0.0, str(fit.get("Ei_kPa")))
         check(f"cell {n}: nothing is called a nucleus",
               "nucleus" not in " ".join(
                   str(m.value) for m in app.get("markdown")).lower())
@@ -4599,6 +4597,176 @@ def case_balloon_and_spring_tab_answers_by_itself():
           str(now and now["key"]))
 
 
+def case_the_prefactors_are_the_papers():
+    print("the prefactors are Lulevich 2006 eq 3 and eq 6, not near enough")
+    model = LulevichModel(np.ones(50), np.linspace(0.01, 0.60, 50),
+                          8.0e-6, cell_radius=4.4e-6,
+                          membrane_thickness=4.0e-9,
+                          poisson_membrane=0.5, poisson_interior=0.0)
+    # eq 3: F_m = 2 pi Em h R0 e^3 / (1 - nu_m)
+    want_m = 2 * np.pi * 4.0e-9 * 4.4e-6 / (1 - 0.5)
+    check("Am is eq 3", abs(model.Am - want_m) < want_m * 1e-12,
+          f"{model.Am:.6g} against {want_m:.6g}")
+    # eq 6: F_i = sqrt(2) Ei R0^2 e^1.5 / (3 (1 - nu_i^2))
+    want_i = np.sqrt(2) * 4.4e-6 ** 2 / (3 * (1 - 0.0 ** 2))
+    check("Ai is eq 6, with R0 squared",
+          abs(model.Ai - want_i) < want_i * 1e-12,
+          f"{model.Ai:.6g} against {want_i:.6g}")
+    # The form it used to have. Kept as a check rather than a comment,
+    # because the two agree only for h0 = 2 R0 and differ by about 2.5x for
+    # the cell shapes this app is used on, straight into every interior
+    # modulus it reports.
+    old_form = np.sqrt(2) * np.sqrt(4.4e-6) * 8.0e-6 ** 1.5 / 3.0
+    check("and that is not the old sqrt(R0) h0^1.5 form",
+          abs(model.Ai - old_form) > old_form * 0.5,
+          f"{model.Ai:.6g} against the old {old_form:.6g}")
+    # The two forms never agree: their ratio is (h0/R0)^1.5, which is 2.83
+    # for a sphere and about 2.45 for the shapes here.
+    sphere = LulevichModel(np.ones(50), np.linspace(0.01, 0.60, 50),
+                           8.0e-6, cell_radius=4.0e-6, poisson_interior=0.0)
+    old_sphere = np.sqrt(2) * np.sqrt(4.0e-6) * 8.0e-6 ** 1.5 / 3.0
+    check("for a sphere the old form was 2 sqrt(2) times too big",
+          abs(old_sphere / sphere.Ai - 2 * np.sqrt(2)) < 1e-6,
+          f"{old_sphere / sphere.Ai:.4f}")
+
+    # eq 5 and eq 2: bending, which the paper writes out and then drops.
+    check("bending goes as the square root of the deformation",
+          abs(model.bending_force(0.25, 30e6)
+              / model.bending_force(1.0, 30e6) - np.sqrt(0.25)) < 1e-9)
+    at_thirty = model.bending_force(0.30, 30e6)
+    check("and at 30 % with a 30 MPa membrane it is under a nanonewton",
+          at_thirty < 1e-9, f"{at_thirty * 1e9:.3g} nN")
+    check("eq 2 puts it well under a twentieth of the stretching term",
+          model.bending_share(0.30) < 0.05,
+          f"{model.bending_share(0.30):.4f}")
+
+
+def case_a_fixed_cell_is_one_hertzian_solid():
+    print("a fixed cell is fitted as one cross-linked solid")
+    import app as app_module
+    check("it is offered as a cell type",
+          "Fixed cell" in app_module.CELL_TYPES, str(list(app_module.CELL_TYPES)))
+    here = app_module.terms_for("Fixed cell")
+    check("with exactly one material", here == ("interior",), str(here))
+    check("named for what it is",
+          "fixed cell" in app_module.plain_name("interior",
+                                                "Fixed cell").lower(),
+          app_module.term_name("interior", "Fixed cell"))
+    picks = app_module.hypotheses_for("Fixed cell")
+    check("and one picture, because there is nothing to compare",
+          len(picks) == 1 and picks[0]["terms"] == ("interior",), str(picks))
+
+    # The paper's own numbers: fixation cross-links the proteins and the
+    # cell comes out 20 to 50 times stiffer, 150 to 230 kPa.
+    eps = np.linspace(0.002, 0.60, 320)
+    blank = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    force = blank.composition_basis(
+        eps, 0.15, 0.40, "continue", "zero")["interior"] * 190e3
+    rng = np.random.default_rng(0)
+    force = force * (1.0 + 0.01 * rng.standard_normal(eps.size))
+
+    app = AppTest.from_file(APP, default_timeout=900)
+    app.run()
+    app.session_state["cell_type"] = "Fixed cell"
+    app.session_state["cell_name"] = "fixed-01"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "fixed.csv",
+        "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "a fixed cell"):
+        return
+    fit = app.session_state["_last_fit"]
+    check("it is fitted", fit and fit.get("success"))
+    if not (fit and fit.get("success")):
+        return
+    check("with the one Hertzian term and nothing else",
+          tuple(fit["terms"]) == ("interior",), str(fit["terms"]))
+    check("and the modulus comes back",
+          abs(fit["Ei_kPa"] - 190.0) < 10.0, f"{fit['Ei_kPa']:.4g} kPa")
+    check("which is in the range the paper reports for fixed cells",
+          150.0 <= fit["Ei_kPa"] <= 230.0, f"{fit['Ei_kPa']:.4g} kPa")
+    table = table_with(app, "Part of the cell")
+    check("the table lists the one material", table is not None
+          and len(table) == 1, "none" if table is None else str(len(table)))
+
+
+def case_unticking_a_material_fits_without_it():
+    print("unticking a material fits without it, rather than putting it back")
+    import app as app_module
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+    eps, force = curves[11]
+    app = AppTest.from_file(APP, default_timeout=900)
+    app.run()
+    app.session_state["cell_type"] = "Cardiomyocyte"
+    app.session_state["cell_name"] = "vcm-11"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "vcm_11.csv",
+        "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "a cardiomyocyte"):
+        return
+    before = (app.session_state["_last_fit"] or {}).get("terms") or []
+    check("all three are fitted to start with",
+          set(before) == {"membrane", "interior", "nucleus"}, str(before))
+
+    names = app_module.components_for("Cardiomyocyte")
+    box = next((c for c in app.checkbox
+                if (c.label or "").startswith(names["membrane"][0])), None)
+    check("the membrane has a checkbox", box is not None,
+          str([c.label for c in app.checkbox][:4]))
+    if box is None:
+        return
+    box.uncheck().run()
+    if not no_exception(app, "unticking the membrane"):
+        return
+    check("it stays unticked", app.session_state["use_membrane"] is False)
+    work = button_by_label(app, "Fit this cell")
+    if work is None:
+        check("the fit button is there", False)
+        return
+    work.click().run()
+    if not no_exception(app, "fitting without the membrane"):
+        return
+    # The bug this catches: every picture carried its own list of materials
+    # and the winner wrote them straight back, so the box you had just
+    # cleared reappeared with a modulus beside it.
+    check("the membrane is still unticked after fitting",
+          app.session_state["use_membrane"] is False)
+    after = app.session_state["_last_fit"]
+    check("and it is not in the fit", "membrane" not in after["terms"],
+          str(after["terms"]))
+    check("the rest still fit the curve", after["r_squared"] > 0.999,
+          f"{after['r_squared']:.6f}")
+    check("the membrane modulus reads zero",
+          after["Em_MPa"] == 0.0, str(after["Em_MPa"]))
+    picture = app.session_state["hypothesis_search"]["best"]["label"]
+    check("and the picture chosen does not name a material it left out",
+          "sarcolemma" not in picture.lower(), picture)
+
+
+def case_the_video_is_not_a_plot_marking():
+    print("the video belongs to the record and the morphology, not the plot")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "plot options"):
+        return
+    keys = [c.key for c in app.checkbox]
+    check("no video frame marker among the plot switches",
+          "show_video_marker" not in keys, str(keys))
+    check("and no video panel switch either",
+          "video_show_panel" not in keys, str(keys))
+    check("the marker is off in the style the plot is drawn with",
+          "show_video_marker=False" in SOURCE)
+    # The video tab itself is untouched: it is what links a cell to its
+    # record and measures the cell's shape.
+    check("the video tab still exists in the source",
+          "adopt_video(" in SOURCE and "detect_nucleus" in SOURCE)
+
+
 if __name__ == "__main__":
     for case in (
         case_loads_clean,
@@ -4644,13 +4812,17 @@ if __name__ == "__main__":
         case_breakpoint_spread_is_the_real_error_bar,
         case_error_bars_are_reported,
         case_clone_keeps_the_whole_geometry,
-        case_the_cardiomyocyte_has_four_materials,
+        case_the_cardiomyocyte_has_three_materials,
+        case_the_prefactors_are_the_papers,
+        case_a_fixed_cell_is_one_hertzian_solid,
+        case_unticking_a_material_fits_without_it,
+        case_the_video_is_not_a_plot_marking,
         case_the_nucleus_is_a_balloon_too,
         case_the_myoblast_nucleus_reaches_the_page,
         case_component_heights_are_readable,
         case_the_membrane_protein_is_put_aside,
-        case_the_cortex_is_separated_by_its_onset,
-        case_the_cardiomyocyte_curves_fit_better_with_four,
+        case_the_interior_carries_first_contact,
+        case_the_cardiomyocyte_curves_fit,
         case_q_and_the_boundaries_are_searched_together,
         case_one_fitting_routine,
         case_materials_are_explained_by_their_law,
