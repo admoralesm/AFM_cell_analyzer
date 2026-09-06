@@ -212,6 +212,38 @@ except Exception as exc:  # pragma: no cover
     OneDriveError = Exception
     ONEDRIVE_IMPORT_ERROR = str(exc)
 
+
+def onedrive_load_problem():
+    """
+    Why OneDrive support did not load, in words that name the fix.
+
+    Almost always the same thing: `onedrive_store.py` is not next to
+    `app.py` in the deployed folder. The bare ImportError says "No module
+    named 'onedrive_store'", which is true and tells nobody what to do, so
+    it is turned into the instruction here.
+    """
+    if not ONEDRIVE_IMPORT_ERROR:
+        return None
+    text = str(ONEDRIVE_IMPORT_ERROR)
+    if "onedrive_store" in text and "No module named" in text:
+        return (
+            "**`onedrive_store.py` is not in the app folder.** It sits "
+            "beside `app.py`, and the app cannot archive anything without "
+            "it. Add that file to the repository, in the same folder as "
+            "`app.py`, commit it, and reboot the app. Nothing else needs "
+            "changing, and no secrets are involved at this stage: this is "
+            "a missing file, not a failed sign-in."
+        )
+    if "No module named" in text:
+        missing = text.split("No module named", 1)[1].strip().strip("'\"")
+        return (
+            f"**A package this needs is not installed: `{missing}`.** Add "
+            f"it to `requirements.txt` in the repository and reboot the "
+            f"app."
+        )
+    return f"**OneDrive support could not load.** {text}"
+
+
 # The archive is OneDrive. Box was here too and was removed: on a UC Davis
 # tenant it cannot be authorised without an administrator, so it was a button
 # that could never light up. OneDriveStore exposes the same interface, so the
@@ -407,8 +439,11 @@ DEFAULTS = {
     "show_legend": True,
     # Separate from the bare switch: sometimes you want the markings but not
     # the model, to look at the data on its own.
-    "show_data": True,
-    "show_fit_line": True,
+    # One switch, not two. The measured points and the model drawn over
+    # them are the plot; wanting one without the other is rare enough that
+    # it does not deserve half the checkbox list, and two boxes that are
+    # both ticked in every real session is two boxes too many.
+    "show_data_and_fit": True,
     "show_component_heights": False,
     # Relative deformation runs 0 to 1 by definition, so that is the honest
     # default: two cells squashed to different depths then look different,
@@ -541,6 +576,11 @@ DEFAULTS = {
     "db_view": "Gallery",
     "exploration": None,
     "video_link": "",
+    # Measured off the video frame, and what you noticed while watching it.
+    # Both go into the spreadsheet beside the moduli. 0 means not measured,
+    # which is not the same as a cell of zero height.
+    "video_height_um": 0.0,
+    "video_comment": "",
     # The last successful fit, kept so a rerun (uploading a video, ticking a
     # box, changing tab) does not wipe the results off the page.
     "_last_fit": None,
@@ -660,9 +700,11 @@ FIT_COLORS = (
     "#1a7f37",  # forest
     "#6a3d9a",  # violet
     "#b35c00",  # burnt orange
-    "#00688b",  # deep teal
     "#8b1a62",  # plum
 )
+# Deliberately no blue or teal in that list: the measured points are blue,
+# and a model line in a neighbouring blue is the one pairing where the two
+# cannot be told apart at a glance.
 
 
 def fit_line_colour():
@@ -1827,15 +1869,10 @@ def plot_option_controls():
         if bare else "Or switch off individual pieces:"
     )
     st.checkbox(
-        "The measured points", key="show_data",
-        help="Off leaves only the fitted curve, for showing the model on its "
-        "own or laying several fits over each other.",
-    )
-    st.checkbox(
-        "The fitted curve", key="show_fit_line",
-        help="Off leaves the measured points alone, with no model drawn "
-        "over them. Independent of “Data and fit only”, so you can have "
-        "a bare plot of just the data.",
+        "The measured points and the fitted curve", key="show_data_and_fit",
+        help="Both are on for every normal plot, so they are one switch. "
+        "Off leaves the axes and the markings with nothing drawn on them, "
+        "which is only useful for making a blank to draw on by hand.",
     )
     st.checkbox(
         "Element curves", key="show_components", disabled=bare,
@@ -2039,8 +2076,10 @@ def current_style(force_N=None) -> PlotStyle:
         # leaves it alone and only its own checkbox removes it.
         # Neither the data nor the fit is a "marking", so the bare switch
         # leaves both alone and each has its own box.
-        show_data=bool(st.session_state["show_data"]),
-        show_fit_line=bool(st.session_state["show_fit_line"]),
+        # Neither the data nor the model is a "marking", so the bare switch
+        # leaves both alone; they go together, under one box.
+        show_data=bool(st.session_state["show_data_and_fit"]),
+        show_fit_line=bool(st.session_state["show_data_and_fit"]),
         x_range=axis_range("x"),
         y_range=axis_range("y"),
         show_schematic_moduli=st.session_state["show_schematic_moduli"],
@@ -3694,6 +3733,13 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "analysis_status": "Complete",
             "notes": st.session_state["cell_notes"],
             "video_link": st.session_state.get("video_link", ""),
+            # Blank rather than 0 when it was never measured: a zero in a
+            # height column reads as a measurement, and it is not one.
+            "video_height_um": (
+                round(float(st.session_state.get("video_height_um", 0.0)), 3)
+                if float(st.session_state.get("video_height_um", 0.0)) > 0 else ""
+            ),
+            "video_comment": st.session_state.get("video_comment", ""),
         }
     )
 
@@ -4273,8 +4319,10 @@ with st.sidebar:
 
     with st.expander("☁️ OneDrive database", expanded=False):
         if ONEDRIVE_IMPORT_ERROR:
-            st.error("OneDrive support could not load.")
-            st.caption(ONEDRIVE_IMPORT_ERROR)
+            st.error(onedrive_load_problem())
+            st.caption(f"Python said: {ONEDRIVE_IMPORT_ERROR}")
+            with st.expander("📖 The setup steps, for when it does load"):
+                onedrive_instructions()
         else:
             st.caption(
                 "Storage you already have, and you can authorise it yourself. "
@@ -7724,6 +7772,33 @@ with tab_video:
                 except Exception as exc:
                     st.error(f"{exc}")
 
+        # Two things about the cell that only the video can tell you, and
+        # that the spreadsheet keeps beside the moduli: how tall the cell
+        # actually was, and anything you noticed while watching it. The
+        # height is filled in from the measurement below when the scale is
+        # set, and can be typed over.
+        vh1, vh2 = st.columns([1, 2])
+        with vh1:
+            st.number_input(
+                "Height from the video (µm)",
+                min_value=0.0, max_value=200.0, step=0.1, format="%.2f",
+                key="video_height_um",
+                help="The cell's height measured off the frame, in "
+                "micrometres. 0 means not measured. It is written to the "
+                "spreadsheet as its own column, beside the height that was "
+                "typed into the geometry settings, so the two can be "
+                "compared rather than one quietly replacing the other.",
+            )
+        with vh2:
+            st.text_input(
+                "Video comment",
+                key="video_comment",
+                placeholder="what the video showed: the probe slipped, the "
+                            "cell rolled, nothing unusual…",
+                help="Goes into the spreadsheet with the numbers. This is "
+                "the column somebody reads first when a modulus looks odd.",
+            )
+
         if adopt_video(uploaded_video, "video_file"):
             st.rerun()
 
@@ -7908,6 +7983,23 @@ with tab_video:
                             "Compare the height against the cell height in "
                             "section 1: they should agree, and the moduli are "
                             "sensitive to that number."
+                        )
+                        if st.button("Use this as the video height",
+                                     key="adopt_video_height", **STRETCH):
+                            # Staged rather than written: the number input
+                            # for it was built earlier this pass, and
+                            # Streamlit refuses a write to a widget's key
+                            # once its widget exists.
+                            st.session_state["_pending_settings"] = {
+                                "video_height_um": round(
+                                    float(det["height_px"] * scale_um_px), 3
+                                )
+                            }
+                            st.rerun()
+                        st.caption(
+                            "It goes into the spreadsheet as **Height (um)**, "
+                            "beside the height typed into the geometry "
+                            "settings rather than instead of it."
                         )
                     else:
                         st.metric("Cell height", f"{det['height_px']:.0f} px")
@@ -8324,7 +8416,8 @@ with tab_db:
                 "except **Send to Google Sheet** after a fit."
             )
     elif ONEDRIVE_IMPORT_ERROR:
-        st.error(f"OneDrive support unavailable: {ONEDRIVE_IMPORT_ERROR}")
+        st.error(onedrive_load_problem())
+        st.caption(f"Python said: {ONEDRIVE_IMPORT_ERROR}")
     elif store is None:
         st.info(
             "No database connected yet. Either connect a Google Sheet, which "
