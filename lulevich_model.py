@@ -3813,7 +3813,19 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
         e_top = float(eps_u.max()) if eps_u.size else 0.0
         f_mem = float(self.balloon_model_cubic(e_top, Em))
         f_int = float(self.hertzian_contact_model(e_top, Ei))
-        membrane_fraction = f_mem / (f_mem + f_int) if (f_mem + f_int) > 0 else float("nan")
+        total_at_max = f_mem + f_int
+        membrane_fraction = (
+            f_mem / total_at_max if total_at_max > 0 else float("nan")
+        )
+        # This fit has two terms and no deep one, so the interior carries
+        # whatever the membrane does not and the deep share is zero. Both
+        # were named in the result below without ever being worked out,
+        # which raised NameError the moment anything asked this routine for
+        # a sequential fit.
+        interior_fraction = (
+            f_int / total_at_max if total_at_max > 0 else float("nan")
+        )
+        nucleus_fraction = 0.0
 
         warnings_list = []
         if interior_range[1] > membrane_range[0]:
