@@ -1123,10 +1123,14 @@ def case_guided_mode_is_the_default():
     check("the one-press button is there", work is not None)
 
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    for phrase in ("What this cell did as it was squashed",
-                   "How stiff each material turned out to be",
-                   "Does the model match the measurement"):
-        check(f"“{phrase[:34]}…” is shown", phrase in text)
+    check("the stiffness table is still headed in plain words",
+          "How stiff each material turned out to be" in text, text[:200])
+    # The retelling of the fit is gone. It restated the boundaries drawn on
+    # the curve and the two numbers printed beside R², and ended on a
+    # sentence about chi-squared that said nothing the numbers did not.
+    for gone in ("What this cell did as it was squashed",
+                 "Does the model match the measurement"):
+        check(f"“{gone[:32]}…” is not on the page", gone not in text)
     check("no bare jargon in the headline",
           "coupling" not in text.lower(), "the word coupling leaked out")
 
@@ -1166,7 +1170,7 @@ def case_full_control_shows_everything():
           any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
     check("the expert search button is still there",
           button_by_label(app, "Find the best combination and fit it") is not None)
-    check("the plain-language summary is not duplicated",
+    check("the retelling of the fit is gone from here too",
           not any("What this cell did as it was squashed" in str(m.value)
                   for m in app.get("markdown")))
 
@@ -5003,24 +5007,23 @@ def case_the_controls_sit_above_the_curve():
     # the page should read.
     controls = source.index('controls_slot = st.container()')
     curve = source.index('curve_slot = st.container()')
-    story = source.index('story_slot = st.container()')
     check("the controls slot is staked out before the curve",
           controls < curve, f"{controls} vs {curve}")
-    check("and the story after it",
-          curve < story, f"{curve} vs {story}")
     check("the working panels are put in the controls slot",
           source.count("parent=controls_slot") >= 3,
           str(source.count("parent=controls_slot")))
     check("the maths is written after the numbers, not under the plot",
           source.index('st.markdown("#### The model, written out")')
           > source.index('st.markdown("#### The numbers")'))
+    check("and the one-block summary comes after the maths",
+          source.index("final_summary(fit, model, date_acquired)")
+          > source.index('st.markdown("#### The model, written out")'))
 
     app = start(cell_name="cell-01")
     if not no_exception(app, "the reordered page"):
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    for wanted in ("What the cell did as it was squashed", "The numbers",
-                   "The model, written out"):
+    for wanted in ("The numbers", "The model, written out", "In one block"):
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
     check("the combination search is on the page",
@@ -5034,13 +5037,86 @@ def case_the_controls_sit_above_the_curve():
           or "Advanced fitting options" in text, str(labels))
 
 
-def case_the_fit_colour_moves_with_the_range():
-    print("blue data, a black fit, and a new fit colour per range")
+def case_the_data_is_a_field_and_the_model_a_dashed_line():
+    print("borderless light blue points, one dashed line over them")
     import app as app_module
     import plot_utils
 
-    check("data is a solid blue by default",
-          app_module.DEFAULTS["data_color"] == "#1668b3",
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.60, 0.15, 0.40)
+    mb, cb, nb = model.composition_terms(eps, 0.15, 0.40)
+    fitted = mb * fit["Em"] + cb * fit["Ei"] + nb * fit["En"]
+    style = plot_utils.PlotStyle(force_unit="N")
+    fig = plot_utils.force_curve_figure(eps, force, style, fit_force_N=fitted)
+
+    points = [t for t in fig.data if t.name == "Experimental data"][0]
+    check("the markers have no outline at all",
+          not getattr(points.marker.line, "width", 0),
+          str(points.marker.line))
+    check("and they are light blue",
+          points.marker.color == "#79c2e8", str(points.marker.color))
+    check("big enough to read as one band", points.marker.size >= 8,
+          str(points.marker.size))
+
+    lines = [t for t in fig.data if t.name == "Model"]
+    check("the model is drawn once, not twice", len(lines) == 1,
+          str([t.name for t in fig.data]))
+    check("and it is dashed", lines[0].line.dash == "dash",
+          str(lines[0].line.dash))
+    check("no white halo is left under it",
+          not any(str(getattr(t.line, "color", "")).lower() == "white"
+                  for t in fig.data if t.mode == "lines"),
+          str([getattr(t.line, "color", None) for t in fig.data]))
+    check("the app agrees with the figure about the colour",
+          app_module.DEFAULTS["data_color"] == "#79c2e8",
+          app_module.DEFAULTS["data_color"])
+
+
+def case_the_range_carries_its_own_maths():
+    print("the fitting range says in maths what it does")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "range maths"):
+        return
+    labels = [str(getattr(e, "label", "")) for e in app.expander]
+    check("there is a maths panel under the range control",
+          any("What this range means" in lab for lab in labels), str(labels))
+    formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
+    check("the least-squares sum is written with the range in it",
+          "arg\\min" in formulas or "argmin" in formulas.replace(" ", ""),
+          formulas[:200])
+    table = table_with(app, "material", "measured over ε")
+    check("and each material's own stretch is listed", table is not None)
+    if table is not None:
+        check("with what it multiplies", "what it multiplies" in table.columns,
+              str(list(table.columns)))
+        check("and the deep material starting later than the shell",
+              len(table) >= 2, str(len(table)))
+
+
+def case_the_page_ends_with_the_answer():
+    print("the last thing on the page is the answer, ready to be quoted")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the final summary"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    check("there is a one-block summary", "In one block" in text)
+    check("naming the cell", "cell-01" in text, text[-400:])
+    check("with the range it was fitted over", "Fitted over ε" in text,
+          text[-400:])
+    check("and the fit quality", "R² =" in text, text[-300:])
+    code = " ".join(str(getattr(c, "value", "")) for c in app.get("code"))
+    check("and one line that can be pasted into a lab book",
+          "cell-01" in code and "R2=" in code, code[-300:])
+
+
+def case_the_fit_colour_moves_with_the_range():
+    print("light blue data, a black fit, and a new fit colour per range")
+    import app as app_module
+    import plot_utils
+
+    check("data is a light blue by default",
+          app_module.DEFAULTS["data_color"] == "#79c2e8",
           app_module.DEFAULTS["data_color"])
     check("the fit is black by default",
           app_module.DEFAULTS["fit_color"] == "#000000",
@@ -5537,6 +5613,9 @@ if __name__ == "__main__":
         case_the_prefactors_are_the_papers,
         case_each_boundary_moves_on_its_own,
         case_the_controls_sit_above_the_curve,
+        case_the_data_is_a_field_and_the_model_a_dashed_line,
+        case_the_range_carries_its_own_maths,
+        case_the_page_ends_with_the_answer,
         case_the_fit_colour_moves_with_the_range,
         case_the_written_equation_is_the_fitted_curve,
         case_the_equation_reaches_the_page,
