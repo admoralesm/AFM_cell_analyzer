@@ -376,8 +376,15 @@ def hint(text: str):
 DEFAULTS = {
     # display
     "force_unit": "N",
-    "data_color": "#1f77b4",
-    "fit_color": "#d62728",
+    # Light blue for the measurement, black for the model drawn over it.
+    # The eye separates them by lightness rather than by hue, which survives
+    # a greyscale print and colour blindness both.
+    "data_color": "#8ecae6",
+    "fit_color": "#000000",
+    # A different colour for the fit every time the fitted range moves, so
+    # two screenshots taken from different ranges cannot be mistaken for one
+    # another. Untick it to keep the colour chosen above.
+    "recolour_on_range": True,
     "marker_size": 6,
     "line_width": 3,
     "plot_height": 520,
@@ -439,7 +446,10 @@ DEFAULTS = {
     "confinement_scan": None,
     "component_search": None,
     "hypothesis_search": None,
-    "guided_window_start": 0.0,
+    # One fitted range for the whole app: guided mode and full
+    # control set the same two numbers, so switching between them
+    # never changes what is being fitted.
+    "window_start": 0.0,
     # Acquisition, recorded with the cell rather than used by the fit.
     "probe_diameter_um": 0.0,
     "approach_speed_um_s": 2.0,
@@ -447,6 +457,9 @@ DEFAULTS = {
     "poisson_interior": 0.50,
     # cell type
     "cell_type": "Myoblast (C2C12)",
+    # Off unless you say so: almost every curve is a living cell, and a tick
+    # that quietly collapses the model to one material must be one you made.
+    "fixed_cell": False,
     "nucleus_fraction": 0.35,
     "nucleus_radius_um": 1.55,
     "nucleus_radius_mode": "From cell radius",
@@ -470,8 +483,6 @@ DEFAULTS = {
     "composition_search": None,
     "arrangement_search": None,
     # The whole curve, until you say otherwise.
-    "guided_window_end": 1.00,
-    # The segmented model always starts at zero, so only the far end is set.
     "window_end": 1.00,
     "procedure": "All at once",
     "crossover_mode": "Scan for best",
@@ -509,6 +520,11 @@ DEFAULTS = {
     "operator": "",
     "cell_notes": "",
     "onedrive_store": None,
+    # The sheet read back for the database tab, and which database that tab
+    # is reading. Both are cleared when a row is written, so a cell just
+    # sent shows up without a refresh by hand.
+    "sheet_rows": None,
+    "db_source": "Google Sheet",
     "onedrive_root": "AFM cells",
     "onedrive_account": "personal",
     "_device_login": None,
@@ -594,8 +610,8 @@ if st.session_state.pop("_start_new_cell", False):
     for key in [k for k in st.session_state if k.startswith("window_")]:
         del st.session_state[key]
     st.session_state["_pending_settings"] = {
+        "window_start": DEFAULTS["window_start"],
         "window_end": DEFAULTS["window_end"],
-        "guided_window_end": DEFAULTS["guided_window_end"],
     }
 
 if st.session_state.pop("_pending_clear_windows", False):
@@ -618,6 +634,67 @@ if st.session_state.pop("_reset_requested", False):
 
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
+
+# A session saved when "Fixed cell" was an entry in the cell-type dropdown.
+# It is a tick beside the materials now, so the stored setting becomes that
+# tick rather than being left pointing at an entry the dropdown no longer
+# offers, which would throw before the page drew anything.
+if st.session_state.get("cell_type") == "Fixed cell":
+    st.session_state["cell_type"] = DEFAULTS["cell_type"]
+    st.session_state["fixed_cell"] = True
+
+
+# Colours for the fitted line, walked one step at a time as the range moves.
+# Black first, because that is the one a figure wants. The rest are dark
+# enough to read as a line over light blue points and far enough apart to be
+# told from one another at a glance.
+FIT_COLORS = (
+    "#000000",  # black
+    "#c0392b",  # brick
+    "#1a7f37",  # forest
+    "#6a3d9a",  # violet
+    "#b35c00",  # burnt orange
+    "#00688b",  # deep teal
+    "#8b1a62",  # plum
+)
+
+
+def fit_line_colour():
+    """The colour the fitted curve is drawn in right now."""
+    if not st.session_state.get("recolour_on_range", True):
+        return st.session_state.get("fit_color", FIT_COLORS[0])
+    index = int(st.session_state.get("_fit_colour_step", 0))
+    return FIT_COLORS[index % len(FIT_COLORS)]
+
+
+def note_fit_range(lo, hi):
+    """
+    Advance the fit colour when the fitted range has actually moved.
+
+    Called once a pass, before anything is drawn, so every route into a new
+    range gets the same treatment: the bar, the boxes, a drag on the plot, a
+    preset, or the window a search settled on. The first range a curve is
+    given is not a change, so it keeps black.
+    """
+    try:
+        now = (round(float(lo), 4), round(float(hi), 4))
+    except (TypeError, ValueError):
+        return
+    seen = st.session_state.get("_fit_colour_range")
+    if seen is None:
+        st.session_state["_fit_colour_range"] = now
+        return
+    if now != seen:
+        st.session_state["_fit_colour_range"] = now
+        st.session_state["_fit_colour_step"] = (
+            int(st.session_state.get("_fit_colour_step", 0)) + 1
+        )
+
+
+note_fit_range(
+    st.session_state.get("window_start", 0.0),
+    st.session_state.get("window_end", 1.0),
+)
 
 
 def suggested_plot_name(cell_name, fit, date_acquired, extension):
@@ -1693,7 +1770,7 @@ def current_style(force_N=None) -> PlotStyle:
     return PlotStyle(
         force_unit=unit,
         data_color=st.session_state["data_color"],
-        fit_color=st.session_state["fit_color"],
+        fit_color=fit_line_colour(),
         marker_size=st.session_state["marker_size"],
         line_width=st.session_state["line_width"],
         height=st.session_state["plot_height"],
@@ -1871,13 +1948,17 @@ def build_model(epsilon, force_N, active_windows=None) -> LulevichModel:
         shell_thickness=float(st.session_state["protein_coat_nm"]) * 1e-9,
         deep_uses_cell_radius=st.session_state["cell_type"] in DEEP_USES_CELL_RADIUS,
         sarcomere_length=float(st.session_state["sarcomere_nm"]) * 1e-9,
-        confinement=float(st.session_state["confinement"]),
+        # Eq 6 is written without a confinement factor, and a fixed cell has
+        # no fluid to displace, so the tick zeroes it rather than carrying
+        # over the q left behind by the living cell type.
+        confinement=0.0 if fixed_cell_on()
+        else float(st.session_state["confinement"]),
         poisson_membrane=float(st.session_state["poisson_membrane"]),
         poisson_interior=float(st.session_state["poisson_interior"]),
         nucleus_radius=nucleus_m,
         poisson_nucleus=float(st.session_state["poisson_nucleus"]),
         nucleus_onset=float(st.session_state["nucleus_onset"]),
-        expected_ranges=CELL_TYPES.get(st.session_state["cell_type"], {}).get("expected"),
+        expected_ranges=expected_for(),
         active_windows=active_windows,
         segment_break_1=float(st.session_state["segment_break_1"]),
         segment_break_2=float(st.session_state["segment_break_2"]),
@@ -1900,8 +1981,56 @@ ALL_TERMS = (
 )
 
 
+# Fixation is a state of the cell, not a kind of cell. A fixed C2C12 and a
+# fixed cardiomyocyte keep the geometry they had when they were alive, which
+# is what the prefactors are built from; what changed is the chemistry. So
+# this is a tick beside the materials rather than an entry in the cell-type
+# list, and the parameters below it are the living cell's.
+FIXED_TYPE = "Fixed cell"
+
+
+def fixed_cell_on():
+    """Whether this curve is being fitted as a chemically fixed cell."""
+    return bool(st.session_state.get("fixed_cell", False))
+
+
+def fixed_cell_control():
+    """The tick that turns the whole cell into one cross-linked solid."""
+
+    def _changed():
+        # Ticking it leaves one material on and nothing else; unticking it
+        # puts back what this cell type normally starts with, rather than
+        # leaving every box cleared for the person to find.
+        if st.session_state.get("fixed_cell"):
+            for term in ALL_TERMS:
+                st.session_state[f"use_{term}"] = term == "interior"
+        else:
+            wanted = DEFAULT_TERMS_BY_TYPE.get(
+                st.session_state.get("cell_type"), {}
+            )
+            for term in ALL_TERMS:
+                st.session_state[f"use_{term}"] = bool(wanted.get(term, False))
+
+    st.checkbox(
+        "🧊 Chemically fixed cell", key="fixed_cell", on_change=_changed,
+        help="Fixation cross-links protein to protein throughout, so "
+        "membrane, cytoskeleton and nucleus stop being separate materials "
+        "and the cell becomes one solid. That is Lulevich eq 6, a Hertzian "
+        "contact over the whole curve, and it has one modulus. The other "
+        "materials are switched off while this is ticked because there is "
+        "nothing left for them to be told apart by.",
+    )
+    if fixed_cell_on():
+        st.caption(
+            "One material, one modulus. Published fixed cells sit near "
+            "150 to 230 kPa."
+        )
+
+
 def terms_for(cell_type):
     """The elements this cell type can be fitted with, in display order."""
+    if fixed_cell_on():
+        return OPTIONAL_TERMS[FIXED_TYPE]
     return OPTIONAL_TERMS.get(cell_type, TERM_ORDER)
 
 
@@ -2287,7 +2416,11 @@ def hypotheses_for(cell_type, terms=None):
     A picture stripped down to nothing is dropped, and two that collapse
     onto the same set of materials and the same order are one picture.
     """
-    if cell_type in INCOMPRESSIBLE_INTERIOR:
+    if fixed_cell_on():
+        # Nothing to compare: one material admits one picture, and offering
+        # a choice between a thing and itself is worse than saying so.
+        found = HYPOTHESES[FIXED_TYPE]
+    elif cell_type in INCOMPRESSIBLE_INTERIOR:
         found = cardiomyocyte_hypotheses()
     else:
         found = HYPOTHESES.get(cell_type, [])
@@ -2389,6 +2522,11 @@ def wants_confinement(cell_type=None):
     """
     if cell_type is None:
         cell_type = st.session_state.get("cell_type")
+    if fixed_cell_on():
+        # A cross-linked solid has no fluid to displace and no shell to run
+        # out of room inside, and eq 6 is written without a confinement
+        # factor. Measuring one here would fit the model to itself.
+        return False
     return (
         cell_type in INCOMPRESSIBLE_INTERIOR
         or str(st.session_state.get("cell_shape", "")).startswith("Belt")
@@ -2459,10 +2597,15 @@ def components_for(cell_type):
     actually fitted is ``terms_for``, and that is the only thing that
     decides what appears on the page.
     """
-    return dict(
+    names = dict(
         GENERIC_COMPONENTS,
         **COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS),
     )
+    if fixed_cell_on():
+        # The one material left is the whole cell, so it is named that way
+        # rather than keeping the living cell's word for its filling.
+        names["interior"] = COMPONENT_SETS[FIXED_TYPE]["interior"]
+    return names
 
 
 CELL_TYPES = {
@@ -2547,6 +2690,24 @@ CELL_TYPES = {
     },
 }
 
+# What the dropdown offers. "Fixed cell" is not a kind of cell you grew, it
+# is what you did to one, so it is a tick beside the materials and its entry
+# above is only the plausibility band that tick switches to.
+SELECTABLE_CELL_TYPES = [name for name in CELL_TYPES if name != FIXED_TYPE]
+
+
+def expected_for(cell_type=None):
+    """The plausibility band to judge this fit against.
+
+    A fixed cell is several times stiffer than the cell it was made from, so
+    warning about it against the living band would flag every good fit.
+    """
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    if fixed_cell_on():
+        return CELL_TYPES[FIXED_TYPE]["expected"]
+    return CELL_TYPES.get(cell_type, {}).get("expected")
+
 
 def apply_cell_type(name):
     """Copy a cell type's defaults into the settings."""
@@ -2613,6 +2774,10 @@ def active_terms():
     able to overrule.
     """
     available = terms_for(st.session_state.get("cell_type"))
+    if fixed_cell_on():
+        # The tick wins over whatever the boxes are left showing, the same
+        # way a knockout does below: it is a statement about the sample.
+        return ("interior",)
     on = tuple(t for t in available if st.session_state.get(f"use_{t}", False))
     if str(st.session_state.get("membrane_protein", "")).startswith("Removed"):
         on = tuple(t for t in on if t != "tension")
@@ -2697,7 +2862,11 @@ def apply_preset(preset, lo, hi):
     if preset.get("combined_window"):
         value = clamped(preset["combined_window"])
         if value:
+            # The pair the widgets read, and the mirror kept for anything
+            # that still stores a preset as one combined window.
             pending["window_combined"] = value
+            pending["window_start"] = round(value[0], 4)
+            pending["window_end"] = round(value[1], 4)
 
     st.session_state["_pending_settings"] = pending
 
@@ -2736,13 +2905,125 @@ def apply_plot_drag(chart_key, lo, hi):
     key = (st.session_state.get("_drag_keys") or {}).get(target)
     if not key:
         return
-    # "window_end" is a single number, not a pair: the segmented range always
-    # starts at zero, so a drag can only move where it ends.
+    # The fitted range is a pair everywhere now, so a drag sets both ends.
+    # It used to set only the far one, because the near one could not be
+    # moved; dragging a box and having half of it ignored is worse than
+    # either behaviour.
+    if key == "window_range":
+        lo_now = round(float(window[0]), 4)
+        hi_now = round(float(window[1]), 4)
+        if (st.session_state.get("window_start"),
+                st.session_state.get("window_end")) != (lo_now, hi_now):
+            st.session_state["_pending_settings"] = {
+                "window_start": lo_now, "window_end": hi_now,
+            }
+            st.rerun()
+        return
     value = window[1] if key == "window_end" else window
     if st.session_state.get(key) != value:
         st.session_state["_pending_settings"] = {key: value}
         st.rerun()
 
+
+# The bar and the two boxes are three ways of saying the same thing, so one
+# pair of numbers is the truth and all three widgets are drawn from it. The
+# alternative, letting each widget own its own value, is what produces a box
+# reading 0.42 beside a bar sitting at 0.60.
+def range_bounds(lo_key, hi_key, floor, ceiling, step):
+    """The stored range, clamped so it is inside the data and lo < hi."""
+    step = float(step)
+    floor, ceiling = float(floor), float(ceiling)
+    if ceiling - floor < step:
+        ceiling = floor + step
+    # Rounded first and clamped second. The other order lets a value a
+    # hair under the top of the data round up past it, and a slider whose
+    # value is above its own maximum is a hard error, not a warning.
+    lo = float(np.clip(round(_as_float(st.session_state.get(lo_key), floor), 4),
+                       floor, ceiling - step))
+    hi = float(np.clip(round(_as_float(st.session_state.get(hi_key), ceiling), 4),
+                       lo + step, ceiling))
+    return lo, hi
+
+
+def _as_float(value, fallback):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return float(fallback) if not np.isfinite(out) else out
+
+
+def epsilon_range_control(lo_key, hi_key, floor, ceiling, step,
+                          label="Fitted range", help_text=None,
+                          boxes=True, prefix=""):
+    """
+    One fitted range, set by a bar or by typing either end.
+
+    ``lo_key`` and ``hi_key`` are plain session keys, not widget keys, so
+    anything else in the app (a preset, a drag on the plot, the winner of a
+    search) can write them at any time and the widgets follow on the next
+    pass. The widgets keep their own keys, which are written here before
+    they are built and read back in the callbacks below.
+
+    Returns the pair actually in force, already clamped.
+    """
+    step = float(step)
+    floor, ceiling = float(floor), float(ceiling)
+    if ceiling - floor < step:
+        ceiling = floor + step
+    bar_key = f"{prefix}{lo_key}__bar"
+    lo_box, hi_box = f"{prefix}{lo_key}__box", f"{prefix}{hi_key}__box"
+    lo, hi = range_bounds(lo_key, hi_key, floor, ceiling, step)
+
+    def _store(a, b):
+        a = float(np.clip(round(float(a), 4), floor, ceiling - step))
+        b = float(np.clip(round(float(b), 4), a + step, ceiling))
+        st.session_state[lo_key] = a
+        st.session_state[hi_key] = b
+
+    def _from_bar():
+        pair = st.session_state.get(bar_key) or (lo, hi)
+        _store(pair[0], pair[1])
+
+    def _from_boxes():
+        a = _as_float(st.session_state.get(lo_box), lo)
+        b = _as_float(st.session_state.get(hi_box), hi)
+        # If the two ends cross, the one that was just typed wins and the
+        # other gives way. Snapping back the number someone has this second
+        # finished typing is the most annoying way to handle it.
+        if b <= a:
+            if abs(a - lo) > 1e-9:
+                b = min(a + step, ceiling)
+            else:
+                a = max(b - step, floor)
+        _store(a, b)
+
+    # Written back, so the stored pair is the one on the page rather than a
+    # wider one left over from another curve that the widgets are quietly
+    # clamping. Anything reading the range later reads what is shown.
+    st.session_state[lo_key], st.session_state[hi_key] = lo, hi
+    st.session_state[bar_key] = (lo, hi)
+    st.session_state[lo_box], st.session_state[hi_box] = lo, hi
+    st.slider(
+        label, min_value=floor, max_value=ceiling, step=step,
+        key=bar_key, on_change=_from_bar, help=help_text,
+    )
+    if boxes:
+        near, far = st.columns(2)
+        with near:
+            st.number_input(
+                "from ε", min_value=floor, max_value=ceiling, step=step,
+                format="%.3f", key=lo_box, on_change=_from_boxes,
+                help="Type the near end. Normally 0: the model describes a "
+                     "cell from first contact.",
+            )
+        with far:
+            st.number_input(
+                "to ε", min_value=floor, max_value=ceiling, step=step,
+                format="%.3f", key=hi_box, on_change=_from_boxes,
+                help="Type the far end. 1.0 is the whole curve.",
+            )
+    return range_bounds(lo_key, hi_key, floor, ceiling, step)
 
 
 # ==================================================== the archive database ==
@@ -3268,6 +3549,93 @@ def refit_stored_cell(store, cell_id, settings):
 
 
 
+def onedrive_instructions():
+    """
+    How to get OneDrive working, written out once and shown in two places.
+
+    Every step here has been the one that stopped somebody. The account type
+    at registration cannot be changed afterwards without re-registering, the
+    public-client switch is off by default and its error names neither
+    itself nor the switch, and the sheet-style mistake of skipping the
+    consent step produces a message about something else entirely.
+    """
+    st.markdown(
+        "**What you need first.** A Microsoft account with a OneDrive: a "
+        "personal one (outlook.com, hotmail, live) or a work or school one "
+        "(your university). Nothing is installed and nothing is paid for.\n\n"
+        "**1 · Register the app, once.** Go to "
+        "[portal.azure.com](https://portal.azure.com) → **Microsoft Entra "
+        "ID** → **App registrations** → **New registration**.\n"
+        "- Name: anything, for example `AFM cell analyzer`.\n"
+        "- Supported account types: **Accounts in any organizational "
+        "directory and personal Microsoft accounts**. This one matters. "
+        "Registering it single-tenant is what produces `AADSTS50020`, whose "
+        "wording blames the account rather than the registration.\n"
+        "- Redirect URI: leave it empty.\n\n"
+        "**2 · Copy the client id.** It is on the app's Overview page, "
+        "called **Application (client) ID**. It is not a secret.\n\n"
+        "**3 · Allow the sign-in this app uses.** **Authentication** → "
+        "scroll to **Advanced settings** → **Allow public client flows** → "
+        "**Yes** → Save. Without it the sign-in fails with "
+        "`AADSTS7000218`.\n\n"
+        "**4 · Ask for the permissions.** **API permissions** → **Add a "
+        "permission** → **Microsoft Graph** → **Delegated permissions** → "
+        "tick `offline_access`, `User.Read` and `Files.ReadWrite` for a "
+        "personal account, or `Files.ReadWrite.All` for a work or school "
+        "one. On a university tenant an administrator may have to press "
+        "**Grant admin consent**; many tenants let you consent yourself the "
+        "first time you sign in.\n\n"
+        "**5 · Put the client id in this app's secrets.** In Streamlit Cloud: "
+        "**⋮ → Settings → Secrets**. Running locally: "
+        "`.streamlit/secrets.toml`. Paste this and reboot the app:"
+    )
+    st.code(
+        '[onedrive]\n'
+        'account = "personal"        # or "work"\n'
+        'client_id = "the id from step 2"\n'
+        'root_folder = "AFM cells"\n',
+        language="toml",
+    )
+    st.markdown(
+        "**6 · Sign in once, in the sidebar.** Open **☁️ OneDrive database** "
+        "→ pick the account type → **Sign in to get a refresh token** → "
+        "**Start sign-in**. Open the address it shows, type the code, sign "
+        "in, then press **I have signed in**. It hands you a block with a "
+        "`refresh_token` in it.\n\n"
+        "**7 · Paste that block into Secrets**, replacing the one from step "
+        "5, and reboot. Treat the refresh token like a password: it is a "
+        "standing key to that OneDrive. Never put it in the repository, only "
+        "in the Secrets box.\n\n"
+        "**8 · Press Connect.** The sidebar says which account it reached. "
+        "Cells you send arrive in the folder from step 5, one folder each, "
+        "holding `record.json`, `curve.csv`, the morphology frame and the "
+        "video if there is one, with an `index.csv` at the root so this tab "
+        "can list them without opening every folder."
+    )
+    with st.expander("If it will not connect"):
+        st.markdown(
+            "- **AADSTS50020** · the registration is single-tenant, or a "
+            "personal account is being signed in against a tenant id. "
+            "Re-register with *any organizational directory and personal "
+            "Microsoft accounts*, and remove `tenant` from the secrets for a "
+            "personal account, which does not belong to a directory.\n"
+            "- **AADSTS7000218** · step 3 was skipped. Allow public client "
+            "flows.\n"
+            "- **AADSTS65001** · nobody has consented yet. Sign in again, or "
+            "ask an administrator for consent on a university tenant.\n"
+            "- **The scope was refused** · a personal account takes "
+            "`Files.ReadWrite`, not `Files.ReadWrite.All`. The account-type "
+            "dropdown in the sidebar sets both the endpoint and the scopes, "
+            "so change it there rather than in secrets.\n"
+            "- **It worked and then stopped** · a refresh token expires "
+            "after about 90 days unused. Sign in again and paste the new "
+            "block.\n"
+            "- **No [onedrive] section in secrets** · the app cannot see "
+            "step 5. On Streamlit Cloud the secrets box needs a reboot "
+            "before the app reads it."
+        )
+
+
 # ================================================================ sidebar ==
 
 with st.sidebar:
@@ -3277,7 +3645,7 @@ with st.sidebar:
     previous_type = st.session_state.get("_applied_cell_type")
     st.selectbox(
         "Cell type",
-        list(CELL_TYPES.keys()),
+        SELECTABLE_CELL_TYPES,
         key="cell_type",
         help="Sets geometry, bilayer thickness, the plausibility bands used for "
         "warnings, and the starting fit windows. Everything stays editable.",
@@ -3546,7 +3914,24 @@ with st.sidebar:
         with c1:
             st.color_picker("Data", key="data_color")
         with c2:
-            st.color_picker("Fit", key="fit_color")
+            st.color_picker(
+                "Fit", key="fit_color",
+                disabled=bool(st.session_state.get("recolour_on_range", True)),
+            )
+        st.checkbox(
+            "New fit colour each time the range changes",
+            key="recolour_on_range",
+            help="On, the fitted line steps through a set of colours as you "
+            "move the fitted range, so two plots made from different ranges "
+            "are never the same colour. Off, it stays the colour picked "
+            "above.",
+        )
+        if st.session_state.get("recolour_on_range", True):
+            st.caption(
+                f"Fit is drawn in `{fit_line_colour()}` for ε = "
+                f"{float(st.session_state.get('window_start', 0.0)):.3f} to "
+                f"{float(st.session_state.get('window_end', 1.0)):.3f}."
+            )
         st.slider("Marker size", 2, 14, key="marker_size")
         st.slider("Line width", 1, 8, key="line_width")
         st.slider("Plot height (px)", 320, 900, step=20, key="plot_height")
@@ -3607,6 +3992,8 @@ with st.sidebar:
                 "Storage you already have, and you can authorise it yourself. "
                 "Files go to a folder per cell."
             )
+            with st.expander("📖 How to set this up, step by step"):
+                onedrive_instructions()
             st.selectbox(
                 "Account type",
                 list(onedrive_store.ACCOUNTS.keys()),
@@ -4016,19 +4403,21 @@ with tab_analysis:
         )
         if st.session_state.get("_auto_picked") != auto_key:
             st.session_state["_auto_picked"] = auto_key
-            pending = {}
+            # A new curve starts the fit colour over at black. The range it
+            # is given here was chosen by the app, not by you, so it is not
+            # a change of range and must not count as one.
+            pending = {"_fit_colour_range": None, "_fit_colour_step": 0}
             notes = []
 
             window = (
                 model.suggest_window() if hasattr(model, "suggest_window") else {}
             )
             if window.get("success"):
-                pending["guided_window_end"] = round(window["epsilon_max"], 4)
-                pending["guided_window_start"] = (
+                pending["window_end"] = round(window["epsilon_max"], 4)
+                pending["window_start"] = (
                     round(window["epsilon_min"], 4)
                     if window.get("bad_contact") else 0.0
                 )
-                pending["window_end"] = round(window["epsilon_max"], 4)
                 pending["window_combined"] = (
                     round(window["epsilon_min"], 4),
                     round(window["epsilon_max"], 4),
@@ -4109,57 +4498,44 @@ with tab_analysis:
             here = terms_for(st.session_state["cell_type"])
 
             # The choices come before the picture, and each is made once.
-            # Read the settings before drawing the widgets that set them:
-            # these are keyed widgets, so their values are already in
-            # session state and the widgets below write the same keys.
-            st.session_state["guided_window_end"] = float(
-                np.clip(
-                    st.session_state.get("guided_window_end", eps_hi_data),
-                    float(step), eps_hi_data,
-                )
-            )
-            guided_hi = float(st.session_state["guided_window_end"])
-            # Normally zero, because the model describes a cell from first
-            # contact. It moves only when the approach itself misbehaved.
-            guided_lo = float(np.clip(
-                st.session_state.get("guided_window_start", 0.0),
-                0.0, max(guided_hi - float(step), 0.0),
-            ))
 
             st.markdown("#### 1 · What to fit")
             pick_col, range_col = st.columns([1.15, 1])
             with pick_col:
                 st.caption("Materials")
+                fixed_cell_control()
+                locked = fixed_cell_on()
                 for term in here:
                     st.checkbox(
                         f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                         key=f"use_{term}", help=names[term][1],
+                        disabled=locked and term != "interior",
                     )
             with range_col:
                 st.caption("How far into the squash")
-                st.slider(
-                    f"ε = {guided_lo:.3f} up to", min_value=float(step),
-                    max_value=eps_hi_data, step=step, key="guided_window_end",
+                guided_lo, guided_hi = epsilon_range_control(
+                    "window_start", "window_end", 0.0, eps_hi_data, step,
+                    label="Fitted range, ε",
+                    help_text="Drag either end, or type it below. The near end "
+                              "is normally 0, because the model describes a "
+                              "cell from first contact.",
                 )
                 inside = int(
                     ((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum()
                 )
                 st.caption(
-                    f"{inside} of {epsilon.size} points"
+                    f"ε {guided_lo:.3f} to {guided_hi:.3f} · {inside} of "
+                    f"{epsilon.size} points"
                     + (f" · rupture near ε = {rupture['epsilon']:.3f}"
                        if rupture.get("method") == "force-drop"
                        and rupture.get("epsilon") is not None else "")
                 )
                 if guided_lo > 0:
-                    st.slider(
-                        "Start at ε =", 0.0,
-                        min(0.5, guided_hi - float(step)), step=step,
-                        key="guided_window_start",
-                    )
                     st.caption(
-                        "⚠️ Not from zero: the approach ran up and fell back "
-                        "before this, which is a probe catching rather than a "
-                        "soft cell. Set it to 0 to fit through it anyway."
+                        "⚠️ Not starting from zero. The membrane term is "
+                        "measured from first contact, so a start above 0 only "
+                        "makes sense when the approach itself misbehaved. "
+                        "Set it back to 0 to fit through it."
                     )
             chosen = active_terms()
             if not chosen:
@@ -4359,10 +4735,13 @@ with tab_analysis:
             with element_col:
                 st.markdown("**1 · Which materials**")
                 names = components_for(st.session_state["cell_type"])
+                fixed_cell_control()
+                locked = fixed_cell_on()
                 for term in terms_for(st.session_state["cell_type"]):
                     st.checkbox(
                         f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                         key=f"use_{term}",
+                        disabled=locked and term != "interior",
                     )
 
         active = active_terms()
@@ -4440,7 +4819,7 @@ with tab_analysis:
             # widget on a page that has too many.
             preview_at = float(np.clip(
                 float(st.session_state["segment_break_1"]) * 1.35,
-                0.05, max(0.06, float(st.session_state["guided_window_end"])),
+                0.05, max(0.06, float(st.session_state["window_end"])),
             ))
             st.plotly_chart(
                 cell_schematic(
@@ -4621,45 +5000,33 @@ with tab_analysis:
             f"rupture: {auto_range['rupture_method']}"
         )
 
-        if segmented:
-            # The segmented model starts at first contact by definition: the
-            # membrane term is ε³ measured from ε = 0, so a range that starts
-            # anywhere else is fitting a curve the model does not describe.
-            # Only the far end is yours to choose.
-            #
-            # The exception is a curve where the approach itself misbehaved.
-            # Points from a probe that caught and slipped are not first
-            # contact, they are not the cell, and including them drives the
-            # membrane modulus to zero. That start is set once when the curve
-            # loads, is shown, and can be put back to zero.
-            fit_lo = float(np.clip(
-                st.session_state.get("guided_window_start", 0.0),
-                0.0, max(float(st.session_state["window_end"]) - step, 0.0),
-            )) if guided else 0.0
-            st.session_state["window_end"] = float(
-                np.clip(
-                    st.session_state.get("window_end", eps_hi_data),
-                    max(step, 0.0), eps_hi_data,
-                )
+        # One range, one pair of numbers, wherever it is set from. In guided
+        # mode it was set at the top of the page and repeating the control
+        # here would give the page two of them, so this only reports it.
+        #
+        # The near end is normally zero: the membrane term is ε³ measured
+        # from first contact, so a range starting anywhere else is fitting a
+        # curve the model does not describe. It moves when the approach
+        # itself misbehaved, which is a probe catching and slipping rather
+        # than a soft cell, and those points drive the membrane modulus to
+        # zero if they are kept.
+        if guided:
+            fit_lo, fit_hi = range_bounds(
+                "window_start", "window_end", 0.0, eps_hi_data, step,
             )
-            fit_hi = st.slider(
-                "Fit up to ε =",
-                min_value=float(step), max_value=eps_hi_data, step=step,
-                key="window_end",
-                help="The range always starts at zero. This sets where it ends, "
-                "and the fitted curve is drawn only over that range.",
+            st.caption(
+                f"Fitting ε = {fit_lo:.3f} to {fit_hi:.3f}, set at the top of "
+                "the page under **What to fit**."
             )
-            st.session_state["window_combined"] = (fit_lo, fit_hi)
         else:
-            st.session_state["window_combined"] = clamp_range(
-                st.session_state.get("window_combined"), auto_window,
+            fit_lo, fit_hi = epsilon_range_control(
+                "window_start", "window_end",
+                0.0 if segmented else eps_lo_data, eps_hi_data, step,
+                label="Fitted range, ε",
+                help_text="The stretch of the curve the fit is measured on. "
+                          "Drag either end, or type it in the boxes.",
             )
-            fit_lo, fit_hi = st.slider(
-                "Fitted range",
-                min_value=eps_lo_data, max_value=eps_hi_data, step=step,
-                key="window_combined",
-                help="The stretch of the curve the fit is measured on.",
-            )
+        st.session_state["window_combined"] = (fit_lo, fit_hi)
         st.caption(f"{int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())} points")
 
         # The sidebar button only asks for the scan; it runs here, where the
@@ -5050,12 +5417,12 @@ with tab_analysis:
                 st.session_state["_pending_clear_windows"] = True
                 st.rerun()
         with r2:
-            range_label = "End of the range" if segmented else "Fitted range"
+            range_label = "Fitted range"
             targets = ["(off)", range_label] + [
                 term_label(t) for t in (active if staged else [])
             ]
             st.session_state["_drag_keys"] = {
-                range_label: "window_end" if segmented else "window_combined"
+                range_label: "window_range"
             }
             st.session_state["_drag_keys"].update(
                 {term_label(t): f"window_term_{t}" for t in (active if staged else [])}
@@ -6518,6 +6885,11 @@ with tab_analysis:
                 try:
                     ok, message = send_cell_to_sheet(sheet_manager, fit, date_acquired)
                     (st.success if ok else st.error)(message)
+                    if ok:
+                        # The database tab reads the sheet once and keeps it;
+                        # a row just added has to reach it without a refresh
+                        # by hand.
+                        st.session_state["sheet_rows"] = None
                 except Exception as exc:
                     st.error(f"Could not write the row: {exc}")
             if st.button(
@@ -6792,11 +7164,11 @@ with tab_explore:
         # about the same stretch of the same curve. Repeating the range
         # controls here would let them drift apart and give two answers.
         hi_ex = float(np.clip(
-            st.session_state.get("guided_window_end", float(eps_ex.max())),
+            st.session_state.get("window_end", float(eps_ex.max())),
             1e-3, float(eps_ex.max()),
         ))
         lo_ex = float(np.clip(
-            st.session_state.get("guided_window_start", 0.0), 0.0,
+            st.session_state.get("window_start", 0.0), 0.0,
             max(hi_ex - 1e-3, 0.0),
         ))
         terms_ex = active_terms() or ("membrane", "interior")
@@ -7580,14 +7952,91 @@ with tab_igor:
 with tab_db:
     section("Cell database")
     store = st.session_state.get("onedrive_store")
+    sheet = (st.session_state.get("gs_manager")
+             if st.session_state.get("db_enabled") else None)
 
-    if ONEDRIVE_IMPORT_ERROR:
+    # Two places a database can live, and the sheet wins when both are
+    # connected: a sheet is the one people actually open, and a row in it is
+    # the record of a cell whether or not its files were ever archived.
+    # OneDrive holds the files, so it stays available beside it.
+    if store is not None and sheet is not None:
+        source = st.radio(
+            "Read the cells from", ["Google Sheet", "OneDrive"],
+            horizontal=True, key="db_source",
+            help="The sheet holds one row per cell. OneDrive holds the whole "
+                 "folder for each cell: the curve, the frame and the video.",
+        )
+    elif sheet is not None:
+        source = "Google Sheet"
+    else:
+        source = "OneDrive"
+
+    if source == "Google Sheet":
+        st.caption("From the connected Google Sheet, one row per cell.")
+        url = sheet.get_spreadsheet_url()
+        if url:
+            st.caption(f"[Open the sheet in Google Sheets]({url})")
+        if st.button("🔄 Refresh from the sheet", key="db_sheet_refresh"):
+            st.session_state["sheet_rows"] = None
+        if st.session_state.get("sheet_rows") is None:
+            with st.spinner("Reading the sheet…"):
+                try:
+                    st.session_state["sheet_rows"] = sheet.get_all_cells()
+                except Exception as exc:
+                    st.error(str(exc))
+                    st.session_state["sheet_rows"] = pd.DataFrame()
+        rows = st.session_state.get("sheet_rows")
+        if rows is None or rows.empty:
+            st.info(
+                "The sheet has no cells in it yet. Fit a curve, then press "
+                "**Send to Google Sheet** under *Video and database*."
+            )
+        else:
+            needle = st.text_input(
+                "Filter", placeholder="cell name, date, model or operator",
+                key="sheet_search", label_visibility="collapsed",
+            )
+            shown = rows
+            if needle:
+                low = needle.lower()
+                shown = rows[rows.apply(
+                    lambda row: low in " ".join(str(v).lower() for v in row.values),
+                    axis=1,
+                )]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cells", len(rows))
+            m2.metric("Shown", len(shown))
+            for column, label, unit, target in (
+                ("Young's Modulus (Em, MPa)", "Median Eₘ", "MPa", m3),
+                ("Young's Modulus (Ei, kPa)", "Median E_c", "kPa", m4),
+            ):
+                values = pd.to_numeric(shown.get(column), errors="coerce").dropna()
+                values = values[values > 0]
+                target.metric(
+                    label, f"{values.median():.3g} {unit}" if len(values) else "n/a"
+                )
+            st.dataframe(shown, hide_index=True, **STRETCH)
+            st.download_button(
+                "⬇️ These rows as CSV",
+                shown.to_csv(index=False).encode("utf-8"),
+                file_name="afm_cells.csv", mime="text/csv",
+                key="sheet_rows_csv",
+            )
+            st.caption(
+                "Rows come from the sheet as they are stored. Edit them in "
+                "Google Sheets and press refresh; nothing here writes back "
+                "except **Send to Google Sheet** after a fit."
+            )
+    elif ONEDRIVE_IMPORT_ERROR:
         st.error(f"OneDrive support unavailable: {ONEDRIVE_IMPORT_ERROR}")
     elif store is None:
         st.info(
-            "Not connected. Open **OneDrive database** in the sidebar and "
-            "connect, then every cell you send appears here."
+            "No database connected yet. Either connect a Google Sheet, which "
+            "keeps one row per cell, or connect OneDrive, which keeps the "
+            "whole folder for each cell. Both are in the sidebar."
         )
+        with st.expander("📖 Setting up OneDrive, step by step", expanded=True):
+            onedrive_instructions()
     else:
         head1, head2, head3 = st.columns([1, 1, 2])
         with head1:
@@ -7812,7 +8261,10 @@ with tab_db:
                             for term, window in (settings.get("term_windows") or {}).items():
                                 pending[f"window_term_{term}"] = tuple(window)
                             if settings.get("combined_window"):
-                                pending["window_combined"] = tuple(settings["combined_window"])
+                                _pair = tuple(settings["combined_window"])
+                                pending["window_combined"] = _pair
+                                pending["window_start"] = round(float(_pair[0]), 4)
+                                pending["window_end"] = round(float(_pair[1]), 4)
                             for term in ALL_TERMS:
                                 pending[f"use_{term}"] = term in (settings.get("terms") or [])
                             pending["_applied_cell_type"] = settings.get("cell_type")
