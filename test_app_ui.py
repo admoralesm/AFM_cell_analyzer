@@ -5110,6 +5110,84 @@ def case_the_page_ends_with_the_answer():
           "cell-01" in code and "R2=" in code, code[-300:])
 
 
+def case_a_companion_file_is_found_wherever_it_sits():
+    print("a companion file is found even when the app is a folder deeper")
+    import app as app_module
+    import os
+    import shutil
+    import tempfile
+
+    check("both companions loaded here",
+          app_module.ONEDRIVE_IMPORT_ERROR is None
+          and app_module.SHEETS_IMPORT_ERROR is None,
+          f"{app_module.ONEDRIVE_IMPORT_ERROR} / "
+          f"{app_module.SHEETS_IMPORT_ERROR}")
+    seen = app_module.companion_files()
+    check("and the app can list what it sees beside itself",
+          "app.py" in seen and "onedrive_store.py" in seen, str(seen))
+
+    # The deployment that produced the bug report: the main file one folder
+    # below the companion it needs. A plain import cannot see it; the app
+    # has to go and find the file.
+    root = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(root, "sub"))
+        with open(os.path.join(root, "sidecar_probe.py"), "w") as handle:
+            handle.write("VALUE = 'found me'\n")
+        found = app_module._find_companion_file.__wrapped__ \
+            if hasattr(app_module._find_companion_file, "__wrapped__") \
+            else app_module._find_companion_file
+        # Point the search at the temporary tree the way a deployment would.
+        old_app, old_repo = app_module.APP_DIR, app_module.REPO_DIR
+        app_module.APP_DIR = os.path.join(root, "sub")
+        app_module.REPO_DIR = root
+        try:
+            path = found("sidecar_probe")
+            check("the file one folder up is found",
+                  path is not None and path.endswith("sidecar_probe.py"),
+                  str(path))
+            module, error = app_module.import_companion("sidecar_probe")
+            check("and it is actually loaded from there",
+                  module is not None and getattr(module, "VALUE", "") == "found me",
+                  str(error))
+            missing, error = app_module.import_companion("no_such_companion_xyz")
+            check("a file that is really absent still reports missing",
+                  missing is None and "No module named" in str(error),
+                  str(error))
+        finally:
+            app_module.APP_DIR, app_module.REPO_DIR = old_app, old_repo
+            import sys
+            sys.modules.pop("sidecar_probe", None)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def case_the_missing_file_message_says_what_it_can_see():
+    print("the missing-file message lists the folder it actually looked in")
+    import app as app_module
+
+    real = app_module.ONEDRIVE_IMPORT_ERROR
+    try:
+        app_module.ONEDRIVE_IMPORT_ERROR = (
+            "ModuleNotFoundError: No module named 'onedrive_store'"
+        )
+        said = app_module.onedrive_load_problem()
+        check("it names the file", "onedrive_store.py" in said, said[:120])
+        check("and the folder the app is running from",
+              app_module.APP_DIR in said, said[:200])
+        check("and lists what is there instead", "app.py" in said, said[:400])
+        check("and names the three things that actually cause it",
+              "branch" in said and "reboot" in said.lower()
+              and ".txt" in said, said)
+
+        app_module.ONEDRIVE_IMPORT_ERROR = "No module named 'requests'"
+        said = app_module.onedrive_load_problem()
+        check("a missing package is told apart from a missing file",
+              "requirements.txt" in said, said[:160])
+    finally:
+        app_module.ONEDRIVE_IMPORT_ERROR = real
+
+
 def case_the_fit_colour_moves_with_the_range():
     print("light blue data, a black fit, and a new fit colour per range")
     import app as app_module
@@ -5613,6 +5691,8 @@ if __name__ == "__main__":
         case_the_prefactors_are_the_papers,
         case_each_boundary_moves_on_its_own,
         case_the_controls_sit_above_the_curve,
+        case_a_companion_file_is_found_wherever_it_sits,
+        case_the_missing_file_message_says_what_it_can_see,
         case_the_data_is_a_field_and_the_model_a_dashed_line,
         case_the_range_carries_its_own_maths,
         case_the_page_ends_with_the_answer,
