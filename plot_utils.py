@@ -59,8 +59,10 @@ class PlotStyle:
     """Everything the user can change about how a figure looks."""
 
     force_unit: str = "nN"
-    data_color: str = "#1f77b4"
-    fit_color: str = "#d62728"
+    # Light blue measurement, black model. Lightness separates them even in
+    # greyscale, which a red-on-blue pair does not.
+    data_color: str = "#8ecae6"
+    fit_color: str = "#000000"
     marker_size: int = 7
     line_width: int = 4
     height: int = 560
