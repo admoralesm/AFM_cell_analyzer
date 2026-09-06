@@ -406,8 +406,12 @@ DEFAULTS = {
     "x_axis_max": 1.0,
     "y_axis_min": 0.0,
     "y_axis_max": 1.0,
-    "show_fit_window": True,
-    "show_video_marker": True,
+    # Off by default. After a fit the plot should be the data, the fitted
+    # line and its parts; a shaded band across the whole chart and a marker
+    # for a video nobody has loaded are decoration that hides the residual
+    # you are trying to see. Both are one tick away under the plot.
+    "show_fit_window": False,
+    "show_video_marker": False,
     "show_rupture_marker": True,
     "show_schematic": True,
     "schematic_style": "Mechanics schematic",
@@ -465,9 +469,10 @@ DEFAULTS = {
     "highlight_segment": "(none)",
     "composition_search": None,
     "arrangement_search": None,
-    "guided_window_end": 0.60,
+    # The whole curve, until you say otherwise.
+    "guided_window_end": 1.00,
     # The segmented model always starts at zero, so only the far end is set.
-    "window_end": 0.60,
+    "window_end": 1.00,
     "procedure": "All at once",
     "crossover_mode": "Scan for best",
     "crossover": 0.18,
@@ -552,7 +557,10 @@ DEFAULTS = {
     "video_reject_dark": True,
     "video_find_nucleus": True,
     "video_strip_lines": True,
-    "video_show_panel": True,
+    # The frame beside the curve is off: the video is loaded to link a cell
+    # to its record and to measure its shape, and a frame pinned next to the
+    # force curve is neither.
+    "video_show_panel": False,
     # data / results
     "data": None,
     "results": None,
@@ -875,35 +883,40 @@ def show_fit_maths(fit, model):
     st.markdown("**2 · The geometry, fixed before fitting**")
     st.latex(
         r"A_m = \frac{2\pi h_m R_0}{1-\nu_m} \qquad "
-        r"A_i = \frac{\sqrt{2}\, R_0^{1/2} h_0^{3/2}}{3(1-\nu_i^{2})} \qquad "
-        r"A_n = \frac{\sqrt{2}\, R_n^{1/2} h_0^{3/2}}{3(1-\nu_n^{2})}"
+        r"A_i = \frac{\sqrt{2}\, R_0^{2}}{3(1-\nu_i^{2})} \qquad "
+        r"A_n = \frac{\sqrt{2}\, R_n^{2}}{3(1-\nu_n^{2})}"
     )
-    if "tension" in terms:
-        st.latex(r"A_t = \frac{2\pi R_0^{2}}{h_0}")
+    st.caption(
+        "Aₘ is Lulevich 2006 eq 3, the balloon of incompressible fluid; "
+        "Aᵢ is eq 6, a homogeneous sphere compressed between two plates, "
+        "which is what that paper fits to dead cells (4 to 7.5 kPa) and "
+        "fixed cells (150 to 230 kPa). Note that eq 6 carries R₀², not "
+        "√R₀·h₀^1.5: the two agree only for a sphere with h₀ = 2R₀, and "
+        "differ by about 2.5× for the shapes here."
+    )
+    # What the paper says about bending, checked rather than assumed.
+    share = model.bending_share(0.30) if hasattr(model, "bending_share") else None
+    bend_N = (
+        model.bending_force(0.30, fit.get("Em", 0.0))
+        if hasattr(model, "bending_force") else None
+    )
+    if share is not None:
         st.caption(
-            "**Is there a bending term?** There is, and it is this same "
-            "column. A thin shell resisting being bent gives Reissner's "
-            "F = 4 E h² δ / (R√(3(1−ν²))), which is linear in ε — and the "
-            "in-plane spring is linear in ε too. They are not two terms, "
-            "they are one term with two names, and no fit can separate them "
-            "because there is nothing to separate. Only the conversion back "
-            "to a material property differs: on this cell a fitted T₀ of "
-            f"1 mN/m is the same measurement as a bending modulus of "
-            f"{fit.get('T0_as_bending_MPa', 0.0) / max(fit.get('T0_mN_m', 1.0), 1e-12):.3g} MPa. "
-            "Which you quote is a claim about the cell, not a result from "
-            "the curve.\n\nThe only way to add a genuinely new element is "
-            "to add a new **shape**: a different power of ε, or the same "
-            "power starting somewhere else. That is why the cortical "
-            "network works where a bending term would not — it is ε³ᐟ², a "
-            "shape nothing else in the model has."
+            "**Is there a bending term?** There is, and Lulevich writes it "
+            "out: eq 1 carries F_bend = π Eₘ h² ε^½ / 2√2 beside the "
+            "stretching term. Its exponent is ½, so it is a shape of its "
+            "own, not a rename of anything else in the model. What eq 2 "
+            "then says is that it is negligible: the ratio of bending to "
+            f"stretching is (h/R)/ε^5/2, which on this cell is "
+            f"{float(share):.3f} at ε = 0.30"
+            + (f", and the bending force there works out at "
+               f"{bend_N * 1e9:.2g} nN"
+               if bend_N is not None and np.isfinite(bend_N) else "")
+            + ". That is why it is not fitted: a column that small has a "
+            "modulus the curve cannot determine, and offering it would "
+            "hand the solver a term to hide errors in."
         )
-        st.caption(
-            "A_t comes from the area a flattening sphere gains, ΔA ≈ πR₀²ε². "
-            "At a fixed tension the stored energy is T₀ΔA, and the force is "
-            "its derivative with respect to the travel δ = εh₀, which gives "
-            "2πR₀²T₀ε/h₀. Note there is no thickness in it: a tension is a "
-            "force per unit length and the curve measures it directly."
-        )
+
     deep_here = "nucleus" in terms
     st.code(
         f"h0 = {model.cell_height:.4g} m        (cell height)\n"
@@ -922,6 +935,12 @@ def show_fit_maths(fit, model):
         f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
         f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa"
         + (f"\nAn = {fit.get('An', float('nan')):.6g} N/Pa" if deep_here else "")
+        + (f"\nhne = {fit.get('h_envelope', float('nan')):.4g} m       "
+           f"(envelope thickness)"
+           f"\nAne = {fit.get('An_shell', float('nan')):.6g} N/Pa   "
+           f"(F = Ane*Ene*<eps-eps2>^3, the same cube law as the cell's "
+           f"own shell)"
+           if "nucleus_shell" in terms else "")
         + (f"\nAt = {fit.get('At', float('nan')):.6g} m        "
            f"(F = At*T0*eps)" if "tension" in terms else ""),
         language="text",
@@ -1580,11 +1599,6 @@ def plot_option_controls():
         "This also hides the highlighted segment.",
     )
     st.checkbox(
-        "Video frame marker", key="show_video_marker", disabled=bare,
-        help="The orange ring and dotted line showing where on the curve "
-        "the displayed video frame sits.",
-    )
-    st.checkbox(
         "Rupture marker", key="show_rupture_marker", disabled=bare,
         help="The dash-dotted line where the force drops.",
     )
@@ -1629,7 +1643,6 @@ def plot_option_controls():
 PLOT_EXTRAS = (
     "show_components",
     "show_fit_window",
-    "show_video_marker",
     "show_rupture_marker",
     "show_legend",
     "show_component_heights",
@@ -1694,7 +1707,11 @@ def current_style(force_N=None) -> PlotStyle:
         # ones so a person cannot half-clean a plot and wonder what is left.
         show_components=on("show_components"),
         show_fit_window=on("show_fit_window"),
-        show_video_marker=on("show_video_marker"),
+        # Not a plot marking any more: the video is for the database
+        # record and for measuring the cell's shape, not for annotating the
+        # force curve. Left in the style object so nothing downstream has to
+        # change, and left off.
+        show_video_marker=False,
         show_rupture_marker=on("show_rupture_marker"),
         show_legend=on("show_legend"),
         show_component_heights=on("show_component_heights"),
@@ -2068,29 +2085,40 @@ COMPONENT_SETS = {
     # deep spring was really absorbing was the cell running out of room, and
     # running out of room is what an incompressible interior does. It is
     # described by the confinement exponent q instead, where it belongs.
-    # Four materials, in the order the plates meet them: the shell, the
-    # cortex welded under it, the general scaffolding, and the myofibrils
-    # filling the cell. Three of them are Hertzian networks and are told
-    # apart only by when they start, which is why each has its own onset.
+    # Three materials, in the order the plates meet them: the sarcolemma,
+    # the packed interior, and the myofibrils met deeper in. No cortical
+    # layer of its own: it is part of what the sarcolemma carries, and a
+    # separate Hertzian term for it can only be told from the interior by
+    # its onset, which is a claim this cell does not need.
     #
-    # No nucleus. Nothing in a cardiomyocyte tells one apart from the rest of
-    # the interior, so a term claiming to measure one measures nothing.
+    # No nucleus either. Nothing in a cardiomyocyte tells one apart from the
+    # rest of the interior, so a term claiming to measure one measures
+    # nothing.
     "Cardiomyocyte": {
         "membrane": (
-            "🎈 Membrane",
-            "the shell around the cell, resisting being stretched",
-        ),
-        "cortex": (
-            "🕸️ Cortical cytoskeleton",
-            "the layer welded under the membrane, loaded from first contact",
+            "🎈 Sarcolemma",
+            "the membrane around the cell, resisting being stretched",
         ),
         "interior": (
             "🧬 Non-sarcomeric cytoskeleton",
-            "the general scaffolding, met once the cortex hands over",
+            "the general scaffolding, loaded from first contact",
         ),
         "nucleus": (
-            "🧵 Myofibrils",
-            "the contractile machinery filling the cell, reached deeper in",
+            "🧵 Sarcomeric cytoskeleton (myofibrils)",
+            "the contractile bundles, reached deeper in",
+        ),
+    },
+    # A chemically fixed cell is no longer a shell around a filling.
+    # Fixation cross-links protein to protein throughout, so membrane,
+    # cytoskeleton and nucleus become one solid, and one solid squeezed
+    # between two plates is a Hertzian contact and nothing else. It is the
+    # elastic-sphere limit of the same model: the ε³ shell term has nothing
+    # separate left to describe, and a fit offered one will split the curve
+    # between two terms that are no longer two materials.
+    "Fixed cell": {
+        "interior": (
+            "🧊 The whole fixed cell",
+            "one cross-linked solid, squeezed between two plates",
         ),
     },
 }
@@ -2128,61 +2156,71 @@ def cardiomyocyte_hypotheses(state=None):
     """
     The pictures worth testing for a ventricular cardiomyocyte.
 
-    Four materials at most, and no nucleus: nothing in a cardiomyocyte tells
-    one apart from the rest of the interior. The shell, the cortex welded
-    under it, the general scaffolding, and the myofibrils filling the cell.
+    Three materials: the sarcolemma, the non-sarcomeric cytoskeleton, and
+    the sarcomeric cytoskeleton — the myofibrils — reached deeper in. No
+    nucleus, because nothing here tells one apart from the rest of the
+    interior, and no cortical layer of its own, because it obeys the same
+    Hertzian law as the interior and could only be separated from it by an
+    onset this cell does not need.
 
-    Three of those are Hertzian networks with the same law, so only their
-    onsets separate them: the cortex from first contact, the scaffolding
-    from ε₁, the myofibrils from ε₂. Give two of them the same onset and the
-    fit is splitting one term between two names.
+    The interior is anchored to the sarcolemma and so is never left unloaded
+    while the membrane deforms alone: it carries the load from first
+    contact in every picture. What varies is the two things the curve can
+    answer: whether the sarcolemma answers from contact or only begins to
+    stretch at ε₁, and whether the deeper myofibrils are reached at all
+    inside the analysed range.
 
-    What varies between these pictures is the two things the curve can
-    actually answer: whether the shell answers from contact or only begins
-    to stretch at ε₁, and whether the myofibrils are reached at all inside
-    the analysed range.
-
-    ``state`` is accepted and ignored. The in-plane membrane spring is not
-    offered here: the plain cardiomyocyte has to be settled first.
+    ``state`` is accepted and ignored.
     """
-    shell_late = {"membrane": "late", "cyto_start": "break"}
-    shell_early = {"membrane": "continue", "cyto_start": "break"}
+    shell_late = {"membrane": "late", "cyto_start": "zero"}
+    shell_early = {"membrane": "continue", "cyto_start": "zero"}
     return [
         {
-            "key": "cortex_first",
-            "label": "Cortex first, then the membrane stretches, then the "
-                     "myofibrils",
-            "detail": "the shell only starts stretching at ε₁; myofibrils "
-                      "at ε₂",
-            "terms": ("membrane", "cortex", "interior", "nucleus"),
-            **shell_late,
+            "key": "interior_first",
+            "label": "Cytoskeleton first, then the sarcolemma stretches, "
+                     "then the myofibrils",
+            "detail": "the membrane only starts stretching at ε₁; "
+                      "myofibrils at ε₂",
+            "terms": ("membrane", "interior", "nucleus"), **shell_late,
         },
         {
             "key": "coupled",
-            "label": "Membrane and cortex together, then the myofibrils",
-            "detail": "the shell loads from first contact; myofibrils at ε₂",
-            "terms": ("membrane", "cortex", "interior", "nucleus"),
-            **shell_early,
+            "label": "Sarcolemma and cytoskeleton together, then the "
+                     "myofibrils",
+            "detail": "the membrane loads from first contact; myofibrils "
+                      "at ε₂",
+            "terms": ("membrane", "interior", "nucleus"), **shell_early,
         },
         {
-            "key": "cortex_first_no_myofibrils",
-            "label": "Cortex first, then the membrane stretches, no "
-                     "myofibrils reached",
+            "key": "interior_first_no_myofibrils",
+            "label": "Cytoskeleton first, then the sarcolemma, no myofibrils "
+                     "reached",
             "detail": "the same, but nothing deeper is met in this range",
-            "terms": ("membrane", "cortex", "interior"),
-            **shell_late,
+            "terms": ("membrane", "interior"), **shell_late,
         },
         {
             "key": "coupled_no_myofibrils",
-            "label": "Membrane and cortex together, no myofibrils reached",
-            "detail": "the shell from contact, nothing deeper met",
-            "terms": ("membrane", "cortex", "interior"),
-            **shell_early,
+            "label": "Sarcolemma and cytoskeleton together, no myofibrils "
+                     "reached",
+            "detail": "the membrane from contact, nothing deeper met",
+            "terms": ("membrane", "interior"), **shell_early,
         },
     ]
 
 
 HYPOTHESES = {
+    # One picture, because there is only one material. The comparison the
+    # other cell types run has nothing to compare, and saying so is better
+    # than offering a choice between a thing and itself.
+    "Fixed cell": [
+        {
+            "key": "one_solid",
+            "label": "One cross-linked solid",
+            "detail": "a Hertzian contact over the whole curve",
+            "terms": ("interior",),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+    ],
     "Myoblast (C2C12)": [
         {
             "key": "handover_with_envelope",
@@ -2235,13 +2273,57 @@ HYPOTHESES = {
 }
 
 
-def hypotheses_for(cell_type):
-    """The named pictures to test for this cell type, if any are defined."""
+def hypotheses_for(cell_type, terms=None):
+    """
+    The named pictures to test for this cell type.
+
+    ``terms`` restricts them to the materials that are actually ticked.
+    Without that, unticking a material had no effect at all: every picture
+    carried its own list of terms and the winner wrote them straight back,
+    so a box you had just cleared reappeared with a modulus beside it. A
+    fit without the membrane is a legitimate thing to ask for, and asking
+    for it should produce exactly that.
+
+    A picture stripped down to nothing is dropped, and two that collapse
+    onto the same set of materials and the same order are one picture.
+    """
     if cell_type in INCOMPRESSIBLE_INTERIOR:
-        return cardiomyocyte_hypotheses(
-            st.session_state.get("membrane_protein", "Not known — test for it")
-        )
-    return HYPOTHESES.get(cell_type, [])
+        found = cardiomyocyte_hypotheses()
+    else:
+        found = HYPOTHESES.get(cell_type, [])
+    if terms is None:
+        return found
+
+    keep = set(terms)
+    trimmed, seen = [], set()
+    for spec in found:
+        here = tuple(term for term in spec["terms"] if term in keep)
+        if not here:
+            continue
+        # With the membrane gone there is nothing for "the membrane starts
+        # stretching at ε₁" to mean, so those pictures collapse onto the
+        # one that is left rather than being compared against themselves.
+        membrane = spec.get("membrane", "continue")
+        if "membrane" not in here:
+            membrane = "continue"
+        signature = (here, membrane, spec.get("cyto_start", "zero"))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        # A trimmed picture needs a name that describes it. Keeping the
+        # original said "then the membrane stretches" about a fit with no
+        # membrane in it, which is a label that lies.
+        label, detail = spec["label"], spec.get("detail", "")
+        if here != tuple(spec["terms"]):
+            label = " + ".join(plain_name(term) for term in here)
+            if membrane == "late":
+                label += ", membrane from ε₁"
+            detail = "the materials you ticked" + (
+                ", with the deeper layer met at ε₂" if "nucleus" in here else ""
+            )
+        trimmed.append(dict(spec, terms=here, membrane=membrane,
+                            label=label, detail=detail))
+    return trimmed
 
 
 # Cell types whose interior is one incompressible material rather than a
@@ -2269,10 +2351,12 @@ OPTIONAL_TERMS = {
     # cardiomyocyte has to be settled before a membrane protein is added
     # to it, and a term nobody has asked for quietly takes force from the
     # ones that were asked for.
-    "Cardiomyocyte": ("membrane", "cortex", "interior", "nucleus"),
+    "Cardiomyocyte": ("membrane", "interior", "nucleus"),
     # The nucleus is two elements, an envelope and what it contains.
     "Myoblast (C2C12)": ("membrane", "interior", "nucleus_shell", "nucleus"),
     "Custom": ("membrane", "interior", "nucleus_shell", "nucleus"),
+    # One material, one modulus. Everything else about the fit is the same.
+    "Fixed cell": ("interior",),
 }
 
 # Which of those are ticked when the cell type is chosen.
@@ -2281,12 +2365,16 @@ DEFAULT_TERMS_BY_TYPE = {
     # knockout is the experiment that takes it away, and choosing that
     # genotype in the sidebar is what removes it from the model.
     "Cardiomyocyte": {
-        "membrane": True, "cortex": True, "interior": True, "nucleus": True,
-        "nucleus_shell": False, "tension": False,
+        "membrane": True, "interior": True, "nucleus": True,
+        "cortex": False, "nucleus_shell": False, "tension": False,
     },
     "Myoblast (C2C12)": {
         "membrane": True, "interior": True, "nucleus": True,
         "nucleus_shell": True, "tension": False, "cortex": False,
+    },
+    "Fixed cell": {
+        "membrane": False, "interior": True, "nucleus": False,
+        "nucleus_shell": False, "tension": False, "cortex": False,
     },
 }
 
@@ -2328,10 +2416,10 @@ def has_deep_term(cell_type=None):
 DEFAULT_COMPOSITION_BY_TYPE = {
     "Cardiomyocyte": {
         "membrane_after_break": "starts stretching at ε₁",
-        # With a cortex in the model, the cortex is what carries the load
-        # from first contact and the general scaffolding is met after it.
-        # Starting both at zero would make them one term with two names.
-        "cyto_starts_at": "at ε₁",
+        # The interior is anchored to the sarcolemma, so it is never left
+        # unloaded while the membrane deforms alone: it carries the load
+        # from first contact, which is what a slope near 3/2 there means.
+        "cyto_starts_at": "from the very start",
     },
 }
 
@@ -2348,9 +2436,33 @@ BASE_COMPOSITION = {
 }
 
 
+# A neutral name for every slot, used only where a cell type does not name
+# one because it does not have one. Deliberately not the myoblast's names:
+# falling back to those would put the word "nucleus" into a cardiomyocyte's
+# component list, which is exactly what the cell-type names exist to avoid.
+GENERIC_COMPONENTS = {
+    "tension": ("In-plane spring", "a spring taut in the membrane"),
+    "membrane": ("Membrane", "the skin around the cell"),
+    "cortex": ("Cortex", "the layer just under the membrane"),
+    "interior": ("Interior", "the material filling the cell"),
+    "nucleus_shell": ("Deep shell", "a shell met deeper in"),
+    "nucleus": ("Deep element", "whatever the plates reach deeper in"),
+}
+
+
 def components_for(cell_type):
-    """Names for the three terms, falling back to the general ones."""
-    return COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS)
+    """
+    Names for every slot, whether or not this cell type uses it.
+
+    Every slot is filled, so that code which reaches for a name it does not
+    expect to be missing gets a name rather than a KeyError. Which slots are
+    actually fitted is ``terms_for``, and that is the only thing that
+    decides what appears on the page.
+    """
+    return dict(
+        GENERIC_COMPONENTS,
+        **COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS),
+    )
 
 
 CELL_TYPES = {
@@ -2404,6 +2516,22 @@ CELL_TYPES = {
         "expected": {"Em": (5e4, 5e7), "Ei": (1e2, 1e5), "En": (5e2, 2e5)},
         "windows": {"membrane": (0.0, 0.35), "interior": (0.0, 0.35),
                     "nucleus": (0.35, 1.0)},
+    },
+    # Same geometry as the living cell it was made from; what changed is the
+    # chemistry, not the shape. Fixation makes a cell several times stiffer,
+    # so the plausibility band is wider at the top.
+    "Fixed cell": {
+        "cell_height_um": 8.0,
+        "radius_aspect": 0.55,
+        "nucleus_fraction": 0.35,
+        "membrane_thickness_nm": 4.0,
+        "nucleus_onset": 0.20,
+        "cell_shape": "Sphere (a rounded cell)",
+        "confinement": 0.0,
+        "weighting": "relative",
+        "expected": {"Em": (2e5, 2e7), "Ei": (5e2, 5e5), "En": (1e3, 5e4)},
+        "windows": {"membrane": (0.0, 0.40), "interior": (0.0, 1.0),
+                    "nucleus": (0.40, 1.0)},
     },
     "Custom": {
         "cell_height_um": 8.09,
@@ -3469,11 +3597,6 @@ with st.sidebar:
             help="The Eₘ, E_c and Eₙ values printed under the cell diagram. The "
             "same numbers are in the results table.",
         )
-        st.checkbox(
-            "Video frame",
-            key="video_show_panel",
-            help="Only appears once a video is loaded in the Compression video tab.",
-        )
 
     with st.expander("☁️ OneDrive database", expanded=False):
         if ONEDRIVE_IMPORT_ERROR:
@@ -3914,7 +4037,10 @@ with tab_analysis:
                 if window.get("bad_contact"):
                     notes.append("**the approach misbehaved near contact**")
 
-            picks = hypotheses_for(st.session_state["cell_type"])
+            picks = hypotheses_for(
+                st.session_state["cell_type"],
+                terms=terms_for(st.session_state["cell_type"]),
+            )
             if picks and hasattr(model, "suggest_window"):
                 lo = window.get("epsilon_min", 0.0) if window.get("success") else 0.0
                 hi = window.get("epsilon_max", eps_hi_data) if window.get("success") \
@@ -4062,7 +4188,9 @@ with tab_analysis:
                     "🔬 Fit this cell", type="primary",
                     disabled=not chosen, key="guided_fit", **STRETCH,
                 ):
-                    picks_now = hypotheses_for(st.session_state["cell_type"])
+                    picks_now = hypotheses_for(
+                        st.session_state["cell_type"], terms=chosen
+                    )
                     with st.spinner("Measuring the confinement, then "
                                     "comparing the pictures of this cell…"):
                         # The same routine as on load, searched harder: a
@@ -6479,36 +6607,67 @@ with tab_analysis:
 # fits a cell, this one asks what shape of cell the curve is describing.
 
 with tab_explore:
-    section("The model, in two springs")
+    section("The model, balloon by balloon")
+
+    _explore_terms = terms_for(st.session_state["cell_type"])
+    _explore_names = components_for(st.session_state["cell_type"])
 
     intro_left, intro_right = st.columns([1.15, 1])
     with intro_left:
         st.markdown(
-            "Squash a cell between two plates and only two things can push "
-            "back, and they push back with different shapes.\n\n"
-            "**🎈 The balloon.** The membrane is a thin shell around fluid "
-            "that does not compress. Flattening the cell forces the shell to "
-            "gain area, and a shell resists gaining area harder the more it "
-            "has already gained. Its force rises as **ε³**: slow at first, "
-            "then very fast.\n\n"
-            "**🕸️ The spring.** The network filling the cell is squeezed like "
-            "any elastic solid between two flat plates. That is a Hertzian "
-            "contact and its force rises as **ε³ᐟ²**: it answers immediately "
-            "and then flattens off.\n\n"
-            "Two shapes, so a curve can tell them apart. Whichever one is "
-            "loaded at first contact sets the slope there, and that slope is "
-            "measurable without fitting anything."
+            "Squash a cell between two plates and only two kinds of thing "
+            "can push back, and they push back with different shapes.\n\n"
+            "**🎈 A balloon.** A thin shell around something that does not "
+            "compress. Flattening it forces the shell to gain area, and a "
+            "shell resists gaining area harder the more it has already "
+            "gained. Its force rises as **ε³**: slow at first, then very "
+            "fast.\n\n"
+            "**🕸️ A spring.** A material filling a space, squeezed between "
+            "two flat plates. That is a Hertzian contact and its force rises "
+            "as **ε³ᐟ²**: it answers immediately and then flattens off.\n\n"
+            "A cell can have more than one of each. A "
+            f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
+            f"modelled with **{len(_explore_terms)}**:"
+        )
+        st.markdown(
+            "\n".join(
+                f"- {_explore_names[term][0]} — "
+                f"{'balloon' if MATERIAL_LAWS[term]['exponent'] == '3' else 'spring'}"
+                f", rises as ε^{MATERIAL_LAWS[term]['exponent']}, "
+                f"{MATERIAL_LAWS[term]['role']}"
+                for term in _explore_terms
+            )
+        )
+        st.caption(
+            "A nucleus is a balloon inside a balloon: an envelope that "
+            "resists being stretched around a filling that resists being "
+            "squeezed. It is the same pair as the cell itself, met deeper "
+            "in, which is why it needs two terms and not one."
+            if "nucleus_shell" in _explore_terms else
+            "Whichever is loaded at first contact sets the slope there, and "
+            "that slope is measurable without fitting anything."
         )
         st.latex(
             r"F(\varepsilon)\;=\;\underbrace{A_m E_m\,\varepsilon^{3}}"
             r"_{\text{balloon}}\;+\;"
             r"\underbrace{A_i E_c\,\langle \varepsilon-\varepsilon_1\rangle^{3/2}}"
             r"_{\text{spring}}"
+            + (r"\;+\;\underbrace{A_{ne} E_{ne}\,\langle \varepsilon-"
+               r"\varepsilon_2\rangle^{3}}_{\text{nuclear balloon}}\;+\;"
+               r"\underbrace{A_n E_n\,\langle \varepsilon-\varepsilon_2"
+               r"\rangle^{3/2}}_{\text{its filling}}"
+               if "nucleus_shell" in _explore_terms else "")
         )
         st.caption(
-            "Aₘ and Aᵢ are geometry, not fitted: Aₘ = 2πh R₀/(1−ν), "
-            "Aᵢ = √2 R₀^½ h₀^1.5 / 3(1−ν²). Only the two moduli are free, "
-            "which is why the shapes have to do the separating."
+            "Every prefactor is geometry, not fitted: Aₘ = 2πh R₀/(1−ν) "
+            "for the cell's shell"
+            + (", A_ne = 2πh_ne R_n/(1−ν_n) for the deeper balloon, the same "
+               "Lulevich law with its own radius and its own shell thickness"
+               if "nucleus_shell" in _explore_terms else "")
+            + "; Aᵢ = √2 R₀² / 3(1−ν²) for a Hertzian contact, which is "
+            "Lulevich's eq 6. Only "
+            "the moduli are free, which is why the shapes have to do the "
+            "separating."
         )
     with intro_right:
         # Both pictures, because they are two views of one model and each
