@@ -242,12 +242,48 @@ class GoogleSheetsManager:
         ("sarcomere_relaxed", "Relaxed sarcomere (nm)"),
         ("sarcomere_at_max", "Sarcomere at ε_max (nm)"),
         ("poisson", "Poisson (membrane / interior)"),
+        # Measured off the video frame rather than typed in, and a note
+        # about what the video showed. Both belong with the summary because
+        # they are what somebody looking at an odd modulus checks first.
+        ("video_height_um", "Height (um)"),
+        ("video_comment", "Video Comment"),
         ("force_curve_created", "Force Curve Created"),
         ("analysis_status", "Analysis Status"),
         ("notes", "Notes"),
         ("timestamp", "Timestamp"),
         ("video_link", "Video Link"),
     ]
+
+    # The first tab holds the columns somebody reads across a population:
+    # who the cell was, how stiff each material came out, over what stretch
+    # of the curve, and how well the model followed it. Everything else is
+    # the working, and it goes on a second tab so this one stays readable
+    # on a laptop screen without scrolling sideways.
+    MAIN_KEYS = (
+        "experiment_date", "cell_id", "cell_height", "spring_constant",
+        "Em", "Em_range", "Ecx", "Ei", "Ei_range", "Ene", "En", "En_range",
+        "fit_quality", "chi_squared", "video_height_um", "video_comment",
+    )
+    # Repeated at the front of the second tab, so a row there can be matched
+    # back to its cell without counting rows.
+    EXTRA_KEYS = ("cell_id", "experiment_date", "spring_constant")
+    EXTRA_TAB = "Additional info"
+
+    @classmethod
+    def main_columns(cls):
+        """(key, heading) for the first tab, in the order it is written."""
+        names = dict(cls.COLUMNS)
+        return [(key, names[key]) for key in cls.MAIN_KEYS if key in names]
+
+    @classmethod
+    def extra_columns(cls):
+        """(key, heading) for the second tab: the working, keyed by cell."""
+        names = dict(cls.COLUMNS)
+        keys = list(cls.EXTRA_KEYS) + [
+            key for key, _ in cls.COLUMNS
+            if key not in cls.MAIN_KEYS and key not in cls.EXTRA_KEYS
+        ]
+        return [(key, names[key]) for key in keys if key in names]
 
     # Columns this app used to write, and what they are called now. A header
     # is renamed in place so the data under it stays put; without this the new
@@ -264,37 +300,76 @@ class GoogleSheetsManager:
         "Membrane Eₘ·h (mN/m)": "Membrane Em·h (mN/m)",
     }
 
-    def _initialize_headers(self):
-        """Put the full header row on a brand new sheet."""
+    def _initialize_headers(self, worksheet=None, columns=None):
+        """Put the header row on a brand new tab."""
+        worksheet = worksheet if worksheet is not None else self.worksheet
+        columns = columns if columns is not None else self.main_columns()
         try:
-            self.worksheet.insert_row([name for _, name in self.COLUMNS], 1)
+            worksheet.insert_row([name for _, name in columns], 1)
         except Exception as e:
             st.warning(f"Could not insert headers: {str(e)}")
 
-    def _header_row(self):
+    def extra_worksheet(self, create=True):
         """
-        The sheet's header, brought up to date with the current layout.
+        The second tab, holding the working. None when there is none yet.
+
+        Made on demand rather than up front, so a spreadsheet somebody
+        already keeps does not sprout an empty tab just for being opened.
+        """
+        # getattr, not attribute access: a manager built for a test, or one
+        # whose sheet was never opened, has no spreadsheet at all, and the
+        # row on the first tab must still be written.
+        if getattr(self, "spreadsheet", None) is None:
+            return None
+        try:
+            return self.spreadsheet.worksheet(self.EXTRA_TAB)
+        except gspread.WorksheetNotFound:
+            if not create:
+                return None
+        except Exception:
+            return None
+        try:
+            sheet = self.spreadsheet.add_worksheet(
+                title=self.EXTRA_TAB, rows=1000,
+                cols=max(len(self.extra_columns()), 10),
+            )
+        except Exception as exc:
+            st.warning(f"Could not add the '{self.EXTRA_TAB}' tab: {exc}")
+            return None
+        self._initialize_headers(sheet, self.extra_columns())
+        return sheet
+
+    def _header_row(self, worksheet=None, columns=None):
+        """
+        A tab's header, brought up to date with the current layout.
 
         Renames first, so data already under an old name stays with it; then
-        the columns this app writes but the sheet lacks. Order is only changed
+        the columns this app writes but the tab lacks. Order is only changed
         when there is nothing to lose, which is why `reorder_columns` is a
         separate, deliberate call.
+
+        A heading that belongs on the other tab is left exactly where it is.
+        A sheet written before the split has every column on the first tab,
+        and quietly deleting half of them to tidy it up would throw away
+        somebody's data; `reorder_columns` is the deliberate move.
         """
+        worksheet = worksheet if worksheet is not None else self.worksheet
+        columns = columns if columns is not None else self.main_columns()
         try:
-            header = [h for h in self.worksheet.row_values(1) if str(h).strip()]
+            header = [h for h in worksheet.row_values(1) if str(h).strip()]
         except Exception:
             header = []
 
         if not header:
-            self._initialize_headers()
-            return [name for _, name in self.COLUMNS]
+            self._initialize_headers(worksheet, columns)
+            return [name for _, name in columns]
 
         renamed = [self.RENAMED.get(name, name) for name in header]
-        missing = [name for _, name in self.COLUMNS if name not in renamed]
+        missing = [name for _, name in columns if name not in renamed]
         if renamed != header or missing:
             renamed = renamed + missing
             try:
-                self.worksheet.update(
+                worksheet.update(
                     values=[renamed],
                     range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(renamed))}",
                 )
@@ -321,27 +396,69 @@ class GoogleSheetsManager:
             return True, "Wrote the header to an empty sheet."
 
         header = [self.RENAMED.get(h, h) for h in values[0]]
-        wanted = [name for _, name in self.COLUMNS]
-        extra = [h for h in header if h and h not in wanted]
-        new_header = wanted + extra
+        rows_by_name = [
+            dict(zip(header, raw)) for raw in values[1:]
+            if any(str(cell).strip() for cell in raw)
+        ]
 
-        rows = []
-        for raw in values[1:]:
-            if not any(str(cell).strip() for cell in raw):
-                continue
-            by_name = dict(zip(header, raw))
-            rows.append([by_name.get(name, "") for name in new_header])
+        main = [name for _, name in self.main_columns()]
+        extra = [name for _, name in self.extra_columns()]
+        # A heading this app has never heard of is somebody's own column. It
+        # is kept, at the end of the first tab, rather than dropped.
+        unknown = [h for h in header if h and h not in main and h not in extra]
 
-        try:
-            self.worksheet.clear()
-            self.worksheet.update(
-                values=[new_header] + rows,
-                range_name=f"A1:{gspread.utils.rowcol_to_a1(len(rows) + 1, len(new_header))}",
+        def rewrite(worksheet, wanted, source):
+            body = [[row.get(name, "") for name in wanted] for row in source]
+            worksheet.clear()
+            worksheet.update(
+                values=[wanted] + body,
+                range_name=(
+                    f"A1:{gspread.utils.rowcol_to_a1(len(body) + 1, len(wanted))}"
+                ),
             )
+
+        # The working tab is written first, and the summary is only stripped
+        # down to the summary columns once that has actually succeeded.
+        # The other order loses data: a spreadsheet where the second tab
+        # cannot be made would have its working columns removed from the
+        # first tab and written nowhere.
+        note, moved = "", False
+        sheet = self.extra_worksheet()
+        if sheet is None:
+            note = (f" The '{self.EXTRA_TAB}' tab could not be made, so "
+                    f"every column is still on this one.")
+        else:
+            try:
+                # Rows already on the second tab are read first, so a sheet
+                # that has been split once is not split again onto itself
+                # and rows written straight there are not lost.
+                existing = sheet.get_all_values()
+                if len(existing) > 1:
+                    seen = [dict(zip([self.RENAMED.get(h, h) for h in existing[0]],
+                                     raw))
+                            for raw in existing[1:]
+                            if any(str(cell).strip() for cell in raw)]
+                else:
+                    seen = []
+                merged = seen if len(seen) >= len(rows_by_name) else rows_by_name
+                rewrite(sheet, extra, merged)
+                moved = True
+                note = f" The working is on the '{self.EXTRA_TAB}' tab."
+            except Exception as exc:
+                note = (f" The '{self.EXTRA_TAB}' tab was not written "
+                        f"({exc}), so every column is still on this one.")
+
+        main_header = (
+            main + unknown if moved
+            else main + [h for h in header if h and h not in main]
+        )
+        try:
+            rewrite(self.worksheet, main_header, rows_by_name)
         except Exception as exc:
             return False, f"Could not rewrite the sheet: {exc}"
-        kept = f" {len(rows)} row(s) kept." if rows else ""
-        return True, f"Columns are now in the app's order.{kept}"
+
+        kept = f" {len(rows_by_name)} row(s) kept." if rows_by_name else ""
+        return True, f"Columns are now in the app's order.{kept}{note}"
 
     CURVE_PREFIX = "curve_"
 
@@ -472,11 +589,32 @@ class GoogleSheetsManager:
                 by_name[name] = "" if value is None else value
 
             header = self._header_row()
-            row = [by_name.get(name, "") for name in header]
+            self.worksheet.append_row(
+                [by_name.get(name, "") for name in header],
+                value_input_option="USER_ENTERED",
+            )
 
-            self.worksheet.append_row(row, value_input_option="USER_ENTERED")
+            # The working goes on the second tab, under the same cell id, so
+            # the summary tab stays something a person can read across.
+            # Failing to write it must not lose the row that did go in, so
+            # this is reported rather than raised.
+            extra_note = ""
+            sheet = self.extra_worksheet()
+            if sheet is not None:
+                try:
+                    extra_header = self._header_row(sheet, self.extra_columns())
+                    sheet.append_row(
+                        [by_name.get(name, "") for name in extra_header],
+                        value_input_option="USER_ENTERED",
+                    )
+                except Exception as exc:
+                    extra_note = f" (the '{self.EXTRA_TAB}' tab was not written: {exc})"
+            else:
+                extra_note = f" (no '{self.EXTRA_TAB}' tab)"
 
-            return True, f"✅ Cell {cell_data['cell_id']} saved to database"
+            return True, (
+                f"✅ Cell {cell_data['cell_id']} saved to database" + extra_note
+            )
 
         except Exception as e:
             return False, f"❌ Error appending data: {str(e)}"
