@@ -59,13 +59,13 @@ class PlotStyle:
     """Everything the user can change about how a figure looks."""
 
     force_unit: str = "nN"
-    # A solid blue for the measurement and black for the model. The pale
-    # blue this used to be disappeared against white at small marker sizes
-    # and printed as almost nothing; this one still separates from black by
-    # lightness, which is what survives greyscale and colour blindness.
-    data_color: str = "#1668b3"
+    # The measurement is a light blue field of points with no outline; the
+    # model is one dark dashed line drawn over it. The two are told apart by
+    # lightness and by being different kinds of mark, which is what survives
+    # a greyscale print and colour blindness both.
+    data_color: str = "#79c2e8"
     fit_color: str = "#000000"
-    marker_size: int = 7
+    marker_size: int = 9
     line_width: int = 4
     height: int = 560
     show_grid: bool = False
@@ -257,10 +257,15 @@ def force_curve_figure(
             y=y_plot,
             mode="markers",
             name="Experimental data",
+            # No outline on the markers. A dark ring around every point
+            # made a dense curve read as a grey band with a blue tint, and
+            # made the black model line look like one more outline among
+            # thousands. The points are one light blue area; the model is
+            # the only line on the plot.
             marker=dict(
                 size=style.marker_size,
                 color=style.data_color,
-                line=dict(width=0.5, color="rgba(0,0,0,0.4)"),
+                line=dict(width=0),
             ),
             hovertemplate="ε = %{x:.4f}<br>F = %{y:.4g} " + unit_label + "<extra></extra>",
         )
@@ -272,29 +277,18 @@ def force_curve_figure(
         if log_mode:
             keep = (fx > 0) & (fy > 0)
             fx, fy = fx[keep], fy[keep]
-        # A white line under the model and a solid one over it. Dashed and
-        # the same width as the markers, the model line disappeared into a
-        # dense band of points: the halo is what makes it read as a line
-        # over the data rather than as part of it, whatever colour either
-        # of them is set to.
+        # One dashed line over a light blue field of points, and nothing
+        # under it. The white halo that used to sit beneath the model read
+        # as an outline around the data, which is exactly the thing the
+        # markers had just stopped having.
         fig.add_trace(
             go.Scatter(
                 x=fx,
                 y=fy,
                 mode="lines",
                 name="Model",
-                showlegend=False,
-                hoverinfo="skip",
-                line=dict(color="white", width=style.line_width + 5),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=fx,
-                y=fy,
-                mode="lines",
-                name="Model",
-                line=dict(color=style.fit_color, width=style.line_width + 1),
+                line=dict(color=style.fit_color, width=style.line_width + 1,
+                          dash="dash"),
                 hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
