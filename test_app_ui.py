@@ -875,8 +875,14 @@ def case_sheet_row_matches_the_header():
           sheet.header[1] == "Experiment Date"
           and sheet.header[3] == "Spring Constant, K (N/m)", str(sheet.header[:5]))
     for wanted in ("Young's Modulus (En, kPa)", "Em range (ε)", "Ei range (ε)",
-                   "En range (ε)", "ε₁ membrane hands over", "RMSE (N)"):
+                   "En range (ε)", "Height (um)", "Video Comment"):
         check(f"{wanted} column present", wanted in sheet.header, str(sheet.header))
+    # The working belongs on the second tab now. An existing sheet keeps
+    # whatever columns it already had, in place, but the app stops adding
+    # these to the summary tab.
+    for moved in ("ε₁ membrane hands over", "RMSE (N)", "Points fitted"):
+        check(f"{moved} is not added to the summary tab",
+              moved not in sheet.header, str(sheet.header))
 
     check("exactly one row was written", len(sheet.rows) == 1)
     written = dict(zip(sheet.header, sheet.rows[0]))
@@ -924,8 +930,18 @@ def case_sheet_reorder_keeps_the_data():
     ok, message = manager.reorder_columns()
     check("the reorder succeeded", ok, message)
     new_header = sheet.header
-    check("video link is last", new_header[-1] == "Video Link"
-          or new_header[-2:] == ["Video Link", "Custom of mine"], str(new_header[-3:]))
+    # No second tab could be made here (this manager has no spreadsheet), so
+    # every column stays on the one tab rather than being stripped off it
+    # and written nowhere. That is the whole point: the working moves only
+    # once there is somewhere for it to move to.
+    check("the summary columns come first",
+          new_header[:2] == ["Experiment Date", "Cell ID"],
+          str(new_header[:3]))
+    check("and the working is still on this tab, not dropped",
+          "Video Link" in new_header and "Notes" in new_header,
+          str(new_header))
+    check("with the message saying so",
+          "still on this one" in message, message)
     check("a column the app does not know about was kept",
           "Custom of mine" in new_header)
     check("the header was renamed here too",
@@ -1030,8 +1046,9 @@ def case_plot_options_are_under_the_plot():
     if not no_exception(app, "plot options"):
         return
     labels = [c.label for c in app.checkbox]
-    for wanted in ("Data and fit only", "The fitted curve", "Element curves",
-                   "Shaded segment bands", "Legend"):
+    for wanted in ("Data and fit only",
+                   "The measured points and the fitted curve",
+                   "Element curves", "Shaded segment bands", "Legend"):
         check(f"“{wanted}” is on the page", wanted in labels, str(labels))
 
     text = " ".join(
@@ -1903,7 +1920,10 @@ def case_fit_only_plot():
     def names(**flags):
         style = plot_utils.PlotStyle(force_unit="N", **flags)
         fig = plot_utils.force_curve_figure(eps, force, style, fit_force_N=fitted)
-        return [t.name for t in fig.data]
+        # The model is drawn twice, a white halo under a coloured line, so
+        # that it reads over a dense band of points. Only one of them is a
+        # trace anybody is meant to see named.
+        return [t.name for t in fig.data if t.showlegend is not False]
 
     check("both by default",
           set(names()) == {"Experimental data", "Model"}, str(names()))
@@ -1914,9 +1934,14 @@ def case_fit_only_plot():
           str(names(show_fit_line=False)))
 
     app = start(cell_name="cell-01")
-    check("there is a checkbox for the points",
-          any("measured points" in (c.label or "").lower() for c in app.checkbox),
-          str([c.label for c in app.checkbox]))
+    boxes = [c.label for c in app.checkbox
+             if "measured points" in (c.label or "").lower()
+             or "fitted curve" in (c.label or "").lower()]
+    check("one checkbox covers the points and the curve together",
+          len(boxes) == 1, str(boxes))
+    check("and it is on to begin with",
+          state(app, "show_data_and_fit") is True,
+          str(state(app, "show_data_and_fit")))
 
 
 def case_springs_share_a_pitch():
@@ -5043,6 +5068,165 @@ class _StubSheet:
         return {}
 
 
+class _FakeTab:
+    """One worksheet, in memory, with just the calls the manager makes."""
+
+    def __init__(self, title, values=None):
+        self.title = title
+        self.values = [list(row) for row in (values or [])]
+
+    def row_values(self, n):
+        return list(self.values[n - 1]) if len(self.values) >= n else []
+
+    def insert_row(self, row, index):
+        self.values.insert(index - 1, list(row))
+
+    def append_row(self, row, value_input_option=None):
+        self.values.append(list(row))
+
+    def get_all_values(self):
+        return [list(row) for row in self.values]
+
+    def clear(self):
+        self.values = []
+
+    def update(self, values=None, range_name=None):
+        if not self.values:
+            self.values = [list(r) for r in values]
+            return
+        self.values[: len(values)] = [list(r) for r in values]
+
+
+class _FakeBook:
+    def __init__(self):
+        self.tabs = {}
+
+    def worksheet(self, title):
+        import gspread
+        if title not in self.tabs:
+            raise gspread.WorksheetNotFound(title)
+        return self.tabs[title]
+
+    def add_worksheet(self, title, rows=0, cols=0):
+        self.tabs[title] = _FakeTab(title)
+        return self.tabs[title]
+
+
+def _fake_manager():
+    from google_sheets_manager import GoogleSheetsManager
+    manager = GoogleSheetsManager()
+    manager.spreadsheet = _FakeBook()
+    manager.worksheet = manager.spreadsheet.add_worksheet("Cells")
+    manager._initialize_headers()
+    return manager
+
+
+def case_the_sheet_has_a_summary_tab_and_a_working_tab():
+    print("the spreadsheet is a readable summary plus a tab of working")
+    from google_sheets_manager import GoogleSheetsManager as G
+
+    wanted = [
+        "Experiment Date", "Cell ID", "Cell Height (μm)",
+        "Spring Constant, K (N/m)", "Young's Modulus (Em, MPa)", "Em range (ε)",
+        "Young's Modulus (Ecx cortex, kPa)", "Young's Modulus (Ei, kPa)",
+        "Ei range (ε)", "Young's Modulus (Ene envelope, MPa)",
+        "Young's Modulus (En, kPa)", "En range (ε)", "Fit Quality (R²)",
+        "Chi squared", "Height (um)", "Video Comment",
+    ]
+    first = [name for _, name in G.main_columns()]
+    check("the first tab is exactly the asked-for columns, in order",
+          first == wanted, str(first))
+    second = [name for _, name in G.extra_columns()]
+    check("the second tab starts with what identifies the cell",
+          second[:3] == ["Cell ID", "Experiment Date",
+                         "Spring Constant, K (N/m)"], str(second[:3]))
+    check("nothing is lost between the two tabs",
+          set(first) | set(second) == {name for _, name in G.COLUMNS},
+          str(set(name for _, name in G.COLUMNS) - (set(first) | set(second))))
+    check("and the working is not repeated on the summary",
+          not ({"Points fitted", "Weighting", "Timestamp"} & set(first)),
+          str(first))
+
+    manager = _fake_manager()
+    ok, message = manager.append_cell_data({
+        "cell_id": "C2C12_001", "experiment_date": "2022-04-13",
+        "cell_height": 8.06, "spring_constant": 0.0,
+        "Em": 8.070523, "Em_range": "0.000 to 0.960",
+        "Ei": 11.559871, "Ei_range": "0.246 to 0.960",
+        "Ene": 155.090322, "En": 7112.678218, "En_range": "0.868 to 0.960",
+        "fit_quality": 0.99984, "chi_squared": 1581300,
+        "video_height_um": 9.1, "video_comment": "probe slipped once",
+        "n_points": 812, "weighting": "relative",
+    })
+    check("the row is written", ok, message)
+    rows = manager.worksheet.get_all_values()
+    check("the summary tab has a header and one row", len(rows) == 2,
+          str(len(rows)))
+    summary = dict(zip(rows[0], rows[1]))
+    check("with the cell named in it", summary["Cell ID"] == "C2C12_001",
+          str(summary.get("Cell ID")))
+    check("its membrane modulus", str(summary["Young's Modulus (Em, MPa)"])
+          .startswith("8.07"), str(summary.get("Young's Modulus (Em, MPa)")))
+    check("the height measured off the video",
+          str(summary["Height (um)"]) == "9.1", str(summary.get("Height (um)")))
+    check("and the comment about it",
+          summary["Video Comment"] == "probe slipped once",
+          str(summary.get("Video Comment")))
+
+    extra = manager.extra_worksheet(create=False)
+    check("a second tab was made", extra is not None)
+    if extra is None:
+        return
+    erows = extra.get_all_values()
+    check("it has the same one row", len(erows) == 2, str(len(erows)))
+    working = dict(zip(erows[0], erows[1]))
+    check("keyed by the same cell", working["Cell ID"] == "C2C12_001",
+          str(working.get("Cell ID")))
+    check("with its date and spring constant repeated",
+          working["Experiment Date"] == "2022-04-13"
+          and working["Spring Constant, K (N/m)"] in ("0", "0.0", 0, 0.0),
+          f"{working.get('Experiment Date')} / "
+          f"{working.get('Spring Constant, K (N/m)')}")
+    check("and the working on it", str(working["Points fitted"]) == "812",
+          str(working.get("Points fitted")))
+
+
+def case_an_old_one_tab_sheet_is_split_without_losing_anything():
+    print("an existing single-tab sheet splits in two without losing a column")
+    from google_sheets_manager import GoogleSheetsManager as G
+
+    manager = _fake_manager()
+    # A sheet as it was written before the split: every column on tab one,
+    # plus a column of the user's own that this app has never heard of.
+    header = [name for _, name in G.COLUMNS] + ["My own note"]
+    row = [f"v{i}" for i in range(len(header))]
+    row[header.index("Cell ID")] = "old-01"
+    row[header.index("Points fitted")] = "404"
+    manager.worksheet.values = [header, row]
+
+    ok, message = manager.reorder_columns()
+    check("the sheet is rewritten", ok, message)
+    first = manager.worksheet.get_all_values()
+    check("the summary tab keeps its row", len(first) == 2, str(len(first)))
+    check("in the asked-for order",
+          first[0][:2] == ["Experiment Date", "Cell ID"], str(first[0][:3]))
+    check("a column of the user's own is kept, at the end",
+          "My own note" in first[0], str(first[0][-3:]))
+    summary = dict(zip(first[0], first[1]))
+    check("and the row is still that cell", summary["Cell ID"] == "old-01",
+          str(summary.get("Cell ID")))
+
+    extra = manager.extra_worksheet(create=False)
+    check("the working moved to the second tab", extra is not None)
+    if extra is None:
+        return
+    working = dict(zip(*extra.get_all_values()[:2]))
+    check("carrying the value that was under that heading",
+          working["Points fitted"] == "404", str(working.get("Points fitted")))
+    check("still keyed by the cell", working["Cell ID"] == "old-01",
+          str(working.get("Cell ID")))
+
+
 def case_the_sheet_can_be_the_database():
     print("a connected sheet is where the database tab reads from")
     app = AppTest.from_file(APP, default_timeout=600)
@@ -5271,6 +5455,8 @@ if __name__ == "__main__":
         case_a_fixed_cell_can_have_several_hertzian_terms,
         case_the_fixed_tick_locks_out_the_other_materials,
         case_the_sheet_can_be_the_database,
+        case_the_sheet_has_a_summary_tab_and_a_working_tab,
+        case_an_old_one_tab_sheet_is_split_without_losing_anything,
         case_a_fixed_cell_is_one_hertzian_solid,
         case_unticking_a_material_fits_without_it,
         case_the_video_is_not_a_plot_marking,
