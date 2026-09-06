@@ -104,6 +104,14 @@ def start(**state):
     return app
 
 
+def state(app, key, default=None):
+    """One session value, or a default. AppTest's session state has no get."""
+    try:
+        return app.session_state[key]
+    except (KeyError, AttributeError):
+        return default
+
+
 def widget_by_label(app, kind, label):
     for w in getattr(app, kind):
         if label.lower() in (w.label or "").lower():
@@ -1703,26 +1711,51 @@ def app_module_model_name(arrangement):
 
 
 def case_guided_range_is_settable():
-    print("the range can be set before working it out")
+    print("the range can be set at either end, by the bar or by typing")
     app = start(cell_name="cell-01")
     if not no_exception(app, "guided range"):
         return
-    slider = widget_by_label(app, "slider", "up to")
-    check("a range slider sits before the button", slider is not None,
+    slider = widget_by_label(app, "slider", "Fitted range")
+    check("a range bar sits before the button", slider is not None,
           str([s.label for s in app.slider]))
     if slider is None:
         return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
     captions = " ".join(str(c.value) for c in app.get("caption"))
     check("it is labelled",
           "How far into the squash" in captions, captions[:200])
+    check("and it has a handle at each end, not just at the far one",
+          isinstance(slider.value, (list, tuple)) and len(slider.value) == 2,
+          str(slider.value))
+    check("with a box for each end beside it",
+          widget_by_label(app, "number_input", "from") is not None
+          and widget_by_label(app, "number_input", "to") is not None,
+          str([n.label for n in app.number_input]))
 
-    slider.set_value(0.35).run()
+    # The bar moves both ends at once.
+    slider.set_value((0.10, 0.35)).run()
     if not no_exception(app, "narrowed range"):
         return
-    check("the slider holds the new end",
-          abs(app.session_state["guided_window_end"] - 0.35) < 0.01,
-          str(app.session_state["guided_window_end"]))
+    check("the near end is where the bar was put",
+          abs(app.session_state["window_start"] - 0.10) < 0.01,
+          str(app.session_state["window_start"]))
+    check("and so is the far end",
+          abs(app.session_state["window_end"] - 0.35) < 0.01,
+          str(app.session_state["window_end"]))
+
+    # Typing does the same thing, and the bar follows.
+    widget_by_label(app, "number_input", "from").set_value(0.0).run()
+    if not no_exception(app, "typing the near end"):
+        return
+    check("typing the near end moves it",
+          abs(app.session_state["window_start"]) < 1e-6,
+          str(app.session_state["window_start"]))
+    check("and leaves the far end alone",
+          abs(app.session_state["window_end"] - 0.35) < 0.01,
+          str(app.session_state["window_end"]))
+    bar = widget_by_label(app, "slider", "Fitted range")
+    check("the bar shows what was typed",
+          bar is not None and abs(bar.value[0]) < 1e-6
+          and abs(bar.value[1] - 0.35) < 0.01, str(bar.value))
 
     button_by_label(app, "Fit this cell").click().run()
     if not no_exception(app, "search over the chosen range"):
@@ -1731,6 +1764,30 @@ def case_guided_range_is_settable():
     check("the fit stops where the range stopped",
           fit is not None and abs(fit["epsilon_range"][1] - 0.35) < 0.02,
           str(fit["epsilon_range"]) if fit else "no fit")
+
+
+def case_typing_the_ends_the_wrong_way_round():
+    print("typing the two ends the wrong way round does not break the page")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "range boxes"):
+        return
+    far = widget_by_label(app, "number_input", "to")
+    if far is None:
+        check("there is a box for the far end", False)
+        return
+    # Far end typed below the near end. The typed number is the one to
+    # honour, so the near end gives way rather than the number snapping
+    # back to where it was.
+    widget_by_label(app, "number_input", "from").set_value(0.40).run()
+    far = widget_by_label(app, "number_input", "to")
+    far.set_value(0.20).run()
+    if not no_exception(app, "ends typed the wrong way round"):
+        return
+    lo = app.session_state["window_start"]
+    hi = app.session_state["window_end"]
+    check("the range is still the right way round", lo < hi, f"{lo} to {hi}")
+    check("and the number just typed is the one kept",
+          abs(hi - 0.20) < 0.01, str(hi))
 
 
 def case_search_maths_is_shown():
@@ -4259,27 +4316,34 @@ def case_plot_clutter_toggles():
           "ε =" in caption(without), caption(without)[:80])
 
 
-def case_range_starts_at_zero():
-    print("the segmented range always starts at zero")
+def case_one_range_control_for_the_whole_page():
+    print("one fitted range, set in one place, whichever model is chosen")
     app = start()
-    ends = [s for s in app.slider if "fit up to" in (s.label or "").lower()]
-    check("single end-of-range slider in the segmented view", len(ends) == 1)
-    pairs = [s for s in app.slider if (s.label or "").strip() == "Fitted range"]
-    check("no two-handle range slider in the segmented view", not pairs)
-    if ends:
-        ends[0].set_value(0.35).run()
-        no_exception(app, "moving the end of the range")
+    bars = [s for s in app.slider if (s.label or "").startswith("Fitted range")]
+    check("exactly one range bar on the page", len(bars) == 1,
+          str([s.label for s in app.slider]))
+    check("and it has two handles", len(bars) == 1
+          and isinstance(bars[0].value, (list, tuple)), str(bars[0].value if bars else None))
+    if bars:
+        bars[0].set_value((0.0, 0.35)).run()
+        no_exception(app, "moving the range")
         lo, hi = app.session_state["window_combined"]
-        check("range starts at zero", lo == 0.0, str(lo))
-        check("range ends where the slider was put", abs(hi - 0.35) < 0.01, str(hi))
+        check("the combined window follows the bar", lo == 0.0 and abs(hi - 0.35) < 0.01,
+              f"{lo} to {hi}")
+        check("and so do the two numbers behind it",
+              app.session_state["window_start"] == 0.0
+              and abs(app.session_state["window_end"] - 0.35) < 0.01,
+              f"{app.session_state['window_start']} to "
+              f"{app.session_state['window_end']}")
 
-    # The other models keep the two-handle slider.
+    # Switching model does not move the range or produce a second control.
     app2 = start()
     widget_by_label(app2, "radio", "how the cell is modelled").set_value(
         "Side by side (every element acts everywhere)"
     ).run()
-    pairs = [s for s in app2.slider if (s.label or "").strip() == "Fitted range"]
-    check("two-handle slider still there for the other models", len(pairs) == 1)
+    bars = [s for s in app2.slider if (s.label or "").startswith("Fitted range")]
+    check("still one range bar for the other models", len(bars) == 1,
+          str([s.label for s in app2.slider]))
 
 
 def case_fit_stops_at_the_end_of_the_range():
@@ -4641,18 +4705,174 @@ def case_the_prefactors_are_the_papers():
           f"{model.bending_share(0.30):.4f}")
 
 
+def case_the_fit_colour_moves_with_the_range():
+    print("light blue data, a black fit, and a new fit colour per range")
+    import app as app_module
+    import plot_utils
+
+    check("data is light blue by default",
+          app_module.DEFAULTS["data_color"] == "#8ecae6",
+          app_module.DEFAULTS["data_color"])
+    check("the fit is black by default",
+          app_module.DEFAULTS["fit_color"] == "#000000",
+          app_module.DEFAULTS["fit_color"])
+    check("and the figures agree with the app about both",
+          plot_utils.PlotStyle().data_color == app_module.DEFAULTS["data_color"]
+          and plot_utils.PlotStyle().fit_color == app_module.DEFAULTS["fit_color"],
+          f"{plot_utils.PlotStyle().data_color} / {plot_utils.PlotStyle().fit_color}")
+    check("the colour walk starts on black",
+          app_module.FIT_COLORS[0] == "#000000", app_module.FIT_COLORS[0])
+    check("and every colour in it is different",
+          len(set(app_module.FIT_COLORS)) == len(app_module.FIT_COLORS),
+          str(app_module.FIT_COLORS))
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "colour walk"):
+        return
+    first = state(app, "_fit_colour_step", 0)
+    bar = widget_by_label(app, "slider", "Fitted range")
+    if bar is None:
+        check("there is a range bar to move", False)
+        return
+    bar.set_value((0.0, 0.40)).run()
+    second = state(app, "_fit_colour_step", 0)
+    check("moving the range takes the fit to the next colour",
+          second == first + 1, f"{first} then {second}")
+    widget_by_label(app, "slider", "Fitted range").set_value((0.0, 0.30)).run()
+    third = state(app, "_fit_colour_step", 0)
+    check("and moving it again takes it to the one after",
+          third == second + 1, f"{second} then {third}")
+    check("which are three different colours",
+          len({app_module.FIT_COLORS[i % len(app_module.FIT_COLORS)]
+               for i in (first, second, third)}) == 3)
+
+    # A pass that changes nothing must not change the colour, or the fit
+    # would be a different colour in every screenshot of the same range.
+    app.run()
+    check("a rerun that changes nothing leaves the colour alone",
+          state(app, "_fit_colour_step", 0) == third,
+          str(state(app, "_fit_colour_step")))
+
+
+def case_the_fixed_tick_locks_out_the_other_materials():
+    print("ticking fixed leaves one material and switches the rest off")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "before fixing"):
+        return
+    boxes = [c for c in app.checkbox if "fixed" in (c.label or "").lower()]
+    check("the tick is on the page beside the materials", len(boxes) >= 1,
+          str([c.label for c in app.checkbox][:12]))
+    if not boxes:
+        return
+    boxes[0].set_value(True).run()
+    if not no_exception(app, "ticking fixed"):
+        return
+    check("the membrane is switched off", not app.session_state["use_membrane"])
+    check("the deep element is switched off", not app.session_state["use_nucleus"])
+    check("the one material left is on", app.session_state["use_interior"])
+    # The tick is a statement about the sample, so it wins over a box left
+    # behind by an earlier cell: even with the membrane forced back on, the
+    # fit is one Hertzian solid.
+    app.session_state["use_membrane"] = True
+    app.run()
+    check("and a material switched back on behind its back is ignored",
+          state(app, "_last_fit") is not None
+          and tuple(state(app, "_last_fit")["terms"]) == ("interior",),
+          str(state(app, "_last_fit", {}).get("terms")))
+    app.session_state["use_membrane"] = False
+    app.run()
+    fit = state(app, "_last_fit")
+    check("the fit that follows has one term",
+          fit and tuple(fit["terms"]) == ("interior",),
+          str(fit["terms"]) if fit else "no fit")
+
+    # Unticking puts back what this cell type normally starts with, rather
+    # than leaving every box cleared.
+    boxes = [c for c in app.checkbox if "fixed" in (c.label or "").lower()]
+    boxes[0].set_value(False).run()
+    if not no_exception(app, "unticking fixed"):
+        return
+    check("unticking it brings the membrane back",
+          app.session_state["use_membrane"])
+    check("and the deep element", app.session_state["use_nucleus"])
+
+
+class _StubSheet:
+    """A Google Sheet with three cells in it, without a Google account."""
+
+    ROWS = [
+        {"Cell ID": "sheet-01", "Experiment Date": "2026-01-04",
+         "Young's Modulus (Em, MPa)": "1.4",
+         "Young's Modulus (Ei, kPa)": "5.1", "Operator": "DM"},
+        {"Cell ID": "sheet-02", "Experiment Date": "2026-01-05",
+         "Young's Modulus (Em, MPa)": "1.8",
+         "Young's Modulus (Ei, kPa)": "6.3", "Operator": "DM"},
+        {"Cell ID": "other-03", "Experiment Date": "2026-01-06",
+         "Young's Modulus (Em, MPa)": "2.2",
+         "Young's Modulus (Ei, kPa)": "7.7", "Operator": "AB"},
+    ]
+
+    def get_all_cells(self):
+        return pd.DataFrame(self.ROWS)
+
+    def get_spreadsheet_url(self):
+        return "https://docs.google.com/spreadsheets/d/stub"
+
+    def export_to_csv(self):
+        return self.get_all_cells().to_csv(index=False)
+
+    def export_to_json(self):
+        return self.get_all_cells().to_json(orient="records")
+
+    def get_statistics(self):
+        return {}
+
+
+def case_the_sheet_can_be_the_database():
+    print("a connected sheet is where the database tab reads from")
+    app = AppTest.from_file(APP, default_timeout=600)
+    app.run()
+    app.session_state["db_enabled"] = True
+    app.session_state["gs_manager"] = _StubSheet()
+    app.run()
+    if not no_exception(app, "the sheet as the database"):
+        return
+    shown = []
+    for element in app.get("dataframe"):
+        frame = getattr(element, "value", None)
+        if frame is not None and "Cell ID" in getattr(frame, "columns", []):
+            shown.append(frame)
+    check("the cells in the sheet are listed",
+          bool(shown) and len(shown[0]) == 3,
+          "none" if not shown else str(len(shown[0])))
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    captions = " ".join(str(c.value) for c in app.get("caption"))
+    check("it says where the rows came from",
+          "sheet" in (text + captions).lower())
+    check("and links to the sheet itself",
+          "docs.google.com/spreadsheets" in (text + captions))
+    check("with no complaint about OneDrive not being connected",
+          "No database connected" not in text)
+
+
 def case_a_fixed_cell_is_one_hertzian_solid():
     print("a fixed cell is fitted as one cross-linked solid")
     import app as app_module
-    check("it is offered as a cell type",
+    # Fixation is a state of the cell, not a kind of cell, so it is a tick
+    # beside the materials and not an entry in the dropdown.
+    check("it is not offered as a cell type",
+          "Fixed cell" not in app_module.SELECTABLE_CELL_TYPES,
+          str(app_module.SELECTABLE_CELL_TYPES))
+    check("its plausibility band is still there to switch to",
           "Fixed cell" in app_module.CELL_TYPES, str(list(app_module.CELL_TYPES)))
-    here = app_module.terms_for("Fixed cell")
+    check("and it is off unless you tick it",
+          app_module.DEFAULTS["fixed_cell"] is False)
+    here = app_module.OPTIONAL_TERMS["Fixed cell"]
     check("with exactly one material", here == ("interior",), str(here))
     check("named for what it is",
-          "fixed cell" in app_module.plain_name("interior",
-                                                "Fixed cell").lower(),
-          app_module.term_name("interior", "Fixed cell"))
-    picks = app_module.hypotheses_for("Fixed cell")
+          "fixed cell" in app_module.COMPONENT_SETS["Fixed cell"]["interior"][0].lower(),
+          app_module.COMPONENT_SETS["Fixed cell"]["interior"][0])
+    picks = app_module.HYPOTHESES["Fixed cell"]
     check("and one picture, because there is nothing to compare",
           len(picks) == 1 and picks[0]["terms"] == ("interior",), str(picks))
 
@@ -4667,7 +4887,7 @@ def case_a_fixed_cell_is_one_hertzian_solid():
 
     app = AppTest.from_file(APP, default_timeout=900)
     app.run()
-    app.session_state["cell_type"] = "Fixed cell"
+    app.session_state["fixed_cell"] = True
     app.session_state["cell_name"] = "fixed-01"
     app.session_state["data"] = {
         "epsilon": eps, "force_N": force, "source": "fixed.csv",
@@ -4689,6 +4909,11 @@ def case_a_fixed_cell_is_one_hertzian_solid():
     table = table_with(app, "Part of the cell")
     check("the table lists the one material", table is not None
           and len(table) == 1, "none" if table is None else str(len(table)))
+    # The living cell type underneath is untouched: fixation changed the
+    # chemistry, not the geometry the prefactors are built from.
+    check("and the cell type underneath is left alone",
+          app.session_state["cell_type"] == "Myoblast (C2C12)",
+          str(app.session_state["cell_type"]))
 
 
 def case_unticking_a_material_fits_without_it():
@@ -4814,6 +5039,9 @@ if __name__ == "__main__":
         case_clone_keeps_the_whole_geometry,
         case_the_cardiomyocyte_has_three_materials,
         case_the_prefactors_are_the_papers,
+        case_the_fit_colour_moves_with_the_range,
+        case_the_fixed_tick_locks_out_the_other_materials,
+        case_the_sheet_can_be_the_database,
         case_a_fixed_cell_is_one_hertzian_solid,
         case_unticking_a_material_fits_without_it,
         case_the_video_is_not_a_plot_marking,
@@ -4867,7 +5095,8 @@ if __name__ == "__main__":
         case_plot_clutter_toggles,
         case_preset_round_trip,
         case_model_names,
-        case_range_starts_at_zero,
+        case_one_range_control_for_the_whole_page,
+        case_typing_the_ends_the_wrong_way_round,
         case_composition_radios,
         case_highlight,
         case_search_beats_the_old_grid,
