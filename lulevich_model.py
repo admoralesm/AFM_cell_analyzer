@@ -1859,6 +1859,11 @@ class _CompositionMixin:
                 ) if name in errors
             },
             "nucleus_onset": float(e2),
+            # The confinement exponent this fit was made with. It multiplies
+            # every term, so a result that does not carry it cannot be
+            # written back out as an equation or checked against another
+            # cell fitted at a different q.
+            "confinement": float(self.confinement),
             "R0": self.R0, "R_nucleus": self.R_nucleus,
             "An_shell": self.An_shell, "h_envelope": self.h_envelope,
             "cell_height": self.cell_height,
