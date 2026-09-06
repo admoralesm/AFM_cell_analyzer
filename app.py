@@ -1636,16 +1636,22 @@ def separation_rule(q=None):
     )
 
 
-def open_panel(title, guided, expanded=False):
+def open_panel(title, guided, expanded=False, parent=None):
     """
     Start a section: a collapsed expander in Guided mode, a heading otherwise.
 
     Entered and exited by hand rather than with a `with` block, so the long
     bodies of these sections keep their current indentation. Streamlit
     containers support the context-manager protocol either way.
+
+    ``parent`` puts the panel inside a container staked out earlier in the
+    page. Streamlit draws things where they were created, so this is how a
+    panel whose code has to run late can still appear early: the controls
+    that change the fit belong under the button that runs it, not below the
+    curve they changed.
     """
     if guided:
-        panel = st.expander(title, expanded=expanded)
+        panel = (parent or st).expander(title, expanded=expanded)
         panel.__enter__()
         return panel
     section(title)
@@ -3353,6 +3359,47 @@ def epsilon_range_control(lo_key, hi_key, floor, ceiling, step,
     return range_bounds(lo_key, hi_key, floor, ceiling, step)
 
 
+def boundary_control(key, label, lower, upper, step, help_text=None,
+                     disabled=False):
+    """
+    One boundary, set on its own by a bar or by typing.
+
+    ``key`` is a plain session key rather than a widget key, so the search
+    buttons and the winning picture can write it at any point and these
+    widgets follow on the next pass. The two boundaries are kept apart by
+    the caller's bounds: ε₁ cannot be pushed past ε₂, and neither can leave
+    the fitted range.
+    """
+    lower, upper, step = float(lower), float(upper), float(step)
+    if upper - lower < step:
+        upper = lower + step
+    bar, box = f"{key}__bar", f"{key}__box"
+    value = float(np.clip(round(_as_float(st.session_state.get(key), lower), 4),
+                          lower, upper))
+
+    def _store(new_value):
+        st.session_state[key] = float(
+            np.clip(round(float(new_value), 4), lower, upper)
+        )
+
+    def _from_bar():
+        _store(st.session_state.get(bar, value))
+
+    def _from_box():
+        _store(st.session_state.get(box, value))
+
+    st.session_state[bar] = value
+    st.session_state[box] = value
+    st.slider(label, min_value=lower, max_value=upper, step=step, key=bar,
+              on_change=_from_bar, help=help_text, disabled=disabled)
+    st.number_input(
+        f"{label} — type it", min_value=lower, max_value=upper, step=step,
+        format="%.3f", key=box, on_change=_from_box, disabled=disabled,
+        label_visibility="collapsed",
+    )
+    return value
+
+
 # ==================================================== the archive database ==
 
 
@@ -4941,82 +4988,19 @@ with tab_analysis:
                         "fitted curve below."
                     )
 
-            # Recommended, not imposed. The search says which picture the
-            # curve supports; picking a different one is a legitimate thing
-            # to want, and having to fight the app to do it is not.
-            if guess and guess.get("success"):
-                labels = [retell(row["label"]) for row in guess["candidates"]]
-                # Which of them the page is currently set to, so the radio
-                # opens on it rather than on the winner.
-                now = (
-                    MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
-                    CYTO_CHOICES[st.session_state["cyto_starts_at"]],
-                )
-                current = next(
-                    (i for i, row in enumerate(guess["candidates"])
-                     if (row["membrane"], row["cyto_start"]) == now),
-                    0,
-                )
-                # The candidate list changes when the curve or the cell type
-                # does, and a stored choice from the last one would be
-                # applied to this one. Reset it whenever the list changes.
-                if st.session_state.get("_picture_labels") != labels:
-                    st.session_state["_picture_labels"] = labels
-                    st.session_state["picture_choice"] = labels[current]
-                    st.session_state["_applied_picture"] = labels[current]
-                picked_label = st.radio(
-                    "Which picture of the cell to use",
-                    labels, key="picture_choice", horizontal=False,
-                    help="The one marked best is what the curve supports. "
-                    "Any of them can be used instead; the page refits with "
-                    "it.",
-                )
-                # Only when the radio was actually moved. Applying it every
-                # run instead undid any other change on the page: unticking
-                # a material re-ticked itself, because the winner's own
-                # materials were being written back each time.
-                if picked_label != st.session_state.get("_applied_picture"):
-                    st.session_state["_applied_picture"] = picked_label
-                    wanted_row = guess["candidates"][labels.index(picked_label)]
-                    st.session_state["_pending_settings"] = (
-                        settings_from_hypothesis(
-                            wanted_row, epsilon_max=guided_hi,
-                            q=wanted_row.get("confinement"),
-                        )
-                    )
-                    st.rerun()
-                with st.expander("📊 The pictures compared, with their numbers"):
-                    flat_table(
-                        pd.DataFrame([
-                            {
-                                "Picture of the cell": retell(row["label"]),
-                                "Materials": " + ".join(
-                                    plain_name(term) for term in ALL_TERMS
-                                    if term in row["terms"]
-                                ),
-                                "ε₁": f"{row['break_1']:.3f}",
-                                "R²": f"{row['r_squared']:.5f}",
-                                "Predicts held-out points":
-                                    f"{row['cv_rmse']:.3g}",
-                                "Verdict": "← best" if row.get("chosen")
-                                else ("ties" if row.get("tied_with_best")
-                                      else ""),
-                            }
-                            for row in guess["candidates"]
-                        ]),
-                        align_right=["ε₁", "R²", "Predicts held-out points"],
-                        caption="Scored on points they were not fitted to, "
-                        "because adding a term can only ever lower the "
-                        "residual on the points it was given.",
-                    )
+            # No picture picker and no table of pictures compared. The
+            # search says in one line which picture the curve supports, and
+            # the way to overrule it is the controls below: change the
+            # combination, or move a boundary, and the page refits. A radio
+            # of five near-identical sentences and a table underneath it was
+            # a paragraph of reading in the middle of the one step that is
+            # meant to be press-and-look.
 
-            # The equation of the picture that won, with this cell's numbers
-            # in it. A verdict in words says which picture; this says what
-            # was actually fitted, in a form that can be checked by hand or
-            # typed into anything else.
-            equation_slot = st.expander(
-                "🧮 The model that fits best, as an equation", expanded=False
-            )
+        # Everything that changes how the fit is made, in one place, under
+        # the button that runs it and above the curve it changes. Filled by
+        # the panels further down, which is where the model, the range and
+        # the fitting options are actually built.
+        controls_slot = st.container()
 
         # The curve goes here, under the choices and the fit button, so the
         # page reads choose, fit, look. Streamlit runs top to bottom and the
@@ -5024,6 +5008,10 @@ with tab_analysis:
         # filled once it does.
         curve_slot = st.container()
         video_slot = st.container()
+        # What the cell did as it was squashed, in words and in a picture,
+        # under the curve it is describing. The numbers and the maths come
+        # after it, at the foot of the page.
+        story_slot = st.container()
 
         st.divider()
 
@@ -5032,7 +5020,8 @@ with tab_analysis:
         # already in Step 2. A page that shows every control twice is a page
         # nobody reads.
         model_panel = open_panel(
-            "⚙️ Change how the materials share the load", guided
+            "⚙️ Change how the materials share the load", guided,
+            parent=controls_slot,
         )
         if guided:
             st.caption(
@@ -5201,8 +5190,10 @@ with tab_analysis:
 
         # Which materials the curve can see at all. A recommendation, in one
         # line, next to a button: it is advice, and the ticks in step 1 stay
-        # yours.
+        # yours. It goes with the controls, above the curve, because acting
+        # on it changes what is fitted.
         if guided:
+          with controls_slot:
             picked = st.session_state.get("component_search")
             if picked and picked.get("success"):
                 names_here = components_for(st.session_state["cell_type"])
@@ -5329,7 +5320,7 @@ with tab_analysis:
 
         # --------------------------------------------------------- ranges ---
         range_panel = open_panel(
-            "📏 Step 4 · Where each material takes over", guided
+            "📏 Where each material takes over", guided, parent=controls_slot,
         )
         if not guided:
             section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
@@ -5471,6 +5462,28 @@ with tab_analysis:
                     "segment_break_2": round(new_2, 4),
                 }
                 st.rerun()
+
+            # Each boundary on its own, because most of the time only one
+            # of them is wrong. The table above moves them together and is
+            # the wrong tool for nudging ε₂ while ε₁ stays put.
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                boundary_control(
+                    "segment_break_1", "ε₁ · where the first hand-over is",
+                    lower=float(fit_lo), upper=float(break_2) - 0.005,
+                    step=float(step),
+                    help_text="Where the first material hands over. Nothing "
+                              "else moves with it.",
+                )
+            with bc2:
+                boundary_control(
+                    "segment_break_2", "ε₂ · where the deeper one is met",
+                    lower=float(break_1) + 0.005, upper=float(fit_hi),
+                    step=float(step),
+                    help_text="Where the deeper material is met. Nothing "
+                              "else moves with it.",
+                    disabled=not has_deep_term(),
+                )
 
             # Which segment to shade on the curve. Editing a boundary is much
             # easier when you can see the stretch of data it moves.
@@ -5902,7 +5915,8 @@ with tab_analysis:
         # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
         close_panel(range_panel)
 
-        fit_panel = open_panel("🔧 Step 5 · Fitting options", guided)
+        fit_panel = open_panel("🔧 Fitting options", guided,
+                               parent=controls_slot)
         if not guided:
             section("6 · Fit" if segmented else "5 · Fit")
 
@@ -6264,7 +6278,9 @@ with tab_analysis:
             }
 
             if guided:
-                plain_language_summary(fit, model)
+                with story_slot:
+                    st.markdown("#### What the cell did as it was squashed")
+                    plain_language_summary(fit, model)
                 st.divider()
                 st.markdown("#### The numbers")
 
@@ -6775,10 +6791,10 @@ with tab_analysis:
             plot_weight = float(st.session_state["plot_width"])
             if guided:
                 plot_col = curve_slot
-                # Filled now that the fit exists, into the panel staked out
-                # under the verdict.
-                with equation_slot:
-                    fitted_equation(fit, unit=style.force_unit, heading=False)
+                # The equation and the working go at the foot of the page
+                # now, after the numbers, rather than in a panel above the
+                # curve: the page reads choose, fit, look, then what the
+                # cell did, then the maths.
                 # The diagram is already drawn live in Step 2, from the same
                 # settings. Drawing it again here would be the same picture
                 # twice on one page.
@@ -6841,14 +6857,6 @@ with tab_analysis:
                         plot_option_controls()
                 with o2:
                     save_plot_controls(figure, fit, date_acquired)
-
-                with st.expander("∑ How this fit was calculated", expanded=False):
-                    show_fit_maths(fit, model)
-
-                with st.expander(
-                    "∑ What “Work it out for me” does, in maths", expanded=False
-                ):
-                    show_search_maths()
 
             panel_index = 0
             if show_schematic and panel_index < len(panel_cols):
@@ -7129,6 +7137,22 @@ with tab_analysis:
                     f"(F_deep = An*En*<eps-eps2>^1.5)",
                     language="text",
                 )
+
+            # ---------------------------------------------- the maths last
+            # The page reads: choose, fit, look at the curve, read what the
+            # cell did, and only then the equation and the working. Putting
+            # the maths under the plot, as it was, meant scrolling past it
+            # to reach the numbers it was the working for.
+            st.markdown("#### The model, written out")
+            fitted_equation(fit, unit=style.force_unit, heading=False)
+
+            with st.expander("∑ How this fit was calculated", expanded=False):
+                show_fit_maths(fit, model)
+
+            with st.expander(
+                "∑ What “Work it out for me” does, in maths", expanded=False
+            ):
+                show_search_maths()
 
         section("7 · Video and database" if segmented else "6 · Video and database")
         store = st.session_state.get("onedrive_store")
