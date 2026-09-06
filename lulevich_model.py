@@ -1995,9 +1995,11 @@ class _CompositionMixin:
         if rupture.get("epsilon") is not None and rupture.get("method") == "force-drop":
             end = min(end, float(rupture["epsilon"]) * 0.98)
             note_end = f"just before the force drop at ε = {rupture['epsilon']:.3f}"
-        if end > 0.70:
-            end = min(end, 0.70)
-            note_end = "ε = 0.70, past which the geometry stops describing a cell"
+        # No cap on the far end. The whole measured curve is the default,
+        # because a range that quietly stops at 70 % is a range nobody chose
+        # and a fit nobody can compare with the next cell's. Where the
+        # geometry stops describing a cell is worth saying, and it is said,
+        # next to a slider that moves.
 
         if not (start < end):
             start, end = float(eps.min()), top
@@ -2841,12 +2843,25 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
 
     @property
     def Ai(self):
-        """Hertzian prefactor: F_interior = Ai * Ei * e^1.5  [N/Pa]."""
+        """
+        Hertzian prefactor: F_interior = Ai * Ei * e^1.5  [N/Pa].
+
+        This is Lulevich 2006 eq 6 exactly,
+
+            F_i = sqrt(2) E_i R0^2 e^(3/2) / (3 (1 - nu_i^2)),
+
+        the compression of a homogeneous sphere between two plates, which is
+        what the paper fits to dead cells (4-7.5 kPa) and fixed cells
+        (150-230 kPa).
+
+        It used to be written with sqrt(R0) * h0^1.5 in place of R0^2. Those
+        two never agree: their ratio is (h0/R0)^1.5, which is 2.83 for a
+        sphere and about 2.45 for the cell shapes here, and it went straight
+        into every interior modulus this app reported. Matching the paper's
+        own equation is the whole point of matching the paper's own numbers.
+        """
         return (
-            np.sqrt(2.0)
-            * np.sqrt(self.R0)
-            * self.cell_height ** 1.5
-            / (3.0 * (1.0 - self.nu_i ** 2))
+            np.sqrt(2.0) * self.R0 ** 2 / (3.0 * (1.0 - self.nu_i ** 2))
         )
 
     def sarcomere_at(self, epsilon, spread=1.0):
@@ -2917,28 +2932,43 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
     @property
     def Ab(self):
         """
-        Shell bending prefactor: F_bending = Ab * E_bend * e  [N/Pa].
+        Shell bending prefactor: F_bending = Ab * E_m * e^(1/2)  [N/Pa].
 
-        Reissner's thin spherical shell: F = 4 E h^2 d / (R sqrt(3(1-nu^2))).
+        Lulevich 2006 eq 1 and eq 5:
 
-        Note what this is, and what it is not. It is linear in e, and so is
-        the in-plane tension term, which means the two are the SAME column of
-        the design matrix. No fit can separate them, because there is nothing
-        to separate: they differ only in what the fitted number is called and
-        how it is converted back into a material property. A fitted in-plane
-        tension T0 is the same measurement as a bending modulus
-        E_bend = T0 * At / Ab, and which one you quote is a claim about the
-        cell, not a result from the curve.
+            F_bending = pi E_m h^2 e^(1/2) / (2 sqrt(2))
 
-        That is worth stating plainly, because "add a bending term" sounds
-        like it would give the model somewhere new to go, and it does not.
-        The only way to add a genuinely new element is to add a new *shape*:
-        a different power of e, or the same power starting somewhere else.
+        Note the exponent. It is one half, not one, so bending is a shape
+        of its own and not the same column as anything else in the model.
+        An earlier version of this used Reissner's linear form and said
+        plainly that bending and the in-plane tension were one column; the
+        paper's own bending term says otherwise, and the paper is the
+        authority here.
+
+        What has not changed is that it is negligible. The paper's eq 2 puts
+        the ratio of bending to stretching at (h/R)/e^(5/2), which for a
+        4 nm shell on a 5 um cell is under 0.05 at e = 0.1 to 0.3, and for
+        dead cells it computes to under 1 nN against loads of hundreds. So
+        it is offered here as a number to check, not as a term to fit: a
+        column that small is a column whose modulus the curve cannot
+        determine.
         """
-        return (
-            4.0 * self.h_shell ** 2 * self.cell_height
-            / (self.R0 * np.sqrt(3.0 * (1.0 - self.nu_m ** 2)))
-        )
+        return np.pi * self.h_shell ** 2 / (2.0 * np.sqrt(2.0))
+
+    def bending_force(self, epsilon, modulus):
+        """The paper's eq 5, in newtons, for a shell of this thickness."""
+        eps = np.clip(np.asarray(epsilon, dtype=float), 0.0, None)
+        return self.Ab * float(modulus) * np.sqrt(eps)
+
+    def bending_share(self, epsilon):
+        """
+        Lulevich eq 2: how big bending is next to stretching, as a ratio.
+
+        Under about 0.05 is where the paper drops the bending term, and
+        that is what this number is for: checking rather than assuming.
+        """
+        eps = np.clip(np.asarray(epsilon, dtype=float), 1e-9, None)
+        return (self.h_shell / self.R0) / eps ** 2.5
 
     @property
     def At(self):
@@ -2969,16 +2999,14 @@ class LulevichModel(_CouplingMixin, _SegmentedMixin, _ExploreMixin, _Composition
     def An(self):
         """Deep prefactor: F_deep = An * En * <e - e_onset>^1.5  [N/Pa].
 
-        Uses the nucleus radius by default. A cardiomyocyte's myofibrils are
-        not a compact body at the centre, they run the length of the cell, so
+        The same Hertzian law as ``Ai``, Lulevich eq 6, with the deep body's
+        own radius. A cardiomyocyte's myofibrils are not a compact body at
+        the centre, they run the length of the cell, so
         ``deep_uses_cell_radius`` puts the cell's own radius here instead.
         """
         radius = self.R0 if self.deep_uses_cell_radius else self.R_nucleus
         return (
-            np.sqrt(2.0)
-            * np.sqrt(radius)
-            * self.cell_height ** 1.5
-            / (3.0 * (1.0 - self.nu_n ** 2))
+            np.sqrt(2.0) * radius ** 2 / (3.0 * (1.0 - self.nu_n ** 2))
         )
 
     @property
