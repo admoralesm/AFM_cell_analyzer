@@ -272,13 +272,29 @@ def force_curve_figure(
         if log_mode:
             keep = (fx > 0) & (fy > 0)
             fx, fy = fx[keep], fy[keep]
+        # A white line under the model and a solid one over it. Dashed and
+        # the same width as the markers, the model line disappeared into a
+        # dense band of points: the halo is what makes it read as a line
+        # over the data rather than as part of it, whatever colour either
+        # of them is set to.
         fig.add_trace(
             go.Scatter(
                 x=fx,
                 y=fy,
                 mode="lines",
                 name="Model",
-                line=dict(color=style.fit_color, width=style.line_width, dash="dash"),
+                showlegend=False,
+                hoverinfo="skip",
+                line=dict(color="white", width=style.line_width + 5),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=fx,
+                y=fy,
+                mode="lines",
+                name="Model",
+                line=dict(color=style.fit_color, width=style.line_width + 1),
                 hovertemplate="ε = %{x:.4f}<br>F(model) = %{y:.4g} " + unit_label + "<extra></extra>",
             )
         )
