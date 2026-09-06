@@ -376,10 +376,12 @@ def hint(text: str):
 DEFAULTS = {
     # display
     "force_unit": "N",
-    # Light blue for the measurement, black for the model drawn over it.
+    # A solid blue for the measurement, black for the model drawn over it.
     # The eye separates them by lightness rather than by hue, which survives
-    # a greyscale print and colour blindness both.
-    "data_color": "#8ecae6",
+    # a greyscale print and colour blindness both. The pale blue this used
+    # to be was too faint to see at small marker sizes and printed as
+    # almost nothing.
+    "data_color": "#1668b3",
     "fit_color": "#000000",
     # A different colour for the fit every time the fitted range moves, so
     # two screenshots taken from different ranges cannot be mistaken for one
@@ -389,6 +391,10 @@ DEFAULTS = {
     "line_width": 3,
     "plot_height": 520,
     "show_grid": False,
+    # The line in the corner of the plot saying which stretch of the curve
+    # the numbers came from. On, because a figure without it cannot be
+    # checked once it has left the app.
+    "show_range_note": True,
     "axis_title_size": 28,
     "tick_size": 22,
     "axis_width": 4,
@@ -846,6 +852,167 @@ def show_search_maths():
     )
 
 
+# Each fitted term: where its prefactor and its modulus are kept, and the
+# shape of ε it multiplies. One table, so the equation on the page and the
+# equation in the code cannot drift apart.
+EQUATION_TERMS = {
+    "tension": ("At", "T0", "A_t", "T_0"),
+    "membrane": ("Am", "Em", "A_m", "E_m"),
+    "cortex": ("Ai", "Ecx", "A_i", "E_{cx}"),
+    "interior": ("Ai", "Ei", "A_i", "E_c"),
+    "nucleus_shell": ("An_shell", "Ene", "A_{ne}", "E_{ne}"),
+    "nucleus": ("An", "En", "A_n", "E_n"),
+}
+
+
+def _basis_latex(term, fit):
+    """The shape of ε one term multiplies, as written in the fit."""
+    mode = fit.get("membrane", "continue")
+    from_break = fit.get("cyto_start") == "break"
+    # The shell has three histories, not two: it can carry on stretching,
+    # hold what it reached at ε₁, or only start stretching there.
+    shell = {
+        "freeze": r"\min(\varepsilon,\ \varepsilon_1)",
+        "late": r"\langle \varepsilon - \varepsilon_1 \rangle",
+    }.get(mode, r"\varepsilon")
+    if term == "tension":
+        return shell
+    if term == "membrane":
+        return shell + "^{3}"
+    if term == "cortex":
+        return r"\varepsilon^{3/2}"
+    if term == "interior":
+        return (r"\langle \varepsilon - \varepsilon_1 \rangle^{3/2}"
+                if from_break else r"\varepsilon^{3/2}")
+    if term == "nucleus_shell":
+        return r"\langle \varepsilon - \varepsilon_2 \rangle^{3}"
+    return r"\langle \varepsilon - \varepsilon_2 \rangle^{3/2}"
+
+
+def equation_pieces(fit):
+    """
+    The fitted model, term by term: symbol, shape of ε, and coefficient.
+
+    The coefficient is the prefactor times the modulus, in newtons, which is
+    the number actually multiplying that shape of ε. Written this way the
+    equation on the page can be evaluated by hand and checked against the
+    drawn curve, which is the whole point of printing it.
+    """
+    if not (fit and fit.get("success")):
+        return []
+    pieces = []
+    for term in ("tension", "membrane", "cortex", "interior",
+                 "nucleus_shell", "nucleus"):
+        if term not in (fit.get("terms") or ()):
+            continue
+        a_key, e_key, a_tex, e_tex = EQUATION_TERMS[term]
+        prefactor = float(fit.get(a_key, float("nan")))
+        modulus = float(fit.get(e_key, float("nan")))
+        if not (np.isfinite(prefactor) and np.isfinite(modulus)):
+            continue
+        pieces.append({
+            "term": term,
+            "name": plain_name(term),
+            "prefactor": prefactor,
+            "modulus": modulus,
+            "coefficient_N": prefactor * modulus,
+            "symbols": f"{a_tex} {e_tex}",
+            "basis": _basis_latex(term, fit),
+        })
+    return pieces
+
+
+def _sci_latex(value, digits=3):
+    """A number as LaTeX, in scientific notation where that reads better."""
+    if not np.isfinite(value):
+        return r"\mathrm{n/a}"
+    if value == 0:
+        return "0"
+    power = int(np.floor(np.log10(abs(value))))
+    if -2 <= power <= 3:
+        return f"{value:.{digits}g}"
+    mantissa = value / (10.0 ** power)
+    return f"{mantissa:.{digits}g} \\times 10^{{{power}}}"
+
+
+def fitted_equation(fit, unit="nN", heading=True):
+    """
+    The model that fits best, written out twice: as symbols and as numbers.
+
+    The symbolic line says what was assumed. The numeric line is that same
+    equation with this cell's numbers in it, so it can be typed into
+    anything and evaluated, and so two cells can be compared as equations
+    rather than as tables of moduli.
+    """
+    pieces = equation_pieces(fit)
+    if not pieces:
+        st.caption("Fit the curve and the equation appears here.")
+        return
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    factor, unit_label = FORCE_UNITS.get(unit, (1e9, "nN"))
+    confine = (r"(1-\varepsilon)^{-" + f"{q:g}" + r"}\," ) if q else ""
+    bracket_open, bracket_close = (r"\left[", r"\right]") if q and len(pieces) > 1 else ("", "")
+
+    if heading:
+        st.markdown("**The model that fits best, written out**")
+    st.latex(
+        r"F(\varepsilon) = " + confine + bracket_open
+        + " + ".join(f"{p['symbols']}\\, {p['basis']}" for p in pieces)
+        + bracket_close
+    )
+    st.latex(
+        r"\frac{F(\varepsilon)}{\mathrm{" + unit_label + r"}} = " + confine
+        + bracket_open
+        + " + ".join(
+            _sci_latex(p["coefficient_N"] * factor) + r"\," + p["basis"]
+            for p in pieces
+        )
+        + bracket_close
+    )
+    e1 = fit.get("break_1")
+    e2 = fit.get("break_2")
+    boundaries = []
+    if any(p["term"] in ("tension", "membrane", "interior") for p in pieces) \
+            and e1 is not None:
+        boundaries.append(f"ε₁ = {float(e1):.3f}")
+    if any(p["term"] in ("nucleus", "nucleus_shell") for p in pieces) \
+            and e2 is not None:
+        boundaries.append(f"ε₂ = {float(e2):.3f}")
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    st.caption(
+        "⟨x⟩ is x where x is positive and zero before that, so each term "
+        "contributes nothing until its boundary. "
+        + ("The bracket is multiplied by the confinement factor, the cell "
+           f"running out of room to spread, measured here as q = {q:g}. "
+           if q else "")
+        + ("Boundaries: " + ", ".join(boundaries) + ". " if boundaries else "")
+        + f"Fitted over ε = {lo:.3f} to {hi:.3f}."
+    )
+    rows = []
+    for piece in pieces:
+        key, unit_name, std_key = MODULUS_FIELDS[piece["term"]]
+        value = fit.get(key)
+        error = fit.get(std_key)
+        rows.append({
+            "element": piece["name"],
+            "modulus": (f"{float(value):.4g} {unit_name}"
+                        if value is not None and np.isfinite(float(value))
+                        else "n/a"),
+            "± (fit)": (f"{float(error):.2g} {unit_name}"
+                        if error is not None and np.isfinite(float(error))
+                        else "n/a"),
+            "prefactor (N/Pa)": f"{piece['prefactor']:.5g}",
+            f"coefficient ({unit_label})": f"{piece['coefficient_N'] * factor:.5g}",
+        })
+    flat_table(
+        pd.DataFrame(rows),
+        align_right=["modulus", "± (fit)", "prefactor (N/Pa)",
+                     f"coefficient ({unit_label})"],
+        caption="Each coefficient is that element's prefactor times its "
+                "modulus: the number in front of its shape of ε above.",
+    )
+
+
 def show_fit_maths(fit, model):
     """
     The arithmetic behind the numbers, with this cell's values in it.
@@ -956,6 +1123,11 @@ def show_fit_maths(fit, model):
                 "layers are given different onsets and the two membrane "
                 "springs different laws."
             )
+
+    st.markdown("**1c · The same model with this cell's numbers in it**")
+    fitted_equation(fit, unit=st.session_state.get("force_unit", "nN")
+                    if st.session_state.get("force_unit") != "auto" else "nN",
+                    heading=False)
 
     st.markdown("**2 · The geometry, fixed before fitting**")
     st.latex(
@@ -1685,6 +1857,14 @@ def plot_option_controls():
         "force it is carrying there, so you can read each contribution "
         "off the plot without hovering.",
     )
+    st.checkbox(
+        "Note saying which range was fitted", key="show_range_note",
+        disabled=bare,
+        help="A line in the corner with the stretch of the curve the "
+        "numbers came from, how many points that was, and how well the "
+        "model followed it. A figure that leaves the room without its "
+        "range on it cannot be checked later.",
+    )
     st.checkbox("Legend", key="show_legend", disabled=bare)
 
     st.markdown("**Axes**")
@@ -1723,6 +1903,7 @@ PLOT_EXTRAS = (
     "show_rupture_marker",
     "show_legend",
     "show_component_heights",
+    "show_range_note",
 )
 
 
@@ -1759,6 +1940,66 @@ def plot_flags(state):
     return {name: (not bare) and value(name) for name in PLOT_EXTRAS}
 
 
+def view_token():
+    """
+    What the zoom belongs to.
+
+    Plotly keeps the view across a redraw for as long as this does not
+    change. It has to change when the numbers on the axes stop meaning what
+    they meant: another curve, another force unit, a log axis, or a pinned
+    range. It must not change when a fit is pressed, which is the whole
+    point: a fit run while zoomed in used to throw the view back out to the
+    whole curve.
+    """
+    data = st.session_state.get("data") or {}
+    epsilon = data.get("epsilon")
+    return "|".join(str(part) for part in (
+        data.get("source", "none"),
+        int(np.size(epsilon)) if epsilon is not None else 0,
+        st.session_state.get("force_unit"),
+        bool(st.session_state.get("log_scale")),
+        st.session_state.get("x_axis_mode"),
+        st.session_state.get("y_axis_mode"),
+    ))
+
+
+def fit_range_note():
+    """
+    The line printed in the corner of the curve: what was fitted, and how well.
+
+    Read off the fit when there is one, because that is the range the
+    numbers actually came from, and off the chosen range before that, so
+    the plot says what is about to be fitted rather than nothing.
+    """
+    fit = st.session_state.get("_last_fit")
+    epsilon = (st.session_state.get("data") or {}).get("epsilon")
+    if fit and fit.get("success"):
+        lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+        bits = [f"fitted ε = {lo:.3f} to {hi:.3f}"]
+        points = fit.get("n_points")
+        if points:
+            bits.append(f"{int(points)} points")
+        r2 = fit.get("r_squared")
+        if r2 is not None and np.isfinite(r2):
+            bits.append(f"R² = {r2:.5f}")
+        q = fit.get("confinement")
+        if q:
+            bits.append(f"q = {float(q):.2f}")
+        return "  ·  ".join(bits)
+
+    lo, hi = range_bounds(
+        "window_start", "window_end", 0.0,
+        float(np.max(epsilon)) if epsilon is not None and np.size(epsilon)
+        else 1.0,
+        0.005,
+    )
+    inside = (
+        int(((epsilon >= lo) & (epsilon <= hi)).sum())
+        if epsilon is not None and np.size(epsilon) else 0
+    )
+    return f"range to fit: ε = {lo:.3f} to {hi:.3f}  ·  {inside} points"
+
+
 def current_style(force_N=None) -> PlotStyle:
     """Build the PlotStyle from the sidebar settings, honouring auto units."""
     unit = st.session_state["force_unit"]
@@ -1792,6 +2033,8 @@ def current_style(force_N=None) -> PlotStyle:
         show_rupture_marker=on("show_rupture_marker"),
         show_legend=on("show_legend"),
         show_component_heights=on("show_component_heights"),
+        range_note=fit_range_note() if on("show_range_note") else None,
+        uirevision=view_token(),
         # Not a marking: the fitted curve is the result, so the bare switch
         # leaves it alone and only its own checkbox removes it.
         # Neither the data nor the fit is a "marking", so the bare switch
@@ -2004,6 +2247,10 @@ def fixed_cell_control():
         if st.session_state.get("fixed_cell"):
             for term in ALL_TERMS:
                 st.session_state[f"use_{term}"] = term == "interior"
+            # One solid, loaded from first contact. Left at "at ε₁" the one
+            # term would start partway along and the early curve would have
+            # nothing fitting it at all.
+            st.session_state["cyto_starts_at"] = "from the very start"
         else:
             wanted = DEFAULT_TERMS_BY_TYPE.get(
                 st.session_state.get("cell_type"), {}
@@ -2013,16 +2260,19 @@ def fixed_cell_control():
 
     st.checkbox(
         "🧊 Chemically fixed cell", key="fixed_cell", on_change=_changed,
-        help="Fixation cross-links protein to protein throughout, so "
-        "membrane, cytoskeleton and nucleus stop being separate materials "
-        "and the cell becomes one solid. That is Lulevich eq 6, a Hertzian "
-        "contact over the whole curve, and it has one modulus. The other "
-        "materials are switched off while this is ticked because there is "
-        "nothing left for them to be told apart by.",
+        help="Fixation cross-links protein to protein throughout, so the "
+        "membrane stops being a shell that stretches and the cell becomes "
+        "solid. That is Lulevich eq 6, a Hertzian contact, and the "
+        "materials below become cross-linked solids rather than layers of "
+        "a living cell.",
     )
     if fixed_cell_on():
         st.caption(
-            "One material, one modulus. Published fixed cells sit near "
+            "Hertzian terms only, all ε³ᐟ². One is the usual case. A fixed "
+            "cardiomyocyte may need two or three, cross-linked bundles "
+            "being stiffer than the cytoplasm around them, and the only "
+            "thing that tells them apart is where each one starts: at "
+            "contact, at ε₁, at ε₂. Published whole fixed cells sit near "
             "150 to 230 kPa."
         )
 
@@ -2244,10 +2494,28 @@ COMPONENT_SETS = {
     # elastic-sphere limit of the same model: the ε³ shell term has nothing
     # separate left to describe, and a fit offered one will split the curve
     # between two terms that are no longer two materials.
+    # More than one Hertzian term is allowed here, and for a fixed
+    # cardiomyocyte it is the interesting case: fixation cross-links the
+    # myofibril bundles into something stiffer than the cytoplasm around
+    # them, and the plates meet that only after they have squashed past the
+    # softer material. Every term obeys the same ε^3/2 law, so what tells
+    # them apart is where each one starts and nothing else. Two terms with
+    # the same law and the same onset are one term with two names, which is
+    # why each of these begins somewhere different.
     "Fixed cell": {
+        "cortex": (
+            "🧊 Outer solid, from contact",
+            "the outermost cross-linked layer, loaded from first touch",
+        ),
         "interior": (
-            "🧊 The whole fixed cell",
-            "one cross-linked solid, squeezed between two plates",
+            "🧊 The fixed cell",
+            "one cross-linked solid; from first contact on its own, or "
+            "from ε₁ when an outer solid is ticked as well",
+        ),
+        "nucleus": (
+            "🧱 A deeper, stiffer solid, from ε₂",
+            "a second Hertzian body met further in, such as fixed "
+            "myofibril bundles",
         ),
     },
 }
@@ -2349,6 +2617,20 @@ HYPOTHESES = {
             "terms": ("interior",),
             "membrane": "continue", "cyto_start": "zero",
         },
+        {
+            "key": "two_solids",
+            "label": "One solid, then a stiffer one deeper in",
+            "detail": "a second Hertzian body met at ε₂",
+            "terms": ("interior", "nucleus"),
+            "membrane": "continue", "cyto_start": "zero",
+        },
+        {
+            "key": "three_solids",
+            "label": "Three solids, each met further in",
+            "detail": "Hertzian from contact, from ε₁ and from ε₂",
+            "terms": ("cortex", "interior", "nucleus"),
+            "membrane": "continue", "cyto_start": "break",
+        },
     ],
     "Myoblast (C2C12)": [
         {
@@ -2417,8 +2699,9 @@ def hypotheses_for(cell_type, terms=None):
     onto the same set of materials and the same order are one picture.
     """
     if fixed_cell_on():
-        # Nothing to compare: one material admits one picture, and offering
-        # a choice between a thing and itself is worse than saying so.
+        # One solid, two, or three, told apart by where each starts. Which
+        # of them is on the list is decided by the boxes, the same as for a
+        # living cell.
         found = HYPOTHESES[FIXED_TYPE]
     elif cell_type in INCOMPRESSIBLE_INTERIOR:
         found = cardiomyocyte_hypotheses()
@@ -2488,8 +2771,10 @@ OPTIONAL_TERMS = {
     # The nucleus is two elements, an envelope and what it contains.
     "Myoblast (C2C12)": ("membrane", "interior", "nucleus_shell", "nucleus"),
     "Custom": ("membrane", "interior", "nucleus_shell", "nucleus"),
-    # One material, one modulus. Everything else about the fit is the same.
-    "Fixed cell": ("interior",),
+    # Hertzian terms only, told apart by where each starts: from contact,
+    # from ε₁, from ε₂. One is the usual case; a fixed cardiomyocyte may
+    # want two or three.
+    "Fixed cell": ("cortex", "interior", "nucleus"),
 }
 
 # Which of those are ticked when the cell type is chosen.
@@ -2602,9 +2887,9 @@ def components_for(cell_type):
         **COMPONENT_SETS.get(cell_type, DEFAULT_COMPONENTS),
     )
     if fixed_cell_on():
-        # The one material left is the whole cell, so it is named that way
-        # rather than keeping the living cell's word for its filling.
-        names["interior"] = COMPONENT_SETS[FIXED_TYPE]["interior"]
+        # The materials left are cross-linked solids, so they are named that
+        # way rather than keeping the living cell's words for its layers.
+        names.update(COMPONENT_SETS[FIXED_TYPE])
     return names
 
 
@@ -2775,9 +3060,12 @@ def active_terms():
     """
     available = terms_for(st.session_state.get("cell_type"))
     if fixed_cell_on():
-        # The tick wins over whatever the boxes are left showing, the same
-        # way a knockout does below: it is a statement about the sample.
-        return ("interior",)
+        # Only the Hertzian terms, whichever of them are ticked, and never
+        # the shell terms: a fixed cell has no separate membrane to stretch.
+        # At least one has to be on, or there is no model at all.
+        on = tuple(t for t in available
+                   if st.session_state.get(f"use_{t}", False))
+        return on or ("interior",)
     on = tuple(t for t in available if st.session_state.get(f"use_{t}", False))
     if str(st.session_state.get("membrane_protein", "")).startswith("Removed"):
         on = tuple(t for t in on if t != "tension")
@@ -4504,12 +4792,10 @@ with tab_analysis:
             with pick_col:
                 st.caption("Materials")
                 fixed_cell_control()
-                locked = fixed_cell_on()
                 for term in here:
                     st.checkbox(
                         f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                         key=f"use_{term}", help=names[term][1],
-                        disabled=locked and term != "interior",
                     )
             with range_col:
                 st.caption("How far into the squash")
@@ -4676,6 +4962,14 @@ with tab_analysis:
                         "residual on the points it was given.",
                     )
 
+            # The equation of the picture that won, with this cell's numbers
+            # in it. A verdict in words says which picture; this says what
+            # was actually fitted, in a form that can be checked by hand or
+            # typed into anything else.
+            equation_slot = st.expander(
+                "🧮 The model that fits best, as an equation", expanded=False
+            )
+
         # The curve goes here, under the choices and the fit button, so the
         # page reads choose, fit, look. Streamlit runs top to bottom and the
         # fit does not exist yet, so the containers are staked out and
@@ -4736,12 +5030,10 @@ with tab_analysis:
                 st.markdown("**1 · Which materials**")
                 names = components_for(st.session_state["cell_type"])
                 fixed_cell_control()
-                locked = fixed_cell_on()
                 for term in terms_for(st.session_state["cell_type"]):
                     st.checkbox(
                         f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                         key=f"use_{term}",
-                        disabled=locked and term != "interior",
                     )
 
         active = active_terms()
@@ -6435,6 +6727,10 @@ with tab_analysis:
             plot_weight = float(st.session_state["plot_width"])
             if guided:
                 plot_col = curve_slot
+                # Filled now that the fit exists, into the panel staked out
+                # under the verdict.
+                with equation_slot:
+                    fitted_equation(fit, unit=style.force_unit, heading=False)
                 # The diagram is already drawn live in Step 2, from the same
                 # settings. Drawing it again here would be the same picture
                 # twice on one page.
