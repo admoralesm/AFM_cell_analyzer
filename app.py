@@ -12,6 +12,7 @@ import importlib
 import io
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime
 
@@ -191,26 +192,104 @@ def figure_kwargs(function, **kwargs):
     return {name: value for name, value in kwargs.items() if name in accepted}
 
 
+# Where this app is, and where its companion files should be. On a hosted
+# deployment the working directory is not always the folder holding app.py,
+# and the main file can be nested a level below the repository root while
+# the companions sit at the top. Both folders go on the import path so that
+# either arrangement works.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(APP_DIR)
+for _folder in (APP_DIR, REPO_DIR, os.getcwd()):
+    if _folder and _folder not in sys.path:
+        sys.path.insert(0, _folder)
+
+
+def companion_files():
+    """Every .py file the app can see beside itself, for the error messages."""
+    try:
+        return sorted(
+            name for name in os.listdir(APP_DIR) if name.endswith(".py")
+        )
+    except OSError:  # pragma: no cover - unreadable folder
+        return []
+
+
+def _find_companion_file(name, depth=2):
+    """Look for `name`.py near the app: beside it, above it, one or two
+    folders down from either. Returns the path, or None."""
+    wanted = f"{name}.py"
+    roots, seen = (APP_DIR, REPO_DIR, os.getcwd()), set()
+    for root in roots:
+        if not root or root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        base = root.rstrip(os.sep).count(os.sep)
+        for folder, subfolders, files in os.walk(root):
+            # Caches, virtual environments and hidden folders are not the
+            # repository; walking into site-packages would take seconds.
+            subfolders[:] = [
+                d for d in subfolders
+                if not d.startswith((".", "__"))
+                and d not in ("site-packages", "node_modules", "venv", "env")
+            ]
+            if folder.rstrip(os.sep).count(os.sep) - base >= depth:
+                subfolders[:] = []
+            if wanted in files:
+                return os.path.join(folder, wanted)
+    return None
+
+
+def import_companion(name):
+    """
+    Import one of this app's own modules, wherever in the repo it ended up.
+
+    Returns (module, error_text). A plain import is tried first, and only
+    if that fails is the file hunted for and loaded from its path. That
+    second attempt is what makes a deployment work when the main file and
+    its companions are not in the same folder, which is a mistake that
+    otherwise shows up as "no module named ..." and nothing else.
+    """
+    import importlib.util
+
+    try:
+        return importlib.import_module(name), None
+    except Exception as exc:  # pragma: no cover - depends on the deployment
+        first = f"{type(exc).__name__}: {exc}"
+
+    path = _find_companion_file(name)
+    if path is None:
+        return None, first
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module, None
+    except Exception as exc:  # pragma: no cover
+        return None, f"{first}; and loading {path} failed with {exc}"
+
+
 # Optional dependencies: the app must still run without Google credentials
 # or the Igor toolchain installed.
-try:
-    from google_sheets_manager import initialize_sheets_manager
+_sheets, SHEETS_IMPORT_ERROR = import_companion("google_sheets_manager")
+initialize_sheets_manager = (
+    getattr(_sheets, "initialize_sheets_manager", None) if _sheets else None
+)
+if _sheets is not None and initialize_sheets_manager is None:
+    SHEETS_IMPORT_ERROR = (
+        "google_sheets_manager.py loaded but has no initialize_sheets_manager; "
+        "it is an older version than this app expects."
+    )
 
-    SHEETS_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on local install
-    initialize_sheets_manager = None
-    SHEETS_IMPORT_ERROR = str(exc)
-
-try:
-    import onedrive_store
-    from onedrive_store import OneDriveStore, OneDriveError
-
-    ONEDRIVE_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover
+onedrive_store, ONEDRIVE_IMPORT_ERROR = import_companion("onedrive_store")
+OneDriveStore = getattr(onedrive_store, "OneDriveStore", None)
+OneDriveError = getattr(onedrive_store, "OneDriveError", Exception)
+if onedrive_store is not None and OneDriveStore is None:
+    ONEDRIVE_IMPORT_ERROR = (
+        "onedrive_store.py loaded but has no OneDriveStore in it; it is an "
+        "older version than this app expects."
+    )
     onedrive_store = None
-    OneDriveStore = None
-    OneDriveError = Exception
-    ONEDRIVE_IMPORT_ERROR = str(exc)
 
 
 def onedrive_load_problem():
@@ -226,13 +305,28 @@ def onedrive_load_problem():
         return None
     text = str(ONEDRIVE_IMPORT_ERROR)
     if "onedrive_store" in text and "No module named" in text:
+        # The app has already searched for the file beside itself, one
+        # folder up and two folders down, so by the time this is reached it
+        # is genuinely not there under that name. Saying which folder was
+        # looked in, and what is in it, is the difference between a message
+        # somebody can act on and one they read three times.
+        seen = companion_files()
         return (
-            "**`onedrive_store.py` is not in the app folder.** It sits "
-            "beside `app.py`, and the app cannot archive anything without "
-            "it. Add that file to the repository, in the same folder as "
-            "`app.py`, commit it, and reboot the app. Nothing else needs "
-            "changing, and no secrets are involved at this stage: this is "
-            "a missing file, not a failed sign-in."
+            "**`onedrive_store.py` is not in this app's folder.**\n\n"
+            f"The app is running from `{APP_DIR}`, and it also looked in "
+            f"`{REPO_DIR}` and in the folders under both. The Python files "
+            "it can actually see beside itself are:\n\n"
+            + ("\n".join(f"- `{name}`" for name in seen)
+               if seen else "- (none)")
+            + "\n\nIf `onedrive_store.py` is not in that list, the copy in "
+            "your repository is not reaching the deployment. The usual "
+            "causes, in the order they happen: the file was uploaded to a "
+            "different branch from the one the app deploys; the name is not "
+            "exactly `onedrive_store.py` (a browser can save it as "
+            "`onedrive_store.py.txt`, and capitals matter here); or the app "
+            "has not been rebooted since the commit. Check the file's page "
+            "on GitHub shows Python, not plain text, and that it sits in "
+            "the same folder as `app.py` on the branch the app deploys."
         )
     if "No module named" in text:
         missing = text.split("No module named", 1)[1].strip().strip("'\"")
