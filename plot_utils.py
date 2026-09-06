@@ -1104,7 +1104,7 @@ def balloon_figure(
                 arrowcolor="#e67e22", text="",
             )
         fig.add_annotation(
-            x=centre_x, y=centre_y + half_height * 0.06,
+            x=centre_x, y=centre_y + half_height * 0.45,
             text="<i>fluid, does not compress</i>", showarrow=False,
             font=dict(size=max(8, style.tick_size - 11), color="#b9770e"),
         )
@@ -1197,33 +1197,42 @@ def balloon_figure(
                     line=dict(color=strong if reached else faint, width=3.5,
                               shape="spline"),
                 ))
-        # Two names for the two things, when the model carries both.
-        if interior == "fluid" or not (show_nucleus_shell and show_nucleus_inside):
-            deep_label = names["nucleus"][0] if not show_nucleus_shell \
-                else names["nucleus_shell"][0]
-        else:
-            deep_label = (f"{names['nucleus_shell'][0]}"
-                          f"<br>around {names['nucleus'][0].lower()}")
-        fig.add_annotation(
-            x=centre_x, y=centre_y - half_height - 2.5,
-            text=f"<b>{deep_label}</b>"
-                 + ("" if reached else "<br><i>not reached yet</i>"),
-            showarrow=False, font=dict(size=max(9, style.tick_size - 10),
-                                       color=colour),
-            yanchor="top",
-        )
+        # No label under the cell. Three or four of them stacked between the
+        # balloon and the dish was the most crowded part of the picture, and
+        # every one of those names is in the legend underneath.
+        if not reached:
+            fig.add_annotation(
+                x=centre_x, y=centre_y - half_height - 2.5,
+                text="<i>not reached yet</i>", showarrow=False,
+                font=dict(size=max(9, style.tick_size - 10), color=faint),
+                yanchor="top",
+            )
 
-    # ---- labels
+    # ---- the legend
+    # One row of coloured names under the picture instead of labels hung on
+    # every part of it. The drawing then has to carry only the shapes, which
+    # is what a drawing is for.
+    legend = [(names["membrane"][0], "#1f77b4"),
+              (names["interior"][0], "#e67e22")]
+    if show_tension:
+        legend.insert(0, (names["tension"][0], "#5dade2"))
+    if show_nucleus and interior != "fluid":
+        if show_nucleus_shell:
+            legend.append((names["nucleus_shell"][0], "#6c3483"))
+        if show_nucleus_inside:
+            legend.append((names["nucleus"][0], "#8e44ad"))
+    elif show_nucleus:
+        legend.append((names["nucleus"][0], "#8e44ad"))
     fig.add_annotation(
-        x=centre_x + width + half_height + 3, y=centre_y + half_height * 0.5,
-        text=f"<b>{names['membrane'][0]}</b>", showarrow=False, xanchor="left",
-        font=dict(size=max(9, style.tick_size - 9), color="#1f77b4"),
+        x=50, y=GROUND_Y - 15,
+        text="   ".join(
+            f"<span style='color:{colour}'>■ <b>{label}</b></span>"
+            for label, colour in legend
+        ),
+        showarrow=False, font=dict(size=max(9, style.tick_size - 10),
+                                   color="#2c3e50"),
     )
-    fig.add_annotation(
-        x=centre_x - width - half_height - 3, y=centre_y - half_height * 0.45,
-        text=f"<b>{names['interior'][0]}</b>", showarrow=False, xanchor="right",
-        font=dict(size=max(9, style.tick_size - 9), color="#e67e22"),
-    )
+
     if show_tension:
         # The horizontal spring, drawn where it acts: along the skin, not
         # across the cell. _zigzag builds a vertical coil, so it is built
@@ -1237,17 +1246,13 @@ def balloon_figure(
             mode="lines", showlegend=False, hoverinfo="skip",
             line=dict(color="#5dade2", width=4, shape="spline"),
         ))
-        fig.add_annotation(
-            x=centre_x, y=centre_y + half_height * 0.82 + 7,
-            text=f"<b>{names['tension'][0]}</b>", showarrow=False,
-            font=dict(size=max(9, style.tick_size - 10), color="#5dade2"),
-        )
+
 
     # ---- how far it has been squashed, and how far it has spread.
     # Under the dish, because above it is where the cantilever, the arrow
     # and a barely-squashed cell all want to be at once.
     fig.add_annotation(
-        x=50, y=GROUND_Y - 9,
+        x=50, y=GROUND_Y - 8,
         text=f"squashed to <b>ε = {eps:.3f}</b>"
              + (f"  ({eps * cell_height_um:.2f} µm of {cell_height_um:.1f})"
                 if cell_height_um else "")
@@ -1259,7 +1264,7 @@ def balloon_figure(
 
     fig.update_xaxes(visible=False, range=[0, 100], fixedrange=True,
                      scaleanchor="y", scaleratio=1)
-    fig.update_yaxes(visible=False, range=[GROUND_Y - 16, CEILING + 6],
+    fig.update_yaxes(visible=False, range=[GROUND_Y - 21, CEILING + 6],
                      fixedrange=True)
     fig.update_layout(
         height=height or max(340, int(style.height * 0.74)),
