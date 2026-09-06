@@ -30,10 +30,11 @@ Two ways in, in order of how much help you need from anyone else:
 Put whichever you have in ``.streamlit/secrets.toml``::
 
     [onedrive]
-    tenant = "common"                 # or your tenant id
+    account = "personal"              # or "work", or "either"
     client_id = "..."
     refresh_token = "..."             # from the device-code flow
     root_folder = "AFM cells"         # created if missing
+    # tenant = "..."                  # work accounts only, never personal
 
     # or, app-only:
     # client_secret = "..."
@@ -59,9 +60,105 @@ import urllib.request
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 LOGIN = "https://login.microsoftonline.com"
-# Files.ReadWrite covers a personal drive; .All adds shared and SharePoint
-# libraries. offline_access is what makes a refresh token come back at all.
-SCOPES = "offline_access Files.ReadWrite.All User.Read"
+
+# Personal and work accounts do not take the same scopes or the same tenant,
+# and getting either wrong fails in a way whose error message names neither.
+#
+# tenant: a personal account does not exist in any directory, so signing it in
+# against a directory (tenant) id is refused. "consumers" is the personal
+# endpoint, "organizations" the work one, "common" accepts both.
+#
+# scopes: Files.ReadWrite.All is a work-account scope. A personal account has
+# no shared drives or SharePoint libraries for the .All to reach, and asking
+# for it is rejected or silently unconsented. Files.ReadWrite is the personal
+# equivalent and covers the whole of that OneDrive.
+ACCOUNTS = {
+    "personal": {
+        "tenant": "consumers",
+        "scopes": "offline_access Files.ReadWrite User.Read",
+        "label": "Personal Microsoft account (outlook.com, hotmail, live)",
+    },
+    "work": {
+        "tenant": "organizations",
+        "scopes": "offline_access Files.ReadWrite.All User.Read",
+        "label": "Work or school account (university, company)",
+    },
+    "either": {
+        "tenant": "common",
+        "scopes": "offline_access Files.ReadWrite User.Read",
+        "label": "Either, let Microsoft decide",
+    },
+}
+DEFAULT_ACCOUNT = "personal"
+
+# Kept for callers that still import it.
+SCOPES = ACCOUNTS["work"]["scopes"]
+
+
+def settings_for(account="personal", tenant=None):
+    """The tenant and scopes to use, with an explicit tenant winning."""
+    profile = ACCOUNTS.get(account or DEFAULT_ACCOUNT, ACCOUNTS[DEFAULT_ACCOUNT])
+    return {
+        "tenant": tenant or profile["tenant"],
+        "scopes": profile["scopes"],
+    }
+
+
+def _looks_like_a_directory_id(tenant):
+    """True for a GUID, which is a work tenant and never a personal one."""
+    text = str(tenant or "")
+    return len(text) == 36 and text.count("-") == 4
+
+
+def explain(error_text, account="personal", tenant=None):
+    """
+    Turn a Microsoft sign-in error into the thing to actually change.
+
+    The AADSTS codes are precise but they describe Microsoft's model, not
+    yours. These are the four that a personal account runs into, and what
+    each one really means.
+    """
+    text = str(error_text)
+    if "AADSTS50020" in text or "does not exist in tenant" in text:
+        return (
+            "That is a personal Microsoft account, but the app is set to sign "
+            "in against a work directory. Set the account type to Personal, "
+            "which uses the `consumers` endpoint, and remove any tenant id "
+            "from your secrets: a personal account does not live in a "
+            "directory and cannot be found in one."
+        )
+    if "AADSTS700016" in text or "AADSTS50194" in text or "was not found in the directory" in text:
+        return (
+            "The app registration does not accept this kind of account. In "
+            "Azure, open the app, go to Authentication, and under Supported "
+            "account types choose the option that includes **personal "
+            "Microsoft accounts**. Registering as single-tenant shuts "
+            "personal accounts out entirely."
+        )
+    if "AADSTS7000218" in text or "client_assertion" in text:
+        return (
+            "The app is not marked as a public client. In Azure, open the "
+            "app, go to Authentication, scroll to Advanced settings, and set "
+            "**Allow public client flows** to Yes."
+        )
+    if "AADSTS65001" in text or "consent" in text.lower():
+        return (
+            "The permissions have not been consented to. Sign in again and "
+            "accept the prompt, or ask an administrator to grant consent for "
+            "a work account."
+        )
+    if "invalid_scope" in text or "AADSTS70011" in text:
+        return (
+            "Those permissions are not valid for this account type. A "
+            "personal account uses Files.ReadWrite, not Files.ReadWrite.All. "
+            "Set the account type to Personal and try again."
+        )
+    if _looks_like_a_directory_id(tenant) and account == "personal":
+        return (
+            "A tenant id is set, but personal accounts do not belong to a "
+            "tenant. Clear `tenant` from the [onedrive] secrets."
+        )
+    return ""
 
 # Files above this go up in chunks; Graph rejects a simple PUT beyond ~4 MB
 # and a compression video is comfortably larger.
@@ -116,24 +213,35 @@ def _request(method, url, token=None, data=None, headers=None, timeout=60,
 # --------------------------------------------------------- device sign-in ---
 
 
-def begin_device_login(client_id, tenant="common"):
+def begin_device_login(client_id, tenant=None, account=DEFAULT_ACCOUNT):
     """
     Start the device-code flow.
 
     Returns the dict Microsoft sends back, which carries ``user_code``,
-    ``verification_uri`` and ``device_code``. Show the first two to the
-    person, then poll :func:`poll_device_login` with the third.
+    ``verification_uri`` and ``device_code``, plus the scopes used, so the
+    refresh later asks for exactly the same ones. Asking for different scopes
+    on refresh than on sign-in is its own quiet failure.
     """
+    config = settings_for(account, tenant)
     data = urllib.parse.urlencode(
-        {"client_id": client_id, "scope": SCOPES}
+        {"client_id": client_id, "scope": config["scopes"]}
     ).encode()
-    return _request(
-        "POST", f"{LOGIN}/{tenant}/oauth2/v2.0/devicecode", data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    try:
+        payload = _request(
+            "POST", f"{LOGIN}/{config['tenant']}/oauth2/v2.0/devicecode",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except OneDriveError as exc:
+        hint = explain(exc, account, tenant)
+        raise OneDriveError(f"{exc}\n\n{hint}" if hint else str(exc)) from exc
+    payload["_scopes"] = config["scopes"]
+    payload["_tenant"] = config["tenant"]
+    return payload
 
 
-def poll_device_login(client_id, device_code, tenant="common"):
+def poll_device_login(client_id, device_code, tenant=None,
+                      account=DEFAULT_ACCOUNT):
     """
     Ask once whether the person has finished signing in.
 
@@ -147,9 +255,10 @@ def poll_device_login(client_id, device_code, tenant="common"):
             "device_code": device_code,
         }
     ).encode()
+    config = settings_for(account, tenant)
     try:
         return _request(
-            "POST", f"{LOGIN}/{tenant}/oauth2/v2.0/token", data=data,
+            "POST", f"{LOGIN}/{config['tenant']}/oauth2/v2.0/token", data=data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
     except OneDriveError as exc:
@@ -161,17 +270,22 @@ def poll_device_login(client_id, device_code, tenant="common"):
             raise OneDriveError(
                 "The code expired before sign-in finished. Start again."
             ) from exc
-        raise
+        hint = explain(text, account, tenant)
+        raise OneDriveError(f"{text}\n\n{hint}" if hint else text) from exc
 
 
 class OneDriveStore:
     """One folder per cell in a OneDrive or SharePoint document library."""
 
-    def __init__(self, client_id=None, client_secret=None, tenant="common",
-                 refresh_token=None, drive_id=None, root_folder="AFM cells"):
+    def __init__(self, client_id=None, client_secret=None, tenant=None,
+                 refresh_token=None, drive_id=None, root_folder="AFM cells",
+                 account=DEFAULT_ACCOUNT):
         self.client_id = client_id
         self.client_secret = client_secret
-        self.tenant = tenant or "common"
+        self.account = account or DEFAULT_ACCOUNT
+        config = settings_for(self.account, tenant)
+        self.tenant = config["tenant"]
+        self.scopes = config["scopes"]
         self.refresh_token = refresh_token
         self.drive_id = drive_id
         self.root_folder = root_folder or "AFM cells"
@@ -182,10 +296,11 @@ class OneDriveStore:
     # ------------------------------------------------------------ auth
 
     def auth_method(self):
+        who = ACCOUNTS.get(self.account, {}).get("label", self.account)
         if self.refresh_token:
-            return "refresh token (signed in as you)"
+            return f"signed in as you · {who}"
         if self.client_secret:
-            return "client credentials (app only)"
+            return f"app only · {who}"
         return "none configured"
 
     def token(self):
@@ -198,7 +313,9 @@ class OneDriveStore:
                 "client_id": self.client_id,
                 "grant_type": "refresh_token",
                 "refresh_token": self.refresh_token,
-                "scope": SCOPES,
+                # The same scopes the sign-in asked for. A refresh that asks
+                # for more than was granted is refused.
+                "scope": self.scopes,
             }
             if self.client_secret:
                 fields["client_secret"] = self.client_secret
@@ -216,11 +333,15 @@ class OneDriveStore:
                 "refresh_token from the sign-in below or a client_secret."
             )
 
-        payload = _request(
-            "POST", f"{LOGIN}/{self.tenant}/oauth2/v2.0/token",
-            data=urllib.parse.urlencode(fields).encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        try:
+            payload = _request(
+                "POST", f"{LOGIN}/{self.tenant}/oauth2/v2.0/token",
+                data=urllib.parse.urlencode(fields).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        except OneDriveError as exc:
+            hint = explain(exc, self.account, self.tenant)
+            raise OneDriveError(f"{exc}\n\n{hint}" if hint else str(exc)) from exc
         self._token = payload.get("access_token")
         self._expires_at = time.time() + float(payload.get("expires_in", 3600))
         # Microsoft hands back a fresh refresh token each time. Keeping the
@@ -506,7 +627,8 @@ def store_from_secrets(st, root_folder=None):
     return OneDriveStore(
         client_id=config.get("client_id"),
         client_secret=config.get("client_secret"),
-        tenant=config.get("tenant", "common"),
+        account=config.get("account", DEFAULT_ACCOUNT),
+        tenant=config.get("tenant"),
         refresh_token=config.get("refresh_token"),
         drive_id=config.get("drive_id"),
         root_folder=root_folder or config.get("root_folder", "AFM cells"),
