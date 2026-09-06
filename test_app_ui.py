@@ -3226,10 +3226,16 @@ def case_components_are_recommended():
     said = " ".join(str(c.value) for c in app.get("caption"))
     check("the recommendation is on the page",
           "Materials this curve can see" in said, said[-400:])
-    check("and the picture chosen can be changed by hand",
-          any("Which picture of the cell" in (r.label or "")
-              for r in app.get("radio")),
+    # No picker of near-identical sentences, and no table under it. What
+    # overrules the pick is the controls: the combination search, the two
+    # boundaries, the fitting options.
+    check("no picture picker is left on the page",
+          not any("Which picture of the cell" in (r.label or "")
+                  for r in app.get("radio")),
           str([r.label for r in app.get("radio")]))
+    check("the way to overrule it is a boundary you can move",
+          any((s.label or "").startswith("ε₁") for s in app.slider),
+          str([s.label for s in app.slider][:8]))
 
 
 def case_a_model_that_cannot_carry_a_term_says_so():
@@ -3890,12 +3896,13 @@ def case_one_fitting_routine():
           0.02 < after["chi_squared_reduced"] < 20.0,
           f"{after['chi_squared_reduced']:.3g}")
 
-    table = table_with(app, "Picture of the cell", "Predicts held-out points")
-    check("the pictures compared are on the page", table is not None)
-    if table is not None:
-        check("one of them is marked best",
-              any("best" in str(v) for v in table["Verdict"]),
-              str(list(table["Verdict"])))
+    check("the table of pictures compared is gone from the page",
+          table_with(app, "Picture of the cell") is None)
+    said = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("success"))
+                    + list(app.get("info")))
+    check("the verdict is still said in one line",
+          "curve" in said.lower(), said[-200:])
 
 
 def case_materials_are_explained_by_their_law():
@@ -4945,6 +4952,88 @@ def case_a_fixed_cell_can_have_several_hertzian_terms():
           "membrane" not in fit["terms"], str(fit["terms"]))
 
 
+def case_each_boundary_moves_on_its_own():
+    print("each boundary can be set by itself, by bar or by typing")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "boundary controls"):
+        return
+    first = [s for s in app.slider if (s.label or "").startswith("ε₁")]
+    second = [s for s in app.slider if (s.label or "").startswith("ε₂")]
+    check("there is a bar for ε₁", len(first) == 1,
+          str([s.label for s in app.slider][:8]))
+    check("and one for ε₂", len(second) == 1,
+          str([s.label for s in app.slider][:8]))
+    if not (first and second):
+        return
+    was_2 = float(state(app, "segment_break_2", 0.0))
+    first[0].set_value(0.22).run()
+    if not no_exception(app, "moving the first boundary"):
+        return
+    check("moving ε₁ moves ε₁",
+          abs(float(state(app, "segment_break_1", 0.0)) - 0.22) < 0.01,
+          str(state(app, "segment_break_1")))
+    check("and leaves ε₂ where it was",
+          abs(float(state(app, "segment_break_2", 0.0)) - was_2) < 1e-6,
+          f"{was_2} then {state(app, 'segment_break_2')}")
+
+    was_1 = float(state(app, "segment_break_1", 0.0))
+    boxes = [n for n in app.number_input if (n.label or "").startswith("ε₂")]
+    if boxes:
+        boxes[0].set_value(0.55).run()
+        no_exception(app, "typing the second boundary")
+        check("typing ε₂ moves ε₂",
+              abs(float(state(app, "segment_break_2", 0.0)) - 0.55) < 0.01,
+              str(state(app, "segment_break_2")))
+        check("and leaves ε₁ alone",
+              abs(float(state(app, "segment_break_1", 0.0)) - was_1) < 1e-6,
+              f"{was_1} then {state(app, 'segment_break_1')}")
+    check("neither can be pushed past the other",
+          float(state(app, "segment_break_1", 0.0))
+          < float(state(app, "segment_break_2", 1.0)),
+          f"{state(app, 'segment_break_1')} / {state(app, 'segment_break_2')}")
+
+
+def case_the_controls_sit_above_the_curve():
+    print("the things that change the fit are above the curve, the maths below")
+    import app as app_module
+    source = SOURCE
+
+    # Order in the source is order on the page: Streamlit draws a container
+    # where it was created, so the slots have to be staked out in the order
+    # the page should read.
+    controls = source.index('controls_slot = st.container()')
+    curve = source.index('curve_slot = st.container()')
+    story = source.index('story_slot = st.container()')
+    check("the controls slot is staked out before the curve",
+          controls < curve, f"{controls} vs {curve}")
+    check("and the story after it",
+          curve < story, f"{curve} vs {story}")
+    check("the working panels are put in the controls slot",
+          source.count("parent=controls_slot") >= 3,
+          str(source.count("parent=controls_slot")))
+    check("the maths is written after the numbers, not under the plot",
+          source.index('st.markdown("#### The model, written out")')
+          > source.index('st.markdown("#### The numbers")'))
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the reordered page"):
+        return
+    text = " ".join(str(m.value) for m in app.get("markdown"))
+    for wanted in ("What the cell did as it was squashed", "The numbers",
+                   "The model, written out"):
+        check(f"“{wanted}” is on the page", wanted in text, text[:300])
+    labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
+    check("the combination search is on the page",
+          button_by_label(app, "Find the best combination") is not None,
+          str([b.label for b in app.button][:12]))
+    check("so is the boundary search",
+          button_by_label(app, "Find the boundaries from the data") is not None,
+          str([b.label for b in app.button][:12]))
+    check("and the advanced fitting options",
+          any("Advanced fitting options" in str(l) for l in labels)
+          or "Advanced fitting options" in text, str(labels))
+
+
 def case_the_fit_colour_moves_with_the_range():
     print("blue data, a black fit, and a new fit colour per range")
     import app as app_module
@@ -5446,6 +5535,8 @@ if __name__ == "__main__":
         case_clone_keeps_the_whole_geometry,
         case_the_cardiomyocyte_has_three_materials,
         case_the_prefactors_are_the_papers,
+        case_each_boundary_moves_on_its_own,
+        case_the_controls_sit_above_the_curve,
         case_the_fit_colour_moves_with_the_range,
         case_the_written_equation_is_the_fitted_curve,
         case_the_equation_reaches_the_page,
