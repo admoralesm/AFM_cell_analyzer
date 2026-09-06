@@ -59,9 +59,11 @@ class PlotStyle:
     """Everything the user can change about how a figure looks."""
 
     force_unit: str = "nN"
-    # Light blue measurement, black model. Lightness separates them even in
-    # greyscale, which a red-on-blue pair does not.
-    data_color: str = "#8ecae6"
+    # A solid blue for the measurement and black for the model. The pale
+    # blue this used to be disappeared against white at small marker sizes
+    # and printed as almost nothing; this one still separates from black by
+    # lightness, which is what survives greyscale and colour blindness.
+    data_color: str = "#1668b3"
     fit_color: str = "#000000"
     marker_size: int = 7
     line_width: int = 4
@@ -90,6 +92,14 @@ class PlotStyle:
     x_range: tuple = None
     y_range: tuple = None
     template: str = "publication"
+    # What the view belongs to. Plotly keeps the zoom, the pan and the
+    # legend across a redraw for as long as this string does not change, so
+    # the app sets it from the loaded curve: pressing fit keeps the view,
+    # loading another cell starts from the whole curve again.
+    uirevision: str = "keep"
+    # A line of text in the corner of the plot saying which stretch of the
+    # curve the numbers came from. None draws nothing.
+    range_note: str = None
 
     # Legacy alias: older call sites used a single `font_size`.
     @property
@@ -126,6 +136,13 @@ def _style_axes(fig, style: PlotStyle, x_title, y_title, log_x=False, log_y=Fals
         tickwidth=style.axis_width,
         ticklen=max(8, style.axis_width * 3),
         tickcolor="black",
+        # Powers of ten, never SI letters. Plotly's default writes a tick of
+        # 2e-8 N as "20n", which reads as a unit stuck to the number and is
+        # wrong the moment the axis is already labelled in newtons. Below
+        # 1000 nothing is added at all, so an axis in nN stays plain.
+        exponentformat="power",
+        showexponent="all",
+        minexponent=3,
         title_font=dict(size=style.axis_title_size, color="black", family=family),
         tickfont=dict(size=style.tick_size, color="black", family=family),
         automargin=True,
@@ -158,6 +175,11 @@ def _base_layout(fig, style: PlotStyle, title):
         height=style.height,
         margin=dict(l=side, r=40, t=max(70, style.title_size * 3), b=bottom),
         showlegend=style.show_legend,
+        # Zoom, pan and the legend survive a redraw. Streamlit rebuilds the
+        # whole figure on every rerun, and without this a fit pressed while
+        # zoomed in threw the view back out to the whole curve. It is tied
+        # to the curve, so loading another cell does start from the top.
+        uirevision=style.uirevision,
         legend=dict(
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="black",
@@ -451,7 +473,35 @@ def force_curve_figure(
         log_y=log_mode,
     )
     _apply_ranges(fig, style, log_mode)
+    _range_note(fig, style)
     return fig
+
+
+def _range_note(fig, style: PlotStyle):
+    """
+    A line in the corner saying which stretch of the curve was fitted.
+
+    Placed against the figure rather than against the axes, so it stays put
+    when the plot is zoomed, works on a log axis, and cannot be pushed off
+    the top by a tall curve. A figure that leaves the room without its
+    range written on it is a figure nobody can check later.
+    """
+    note = getattr(style, "range_note", None)
+    if not note:
+        return
+    fig.add_annotation(
+        text=str(note),
+        xref="paper", yref="paper",
+        x=0.985, y=0.03, xanchor="right", yanchor="bottom",
+        showarrow=False,
+        align="right",
+        font=dict(size=max(11, style.tick_size - 7), color="black",
+                  family=REGULAR_FAMILY),
+        bgcolor="rgba(255,255,255,0.88)",
+        bordercolor="black",
+        borderwidth=1,
+        borderpad=4,
+    )
 
 
 def _apply_ranges(fig, style: PlotStyle, log_mode=False):
