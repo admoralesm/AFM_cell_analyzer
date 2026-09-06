@@ -1,5 +1,5 @@
 """
-OneDrive / SharePoint storage for AFM cell records, over Microsoft Graph.
+oneDrive / SharePoint storage for AFM cell records, over Microsoft Graph.
 
 Same job as ``box_store``, same public interface, different service: one
 folder per cell holding ``record.json``, ``curve.csv``, the morphology frame
