@@ -408,18 +408,19 @@ def hint(text: str):
 DEFAULTS = {
     # display
     "force_unit": "N",
-    # A solid blue for the measurement, black for the model drawn over it.
-    # The eye separates them by lightness rather than by hue, which survives
-    # a greyscale print and colour blindness both. The pale blue this used
-    # to be was too faint to see at small marker sizes and printed as
-    # almost nothing.
-    "data_color": "#1668b3",
+    # A light blue field of points with no outline, and one dark dashed
+    # line over it. The eye separates them by lightness and by the kind of
+    # mark, which survives a greyscale print and colour blindness both.
+    "data_color": "#79c2e8",
     "fit_color": "#000000",
     # A different colour for the fit every time the fitted range moves, so
     # two screenshots taken from different ranges cannot be mistaken for one
     # another. Untick it to keep the colour chosen above.
     "recolour_on_range": True,
-    "marker_size": 6,
+    # Big enough that a dense curve reads as one continuous light band, so
+    # the dashed model line has something to sit on rather than something
+    # to hide in.
+    "marker_size": 9,
     "line_width": 3,
     "plot_height": 520,
     "show_grid": False,
@@ -1700,77 +1701,98 @@ def quality_in_words(r_squared):
     return "the line does not really follow the data; something is wrong"
 
 
-def plain_language_summary(fit, model):
+def range_maths(lo, hi, terms=None):
     """
-    What the fit says, for someone who does not know cell mechanics.
+    What the chosen range does to the fit, written as maths.
 
-    Written as the story of the compression rather than as a table of
-    parameters: what resists first, what takes over, what joins last, and
-    how stiff each of those turned out to be.
+    A range is not only a pair of numbers: it decides which points enter
+    the least-squares sum, and it decides the stretch of deformation each
+    material is actually measured over, which is not the same interval for
+    each of them. Printed here, under the control that sets it, so moving
+    a handle and watching these change is one gesture.
+    """
+    terms = tuple(terms or active_terms())
+    e1 = float(st.session_state["segment_break_1"])
+    e2 = float(st.session_state["segment_break_2"])
+    q = float(st.session_state.get("confinement", 0.0) or 0.0)
+    membrane = MEMBRANE_CHOICES.get(
+        st.session_state["membrane_after_break"], "freeze"
+    )
+    from_break = CYTO_CHOICES.get(
+        st.session_state["cyto_starts_at"], "break"
+    ) == "break"
+
+    st.latex(
+        r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta} \ge 0}"
+        r"\sum_{i:\ " + f"{lo:.3f}" + r" \le \varepsilon_i \le "
+        + f"{hi:.3f}" + r"} w_i \left( F_i - F(\varepsilon_i) \right)^{2}"
+    )
+    st.caption(
+        f"Only points inside the range enter the sum, so the range is part "
+        f"of the model, not a view of it. Moving either end changes every "
+        f"modulus."
+        + (f" Every term is multiplied by (1−ε)^−{q:g} across it."
+           if q else "")
+    )
+
+    # Which stretch each material is actually measured over. Two materials
+    # can share the range and still be measured on different parts of it,
+    # and that is the whole of how a fit tells them apart.
+    rows = []
+    for term in ALL_TERMS:
+        if term not in terms:
+            continue
+        if term in ("tension", "membrane"):
+            begin, end = lo, (hi if membrane == "continue" else min(e1, hi))
+            basis = (r"min(ε, ε₁)" if membrane == "freeze"
+                     else "⟨ε − ε₁⟩" if membrane == "late" else "ε")
+            basis += "³" if term == "membrane" else ""
+        elif term == "cortex":
+            begin, end, basis = lo, hi, "ε³ᐟ²"
+        elif term == "interior":
+            begin = max(lo, e1) if from_break else lo
+            end, basis = hi, ("⟨ε − ε₁⟩³ᐟ²" if from_break else "ε³ᐟ²")
+        else:
+            begin, end = max(lo, e2), hi
+            basis = ("⟨ε − ε₂⟩³" if term == "nucleus_shell"
+                     else "⟨ε − ε₂⟩³ᐟ²")
+        points = 0
+        data = (st.session_state.get("data") or {}).get("epsilon")
+        if data is not None and np.size(data):
+            data = np.asarray(data, dtype=float)
+            points = int(((data >= begin) & (data <= end)).sum())
+        rows.append({
+            "material": plain_name(term),
+            "measured over ε": f"{begin:.3f} to {max(end, begin):.3f}",
+            "points there": points,
+            "what it multiplies": basis,
+        })
+    if rows:
+        flat_table(
+            pd.DataFrame(rows),
+            align_right=["measured over ε", "points there"],
+            caption="A material is only measured where its own term is "
+                    "non-zero. Two of them sharing an interval and a power "
+                    "of ε cannot be told apart at all, however wide the "
+                    "range is made.",
+        )
+
+
+def stiffness_table(fit):
+    """
+    What each material turned out to be, in its own units and in words.
+
+    All that is left of what used to be a retelling of the fit. The story
+    of the compression restated the boundaries already drawn on the curve,
+    and the paragraph after it restated R² and chi-squared, which are two
+    numbers standing beside it. This table is the part that said something
+    the numbers did not: what the material is, and what that stiffness is
+    like to hold.
     """
     if not (fit and fit.get("success")):
         return
 
     terms = set(fit.get("terms") or ())
-    e1, e2 = fit.get("break_1"), fit.get("break_2")
-    segmented = fit.get("coupling") == "segmented"
-
-    st.markdown("##### What this cell did as it was squashed")
-
-    if segmented and e1 is not None and e2 is not None:
-        held = fit.get("membrane") != "continue"
-        early_cyto = fit.get("cyto_start") == "zero"
-        story = []
-        names = components_for(st.session_state["cell_type"])
-        membrane_word = names["membrane"][0].lower()
-        interior_word = names["interior"][0].lower()
-        nucleus_word = plain_name("nucleus").lower()
-        story.append(
-            f"**Up to {e1 * 100:.0f} %** of the way down, "
-            + (f"the {membrane_word} and the {interior_word} resist together."
-               if early_cyto else
-               f"only the {membrane_word} resists, stretching like a balloon "
-               f"being pressed.")
-        )
-        story.append(
-            f"**From {e1 * 100:.0f} % to {e2 * 100:.0f} %**, "
-            + (f"the {membrane_word} keeps stiffening and the "
-               f"{interior_word} adds to it."
-               if not held else
-               f"the {membrane_word} stops adding force and the "
-               f"{interior_word}, {names['interior'][1]}, takes over.")
-        )
-        if "nucleus" in terms and fit.get("En_kPa", 0.0) > 0:
-            story.append(
-                f"**Past {e2 * 100:.0f} %**, the plates reach the "
-                f"{nucleus_word} and it starts pushing back as well."
-            )
-        elif "nucleus" in terms:
-            story.append(
-                f"**Past {e2 * 100:.0f} %**, nothing new joins in: this curve "
-                f"shows no sign of the {nucleus_word} being reached."
-            )
-        else:
-            # No deep element in the model at all, so nothing was looked for
-            # deeper in and nothing can be said to be missing. What happens
-            # deep in the squash is the interior running out of room.
-            q_here = float(st.session_state.get("confinement", 0.0) or 0.0)
-            story.append(
-                "**Deeper than that**, no new material joins in. The cell is "
-                "a shell around one interior that does not compress, so what "
-                "the plates feel from here on is the same two materials "
-                "having less and less room"
-                + (f", which is the confinement exponent q = {q_here:.2f}."
-                   if q_here > 0 else ".")
-            )
-        for line in story:
-            st.markdown(f"- {line}")
-    else:
-        st.markdown(
-            "- Every part of the cell resists together across the whole "
-            "squash, which is what this model assumes."
-        )
-
     st.markdown("##### How stiff each material turned out to be")
     names = components_for(st.session_state["cell_type"])
     rows = []
@@ -1814,43 +1836,88 @@ def plain_language_summary(fit, model):
             "comparison in the last column does make that conversion."
         )
 
-    chi_red = float(fit.get("chi_squared_reduced", float("nan")))
-    st.markdown(
-        f"**Does the model match the measurement?** "
-        f"{quality_in_words(float(fit.get('r_squared', float('nan'))))} "
-        f"(R² = {fit.get('r_squared', float('nan')):.4f}"
-        + (f", χ²/dof = {chi_red:.1f}" if np.isfinite(chi_red) else "")
-        + ")."
+
+def final_summary(fit, model, date_acquired=None):
+    """
+    The last thing on the page: this cell in one block, ready to be quoted.
+
+    Everything above it is how the answer was arrived at. This is the
+    answer, in the form somebody would paste into a lab book or read out
+    to a supervisor: which cell, over what stretch of curve, under which
+    picture, what each material came out at, and how well it fitted.
+    """
+    if not (fit and fit.get("success")):
+        return
+    terms = tuple(fit.get("terms") or ())
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    chi = float(fit.get("chi_squared_reduced", float("nan")))
+    r2 = float(fit.get("r_squared", float("nan")))
+
+    st.markdown("#### In one block")
+    name = st.session_state.get("cell_name") or "this cell"
+    head = f"**{name}**"
+    if date_acquired is not None:
+        head += f" · {date_acquired}"
+    head += (
+        f" · {st.session_state['cell_type']}"
+        + (" · chemically fixed" if fixed_cell_on() else "")
     )
-    if np.isfinite(chi_red) and chi_red > 5:
-        st.warning(
-            f"The line looks close, but it misses the points by about "
-            f"{np.sqrt(chi_red):.0f} times the scatter in the measurement. "
-            f"That usually means a material is missing from the model, or "
-            f"the boundaries are in the wrong place. R² alone would not "
-            f"have told you."
-        )
-    # Chi-squared per point divides by the noise, so it only means what it
-    # says when the fit was weighted by the noise too. Under any other
-    # weighting the fit was deliberately asked to trade some accuracy where
-    # the noise is small for accuracy where it is not, and chi-squared reads
-    # that trade as a failure. Saying so is the difference between a number
-    # and a number a reader can use.
-    if np.isfinite(chi_red) and fit.get("weighting") not in (None, "noise"):
+    st.markdown(head)
+
+    lines = [
+        f"Fitted over ε = {lo:.3f} to {hi:.3f} "
+        f"({int(fit.get('n_points', 0))} points), "
+        f"weighted {fit.get('weighting', 'uniform')}"
+        + (f", confinement q = {q:.2f}" if q else "")
+        + ".",
+    ]
+    boundaries = []
+    if fit.get("break_1") is not None:
+        boundaries.append(f"ε₁ = {float(fit['break_1']):.3f}")
+    if fit.get("break_2") is not None and any(
+        t in terms for t in ("nucleus", "nucleus_shell")
+    ):
+        boundaries.append(f"ε₂ = {float(fit['break_2']):.3f}")
+    if boundaries:
+        lines.append("Boundaries: " + ", ".join(boundaries) + ".")
+    for term in ALL_TERMS:
+        if term not in terms:
+            continue
+        key, unit, std_key = MODULUS_FIELDS[term]
+        value = fit.get(key)
+        error = fit.get(std_key)
+        if value is None:
+            continue
+        piece = f"{plain_name(term)}: {float(value):.4g} {unit}"
+        if error is not None and np.isfinite(float(error)):
+            piece += f" ± {float(error):.2g}"
+        lines.append(piece + ".")
+    lines.append(
+        f"R² = {r2:.5f}"
+        + (f", χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
+        + "."
+    )
+    for line in lines:
+        st.markdown(f"- {line}")
+
+    # One copyable line, because a lab book is not a screenshot.
+    quoted = "; ".join(
+        f"{plain_name(term)} {float(fit.get(MODULUS_FIELDS[term][0], 0.0)):.4g} "
+        f"{MODULUS_FIELDS[term][1]}"
+        for term in ALL_TERMS if term in terms
+    )
+    st.code(
+        f"{name}\t{lo:.3f}-{hi:.3f}\t{quoted}\tR2={r2:.5f}"
+        + (f"\tchi2/dof={chi:.3g}" if np.isfinite(chi) else ""),
+        language="text",
+    )
+    if np.isfinite(chi) and chi > 5 and fit.get("weighting") in (None, "noise"):
         st.caption(
-            f"χ²/dof divides by the measurement noise, and this fit was "
-            f"weighted **{fit.get('weighting')}** rather than by that noise, "
-            f"so read it as a rough guide only. Weighted by the noise it "
-            f"would be smaller, at the cost of following the low-force half "
-            f"of the curve less closely. R², and the per-material error bars "
-            f"below, do not depend on that choice."
-        )
-    if float(fit.get("r_squared", 0.0)) < 0.9:
-        st.warning(
-            "A poor match usually means the cell height or the contact point "
-            "is wrong, or the curve was squashed far enough to damage the "
-            "cell. Check the cell height in section 1 before trusting these "
-            "numbers."
+            f"χ²/dof of {chi:.3g} under noise weighting means the line "
+            f"misses the points by about {np.sqrt(chi):.0f} times the "
+            f"scatter in the measurement, which is usually a missing "
+            f"material or a boundary in the wrong place."
         )
 
 
@@ -4918,6 +4985,8 @@ with tab_analysis:
                         "makes sense when the approach itself misbehaved. "
                         "Set it back to 0 to fit through it."
                     )
+                with st.expander("∑ What this range means, in maths"):
+                    range_maths(guided_lo, guided_hi, active_terms())
             chosen = active_terms()
             if not chosen:
                 st.warning("Tick at least one material before fitting.")
@@ -5008,10 +5077,6 @@ with tab_analysis:
         # filled once it does.
         curve_slot = st.container()
         video_slot = st.container()
-        # What the cell did as it was squashed, in words and in a picture,
-        # under the curve it is describing. The numbers and the maths come
-        # after it, at the foot of the page.
-        story_slot = st.container()
 
         st.divider()
 
@@ -6278,10 +6343,12 @@ with tab_analysis:
             }
 
             if guided:
-                with story_slot:
-                    st.markdown("#### What the cell did as it was squashed")
-                    plain_language_summary(fit, model)
-                st.divider()
+                # No retelling of the fit in words. It restated the
+                # boundaries already drawn on the curve, printed the moduli
+                # a second time under the ones below, and ended with a
+                # sentence about chi-squared that a person could read
+                # straight off the two numbers beside R². Three of those
+                # were duplicates and the fourth was noise.
                 st.markdown("#### The numbers")
 
             # All three moduli, always. A term that was not in the model reads
@@ -7145,6 +7212,7 @@ with tab_analysis:
             # to reach the numbers it was the working for.
             st.markdown("#### The model, written out")
             fitted_equation(fit, unit=style.force_unit, heading=False)
+            stiffness_table(fit)
 
             with st.expander("∑ How this fit was calculated", expanded=False):
                 show_fit_maths(fit, model)
@@ -7153,6 +7221,11 @@ with tab_analysis:
                 "∑ What “Work it out for me” does, in maths", expanded=False
             ):
                 show_search_maths()
+
+            # And the answer on its own at the very bottom, after the
+            # working, in the form it would be written down in.
+            st.divider()
+            final_summary(fit, model, date_acquired)
 
         section("7 · Video and database" if segmented else "6 · Video and database")
         store = st.session_state.get("onedrive_store")
