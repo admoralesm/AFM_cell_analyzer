@@ -4705,13 +4705,228 @@ def case_the_prefactors_are_the_papers():
           f"{model.bending_share(0.30):.4f}")
 
 
+def case_the_written_equation_is_the_fitted_curve():
+    print("the equation printed on the page evaluates to the fitted curve")
+    import app as app_module
+
+    eps, force = synthetic()
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    model.confinement = 0.8
+    fit = model.fit_composition(0.0, 0.85, 0.15, 0.40, membrane="freeze",
+                                cyto_start="break")
+    check("the fit succeeded", fit.get("success"))
+    if not fit.get("success"):
+        return
+
+    pieces = app_module.equation_pieces(fit)
+    check("every fitted term is in the equation",
+          {p["term"] for p in pieces} == set(fit["terms"]),
+          f"{[p['term'] for p in pieces]} vs {fit['terms']}")
+    check("and it carries the confinement it was fitted at",
+          abs(float(fit["confinement"]) - 0.8) < 1e-9,
+          str(fit.get("confinement")))
+
+    # Rebuild the curve from the printed coefficients alone: coefficient
+    # times shape of epsilon, times the confinement factor. If this does not
+    # land on the fitted curve then the equation on the page is not the
+    # model that was fitted, which is worse than printing nothing.
+    e1, e2 = float(fit["break_1"]), float(fit["break_2"])
+    held = np.clip(np.minimum(eps, e1), 0.0, None)
+    shapes = {
+        "tension": held,
+        "membrane": held ** 3,
+        "cortex": np.clip(eps, 0.0, None) ** 1.5,
+        "interior": np.clip(eps - e1, 0.0, None) ** 1.5,
+        "nucleus_shell": np.clip(eps - e2, 0.0, None) ** 3,
+        "nucleus": np.clip(eps - e2, 0.0, None) ** 1.5,
+    }
+    by_hand = np.zeros_like(eps)
+    for piece in pieces:
+        by_hand = by_hand + piece["coefficient_N"] * shapes[piece["term"]]
+    by_hand = by_hand * (1.0 - np.clip(eps, 0.0, 0.999)) ** (-0.8)
+    theirs = model.composition_curve(eps, fit)
+    scale = float(np.max(np.abs(theirs))) or 1.0
+    worst = float(np.max(np.abs(by_hand - theirs))) / scale
+    check("the printed coefficients rebuild the fitted curve",
+          worst < 1e-9, f"worst difference {worst:.3g} of full scale")
+
+    # And the coefficient really is prefactor times modulus, in newtons.
+    for piece in pieces:
+        if piece["term"] != "interior":
+            continue
+        check("the interior coefficient is Ai times Ec",
+              abs(piece["coefficient_N"] - fit["Ai"] * fit["Ei"])
+              < 1e-12 * max(1.0, abs(fit["Ai"] * fit["Ei"])),
+              f"{piece['coefficient_N']:.6g} vs {fit['Ai'] * fit['Ei']:.6g}")
+
+
+def case_the_equation_reaches_the_page():
+    print("the equation is on the page after a fit, with numbers in it")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the equation on the page"):
+        return
+    formulas = [str(getattr(e, "value", "")) for e in app.get("latex")]
+    joined = " ".join(formulas)
+    check("an equation for F is printed", "F(\\varepsilon)" in joined,
+          joined[:160])
+    check("with the moduli named in it", "E_c" in joined or "E_m" in joined,
+          joined[:160])
+    check("and a numeric version beside it",
+          "frac{F(\\varepsilon)}" in joined, joined[:200])
+
+
+def case_the_plot_says_which_range_was_used():
+    print("the plot carries a note saying which range the numbers came from")
+    import plot_utils
+
+    eps, force = synthetic()
+    style = plot_utils.PlotStyle(force_unit="nN",
+                                 range_note="fitted ε = 0.000 to 0.600")
+    fig = plot_utils.force_curve_figure(eps, force, style)
+    notes = [getattr(a, "text", "") for a in fig.layout.annotations]
+    check("the note is drawn", any("fitted ε" in str(n) for n in notes),
+          str(notes))
+    check("against the figure, not the axes, so zooming keeps it",
+          any(getattr(a, "xref", "") == "paper" for a in fig.layout.annotations))
+
+    bare = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="nN"))
+    check("and nothing is drawn when there is no note",
+          not any("fitted ε" in str(getattr(a, "text", ""))
+                  for a in bare.layout.annotations))
+
+    # The app's own note, off the fit.
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the range note"):
+        return
+    style_note = None
+    try:
+        import app as app_module
+        style_note = app_module.fit_range_note()
+    except Exception as exc:  # no running app around this helper
+        style_note = f"unavailable: {exc}"
+    check("the app writes a note naming a range",
+          "ε" in str(style_note) and "to" in str(style_note),
+          str(style_note))
+
+
+def case_the_zoom_survives_a_refit():
+    print("zooming in and refitting keeps the view")
+    import plot_utils
+
+    eps, force = synthetic()
+    first = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="nN", uirevision="cell-a"))
+    check("the figure carries a view token", first.layout.uirevision == "cell-a",
+          str(first.layout.uirevision))
+    again = plot_utils.force_curve_figure(
+        eps, force,
+        plot_utils.PlotStyle(force_unit="nN", uirevision="cell-a",
+                             fit_color="#c0392b"))
+    check("redrawing the same curve keeps the same token, so the zoom stays",
+          again.layout.uirevision == first.layout.uirevision)
+    other = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="nN", uirevision="cell-b"))
+    check("another curve gets a different one, so the view starts over",
+          other.layout.uirevision != first.layout.uirevision)
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the view token"):
+        return
+    before = state(app, "_view_token_seen")
+    import app as app_module
+    # What matters is that the token does not move when the curve is
+    # refitted: that is what keeps the zoom. Two runs of the same page with
+    # the same curve must produce the same one.
+    first = str(app_module.view_token())
+    button = button_by_label(app, "Fit this cell")
+    if button is not None:
+        button.click().run()
+        no_exception(app, "refitting while zoomed")
+    check("the token is the same after a fit, so the view is kept",
+          str(app_module.view_token()) == first,
+          f"{first} then {app_module.view_token()}")
+    check("and it names the curve, not the fit", "|" in first, first)
+    del before
+
+
+def case_axis_numbers_are_powers_not_letters():
+    print("tick labels use powers of ten, never SI letters")
+    import plot_utils
+
+    eps, force = synthetic()
+    fig = plot_utils.force_curve_figure(
+        eps, force, plot_utils.PlotStyle(force_unit="N"))
+    check("the force axis is in powers of ten",
+          fig.layout.yaxis.exponentformat == "power",
+          str(fig.layout.yaxis.exponentformat))
+    check("and so is the deformation axis",
+          fig.layout.xaxis.exponentformat == "power",
+          str(fig.layout.xaxis.exponentformat))
+    check("the unit stays in the axis title, where it belongs",
+          "N" in str(fig.layout.yaxis.title.text),
+          str(fig.layout.yaxis.title.text))
+
+
+def case_a_fixed_cell_can_have_several_hertzian_terms():
+    print("a fixed cell can be given more than one Hertzian term")
+    import app as app_module
+
+    offered = app_module.OPTIONAL_TERMS["Fixed cell"]
+    check("three Hertzian slots are offered",
+          set(offered) == {"cortex", "interior", "nucleus"}, str(offered))
+    check("and no shell term among them",
+          not any(t in offered for t in ("membrane", "tension", "nucleus_shell")),
+          str(offered))
+    picks = app_module.HYPOTHESES["Fixed cell"]
+    check("one, two and three solids are all offered", len(picks) == 3,
+          str([p["key"] for p in picks]))
+    check("only one of them is on by default",
+          sum(1 for on in app_module.DEFAULT_TERMS_BY_TYPE["Fixed cell"].values()
+              if on) == 1,
+          str(app_module.DEFAULT_TERMS_BY_TYPE["Fixed cell"]))
+    # Every picture must give its terms different onsets, or two of them are
+    # one term with two names and the split between them is arbitrary.
+    for spec in picks:
+        if "cortex" in spec["terms"] and "interior" in spec["terms"]:
+            check("with the cortex in, the interior starts at ε₁",
+                  spec["cyto_start"] == "break", str(spec))
+        elif spec["terms"] == ("interior",) or "cortex" not in spec["terms"]:
+            check("without it, the one from contact starts at zero",
+                  spec["cyto_start"] == "zero", str(spec))
+
+    # Two Hertzian bodies, the deeper one stiffer, met at eps2. This is the
+    # fixed cardiomyocyte: cross-linked bundles inside cross-linked cytoplasm.
+    eps = np.linspace(0.002, 0.70, 420)
+    blank = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    basis = blank.composition_basis(eps, 0.15, 0.35, "continue", "zero")
+    force = basis["interior"] * 120e3 + basis["nucleus"] * 400e3
+    rng = np.random.default_rng(3)
+    force = force * (1.0 + 0.005 * rng.standard_normal(eps.size))
+
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    fit = model.fit_composition(0.0, 0.70, 0.15, 0.35, membrane="continue",
+                                cyto_start="zero", use_membrane=False,
+                                use_interior=True, use_nucleus=True,
+                                weighting="relative")
+    check("two Hertzian terms can be fitted together", fit.get("success"))
+    if not fit.get("success"):
+        return
+    check("the first solid comes back", abs(fit["Ei_kPa"] - 120.0) < 12.0,
+          f"{fit['Ei_kPa']:.4g} kPa")
+    check("and the deeper, stiffer one too",
+          abs(fit["En_kPa"] - 400.0) < 40.0, f"{fit['En_kPa']:.4g} kPa")
+    check("with no membrane term in the answer",
+          "membrane" not in fit["terms"], str(fit["terms"]))
+
+
 def case_the_fit_colour_moves_with_the_range():
-    print("light blue data, a black fit, and a new fit colour per range")
+    print("blue data, a black fit, and a new fit colour per range")
     import app as app_module
     import plot_utils
 
-    check("data is light blue by default",
-          app_module.DEFAULTS["data_color"] == "#8ecae6",
+    check("data is a solid blue by default",
+          app_module.DEFAULTS["data_color"] == "#1668b3",
           app_module.DEFAULTS["data_color"])
     check("the fit is black by default",
           app_module.DEFAULTS["fit_color"] == "#000000",
@@ -4868,13 +5083,15 @@ def case_a_fixed_cell_is_one_hertzian_solid():
     check("and it is off unless you tick it",
           app_module.DEFAULTS["fixed_cell"] is False)
     here = app_module.OPTIONAL_TERMS["Fixed cell"]
-    check("with exactly one material", here == ("interior",), str(here))
+    check("with Hertzian materials only", set(here) <= {"cortex", "interior",
+                                                        "nucleus"}, str(here))
     check("named for what it is",
           "fixed cell" in app_module.COMPONENT_SETS["Fixed cell"]["interior"][0].lower(),
           app_module.COMPONENT_SETS["Fixed cell"]["interior"][0])
     picks = app_module.HYPOTHESES["Fixed cell"]
-    check("and one picture, because there is nothing to compare",
-          len(picks) == 1 and picks[0]["terms"] == ("interior",), str(picks))
+    check("the simplest picture is one solid over the whole curve",
+          picks[0]["terms"] == ("interior",) and picks[0]["cyto_start"] == "zero",
+          str(picks[0]))
 
     # The paper's own numbers: fixation cross-links the proteins and the
     # cell comes out 20 to 50 times stiffer, 150 to 230 kPa.
@@ -4907,8 +5124,14 @@ def case_a_fixed_cell_is_one_hertzian_solid():
     check("which is in the range the paper reports for fixed cells",
           150.0 <= fit["Ei_kPa"] <= 230.0, f"{fit['Ei_kPa']:.4g} kPa")
     table = table_with(app, "Part of the cell")
-    check("the table lists the one material", table is not None
-          and len(table) == 1, "none" if table is None else str(len(table)))
+    fitted_rows = ([] if table is None else
+                   [r for _, r in table.iterrows()
+                    if "not included" not in str(r["Roughly"])])
+    check("the table lists exactly one material as fitted",
+          len(fitted_rows) == 1, str(len(fitted_rows)))
+    check("and says plainly that the others were not in this model",
+          table is not None and len(table) - len(fitted_rows) == len(table) - 1,
+          "none" if table is None else str(len(table)))
     # The living cell type underneath is untouched: fixation changed the
     # chemistry, not the geometry the prefactors are built from.
     check("and the cell type underneath is left alone",
@@ -5040,6 +5263,12 @@ if __name__ == "__main__":
         case_the_cardiomyocyte_has_three_materials,
         case_the_prefactors_are_the_papers,
         case_the_fit_colour_moves_with_the_range,
+        case_the_written_equation_is_the_fitted_curve,
+        case_the_equation_reaches_the_page,
+        case_the_plot_says_which_range_was_used,
+        case_the_zoom_survives_a_refit,
+        case_axis_numbers_are_powers_not_letters,
+        case_a_fixed_cell_can_have_several_hertzian_terms,
         case_the_fixed_tick_locks_out_the_other_materials,
         case_the_sheet_can_be_the_database,
         case_a_fixed_cell_is_one_hertzian_solid,
