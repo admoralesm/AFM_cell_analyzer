@@ -5321,6 +5321,124 @@ def case_the_placement_search_finds_where_elements_act():
           len(found["trials"]) > 20, str(len(found["trials"])))
 
 
+def case_the_ranges_follow_the_fit():
+    print("each material's range shows where the fit actually put it")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "ranges after the first fit"):
+        return
+    fit = state(app, "_last_fit")
+    check("there is a fit to follow", fit and fit.get("success"))
+    if not (fit and fit.get("success")):
+        return
+
+    def bar(term):
+        return state(app, f"element_window_{term}")
+
+    e1, e2 = float(fit["break_1"]), float(fit["break_2"])
+    hi = float(fit["epsilon_range"][1])
+    check("the shell's bar ends where the fit hands over",
+          fit.get("membrane") != "freeze" or abs(bar("membrane")[1] - e1) < 1e-3,
+          f"{bar('membrane')} against ε₁ = {e1:.3f}")
+    check("the scaffolding starts where the fit says it starts",
+          fit.get("cyto_start") == "zero"
+          or abs(bar("interior")[0] - e1) < 1e-3,
+          f"{bar('interior')} against ε₁ = {e1:.3f}")
+    if state(app, "use_nucleus"):
+        check("and the deeper material starts at ε₂",
+              abs(bar("nucleus")[0] - e2) < 1e-3,
+              f"{bar('nucleus')} against ε₂ = {e2:.3f}")
+    check("nothing runs past the fitted range",
+          all(bar(t)[1] <= hi + 1e-6 for t in ("membrane", "interior")),
+          f"{bar('membrane')} {bar('interior')} against {hi:.3f}")
+
+    # Refit over a shorter range: the bars have to move with it, or they are
+    # describing a model that is no longer the one on the page.
+    before = bar("interior")
+    widget_by_label(app, "slider", "Fitted range").set_value((0.0, 0.40)).run()
+    button = button_by_label(app, "Fit this cell")
+    if button is not None:
+        button.click().run()
+        if not no_exception(app, "refit over a shorter range"):
+            return
+    after_fit = state(app, "_last_fit")
+    check("the refit happened", after_fit and after_fit.get("success"))
+    if not (after_fit and after_fit.get("success")):
+        return
+    check("and every bar followed it",
+          abs(bar("interior")[1] - float(after_fit["epsilon_range"][1])) < 1e-3,
+          f"{before} then {bar('interior')} for a fit ending at "
+          f"{after_fit['epsilon_range'][1]:.3f}")
+    check("including where the new ε₁ landed",
+          after_fit.get("cyto_start") == "zero"
+          or abs(bar("interior")[0] - float(after_fit["break_1"])) < 1e-3,
+          f"{bar('interior')} against ε₁ = {after_fit['break_1']:.3f}")
+
+    # And once they are yours, a fit no longer moves them - but the page
+    # says so and offers to put them back.
+    app.session_state["use_element_windows"] = True
+    app.run()
+    app.session_state["element_window_interior"] = (0.05, 0.30)
+    app.run()
+    if not no_exception(app, "own windows drifting from the fit"):
+        return
+    said = " ".join(str(c.value) for c in app.get("caption"))
+    check("it says the bars are no longer following the fit",
+          "yours now" in said, said[-300:])
+    check("and offers to put them back",
+          button_by_label(app, "Put them back where the fit wants them")
+          is not None, str([b.label for b in app.button][:12]))
+
+
+def case_a_sheet_that_will_not_open_says_why():
+    print("a Google Sheet that cannot be opened says so, and what to do")
+    from google_sheets_manager import GoogleSheetsManager
+
+    manager = GoogleSheetsManager.__new__(GoogleSheetsManager)
+    manager.spreadsheet = None
+    manager.worksheet = None
+    check("a manager with no worksheet says that plainly",
+          "no worksheet" in manager.describe().lower(), manager.describe())
+    ok, said = manager.check()
+    check("and its check fails rather than pretending", not ok, said)
+    check("naming the thing to do about it",
+          "reconnect" in said.lower(), said)
+
+    class _Book:
+        title = "AFM cells"
+
+    class _Tab:
+        title = "Cells"
+
+        def row_values(self, n):
+            return ["Cell ID", "Experiment Date"]
+
+        def get_all_values(self):
+            return [["Cell ID", "Experiment Date"], ["c1", "2026-01-01"]]
+
+        def update(self, values=None, range_name=None):
+            return None
+
+    manager.spreadsheet, manager.worksheet = _Book(), _Tab()
+    check("a working one names the file and the tab",
+          "AFM cells" in manager.describe() and "Cells" in manager.describe(),
+          manager.describe())
+    ok, said = manager.check()
+    check("and its check passes", ok, said)
+    check("reporting what is in the sheet",
+          "2 columns" in said and "1 row" in said, said)
+    check("and that writing works", "Writing works" in said, said)
+
+    class _ReadOnly(_Tab):
+        def update(self, values=None, range_name=None):
+            raise RuntimeError("The caller does not have permission")
+
+    manager.worksheet = _ReadOnly()
+    ok, said = manager.check()
+    check("a read-only share is caught before a row goes missing", not ok, said)
+    check("and named as the Viewer/Editor mistake it is",
+          "Editor" in said and "Viewer" in said, said)
+
+
 def case_each_element_gets_its_own_bar():
     print("each element has a bar of its own, and a button that places them")
     app = start(cell_name="cell-01")
@@ -5958,6 +6076,8 @@ if __name__ == "__main__":
         case_the_button_says_what_it_will_do,
         case_an_element_window_is_an_onset_not_a_mask,
         case_the_placement_search_finds_where_elements_act,
+        case_the_ranges_follow_the_fit,
+        case_a_sheet_that_will_not_open_says_why,
         case_each_element_gets_its_own_bar,
         case_a_companion_file_is_found_wherever_it_sits,
         case_the_missing_file_message_says_what_it_can_see,
