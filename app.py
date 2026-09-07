@@ -105,6 +105,13 @@ HAS_ORDER_PLOTS = _pull(_plot_module, "plot_utils.py",
                         ("ordering_figure", "ordering_slope_figure"),
                         required=False)
 
+# The per-element window search. Optional, so an older lulevich_model.py
+# leaves the bars usable by hand and only the button missing.
+HAS_WINDOW_SEARCH = _pull(_model_module, "lulevich_model.py",
+                          ("search_term_windows",), required=False)
+if not HAS_WINDOW_SEARCH:
+    search_term_windows = None
+
 if MISSING_PIECES:
     st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
     st.error(
@@ -617,6 +624,11 @@ DEFAULTS = {
     "cyto_starts_at": "at ε₁",
     "highlight_segment": "(none)",
     "composition_search": None,
+    # Per-element windows: the stretch of the squash each element is allowed
+    # to carry load over. Off unless asked for, because switching them on
+    # changes what every modulus means, and that has to be a decision.
+    "use_element_windows": False,
+    "element_window_search": None,
     "arrangement_search": None,
     # The whole curve, until you say otherwise.
     "window_end": 1.00,
@@ -3520,6 +3532,114 @@ def epsilon_range_control(lo_key, hi_key, floor, ceiling, step,
     return range_bounds(lo_key, hi_key, floor, ceiling, step)
 
 
+def element_window_key(term):
+    """Session key holding one element's own window."""
+    return f"element_window_{term}"
+
+
+def element_windows(terms=None, lo=0.0, hi=1.0):
+    """
+    Each element's own stretch of the squash, as the page has it set.
+
+    Returns None when the per-element windows are switched off, which is
+    what tells the model to place the elements from the composition's own
+    boundaries instead. Anything else would silently turn every fit into a
+    different model.
+    """
+    if not st.session_state.get("use_element_windows", False):
+        return None
+    terms = tuple(terms if terms is not None else active_terms())
+    out = {}
+    for term in terms:
+        window = st.session_state.get(element_window_key(term))
+        if not window:
+            continue
+        try:
+            a, b = float(window[0]), float(window[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        a = float(np.clip(a, lo, hi))
+        b = float(np.clip(b, a, hi))
+        if b > a:
+            out[term] = (round(a, 4), round(b, 4))
+    return out or None
+
+
+def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
+                           cyto_start="break"):
+    """Where the composition would put this element, before anyone moves it."""
+    if term in ("nucleus", "nucleus_shell"):
+        return (float(np.clip(e2, lo, hi)), hi)
+    if term == "interior" and cyto_start == "break":
+        return (float(np.clip(e1, lo, hi)), hi)
+    if term in ("membrane", "tension"):
+        if membrane == "late":
+            return (float(np.clip(e1, lo, hi)), hi)
+        if membrane == "freeze":
+            return (lo, float(np.clip(e1, lo, hi)))
+    return (lo, hi)
+
+
+def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
+                            cyto_start="break"):
+    """
+    One bar per element: the stretch of the squash it is allowed to act on.
+
+    The bar is not a view of the fit, it is part of the model. An element's
+    window is where its own law starts and where it stops taking more, so
+    moving a handle changes the curve and every modulus in it. That is why
+    the whole panel is behind a tick: the boundaries ε₁ and ε₂ describe the
+    same thing more simply, and are right for most cells.
+    """
+    st.checkbox(
+        "Give each element its own range",
+        key="use_element_windows",
+        help="Off, the elements are placed by ε₁ and ε₂: shell first, "
+        "scaffolding from ε₁, whatever is deeper from ε₂. On, each element "
+        "gets a bar of its own and can start and stop wherever you put it. "
+        "Useful when a curve has more parts than two boundaries can "
+        "describe, and honest only when you have a reason.",
+    )
+    if not st.session_state["use_element_windows"]:
+        return None
+    if not terms:
+        st.caption("Tick some materials first.")
+        return None
+
+    names = components_for(st.session_state["cell_type"])
+    columns = st.columns(min(len(terms), 2))
+    for index, term in enumerate(terms):
+        key = element_window_key(term)
+        if not st.session_state.get(key):
+            st.session_state[key] = default_element_window(
+                term, lo, hi, e1, e2, membrane, cyto_start
+            )
+        with columns[index % len(columns)]:
+            bar = f"{key}__bar"
+            pair = st.session_state[key]
+            a = float(np.clip(pair[0], lo, hi - step))
+            b = float(np.clip(pair[1], a + step, hi))
+            st.session_state[bar] = (a, b)
+
+            def _store(term=term, key=key, bar=bar):
+                got = st.session_state.get(bar)
+                if got:
+                    st.session_state[key] = (
+                        round(float(got[0]), 4), round(float(got[1]), 4)
+                    )
+
+            st.slider(
+                f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
+                min_value=float(lo), max_value=float(hi), step=float(step),
+                key=bar, on_change=_store,
+                help="Where this element starts carrying load and where it "
+                     "stops taking more. Past the far end it holds what it "
+                     "reached rather than vanishing, so the curve has no "
+                     "step in it.",
+            )
+    return element_windows(terms, lo, hi)
+
+
 def boundary_control(key, label, lower, upper, step, help_text=None,
                      disabled=False):
     """
@@ -4551,6 +4671,26 @@ with st.sidebar:
                 "Files.ReadWrite.All.",
             )
             st.text_input("Folder for the cells", key="onedrive_root")
+            # Which half of the setup is done. A client_id with no token is
+            # the normal halfway state, and it deserves an instruction
+            # rather than the raw error the token request would raise.
+            try:
+                _od = dict(st.secrets.get("onedrive", {}))
+            except Exception:
+                _od = {}
+            _has_id = bool(_od.get("client_id"))
+            _has_key = bool(_od.get("refresh_token") or _od.get("client_secret"))
+            if _has_id and not _has_key:
+                st.info(
+                    "**One step left.** The client id is in secrets and "
+                    "nobody has signed in with it yet, so there is nothing "
+                    "to connect with. Open **Sign in to get a refresh "
+                    "token** below, press **Start sign-in**, and follow it "
+                    "through; it ends by handing you a block to paste back "
+                    "into Secrets. Pressing Connect before that will always "
+                    "say there are no credentials."
+                )
+
             if st.button("🔌 Connect to OneDrive", **STRETCH):
                 store = onedrive_store.store_from_secrets(
                     st, st.session_state["onedrive_root"] or None
@@ -4572,6 +4712,15 @@ with st.sidebar:
                     if status["ok"]:
                         st.session_state["onedrive_store"] = store
                         st.success(f"Connected: {status['detail']}")
+                    elif "No OneDrive credentials" in str(status["detail"]):
+                        st.warning(
+                            "Nothing to connect with yet: secrets have the "
+                            "client id but no refresh token. That token "
+                            "comes from **Sign in to get a refresh token** "
+                            "just below — do that first, paste the block it "
+                            "gives you into Secrets, reboot, and then press "
+                            "Connect."
+                        )
                     else:
                         st.error(status["detail"])
             if st.session_state.get("onedrive_store"):
@@ -4579,7 +4728,8 @@ with st.sidebar:
                     f"Connected ✓ · {st.session_state['onedrive_store'].auth_method()}"
                 )
 
-            with st.expander("Sign in to get a refresh token"):
+            with st.expander("Sign in to get a refresh token",
+                             expanded=_has_id and not _has_key):
                 st.caption(
                     "Do this once. It needs client_id and tenant in secrets; "
                     "everything else happens in your browser."
@@ -5622,6 +5772,89 @@ with tab_analysis:
                 }
                 st.rerun()
 
+            # A bar per element, for a curve that two boundaries cannot
+            # describe. Above the boundary controls, because switching it on
+            # is what makes those boundaries stop mattering.
+            st.markdown("**Where each element acts**")
+            element_window_controls(
+                active, fit_lo, fit_hi, step, break_1, break_2,
+                membrane_mode, cyto_mode,
+            )
+            if st.session_state.get("use_element_windows"):
+                can_place = search_term_windows is not None
+                if st.button(
+                    "🎯 Find where each element acts", type="primary",
+                    disabled=not (can_place and active), **STRETCH,
+                ):
+                    with st.spinner(
+                        "Moving each element's window and scoring every "
+                        "placement on points it was not fitted to…"
+                    ):
+                        try:
+                            found = search_term_windows(
+                                model, fit_lo, fit_hi, active,
+                                membrane=membrane_mode, cyto_start=cyto_mode,
+                                e1=break_1, e2=break_2,
+                                weighting=st.session_state["weighting"],
+                                fit_offset=st.session_state["fit_offset"],
+                                start_from=element_windows(active, fit_lo, fit_hi),
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            found = {"success": False, "error": str(exc)}
+                    st.session_state["element_window_search"] = found
+                    if found.get("success"):
+                        pending = {
+                            element_window_key(term): tuple(window)
+                            for term, window in found["windows"].items()
+                        }
+                        st.session_state["_pending_settings"] = pending
+                        st.rerun()
+                    else:
+                        st.error(found.get("error", "The placement search failed."))
+                st.caption(
+                    "Moves one edge at a time, and each hand-over from one "
+                    "element to the next as a single step, scoring every "
+                    "placement on points it was not fitted to. Held-out "
+                    "error is relative, so a placement that ruins the fit "
+                    "near contact cannot win by being right at the top."
+                )
+                placed = st.session_state.get("element_window_search")
+                if placed and placed.get("success"):
+                    started = placed["trials"][0]["score"] if placed["trials"] else float("nan")
+                    ended = placed["cv_rmse"]
+                    flat_table(
+                        pd.DataFrame([
+                            {
+                                "element": plain_name(term),
+                                "acts from ε": f"{window[0]:.3f}",
+                                "to ε": f"{window[1]:.3f}",
+                            }
+                            for term, window in placed["windows"].items()
+                        ]),
+                        align_right=["acts from ε", "to ε"],
+                    )
+                    better = (
+                        np.isfinite(started) and started > 0
+                        and (started - ended) / started
+                    )
+                    st.caption(
+                        f"Held-out error {ended:.4g}, from {started:.4g} "
+                        f"where the elements started"
+                        + (f" — {100 * better:.0f} % better."
+                           if better and better > 0 else
+                           ". Nothing beat where they already were.")
+                        + f" {len(placed['trials'])} placements tried."
+                    )
+                    if better and better < 0.05:
+                        st.warning(
+                            "That is a small improvement for a large change "
+                            "in the model. Four elements with four free "
+                            "windows can fit one curve several ways, and a "
+                            "few per cent of held-out error is not enough to "
+                            "choose between them. Check the error bars "
+                            "beside each modulus before quoting any of them."
+                        )
+
             # Each boundary on its own, because most of the time only one
             # of them is wrong. The table above moves them together and is
             # the wrong tool for nudging ε₂ while ε₁ stays put.
@@ -6150,6 +6383,12 @@ with tab_analysis:
                         use_cortex="cortex" in active,
                         weighting=st.session_state["weighting"],
                         fit_offset=st.session_state["fit_offset"],
+                        **figure_kwargs(
+                            model.fit_composition,
+                            term_windows=element_windows(
+                                active, fit_lo, fit_hi
+                            ),
+                        ),
                     )
                 else:
                     fit = model.fit_segmented(
@@ -6290,9 +6529,15 @@ with tab_analysis:
                 # curves would not add up to the line through the data.
                 tension_basis = None
                 if hasattr(model, "composition_basis"):
+                    basis = figure_kwargs(
+                        model.composition_basis,
+                        term_windows=fit.get("term_windows"),
+                    )
                     basis = model.composition_basis(
                         epsilon, fit["break_1"], fit["break_2"],
-                        fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
+                        fit.get("membrane", "freeze"),
+                        fit.get("cyto_start", "break"),
+                        **basis,
                     )
                     membrane_basis = basis["membrane"]
                     cyto_basis = basis["interior"]
