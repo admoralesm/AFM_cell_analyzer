@@ -300,6 +300,33 @@ class GoogleSheetsManager:
         "Membrane Eₘ·h (mN/m)": "Membrane Em·h (mN/m)",
     }
 
+    @staticmethod
+    def unique_headers(names):
+        """
+        A header row with no two columns sharing a name, and none blank.
+
+        A real sheet acquires duplicates: a column added by hand under a
+        name the app also writes, a rename that lands on a heading already
+        there, a stray copy. Pandas tolerates that; Arrow does not, and the
+        database tab died with "Duplicate column names found" while showing
+        nothing about which ones. Later copies are numbered rather than
+        dropped, because a column with data in it is somebody's data even
+        when its name is a mistake.
+        """
+        seen, out = {}, []
+        for index, raw in enumerate(names):
+            name = str(raw).strip() or f"Column {index + 1}"
+            if name in seen:
+                seen[name] += 1
+                name = f"{name} ({seen[name]})"
+                # The numbered name could itself collide with a real one.
+                while name in seen:
+                    seen[name] = seen.get(name, 1) + 1
+                    name = f"{name} ({seen[name]})"
+            seen[name] = 1
+            out.append(name)
+        return out
+
     def _initialize_headers(self, worksheet=None, columns=None):
         """Put the header row on a brand new tab."""
         worksheet = worksheet if worksheet is not None else self.worksheet
@@ -364,7 +391,9 @@ class GoogleSheetsManager:
             self._initialize_headers(worksheet, columns)
             return [name for _, name in columns]
 
-        renamed = [self.RENAMED.get(name, name) for name in header]
+        renamed = self.unique_headers(
+            [self.RENAMED.get(name, name) for name in header]
+        )
         missing = [name for _, name in columns if name not in renamed]
         if renamed != header or missing:
             renamed = renamed + missing
@@ -395,7 +424,9 @@ class GoogleSheetsManager:
             self._initialize_headers()
             return True, "Wrote the header to an empty sheet."
 
-        header = [self.RENAMED.get(h, h) for h in values[0]]
+        header = self.unique_headers(
+            [self.RENAMED.get(h, h) for h in values[0]]
+        )
         rows_by_name = [
             dict(zip(header, raw)) for raw in values[1:]
             if any(str(cell).strip() for cell in raw)
@@ -637,9 +668,14 @@ class GoogleSheetsManager:
             if len(all_values) <= 1:
                 return pd.DataFrame()
 
-            # Convert to DataFrame
-            headers = all_values[0]
-            data = all_values[1:]
+            # Convert to DataFrame. The header comes from somebody's
+            # spreadsheet, so it can hold blanks and repeats; both are fatal
+            # to the table widget and neither is a reason to show nothing.
+            headers = self.unique_headers(all_values[0])
+            width = len(headers)
+            data = [
+                (list(row) + [""] * width)[:width] for row in all_values[1:]
+            ]
 
             df = pd.DataFrame(data, columns=headers)
 
