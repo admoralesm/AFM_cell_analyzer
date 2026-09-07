@@ -1484,8 +1484,41 @@ class _CompositionMixin:
         basis = self.composition_basis(epsilon, e1, e2, membrane, cyto_start)
         return basis["membrane"], basis["interior"], basis["nucleus"]
 
+    # One element's own law, as a function of how far it has been deformed
+    # since it started carrying load. The prefactor and the power are what
+    # make it that element; where it starts is the window.
+    def _term_shape(self, term, reach):
+        if term == "tension":
+            return self.At * reach
+        if term == "membrane":
+            return self.Am * reach ** 3
+        if term in ("cortex", "interior"):
+            return self.Ai * reach ** 1.5
+        if term == "nucleus_shell":
+            return self.An_shell * reach ** 3
+        return self.An * reach ** 1.5
+
+    def _windowed_term(self, eps, term, window, squeeze):
+        """
+        One element restricted to its own stretch of the squash.
+
+        The window is not a mask over the existing term: it *is* that
+        element's onset. A body first met at 0.4 answers with (e - 0.4)^3/2,
+        not with (e - e2)^3/2 blanked out below 0.4, and the two are
+        different curves with different moduli.
+
+        Past the far end the element holds what it had reached rather than
+        vanishing. A material that stops taking more load stops taking more
+        load; one that disappears puts a step in the force, which no cell
+        does and no fit should have to follow.
+        """
+        lo, hi = float(window[0]), float(window[1])
+        reach = np.clip(np.minimum(eps, hi) - lo, 0.0, None)
+        return self._term_shape(term, reach) * squeeze
+
     def composition_basis(
         self, epsilon, e1, e2, membrane="freeze", cyto_start="break",
+        term_windows=None,
     ):
         """
         Every basis function the composition can use, keyed by term name.
@@ -1534,7 +1567,7 @@ class _CompositionMixin:
         # any one of them: it is the cell running out of room. See
         # confinement_factor.
         squeeze = self.confinement_factor(eps)
-        return {
+        basis = {
             "membrane": self.Am * held ** 3 * squeeze,
             "tension": self.At * held * squeeze,
             "interior": (
@@ -1556,6 +1589,20 @@ class _CompositionMixin:
                 * squeeze
             ),
         }
+        # A window given by hand replaces the onset that e1 and e2 imply for
+        # that element, and only for that element. Everything else keeps the
+        # composition's own arrangement.
+        for term, window in (term_windows or {}).items():
+            if term not in basis or not window:
+                continue
+            try:
+                lo, hi = float(window[0]), float(window[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if hi <= lo:
+                continue
+            basis[term] = self._windowed_term(eps, term, (lo, hi), squeeze)
+        return basis
 
     def composition_curve(self, epsilon, fit):
         """
@@ -1574,6 +1621,7 @@ class _CompositionMixin:
             float(fit.get("break_2", self.segment_break_2)),
             fit.get("membrane", "continue"),
             fit.get("cyto_start", "zero"),
+            term_windows=fit.get("term_windows"),
         )
         total = np.full(eps.shape, float(fit.get("force_offset", 0.0) or 0.0))
         for term, modulus in (
@@ -1652,9 +1700,15 @@ class _CompositionMixin:
         use_cortex=False,
         fit_offset=False,
         with_stats=True,
+        term_windows=None,
     ):
         """
         Exact linear fit of one composition at fixed breakpoints.
+
+        ``term_windows`` narrows individual elements: {term: (lo, hi)}. An
+        element is then fitted only on its own stretch of the curve and
+        contributes nothing outside it. The fit stays one linear solve,
+        because a window is a mask on a column rather than a parameter.
 
         A term switched off is left out of the design matrix entirely rather
         than fitted and ignored. That matters: an unwanted column still soaks
@@ -1687,7 +1741,8 @@ class _CompositionMixin:
         if eps.size < n_params + 1:
             return self._failure(f"Only {eps.size} points in the fitted range.")
 
-        bases = self.composition_basis(eps, e1, e2, membrane, cyto_start)
+        bases = self.composition_basis(eps, e1, e2, membrane, cyto_start,
+                                       term_windows=term_windows)
         m_basis = bases["membrane"]
         t_basis = bases["tension"]
         c_basis = bases["interior"]
@@ -1859,6 +1914,12 @@ class _CompositionMixin:
                 ) if name in errors
             },
             "nucleus_onset": float(e2),
+            # The per-element windows this fit was made with, so the drawn
+            # curve, the equation and any refit are the same model.
+            "term_windows": (
+                {k: (float(v[0]), float(v[1]))
+                 for k, v in (term_windows or {}).items() if v} or None
+            ),
             # The confinement exponent this fit was made with. It multiplies
             # every term, so a result that does not carry it cannot be
             # written back out as an equation or checked against another
@@ -4109,6 +4170,255 @@ def _aicc(ss_res, n, k):
     if n <= 0 or ss_res <= 0 or n - k - 1 <= 0:
         return float("nan")
     return n * np.log(ss_res / n) + 2 * k + (2 * k * (k + 1)) / (n - k - 1)
+
+
+def search_term_windows(
+    model, epsilon_min, epsilon_max, terms, membrane="freeze",
+    cyto_start="break", e1=None, e2=None, weighting="uniform",
+    n_grid=9, rounds=3, n_folds=5, cv_repeats=2, seed=0, fit_offset=False,
+    start_from=None, tolerance=0.005,
+):
+    """
+    Find where each element should act, by trying and scoring, not by taste.
+
+    Every element is given a window of its own: the stretch of deformation
+    on which it is allowed to carry load. Those windows are what a person
+    would otherwise set by eye with a slider, and this is the arithmetic
+    version of the same act.
+
+    The search is coordinate descent. Each element's onset is moved along a
+    grid with every other element held where it is, the best position is
+    kept, and the sweep is repeated. That is far cheaper than the product of
+    all the grids (which for four elements at nine positions is 6561 fits)
+    and lands in the same place whenever the elements are separable at all,
+    because each onset changes the residual in one direction.
+
+    Scored on held-out points rather than on residual sum. Narrowing a
+    window can only ever remove force from the model, and widening it can
+    only ever lower the residual on the points it was fitted to, so a score
+    computed on the fitted points would always prefer the widest window and
+    would be measuring nothing.
+
+    The held-out error is relative, |F - F_model| / |F|, because a
+    compression curve spans decades of force. Scored absolutely, the last
+    tenth of the curve decides everything, and a window that wrecks the fit
+    near contact scores well while reporting a membrane modulus of zero.
+
+    Returns a dict with ``windows`` (term -> (lo, hi)), the score of the
+    winner, and ``trials``: every position tried, in the order tried, so the
+    search can be shown rather than trusted.
+    """
+    lo, hi = float(epsilon_min), float(epsilon_max)
+    terms = tuple(t for t in COMPOSITION_TERMS if t in set(terms or ()))
+    if not terms:
+        return {"success": False, "error": "No elements to place."}
+    eps_all, force_all, _ = model._select(lo, hi)
+    n = eps_all.size
+    if n < 24:
+        return {"success": False, "error": f"Only {n} points; need at least 24."}
+
+    e1 = float(model.segment_break_1 if e1 is None else e1)
+    e2 = float(model.segment_break_2 if e2 is None else e2)
+    flags = {
+        "use_membrane": "membrane" in terms,
+        "use_interior": "interior" in terms,
+        "use_nucleus": "nucleus" in terms,
+        "use_tension": "tension" in terms,
+        "use_nucleus_shell": "nucleus_shell" in terms,
+        "use_cortex": "cortex" in terms,
+    }
+
+    fold_sets = []
+    for repeat in range(max(1, int(cv_repeats))):
+        rng = np.random.default_rng(seed + repeat)
+        fold_sets.append(np.array_split(rng.permutation(n), min(n_folds, n)))
+
+    def score(windows):
+        """Held-out error of one set of windows, and the fit that made it."""
+        whole = model.fit_composition(
+            lo, hi, e1, e2, membrane, cyto_start, weighting=weighting,
+            fit_offset=fit_offset, term_windows=windows, **flags
+        )
+        if not whole.get("success"):
+            return float("inf"), None
+        errors = []
+        for folds in fold_sets:
+            per_fold = []
+            for fold in folds:
+                if fold.size == 0 or fold.size >= n - 3:
+                    continue
+                keep = np.ones(n, dtype=bool)
+                keep[fold] = False
+                sub = model._clone(force_all[keep], eps_all[keep])
+                trained = sub.fit_composition(
+                    lo, hi, e1, e2, membrane, cyto_start, weighting=weighting,
+                    with_stats=False, fit_offset=fit_offset,
+                    term_windows=windows, **flags
+                )
+                if not trained.get("success"):
+                    continue
+                predicted = model.composition_curve(eps_all[fold], trained)
+                # Relative error, not absolute. A compression curve spans
+                # decades of force, so an absolute held-out error is decided
+                # almost entirely by its last tenth: a window that destroys
+                # the fit near contact costs nothing in absolute terms and
+                # everything in what the numbers mean. This is the same
+                # reasoning as the "relative" weighting used for fitting.
+                truth = force_all[fold]
+                scale = np.maximum(np.abs(truth), 1e-18)
+                per_fold.append(
+                    float(np.sqrt(np.mean(((truth - predicted) / scale) ** 2)))
+                )
+            if per_fold:
+                errors.append(float(np.mean(per_fold)))
+        if not errors:
+            return float("inf"), whole
+        return float(np.mean(errors)), whole
+
+    # Where each element starts out. The onsets the segmented model implies,
+    # so a search that finds nothing better leaves the model where it was.
+    def default_window(term):
+        if term in ("nucleus", "nucleus_shell"):
+            return (min(max(e2, lo), hi), hi)
+        if term == "interior" and cyto_start == "break":
+            return (min(max(e1, lo), hi), hi)
+        if term in ("membrane", "tension") and membrane == "late":
+            return (min(max(e1, lo), hi), hi)
+        return (lo, hi)
+
+    windows = {t: tuple(map(float, (start_from or {}).get(t, default_window(t))))
+               for t in terms}
+    best_score, best_fit = score(windows)
+    trials = [{"term": "start", "onset": None, "score": best_score}]
+
+    span = max(hi - lo, 1e-6)
+    grid = np.linspace(lo, hi, max(4, int(n_grid)))
+    # A move has to earn its place. The held-out error is itself measured
+    # with noise, so accepting anything that looks a hair better walks the
+    # windows around on that noise; four elements with four moduli have
+    # enough freedom to fit the curve several ways, and only a real
+    # improvement should be allowed to choose between them.
+    margin = 1.0 - float(tolerance)
+
+    def try_windows(trial, note):
+        """Score one candidate and keep it if it is really better."""
+        nonlocal best_score, best_fit, windows
+        value, fitted = score(trial)
+        trials.append(dict(note, score=value))
+        if value < best_score * margin:
+            best_score, best_fit = value, fitted
+            windows = trial
+            return True
+        return False
+
+    # Elements in the order they are met, outside inwards. The pair that is
+    # met together stays together.
+    ordered = [t for t in COMPOSITION_TERMS if t in windows]
+    deep_pair = ("nucleus_shell", "nucleus")
+
+    for _ in range(max(1, int(rounds))):
+        moved = False
+
+        # Hand-overs first. One element stopping where the next starts is
+        # the shape of every arrangement this model describes, and moving
+        # that single deformation is one step where moving two edges
+        # separately is two steps, each of which can look like no
+        # improvement on its own. Coordinate descent cannot cross a ridge
+        # like that, which is how a search lands on a decomposition ten
+        # times worse than the one it was looking for.
+        for outer, inner in zip(ordered, ordered[1:]):
+            for edge in grid:
+                trial = dict(windows)
+                if (outer, inner) == deep_pair:
+                    # Met at the same deformation: an envelope and what it
+                    # contains are reached together, so the boundary moves
+                    # both onsets rather than putting one inside the other.
+                    trial[outer] = (float(edge), windows[outer][1])
+                    trial[inner] = (float(edge), windows[inner][1])
+                else:
+                    trial[outer] = (windows[outer][0], float(edge))
+                    trial[inner] = (float(edge), windows[inner][1])
+                if any(w[1] - w[0] < 0.05 * span for w in trial.values()):
+                    continue
+                if try_windows(trial, {"term": f"{outer}→{inner}",
+                                       "edge": "hand-over",
+                                       "epsilon": float(edge)}):
+                    moved = True
+
+        for term in terms:
+            # Both ends, one at a time: where the element starts carrying
+            # load, and where it stops taking more. The second is what
+            # describes a membrane that has reached its limit, and a search
+            # that only moved onsets could never find one.
+            for which in (0, 1):
+                here = windows[term]
+                for edge in grid:
+                    trial_window = (
+                        (float(edge), here[1]) if which == 0
+                        else (here[0], float(edge))
+                    )
+                    if trial_window[1] - trial_window[0] < 0.05 * span:
+                        continue
+                    if abs(trial_window[which] - here[which]) < 1e-9:
+                        continue
+                    trial = dict(windows)
+                    trial[term] = trial_window
+                    if try_windows(trial, {
+                        "term": term,
+                        "edge": "start" if which == 0 else "end",
+                        "epsilon": float(edge),
+                    }):
+                        here = trial_window
+                        moved = True
+        if not moved:
+            break
+
+    # A polish on a finer grid around wherever the sweep stopped. The coarse
+    # grid can only ever land on its own points, and an onset reported as
+    # 0.094 when the curve says 0.15 is off by more than the difference the
+    # search was asked to resolve. Two rounds of this narrow each edge by
+    # roughly the grid step each time.
+    step = span / max(int(n_grid) - 1, 1)
+    for _ in range(2):
+        step *= 0.5
+        polished = False
+        for term in terms:
+            for which in (0, 1):
+                here = windows[term]
+                fine = np.linspace(
+                    max(lo, here[which] - 2 * step),
+                    min(hi, here[which] + 2 * step), 7,
+                )
+                for edge in fine:
+                    trial_window = (
+                        (float(edge), here[1]) if which == 0
+                        else (here[0], float(edge))
+                    )
+                    if trial_window[1] - trial_window[0] < 0.05 * span:
+                        continue
+                    if abs(trial_window[which] - here[which]) < 1e-9:
+                        continue
+                    trial = dict(windows)
+                    trial[term] = trial_window
+                    if try_windows(trial, {
+                        "term": term,
+                        "edge": ("start" if which == 0 else "end") + " (fine)",
+                        "epsilon": float(edge),
+                    }):
+                        here = trial_window
+                        polished = True
+        if not polished:
+            break
+
+    return {
+        "success": np.isfinite(best_score) and best_fit is not None,
+        "windows": {t: tuple(map(float, w)) for t, w in windows.items()},
+        "cv_rmse": float(best_score) if np.isfinite(best_score) else float("nan"),
+        "fit": best_fit,
+        "trials": trials,
+        "terms": terms,
+        "epsilon_range": [lo, hi],
+    }
 
 
 def compare_hypotheses(
