@@ -691,6 +691,11 @@ DEFAULTS = {
     # The last successful fit, kept so a rerun (uploading a video, ticking a
     # box, changing tab) does not wipe the results off the page.
     "_last_fit": None,
+    # What the per-material bars were last drawn from, so a fit that moves a
+    # boundary can redraw them once instead of leaving them showing the
+    # placement before it.
+    "_bars_drawn_with": None,
+    "_bars_redrawn_for": None,
     "_plot_png": None,
     "_last_fit_signature": None,
     # video
@@ -1771,7 +1776,7 @@ def safe_frame(frame):
     return out
 
 
-def default_plan(terms, lo, hi):
+def default_plan(terms, lo, hi, membrane=None, cyto_start=None):
     """
     What "Fit this cell" will do, said before it is pressed.
 
@@ -1796,9 +1801,9 @@ def default_plan(terms, lo, hi):
                 continue
             a_tex, e_tex = EQUATION_TERMS[term][2], EQUATION_TERMS[term][3]
             pieces.append(f"{a_tex} {e_tex}\\," + _basis_latex(term, {
-                "membrane": MEMBRANE_CHOICES.get(
+                "membrane": membrane or MEMBRANE_CHOICES.get(
                     st.session_state["membrane_after_break"], "freeze"),
-                "cyto_start": CYTO_CHOICES.get(
+                "cyto_start": cyto_start or CYTO_CHOICES.get(
                     st.session_state["cyto_starts_at"], "break"),
             }))
         confine = (r"(1-\varepsilon)^{-q}\," if q_measured else "")
@@ -3798,6 +3803,32 @@ def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
             "the bars move with them. Tick **Set these myself** to place a "
             "material by hand."
         )
+    else:
+        automatic = {
+            term: default_element_window(term, lo, hi, e1, e2, membrane,
+                                         cyto_start)
+            for term in terms
+        }
+        drifted = [
+            term for term in terms
+            if st.session_state.get(element_window_key(term)) != automatic[term]
+        ]
+        if drifted:
+            st.caption(
+                "These are yours now, so a fit that moves ε₁ or ε₂ no longer "
+                "moves them. "
+                + ", ".join(plain_name(t) for t in drifted)
+                + (" is" if len(drifted) == 1 else " are")
+                + " away from where the fit would put "
+                + ("it." if len(drifted) == 1 else "them.")
+            )
+            if st.button("↺ Put them back where the fit wants them",
+                         key="reset_element_windows", **STRETCH):
+                st.session_state["_pending_settings"] = {
+                    element_window_key(term): window
+                    for term, window in automatic.items()
+                }
+                st.rerun()
     return element_windows(terms, lo, hi)
 
 
@@ -4957,17 +4988,70 @@ with st.sidebar:
                     "no Drive storage of its own, so it cannot create one.",
                 )
                 if st.button("🔗 Connect", **STRETCH):
-                    manager = initialize_sheets_manager(
-                        spreadsheet_id=st.session_state["sheet_id"] or None
-                    )
+                    with st.spinner("Opening the sheet…"):
+                        manager = initialize_sheets_manager(
+                            spreadsheet_id=st.session_state["sheet_id"] or None
+                        )
                     st.session_state["gs_manager"] = manager
                     if manager:
                         st.success("Connected.")
+                    else:
+                        # It used to say nothing at all here, which is how a
+                        # failed connection looked exactly like a successful
+                        # one until the send button downstream stayed grey.
+                        st.error(
+                            "**Could not open the sheet.** Nothing is "
+                            "connected, so the send buttons stay disabled. "
+                            "In the order these actually go wrong:\n\n"
+                            "1. The sheet is not shared with the service "
+                            "account. Open it in Google Sheets, press "
+                            "Share, and add the address below as an "
+                            "**Editor**. This is the one that is usually "
+                            "missed, and it fails with a message about "
+                            "Drive storage quota, which sounds like a "
+                            "different problem.\n"
+                            "2. The id in the box above is not that "
+                            "sheet's. Paste the whole URL if in doubt.\n"
+                            "3. `[google_sheets_credentials]` is missing "
+                            "from Secrets, or the Sheets and Drive APIs are "
+                            "not enabled for that project."
+                        )
+                        email = ""
+                        try:
+                            email = st.secrets["google_sheets_credentials"].get(
+                                "client_email", ""
+                            )
+                        except Exception:
+                            email = ""
+                        if email:
+                            st.caption("Share the sheet with this address:")
+                            st.code(email, language="text")
+                        else:
+                            st.caption(
+                                "No `client_email` in "
+                                "`[google_sheets_credentials]`, so the "
+                                "credentials themselves are what is "
+                                "missing."
+                            )
                 if st.session_state["gs_manager"]:
-                    st.caption("Connected ✓ · rows are appended to the first tab")
-                    url = st.session_state["gs_manager"].get_spreadsheet_url()
+                    manager = st.session_state["gs_manager"]
+                    describe = getattr(manager, "describe", None)
+                    st.caption(
+                        f"Connected ✓ · {describe()}" if callable(describe)
+                        else "Connected ✓ · rows go to the first tab"
+                    )
+                    url = manager.get_spreadsheet_url()
                     if url:
                         st.caption(f"[Open the sheet]({url})")
+                    if callable(getattr(manager, "check", None)) and st.button(
+                        "🧪 Check it can write", **STRETCH,
+                        help="Reads the sheet, reports what it finds, and "
+                             "tries one write, so a Viewer-only share is "
+                             "caught before a row goes missing.",
+                    ):
+                        with st.spinner("Looking at the sheet…"):
+                            ok, said = manager.check()
+                        (st.success if ok else st.error)(said)
                     if st.button("↕️ Put the columns in order", **STRETCH):
                         with st.spinner("Rewriting the header…"):
                             ok, message = st.session_state["gs_manager"].reorder_columns()
@@ -5399,15 +5483,38 @@ with tab_analysis:
             # A range for each material, and the equation that follows from
             # them. This is the whole of what the fit assumes, said where
             # the choices are made rather than in a panel further down.
+            # Off the last fit where there is one, so the bars show what was
+            # actually fitted rather than what the page was set to before
+            # the search moved it. A bar showing the wrong place is worse
+            # than no bar: it is a claim about the model that is not true.
+            _shown = st.session_state.get("_last_fit")
+            if _shown and _shown.get("success"):
+                _e1 = float(_shown.get("break_1",
+                                       st.session_state["segment_break_1"]))
+                _e2 = float(_shown.get("break_2",
+                                       st.session_state["segment_break_2"]))
+                _mem = _shown.get(
+                    "membrane",
+                    MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
+                )
+                _cyto = _shown.get(
+                    "cyto_start",
+                    CYTO_CHOICES[st.session_state["cyto_starts_at"]],
+                )
+            else:
+                _e1 = float(st.session_state["segment_break_1"])
+                _e2 = float(st.session_state["segment_break_2"])
+                _mem = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
+                _cyto = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
+            st.session_state["_bars_drawn_with"] = (
+                round(_e1, 4), round(_e2, 4), _mem, _cyto,
+                round(float(guided_hi), 4),
+            )
             element_window_controls(
-                chosen, guided_lo, guided_hi, step,
-                float(st.session_state["segment_break_1"]),
-                float(st.session_state["segment_break_2"]),
-                MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
-                CYTO_CHOICES[st.session_state["cyto_starts_at"]],
+                chosen, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
                 heading="Where each material acts",
             )
-            default_plan(chosen, guided_lo, guided_hi)
+            default_plan(chosen, guided_lo, guided_hi, _mem, _cyto)
 
             # ------------------------------------------------- 2 · fit ---
             st.markdown("#### 2 · Fit")
@@ -6643,6 +6750,25 @@ with tab_analysis:
                     fit["breakpoint_spread"] = None
             st.session_state["_last_fit"] = fit
             st.session_state["_last_fit_signature"] = fit_signature
+            # The bars in "What to fit" were drawn earlier in this same pass,
+            # from the fit that existed then. If this one moved a boundary
+            # they are now showing the old placement, which is a claim about
+            # the model that is not true any more. One redraw fixes it, and
+            # the guard stops a fit that never settles from spinning.
+            _now = (
+                round(float(fit.get("break_1", 0.0)), 4),
+                round(float(fit.get("break_2", 0.0)), 4),
+                fit.get("membrane"), fit.get("cyto_start"),
+                round(float(fit.get("epsilon_range", (0, 1))[1]), 4),
+            )
+            if (
+                not st.session_state.get("use_element_windows", False)
+                and st.session_state.get("_bars_drawn_with") is not None
+                and st.session_state["_bars_drawn_with"] != _now
+                and st.session_state.get("_bars_redrawn_for") != _now
+            ):
+                st.session_state["_bars_redrawn_for"] = _now
+                st.rerun()
         elif fit is None and st.session_state.get("_last_fit") is not None:
             # Nothing asked for a fit on this run, so show the last good one
             # rather than an empty page.
@@ -7838,6 +7964,19 @@ with tab_analysis:
             sheet_blockers = list(common_blockers)
             if not sheet_ready:
                 sheet_blockers.append("connect the Google Sheet in the sidebar")
+            if sheet_ready:
+                # Which file the row is about to go into. "Connected" is not
+                # the same as "connected to the sheet you are looking at",
+                # and a row that lands in the wrong spreadsheet looks
+                # exactly like a button that did nothing. Asked for rather
+                # than assumed: an older google_sheets_manager.py has no
+                # describe(), and a missing caption must not take the send
+                # button down with it.
+                where = getattr(sheet_manager, "describe", None)
+                st.caption(
+                    f"Writes into {where()}." if callable(where)
+                    else "Writes one row into the connected sheet."
+                )
             if st.button(
                 "📗 Send to Google Sheet", type="primary",
                 disabled=bool(sheet_blockers), **STRETCH,
@@ -7845,6 +7984,13 @@ with tab_analysis:
                 try:
                     ok, message = send_cell_to_sheet(sheet_manager, fit, date_acquired)
                     (st.success if ok else st.error)(message)
+                    if not ok:
+                        st.caption(
+                            "Nothing was written. Press **🧪 Check it can "
+                            "write** in the sidebar: the usual cause is that "
+                            "the sheet is shared with the service account as "
+                            "a Viewer rather than an Editor."
+                        )
                     if ok:
                         # The database tab reads the sheet once and keeps it;
                         # a row just added has to reach it without a refresh
@@ -7852,6 +7998,11 @@ with tab_analysis:
                         st.session_state["sheet_rows"] = None
                 except Exception as exc:
                     st.error(f"Could not write the row: {exc}")
+                    st.caption(
+                        "That is the error Google returned. If it mentions "
+                        "permission or quota, the sheet is not shared with "
+                        "the service account as an Editor."
+                    )
             if st.button(
                 "📈 Also save the curve as a tab",
                 disabled=bool(sheet_blockers), **STRETCH,
