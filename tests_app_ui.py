@@ -5659,6 +5659,70 @@ def case_an_old_one_tab_sheet_is_split_without_losing_anything():
           str(working.get("Cell ID")))
 
 
+def case_a_sheet_with_repeated_headings_still_opens():
+    print("a spreadsheet with a repeated or blank heading still shows")
+    import app as app_module
+    from google_sheets_manager import GoogleSheetsManager as G
+
+    made = G.unique_headers(["Cell ID", "Notes", "", "Notes", "Cell ID"])
+    check("no two columns share a name", len(set(made)) == len(made), str(made))
+    check("the first of each keeps its name",
+          made[0] == "Cell ID" and made[1] == "Notes", str(made))
+    check("a blank heading becomes a named column",
+          made[2] == "Column 3", str(made))
+    check("and the repeats are numbered, not dropped",
+          made[3] == "Notes (2)" and made[4] == "Cell ID (2)", str(made))
+
+    # The crash: Arrow refuses a DataFrame with two columns of one name, and
+    # the whole page went down naming none of them.
+    frame = pd.DataFrame([["a", "b", "c"]], columns=["x", "y", "x"])
+    fixed = app_module.safe_frame(frame)
+    check("a frame with a repeated column comes back usable",
+          len(set(fixed.columns)) == 3, str(list(fixed.columns)))
+    check("with every value still in it",
+          list(fixed.iloc[0]) == ["a", "b", "c"], str(list(fixed.iloc[0])))
+    try:
+        import pyarrow
+        pyarrow.Table.from_pandas(fixed, preserve_index=False)
+        arrow_ok = True
+    except ImportError:
+        arrow_ok = True  # nothing to prove without pyarrow installed
+    except Exception as exc:
+        arrow_ok = False
+        print(f"  arrow refused it: {exc}")
+    check("and Arrow accepts it, which is what the table widget needs",
+          arrow_ok)
+    check("a frame that was already fine is handed back untouched",
+          app_module.safe_frame(frame[["x", "y"]]) is not None)
+
+    # End to end: a stub sheet whose header repeats itself.
+    class _Twice(_StubSheet):
+        """A sheet whose header really does repeat a name."""
+
+        def get_all_cells(self):
+            frame = pd.DataFrame(self.ROWS)
+            frame["Cell ID "] = frame["Cell ID"]
+            frame.columns = list(frame.columns[:-1]) + ["Cell ID"]
+            return frame
+
+        # The real manager de-duplicates inside get_all_cells, so its own
+        # exports are already safe; this stub deliberately does not, and the
+        # exports would fail for a reason that is not what is being tested.
+        def export_to_csv(self):
+            return pd.DataFrame(self.ROWS).to_csv(index=False)
+
+        def export_to_json(self):
+            return pd.DataFrame(self.ROWS).to_json(orient="records")
+
+    app = AppTest.from_file(APP, default_timeout=600)
+    app.run()
+    app.session_state["db_enabled"] = True
+    app.session_state["gs_manager"] = _Twice()
+    app.run()
+    check("the database tab opens on a sheet with a repeated heading",
+          no_exception(app, "a sheet with two Cell ID columns"))
+
+
 def case_the_sheet_can_be_the_database():
     print("a connected sheet is where the database tab reads from")
     app = AppTest.from_file(APP, default_timeout=600)
@@ -5898,6 +5962,7 @@ if __name__ == "__main__":
         case_a_fixed_cell_can_have_several_hertzian_terms,
         case_the_fixed_tick_locks_out_the_other_materials,
         case_the_sheet_can_be_the_database,
+        case_a_sheet_with_repeated_headings_still_opens,
         case_the_sheet_has_a_summary_tab_and_a_working_tab,
         case_an_old_one_tab_sheet_is_split_without_losing_anything,
         case_a_fixed_cell_is_one_hertzian_solid,
