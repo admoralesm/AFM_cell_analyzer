@@ -1819,37 +1819,21 @@ def default_plan(terms, lo, hi, membrane=None, cyto_start=None):
             "three-halves law — so what separates two of them is the power, "
             "or where each one starts."
         )
-        rows = [
-            ("What is fitted",
-             ", ".join(plain_name(t) for t in ALL_TERMS if t in terms)),
-            ("Over", f"ε = {lo:.3f} to {hi:.3f}"),
-            ("Boundaries",
-             "found from the curve, not assumed: every arrangement below is "
-             "fitted at its own best ε₁ and ε₂"),
-            ("Arrangements compared",
-             "; ".join(retell(row["label"]) for row in pictures) or "one"),
-            ("Chosen by",
-             "error on points the fit was not given, averaged over several "
-             "splits. Where two tie, the one with fewer free moduli wins"),
-            ("Each point counts", {
-                "uniform": "the same (uniform), so the largest forces decide "
-                           "the fit",
-                "relative": "by 1/|F| (relative), so every decade of force "
-                            "counts the same",
-                "noise": "by 1/σ (noise), the maximum-likelihood choice",
-            }.get(weighting, weighting)),
-            ("Confinement q",
-             "measured from this curve, because the interior does not "
-             "compress" if q_measured else
-             "not used: this cell is modelled as a free shell"),
-        ]
-        flat_table(pd.DataFrame(
-            [{"setting": name, "default": value} for name, value in rows]
-        ))
+        # No table of defaults. It restated the bars directly above it, the
+        # range beside them and the arrangement list the verdict names after
+        # the fit, in seven rows nobody read twice. One sentence carries
+        # what it was for.
         st.caption(
-            "This is what happens if you press the button and change "
-            "nothing. Every one of these can be overruled in **Change what "
-            "the fit assumed**, in the sidebar."
+            f"Fitted over ε = {lo:.3f} to {hi:.3f}, weighted "
+            f"{weighting}"
+            + (", with the confinement q measured from this curve"
+               if q_measured else "")
+            + f". ε₁ and ε₂ are found from the curve, not assumed: "
+            f"{len(pictures)} arrangement"
+            + ("s are" if len(pictures) != 1 else " is")
+            + " compared, each at its own best boundaries, and the winner is "
+            "the one that best predicts points it was not fitted to. All of "
+            "it is in **Change what the fit assumed**, in the sidebar."
         )
 
 
@@ -2041,6 +2025,74 @@ def range_maths(lo, hi, terms=None):
                     "of ε cannot be told apart at all, however wide the "
                     "range is made.",
         )
+
+
+def power_law_notes(fit, model=None):
+    """
+    What each material's exponent means, and how to check it by hand.
+
+    Every term here is one power of ε. That exponent is the part of the
+    model a person can hold it to without trusting any of the fitting: the
+    slope of their own curve on log-log paper near contact should land
+    between the smallest and the largest listed, and if it does not, the
+    materials in the model are not the materials in the cell.
+    """
+    terms = set(fit.get("terms") or ())
+    if not terms:
+        return
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    rows = []
+    for term, symbol, power, shape in (
+        ("tension", "T₀", 1.0, "A_t T₀ ε"),
+        ("membrane", "Eₘ", 3.0, "A_m Eₘ ε³"),
+        ("cortex", "E_cx", 1.5, "A_i E_cx ε³ᐟ²"),
+        ("interior", "Ec", 1.5, "A_i Ec ⟨ε − ε₁⟩³ᐟ²"),
+        ("nucleus_shell", "E_ne", 3.0, "A_ne E_ne ⟨ε − ε₂⟩³"),
+        ("nucleus", "Eₙ", 1.5, "A_n Eₙ ⟨ε − ε₂⟩³ᐟ²"),
+    ):
+        if term not in terms:
+            continue
+        rows.append({
+            "material": plain_name(term),
+            "contributes": shape + (f" × (1−ε)^−{q:g}" if q else ""),
+            "slope near contact": f"{power:g}",
+            "slope at ε = 0.6": (
+                f"{power + q * 0.6 / 0.4:.2f}" if q else f"{power:g}"
+            ),
+        })
+    if not rows:
+        return
+    flat_table(
+        pd.DataFrame(rows),
+        align_right=["slope near contact", "slope at ε = 0.6"],
+    )
+    st.caption(
+        "The slope is d(ln F)/d(ln ε), which is what you read off a log-log "
+        "plot, and it is the part of this you can check by hand: measure "
+        "the slope of your own curve near contact and it should land "
+        "between the smallest and the largest listed here. 3 is a membrane "
+        "on its own, 3/2 anything Hertzian, and above 3 is the cell running "
+        "out of room. "
+        + (f"Confinement adds qε/(1−ε) to every one of them, and here "
+           f"q = {q:g}, which is why the measured slope climbs along the "
+           f"curve instead of sitting on a constant."
+           if q else "Here q = 0, so every slope is constant.")
+    )
+    separation_rule(q=q if q else None)
+    if model is not None and hasattr(model, "local_exponent"):
+        try:
+            grid, slope = model.local_exponent(window_frac=0.18)
+            good = np.isfinite(slope)
+            if good.sum() > 4:
+                st.caption(
+                    "Measured on this curve: slope "
+                    f"{float(slope[good][0]):.2f} near contact, "
+                    f"{float(slope[good][-1]):.2f} at the far end. If those "
+                    "sit outside the table above, the model has materials "
+                    "this cell does not."
+                )
+        except Exception:  # pragma: no cover - a curve too short to differentiate
+            pass
 
 
 def stiffness_table(fit):
@@ -3802,6 +3854,12 @@ def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
             "These follow the fit: ε₁ and ε₂ are found from the curve, and "
             "the bars move with them. Tick **Set these myself** to place a "
             "material by hand."
+            + ("  A C2C12 usually goes membrane first, then the "
+               "cytoskeleton — or both together from contact — then the "
+               "nuclear envelope and what it contains, met at the same "
+               "deformation."
+               if st.session_state.get("cell_type", "").startswith("Myoblast")
+               else "")
         )
     else:
         automatic = {
@@ -5318,9 +5376,8 @@ with tab_analysis:
                 "kept for the plot but excluded from any fit window starting at ε ≥ 0."
             )
 
-        # `guided` is settled further down, where its radio is drawn; the
-        # value it will take is already in session state.
-        guided_now = st.session_state["ui_mode"].startswith("Guided")
+        # One layout, so this is settled here and never asked again.
+        guided_now = True
 
         # ----------------------------------------------------------- model ---
 
@@ -5418,19 +5475,15 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
-        head, mode = st.columns([1.6, 1])
-        with head:
-            section("3 · Model")
-        with mode:
-            st.radio(
-                "How much to show",
-                ["Guided · plain language", "Full control · every setting"],
-                key="ui_mode", horizontal=True, label_visibility="collapsed",
-                help="Guided gives you the choices, one button and an answer "
-                "in words. Full control lays every setting out. Both do "
-                "exactly the same fitting.",
-            )
-        guided = st.session_state["ui_mode"].startswith("Guided")
+        section("3 · Model")
+        # One page, not two. There used to be a plain-language mode and an
+        # every-setting mode, which meant every change had to be made twice
+        # and half the app was only reachable by knowing a radio existed.
+        # This is that page: the choices, the button, the curve, the numbers
+        # and the maths, with everything the fit assumed one click away in
+        # the sidebar. `guided` stays as the flag the layout is written
+        # against rather than being spelled out of two hundred branches.
+        guided = True
 
         if guided:
             names = components_for(st.session_state["cell_type"])
@@ -5439,43 +5492,45 @@ with tab_analysis:
             # The choices come before the picture, and each is made once.
 
             st.markdown("#### 1 · What to fit")
-            pick_col, range_col = st.columns([1.15, 1])
-            with pick_col:
-                st.caption("Materials")
-                fixed_cell_control()
-                for term in here:
+            # The range first: it decides which points exist at all, and
+            # every material below is placed inside it. Choosing materials
+            # for a stretch of curve you have not chosen yet is the wrong
+            # way round.
+            st.markdown("##### How far into the squash")
+            guided_lo, guided_hi = epsilon_range_control(
+                "window_start", "window_end", 0.0, eps_hi_data, step,
+                label="Fitted range, ε",
+                help_text="Drag either end, or type it below. The near end "
+                          "is normally 0, because the model describes a "
+                          "cell from first contact.",
+            )
+            inside = int(
+                ((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum()
+            )
+            st.caption(
+                f"ε {guided_lo:.3f} to {guided_hi:.3f} · {inside} of "
+                f"{epsilon.size} points"
+                + (f" · rupture near ε = {rupture['epsilon']:.3f}"
+                   if rupture.get("method") == "force-drop"
+                   and rupture.get("epsilon") is not None else "")
+            )
+            if guided_lo > 0:
+                st.caption(
+                    "⚠️ Not starting from zero. The membrane term is "
+                    "measured from first contact, so a start above 0 only "
+                    "makes sense when the approach itself misbehaved. "
+                    "Set it back to 0 to fit through it."
+                )
+
+            st.markdown("##### Materials")
+            fixed_cell_control()
+            pick_cols = st.columns(min(max(len(here), 1), 4))
+            for index, term in enumerate(here):
+                with pick_cols[index % len(pick_cols)]:
                     st.checkbox(
                         f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                         key=f"use_{term}", help=names[term][1],
                     )
-            with range_col:
-                st.caption("How far into the squash")
-                guided_lo, guided_hi = epsilon_range_control(
-                    "window_start", "window_end", 0.0, eps_hi_data, step,
-                    label="Fitted range, ε",
-                    help_text="Drag either end, or type it below. The near end "
-                              "is normally 0, because the model describes a "
-                              "cell from first contact.",
-                )
-                inside = int(
-                    ((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum()
-                )
-                st.caption(
-                    f"ε {guided_lo:.3f} to {guided_hi:.3f} · {inside} of "
-                    f"{epsilon.size} points"
-                    + (f" · rupture near ε = {rupture['epsilon']:.3f}"
-                       if rupture.get("method") == "force-drop"
-                       and rupture.get("epsilon") is not None else "")
-                )
-                if guided_lo > 0:
-                    st.caption(
-                        "⚠️ Not starting from zero. The membrane term is "
-                        "measured from first contact, so a start above 0 only "
-                        "makes sense when the approach itself misbehaved. "
-                        "Set it back to 0 to fit through it."
-                    )
-                with st.expander("∑ What this range means, in maths"):
-                    range_maths(guided_lo, guided_hi, active_terms())
             chosen = active_terms()
             if not chosen:
                 st.warning("Tick at least one material before fitting.")
@@ -5596,6 +5651,12 @@ with tab_analysis:
             # does not draw is a control whose value it forgets, and these
             # hold the weighting, the boundaries and the arrangement. Out of
             # the page's way, still one click from anywhere on it.
+            # A second sidebar panel, staked out now and filled once the fit
+            # exists. The working belongs somewhere: off the page, but not
+            # nowhere, or a curve that fits badly has nothing to look at.
+            diagnostics_box = st.sidebar.expander(
+                "🔍 The working, in detail", expanded=False
+            )
             settings_box = st.sidebar.expander(
                 "⚙️ Change what the fit assumed", expanded=False
             )
@@ -7118,12 +7179,12 @@ with tab_analysis:
                 # Working, not answer. In guided mode the page is meant to
                 # read curve, numbers, maths, database, and every extra
                 # panel between them is one more thing to scroll past.
-                if bands and not guided:
-                    with st.expander(
-                        f"📊 How well it fits, stretch by stretch "
-                        f"(worst {100 * worst_band:.1f} %)",
-                        expanded=worst_band > 0.15,
-                    ):
+                if bands:
+                    with diagnostics_box:
+                        st.markdown(
+                            f"**📊 How well it fits, stretch by stretch** "
+                            f"(worst {100 * worst_band:.1f} %)"
+                        )
                         flat_table(
                             pd.DataFrame(bands),
                             align_right=["points", "typical force there",
@@ -7176,10 +7237,8 @@ with tab_analysis:
                 held = model.sarcomere_report(
                     fit["epsilon_range"][1], onset=deep_onset, spread=0.0,
                 )
-                with sub_panel(
-                    "🧬 What the squash did to the sarcomeres",
-                    flat=False, expanded=free["beyond_working_range"],
-                ) if not guided else nothing_drawn():
+                with diagnostics_box:
+                    st.markdown("**🧬 What the squash did to the sarcomeres**")
                     s1, s2, s3 = st.columns(3)
                     s1.metric(
                         "Relaxed", f"{free['relaxed_nm']:.0f} nm",
@@ -7268,12 +7327,12 @@ with tab_analysis:
                     )
                     if band["relative"] > 0.5:
                         loose_rows.append(term)
-                if spread_rows and not guided:
-                    with st.expander(
-                        "📏 How much do these numbers depend on where the "
-                        "boundaries were put?",
-                        expanded=bool(loose_rows),
-                    ):
+                if spread_rows:
+                    with diagnostics_box:
+                        st.markdown(
+                            "**📏 How much do these numbers depend on where "
+                            "the boundaries were put?**"
+                        )
                         st.caption(
                             f"ε₁ and ε₂ are fitted too, and "
                             f"{spread['n_accepted']} placements of them fit "
@@ -7710,8 +7769,8 @@ with tab_analysis:
                         )
 
             # ------------------------------------------------- diagnostics
-            with (st.expander("🔍 Fit diagnostics") if not guided
-                  else nothing_drawn()):
+            with diagnostics_box:
+                st.markdown("**🔍 Fit diagnostics**")
                 # One column per material actually in the fit, and never a
                 # column for one that is not: a share of the load reported
                 # for a material the model does not have reads as a
@@ -7860,11 +7919,23 @@ with tab_analysis:
             fitted_equation(fit, unit=style.force_unit, heading=False)
             stiffness_table(fit)
 
+            # What the powers of ε mean, at the end, where the equation they
+            # belong to has just been printed with this cell's numbers in
+            # it. The exponent is the checkable part of all of this: it is
+            # something you can read off your own curve by hand.
+            st.markdown("##### What the power law says")
+            power_law_notes(fit, model)
+            st.markdown("##### The range, and what each material saw of it")
+            range_maths(
+                float(fit["epsilon_range"][0]), float(fit["epsilon_range"][1]),
+                fit.get("terms"),
+            )
+
             with st.expander("∑ How this fit was calculated", expanded=False):
                 show_fit_maths(fit, model)
 
-            with (st.expander("∑ What “Work it out for me” does, in maths")
-                  if not guided else nothing_drawn()):
+            with diagnostics_box:
+                st.markdown("**∑ What the search does, in maths**")
                 show_search_maths()
 
             # And the answer on its own at the very bottom, after the
