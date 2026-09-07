@@ -4998,20 +4998,18 @@ def case_each_boundary_moves_on_its_own():
 
 
 def case_the_controls_sit_above_the_curve():
-    print("the things that change the fit are above the curve, the maths below")
+    print("the settings are under the curve, the maths and the answer below")
     import app as app_module
     source = SOURCE
 
     # Order in the source is order on the page: Streamlit draws a container
     # where it was created, so the slots have to be staked out in the order
     # the page should read.
-    controls = source.index('controls_slot = st.container()')
-    curve = source.index('curve_slot = st.container()')
-    check("the controls slot is staked out before the curve",
-          controls < curve, f"{controls} vs {curve}")
-    check("the working panels are put in the controls slot",
-          source.count("parent=controls_slot") >= 3,
-          str(source.count("parent=controls_slot")))
+    check("the settings live under the curve, not between it and the button",
+          source.index("settings_slot = st.container()")
+          > source.index("curve_slot = st.container()"))
+    check("and in guided mode they are one collapsed line, not three panels",
+          source.count("flat=guided") >= 3, str(source.count("flat=guided")))
     check("the maths is written after the numbers, not under the plot",
           source.index('st.markdown("#### The model, written out")')
           > source.index('st.markdown("#### The numbers")'))
@@ -5026,15 +5024,51 @@ def case_the_controls_sit_above_the_curve():
     for wanted in ("The numbers", "The model, written out", "In one block"):
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
-    check("the combination search is on the page",
+    check("the settings are behind one line, not three",
+          sum(1 for l in labels if "Change what the fit assumed" in str(l)) == 1,
+          str(labels))
+    for gone in ("⚙️ Change how the materials share the load",
+                 "📏 Where each material takes over", "🔧 Fitting options"):
+        check(f"“{gone}” is no longer a panel of its own",
+              gone not in labels, str(labels))
+    # Still reachable, still working, just not in the way.
+    check("the combination search is still reachable",
           button_by_label(app, "Find the best combination") is not None,
           str([b.label for b in app.button][:12]))
     check("so is the boundary search",
           button_by_label(app, "Find the boundaries from the data") is not None,
           str([b.label for b in app.button][:12]))
     check("and the advanced fitting options",
-          any("Advanced fitting options" in str(l) for l in labels)
-          or "Advanced fitting options" in text, str(labels))
+          "Advanced fitting options" in text, text[:200])
+
+
+def case_the_button_says_what_it_will_do():
+    print("the fit button says what it assumes before it is pressed")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "the default plan"):
+        return
+    labels = [str(getattr(e, "label", "")) for e in app.expander]
+    check("there is a panel saying what pressing it does",
+          any("What pressing this will do" in lab for lab in labels),
+          str(labels[:6]))
+    text = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("caption")))
+    formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
+    check("with the model written as an equation",
+          "F(\\varepsilon)" in formulas, formulas[:160])
+    table = table_with(app, "setting", "default")
+    check("and a table of every default it is about to use", table is not None)
+    if table is None:
+        return
+    said = " ".join(str(v) for v in table["setting"])
+    for wanted in ("What is fitted", "Over", "Boundaries", "Each point counts",
+                   "Confinement q"):
+        check(f"“{wanted}” is one of them", wanted in said, said)
+    values = " ".join(str(v) for v in table["default"])
+    check("the range it will use is stated",
+          "ε = " in values, values[:200])
+    check("and that the boundaries are found rather than assumed",
+          "found from the curve" in values, values[:300])
 
 
 def case_the_data_is_a_field_and_the_model_a_dashed_line():
@@ -5846,6 +5880,7 @@ if __name__ == "__main__":
         case_the_prefactors_are_the_papers,
         case_each_boundary_moves_on_its_own,
         case_the_controls_sit_above_the_curve,
+        case_the_button_says_what_it_will_do,
         case_an_element_window_is_an_onset_not_a_mask,
         case_the_placement_search_finds_where_elements_act,
         case_each_element_gets_its_own_bar,
