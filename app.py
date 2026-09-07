@@ -1788,14 +1788,8 @@ def default_plan(terms, lo, hi):
     weighting = st.session_state.get("weighting", "uniform")
     pictures = hypotheses_for(st.session_state["cell_type"], terms=terms)
 
-    with st.expander("What pressing this will do, and what it assumes",
-                     expanded=False):
-        st.markdown(
-            f"**The model.** Every material you ticked adds its own force, "
-            f"and they add up. Each obeys one power of ε — the shell a cube "
-            f"law, anything Hertzian a three-halves law — and what separates "
-            f"two of them is the power, or where each one starts:"
-        )
+    if True:
+        st.markdown("##### The equation this will fit")
         pieces = []
         for term in ALL_TERMS:
             if term not in terms:
@@ -1813,6 +1807,12 @@ def default_plan(terms, lo, hi):
             + (r"\left[" if q_measured and len(pieces) > 1 else "")
             + " + ".join(pieces)
             + (r"\right]" if q_measured and len(pieces) > 1 else "")
+        )
+        st.caption(
+            "Every material adds its own force and they add up. Each obeys "
+            "one power of ε — the shell a cube law, anything Hertzian a "
+            "three-halves law — so what separates two of them is the power, "
+            "or where each one starts."
         )
         rows = [
             ("What is fitted",
@@ -1842,10 +1842,38 @@ def default_plan(terms, lo, hi):
             [{"setting": name, "default": value} for name, value in rows]
         ))
         st.caption(
-            "Every one of these can be overruled in **Change what the fit "
-            "assumed**, under the curve. Nothing here is fixed; it is what "
-            "happens if you press the button and change nothing."
+            "This is what happens if you press the button and change "
+            "nothing. Every one of these can be overruled in **Change what "
+            "the fit assumed**, in the sidebar."
         )
+
+
+class _Nowhere:
+    """A `with` block whose body is executed and drawn nowhere.
+
+    Used for the panels a guided page does not show. The body still runs,
+    so anything it computes still happens and any widget in it still keeps
+    its value; it simply does not appear. Streamlit's empty container is
+    the sink: writing into it and then clearing it leaves nothing behind.
+    """
+
+    def __init__(self):
+        self._holder = st.empty()
+        self._inner = None
+
+    def __enter__(self):
+        self._inner = self._holder.container()
+        self._inner.__enter__()
+        return self._inner
+
+    def __exit__(self, *exc):
+        self._inner.__exit__(*exc)
+        self._holder.empty()
+        return False
+
+
+def nothing_drawn():
+    return _Nowhere()
 
 
 def sub_panel(title, flat=False, expanded=False):
@@ -3707,7 +3735,7 @@ def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
 
 
 def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
-                            cyto_start="break"):
+                            cyto_start="break", heading=None):
     """
     One bar per element: the stretch of the squash it is allowed to act on.
 
@@ -3717,29 +3745,30 @@ def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
     the whole panel is behind a tick: the boundaries ε₁ and ε₂ describe the
     same thing more simply, and are right for most cells.
     """
-    st.checkbox(
-        "Give each element its own range",
-        key="use_element_windows",
-        help="Off, the elements are placed by ε₁ and ε₂: shell first, "
-        "scaffolding from ε₁, whatever is deeper from ε₂. On, each element "
-        "gets a bar of its own and can start and stop wherever you put it. "
-        "Useful when a curve has more parts than two boundaries can "
-        "describe, and honest only when you have a reason.",
-    )
-    if not st.session_state["use_element_windows"]:
-        return None
     if not terms:
-        st.caption("Tick some materials first.")
         return None
+    if heading:
+        st.markdown(f"##### {heading}")
+    own = st.checkbox(
+        "Set these myself",
+        key="use_element_windows",
+        help="Off, the bars show where the fit will place each material: "
+        "the shell from first contact, the scaffolding from ε₁, whatever is "
+        "deeper from ε₂, with ε₁ and ε₂ found from the curve. On, each bar "
+        "is yours to move and the fit uses exactly what you set.",
+    )
 
     names = components_for(st.session_state["cell_type"])
     columns = st.columns(min(len(terms), 2))
     for index, term in enumerate(terms):
         key = element_window_key(term)
-        if not st.session_state.get(key):
-            st.session_state[key] = default_element_window(
-                term, lo, hi, e1, e2, membrane, cyto_start
-            )
+        automatic = default_element_window(term, lo, hi, e1, e2, membrane,
+                                           cyto_start)
+        # While the bars are not yours, they follow the fit rather than
+        # holding an old position: they are showing you where each material
+        # will act, and a bar that shows the wrong place is worse than none.
+        if not own or not st.session_state.get(key):
+            st.session_state[key] = automatic
         with columns[index % len(columns)]:
             bar = f"{key}__bar"
             pair = st.session_state[key]
@@ -3757,12 +3786,18 @@ def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
             st.slider(
                 f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                 min_value=float(lo), max_value=float(hi), step=float(step),
-                key=bar, on_change=_store,
-                help="Where this element starts carrying load and where it "
+                key=bar, on_change=_store, disabled=not own,
+                help="Where this material starts carrying load and where it "
                      "stops taking more. Past the far end it holds what it "
                      "reached rather than vanishing, so the curve has no "
                      "step in it.",
             )
+    if not own:
+        st.caption(
+            "These follow the fit: ε₁ and ε₂ are found from the curve, and "
+            "the bars move with them. Tick **Set these myself** to place a "
+            "material by hand."
+        )
     return element_windows(terms, lo, hi)
 
 
@@ -5361,28 +5396,21 @@ with tab_analysis:
             if not chosen:
                 st.warning("Tick at least one material before fitting.")
 
-            with st.expander("📋 What each material is, and how they are told apart"):
-                materials_table(
-                    chosen or here,
-                    membrane_mode=MEMBRANE_CHOICES[
-                        st.session_state["membrane_after_break"]
-                    ],
-                    cyto_start=CYTO_CHOICES[st.session_state["cyto_starts_at"]],
-                    e1=float(st.session_state["segment_break_1"]),
-                    e2=float(st.session_state["segment_break_2"]),
-                )
-                separation_rule(
-                    q=float(st.session_state["confinement"])
-                    if wants_confinement() else None
-                )
+            # A range for each material, and the equation that follows from
+            # them. This is the whole of what the fit assumes, said where
+            # the choices are made rather than in a panel further down.
+            element_window_controls(
+                chosen, guided_lo, guided_hi, step,
+                float(st.session_state["segment_break_1"]),
+                float(st.session_state["segment_break_2"]),
+                MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
+                CYTO_CHOICES[st.session_state["cyto_starts_at"]],
+                heading="Where each material acts",
+            )
+            default_plan(chosen, guided_lo, guided_hi)
 
             # ------------------------------------------------- 2 · fit ---
             st.markdown("#### 2 · Fit")
-            # What the button is about to do, before it is pressed. It used
-            # to be discoverable only by pressing it and reading the verdict,
-            # which is the wrong order: a person should know what is being
-            # assumed on their behalf while they can still change it.
-            default_plan(chosen, guided_lo, guided_hi)
             fit_col, verdict_col = st.columns([1, 2.4])
             with fit_col:
                 if st.button(
@@ -5454,10 +5482,14 @@ with tab_analysis:
         # to scroll past. The controls still exist, and every one of them
         # still holds its value, because a setting that is not drawn is a
         # setting Streamlit forgets.
-        settings_slot = st.container()
         settings_box = None
         if guided:
-            settings_box = settings_slot.expander(
+            # In the sidebar, where every other setting in this app already
+            # lives. It cannot be dropped altogether: a control Streamlit
+            # does not draw is a control whose value it forgets, and these
+            # hold the weighting, the boundaries and the arrangement. Out of
+            # the page's way, still one click from anywhere on it.
+            settings_box = st.sidebar.expander(
                 "⚙️ Change what the fit assumed", expanded=False
             )
             settings_box.__enter__()
@@ -5912,13 +5944,15 @@ with tab_analysis:
                 st.rerun()
 
             # A bar per element, for a curve that two boundaries cannot
-            # describe. Above the boundary controls, because switching it on
-            # is what makes those boundaries stop mattering.
-            st.markdown("**Where each element acts**")
-            element_window_controls(
-                active, fit_lo, fit_hi, step, break_1, break_2,
-                membrane_mode, cyto_mode,
-            )
+            # describe. In guided mode these live with the other choices, in
+            # "What to fit", and drawing them twice is one widget key twice,
+            # which Streamlit refuses outright.
+            if not guided:
+                element_window_controls(
+                    active, fit_lo, fit_hi, step, break_1, break_2,
+                    membrane_mode, cyto_mode,
+                    heading="Where each element acts",
+                )
             if st.session_state.get("use_element_windows"):
                 can_place = search_term_windows is not None
                 if st.button(
@@ -6389,7 +6423,8 @@ with tab_analysis:
                         label_visibility="collapsed",
                     )
                 with a2:
-                    if st.button("Apply", **STRETCH):
+                    if st.button("Apply this preset", key="apply_preset",
+                                 **STRETCH):
                         apply_preset(presets[chosen], eps_lo_data, eps_hi_data)
                         st.rerun()
                 with a3:
@@ -6954,7 +6989,10 @@ with tab_analysis:
                         ),
                         "model is out by": f"{100 * miss:+.1f} %",
                     })
-                if bands:
+                # Working, not answer. In guided mode the page is meant to
+                # read curve, numbers, maths, database, and every extra
+                # panel between them is one more thing to scroll past.
+                if bands and not guided:
                     with st.expander(
                         f"📊 How well it fits, stretch by stretch "
                         f"(worst {100 * worst_band:.1f} %)",
@@ -7012,10 +7050,10 @@ with tab_analysis:
                 held = model.sarcomere_report(
                     fit["epsilon_range"][1], onset=deep_onset, spread=0.0,
                 )
-                with st.expander(
+                with sub_panel(
                     "🧬 What the squash did to the sarcomeres",
-                    expanded=free["beyond_working_range"],
-                ):
+                    flat=False, expanded=free["beyond_working_range"],
+                ) if not guided else nothing_drawn():
                     s1, s2, s3 = st.columns(3)
                     s1.metric(
                         "Relaxed", f"{free['relaxed_nm']:.0f} nm",
@@ -7104,7 +7142,7 @@ with tab_analysis:
                     )
                     if band["relative"] > 0.5:
                         loose_rows.append(term)
-                if spread_rows:
+                if spread_rows and not guided:
                     with st.expander(
                         "📏 How much do these numbers depend on where the "
                         "boundaries were put?",
@@ -7546,7 +7584,8 @@ with tab_analysis:
                         )
 
             # ------------------------------------------------- diagnostics
-            with st.expander("🔍 Fit diagnostics"):
+            with (st.expander("🔍 Fit diagnostics") if not guided
+                  else nothing_drawn()):
                 # One column per material actually in the fit, and never a
                 # column for one that is not: a share of the load reported
                 # for a material the model does not have reads as a
@@ -7698,9 +7737,8 @@ with tab_analysis:
             with st.expander("∑ How this fit was calculated", expanded=False):
                 show_fit_maths(fit, model)
 
-            with st.expander(
-                "∑ What “Work it out for me” does, in maths", expanded=False
-            ):
+            with (st.expander("∑ What “Work it out for me” does, in maths")
+                  if not guided else nothing_drawn()):
                 show_search_maths()
 
             # And the answer on its own at the very bottom, after the
