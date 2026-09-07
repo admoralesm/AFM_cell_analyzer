@@ -1124,8 +1124,8 @@ def case_guided_mode_is_the_default():
     check("the one-press button is there", work is not None)
 
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the stiffness table is still headed in plain words",
-          "How stiff each material turned out to be" in text, text[:200])
+    check("the results are headed as results",
+          "Fitting results" in text, text[:200])
     # The retelling of the fit is gone. It restated the boundaries drawn on
     # the curve and the two numbers printed beside R², and ended on a
     # sentence about chi-squared that said nothing the numbers did not.
@@ -1135,17 +1135,14 @@ def case_guided_mode_is_the_default():
     check("no bare jargon in the headline",
           "coupling" not in text.lower(), "the word coupling leaked out")
 
-    # The plain-language table names the parts in everyday words.
+    # The stiffness table is gone: every modulus is in the metrics row and
+    # again in the equation's coefficients, and a third copy in words was a
+    # third place for them to disagree.
     parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
-    check("the stiffness table is there", len(parts) == 1, str(len(parts)))
-    if parts:
-        table = parts[0]
-        check("it names every material in the model",
-              len(table) == len(app_module_terms()), str(len(table)))
-        check("it explains what each part is",
-              all(isinstance(v, str) and v for v in table["What it is"]))
-        check("it gives an everyday comparison",
-              any("as" in str(v) for v in table["Roughly"]), str(list(table["Roughly"])))
+    check("the stiffness table is gone", not parts, str(len(parts)))
+    check("but every modulus is still on the page",
+          any("Eₘ" in (m.label or "") for m in app.get("metric")),
+          str([m.label for m in app.get("metric")][:6]))
 
     if work is not None:
         work.click().run()
@@ -1169,8 +1166,9 @@ def case_full_control_shows_everything():
     # on it, and so are the choices it needs.
     check("the fit button is on it", button_by_label(app, "Fit this cell")
           is not None)
-    check("and so is the range", any("How far into the squash" in str(m.value)
-                                     for m in app.get("markdown")))
+    check("and so is the range",
+          any("Relative deformation, total range" in str(m.value)
+              for m in app.get("markdown")))
     check("the expert search button is still there",
           button_by_label(app, "Find the best combination and fit it") is not None)
     check("the retelling of the fit is gone from here too",
@@ -1379,19 +1377,18 @@ def case_component_names_follow_the_cell_type():
     app = start(cell_name="cell-01", cell_type="Cardiomyocyte")
     if not no_exception(app, "cardiomyocyte names"):
         return
-    parts = [f for f in flat_tables(app) if "Part of the cell" in f.columns]
-    check("the plain-language table is there", len(parts) == 1)
-    if parts:
-        listed = list(parts[0]["Part of the cell"])
-        check("it lists the sarcolemma and both cytoskeletons",
-              any("sarcolemma" in v.lower() for v in listed)
-              and any("non-sarcomeric" in v.lower() for v in listed)
-              and any("myofibril" in v.lower() for v in listed),
-              str(listed))
-        check("and never calls anything a nucleus",
-              not any("Nucleus" in v for v in listed), str(listed))
-        check("the shell is listed once, as the sarcolemma",
-              sum("Sarcolemma" in v for v in listed) == 1, str(listed))
+    # The components are named on their own ticks now, not in a table.
+    listed = [str(c.label or "") for c in app.checkbox]
+    check("the components are named on the page", listed)
+    check("it lists the sarcolemma and both cytoskeletons",
+          any("sarcolemma" in v.lower() for v in listed)
+          and any("non-sarcomeric" in v.lower() for v in listed)
+          and any("myofibril" in v.lower() for v in listed),
+          str(listed))
+    check("and never calls anything a nucleus",
+          not any("Nucleus" in v for v in listed), str(listed))
+    check("the shell is offered once, as the sarcolemma",
+          sum("Sarcolemma" in v for v in listed) == 1, str(listed))
     check("the fit succeeds for a cardiomyocyte",
           app.session_state["_last_fit"] is not None
           and app.session_state["_last_fit"].get("success"))
@@ -1746,11 +1743,12 @@ def case_guided_range_is_settable():
         return
     said = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
-    check("it is labelled", "How far into the squash" in said, said[:200])
-    check("and it comes before the materials, since it decides which "
+    check("it is labelled",
+          "Relative deformation, total range" in said, said[:200])
+    check("and it comes before the components, since it decides which "
           "points exist at all",
-          said.index("How far into the squash") < said.index("Materials"),
-          said[:200])
+          said.index("Relative deformation, total range")
+          < said.index("Components"), said[:200])
     check("and it has a handle at each end, not just at the far one",
           isinstance(slider.value, (list, tuple)) and len(slider.value) == 2,
           str(slider.value))
@@ -3786,22 +3784,22 @@ def case_the_cardiomyocyte_has_three_materials():
     fitted = (app.session_state["_last_fit"] or {}).get("terms") or []
     check("all three are fitted",
           set(fitted) == {"membrane", "interior", "nucleus"}, str(fitted))
-    table = table_with(app, "Part of the cell")
-    check("the stiffness table lists all three",
-          table is not None and len(table) == 3,
-          "none" if table is None else str(len(table)))
-    if table is not None:
-        check("and none of its rows is a nucleus",
-              not any("nucleus" in str(v).lower()
-                      for v in table["Part of the cell"]),
-              str(list(table["Part of the cell"])))
+    # Named on the page as its own three components, in the metrics row and
+    # on the component ticks. No table of parts any more.
+    labels = " ".join(str(m.label or "") for m in app.get("metric"))
+    boxes = " ".join(str(c.label or "") for c in app.checkbox)
+    check("all three are named on the page",
+          "sarcolemma" in (labels + boxes).lower(), labels + " | " + boxes)
+    check("and nothing on it says nucleus",
+          "nucleus" not in (labels + boxes).lower(), labels + " | " + boxes)
 
     plain = start(cell_name="myo-01")
     if no_exception(plain, "a myoblast"):
-        plain_table = table_with(plain, "Part of the cell")
-        check("a myoblast still lists four of its own",
-              plain_table is not None and len(plain_table) == 4,
-              "none" if plain_table is None else str(len(plain_table)))
+        myo = " ".join(str(c.label or "") for c in plain.checkbox)
+        check("a myoblast still offers four of its own",
+              sum(1 for term in ("Membrane", "Cytoskeleton",
+                                 "Nuclear envelope", "Inside the nucleus")
+                  if term in myo) == 4, myo)
 
 
 def case_q_and_the_boundaries_are_searched_together():
@@ -5017,18 +5015,19 @@ def case_the_controls_sit_above_the_curve():
           "st.sidebar.expander(\n                \"⚙️ Change what the fit assumed\""
           in source or 'settings_box = st.sidebar.expander(' in source,
           "settings box is not in the sidebar")
-    check("the maths is written after the numbers, not under the plot",
-          source.index('st.markdown("#### The model, written out")')
-          > source.index('st.markdown("#### The numbers")'))
-    check("and the one-block summary comes after the maths",
+    check("the equation is written after the results heading",
+          source.index('st.markdown("##### The equation that was fitted")')
+          > source.index('st.markdown("#### Fitting results")'))
+    check("and the one-block summary comes after it",
           source.index("final_summary(fit, model, date_acquired)")
-          > source.index('st.markdown("#### The model, written out")'))
+          > source.index('st.markdown("##### The equation that was fitted")'))
 
     app = start(cell_name="cell-01")
     if not no_exception(app, "the reordered page"):
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
-    for wanted in ("The numbers", "The model, written out", "In one block"):
+    for wanted in ("Fitting results", "The equation that was fitted",
+                   "In one block"):
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
     check("the settings are behind one line, not three",
@@ -5061,16 +5060,16 @@ def case_the_button_says_what_it_will_do():
         return
     text = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
-    check("the equation it will fit is on the page, not behind a panel",
-          "The equation this will fit" in text, text[:300])
-    check("and the table of defaults under it is gone",
+    check("the equation is with the results, where what was done belongs",
+          "The equation that was fitted" in text, text[:300])
+    check("and the table of defaults is gone",
           table_with(app, "setting", "default") is None)
-    check("its one sentence says the range and the weighting",
+    check("one sentence says the range and the weighting instead",
           "Fitted over ε" in text and "weighted" in text, text[:400])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("with the model written as an equation",
           "F(\\varepsilon)" in formulas, formulas[:160])
-    check("it says the boundaries are found rather than assumed",
+    check("it says the boundaries were found rather than assumed",
           "found from the curve" in text, text[:400])
     check("and how the winner among the arrangements is chosen",
           "predicts points it was not fitted to" in text, text[:600])
@@ -5118,19 +5117,18 @@ def case_the_range_carries_its_own_maths():
     if not no_exception(app, "range maths"):
         return
     said = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the range and what each material saw of it is written out",
-          "The range, and what each material saw of it" in said, said[-400:])
+    check("what the power law says is written out at the end",
+          "What the power law says" in said, said[-400:])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("the least-squares sum is written with the range in it",
           "arg\\min" in formulas or "argmin" in formulas.replace(" ", ""),
           formulas[:200])
-    table = table_with(app, "material", "measured over ε")
-    check("and each material's own stretch is listed", table is not None)
+    table = table_with(app, "material", "contributes")
+    check("and each material's own law is listed", table is not None)
     if table is not None:
-        check("with what it multiplies", "what it multiplies" in table.columns,
-              str(list(table.columns)))
-        check("and the deep material starting later than the shell",
-              len(table) >= 2, str(len(table)))
+        check("with the slope it implies near contact",
+              "slope near contact" in table.columns, str(list(table.columns)))
+        check("for every material in the fit", len(table) >= 2, str(len(table)))
 
 
 def case_the_page_ends_with_the_answer():
@@ -5376,11 +5374,11 @@ def case_the_ranges_follow_the_fit():
     if not no_exception(app, "own windows drifting from the fit"):
         return
     said = " ".join(str(c.value) for c in app.get("caption"))
-    check("it says the bars are no longer following the fit",
+    check("it says the ranges are no longer following the fit",
           "yours now" in said, said[-300:])
     check("and offers to put them back",
           button_by_label(app, "Put them back where the fit wants them")
-          is not None, str([b.label for b in app.button][:12]))
+          is not None, str([b.label for b in app.button][:14]))
 
 
 def case_a_sheet_that_will_not_open_says_why():
@@ -5452,10 +5450,9 @@ def case_each_element_gets_its_own_bar():
         return
     terms = [t for t in ("membrane", "interior", "nucleus", "nucleus_shell")
              if state(app, f"use_{t}")]
-    bars = [s for s in app.slider if "·" in (s.label or "")
-            and any(sym in (s.label or "") for sym in ("Eₘ", "Ec", "Eₙ", "E_ne"))]
-    check("there is a bar for every element that is ticked",
-          len(bars) >= len(terms), f"{len(bars)} bars for {len(terms)} elements")
+    bars = [s for s in app.slider if (s.label or "").startswith("acts over ε")]
+    check("there is a bar for every component offered",
+          len(bars) >= len(terms), f"{len(bars)} bars for {len(terms)} components")
 
     # Moving one element's bar moves that element and nothing else.
     others = {t: state(app, f"element_window_{t}") for t in terms[1:]}
@@ -5476,7 +5473,7 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Find where each element acts")
+    button = button_by_label(app, "Find where each component acts")
     check("and there is a button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:10]))
     if button is None:
@@ -5926,15 +5923,9 @@ def case_a_fixed_cell_is_one_hertzian_solid():
           abs(fit["Ei_kPa"] - 190.0) < 10.0, f"{fit['Ei_kPa']:.4g} kPa")
     check("which is in the range the paper reports for fixed cells",
           150.0 <= fit["Ei_kPa"] <= 230.0, f"{fit['Ei_kPa']:.4g} kPa")
-    table = table_with(app, "Part of the cell")
-    fitted_rows = ([] if table is None else
-                   [r for _, r in table.iterrows()
-                    if "not included" not in str(r["Roughly"])])
-    check("the table lists exactly one material as fitted",
-          len(fitted_rows) == 1, str(len(fitted_rows)))
-    check("and says plainly that the others were not in this model",
-          table is not None and len(table) - len(fitted_rows) == len(table) - 1,
-          "none" if table is None else str(len(table)))
+    notes = " ".join(str(m.delta or "") for m in app.get("metric"))
+    check("the others are marked as not in this model",
+          "not in this model" in notes, notes[:200])
     # The living cell type underneath is untouched: fixation changed the
     # chemistry, not the geometry the prefactors are built from.
     check("and the cell type underneath is left alone",
