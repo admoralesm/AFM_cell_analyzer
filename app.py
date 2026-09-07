@@ -1743,7 +1743,98 @@ def separation_rule(q=None):
     )
 
 
-def open_panel(title, guided, expanded=False, parent=None):
+def default_plan(terms, lo, hi):
+    """
+    What "Fit this cell" will do, said before it is pressed.
+
+    Everything here is a default the app chose, and every one of them can be
+    overruled further down the page. Printing them is the difference between
+    a button that produces numbers and a button whose numbers can be
+    defended: the model, the range, the weighting and the confinement are
+    all decisions, and they belong in front of the person making them.
+    """
+    terms = tuple(terms or ())
+    if not terms:
+        return
+    q_measured = wants_confinement()
+    weighting = st.session_state.get("weighting", "uniform")
+    pictures = hypotheses_for(st.session_state["cell_type"], terms=terms)
+
+    with st.expander("What pressing this will do, and what it assumes",
+                     expanded=False):
+        st.markdown(
+            f"**The model.** Every material you ticked adds its own force, "
+            f"and they add up. Each obeys one power of ε — the shell a cube "
+            f"law, anything Hertzian a three-halves law — and what separates "
+            f"two of them is the power, or where each one starts:"
+        )
+        pieces = []
+        for term in ALL_TERMS:
+            if term not in terms:
+                continue
+            a_tex, e_tex = EQUATION_TERMS[term][2], EQUATION_TERMS[term][3]
+            pieces.append(f"{a_tex} {e_tex}\\," + _basis_latex(term, {
+                "membrane": MEMBRANE_CHOICES.get(
+                    st.session_state["membrane_after_break"], "freeze"),
+                "cyto_start": CYTO_CHOICES.get(
+                    st.session_state["cyto_starts_at"], "break"),
+            }))
+        confine = (r"(1-\varepsilon)^{-q}\," if q_measured else "")
+        st.latex(
+            r"F(\varepsilon) = " + confine
+            + (r"\left[" if q_measured and len(pieces) > 1 else "")
+            + " + ".join(pieces)
+            + (r"\right]" if q_measured and len(pieces) > 1 else "")
+        )
+        rows = [
+            ("What is fitted",
+             ", ".join(plain_name(t) for t in ALL_TERMS if t in terms)),
+            ("Over", f"ε = {lo:.3f} to {hi:.3f}"),
+            ("Boundaries",
+             "found from the curve, not assumed: every arrangement below is "
+             "fitted at its own best ε₁ and ε₂"),
+            ("Arrangements compared",
+             "; ".join(retell(row["label"]) for row in pictures) or "one"),
+            ("Chosen by",
+             "error on points the fit was not given, averaged over several "
+             "splits. Where two tie, the one with fewer free moduli wins"),
+            ("Each point counts", {
+                "uniform": "the same (uniform), so the largest forces decide "
+                           "the fit",
+                "relative": "by 1/|F| (relative), so every decade of force "
+                            "counts the same",
+                "noise": "by 1/σ (noise), the maximum-likelihood choice",
+            }.get(weighting, weighting)),
+            ("Confinement q",
+             "measured from this curve, because the interior does not "
+             "compress" if q_measured else
+             "not used: this cell is modelled as a free shell"),
+        ]
+        flat_table(pd.DataFrame(
+            [{"setting": name, "default": value} for name, value in rows]
+        ))
+        st.caption(
+            "Every one of these can be overruled in **Change what the fit "
+            "assumed**, under the curve. Nothing here is fixed; it is what "
+            "happens if you press the button and change nothing."
+        )
+
+
+def sub_panel(title, flat=False, expanded=False):
+    """
+    An expander, or a bold line when one is already open around it.
+
+    Streamlit refuses an expander inside an expander, and in guided mode
+    every setting lives inside one. Used with ``with``, so the body reads
+    the same either way.
+    """
+    if not flat:
+        return st.expander(title, expanded=expanded)
+    st.markdown(f"**{title}**")
+    return st.container()
+
+
+def open_panel(title, guided, expanded=False, parent=None, flat=False):
     """
     Start a section: a collapsed expander in Guided mode, a heading otherwise.
 
@@ -1757,6 +1848,13 @@ def open_panel(title, guided, expanded=False, parent=None):
     that change the fit belong under the button that runs it, not below the
     curve they changed.
     """
+    if flat:
+        # Already inside an expander, and Streamlit will not nest them. A
+        # bold line does the same job of separating one group from the next.
+        st.markdown(f"**{title}**")
+        panel = st.container()
+        panel.__enter__()
+        return panel
     if guided:
         panel = (parent or st).expander(title, expanded=expanded)
         panel.__enter__()
@@ -5252,6 +5350,11 @@ with tab_analysis:
 
             # ------------------------------------------------- 2 · fit ---
             st.markdown("#### 2 · Fit")
+            # What the button is about to do, before it is pressed. It used
+            # to be discoverable only by pressing it and reading the verdict,
+            # which is the wrong order: a person should know what is being
+            # assumed on their behalf while they can still change it.
+            default_plan(chosen, guided_lo, guided_hi)
             fit_col, verdict_col = st.columns([1, 2.4])
             with fit_col:
                 if st.button(
@@ -5309,12 +5412,6 @@ with tab_analysis:
             # a paragraph of reading in the middle of the one step that is
             # meant to be press-and-look.
 
-        # Everything that changes how the fit is made, in one place, under
-        # the button that runs it and above the curve it changes. Filled by
-        # the panels further down, which is where the model, the range and
-        # the fitting options are actually built.
-        controls_slot = st.container()
-
         # The curve goes here, under the choices and the fit button, so the
         # page reads choose, fit, look. Streamlit runs top to bottom and the
         # fit does not exist yet, so the containers are staked out and
@@ -5322,21 +5419,35 @@ with tab_analysis:
         curve_slot = st.container()
         video_slot = st.container()
 
-        st.divider()
+        # Everything the fit decided for you, under the curve rather than
+        # between the button and it. In guided mode all of it lives behind
+        # this one collapsed line: three panels of settings in the middle of
+        # a page whose whole promise is "press the button" was three panels
+        # to scroll past. The controls still exist, and every one of them
+        # still holds its value, because a setting that is not drawn is a
+        # setting Streamlit forgets.
+        settings_slot = st.container()
+        settings_box = None
+        if guided:
+            settings_box = settings_slot.expander(
+                "⚙️ Change what the fit assumed", expanded=False
+            )
+            settings_box.__enter__()
+            st.caption(
+                "Every one of these was chosen by the fit. Open it only to "
+                "overrule that, and the page refits with what you choose."
+            )
 
-        # In guided mode this is one collapsed panel, not a section of the
-        # page: the arrangement is chosen for you and the checkboxes are
-        # already in Step 2. A page that shows every control twice is a page
-        # nobody reads.
+        if not guided:
+            st.divider()
+
+        # Flat inside the box: Streamlit cannot nest an expander in an
+        # expander, so in guided mode these are headings rather than panels
+        # of their own.
         model_panel = open_panel(
             "⚙️ Change how the materials share the load", guided,
-            parent=controls_slot,
+            flat=guided,
         )
-        if guided:
-            st.caption(
-                "Everything here is set for you by the fit. Open it only to "
-                "overrule that."
-            )
 
         if guided:
             st.radio(
@@ -5502,7 +5613,7 @@ with tab_analysis:
         # yours. It goes with the controls, above the curve, because acting
         # on it changes what is fitted.
         if guided:
-          with controls_slot:
+          if True:
             picked = st.session_state.get("component_search")
             if picked and picked.get("success"):
                 names_here = components_for(st.session_state["cell_type"])
@@ -5629,7 +5740,7 @@ with tab_analysis:
 
         # --------------------------------------------------------- ranges ---
         range_panel = open_panel(
-            "📏 Where each material takes over", guided, parent=controls_slot,
+            "📏 Where each material takes over", guided, flat=guided,
         )
         if not guided:
             section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
@@ -6174,7 +6285,9 @@ with tab_analysis:
             )
             st.selectbox("Drag on the plot to set", targets, key="drag_target")
 
-        with st.expander("⚙️ Advanced fitting options"):
+        # Flat when guided, because this already sits inside the settings
+        # box and Streamlit refuses an expander inside an expander.
+        with sub_panel("⚙️ Advanced fitting options", flat=guided):
             a1, a2 = st.columns(2)
             with a1:
                 st.selectbox(
@@ -6197,7 +6310,7 @@ with tab_analysis:
             st.checkbox("Refit live as settings change", key="live_fit")
 
         # ------------------------------------------------- saved presets ---
-        with st.expander("💾 Saved windows", expanded=False):
+        with sub_panel("💾 Saved windows", flat=guided):
             p1, p2 = st.columns([2, 1])
             with p1:
                 preset_name = st.text_input(
@@ -6307,8 +6420,7 @@ with tab_analysis:
         # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
         close_panel(range_panel)
 
-        fit_panel = open_panel("🔧 Fitting options", guided,
-                               parent=controls_slot)
+        fit_panel = open_panel("🔧 Fitting options", guided, flat=guided)
         if not guided:
             section("6 · Fit" if segmented else "5 · Fit")
 
@@ -6439,6 +6551,8 @@ with tab_analysis:
                 )
 
         close_panel(fit_panel)
+        if settings_box is not None:
+            settings_box.__exit__(None, None, None)
 
         # The video and database section below runs whether or not there is a
         # fit, so the names it reads have to exist either way.
