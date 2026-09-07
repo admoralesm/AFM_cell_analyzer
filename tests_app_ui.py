@@ -1115,9 +1115,10 @@ def case_guided_mode_is_the_default():
     app = start(cell_name="cell-01")
     if not no_exception(app, "guided load"):
         return
-    check("guided is the default",
-          app.session_state["ui_mode"].startswith("Guided"),
-          app.session_state["ui_mode"])
+    check("there is no mode to choose any more",
+          not any("How much to show" in (r.label or "")
+                  for r in app.get("radio")),
+          str([r.label for r in app.get("radio")]))
 
     work = button_by_label(app, "Fit this cell")
     check("the one-press button is there", work is not None)
@@ -1164,10 +1165,12 @@ def case_full_control_shows_everything():
     app = start(cell_name="cell-01", ui_mode="Full control · every setting")
     if not no_exception(app, "full control"):
         return
-    check("the one-press button is hidden in full control",
-          button_by_label(app, "Fit this cell") is None)
-    check("the section headings are back",
-          any("Deformation ranges" in str(m.value) for m in app.get("markdown")))
+    # There is one page now, so "full control" is the page: the button is
+    # on it, and so are the choices it needs.
+    check("the fit button is on it", button_by_label(app, "Fit this cell")
+          is not None)
+    check("and so is the range", any("How far into the squash" in str(m.value)
+                                     for m in app.get("markdown")))
     check("the expert search button is still there",
           button_by_label(app, "Find the best combination and fit it") is not None)
     check("the retelling of the fit is gone from here too",
@@ -1741,9 +1744,13 @@ def case_guided_range_is_settable():
           str([s.label for s in app.slider]))
     if slider is None:
         return
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("it is labelled",
-          "How far into the squash" in captions, captions[:200])
+    said = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("caption")))
+    check("it is labelled", "How far into the squash" in said, said[:200])
+    check("and it comes before the materials, since it decides which "
+          "points exist at all",
+          said.index("How far into the squash") < said.index("Materials"),
+          said[:200])
     check("and it has a handle at each end, not just at the far one",
           isinstance(slider.value, (list, tuple)) and len(slider.value) == 2,
           str(slider.value))
@@ -2444,14 +2451,11 @@ def case_the_curve_comes_first():
     labels = [e.label or "" for e in app.get("expander")]
     check("Explore the curve is not in the guided flow",
           not any("Explore the curve" in l for l in labels), str(labels))
-    full = start(cell_name="cell-01", ui_mode="Full control · every setting")
-    if no_exception(full, "full control"):
-        check("but it is still there in full control",
-              any("Explore" in (e.label or "")
-                  for e in full.get("expander"))
-              or any("Explore" in str(m.value)
-                     for m in full.get("markdown")),
-              str([e.label for e in full.get("expander")]))
+    # There is one page now, so it is gone for good: the boundaries are
+    # found by the fit and moved by the two sliders in the sidebar, and a
+    # second, manual way of finding them was a section to scroll past.
+    check("and not reachable by a mode switch either, because there is none",
+          "How much to show" not in source, "the mode radio is still there")
 
     # The three tables that were asked to go.
     for gone in ("The pictures it compared", "How the arrangements compared",
@@ -3550,8 +3554,7 @@ def case_sarcomere_length():
     # And it has to reach the page, for cardiomyocytes only. It is working
     # rather than answer, so guided mode leaves it out; full control shows
     # it, which is where this is checked.
-    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte",
-                ui_mode="Full control · every setting")
+    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
     if not no_exception(app, "sarcomere panel"):
         return
     # Captions are their own element type in AppTest, not markdown.
@@ -3561,10 +3564,10 @@ def case_sarcomere_length():
             for x in a.get(kind)
         )
 
-    check("the sarcomere panel is shown for a cardiomyocyte",
-          any("sarcomere" in (e.label or "").lower()
-              for e in app.get("expander")),
-          str([e.label for e in app.get("expander")]))
+    said = " ".join(str(x.value) for kind in ("markdown", "caption")
+                    for x in app.get(kind))
+    check("the sarcomere working is shown for a cardiomyocyte",
+          "sarcomeres" in said.lower(), said[-400:])
     labels = [m.label for m in app.get("metric")]
     check("the relaxed length is on the page", "Relaxed" in labels, str(labels))
     check("so is the length at the top of the range",
@@ -3572,14 +3575,10 @@ def case_sarcomere_length():
     check("it says which way the length goes",
           "lengthens them" in page_text(app))
 
-    plain = start(cell_name="myo-01",
-                  ui_mode="Full control · every setting")
+    plain = start(cell_name="myo-01")
     if no_exception(plain, "no sarcomere panel"):
         check("and not for a myoblast",
-              not any("sarcomere" in (e.label or "").lower()
-                      for e in plain.get("expander")),
-              str([e.label for e in plain.get("expander")]))
-        check("nor in its text", "sarcomere" not in page_text(plain).lower())
+              "sarcomere" not in page_text(plain).lower())
 
 
 def case_extra_terms_never_crash_old_paths():
@@ -5064,22 +5063,17 @@ def case_the_button_says_what_it_will_do():
                     list(app.get("markdown")) + list(app.get("caption")))
     check("the equation it will fit is on the page, not behind a panel",
           "The equation this will fit" in text, text[:300])
+    check("and the table of defaults under it is gone",
+          table_with(app, "setting", "default") is None)
+    check("its one sentence says the range and the weighting",
+          "Fitted over ε" in text and "weighted" in text, text[:400])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("with the model written as an equation",
           "F(\\varepsilon)" in formulas, formulas[:160])
-    table = table_with(app, "setting", "default")
-    check("and a table of every default it is about to use", table is not None)
-    if table is None:
-        return
-    said = " ".join(str(v) for v in table["setting"])
-    for wanted in ("What is fitted", "Over", "Boundaries", "Each point counts",
-                   "Confinement q"):
-        check(f"“{wanted}” is one of them", wanted in said, said)
-    values = " ".join(str(v) for v in table["default"])
-    check("the range it will use is stated",
-          "ε = " in values, values[:200])
-    check("and that the boundaries are found rather than assumed",
-          "found from the curve" in values, values[:300])
+    check("it says the boundaries are found rather than assumed",
+          "found from the curve" in text, text[:400])
+    check("and how the winner among the arrangements is chosen",
+          "predicts points it was not fitted to" in text, text[:600])
 
 
 def case_the_data_is_a_field_and_the_model_a_dashed_line():
@@ -5123,9 +5117,9 @@ def case_the_range_carries_its_own_maths():
     app = start(cell_name="cell-01")
     if not no_exception(app, "range maths"):
         return
-    labels = [str(getattr(e, "label", "")) for e in app.expander]
-    check("there is a maths panel under the range control",
-          any("What this range means" in lab for lab in labels), str(labels))
+    said = " ".join(str(m.value) for m in app.get("markdown"))
+    check("the range and what each material saw of it is written out",
+          "The range, and what each material saw of it" in said, said[-400:])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("the least-squares sum is written with the range in it",
           "arg\\min" in formulas or "argmin" in formulas.replace(" ", ""),
