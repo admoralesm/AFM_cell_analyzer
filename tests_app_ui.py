@@ -472,7 +472,7 @@ def case_preset_round_trip():
     widget_by_label(app, "radio", "the membrane").set_value(
         "holds what it reached"
     ).run()
-    apply = button_by_label(app, "Apply")
+    apply = button_by_label(app, "Apply this preset")
     if apply is not None:
         apply.click().run()
         if no_exception(app, "apply preset"):
@@ -1813,7 +1813,10 @@ def case_typing_the_ends_the_wrong_way_round():
 
 def case_search_maths_is_shown():
     print("the maths behind the button is available")
-    app = start(cell_name="cell-01")
+    # In full control: the guided page keeps to curve, numbers, maths,
+    # database, and this is the working behind the search rather than the
+    # working behind the fit.
+    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
     if not no_exception(app, "search maths"):
         return
     blocks = [str(b.value) for b in app.get("latex")]
@@ -3544,8 +3547,11 @@ def case_sarcomere_length():
     check("but the clone carries it", model._clone(
         model.force, model.epsilon).L_sarcomere == model.L_sarcomere)
 
-    # And it has to reach the page, for cardiomyocytes only.
-    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte")
+    # And it has to reach the page, for cardiomyocytes only. It is working
+    # rather than answer, so guided mode leaves it out; full control shows
+    # it, which is where this is checked.
+    app = start(cell_name="cardio-01", cell_type="Cardiomyocyte",
+                ui_mode="Full control · every setting")
     if not no_exception(app, "sarcomere panel"):
         return
     # Captions are their own element type in AppTest, not markdown.
@@ -3566,7 +3572,8 @@ def case_sarcomere_length():
     check("it says which way the length goes",
           "lengthens them" in page_text(app))
 
-    plain = start(cell_name="myo-01")
+    plain = start(cell_name="myo-01",
+                  ui_mode="Full control · every setting")
     if no_exception(plain, "no sarcomere panel"):
         check("and not for a myoblast",
               not any("sarcomere" in (e.label or "").lower()
@@ -5005,11 +5012,12 @@ def case_the_controls_sit_above_the_curve():
     # Order in the source is order on the page: Streamlit draws a container
     # where it was created, so the slots have to be staked out in the order
     # the page should read.
-    check("the settings live under the curve, not between it and the button",
-          source.index("settings_slot = st.container()")
-          > source.index("curve_slot = st.container()"))
-    check("and in guided mode they are one collapsed line, not three panels",
+    check("in guided mode the settings are one collapsed line, not three panels",
           source.count("flat=guided") >= 3, str(source.count("flat=guided")))
+    check("and that line is in the sidebar, off the page entirely",
+          "st.sidebar.expander(\n                \"⚙️ Change what the fit assumed\""
+          in source or 'settings_box = st.sidebar.expander(' in source,
+          "settings box is not in the sidebar")
     check("the maths is written after the numbers, not under the plot",
           source.index('st.markdown("#### The model, written out")')
           > source.index('st.markdown("#### The numbers")'))
@@ -5027,6 +5035,11 @@ def case_the_controls_sit_above_the_curve():
     check("the settings are behind one line, not three",
           sum(1 for l in labels if "Change what the fit assumed" in str(l)) == 1,
           str(labels))
+    for gone in ("What each material is, and how they are told apart",
+                 "🔍 Fit diagnostics",
+                 "📊 How well it fits, stretch by stretch"):
+        check(f"“{gone[:36]}…” is not on the guided page",
+              not any(gone in str(l) for l in labels), str(labels))
     for gone in ("⚙️ Change how the materials share the load",
                  "📏 Where each material takes over", "🔧 Fitting options"):
         check(f"“{gone}” is no longer a panel of its own",
@@ -5047,12 +5060,10 @@ def case_the_button_says_what_it_will_do():
     app = start(cell_name="cell-01")
     if not no_exception(app, "the default plan"):
         return
-    labels = [str(getattr(e, "label", "")) for e in app.expander]
-    check("there is a panel saying what pressing it does",
-          any("What pressing this will do" in lab for lab in labels),
-          str(labels[:6]))
     text = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
+    check("the equation it will fit is on the page, not behind a panel",
+          "The equation this will fit" in text, text[:300])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("with the model written as an equation",
           "F(\\varepsilon)" in formulas, formulas[:160])
