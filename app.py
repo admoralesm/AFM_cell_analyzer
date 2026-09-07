@@ -1776,93 +1776,32 @@ def safe_frame(frame):
     return out
 
 
-def default_plan(terms, lo, hi, membrane=None, cyto_start=None):
+def how_it_was_fitted(fit):
     """
-    What "Fit this cell" will do, said before it is pressed.
+    One sentence saying how this fit was made, above the numbers it made.
 
-    Everything here is a default the app chose, and every one of them can be
-    overruled further down the page. Printing them is the difference between
-    a button that produces numbers and a button whose numbers can be
-    defended: the model, the range, the weighting and the confinement are
-    all decisions, and they belong in front of the person making them.
+    The range, the weighting and the confinement are decisions, and a
+    modulus quoted without them is a number nobody else can reproduce. It
+    is a sentence rather than a table because a table of seven rows that
+    restate the controls above it is a table nobody reads twice.
     """
-    terms = tuple(terms or ())
-    if not terms:
+    if not (fit and fit.get("success")):
         return
-    q_measured = wants_confinement()
-    weighting = st.session_state.get("weighting", "uniform")
-    pictures = hypotheses_for(st.session_state["cell_type"], terms=terms)
-
-    if True:
-        st.markdown("##### The equation this will fit")
-        pieces = []
-        for term in ALL_TERMS:
-            if term not in terms:
-                continue
-            a_tex, e_tex = EQUATION_TERMS[term][2], EQUATION_TERMS[term][3]
-            pieces.append(f"{a_tex} {e_tex}\\," + _basis_latex(term, {
-                "membrane": membrane or MEMBRANE_CHOICES.get(
-                    st.session_state["membrane_after_break"], "freeze"),
-                "cyto_start": cyto_start or CYTO_CHOICES.get(
-                    st.session_state["cyto_starts_at"], "break"),
-            }))
-        confine = (r"(1-\varepsilon)^{-q}\," if q_measured else "")
-        st.latex(
-            r"F(\varepsilon) = " + confine
-            + (r"\left[" if q_measured and len(pieces) > 1 else "")
-            + " + ".join(pieces)
-            + (r"\right]" if q_measured and len(pieces) > 1 else "")
-        )
-        st.caption(
-            "Every material adds its own force and they add up. Each obeys "
-            "one power of ε — the shell a cube law, anything Hertzian a "
-            "three-halves law — so what separates two of them is the power, "
-            "or where each one starts."
-        )
-        # No table of defaults. It restated the bars directly above it, the
-        # range beside them and the arrangement list the verdict names after
-        # the fit, in seven rows nobody read twice. One sentence carries
-        # what it was for.
-        st.caption(
-            f"Fitted over ε = {lo:.3f} to {hi:.3f}, weighted "
-            f"{weighting}"
-            + (", with the confinement q measured from this curve"
-               if q_measured else "")
-            + f". ε₁ and ε₂ are found from the curve, not assumed: "
-            f"{len(pictures)} arrangement"
-            + ("s are" if len(pictures) != 1 else " is")
-            + " compared, each at its own best boundaries, and the winner is "
-            "the one that best predicts points it was not fitted to. All of "
-            "it is in **Change what the fit assumed**, in the sidebar."
-        )
-
-
-class _Nowhere:
-    """A `with` block whose body is executed and drawn nowhere.
-
-    Used for the panels a guided page does not show. The body still runs,
-    so anything it computes still happens and any widget in it still keeps
-    its value; it simply does not appear. Streamlit's empty container is
-    the sink: writing into it and then clearing it leaves nothing behind.
-    """
-
-    def __init__(self):
-        self._holder = st.empty()
-        self._inner = None
-
-    def __enter__(self):
-        self._inner = self._holder.container()
-        self._inner.__enter__()
-        return self._inner
-
-    def __exit__(self, *exc):
-        self._inner.__exit__(*exc)
-        self._holder.empty()
-        return False
-
-
-def nothing_drawn():
-    return _Nowhere()
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    st.caption(
+        f"Fitted over ε = {lo:.3f} to {hi:.3f}, "
+        f"{int(fit.get('n_points', 0))} points, weighted "
+        f"{fit.get('weighting', 'uniform')}"
+        + (f", confinement q = {q:.2f}" if q else "")
+        + (f". ε₁ = {float(fit['break_1']):.3f}"
+           if fit.get("break_1") is not None else "")
+        + (f", ε₂ = {float(fit['break_2']):.3f}"
+           if fit.get("break_2") is not None else "")
+        + ". Boundaries were found from the curve: several arrangements "
+        "were fitted, each at its own best pair, and the one kept is the "
+        "one that best predicts points it was not fitted to."
+    )
 
 
 def sub_panel(title, flat=False, expanded=False):
@@ -3791,6 +3730,183 @@ def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
     return (lo, hi)
 
 
+def component_controls(terms, names, lo, hi, step, e1, e2,
+                       membrane="freeze", cyto_start="break"):
+    """
+    Every component of the cell: whether it is in the model, and where it acts.
+
+    One row each, because they are one decision. A component is in the fit
+    or it is not, and if it is, it carries load over some stretch of the
+    squash and not the rest; splitting those across two parts of the page
+    made a person hold one in their head while setting the other.
+
+    The ranges follow the fit until somebody takes them over. That is the
+    honest default: epsilon 1 and epsilon 2 are found from the curve, and a
+    range that did not move with them would be describing a model that is
+    no longer the one being fitted.
+    """
+    if not terms:
+        return None
+    own = st.checkbox(
+        "Set the ranges myself",
+        key="use_element_windows",
+        help="Off, each range shows where the fit will place that "
+        "component: the shell from first contact, the scaffolding from ε₁, "
+        "whatever is deeper from ε₂, with ε₁ and ε₂ found from the curve. "
+        "On, every range is yours and the fit uses exactly what you set.",
+    )
+    for term in terms:
+        key = element_window_key(term)
+        automatic = default_element_window(term, lo, hi, e1, e2, membrane,
+                                           cyto_start)
+        if not own or not st.session_state.get(key):
+            st.session_state[key] = automatic
+
+        tick_col, range_col = st.columns([1.25, 2])
+        with tick_col:
+            st.checkbox(
+                f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
+                key=f"use_{term}", help=names[term][1],
+            )
+        with range_col:
+            bar = f"{key}__bar"
+            pair = st.session_state[key]
+            a = float(np.clip(pair[0], lo, hi - step))
+            b = float(np.clip(pair[1], a + step, hi))
+            st.session_state[bar] = (a, b)
+
+            def _store(key=key, bar=bar):
+                got = st.session_state.get(bar)
+                if got:
+                    st.session_state[key] = (
+                        round(float(got[0]), 4), round(float(got[1]), 4)
+                    )
+
+            st.slider(
+                f"acts over ε · {plain_name(term)}",
+                min_value=float(lo), max_value=float(hi), step=float(step),
+                key=bar, on_change=_store,
+                disabled=not own or not st.session_state.get(f"use_{term}"),
+                label_visibility="collapsed",
+                help="Where this component starts carrying load and where "
+                     "it stops taking more. Past the far end it holds what "
+                     "it reached rather than vanishing, so the curve has no "
+                     "step in it.",
+            )
+    if own:
+        automatic = {
+            term: default_element_window(term, lo, hi, e1, e2, membrane,
+                                         cyto_start)
+            for term in terms
+        }
+        drifted = [
+            term for term in terms
+            if st.session_state.get(f"use_{term}")
+            and st.session_state.get(element_window_key(term)) != automatic[term]
+        ]
+        if drifted:
+            st.caption(
+                "These ranges are yours now, so a fit that moves ε₁ or ε₂ no "
+                "longer moves them. "
+                + ", ".join(plain_name(t) for t in drifted)
+                + (" is" if len(drifted) == 1 else " are")
+                + " away from where the fit would put "
+                + ("it." if len(drifted) == 1 else "them.")
+            )
+            if st.button("↺ Put them back where the fit wants them",
+                         key="reset_element_windows", **STRETCH):
+                st.session_state["_pending_settings"] = {
+                    element_window_key(term): window
+                    for term, window in automatic.items()
+                }
+                st.rerun()
+    if not own:
+        st.caption(
+            "The ranges follow the fit: ε₁ and ε₂ are found from the curve "
+            "and the ranges move with them."
+            + ("  A C2C12 usually goes membrane first, then the "
+               "cytoskeleton — or both together from contact — then the "
+               "nuclear envelope and what it contains, met together."
+               if str(st.session_state.get("cell_type", "")).startswith("Myoblast")
+               else "")
+        )
+    return element_windows(active_terms(), lo, hi)
+
+
+def find_boundaries_control(model, lo, hi, terms):
+    """
+    Find ε₁ and ε₂ from the curve, at the end of the choices.
+
+    The boundaries are the last thing settled before the fit, because every
+    component's range is measured from them. Pressing this moves them and
+    nothing else: the components stay as ticked and the total range stays
+    where it was put.
+    """
+    if not terms:
+        return
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        pressed = st.button(
+            "🔎 Find boundaries from the data", key="find_breaks_top",
+            disabled=not hasattr(model, "scan_segment_breaks"), **STRETCH,
+        )
+    with c2:
+        st.caption(
+            f"Now at ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
+            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
+            "Pressing this scans the curve for where one component hands "
+            "over to the next, and moves only those two."
+        )
+    # When the ranges are the person's own, the boundaries no longer place
+    # anything, and the thing to search for is the ranges themselves.
+    if st.session_state.get("use_element_windows") and search_term_windows:
+        if st.button("🎯 Find where each component acts", type="primary",
+                     key="place_components", **STRETCH):
+            with st.spinner("Moving each range and scoring every placement "
+                            "on points it was not fitted to…"):
+                try:
+                    found = search_term_windows(
+                        model, lo, hi, terms,
+                        membrane=MEMBRANE_CHOICES.get(
+                            st.session_state["membrane_after_break"], "freeze"),
+                        cyto_start=CYTO_CHOICES.get(
+                            st.session_state["cyto_starts_at"], "break"),
+                        e1=float(st.session_state["segment_break_1"]),
+                        e2=float(st.session_state["segment_break_2"]),
+                        weighting=st.session_state["weighting"],
+                        fit_offset=st.session_state["fit_offset"],
+                        start_from=element_windows(terms, lo, hi),
+                    )
+                except Exception as exc:  # pragma: no cover
+                    found = {"success": False, "error": str(exc)}
+            st.session_state["element_window_search"] = found
+            if found.get("success"):
+                st.session_state["_pending_settings"] = {
+                    element_window_key(term): tuple(window)
+                    for term, window in found["windows"].items()
+                }
+                st.rerun()
+            st.error(found.get("error", "The placement search failed."))
+
+    if not pressed:
+        return
+    with st.spinner("Scanning for the boundaries…"):
+        try:
+            found = model.scan_segment_breaks(
+                lo, hi, terms=terms or ("membrane", "interior"),
+                weighting=st.session_state["weighting"],
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            found = {"success": False, "error": str(exc)}
+    if found.get("success"):
+        st.session_state["_pending_settings"] = {
+            "segment_break_1": round(float(found["best_break_1"]), 3),
+            "segment_break_2": round(float(found["best_break_2"]), 3),
+        }
+        st.rerun()
+    st.error(found.get("error", "The boundary scan found nothing."))
+
+
 def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
                             cyto_start="break", heading=None):
     """
@@ -5475,7 +5591,7 @@ with tab_analysis:
             hi = float(np.clip(hi, eps_lo_data, eps_hi_data))
             return (lo, hi) if lo < hi else fallback
 
-        section("3 · Model")
+        section("3 · Nonlinear fitting")
         # One page, not two. There used to be a plain-language mode and an
         # every-setting mode, which meant every change had to be made twice
         # and half the app was only reachable by knowing a radio existed.
@@ -5496,7 +5612,7 @@ with tab_analysis:
             # every material below is placed inside it. Choosing materials
             # for a stretch of curve you have not chosen yet is the wrong
             # way round.
-            st.markdown("##### How far into the squash")
+            st.markdown("##### Relative deformation, total range")
             guided_lo, guided_hi = epsilon_range_control(
                 "window_start", "window_end", 0.0, eps_hi_data, step,
                 label="Fitted range, ε",
@@ -5522,15 +5638,8 @@ with tab_analysis:
                     "Set it back to 0 to fit through it."
                 )
 
-            st.markdown("##### Materials")
+            st.markdown("##### Components")
             fixed_cell_control()
-            pick_cols = st.columns(min(max(len(here), 1), 4))
-            for index, term in enumerate(here):
-                with pick_cols[index % len(pick_cols)]:
-                    st.checkbox(
-                        f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
-                        key=f"use_{term}", help=names[term][1],
-                    )
             chosen = active_terms()
             if not chosen:
                 st.warning("Tick at least one material before fitting.")
@@ -5538,10 +5647,10 @@ with tab_analysis:
             # A range for each material, and the equation that follows from
             # them. This is the whole of what the fit assumes, said where
             # the choices are made rather than in a panel further down.
-            # Off the last fit where there is one, so the bars show what was
-            # actually fitted rather than what the page was set to before
-            # the search moved it. A bar showing the wrong place is worse
-            # than no bar: it is a claim about the model that is not true.
+            # Off the last fit where there is one, so the ranges show what
+            # was actually fitted rather than what the page was set to
+            # before the search moved it. A range showing the wrong place is
+            # worse than none: it is a claim about the model that is untrue.
             _shown = st.session_state.get("_last_fit")
             if _shown and _shown.get("success"):
                 _e1 = float(_shown.get("break_1",
@@ -5565,11 +5674,18 @@ with tab_analysis:
                 round(_e1, 4), round(_e2, 4), _mem, _cyto,
                 round(float(guided_hi), 4),
             )
-            element_window_controls(
-                chosen, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
-                heading="Where each material acts",
+            # One row per component: whether it is in the model, and the
+            # stretch of the squash it acts on. The two belong together --
+            # ticking a component and then finding its range three headings
+            # away was two decisions about one thing.
+            component_controls(
+                here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
             )
-            default_plan(chosen, guided_lo, guided_hi, _mem, _cyto)
+            chosen = active_terms()
+
+            # Where the boundaries come from, at the end of the choices and
+            # before the button that uses them.
+            find_boundaries_control(model, guided_lo, guided_hi, chosen)
 
             # ------------------------------------------------- 2 · fit ---
             st.markdown("#### 2 · Fit")
@@ -6063,138 +6179,11 @@ with tab_analysis:
                 "3 · " + ("membrane + " if membrane_mode == "continue" else "")
                 + "cytoskeleton + nucleus"
             )
-            table = pd.DataFrame(
-                [
-                    {
-                        "segment": seg_1_name,
-                        "ε start": round(fit_lo, 3),
-                        "ε end": round(break_1, 3),
-                        "points": int(((epsilon >= fit_lo) & (epsilon <= break_1)).sum()),
-                    },
-                    {
-                        "segment": seg_2_name,
-                        "ε start": round(break_1, 3),
-                        "ε end": round(break_2, 3),
-                        "points": int(((epsilon > break_1) & (epsilon <= break_2)).sum()),
-                    },
-                    {
-                        "segment": seg_3_name,
-                        "ε start": round(break_2, 3),
-                        "ε end": round(fit_hi, 3),
-                        "points": int(((epsilon > break_2) & (epsilon <= fit_hi)).sum()),
-                    },
-                ]
-            )
-            edited = st.data_editor(
-                table,
-                hide_index=True,
-                key="segment_table",
-                disabled=["segment", "ε start", "points"],
-                column_config={
-                    "ε end": st.column_config.NumberColumn(
-                        "ε end", min_value=0.0, max_value=1.0, step=0.005, format="%.3f",
-                    )
-                },
-                **STRETCH,
-            )
-            try:
-                new_1 = float(edited.loc[0, "ε end"])
-                new_2 = float(edited.loc[1, "ε end"])
-            except Exception:
-                new_1, new_2 = break_1, break_2
-            if (
-                abs(new_1 - break_1) > 1e-6 or abs(new_2 - break_2) > 1e-6
-            ) and 0 <= new_1 < new_2 <= 1:
-                st.session_state["_pending_settings"] = {
-                    "segment_break_1": round(new_1, 4),
-                    "segment_break_2": round(new_2, 4),
-                }
-                st.rerun()
-
-            # A bar per element, for a curve that two boundaries cannot
-            # describe. In guided mode these live with the other choices, in
-            # "What to fit", and drawing them twice is one widget key twice,
-            # which Streamlit refuses outright.
-            if not guided:
-                element_window_controls(
-                    active, fit_lo, fit_hi, step, break_1, break_2,
-                    membrane_mode, cyto_mode,
-                    heading="Where each element acts",
-                )
-            if st.session_state.get("use_element_windows"):
-                can_place = search_term_windows is not None
-                if st.button(
-                    "🎯 Find where each element acts", type="primary",
-                    disabled=not (can_place and active), **STRETCH,
-                ):
-                    with st.spinner(
-                        "Moving each element's window and scoring every "
-                        "placement on points it was not fitted to…"
-                    ):
-                        try:
-                            found = search_term_windows(
-                                model, fit_lo, fit_hi, active,
-                                membrane=membrane_mode, cyto_start=cyto_mode,
-                                e1=break_1, e2=break_2,
-                                weighting=st.session_state["weighting"],
-                                fit_offset=st.session_state["fit_offset"],
-                                start_from=element_windows(active, fit_lo, fit_hi),
-                            )
-                        except Exception as exc:  # pragma: no cover
-                            found = {"success": False, "error": str(exc)}
-                    st.session_state["element_window_search"] = found
-                    if found.get("success"):
-                        pending = {
-                            element_window_key(term): tuple(window)
-                            for term, window in found["windows"].items()
-                        }
-                        st.session_state["_pending_settings"] = pending
-                        st.rerun()
-                    else:
-                        st.error(found.get("error", "The placement search failed."))
-                st.caption(
-                    "Moves one edge at a time, and each hand-over from one "
-                    "element to the next as a single step, scoring every "
-                    "placement on points it was not fitted to. Held-out "
-                    "error is relative, so a placement that ruins the fit "
-                    "near contact cannot win by being right at the top."
-                )
-                placed = st.session_state.get("element_window_search")
-                if placed and placed.get("success"):
-                    started = placed["trials"][0]["score"] if placed["trials"] else float("nan")
-                    ended = placed["cv_rmse"]
-                    flat_table(
-                        pd.DataFrame([
-                            {
-                                "element": plain_name(term),
-                                "acts from ε": f"{window[0]:.3f}",
-                                "to ε": f"{window[1]:.3f}",
-                            }
-                            for term, window in placed["windows"].items()
-                        ]),
-                        align_right=["acts from ε", "to ε"],
-                    )
-                    better = (
-                        np.isfinite(started) and started > 0
-                        and (started - ended) / started
-                    )
-                    st.caption(
-                        f"Held-out error {ended:.4g}, from {started:.4g} "
-                        f"where the elements started"
-                        + (f" — {100 * better:.0f} % better."
-                           if better and better > 0 else
-                           ". Nothing beat where they already were.")
-                        + f" {len(placed['trials'])} placements tried."
-                    )
-                    if better and better < 0.05:
-                        st.warning(
-                            "That is a small improvement for a large change "
-                            "in the model. Four elements with four free "
-                            "windows can fit one curve several ways, and a "
-                            "few per cent of held-out error is not enough to "
-                            "choose between them. Check the error bars "
-                            "beside each modulus before quoting any of them."
-                        )
+            # No table of segments. It said what each component does either
+            # side of each boundary, which is what the component ranges up
+            # in "3 · Nonlinear fitting" now show directly, and it was a
+            # second, editable copy of two numbers that already have their
+            # own sliders below.
 
             # Each boundary on its own, because most of the time only one
             # of them is wrong. The table above moves them together and is
@@ -7052,7 +7041,8 @@ with tab_analysis:
                 # sentence about chi-squared that a person could read
                 # straight off the two numbers beside R². Three of those
                 # were duplicates and the fourth was noise.
-                st.markdown("#### The numbers")
+                st.markdown("#### Fitting results")
+                how_it_was_fitted(fit)
 
             # All three moduli, always. A term that was not in the model reads
             # 0 and says so, rather than disappearing: a blank column in a
@@ -7915,9 +7905,8 @@ with tab_analysis:
             # cell did, and only then the equation and the working. Putting
             # the maths under the plot, as it was, meant scrolling past it
             # to reach the numbers it was the working for.
-            st.markdown("#### The model, written out")
+            st.markdown("##### The equation that was fitted")
             fitted_equation(fit, unit=style.force_unit, heading=False)
-            stiffness_table(fit)
 
             # What the powers of ε mean, at the end, where the equation they
             # belong to has just been printed with this cell's numbers in
@@ -7925,11 +7914,6 @@ with tab_analysis:
             # something you can read off your own curve by hand.
             st.markdown("##### What the power law says")
             power_law_notes(fit, model)
-            st.markdown("##### The range, and what each material saw of it")
-            range_maths(
-                float(fit["epsilon_range"][0]), float(fit["epsilon_range"][1]),
-                fit.get("terms"),
-            )
 
             with st.expander("∑ How this fit was calculated", expanded=False):
                 show_fit_maths(fit, model)
