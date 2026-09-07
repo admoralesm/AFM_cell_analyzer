@@ -5188,6 +5188,161 @@ def case_the_missing_file_message_says_what_it_can_see():
         app_module.ONEDRIVE_IMPORT_ERROR = real
 
 
+def case_an_element_window_is_an_onset_not_a_mask():
+    print("an element's own range moves where its law starts, and holds after")
+    eps = np.linspace(0.0, 0.9, 400)
+    model = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+
+    plain = model.composition_basis(eps, 0.15, 0.40, "continue", "zero")
+    moved = model.composition_basis(
+        eps, 0.15, 0.40, "continue", "zero",
+        term_windows={"nucleus": (0.40, 0.70)},
+    )
+    check("nothing before the window", float(np.max(moved["nucleus"][eps < 0.40])) == 0.0)
+    # The point of this: a body first met at 0.40 answers with (e-0.40)^1.5,
+    # which is what the untouched basis already does when e2 is 0.40. A mask
+    # would have kept the old onset and blanked the front of it instead.
+    check("it is that element's own law measured from its own start",
+          np.allclose(moved["nucleus"][(eps >= 0.40) & (eps <= 0.70)],
+                      plain["nucleus"][(eps >= 0.40) & (eps <= 0.70)]),
+          "windowed term does not match the same onset")
+
+    after = moved["nucleus"][eps > 0.70]
+    check("past the far end it holds what it reached, it does not vanish",
+          float(np.min(after)) > 0.0, f"min {float(np.min(after)):.3g}")
+    check("and holds it flat, so the curve has no step in it",
+          float(np.ptp(after)) < 1e-12, f"spread {float(np.ptp(after)):.3g}")
+
+    check("no windows given leaves every term exactly as it was",
+          all(np.allclose(plain[t], model.composition_basis(
+              eps, 0.15, 0.40, "continue", "zero", term_windows=None)[t])
+              for t in plain))
+
+
+def case_the_placement_search_finds_where_elements_act():
+    print("the search places four elements where the curve says they act")
+    from lulevich_model import search_term_windows
+
+    eps = np.linspace(0.002, 0.85, 420)
+    blank = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
+    # A cell built with four elements and known hand-overs: the shell holds
+    # at 0.15, the scaffolding takes over there, and the nucleus and its
+    # envelope are both met at 0.55.
+    basis = blank.composition_basis(eps, 0.15, 0.55, "freeze", "break")
+    force = (basis["membrane"] * 0.8e6 + basis["interior"] * 2.0e3
+             + basis["nucleus_shell"] * 30e6 + basis["nucleus"] * 20e3)
+    rng = np.random.default_rng(1)
+    force = force * (1.0 + 0.004 * rng.standard_normal(eps.size))
+
+    model = LulevichModel(force, eps, cell_height=8.0e-6)
+    found = search_term_windows(
+        model, 0.0, 0.85,
+        ("membrane", "interior", "nucleus_shell", "nucleus"),
+        membrane="freeze", cyto_start="break",
+        # Deliberately started at the wrong deep boundary: the search has to
+        # move it, which is the whole point of having one.
+        e1=0.15, e2=0.35, weighting="relative", n_grid=10, rounds=3,
+    )
+    check("the search ran", found.get("success"), str(found.get("error")))
+    if not found.get("success"):
+        return
+    windows = found["windows"]
+    check("the shell is found to hold near 0.15",
+          abs(windows["membrane"][1] - 0.15) < 0.05,
+          str([round(v, 3) for v in windows["membrane"]]))
+    check("the scaffolding takes over there",
+          abs(windows["interior"][0] - 0.15) < 0.05,
+          str([round(v, 3) for v in windows["interior"]]))
+    check("and the deep pair is met near 0.55, not at the 0.35 it started on",
+          abs(windows["nucleus"][0] - 0.55) < 0.06
+          and abs(windows["nucleus_shell"][0] - 0.55) < 0.06,
+          f"{windows['nucleus_shell'][0]:.3f} / {windows['nucleus'][0]:.3f}")
+
+    started = found["trials"][0]["score"]
+    check("and it ends better than where it started",
+          found["cv_rmse"] < started,
+          f"{started:.4g} -> {found['cv_rmse']:.4g}")
+
+    fit = found["fit"]
+    check("the moduli come back with it",
+          abs(fit["Em_MPa"] - 0.8) < 0.15 and abs(fit["Ei_kPa"] - 2.0) < 0.4,
+          f"Em {fit['Em_MPa']:.4g}, Ei {fit['Ei_kPa']:.4g}")
+    check("including the envelope, which only its own window separates",
+          abs(fit["Ene_MPa"] - 30.0) < 6.0, f"{fit['Ene_MPa']:.4g} MPa")
+    check("the fit carries the windows it was made with",
+          fit.get("term_windows") is not None
+          and set(fit["term_windows"]) == set(windows), str(fit.get("term_windows")))
+    check("every placement tried is reported, not just the winner",
+          len(found["trials"]) > 20, str(len(found["trials"])))
+
+
+def case_each_element_gets_its_own_bar():
+    print("each element has a bar of its own, and a button that places them")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "before the element windows"):
+        return
+    check("the per-element ranges are off unless asked for",
+          state(app, "use_element_windows") is False,
+          str(state(app, "use_element_windows")))
+    fit = state(app, "_last_fit")
+    check("so the fit is made without them",
+          fit is not None and fit.get("term_windows") is None,
+          str(fit.get("term_windows") if fit else "no fit"))
+
+    app.session_state["use_element_windows"] = True
+    app.run()
+    if not no_exception(app, "element windows on"):
+        return
+    terms = [t for t in ("membrane", "interior", "nucleus", "nucleus_shell")
+             if state(app, f"use_{t}")]
+    bars = [s for s in app.slider if "·" in (s.label or "")
+            and any(sym in (s.label or "") for sym in ("Eₘ", "Ec", "Eₙ", "E_ne"))]
+    check("there is a bar for every element that is ticked",
+          len(bars) >= len(terms), f"{len(bars)} bars for {len(terms)} elements")
+
+    # Moving one element's bar moves that element and nothing else.
+    others = {t: state(app, f"element_window_{t}") for t in terms[1:]}
+    if bars:
+        bars[0].set_value((0.10, 0.45)).run()
+        no_exception(app, "moving one element's bar")
+        moved = [t for t in terms
+                 if state(app, f"element_window_{t}") == (0.1, 0.45)]
+        check("the bar that was moved is the one that changed",
+              len(moved) == 1, str(moved))
+        check("and the others stayed where they were",
+              all(state(app, f"element_window_{t}") == w
+                  for t, w in others.items() if w is not None),
+              str(others))
+
+    fit = state(app, "_last_fit")
+    check("the fit is now made with each element on its own range",
+          fit is not None and fit.get("term_windows"),
+          str(fit.get("term_windows") if fit else "no fit"))
+
+    button = button_by_label(app, "Find where each element acts")
+    check("and there is a button that places them by arithmetic",
+          button is not None, str([b.label for b in app.button][:10]))
+    if button is None:
+        return
+    button.click().run()
+    if not no_exception(app, "the placement search"):
+        return
+    found = state(app, "element_window_search")
+    check("the search ran and applied its answer",
+          found is not None and found.get("success"), str(found))
+    if found and found.get("success"):
+        applied = {t: state(app, f"element_window_{t}") for t in found["windows"]}
+        check("every element sits where the search put it",
+              all(abs(applied[t][0] - w[0]) < 1e-3
+                  and abs(applied[t][1] - w[1]) < 1e-3
+                  for t, w in found["windows"].items()),
+              f"{applied} vs {found['windows']}")
+        after = state(app, "_last_fit")
+        check("and the curve is refitted with them",
+              after is not None and after.get("term_windows") is not None
+              and after.get("success"), str(after.get("term_windows") if after else None))
+
+
 def case_the_fit_colour_moves_with_the_range():
     print("light blue data, a black fit, and a new fit colour per range")
     import app as app_module
@@ -5691,6 +5846,9 @@ if __name__ == "__main__":
         case_the_prefactors_are_the_papers,
         case_each_boundary_moves_on_its_own,
         case_the_controls_sit_above_the_curve,
+        case_an_element_window_is_an_onset_not_a_mask,
+        case_the_placement_search_finds_where_elements_act,
+        case_each_element_gets_its_own_bar,
         case_a_companion_file_is_found_wherever_it_sits,
         case_the_missing_file_message_says_what_it_can_see,
         case_the_data_is_a_field_and_the_model_a_dashed_line,
