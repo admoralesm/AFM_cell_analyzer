@@ -1743,6 +1743,34 @@ def separation_rule(q=None):
     )
 
 
+def safe_frame(frame):
+    """
+    A table the widget can actually draw.
+
+    Streamlit hands a DataFrame to Arrow, and Arrow refuses two columns with
+    the same name — with an error that names none of them and takes the
+    whole page down. A spreadsheet somebody keeps by hand acquires repeats
+    and blank headings, so anything read from one comes through here first.
+    Later copies are numbered rather than dropped: a column with data in it
+    is somebody's data even when its name is a mistake.
+    """
+    if frame is None or not hasattr(frame, "columns"):
+        return frame
+    seen, names = {}, []
+    for index, raw in enumerate(list(frame.columns)):
+        name = str(raw).strip() or f"Column {index + 1}"
+        while name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        seen[name] = 1
+        names.append(name)
+    if names == list(frame.columns):
+        return frame
+    out = frame.copy()
+    out.columns = names
+    return out
+
+
 def default_plan(terms, lo, hi):
     """
     What "Fit this cell" will do, said before it is pressed.
@@ -8861,13 +8889,14 @@ with tab_igor:
                             **STRETCH,
                             key="igor_plot",
                         )
-                        st.dataframe(out.head(25), hide_index=True, **STRETCH)
+                        st.dataframe(safe_frame(out.head(25)),
+                                     hide_index=True, **STRETCH)
 
                         c1, c2 = st.columns(2)
                         with c1:
                             st.download_button(
                                 "📥 Download CSV",
-                                data=out.to_csv(index=False),
+                                data=safe_frame(out).to_csv(index=False),
                                 file_name="force_curve_generated.csv",
                                 mime="text/csv",
                                 **STRETCH,
@@ -8953,10 +8982,10 @@ with tab_db:
                 target.metric(
                     label, f"{values.median():.3g} {unit}" if len(values) else "n/a"
                 )
-            st.dataframe(shown, hide_index=True, **STRETCH)
+            st.dataframe(safe_frame(shown), hide_index=True, **STRETCH)
             st.download_button(
                 "⬇️ These rows as CSV",
-                shown.to_csv(index=False).encode("utf-8"),
+                safe_frame(shown).to_csv(index=False).encode("utf-8"),
                 file_name="afm_cells.csv", mime="text/csv",
                 key="sheet_rows_csv",
             )
@@ -9106,9 +9135,9 @@ with tab_db:
                     if column in table.columns:
                         table[column] = pd.to_numeric(table[column], errors="coerce")
                 st.dataframe(
-                    table.round(
+                    safe_frame(table.round(
                         {c: 4 for c in numeric if c in table.columns}
-                    ),
+                    )),
                     hide_index=True,
                     **STRETCH,
                 )
@@ -9224,7 +9253,7 @@ with tab_db:
             with b3:
                 st.download_button(
                     "📥 Export the whole index (CSV)",
-                    data=index.to_csv(index=False),
+                    data=safe_frame(index).to_csv(index=False),
                     file_name=f"afm_cell_database_{datetime.now():%Y%m%d}.csv",
                     mime="text/csv",
                     **STRETCH,
