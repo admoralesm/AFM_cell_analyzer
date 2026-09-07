@@ -891,6 +891,58 @@ class GoogleSheetsManager:
 
         return stats
 
+    def describe(self) -> str:
+        """Which file and which tab this manager is actually writing to."""
+        book = getattr(getattr(self, "spreadsheet", None), "title", None)
+        tab = getattr(getattr(self, "worksheet", None), "title", None)
+        if book and tab:
+            return f"“{book}” → tab “{tab}”"
+        if tab:
+            return f"tab “{tab}”"
+        return "connected, but no worksheet was opened"
+
+    def check(self):
+        """
+        Read the sheet and say what is there, changing nothing.
+
+        A send button that is enabled is not the same as a sheet that can
+        be written to: the credentials can be right, the file open, and the
+        service account still hold read-only access. This is the cheapest
+        way to find that out before a row goes missing.
+        """
+        if not self.worksheet:
+            return False, (
+                "Authenticated, but no worksheet is open. Reconnect with the "
+                "spreadsheet id in the box above."
+            )
+        try:
+            header = [h for h in self.worksheet.row_values(1) if str(h).strip()]
+            rows = max(len(self.worksheet.get_all_values()) - 1, 0)
+        except Exception as exc:
+            return False, f"Could not read the sheet: {exc}"
+
+        permissions = ""
+        try:
+            # gspread raises on a write when the share is read-only, and
+            # there is no cheap way to ask beforehand, so the header is
+            # rewritten with exactly what it already said.
+            if header:
+                self.worksheet.update(
+                    values=[header],
+                    range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}",
+                )
+                permissions = " Writing works."
+        except Exception as exc:
+            who = self.service_account_email() or "the service account"
+            return False, (
+                f"{self.describe()}: readable, but not writable ({exc}). "
+                f"Share it with {who} as an **Editor**, not a Viewer."
+            )
+        return True, (
+            f"{self.describe()}: {len(header)} columns, {rows} row(s)."
+            + permissions
+        )
+
     def get_spreadsheet_url(self) -> str:
         """
         Get the URL of the Google Sheet
