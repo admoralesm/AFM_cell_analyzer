@@ -3437,12 +3437,17 @@ def case_cardiomyocyte_defaults_match_the_experiment():
     app = start(cell_name="WT_2", cell_type="Cardiomyocyte")
     if not no_exception(app, "cardiomyocyte defaults"):
         return
-    # Confinement is the exception: it starts from the preset and is then
-    # measured from the curve, which is what should happen.
+    # Confinement starts from the preset. Measuring it from the curve is a
+    # button now, like the boundary search: nothing on a freshly loaded page
+    # is a search result nobody asked for.
     check("confinement starts from the cell type",
           app_module.CELL_TYPES["Cardiomyocyte"]["confinement"] == 1.10)
-    check("and is then measured from the curve",
-          (app.session_state["confinement_scan"] or {}).get("success") is True)
+    check("and it is what a loaded curve is fitted at",
+          abs(float(app.session_state["confinement"]) - 1.10) < 1e-9,
+          str(app.session_state["confinement"]))
+    check("with a button to measure it from this curve instead",
+          button_by_label(app, "Measure q from this curve") is not None,
+          str([b.label for b in app.button][:12]))
     for key, want in (("cell_height_um", 19.0), ("radius_aspect", 0.55),
                       ("membrane_thickness_nm", 8.0)):
         check(f"{key} reaches the page as {want}",
@@ -3853,7 +3858,7 @@ def case_one_fitting_routine():
     print("what loads and what the button does are the same routine")
     source = pathlib.Path(APP).read_text()
     check("there is one routine", source.count("def analyse_curve(") == 1)
-    check("and both paths call it", source.count("analyse_curve(") == 3,
+    check("and the button calls it", source.count("analyse_curve(") >= 2,
           str(source.count("analyse_curve(")))
     check("the arrangement search no longer competes with it",
           "search_arrangements(" not in source.split("def analyse_curve")[-1]
@@ -4205,6 +4210,14 @@ def case_the_cardiomyocyte_curves_fit():
         app.run()
         if not no_exception(app, f"cell {n}"):
             continue
+        # A loaded curve is fitted at this cell type's stated boundaries.
+        # Finding the arrangement the curve actually supports is what the
+        # button does, so that is what is being measured here.
+        button = button_by_label(app, "Fit this cell")
+        if button is not None:
+            button.click().run()
+            if not no_exception(app, f"cell {n} fitted"):
+                continue
         fit = app.session_state["_last_fit"]
         check(f"cell {n} is fitted", fit and fit.get("success"))
         if not (fit and fit.get("success")):
@@ -5313,6 +5326,60 @@ def case_the_placement_search_finds_where_elements_act():
           len(found["trials"]) > 20, str(len(found["trials"])))
 
 
+def case_a_new_curve_starts_from_the_cell_type_defaults():
+    print("a curve loads at its cell type's boundaries, not at a search result")
+    import app as app_module
+
+    wanted = app_module.default_boundaries("Myoblast (C2C12)")
+    check("a C2C12 has boundaries of its own",
+          abs(wanted["segment_break_1"] - 0.15) < 1e-9
+          and abs(wanted["segment_break_2"] - 0.40) < 1e-9, str(wanted))
+    check("and an unknown cell type falls back to the app's",
+          app_module.default_boundaries("Something else")["segment_break_1"]
+          == app_module.DEFAULTS["segment_break_1"])
+
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "a freshly loaded curve"):
+        return
+    check("the loaded curve sits on those boundaries",
+          abs(float(state(app, "segment_break_1")) - 0.15) < 1e-6
+          and abs(float(state(app, "segment_break_2")) - 0.40) < 1e-6,
+          f"{state(app, 'segment_break_1')} / {state(app, 'segment_break_2')}")
+    check("the component ranges follow them",
+          state(app, "element_window_membrane") == (0.0, 0.15)
+          and state(app, "element_window_nucleus")[0] == 0.4,
+          f"{state(app, 'element_window_membrane')} "
+          f"{state(app, 'element_window_nucleus')}")
+    fit = state(app, "_last_fit")
+    check("and it is still fitted, at those boundaries",
+          fit and fit.get("success")
+          and abs(float(fit["break_1"]) - 0.15) < 1e-6, str(fit.get("break_1")))
+    check("no search ran on load, so nothing was applied unasked",
+          state(app, "hypothesis_search") in (None, {}),
+          str(type(state(app, "hypothesis_search"))))
+
+    # And the button is what goes looking.
+    button = button_by_label(app, "Find boundaries from the data")
+    check("there is a button to find them from the curve", button is not None,
+          str([b.label for b in app.button][:10]))
+    if button is None:
+        return
+    button.click().run()
+    if not no_exception(app, "the boundary search"):
+        return
+    moved = (float(state(app, "segment_break_1")),
+             float(state(app, "segment_break_2")))
+    check("pressing it moves them off the defaults",
+          moved != (0.15, 0.40), str(moved))
+    check("and the ranges move with them",
+          abs(state(app, "element_window_membrane")[1] - moved[0]) < 1e-6,
+          f"{state(app, 'element_window_membrane')} against {moved}")
+    check("the total range is left alone",
+          abs(float(state(app, "window_end"))
+              - float(fit["epsilon_range"][1])) < 1e-6,
+          f"{state(app, 'window_end')} against {fit['epsilon_range'][1]}")
+
+
 def case_the_ranges_follow_the_fit():
     print("each material's range shows where the fit actually put it")
     app = start(cell_name="cell-01")
@@ -5473,8 +5540,8 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Find where each component acts")
-    check("and there is a button that places them by arithmetic",
+    button = button_by_label(app, "Find boundaries from the data")
+    check("and one button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:10]))
     if button is None:
         return
@@ -5905,6 +5972,12 @@ def case_a_fixed_cell_is_one_hertzian_solid():
     app = AppTest.from_file(APP, default_timeout=900)
     app.run()
     app.session_state["fixed_cell"] = True
+    # Set directly rather than through the tick, so the tick's own callback
+    # has not run: say what it would have said.
+    app.session_state["use_nucleus"] = False
+    app.session_state["use_nucleus_shell"] = False
+    app.session_state["use_membrane"] = False
+    app.session_state["cyto_starts_at"] = "from the very start"
     app.session_state["cell_name"] = "fixed-01"
     app.session_state["data"] = {
         "epsilon": eps, "force_N": force, "source": "fixed.csv",
@@ -6061,6 +6134,7 @@ if __name__ == "__main__":
         case_the_button_says_what_it_will_do,
         case_an_element_window_is_an_onset_not_a_mask,
         case_the_placement_search_finds_where_elements_act,
+        case_a_new_curve_starts_from_the_cell_type_defaults,
         case_the_ranges_follow_the_fit,
         case_a_sheet_that_will_not_open_says_why,
         case_each_element_gets_its_own_bar,
