@@ -6095,6 +6095,96 @@ def case_unticking_a_material_fits_without_it():
           f"{end.get('r_squared', 0):.6f}")
 
 
+def case_a_new_curve_arrives_ready_to_fit():
+    print("a loaded curve comes with its components ticked and a range that "
+          "says where it came from")
+    import app as app_module
+    curves = vcm_curves()
+    if not curves:
+        check("the VCM reference curves are in the repository", False)
+        return
+
+    app = AppTest.from_file(APP, default_timeout=900)
+    app.run()
+    app.session_state["cell_type"] = "Cardiomyocyte"
+    app.session_state["cell_name"] = "vcm-3"
+    eps, force = curves[3]
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "vcm_3.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "loading a curve"):
+        return
+
+    here = app_module.terms_for("Cardiomyocyte")
+    check("every component of this cell type is ticked on arrival",
+          all(state(app, f"use_{t}", False) for t in here),
+          str({t: state(app, f"use_{t}", False) for t in here}))
+
+    suggested = state(app, "_suggested_window")
+    check("the curve's own suggested range was worked out",
+          suggested is not None, str(suggested))
+    if not suggested:
+        return
+    check("and it is the range on screen",
+          abs(float(state(app, "window_start")) - suggested["start"]) < 5e-4
+          and abs(float(state(app, "window_end")) - suggested["end"]) < 5e-4,
+          f"{state(app, 'window_start')} {state(app, 'window_end')} "
+          f"vs {suggested}")
+    said = " ".join(str(c.value) for c in app.get("caption"))
+    check("the page says so, rather than leaving it to be guessed",
+          "This is the suggested range" in said, said[:300])
+    # Cell 3 has the bad contact, so the reason is worth reading.
+    check("and says why it does not start at contact",
+          "bad contact" in said, said[:400])
+
+    # Moved by hand, it stops claiming to be the suggestion and offers it back.
+    app.session_state["window_start"] = 0.30
+    app.session_state["window_combined"] = (0.30, float(suggested["end"]))
+    app.run()
+    if not no_exception(app, "after moving the range"):
+        return
+    said = " ".join(str(c.value) for c in app.get("caption"))
+    check("a moved range is called yours, not the suggestion",
+          "This range is yours" in said, said[:300])
+    back = button_by_label(app, "Back to the suggested range")
+    check("with the suggestion one button away", back is not None,
+          str([b.label for b in app.button][:10]))
+    if back is not None:
+        back.click().run()
+        check("and pressing it restores the suggested range",
+              abs(float(state(app, "window_start")) - suggested["start"]) < 5e-4,
+              str(state(app, "window_start")))
+
+    # A search that drops a component answers about that curve, not the next.
+    app.session_state["use_nucleus"] = False
+    eps, force = curves[5]
+    app.session_state["cell_name"] = "vcm-5"
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "vcm_5.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "loading the next curve"):
+        return
+    check("the next curve starts with its components back",
+          all(state(app, f"use_{t}", False) for t in here),
+          str({t: state(app, f"use_{t}", False) for t in here}))
+
+    # And the results carry the uncertainty beside every modulus.
+    fit = state(app, "_last_fit")
+    check("it was fitted on arrival", fit and fit.get("success"))
+    table = table_with(app, "modulus", "± (standard error)")
+    check("every modulus is listed with its standard error",
+          table is not None,
+          str([list(f.columns) for f in flat_tables(app)])[:300])
+    if table is not None:
+        check("one row per component of this cell type",
+              len(table) == len(here), f"{len(table)} rows for {here}")
+        check("and the ± is a number, not a blank",
+              any(str(v).startswith("±") for v in table["± (standard error)"]),
+              str(list(table["± (standard error)"])))
+
+
 def case_the_video_is_not_a_plot_marking():
     print("the video belongs to the record and the morphology, not the plot")
     app = start(cell_name="cell-01")
@@ -6188,6 +6278,7 @@ if __name__ == "__main__":
         case_an_old_one_tab_sheet_is_split_without_losing_anything,
         case_a_fixed_cell_is_one_hertzian_solid,
         case_unticking_a_material_fits_without_it,
+        case_a_new_curve_arrives_ready_to_fit,
         case_the_video_is_not_a_plot_marking,
         case_the_nucleus_is_a_balloon_too,
         case_the_myoblast_nucleus_reaches_the_page,
