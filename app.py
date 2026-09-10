@@ -629,6 +629,9 @@ DEFAULTS = {
     # changes what every modulus means, and that has to be a decision.
     "use_element_windows": False,
     "element_window_search": None,
+    # Boundaries measured from a batch of curves, per cell type. They
+    # replace the written-down defaults for every new curve of that type.
+    "learned_boundaries": {},
     "arrangement_search": None,
     # The whole curve, until you say otherwise.
     "window_end": 1.00,
@@ -653,6 +656,11 @@ DEFAULTS = {
     "stage_of_membrane": 2,
     "stage_of_interior": 1,
     "stage_of_nucleus": 3,
+    # Every term needs one, or saving a preset for a cell type that has the
+    # envelope or a cortex reaches for a key that was never made.
+    "stage_of_nucleus_shell": 3,
+    "stage_of_cortex": 1,
+    "stage_of_tension": 2,
     "refine_iterations": 3,
     "seed_parallel": True,
     "range_presets": {},
@@ -1746,6 +1754,21 @@ def separation_rule(q=None):
         ),
         icon="🔍",
     )
+
+
+def numeric_column(frame, column):
+    """
+    One column of a table as numbers, and an empty series when it is absent.
+
+    A spreadsheet somebody keeps by hand does not always have the column the
+    app is looking for. `frame.get(name)` answers None for a missing one,
+    and `pd.to_numeric(None).dropna()` is an AttributeError that takes the
+    whole page down while naming neither the column nor the sheet.
+    """
+    if frame is None or column not in getattr(frame, "columns", []):
+        return pd.Series(dtype=float)
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return values
 
 
 def safe_frame(frame):
@@ -3362,6 +3385,39 @@ def expected_for(cell_type=None):
     return CELL_TYPES.get(cell_type, {}).get("expected")
 
 
+# Where each cell type's boundaries start, before anything is measured.
+# These are the placements the model is usually written with, not fits: a
+# C2C12's membrane holds at about a sixth of the way down and its nucleus is
+# met a little under half way. A curve that disagrees says so when the
+# boundary search is pressed.
+DEFAULT_BOUNDARIES_BY_TYPE = {
+    "Myoblast (C2C12)": {"segment_break_1": 0.15, "segment_break_2": 0.40},
+    "Cardiomyocyte": {"segment_break_1": 0.15, "segment_break_2": 0.40},
+}
+
+
+def default_boundaries(cell_type=None):
+    """
+    This cell type's starting ε₁ and ε₂, as settings to apply.
+
+    Boundaries learned from a batch of real curves win over the written-down
+    ones: they are the same claim, measured on this lab's cells rather than
+    taken from the literature.
+    """
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    learned = (st.session_state.get("learned_boundaries") or {}).get(cell_type)
+    if learned:
+        return {
+            "segment_break_1": round(float(learned["break_1"]), 3),
+            "segment_break_2": round(float(learned["break_2"]), 3),
+        }
+    return dict(DEFAULT_BOUNDARIES_BY_TYPE.get(cell_type, {
+        "segment_break_1": DEFAULTS["segment_break_1"],
+        "segment_break_2": DEFAULTS["segment_break_2"],
+    }))
+
+
 def apply_cell_type(name):
     """Copy a cell type's defaults into the settings."""
     preset = CELL_TYPES.get(name)
@@ -3835,61 +3891,78 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
 
 def find_boundaries_control(model, lo, hi, terms):
     """
-    Find ε₁ and ε₂ from the curve, at the end of the choices.
+    One button that finds where the components hand over, and its neighbours.
 
-    The boundaries are the last thing settled before the fit, because every
-    component's range is measured from them. Pressing this moves them and
-    nothing else: the components stay as ticked and the total range stays
-    where it was put.
+    Which search it runs depends on what is being asked. With the ranges
+    following the fit, the only free numbers are ε₁ and ε₂, so it scans for
+    those. With the ranges taken over by hand, the boundaries no longer
+    place anything and the ranges themselves are what to search. Two
+    buttons for that was two names for one question.
     """
     if not terms:
         return
-    c1, c2 = st.columns([1, 2])
+    own = bool(st.session_state.get("use_element_windows"))
+    can_place = own and search_term_windows is not None
+    can_scan = hasattr(model, "scan_segment_breaks")
+
+    c1, c2, c3 = st.columns([1.3, 1.3, 1.6])
     with c1:
         pressed = st.button(
             "🔎 Find boundaries from the data", key="find_breaks_top",
-            disabled=not hasattr(model, "scan_segment_breaks"), **STRETCH,
+            type="primary", disabled=not (can_scan or can_place), **STRETCH,
         )
     with c2:
-        st.caption(
-            f"Now at ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
-            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
-            "Pressing this scans the curve for where one component hands "
-            "over to the next, and moves only those two."
+        reset = st.button(
+            "↺ Back to the usual ones", key="reset_breaks_top", **STRETCH,
+            help="Puts ε₁ and ε₂ back where this cell type normally has "
+                 "them, and the component ranges with them.",
         )
-    # When the ranges are the person's own, the boundaries no longer place
-    # anything, and the thing to search for is the ranges themselves.
-    if st.session_state.get("use_element_windows") and search_term_windows:
-        if st.button("🎯 Find where each component acts", type="primary",
-                     key="place_components", **STRETCH):
-            with st.spinner("Moving each range and scoring every placement "
-                            "on points it was not fitted to…"):
-                try:
-                    found = search_term_windows(
-                        model, lo, hi, terms,
-                        membrane=MEMBRANE_CHOICES.get(
-                            st.session_state["membrane_after_break"], "freeze"),
-                        cyto_start=CYTO_CHOICES.get(
-                            st.session_state["cyto_starts_at"], "break"),
-                        e1=float(st.session_state["segment_break_1"]),
-                        e2=float(st.session_state["segment_break_2"]),
-                        weighting=st.session_state["weighting"],
-                        fit_offset=st.session_state["fit_offset"],
-                        start_from=element_windows(terms, lo, hi),
-                    )
-                except Exception as exc:  # pragma: no cover
-                    found = {"success": False, "error": str(exc)}
-            st.session_state["element_window_search"] = found
-            if found.get("success"):
-                st.session_state["_pending_settings"] = {
-                    element_window_key(term): tuple(window)
-                    for term, window in found["windows"].items()
-                }
-                st.rerun()
-            st.error(found.get("error", "The placement search failed."))
+    with c3:
+        st.caption(
+            f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
+            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}"
+            + (" · the ranges are yours, so the search moves those rather "
+               "than the boundaries." if own else
+               " · this cell type's usual placement until you press.")
+        )
+
+    if reset:
+        st.session_state["_pending_settings"] = default_boundaries()
+        st.rerun()
+
+    learn_boundaries_control(model)
 
     if not pressed:
         return
+
+    if own:
+        with st.spinner("Moving each range and scoring every placement on "
+                        "points it was not fitted to…"):
+            try:
+                found = search_term_windows(
+                    model, lo, hi, terms,
+                    membrane=MEMBRANE_CHOICES.get(
+                        st.session_state["membrane_after_break"], "freeze"),
+                    cyto_start=CYTO_CHOICES.get(
+                        st.session_state["cyto_starts_at"], "break"),
+                    e1=float(st.session_state["segment_break_1"]),
+                    e2=float(st.session_state["segment_break_2"]),
+                    weighting=st.session_state["weighting"],
+                    fit_offset=st.session_state["fit_offset"],
+                    start_from=element_windows(terms, lo, hi),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                found = {"success": False, "error": str(exc)}
+        st.session_state["element_window_search"] = found
+        if found.get("success"):
+            st.session_state["_pending_settings"] = {
+                element_window_key(term): tuple(window)
+                for term, window in found["windows"].items()
+            }
+            st.rerun()
+        st.error(found.get("error", "The placement search failed."))
+        return
+
     with st.spinner("Scanning for the boundaries…"):
         try:
             found = model.scan_segment_breaks(
@@ -3905,6 +3978,118 @@ def find_boundaries_control(model, lo, hi, terms):
         }
         st.rerun()
     st.error(found.get("error", "The boundary scan found nothing."))
+
+
+def learn_boundaries_control(model):
+    """
+    Boundaries learned from several curves, and kept as this cell type's own.
+
+    One curve's boundaries are one curve's. A placement worth starting every
+    cell from is the one several cells agree on, so this scans a batch and
+    keeps the median: the middle value rather than the mean, because one
+    curve with a bad contact should move the answer by one place in the
+    order and not by its whole distance.
+    """
+    with st.expander("📚 Learn the usual boundaries from several curves"):
+        st.caption(
+            "Upload curves of this cell type — the same two columns as a "
+            "single one, relative deformation and force. Each is scanned on "
+            "its own, and the median ε₁ and ε₂ become what every new curve "
+            "of this cell type starts from."
+        )
+        files = st.file_uploader(
+            "Curves to learn from", type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True, key="learn_boundary_files",
+        )
+        learned = st.session_state.get("learned_boundaries", {}).get(
+            st.session_state["cell_type"]
+        )
+        if learned:
+            st.caption(
+                f"Learned from {learned['n']} curve"
+                + ("s" if learned["n"] != 1 else "")
+                + f": ε₁ = {learned['break_1']:.3f}, ε₂ = "
+                f"{learned['break_2']:.3f}"
+                + (f" (spread {learned['spread_1']:.3f} and "
+                   f"{learned['spread_2']:.3f})" if learned.get("spread_1")
+                   is not None else "")
+                + ". New curves of this cell type start there."
+            )
+            if st.button("↺ Forget them", key="forget_learned", **STRETCH):
+                st.session_state.setdefault("learned_boundaries", {}).pop(
+                    st.session_state["cell_type"], None
+                )
+                st.rerun()
+        if not files:
+            return
+        if not st.button(f"📚 Scan these {len(files)} curves",
+                         key="learn_boundaries_go", type="primary", **STRETCH):
+            return
+
+        found_1, found_2, failed = [], [], []
+        progress = st.progress(0.0, text="Scanning…")
+        for index, handle in enumerate(files):
+            progress.progress((index + 1) / max(len(files), 1),
+                              text=f"{handle.name}")
+            try:
+                frame = load_table(handle.getvalue(), handle.name)
+                columns = list(frame.columns)
+                eps = pd.to_numeric(
+                    frame[columns[guess_column(
+                        columns, ("reldef", "rel def", "deform", "eps", "ε",
+                                  "strain"), 0)]],
+                    errors="coerce").to_numpy(dtype=float)
+                force = pd.to_numeric(
+                    frame[columns[guess_column(columns, ("force", "f ("), 1)]],
+                    errors="coerce").to_numpy(dtype=float)
+                good = np.isfinite(eps) & np.isfinite(force)
+                order = np.argsort(eps[good], kind="stable")
+                eps, force = eps[good][order], force[good][order]
+                here = build_model(eps, force)
+                window = (here.suggest_window()
+                          if hasattr(here, "suggest_window") else {})
+                lo_here = (round(window.get("epsilon_min", 0.0), 4)
+                           if window.get("bad_contact") else 0.0)
+                hi_here = float(window.get("epsilon_max", eps.max())
+                                if window.get("success") else eps.max())
+                scan = here.scan_segment_breaks(
+                    lo_here, hi_here,
+                    terms=terms_for(st.session_state["cell_type"]),
+                    weighting=st.session_state["weighting"],
+                )
+                if scan.get("success"):
+                    found_1.append(float(scan["best_break_1"]))
+                    found_2.append(float(scan["best_break_2"]))
+                else:
+                    failed.append(f"{handle.name}: {scan.get('error', 'no fit')}")
+            except Exception as exc:
+                failed.append(f"{handle.name}: {exc}")
+        progress.empty()
+
+        if not found_1:
+            st.error("None of those curves could be scanned. "
+                     + "; ".join(failed[:3]))
+            return
+        learned = {
+            "n": len(found_1),
+            "break_1": float(np.median(found_1)),
+            "break_2": float(np.median(found_2)),
+            "spread_1": float(np.percentile(found_1, 75)
+                              - np.percentile(found_1, 25)),
+            "spread_2": float(np.percentile(found_2, 75)
+                              - np.percentile(found_2, 25)),
+        }
+        store = dict(st.session_state.get("learned_boundaries", {}))
+        store[st.session_state["cell_type"]] = learned
+        st.session_state["learned_boundaries"] = store
+        if failed:
+            st.warning(f"{len(failed)} of {len(files)} could not be scanned: "
+                       + "; ".join(failed[:3]))
+        st.session_state["_pending_settings"] = {
+            "segment_break_1": round(learned["break_1"], 3),
+            "segment_break_2": round(learned["break_2"], 3),
+        }
+        st.rerun()
 
 
 def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
@@ -5538,35 +5723,22 @@ with tab_analysis:
                 if window.get("bad_contact"):
                     notes.append("**the approach misbehaved near contact**")
 
-            picks = hypotheses_for(
-                st.session_state["cell_type"],
-                terms=terms_for(st.session_state["cell_type"]),
-            )
-            if picks and hasattr(model, "suggest_window"):
-                lo = window.get("epsilon_min", 0.0) if window.get("success") else 0.0
-                hi = window.get("epsilon_max", eps_hi_data) if window.get("success") \
-                    else eps_hi_data
-                # The same routine the Fit button runs, at its quick setting.
-                # One engine, so what appears when the curve loads and what
-                # appears when the button is pressed can differ in how hard
-                # they looked and in nothing else.
-                outcome = analyse_curve(
-                    model, lo, hi, picks,
-                    weighting=st.session_state["weighting"],
-                    measure_q=wants_confinement(),
-                    terms_hint=terms_for(st.session_state["cell_type"]),
-                    n_grid=8, cv_repeats=2, passes=2,
-                )
-                if outcome["q_scan"] is not None:
-                    st.session_state["confinement_scan"] = outcome["q_scan"]
-                if outcome["components"] is not None:
-                    st.session_state["component_search"] = outcome["components"]
-                chosen = outcome["hypotheses"]
-                if chosen and chosen.get("success"):
-                    st.session_state["hypothesis_search"] = chosen
-                    pending.update(settings_from_hypothesis(
-                        chosen["best"], q=outcome["q"],
-                    ))
+            # The boundaries a new curve starts from are this cell type's,
+            # not a search result. For a C2C12 that is the membrane holding
+            # at ε₁ and the nucleus met at ε₂, which is what the literature
+            # says and what somebody opening the app expects to see. The
+            # search still exists; it is a button now, so the numbers on
+            # screen are always either a stated default or something that
+            # was asked for.
+            pending.update(default_boundaries(st.session_state["cell_type"]))
+
+            # No search here. Loading a curve used to run the whole
+            # comparison and apply its winner, so the boundaries on screen
+            # were a result nobody had asked for and the defaults were never
+            # seen. The search is two buttons now: "Find boundaries from the
+            # data" moves ε₁ and ε₂, and "Fit this cell" compares the
+            # arrangements. Loading is also several seconds quicker for it.
+
             if pending:
                 st.session_state["_auto_notes"] = notes
                 st.session_state["_pending_settings"] = pending
@@ -9221,7 +9393,7 @@ with tab_db:
                 ("Young's Modulus (Em, MPa)", "Median Eₘ", "MPa", m3),
                 ("Young's Modulus (Ei, kPa)", "Median E_c", "kPa", m4),
             ):
-                values = pd.to_numeric(shown.get(column), errors="coerce").dropna()
+                values = numeric_column(shown, column)
                 values = values[values > 0]
                 target.metric(
                     label, f"{values.median():.3g} {unit}" if len(values) else "n/a"
@@ -9303,7 +9475,7 @@ with tab_db:
             for column, label, target in (
                 ("Em_MPa", "Median Eₘ", m3), ("Ec_kPa", "Median Ec", m4)
             ):
-                values = pd.to_numeric(shown.get(column), errors="coerce").dropna()
+                values = numeric_column(shown, column)
                 values = values[values > 0]
                 unit = "MPa" if column == "Em_MPa" else "kPa"
                 target.metric(
