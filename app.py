@@ -1198,6 +1198,10 @@ def fit_record(fit, unit="nN"):
         "weighting": fit.get("weighting", "uniform"),
         "membrane past eps1": fit.get("membrane", ""),
         "cytoskeleton starts": fit.get("cyto_start", ""),
+        "condition number": (
+            float(fit["condition_number"])
+            if np.isfinite(fit.get("condition_number", float("nan"))) else ""
+        ),
         "worst basis correlation": (
             abs(float(fit["worst_correlation"]))
             if fit.get("worst_correlation") is not None
@@ -1337,7 +1341,12 @@ def fitted_equation(fit, unit="nN", heading=True):
         + f" · RMSE = {fit.get('rmse', float('nan')):.4g} N"
         + f" · {int(fit.get('n_points', 0))} points"
         + f" · {int(fit.get('n_params', 0))} free parameters"
-        + f" · weighted {fit.get('weighting', 'uniform')}."
+        + f" · weighted {fit.get('weighting', 'uniform')}"
+        + (f" · κ(X) = {float(fit['condition_number']):.4g}"
+           if np.isfinite(fit.get("condition_number", np.nan)) else "")
+        + (f" · worst basis correlation ρ = {correlation:.4f}"
+           if correlation else "")
+        + "."
     )
     copy_the_results(fit, unit)
 
@@ -4214,13 +4223,14 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
 
 def find_boundaries_control(model, lo, hi, terms):
     """
-    One button that finds where the components hand over, and its neighbours.
+    Two searches, because they answer two different questions.
 
-    Which search it runs depends on what is being asked. With the ranges
-    following the fit, the only free numbers are ε₁ and ε₂, so it scans for
-    those. With the ranges taken over by hand, the boundaries no longer
-    place anything and the ranges themselves are what to search. Two
-    buttons for that was two names for one question.
+    Which elements the curve can resolve is a model-selection problem: it is
+    settled on held-out error, and its answer is a subset. Where those
+    elements hand over is an estimation problem at a fixed subset: it is
+    settled on the residual surface, and its answer is a pair of
+    deformations. Running both from one button meant the person could not
+    ask the second without also being given a new answer to the first.
     """
     if not terms:
         return
@@ -4231,30 +4241,52 @@ def find_boundaries_control(model, lo, hi, terms):
     )
     can_place = moved and search_term_windows is not None
     can_scan = hasattr(model, "scan_segment_breaks")
+    e1_now = float(st.session_state["segment_break_1"])
+    e2_now = float(st.session_state["segment_break_2"])
 
-    c1, c2 = st.columns([1.2, 2])
-    with c1:
-        pressed = st.button(
-            "🔎 Find the elements and optimise the ranges",
-            key="find_breaks_top", type="primary",
-            disabled=not (can_scan or can_place), **STRETCH,
+    st.markdown("##### Let the curve decide")
+    left, right = st.columns(2)
+    with left:
+        find_elements = st.button(
+            "🧬 Find the elements", key="find_elements_button",
+            disabled=recommend_components is None, **STRETCH,
         )
-    with c2:
         st.caption(
-            f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
-            f"ε₂ = {float(st.session_state['segment_break_2']):.3f} · "
+            "Which of this cell type's elements the curve can actually "
+            "resolve, judged at the boundaries as they stand "
+            f"(ε₁ = {e1_now:.3f}, ε₂ = {e2_now:.3f}). Every subset is "
+            "refitted and the one kept is the one that best predicts points "
+            "it was not fitted to. Ticks the answer."
+        )
+    with right:
+        optimise = st.button(
+            "📐 Optimise the ranges", key="optimise_ranges_button",
+            type="primary", disabled=not (can_scan or can_place), **STRETCH,
+        )
+        st.caption(
+            "Where the elements now selected ("
             + ", ".join(plain_name(t).lower() for t in terms)
-            + (" · a range has been moved by hand, so this searches the "
-               "ranges rather than the boundaries."
-               if can_place else
-               " · the default until you press this or set your own.")
+            + ") take over from one another, found from the curve rather "
+            "than assumed"
+            + (": each element's own range is searched, since one has been "
+               "moved by hand." if can_place else
+               ": the residual surface is profiled over ε₁ and ε₂.")
         )
 
+    search_results_as_equations()
     why_this_search(model)
-    last_mixture_note()
     set_default_boundaries_control()
 
-    if not pressed:
+    if find_elements:
+        applied = search_the_mixture(model, lo, hi, e1_now, e2_now)
+        found = st.session_state.get("component_search") or {}
+        if found.get("success"):
+            st.session_state["_pending_settings"] = applied
+            st.rerun()
+        st.error(found.get("error", "The element search found nothing."))
+        return
+
+    if not optimise:
         return
 
     if can_place:
@@ -4267,8 +4299,7 @@ def find_boundaries_control(model, lo, hi, terms):
                         st.session_state["membrane_after_break"], "freeze"),
                     cyto_start=CYTO_CHOICES.get(
                         st.session_state["cyto_starts_at"], "break"),
-                    e1=float(st.session_state["segment_break_1"]),
-                    e2=float(st.session_state["segment_break_2"]),
+                    e1=e1_now, e2=e2_now,
                     weighting=st.session_state["weighting"],
                     fit_offset=st.session_state["fit_offset"],
                     start_from=element_windows(terms, lo, hi),
@@ -4276,6 +4307,7 @@ def find_boundaries_control(model, lo, hi, terms):
             except Exception as exc:  # pragma: no cover - defensive
                 found = {"success": False, "error": str(exc)}
         st.session_state["element_window_search"] = found
+        st.session_state["_last_search"] = "windows"
         if found.get("success"):
             pending = {
                 element_window_key(term): tuple(window)
@@ -4286,15 +4318,12 @@ def find_boundaries_control(model, lo, hi, terms):
             pending.update({
                 f"_window_touched_{term}": True for term in found["windows"]
             })
-            e1 = float(st.session_state["segment_break_1"])
-            e2 = float(st.session_state["segment_break_2"])
-            pending.update(search_the_mixture(model, lo, hi, e1, e2))
             st.session_state["_pending_settings"] = pending
             st.rerun()
         st.error(found.get("error", "The placement search failed."))
         return
 
-    with st.spinner("Scanning for the boundaries…"):
+    with st.spinner("Profiling the residual over the boundary grid…"):
         try:
             found = model.scan_segment_breaks(
                 lo, hi, terms=terms or ("membrane", "interior"),
@@ -4302,18 +4331,138 @@ def find_boundaries_control(model, lo, hi, terms):
             )
         except Exception as exc:  # pragma: no cover - defensive
             found = {"success": False, "error": str(exc)}
+    st.session_state["boundary_search"] = found
+    st.session_state["_last_search"] = "boundaries"
     if found.get("success"):
-        e1 = round(float(found["best_break_1"]), 3)
-        e2 = round(float(found["best_break_2"]), 3)
-        pending = {"segment_break_1": e1, "segment_break_2": e2}
-        # And, at those boundaries, which components the curve can actually
-        # see. The two questions are asked in this order because the answer
-        # to the second depends on the first: a component judged at the
-        # wrong boundary is being judged on the wrong basis function.
-        pending.update(search_the_mixture(model, lo, hi, e1, e2))
-        st.session_state["_pending_settings"] = pending
+        st.session_state["_pending_settings"] = {
+            "segment_break_1": round(float(found["best_break_1"]), 3),
+            "segment_break_2": round(float(found["best_break_2"]), 3),
+        }
         st.rerun()
     st.error(found.get("error", "The boundary scan found nothing."))
+
+
+def _term_symbol(term):
+    """This element's modulus symbol, as LaTeX."""
+    return EQUATION_TERMS.get(term, (None, None, None, term))[3]
+
+
+def _subset_latex(terms):
+    """A combination of elements as a set of moduli."""
+    return r"\{" + r",\,".join(_term_symbol(t) for t in terms) + r"\}"
+
+
+def search_results_as_equations():
+    """
+    What the last search decided, written as the arithmetic it decided on.
+
+    A table of combinations invited the reader to compare them by eye, which
+    is exactly the comparison the cross-validation was run to replace. The
+    numbers that settled it are three: the generalisation error of each
+    candidate, the tie tolerance, and the gap between the best two.
+    """
+    which = st.session_state.get("_last_search")
+    if which == "elements":
+        found = st.session_state.get("component_search")
+        if not (found and found.get("success")):
+            return
+        rows = sorted(found["candidates"], key=lambda r: r["cv_rmse"])
+        best = found["best"]
+        tau = float(found["tie_tolerance"])
+        lines = []
+        for row in rows[:6]:
+            mark = ""
+            if row["terms"] == best["terms"]:
+                mark = r"&& \leftarrow \text{retained}"
+            elif row.get("tied_with_best"):
+                mark = r"&& \text{(within } \tau \text{)}"
+            lines.append(
+                r"\mathrm{CV}\bigl(" + _subset_latex(row["terms"]) + r"\bigr) &= "
+                + _sci_latex(row["cv_rmse"]) + r"\ \mathrm{N}" + mark
+            )
+        st.latex(r"\begin{aligned}" + r"\\".join(lines) + r"\end{aligned}")
+        gap = None
+        others = [r for r in rows if r["terms"] != best["terms"]]
+        if others:
+            gap = min(r["cv_rmse"] for r in others) - best["cv_rmse"]
+        st.latex(
+            r"\tau = " + _sci_latex(tau) + r"\ \mathrm{N}"
+            + (r", \qquad \Delta\mathrm{CV} = " + _sci_latex(abs(gap))
+               + r"\ \mathrm{N}" + (r" > \tau" if gap is not None
+                                    and abs(gap) > tau else r" < \tau")
+               if gap is not None else "")
+        )
+        dropped = found.get("dropped") or ()
+        st.caption(
+            "Retained: "
+            + ", ".join(plain_name(t).lower() for t in best["terms"])
+            + (". Dropped: "
+               + ", ".join(plain_name(t).lower() for t in dropped)
+               + ", whose basis functions carry no variance the retained set "
+                 "cannot already account for."
+               if dropped else ", the whole set being separable here.")
+            + (" The gap clears the tolerance, so the selection is decided "
+               "on generalisation error alone."
+               if found.get("clear_cut") else
+               " The gap is inside the tolerance, so parsimony broke the "
+               "tie: the smaller model is the one whose moduli will "
+               "reproduce between cells.")
+        )
+        return
+
+    if which == "boundaries":
+        found = st.session_state.get("boundary_search")
+        if not (found and found.get("success")):
+            return
+        trials = sorted(found.get("trials") or [],
+                        key=lambda t: -t["r_squared"])[:5]
+        if not trials:
+            return
+        lines = []
+        for i, trial in enumerate(trials):
+            residual = max(1.0 - float(trial["r_squared"]), 0.0)
+            lines.append(
+                r"\tilde{S}(" + f"{trial['e1']:.3f}" + r",\,"
+                + f"{trial['e2']:.3f}" + r") &= " + _sci_latex(residual)
+                + (r"&& \leftarrow \text{minimum}" if i == 0 else "")
+            )
+        st.latex(r"\begin{aligned}" + r"\\".join(lines) + r"\end{aligned}")
+        st.latex(
+            r"\tilde{S} = \frac{\min_{\theta\ge0}\lVert W(F-X\theta)"
+            r"\rVert^{2}}{\lVert W(F-\bar{F})\rVert^{2}} = 1 - R^{2}"
+        )
+        st.caption(
+            f"The grid minimum sits at ε₁ = {float(found['best_break_1']):.3f}, "
+            f"ε₂ = {float(found['best_break_2']):.3f}. S̃ is the weighted "
+            "residual normalised by the total sum of squares, so it is "
+            "comparable between curves; the moduli at each grid point are "
+            "the exact bounded least-squares solution there, which is why "
+            "the surface can be profiled rather than descended."
+        )
+        return
+
+    if which == "windows":
+        found = st.session_state.get("element_window_search")
+        if not (found and found.get("success")):
+            return
+        lines = []
+        for term, window in found["windows"].items():
+            lines.append(
+                _term_symbol(term) + r"&: \varepsilon \in ["
+                + f"{float(window[0]):.3f}" + r",\,"
+                + f"{float(window[1]):.3f}" + r"]"
+            )
+        st.latex(r"\begin{aligned}" + r"\\".join(lines) + r"\end{aligned}")
+        cv = float(found.get("cv_rmse", float("nan")))
+        if np.isfinite(cv):
+            st.latex(r"\mathrm{CV} = " + _sci_latex(cv) + r"\ \mathrm{N}")
+        st.caption(
+            "Each interval is that element's support: it begins carrying "
+            "load at the lower edge and stops taking more at the upper one, "
+            "holding what it reached past it, so the total force has no "
+            "step in it. The placement was scored on held-out points, the "
+            "same criterion as the element search."
+        )
 
 
 def search_the_mixture(model, lo, hi, e1, e2):
@@ -4349,6 +4498,7 @@ def search_the_mixture(model, lo, hi, e1, e2):
     except Exception as exc:  # pragma: no cover - defensive
         found = {"success": False, "error": str(exc)}
     st.session_state["component_search"] = found
+    st.session_state["_last_search"] = "elements"
     if not found.get("success"):
         return {}
     wanted = set(found["recommended"])
@@ -4362,63 +4512,6 @@ def search_the_mixture(model, lo, hi, e1, e2):
     }
 
 
-def last_mixture_note():
-    """What the last mixture search decided, and by how much."""
-    found = st.session_state.get("component_search")
-    if not (found and found.get("success")):
-        return
-    best = found["best"]
-    kept = ", ".join(plain_name(t).lower() for t in best["terms"])
-    dropped = found.get("dropped") or ()
-    margin = ""
-    others = [
-        row for row in found["candidates"] if row["terms"] != best["terms"]
-    ]
-    if others:
-        gap = min(row["cv_rmse"] for row in others) - best["cv_rmse"]
-        margin = (
-            f" It predicts held-out points {abs(gap) / max(best['cv_rmse'], 1e-30) * 100:.0f}% "
-            + ("better than" if gap > 0 else "no better than")
-            + " the next combination"
-            + (", so this one is the clear answer." if found.get("clear_cut")
-               else ", which is inside the tie tolerance, so the smaller "
-                    "mixture was taken.")
-        )
-    st.caption(
-        f"Last search kept **{kept}**"
-        + (" and dropped " + ", ".join(plain_name(t).lower() for t in dropped)
-           + ", the curve carrying no separable evidence for "
-           + ("it" if len(dropped) == 1 else "them")
-           if dropped else ", every component it was offered")
-        + "." + margin
-    )
-    with st.expander("The combinations compared", expanded=False):
-        rows = []
-        for row in sorted(found["candidates"], key=lambda r: r["cv_rmse"]):
-            rows.append({
-                "components": ", ".join(
-                    plain_name(t).lower() for t in row["terms"]
-                ),
-                "held-out RMSE (N)": f"{row['cv_rmse']:.4g}",
-                "spread": f"{row['cv_spread']:.2g}",
-                "R²": f"{row['r_squared']:.5f}",
-                "free moduli": str(row["n_terms"]),
-                "came out at zero": (
-                    ", ".join(plain_name(t).lower() for t in row["empty"])
-                    or "—"
-                ),
-                "": "✅ kept" if row.get("recommended")
-                    else ("tied" if row.get("tied_with_best") else ""),
-            })
-        flat_table(
-            pd.DataFrame(rows),
-            align_right=["held-out RMSE (N)", "spread", "R²", "free moduli"],
-            caption=f"Tie tolerance τ = {found['tie_tolerance']:.4g} N. "
-                    "Anything within τ of the lowest counts as tied, and "
-                    "among tied combinations the smallest one is kept.",
-        )
-
-
 def why_this_search(model=None):
     """
     The mathematics the search button follows, written out.
@@ -4428,13 +4521,13 @@ def why_this_search(model=None):
     argument for why the boundary it was measured at is the boundary the
     curve has.
     """
-    with st.expander("∑ Why the boundaries and the mixture come out this way",
-                     expanded=False):
+    with st.expander(
+        "∑ Model selection and boundary estimation, in full", expanded=False
+    ):
         st.caption(
-            "Pressing the button means the boundaries are found from the "
-            "curve rather than assumed, and the combination of components "
-            "kept is the one that best predicts points it was not fitted "
-            "to. Written as one problem, it solves"
+            "The two buttons above solve one joint problem, separated "
+            "because the two halves are answered on different criteria. "
+            "Written out:"
         )
         st.latex(
             r"\bigl(\mathcal{S}^{*},\varepsilon_1^{*},\varepsilon_2^{*}"
@@ -4445,17 +4538,20 @@ def why_this_search(model=None):
             r"within}\; \tau"
         )
         st.caption(
-            "𝒞 is this cell type's components, 𝒢 the grid of boundary "
-            "pairs, CV the error on points the fit never saw, and τ the "
-            "tolerance below which two scores are not telling anything "
-            "apart. The five parts below are that one line, each with the "
-            "reason it takes the form it does."
+            "𝒞 is the admissible element set for this cell type, 𝒢 the "
+            "boundary grid, CV the generalisation error, τ the resolution "
+            "of that estimate. Support recovery (which elements) and "
+            "changepoint estimation (where they hand over) are separated "
+            "because a subset chosen at the wrong changepoint is being "
+            "scored on the wrong design matrix, and a changepoint estimated "
+            "under a misspecified subset absorbs the missing term."
         )
-        st.markdown("**1 · With the boundaries fixed, the moduli are exact**")
+
+        st.markdown("**1 · Conditional linearity of the constitutive model**")
         st.caption(
-            "Every component contributes its own shape of ε multiplied by "
-            "its own modulus, and the forces add, so at fixed ε₁ and ε₂ the "
-            "model is linear in the moduli:"
+            "The elements act in parallel under a common areal strain, so "
+            "their tractions superpose and the model is linear in the "
+            "moduli once the changepoints are held fixed:"
         )
         st.latex(
             r"F(\varepsilon) \;=\; \sum_k a_k E_k\, g_k(\varepsilon;"
@@ -4467,15 +4563,19 @@ def why_this_search(model=None):
             r"F - X(\varepsilon_1,\varepsilon_2)\theta\bigr) \bigr\|^{2}"
         )
         st.caption(
-            "That is one bounded least-squares solve: an exact answer, with "
-            "no starting guess and no local minimum to fall into. θ ≥ 0 "
-            "because a material cannot pull the probe in, which is also why "
-            "a component that comes back at exactly zero is a measurement "
-            "and not a failure."
+            "The prefactors a_k are pure geometry, fixed before fitting from "
+            "the cell's height, radius and shell thickness, so the free "
+            "parameters are moduli and nothing else. This is a "
+            "bounded-variable least-squares programme: convex, with a unique "
+            "global solution and KKT conditions that put an inactive element "
+            "exactly on its bound. The non-negativity is thermodynamic, not "
+            "numerical: a passive element cannot do negative work on the "
+            "indenter, so an element returned at θ = 0 is an estimate of "
+            "zero stiffness contribution over that support, not a solver "
+            "failure."
         )
 
-        st.markdown("**2 · The boundaries are found by profiling, not by "
-                    "gradient**")
+        st.markdown("**2 · Changepoint estimation by profiling**")
         st.latex(
             r"S(\varepsilon_1,\varepsilon_2) \;=\; \min_{\theta \ge 0} "
             r"\bigl\| W\bigl(F - X(\varepsilon_1,\varepsilon_2)\theta\bigr) "
@@ -4483,40 +4583,49 @@ def why_this_search(model=None):
             r"= \arg\min S"
         )
         st.caption(
-            "The boundaries sit inside min(·) and ⟨·⟩, so S is continuous "
-            "but has a kink wherever a boundary crosses a data point: its "
-            "derivative jumps, and a gradient method steps straight across "
-            "the minimum. So S is evaluated on a grid of (ε₁, ε₂), each "
-            "point an exact solve of step 1, and the grid is then re-laid "
-            "inside one step either side of the winner, twice, narrowing it "
-            "by about 25 times."
+            "The changepoints enter through min(·) and the Macaulay bracket "
+            "⟨·⟩, so S is continuous but only piecewise differentiable: its "
+            "gradient jumps each time a boundary crosses a sample, and "
+            "quasi-Newton steps walk through the minimum rather than into "
+            "it. The nuisance parameters are therefore concentrated out "
+            "analytically and the two-dimensional profile is evaluated "
+            "exhaustively on 𝒢, then re-gridded within one step of the "
+            "incumbent for two rounds, contracting the bracket by about 25×. "
+            "Cost is one BVLS solve per node, which is milliseconds."
         )
 
-        st.markdown("**3 · Why a boundary is there at all**")
+        st.markdown("**3 · The physical meaning of a changepoint**")
         st.caption(
-            "Each law is a power of ε, so the slope of the curve on log-log "
-            "axes is the force-weighted average of those powers:"
+            "Each constitutive law is a power law in ε, so the local "
+            "logarithmic stiffness is the traction-weighted mean of the "
+            "exponents in play:"
         )
         st.latex(
             r"\frac{d\log F}{d\log \varepsilon} \;=\; \sum_k w_k\,p_k, "
             r"\qquad w_k = \frac{a_k E_k g_k}{\sum_j a_j E_j g_j}"
         )
         st.caption(
-            "with p = 3 for a stretching shell, 3/2 for a Hertzian contact "
-            "and 1 for a network already under tension. A boundary is where "
-            "the weights move from one component to the next, so the slope "
-            "swings from one exponent towards another, and that swing is "
-            "exactly what makes S smallest there. The measured slope is "
-            "printed further down the page, so the boundary the search "
-            "chose can be checked against the curve by hand."
+            "p = 3 for area-strain stretching of a fluid-filled shell "
+            "(Lulevich eq 3), p = 3/2 for Hertzian compression of the "
+            "cytoplasmic continuum and of the deep organelle (eq 6), p = 1 "
+            "for pre-existing cortical tension resisting the area gained on "
+            "flattening. A changepoint is where the weight transfers from "
+            "one law to the next, so the apparent exponent relaxes from one "
+            "value towards another; S is minimised there because that is "
+            "the only place a single kinked basis can reproduce the "
+            "curvature of the transition. The exponent read directly off "
+            "the data by local regression is reported below the fit, which "
+            "makes the estimate falsifiable independently of the fit."
         )
 
-        st.markdown("**4 · Which components belong in the model**")
+        st.markdown("**4 · Support recovery cannot be done on the residual**")
         st.caption(
-            "This cannot be read off the fit. The models are nested, so "
-            "adding a component can only lower the residual on the points "
-            "it was fitted to: RSS, R² and χ² all improve for a component "
-            "that is not there. Held-out error does not."
+            "The candidate models are nested, so the residual sum of "
+            "squares is monotone non-increasing in |𝒮|: RSS, R² and χ² all "
+            "improve on adding an element that contributes nothing, and an "
+            "information criterion only trades that off against a penalty "
+            "chosen a priori. Out-of-sample prediction error estimates the "
+            "quantity that is actually at issue."
         )
         st.latex(
             r"\mathrm{CV}(\mathcal{S}) = \frac{1}{R}\sum_{r=1}^{R}"
@@ -4525,61 +4634,66 @@ def why_this_search(model=None):
             r"(\varepsilon_i)\bigr)^{2}}"
         )
         st.caption(
-            "Every subset 𝒮 of the components is fitted at the boundaries "
-            "from step 2, on the same folds, and asked to predict the fold "
-            "it never saw. K = 5 folds, R = 3 different random splits, "
-            "because one split of a few hundred points is noisy enough to "
-            "reorder combinations that are genuinely tied."
+            "Every 𝒮 ⊆ 𝒞 is refitted on each training partition at the same "
+            "changepoints and evaluated on the held-out fold. K = 5, R = 3 "
+            "independent permutations, because the fold-to-fold variance on "
+            "a few hundred correlated samples is itself large enough to "
+            "reorder candidates that are not distinguishable."
         )
 
-        st.markdown("**5 · The tie rule, and why it favours the smaller "
-                    "mixture**")
+        st.markdown("**5 · Identifiability sets the tie rule**")
         st.latex(
             r"\tau = \max\bigl(0.05\,\mathrm{CV}_{\min},\; s_{\min} + "
             r"\max_j s_j\bigr)"
         )
         st.caption(
-            "s is how much a combination's score moves between splits. A "
-            "gap smaller than that is not evidence, so everything within τ "
-            "of the lowest is called tied and the smallest mixture wins."
+            "s is the between-permutation standard deviation of a "
+            "candidate's score, so τ is the resolution of the estimator "
+            "itself; differences below it carry no information. Among "
+            "candidates inside τ the minimal support is retained, and the "
+            "reason is collinearity of the design, not Occam:"
         )
         st.latex(
             r"\operatorname{Var}(\hat{\theta}_k) \;=\; \frac{\sigma^{2}}"
-            r"{(1-\rho^{2})\,\lVert x_k \rVert^{2}}"
+            r"{(1-\rho^{2})\,\lVert x_k \rVert^{2}}, \qquad "
+            r"\kappa(X) = \frac{\sigma_{\max}(X)}{\sigma_{\min}(X)}"
         )
         st.caption(
-            "That is the reason, not a preference for tidiness. Two basis "
-            "functions with correlation ρ have a well-determined sum and a "
-            "split between them whose variance grows as 1/(1 − ρ²). A "
-            "component the curve cannot separate does not give a wrong "
-            "modulus so much as an unstable one, which wanders from cell to "
-            "cell while its neighbour absorbs the difference. Dropping it "
-            "is what makes the numbers poolable. The correlation actually "
-            "reached is reported with the fit."
+            "Two basis functions with correlation ρ leave their sum sharply "
+            "determined and their partition variance-inflated by "
+            "1/(1 − ρ²). Retaining a component the design cannot separate "
+            "does not bias the total traction; it makes the partition of "
+            "that traction between neighbours drift from cell to cell, "
+            "which is precisely the variance that destroys a population "
+            "comparison. The realised ρ and the condition number κ(X) are "
+            "both reported with the fit."
         )
 
-        st.markdown("**6 · Why these laws, and no others**")
+        st.markdown("**6 · Admissibility of the basis**")
         st.caption(
-            "A fit can only separate two components whose force laws differ "
-            "in shape or in where they begin. Two terms with the same power "
-            "of ε and the same onset are one term wearing two names, and no "
-            "amount of data will split them, which is why every component "
-            "here has either its own exponent or its own boundary."
+            "Two elements are separable only if their laws differ in "
+            "exponent or in support. Identical p with identical onset gives "
+            "a rank-deficient design and an unidentifiable partition, no "
+            "matter how many samples are taken, which is why each element "
+            "in 𝒞 carries either its own exponent or its own changepoint. "
+            "It is also why fixation collapses the model to a set of "
+            "Hertzian terms separated only by onset: cross-linking removes "
+            "the fluid-filled shell that made the cube law distinct."
         )
         share = (model.bending_share(0.30)
                  if hasattr(model, "bending_share") else None)
         st.caption(
-            "**Is there a bending term?** There is, and Lulevich writes it "
-            "out: eq 1 carries F_bend = π Eₘ h² ε^½ / 2√2 beside the "
-            "stretching term. Its exponent is ½, so it is a shape of its "
-            "own, not a rename of anything else in the model. What eq 2 "
-            "then says is that it is negligible: the ratio of bending to "
-            "stretching is (h/R)/ε^5/2"
+            "**Bending.** Lulevich eq 1 carries a bending contribution "
+            "F_bend = π Eₘ h² ε^½ / 2√2 alongside the stretching term, with "
+            "exponent ½, so it is a distinct shape rather than a "
+            "reparametrisation. Eq 2 gives the ratio of bending to "
+            "stretching as (h/R)/ε^{5/2}"
             + (f", which on this cell is {float(share):.3g} at ε = 0.30"
                if share is not None and np.isfinite(float(share)) else "")
-            + ". That is why it is not offered: a column that small has a "
-            "modulus the curve cannot determine, and a term the curve "
-            "cannot see is a place for the solver to hide its errors."
+            + ". A column with that little leverage has an ill-determined "
+            "coefficient and, being non-orthogonal to the rest, acts as a "
+            "sink for model error elsewhere, so it is excluded from 𝒞 "
+            "rather than offered and regularised."
         )
 
 
