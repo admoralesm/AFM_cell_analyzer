@@ -1125,7 +1125,7 @@ def case_full_control_shows_everything():
     check("the fit button is on it", button_by_label(app, "Fit this cell")
           is not None)
     check("and so is the range",
-          any("Relative deformation, total range" in str(m.value)
+          any("1 · Relative deformation range" in str(m.value)
               for m in app.get("markdown")))
     check("the expert search button is still there",
           button_by_label(app, "Find the best combination and fit it") is not None)
@@ -1548,13 +1548,13 @@ def case_guided_order_follows_the_work():
     # the parts and how they share the load, then the fit.
     # Choices first, in one place and made once; then the fit; then
     # everything the fit produced.
-    check("step 1 is what to fit",
-          any("1 · What to fit" in h for h in headings), order)
+    check("step 1 is the range",
+          any("1 · Relative deformation range" in h for h in headings), order)
     check("step 2 is the fit itself",
           any("2 · Fit" in h for h in headings), order)
     positions = [
         next(i for i, h in enumerate(headings) if key in h)
-        for key in ("1 · What to fit", "2 · Fit")
+        for key in ("1 · Relative deformation range", "2 · Fit")
     ]
     check("and they are in that order", positions == sorted(positions),
           str(positions))
@@ -1708,10 +1708,10 @@ def case_guided_range_is_settable():
     said = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
     check("it is labelled",
-          "Relative deformation, total range" in said, said[:200])
+          "1 · Relative deformation range" in said, said[:200])
     check("and it comes before the components, since it decides which "
           "points exist at all",
-          said.index("Relative deformation, total range")
+          said.index("1 · Relative deformation range")
           < said.index("Components"), said[:200])
     check("and it has a handle at each end, not just at the far one",
           isinstance(slider.value, (list, tuple)) and len(slider.value) == 2,
@@ -2296,7 +2296,7 @@ def case_sharing_controls_sit_with_the_parts():
         if str(m.value).strip().startswith("####")
     ]
     check("the materials and the range are chosen in one place",
-          any("1 · What to fit" in h for h in headings), str(headings))
+          any("1 · Relative deformation range" in h for h in headings), str(headings))
 
     radios = [r.label for r in app.get("radio")]
     for wanted in ("How the cell is modelled", "After ε₁ the membrane…",
@@ -2392,7 +2392,7 @@ def case_the_curve_comes_first():
     # fit, look rather than look, scroll, choose.
     check("the curve is staked out after the choices",
           source.index("curve_slot = st.container()")
-          > source.index('st.markdown("#### 1 · What to fit")'),
+          > source.index('st.markdown("#### 1 · Relative deformation range")'),
           "curve_slot is too early")
     check("and the plot is drawn into it",
           "plot_col = curve_slot" in source)
@@ -3189,7 +3189,7 @@ def case_components_are_recommended():
     # The mixture is the search button's job, not the fit button's: fitting
     # must never change which boxes are ticked, or a box clears while
     # somebody is looking at the curve.
-    work = button_by_label(app, "Find the boundaries and the best mixture")
+    work = button_by_label(app, "Find the elements and optimise the ranges")
     if work is None:
         check("the button is there", False)
         return
@@ -5358,7 +5358,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Find the boundaries and the best mixture")
+    button = button_by_label(app, "Find the elements and optimise the ranges")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5538,7 +5538,7 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Find the boundaries and the best mixture")
+    button = button_by_label(app, "Find the elements and optimise the ranges")
     check("and one button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:10]))
     if button is None:
@@ -6183,6 +6183,14 @@ def case_a_new_curve_arrives_ready_to_fit():
         check("and the ± is a number, not a blank",
               any(str(v).startswith("±") for v in table["± (standard error)"]),
               str(list(table["± (standard error)"])))
+        check("the interval itself is given, not only the half-width",
+              "95% interval" in table.columns
+              and any(" to " in str(v) for v in table["95% interval"]),
+              str(list(table.get("95% interval", []))))
+        check("and it never reaches below zero, which a modulus cannot",
+              all(float(str(v).split(" to ")[0]) >= 0
+                  for v in table["95% interval"] if " to " in str(v)),
+              str(list(table["95% interval"])))
 
 
 def case_the_video_is_not_a_plot_marking():
