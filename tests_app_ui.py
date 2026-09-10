@@ -3031,9 +3031,11 @@ def case_switching_cell_type_and_back_changes_nothing():
           f"h {app.session_state['cell_height_um']} "
           f"q {app.session_state['confinement']} "
           f"hm {app.session_state['membrane_thickness_nm']}")
+    # A C2C12 carries its sarcolemma and cytoskeleton throughout, which is
+    # its own composition default, not the app's blank one.
     check("and so does the composition",
-          app.session_state["membrane_after_break"] == "holds what it reached"
-          and app.session_state["cyto_starts_at"] == "at ε₁",
+          app.session_state["membrane_after_break"] == "keeps stiffening"
+          and app.session_state["cyto_starts_at"] == "from the very start",
           f"{app.session_state['membrane_after_break']} / "
           f"{app.session_state['cyto_starts_at']}")
     check("the cardiomyocyte's extra spring does not follow it home",
@@ -4012,7 +4014,10 @@ def case_the_myoblast_nucleus_reaches_the_page():
 
     eps = np.linspace(0.002, 0.62, 300)
     seed = LulevichModel(np.zeros_like(eps), eps, cell_height=8.0e-6)
-    basis = seed.composition_basis(eps, 0.15, 0.40, "freeze", "break")
+    # Built the way a C2C12 is now understood to behave: both outer
+    # elements loading from first contact, the nucleus met at 0.50, inside
+    # the 44 % to 70 % band.
+    basis = seed.composition_basis(eps, 0.15, 0.50, "continue", "zero")
     # 30 kPa inside the nucleus, not 3. Its prefactor is the nucleus radius
     # squared (Lulevich eq 6), and at 3 kPa a body that size contributes
     # less than the noise: the search would be right to drop it, so a test
@@ -4037,6 +4042,16 @@ def case_the_myoblast_nucleus_reaches_the_page():
         return
     check("the envelope is one of the fitted terms",
           "nucleus_shell" in fit["terms"], str(fit["terms"]))
+    # The curve was built with its nucleus met at 0.50 and the page starts
+    # at the middle of the band, so the envelope only carries load once the
+    # boundary has been estimated. That is the search's job.
+    work = button_by_label(app, "Fit this cell")
+    if work is not None:
+        work.click().run()
+        no_exception(app, "fitting the myoblast")
+        fit = state(app, "_last_fit") or fit
+    check("the boundary is recovered inside the band",
+          abs(float(fit["break_2"]) - 0.50) < 0.06, str(fit.get("break_2")))
     check("and it carries load", fit.get("Ene_MPa", 0.0) > 0.1,
           str(fit.get("Ene_MPa")))
     check("the fit follows the curve", fit["r_squared"] > 0.999,
@@ -5336,9 +5351,13 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
     import app as app_module
 
     wanted = app_module.default_boundaries("Myoblast (C2C12)")
+    # ε₂ starts in the middle of the band a C2C12's nucleus is met in.
+    band = app_module.deep_onset_band("Myoblast (C2C12)")
     check("a C2C12 has boundaries of its own",
           abs(wanted["segment_break_1"] - 0.15) < 1e-9
-          and abs(wanted["segment_break_2"] - 0.40) < 1e-9, str(wanted))
+          and band[0] <= wanted["segment_break_2"] <= band[1], str(wanted))
+    check("and that band is the published one, 44 % to 70 %",
+          abs(band[0] - 0.44) < 1e-9 and abs(band[1] - 0.70) < 1e-9, str(band))
     check("and an unknown cell type falls back to the app's",
           app_module.default_boundaries("Something else")["segment_break_1"]
           == app_module.DEFAULTS["segment_break_1"])
@@ -5347,24 +5366,34 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
     if not no_exception(app, "a freshly loaded curve"):
         return
     check("the loaded curve sits on those boundaries",
-          abs(float(state(app, "segment_break_1")) - 0.15) < 1e-6
-          and abs(float(state(app, "segment_break_2")) - 0.40) < 1e-6,
+          abs(float(state(app, "segment_break_1"))
+              - wanted["segment_break_1"]) < 1e-6
+          and abs(float(state(app, "segment_break_2"))
+                  - wanted["segment_break_2"]) < 1e-6,
           f"{state(app, 'segment_break_1')} / {state(app, 'segment_break_2')}")
     check("the component ranges follow them",
-          state(app, "element_window_membrane") == (0.0, 0.15)
-          and state(app, "element_window_nucleus")[0] == 0.4,
+          state(app, "element_window_membrane")[0] == 0.0
+          and abs(state(app, "element_window_nucleus")[0]
+                  - wanted["segment_break_2"]) < 1e-6,
           f"{state(app, 'element_window_membrane')} "
           f"{state(app, 'element_window_nucleus')}")
+    check("and the two a C2C12 carries throughout do run throughout",
+          state(app, "element_window_membrane")[1]
+          == state(app, "element_window_interior")[1]
+          == float(state(app, "window_end")),
+          f"{state(app, 'element_window_membrane')} "
+          f"{state(app, 'element_window_interior')}")
     fit = state(app, "_last_fit")
     check("and it is still fitted, at those boundaries",
           fit and fit.get("success")
-          and abs(float(fit["break_1"]) - 0.15) < 1e-6, str(fit.get("break_1")))
+          and abs(float(fit["break_2"])
+                  - wanted["segment_break_2"]) < 1e-6, str(fit.get("break_2")))
     check("no search ran on load, so nothing was applied unasked",
           state(app, "hypothesis_search") in (None, {}),
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Optimise the ranges")
+    button = button_by_label(app, "Refine the boundaries")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5374,11 +5403,21 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
         return
     moved = (float(state(app, "segment_break_1")),
              float(state(app, "segment_break_2")))
-    check("pressing it moves them off the defaults",
-          moved != (0.15, 0.40), str(moved))
-    check("and the ranges move with them",
-          abs(state(app, "element_window_membrane")[1] - moved[0]) < 1e-6,
-          f"{state(app, 'element_window_membrane')} against {moved}")
+    check("pressing it moves them off the defaults", moved != (
+        wanted["segment_break_1"], wanted["segment_break_2"]), str(moved))
+    check("but never outside the band the biology allows",
+          band[0] - 1e-6 <= moved[1] <= band[1] + 1e-6, str(moved))
+    check("and the deep range moves with the boundary",
+          abs(state(app, "element_window_nucleus")[0] - moved[1]) < 1e-6,
+          f"{state(app, 'element_window_nucleus')} against {moved}")
+    # Pressed twice it must land in the same place: a search that answers
+    # differently each time is not an estimate.
+    button = button_by_label(app, "Refine the boundaries")
+    button.click().run()
+    again = (float(state(app, "segment_break_1")),
+             float(state(app, "segment_break_2")))
+    check("and pressing it again does not move it", again == moved,
+          f"{moved} then {again}")
     check("the total range is left alone",
           abs(float(state(app, "window_end"))
               - float(fit["epsilon_range"][1])) < 1e-6,
@@ -5517,8 +5556,8 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
     check("and those ranges are the boundaries, until one is moved",
-          abs(fit["term_windows"]["membrane"][1] - float(fit["break_1"])) < 1e-6,
-          f"{fit['term_windows']['membrane']} against ε₁ = {fit['break_1']:.3f}")
+          abs(fit["term_windows"]["nucleus"][0] - float(fit["break_2"])) < 1e-6,
+          f"{fit['term_windows']['nucleus']} against ε₂ = {fit['break_2']:.3f}")
     terms = [t for t in ("membrane", "interior", "nucleus", "nucleus_shell")
              if state(app, f"use_{t}")]
     bars = [s for s in app.slider if (s.label or "").startswith("acts over ε")]
@@ -5544,9 +5583,11 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Optimise the ranges")
+    # The unconstrained placement search moved to the settings, because it
+    # overwrites every range at once and knows nothing about the cell type.
+    button = button_by_label(app, "Search the ranges freely")
     check("and one button that places them by arithmetic",
-          button is not None, str([b.label for b in app.button][:10]))
+          button is not None, str([b.label for b in app.button][:14]))
     if button is None:
         return
     button.click().run()
