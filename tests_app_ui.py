@@ -3113,6 +3113,7 @@ def case_no_nucleus_wording_for_a_cardiomyocyte():
 def case_components_are_recommended():
     print("the search says which components to use, and can apply them")
     from lulevich_model import recommend_components
+    import app as app_module
     eps, force, model, _ = four_element_curve()
 
     # A curve whose in-plane spring carries real force. The default one in
@@ -3185,20 +3186,27 @@ def case_components_are_recommended():
     app = start(cell_name="WT", cell_type="Cardiomyocyte")
     if not no_exception(app, "component search"):
         return
-    work = button_by_label(app, "Fit this cell")
+    # The mixture is the search button's job, not the fit button's: fitting
+    # must never change which boxes are ticked, or a box clears while
+    # somebody is looking at the curve.
+    work = button_by_label(app, "Find the boundaries and the best mixture")
     if work is None:
         check("the button is there", False)
         return
     work.click().run()
     if not no_exception(app, "after working it out"):
         return
-    picked = app.session_state["component_search"]
+    picked = state(app, "component_search")
     check("the search ran with the button", picked and picked.get("success"))
-    # It is a caption now, not a section: advice beside the choices rather
-    # than a heading to scroll past.
     said = " ".join(str(c.value) for c in app.get("caption"))
     check("the recommendation is on the page",
-          "Materials this curve can see" in said, said[-400:])
+          "Last search kept" in said, said[-400:])
+    check("and what it kept is what is ticked",
+          set(picked["recommended"])
+          == {t for t in app_module.ALL_TERMS
+              if state(app, f"use_{t}", False)
+              and t in app_module.terms_for("Cardiomyocyte")},
+          str(picked["recommended"]))
     # No picker of near-identical sentences, and no table under it. What
     # overrules the pick is the controls: the combination search, the two
     # boundaries, the fitting options.
@@ -5050,6 +5058,32 @@ def case_the_button_says_what_it_will_do():
           "found from the curve" in text, text[:400])
     check("and how the winner among the arrangements is chosen",
           "predicts points it was not fitted to" in text, text[:600])
+    # Everything the fit measured, in one block that pastes into a
+    # spreadsheet one number per cell.
+    panels = [e.label for e in app.get("expander")]
+    check("the results can be copied into a spreadsheet",
+          any("Copy these results" in (p or "") for p in panels), str(panels))
+    check("and the panel of workings is gone",
+          not any("How this fit was calculated" in (p or "") for p in panels),
+          str(panels))
+    blocks = [str(c.value) for c in app.get("code")]
+    record = next((b for b in blocks if b.startswith("Cell ID\t")), None)
+    check("the block is two tab separated lines, headers then values",
+          record is not None and len(record.split("\n")) == 2
+          and len(record.split("\n")[0].split("\t"))
+          == len(record.split("\n")[1].split("\t")),
+          str(record)[:120])
+    if record:
+        headers = record.split("\n")[0].split("\t")
+        check("every modulus is followed by its own uncertainty",
+              all(f"± {h}" in headers
+                  for h in headers
+                  if not h.startswith("±")
+                  and (h.endswith("(MPa)") or h.endswith("(kPa)"))),
+              str(headers))
+        check("and the quality of the fit travels with it",
+              {"R2", "chi2 per dof", "n points"} <= set(headers),
+              str(headers))
 
 
 def case_the_data_is_a_field_and_the_model_a_dashed_line():
@@ -5324,7 +5358,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Find boundaries from the data")
+    button = button_by_label(app, "Find the boundaries and the best mixture")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5504,7 +5538,7 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Find boundaries from the data")
+    button = button_by_label(app, "Find the boundaries and the best mixture")
     check("and one button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:10]))
     if button is None:
@@ -6030,6 +6064,35 @@ def case_unticking_a_material_fits_without_it():
     picture = app.session_state["hypothesis_search"]["best"]["label"]
     check("and the picture chosen does not name a material it left out",
           "sarcolemma" not in picture.lower(), picture)
+
+    # And the other half of the same rule: a component that is ticked stays
+    # ticked. Fitting decides the arrangement and the boundaries; which
+    # components are in the model is the search button's question, asked on
+    # purpose, with its own criterion.
+    box = next((c for c in app.checkbox
+                if (c.label or "").startswith(names["membrane"][0])), None)
+    if box is None:
+        return
+    box.check().run()
+    if not no_exception(app, "ticking the membrane again"):
+        return
+    ticked = {t for t in ("membrane", "interior", "nucleus")
+              if state(app, f"use_{t}", False)}
+    work = button_by_label(app, "Fit this cell")
+    if work is None:
+        return
+    work.click().run()
+    if not no_exception(app, "fitting with all three"):
+        return
+    still = {t for t in ("membrane", "interior", "nucleus")
+             if state(app, f"use_{t}", False)}
+    check("fitting never unticks a component you asked for",
+          still == ticked, f"{sorted(ticked)} -> {sorted(still)}")
+    end = state(app, "_last_fit") or {}
+    check("and every one of them is in the fit",
+          set(end.get("terms") or ()) == ticked, str(end.get("terms")))
+    check("which still follows the curve", end.get("r_squared", 0) > 0.999,
+          f"{end.get('r_squared', 0):.6f}")
 
 
 def case_the_video_is_not_a_plot_marking():
