@@ -1519,11 +1519,17 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
     boundaries and nothing else.
     """
     out = {"q": None, "q_scan": None, "hypotheses": None, "components": None}
+    # The deep boundary is searched inside the band this cell type is known
+    # to put it in, so the fit button and the refine button cannot disagree
+    # about where a nucleus can be met.
+    band_2 = deep_onset_band(st.session_state.get("cell_type"), lo, hi)
+    if band_2 == (float(lo), float(hi)):
+        band_2 = None
     try:
         chosen = compare_hypotheses(
             model, lo, hi, picks, weighting=weighting, cv_repeats=cv_repeats,
             n_grid=n_grid, refine_rounds=max(1, int(passes) - 1),
-            scan_q=bool(measure_q),
+            scan_q=bool(measure_q), band_2=band_2,
         )
     except Exception:  # pragma: no cover - defensive
         return out
@@ -1572,6 +1578,7 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
                     # one the page then fits at them.
                     use_nucleus_shell="nucleus_shell" in best["terms"],
                     use_cortex="cortex" in best["terms"],
+                    band_2=band_2,
                 )
                 if refit and refit.get("success"):
                     e1, e2 = float(refit["break_1"]), float(refit["break_2"])
@@ -3473,6 +3480,14 @@ def has_deep_term(cell_type=None):
 # membrane is deforming on its own. Starting the cytoskeleton at zero is what
 # reproduces a 1.7 rather than a 3.
 DEFAULT_COMPOSITION_BY_TYPE = {
+    # Both outer elements of a C2C12 carry load from first contact and keep
+    # carrying it, which is what "present throughout" means as an
+    # arrangement: the shell goes on stiffening rather than holding at ε₁,
+    # and the cytoskeleton is loaded from zero rather than waiting for it.
+    "Myoblast (C2C12)": {
+        "membrane_after_break": "keeps stiffening",
+        "cyto_starts_at": "from the very start",
+    },
     "Cardiomyocyte": {
         "membrane_after_break": "starts stretching at ε₁",
         # The interior is anchored to the sarcolemma, so it is never left
@@ -3636,9 +3651,71 @@ def expected_for(cell_type=None):
 # met a little under half way. A curve that disagrees says so when the
 # boundary search is pressed.
 DEFAULT_BOUNDARIES_BY_TYPE = {
-    "Myoblast (C2C12)": {"segment_break_1": 0.15, "segment_break_2": 0.40},
+    # A C2C12 is met by its sarcolemma and its cytoskeleton from first
+    # contact and by its nucleus somewhere between 44 % and 70 %, so ε₂
+    # starts in the middle of that band rather than at a number with
+    # nothing behind it. ε₁ is kept for the arrangements that use it; with
+    # both outer elements carrying load throughout it does nothing.
+    "Myoblast (C2C12)": {"segment_break_1": 0.15, "segment_break_2": 0.55},
     "Cardiomyocyte": {"segment_break_1": 0.15, "segment_break_2": 0.40},
 }
+
+# What is already known about where each element of a cell type carries
+# load. This is prior knowledge, not a measurement, and it is used in two
+# places: the range a component starts on, and the interval the search is
+# allowed to move a boundary within. A search with no prior wanders --
+# press it twice on the same curve after nudging one bar and the boundaries
+# can end up on the other side of the cell -- and a boundary that moves
+# further than the biology allows is not a measurement of anything.
+COMPONENT_PRIORS = {
+    "Myoblast (C2C12)": {
+        # Load-bearing from first contact to the end of the squash.
+        "throughout": ("membrane", "interior"),
+        # Where the deep elements are first met.
+        "onset": {"nucleus": (0.44, 0.70), "nucleus_shell": (0.44, 0.70)},
+        "why": (
+            "in a C2C12 the sarcolemma and the cytoskeleton carry load "
+            "throughout the compression, and the nucleus is met between "
+            "44 % and 70 % relative deformation"
+        ),
+    },
+}
+
+
+def component_prior(cell_type=None):
+    """What is known in advance about this cell type's elements."""
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    return COMPONENT_PRIORS.get(cell_type, {})
+
+
+def carries_throughout(term, cell_type=None):
+    """Whether this element is known to bear load over the whole squash."""
+    return term in (component_prior(cell_type).get("throughout") or ())
+
+
+def onset_band(term, cell_type=None, lo=0.0, hi=1.0):
+    """
+    The interval this element's onset is allowed to sit in.
+
+    Returns the whole range where nothing is known, so a cell type without
+    a prior is searched exactly as before.
+    """
+    band = (component_prior(cell_type).get("onset") or {}).get(term)
+    if not band:
+        return (float(lo), float(hi))
+    a, b = float(band[0]), float(band[1])
+    return (float(np.clip(a, lo, hi)), float(np.clip(b, lo, hi)))
+
+
+def deep_onset_band(cell_type=None, lo=0.0, hi=1.0):
+    """The ε₂ band: where the deep elements of this cell type are met."""
+    onsets = component_prior(cell_type).get("onset") or {}
+    bands = [onset_band(term, cell_type, lo, hi)
+             for term in ("nucleus_shell", "nucleus") if term in onsets]
+    if not bands:
+        return (float(lo), float(hi))
+    return (min(b[0] for b in bands), max(b[1] for b in bands))
 
 
 def default_boundaries(cell_type=None):
@@ -4087,6 +4164,13 @@ def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
         # so the fit hands it zero rather than failing.
         return float(np.clip(value, lo, hi - 0.01 * span))
 
+    # An element the cell type is known to load throughout gets the whole
+    # squash by way of its arrangement, not by an override here: the
+    # composition defaults put a C2C12's shell on "keeps stiffening" and its
+    # cytoskeleton on "from the very start", which lands on (0, hi) two
+    # lines below. Overriding it here instead would make the arrangement
+    # radios inert, which is a worse kind of prior: one that cannot be
+    # argued with.
     if term in ("nucleus", "nucleus_shell"):
         return (onset(e2), hi)
     if term == "interior" and cyto_start == "break":
@@ -4221,116 +4305,123 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
     return element_windows(active_terms(), lo, hi)
 
 
-def find_boundaries_control(model, lo, hi, terms):
+def find_elements_control(model, lo, hi, terms):
     """
-    Two searches, because they answer two different questions.
+    Which elements the curve can resolve, asked where the elements are.
 
-    Which elements the curve can resolve is a model-selection problem: it is
-    settled on held-out error, and its answer is a subset. Where those
-    elements hand over is an estimation problem at a fixed subset: it is
-    settled on the residual surface, and its answer is a pair of
-    deformations. Running both from one button meant the person could not
-    ask the second without also being given a new answer to the first.
+    Support recovery belongs next to the tick boxes it writes to. It used to
+    sit in a panel of its own further down, which put a button that clears
+    a checkbox out of sight of the checkbox it clears.
+    """
+    e1_now = float(st.session_state["segment_break_1"])
+    e2_now = float(st.session_state["segment_break_2"])
+    pressed = st.button(
+        "🧬 Find the elements", key="find_elements_button",
+        disabled=recommend_components is None or not terms, **STRETCH,
+    )
+    st.caption(
+        "Which of these the curve can actually resolve, judged at the "
+        f"boundaries as they stand (ε₁ = {e1_now:.3f}, ε₂ = {e2_now:.3f}). "
+        "Every subset is refitted and the one kept is the one that best "
+        "predicts points it was not fitted to. Ticks the answer."
+    )
+    if not pressed:
+        return
+    applied = search_the_mixture(model, lo, hi, e1_now, e2_now)
+    found = st.session_state.get("component_search") or {}
+    if found.get("success"):
+        st.session_state["_pending_settings"] = applied
+        st.rerun()
+    st.error(found.get("error", "The element search found nothing."))
+
+
+def boundary_grid(band, n):
+    """A grid over a band, or the single point when the band is one."""
+    a, b = float(band[0]), float(band[1])
+    if b - a < 1e-6:
+        return np.array([a])
+    return np.linspace(a, b, int(n))
+
+
+def epsilon_1_is_free(terms, membrane, cyto_start):
+    """
+    Whether ε₁ changes the model at all, as it is currently arranged.
+
+    With every outer element carrying load throughout, ε₁ is a number the
+    basis functions never read. Searching it then produces a different
+    answer every time from noise alone, which is exactly what "the
+    boundaries move a lot each press" was.
+    """
+    if any(term in terms and not carries_throughout(term)
+           for term in ("membrane", "tension")) and membrane in ("freeze", "late"):
+        return True
+    if ("interior" in terms and not carries_throughout("interior")
+            and cyto_start == "break"):
+        return True
+    return False
+
+
+def refine_boundaries_control(model, lo, hi, terms):
+    """
+    Move the boundaries within the interval the biology allows, and no further.
+
+    The free search was the problem: pressing it moved every boundary and
+    every element's range across the whole curve, so two presses on one
+    cell gave two different cells. What is actually being estimated is
+    narrow. A C2C12 is met by its sarcolemma and cytoskeleton from first
+    contact, so their ranges are not in question at all, and its nucleus is
+    met between 44 % and 70 %, so ε₂ is a number inside a band a third of
+    the curve wide. Constraining the profile to that band is not a
+    convenience: an estimate allowed outside it would be reporting a cell
+    nobody has ever measured.
     """
     if not terms:
         return
-    moved = any(
-        st.session_state.get(element_window_key(term)) is not None
-        and st.session_state.get(f"_window_touched_{term}")
-        for term in terms
-    )
-    can_place = moved and search_term_windows is not None
-    can_scan = hasattr(model, "scan_segment_breaks")
+    cell_type = st.session_state.get("cell_type")
+    prior = component_prior(cell_type)
+    membrane = MEMBRANE_CHOICES.get(
+        st.session_state["membrane_after_break"], "freeze")
+    cyto_start = CYTO_CHOICES.get(st.session_state["cyto_starts_at"], "break")
     e1_now = float(st.session_state["segment_break_1"])
     e2_now = float(st.session_state["segment_break_2"])
 
-    st.markdown("##### Let the curve decide")
-    left, right = st.columns(2)
-    with left:
-        find_elements = st.button(
-            "🧬 Find the elements", key="find_elements_button",
-            disabled=recommend_components is None, **STRETCH,
-        )
-        st.caption(
-            "Which of this cell type's elements the curve can actually "
-            "resolve, judged at the boundaries as they stand "
-            f"(ε₁ = {e1_now:.3f}, ε₂ = {e2_now:.3f}). Every subset is "
-            "refitted and the one kept is the one that best predicts points "
-            "it was not fitted to. Ticks the answer."
-        )
-    with right:
-        optimise = st.button(
-            "📐 Optimise the ranges", key="optimise_ranges_button",
-            type="primary", disabled=not (can_scan or can_place), **STRETCH,
-        )
-        st.caption(
-            "Where the elements now selected ("
-            + ", ".join(plain_name(t).lower() for t in terms)
-            + ") take over from one another, found from the curve rather "
-            "than assumed"
-            + (": each element's own range is searched, since one has been "
-               "moved by hand." if can_place else
-               ": the residual surface is profiled over ε₁ and ε₂.")
-        )
+    deep = [t for t in terms if t in ("nucleus", "nucleus_shell")]
+    band2 = deep_onset_band(cell_type, lo, hi) if deep else (e2_now, e2_now)
+    free1 = epsilon_1_is_free(terms, membrane, cyto_start)
+    band1 = (max(lo, 0.02), min(band2[0], hi) - 0.02) if free1         else (e1_now, e1_now)
+    if band1[1] <= band1[0]:
+        band1 = (e1_now, e1_now)
 
-    search_results_as_equations()
-    why_this_search(model)
-    set_default_boundaries_control()
+    moving = []
+    if band1[1] > band1[0]:
+        moving.append(f"ε₁ within {band1[0]:.2f} to {band1[1]:.2f}")
+    if band2[1] > band2[0]:
+        moving.append(f"ε₂ within {band2[0]:.2f} to {band2[1]:.2f}")
 
-    if find_elements:
-        applied = search_the_mixture(model, lo, hi, e1_now, e2_now)
-        found = st.session_state.get("component_search") or {}
-        if found.get("success"):
-            st.session_state["_pending_settings"] = applied
-            st.rerun()
-        st.error(found.get("error", "The element search found nothing."))
+    pressed = st.button(
+        "📐 Refine the boundaries, inside what is known",
+        key="refine_boundaries_button", type="primary",
+        disabled=not moving, **STRETCH,
+    )
+    st.caption(
+        (("Boundaries found from the curve rather than assumed: profiles "
+          + " and ".join(moving) + ". ") if moving else
+         "Nothing to refine: with these elements every boundary is fixed "
+         "by the arrangement. ")
+        + (prior.get("why", "").capitalize() + ", so the search moves each "
+           "boundary a little inside that band rather than across the "
+           "curve. " if prior.get("why") else "")
+        + "Ranges you moved by hand are left alone."
+    )
+
+    if not pressed:
         return
 
-    if not optimise:
-        return
-
-    if can_place:
-        with st.spinner("Moving each range and scoring every placement on "
-                        "points it was not fitted to…"):
-            try:
-                found = search_term_windows(
-                    model, lo, hi, terms,
-                    membrane=MEMBRANE_CHOICES.get(
-                        st.session_state["membrane_after_break"], "freeze"),
-                    cyto_start=CYTO_CHOICES.get(
-                        st.session_state["cyto_starts_at"], "break"),
-                    e1=e1_now, e2=e2_now,
-                    weighting=st.session_state["weighting"],
-                    fit_offset=st.session_state["fit_offset"],
-                    start_from=element_windows(terms, lo, hi),
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                found = {"success": False, "error": str(exc)}
-        st.session_state["element_window_search"] = found
-        st.session_state["_last_search"] = "windows"
-        if found.get("success"):
-            pending = {
-                element_window_key(term): tuple(window)
-                for term, window in found["windows"].items()
-            }
-            # A searched range is a placed range: it must not be put back on
-            # the boundaries by the next redraw.
-            pending.update({
-                f"_window_touched_{term}": True for term in found["windows"]
-            })
-            st.session_state["_pending_settings"] = pending
-            st.rerun()
-        st.error(found.get("error", "The placement search failed."))
-        return
-
-    with st.spinner("Profiling the residual over the boundary grid…"):
-        try:
-            found = model.scan_segment_breaks(
-                lo, hi, terms=terms or ("membrane", "interior"),
-                weighting=st.session_state["weighting"],
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            found = {"success": False, "error": str(exc)}
+    fixed = {t for t in terms if st.session_state.get(f"_window_touched_{t}")}
+    with st.spinner("Profiling the residual over the allowed boundaries…"):
+        found = profile_boundaries(
+            model, lo, hi, terms, band1, band2, membrane, cyto_start,
+        )
     st.session_state["boundary_search"] = found
     st.session_state["_last_search"] = "boundaries"
     if found.get("success"):
@@ -4338,8 +4429,135 @@ def find_boundaries_control(model, lo, hi, terms):
             "segment_break_1": round(float(found["best_break_1"]), 3),
             "segment_break_2": round(float(found["best_break_2"]), 3),
         }
+        if fixed:
+            st.session_state["_boundaries_left_alone"] = sorted(fixed)
         st.rerun()
-    st.error(found.get("error", "The boundary scan found nothing."))
+    st.error(found.get("error", "No boundary in the allowed band fitted."))
+
+
+def profile_boundaries(model, lo, hi, terms, band1, band2,
+                       membrane="freeze", cyto_start="break", n=13):
+    """
+    The residual surface over the allowed boundary pairs, and its minimum.
+
+    One exact bounded least-squares solve per node, which is what makes an
+    exhaustive profile affordable and removes every question of starting
+    values: there is nothing to start from.
+    """
+    flags = {
+        "use_membrane": "membrane" in terms,
+        "use_interior": "interior" in terms,
+        "use_nucleus": "nucleus" in terms,
+        "use_tension": "tension" in terms,
+        "use_nucleus_shell": "nucleus_shell" in terms,
+        "use_cortex": "cortex" in terms,
+    }
+    trials, best = [], None
+    for e1 in boundary_grid(band1, n):
+        for e2 in boundary_grid(band2, n):
+            if float(e2) <= float(e1):
+                continue
+            try:
+                got = model.fit_composition(
+                    lo, hi, float(e1), float(e2), membrane, cyto_start,
+                    weighting=st.session_state["weighting"],
+                    fit_offset=st.session_state["fit_offset"], **flags
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if not got.get("success"):
+                continue
+            trials.append({
+                "e1": float(e1), "e2": float(e2),
+                "r_squared": float(got["r_squared"]),
+            })
+            if best is None or got["r_squared"] > best["r_squared"]:
+                best = got
+    if best is None:
+        return {"success": False,
+                "error": "No usable fit anywhere in the allowed band."}
+    return {
+        "success": True,
+        "best": best,
+        "best_break_1": float(best["break_1"]),
+        "best_break_2": float(best["break_2"]),
+        "trials": trials,
+        "band_1": tuple(float(v) for v in band1),
+        "band_2": tuple(float(v) for v in band2),
+    }
+
+
+def free_placement_control(model, lo, hi, terms):
+    """
+    The unconstrained placement search, kept but moved out of the way.
+
+    It searches both edges of every element's range against held-out error,
+    which is the right tool when a cell type has no prior worth the name
+    and the wrong one when it does: on a C2C12 it will happily move the
+    sarcolemma off first contact, which is not a thing a sarcolemma does.
+    So it lives in the settings, behind a sentence saying what it will do.
+    """
+    if search_term_windows is None or not terms:
+        return
+    st.markdown("**🧪 Search every element's range freely**")
+    st.caption(
+        "Moves both edges of every element's range, scoring each placement "
+        "on held-out points, with no prior about where an element belongs. "
+        "It overwrites every range at once, including ones you set, so it "
+        "is for a cell type this app has no expectations about rather than "
+        "for tidying up a C2C12."
+    )
+    if not st.button("Search the ranges freely", key="free_placement",
+                     **STRETCH):
+        return
+    with st.spinner("Moving each range and scoring every placement…"):
+        try:
+            found = search_term_windows(
+                model, lo, hi, terms,
+                membrane=MEMBRANE_CHOICES.get(
+                    st.session_state["membrane_after_break"], "freeze"),
+                cyto_start=CYTO_CHOICES.get(
+                    st.session_state["cyto_starts_at"], "break"),
+                e1=float(st.session_state["segment_break_1"]),
+                e2=float(st.session_state["segment_break_2"]),
+                weighting=st.session_state["weighting"],
+                fit_offset=st.session_state["fit_offset"],
+                start_from=element_windows(terms, lo, hi),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            found = {"success": False, "error": str(exc)}
+    st.session_state["element_window_search"] = found
+    st.session_state["_last_search"] = "windows"
+    if found.get("success"):
+        pending = {
+            element_window_key(term): tuple(window)
+            for term, window in found["windows"].items()
+        }
+        pending.update({
+            f"_window_touched_{term}": True for term in found["windows"]
+        })
+        st.session_state["_pending_settings"] = pending
+        st.rerun()
+    st.error(found.get("error", "The placement search failed."))
+
+
+def optimisation_controls(model, lo, hi, terms):
+    """The optimisation step: what it decided, and the argument for how."""
+    if not terms:
+        return
+    st.markdown("##### Optimization")
+    refine_boundaries_control(model, lo, hi, terms)
+    left_alone = st.session_state.pop("_boundaries_left_alone", None)
+    if left_alone:
+        st.caption(
+            "Left as you set "
+            + ", ".join(plain_name(t).lower() for t in left_alone)
+            + ": those ranges were moved by hand, so the new boundaries did "
+            "not touch them."
+        )
+    search_results_as_equations()
+    why_this_search(model)
+    set_default_boundaries_control()
 
 
 def _term_symbol(term):
@@ -4545,6 +4763,54 @@ def why_this_search(model=None):
             "because a subset chosen at the wrong changepoint is being "
             "scored on the wrong design matrix, and a changepoint estimated "
             "under a misspecified subset absorbs the missing term."
+        )
+
+        st.markdown("**0 · Initial values, and the order the steps run in**")
+        st.caption(
+            "There is no initial guess for the moduli, and none is "
+            "possible to get wrong: at fixed changepoints the problem is "
+            "convex with a unique global minimiser, so the solver returns "
+            "the same θ̂ from anywhere. What does need starting values is "
+            "the small set of parameters that enter non-linearly, and "
+            "those come from prior knowledge of the cell type rather than "
+            "from the curve: "
+            + (component_prior().get("why", "")
+               or "no prior is declared for this cell type, so the "
+                  "changepoints start at the stored defaults")
+            + ". The estimate is then a block coordinate descent, each "
+            "block solved exactly rather than stepped:"
+        )
+        st.latex(
+            r"\begin{aligned}"
+            r"\text{(i)}\quad & \hat{\theta}^{(m)} = \arg\min_{\theta\ge0}"
+            r"\lVert W(F - X(\varepsilon^{(m)})\theta)\rVert^{2} "
+            r"&& \text{exact, BVLS}\\"
+            r"\text{(ii)}\quad & \varepsilon^{(m+1)} = \arg\min_{\varepsilon"
+            r"\in\mathcal{G}} S(\varepsilon) && \text{grid profile, then "
+            r"two refinements}\\"
+            r"\text{(iii)}\quad & q^{(m+1)} = \arg\min_{q} S(\varepsilon^{"
+            r"(m+1)};q) && \text{scanned at the incumbent boundaries}\\"
+            r"\text{(iv)}\quad & \varepsilon^{(m+2)} = \arg\min_{\varepsilon"
+            r"\in\mathcal{G}} S(\varepsilon;q^{(m+1)}) && \text{re-profiled "
+            r"at the new } q\\"
+            r"\text{(v)}\quad & \mathcal{S}^{*} = \arg\min_{\mathcal{S}}"
+            r"\mathrm{CV}(\mathcal{S}) && \text{support, on held-out error}"
+            r"\end{aligned}"
+        )
+        st.caption(
+            "Steps (ii) to (iv) are one descent, not a pipeline: the "
+            "confinement exponent q multiplies every basis function, so "
+            "changepoints estimated at the wrong q are estimated on the "
+            "wrong design, and q measured at the wrong changepoints absorbs "
+            "the mismatch. Each candidate arrangement carries its own q "
+            "through the comparison for the same reason, which is also what "
+            "stops the answer depending on which candidate was fitted "
+            "first. S is non-increasing along the sequence and each block "
+            "is solved to its exact optimum, so the descent terminates; in "
+            "practice three passes move χ²/dof by less than the "
+            "fold-to-fold spread. Every quantity that is not solved exactly "
+            "is profiled on a closed interval, so nothing here can diverge "
+            "or fail to converge."
         )
 
         st.markdown("**1 · Conditional linearity of the constitutive model**")
@@ -6559,9 +6825,13 @@ with tab_analysis:
             )
             chosen = active_terms()
 
-            # Where the boundaries come from, at the end of the choices and
-            # before the button that uses them.
-            find_boundaries_control(model, guided_lo, guided_hi, chosen)
+            # The element search sits with the elements, because the boxes
+            # it ticks are right above it.
+            find_elements_control(model, guided_lo, guided_hi, chosen)
+
+            # Then the optimisation: the boundaries, inside the band the
+            # cell type is known to put them in.
+            optimisation_controls(model, guided_lo, guided_hi, chosen)
 
             # ------------------------------------------------- 2 · fit ---
             st.markdown("#### 2 · Fit")
@@ -6669,6 +6939,11 @@ with tab_analysis:
                 "Every one of these was chosen by the fit. Open it only to "
                 "overrule that, and the page refits with what you choose."
             )
+            # The unconstrained placement search lives here rather than on
+            # the page: it rewrites every range at once and ignores what is
+            # known about the cell type, which is the right tool rarely and
+            # a surprise often.
+            free_placement_control(model, guided_lo, guided_hi, active_terms())
 
         if not guided:
             st.divider()
