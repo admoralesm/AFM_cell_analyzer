@@ -998,48 +998,6 @@ def case_fit_line_and_heights_toggle():
           all("N" in (t or "") for t in texts), str(texts))
 
 
-def case_range_table_shows_zero_moduli():
-    print("each range lists the moduli active there, zero where not reached")
-    app = start()
-    if not no_exception(app, "range table"):
-        return
-    # A full-control diagnostic: too much to meet on the way to a number,
-    # but still the honest answer to "who was carrying what, where".
-    app = start(ui_mode="Full control · every setting")
-    if not no_exception(app, "range table"):
-        return
-    target = table_with(app, "range", "membrane")
-    check("the range table is on the page in full control", target is not None)
-    if target is None:
-        return
-    # One stiffness column per material the cell type is fitted with,
-    # headed by that material's own symbol and name.
-    import app as app_module
-    here = app_module.terms_for("Myoblast (C2C12)")
-    columns = {
-        term: f"{app_module.TERM_SYMBOLS[term]} "
-              f"{app_module.plain_name(term, 'Myoblast (C2C12)').lower()}"
-        for term in here
-    }
-    for term, column in columns.items():
-        check(f"{term} has a stiffness column", column in target.columns,
-              str(list(target.columns)))
-    if not set(columns.values()) <= set(target.columns):
-        return
-    first = target.iloc[0]
-    check("the first range carries only the membrane",
-          all(first[columns[term]].startswith("0")
-              for term in here if term != "membrane"),
-          str({t: first[columns[t]] for t in here}))
-    check("and the membrane is non-zero there",
-          not first[columns["membrane"]].startswith("0 "),
-          str(first[columns["membrane"]]))
-    last = target.iloc[-1]
-    check("the last range carries what is inside the nucleus",
-          not last[columns["nucleus"]].startswith("0 "),
-          str(last[columns["nucleus"]]))
-
-
 def case_plot_options_are_under_the_plot():
     print("the plot switches are next to the plot, not buried in the sidebar")
     app = start(cell_name="cell-01")
@@ -1413,18 +1371,24 @@ def case_cardiomyocyte_model_is_flagged_provisional():
           "send me" in warnings.lower(), warnings[:200])
 
 
-def case_not_reached_is_explained():
-    print("“not reached yet” is spelled out")
-    # It appears with the range-by-range table, which is a full-control
-    # diagnostic rather than something to meet on the way to a number.
-    app = start(cell_name="cell-01", ui_mode="Full control · every setting")
-    if not no_exception(app, "range wording"):
+def case_a_zero_modulus_is_a_measurement():
+    print("a modulus that came back at zero says so, and says what it means")
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "a zero modulus"):
         return
-    captions = " ".join(str(c.value) for c in app.get("caption"))
-    check("the wording is explained",
-          "not reached" in captions, captions[-300:])
-    check("and says a zero there is a real zero, not a gap",
-          "contributes exactly zero" in captions, captions[:200])
+    # The range-by-range table that used to explain "not reached" is gone.
+    # What has to survive it is the point that table was making: a term the
+    # fit gave nothing to is a measurement, not a missing number.
+    app.session_state["use_nucleus_shell"] = False
+    app.run()
+    if not no_exception(app, "a component left out"):
+        return
+    notes = " ".join(str(m.delta or "") for m in app.get("metric"))
+    check("a component left out of the model is named as left out",
+          "not in this model" in notes, notes[:300])
+    check("rather than reading as a measured zero",
+          any("0" in str(m.value) for m in app.get("metric")),
+          str([m.value for m in app.get("metric")][:6]))
 
 
 def case_fit_statistics():
@@ -5031,8 +4995,8 @@ def case_the_controls_sit_above_the_curve():
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
           > source.index('st.markdown("#### Fitting results")'))
-    check("and the one-block summary comes after it",
-          source.index("final_summary(fit, model, date_acquired)")
+    check("and the power law after that",
+          source.index('st.markdown("##### What the power law says")')
           > source.index('st.markdown("##### The equation that was fitted")'))
 
     app = start(cell_name="cell-01")
@@ -5040,7 +5004,7 @@ def case_the_controls_sit_above_the_curve():
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
     for wanted in ("Fitting results", "The equation that was fitted",
-                   "In one block"):
+                   "What the power law says"):
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
     check("the settings are behind one line, not three",
@@ -5145,19 +5109,20 @@ def case_the_range_carries_its_own_maths():
 
 
 def case_the_page_ends_with_the_answer():
-    print("the last thing on the page is the answer, ready to be quoted")
+    print("the answer is on the page once, not repeated at the foot")
     app = start(cell_name="cell-01")
-    if not no_exception(app, "the final summary"):
+    if not no_exception(app, "the results"):
         return
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("there is a one-block summary", "In one block" in text)
-    check("naming the cell", "cell-01" in text, text[-400:])
-    check("with the range it was fitted over", "Fitted over ε" in text,
-          text[-400:])
-    check("and the fit quality", "R² =" in text, text[-300:])
-    code = " ".join(str(getattr(c, "value", "")) for c in app.get("code"))
-    check("and one line that can be pasted into a lab book",
-          "cell-01" in code and "R2=" in code, code[-300:])
+    text = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("caption")))
+    check("the block that repeated it all is gone", "In one block" not in text)
+    check("the range it was fitted over is still said once",
+          "Fitted over ε" in text, text[:400])
+    labels = [str(m.label or "") for m in app.get("metric")]
+    check("and every modulus is in the metrics row",
+          any("Eₘ" in lab for lab in labels), str(labels[:6]))
+    check("with the fit quality beside them",
+          any("R²" in lab for lab in labels), str(labels[:8]))
 
 
 def case_a_companion_file_is_found_wherever_it_sits():
@@ -5434,17 +5399,16 @@ def case_the_ranges_follow_the_fit():
 
     # And once they are yours, a fit no longer moves them - but the page
     # says so and offers to put them back.
-    app.session_state["use_element_windows"] = True
-    app.run()
     app.session_state["element_window_interior"] = (0.05, 0.30)
+    app.session_state["_window_touched_interior"] = True
     app.run()
-    if not no_exception(app, "own windows drifting from the fit"):
+    if not no_exception(app, "a range moved by hand"):
         return
     said = " ".join(str(c.value) for c in app.get("caption"))
-    check("it says the ranges are no longer following the fit",
-          "yours now" in said, said[-300:])
-    check("and offers to put them back",
-          button_by_label(app, "Put them back where the fit wants them")
+    check("it says that range no longer follows the boundaries",
+          "Moved by hand" in said, said[-300:])
+    check("and offers to put it back",
+          button_by_label(app, "Put them back on the boundaries")
           is not None, str([b.label for b in app.button][:14]))
 
 
@@ -5503,18 +5467,18 @@ def case_each_element_gets_its_own_bar():
     app = start(cell_name="cell-01")
     if not no_exception(app, "before the element windows"):
         return
-    check("the per-element ranges are off unless asked for",
-          state(app, "use_element_windows") is False,
-          str(state(app, "use_element_windows")))
+    check("there is no switch to choose between the ranges and the "
+          "boundaries, because they are the same numbers",
+          not any("Set the ranges myself" in (c.label or "")
+                  for c in app.checkbox),
+          str([c.label for c in app.checkbox][:8]))
     fit = state(app, "_last_fit")
-    check("so the fit is made without them",
-          fit is not None and fit.get("term_windows") is None,
+    check("the fit is made with each component on its own range",
+          fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
-
-    app.session_state["use_element_windows"] = True
-    app.run()
-    if not no_exception(app, "element windows on"):
-        return
+    check("and those ranges are the boundaries, until one is moved",
+          abs(fit["term_windows"]["membrane"][1] - float(fit["break_1"])) < 1e-6,
+          f"{fit['term_windows']['membrane']} against ε₁ = {fit['break_1']:.3f}")
     terms = [t for t in ("membrane", "interior", "nucleus", "nucleus_shell")
              if state(app, f"use_{t}")]
     bars = [s for s in app.slider if (s.label or "").startswith("acts over ε")]
@@ -5536,7 +5500,7 @@ def case_each_element_gets_its_own_bar():
               str(others))
 
     fit = state(app, "_last_fit")
-    check("the fit is now made with each element on its own range",
+    check("moving one keeps it",
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
@@ -5653,7 +5617,11 @@ def case_the_fixed_tick_locks_out_the_other_materials():
         return
     check("unticking it brings the membrane back",
           app.session_state["use_membrane"])
-    check("and the deep element", app.session_state["use_nucleus"])
+    check("and the deep element",
+          app.session_state["use_nucleus"]
+          or app.session_state["use_nucleus_shell"],
+          f"{app.session_state['use_nucleus']} / "
+          f"{app.session_state['use_nucleus_shell']}")
 
 
 class _StubSheet:
@@ -6185,7 +6153,7 @@ if __name__ == "__main__":
         case_nucleus_spring_is_shorter,
         case_component_names_follow_the_cell_type,
         case_cardiomyocyte_model_is_flagged_provisional,
-        case_not_reached_is_explained,
+        case_a_zero_modulus_is_a_measurement,
         case_plain_language_helpers,
         case_guided_mode_is_the_default,
         case_full_control_shows_everything,
@@ -6196,7 +6164,6 @@ if __name__ == "__main__":
         case_sheet_row_matches_the_header,
         case_sheet_reorder_keeps_the_data,
         case_fit_line_and_heights_toggle,
-        case_range_table_shows_zero_moduli,
         case_all_three_moduli_always_reported,
         case_load_share_table,
         case_download_when_box_is_absent,
