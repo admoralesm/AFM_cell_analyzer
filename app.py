@@ -1437,7 +1437,7 @@ def settings_from_hypothesis(winner, epsilon_max=None, q=None):
 
 
 def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
-                  n_grid=8, cv_repeats=2, passes=2):
+                  n_grid=8, cv_repeats=2, passes=2, band_1=None, band_2=None):
     """
     The one fitting routine. Everything that fits a curve comes through here.
 
@@ -1466,14 +1466,15 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
     # The deep boundary is searched inside the band this cell type is known
     # to put it in, so the fit button and the refine button cannot disagree
     # about where a nucleus can be met.
-    band_2 = deep_onset_band(st.session_state.get("cell_type"), lo, hi)
-    if band_2 == (float(lo), float(hi)):
-        band_2 = None
+    if band_2 is None:
+        band_2 = deep_onset_band(st.session_state.get("cell_type"), lo, hi)
+        if band_2 == (float(lo), float(hi)):
+            band_2 = None
     try:
         chosen = compare_hypotheses(
             model, lo, hi, picks, weighting=weighting, cv_repeats=cv_repeats,
             n_grid=n_grid, refine_rounds=max(1, int(passes) - 1),
-            scan_q=bool(measure_q), band_2=band_2,
+            scan_q=bool(measure_q), band_1=band_1, band_2=band_2,
         )
     except Exception:  # pragma: no cover - defensive
         return out
@@ -1522,7 +1523,7 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
                     # one the page then fits at them.
                     use_nucleus_shell="nucleus_shell" in best["terms"],
                     use_cortex="cortex" in best["terms"],
-                    band_2=band_2,
+                    band_1=band_1, band_2=band_2,
                 )
                 if refit and refit.get("success"):
                     e1, e2 = float(refit["break_1"]), float(refit["break_2"])
@@ -3712,6 +3713,39 @@ def default_boundaries(cell_type=None):
     }))
 
 
+# Session keys that are not settings and must never be carried through a
+# rerun by hand: the data, the fit, the connections and the caches.
+NOT_A_SETTING = (
+    "data", "results", "gs_manager", "onedrive_store", "_last_fit",
+    "_last_fit_signature", "_plot_png", "video_path", "video_info",
+    "video_track", "video_saved_frame", "exploration", "composition_search",
+    "arrangement_search", "component_search", "confinement_scan",
+    "hypothesis_search", "boundary_search", "element_window_search",
+)
+
+
+def rerun_keeping_settings(extra=None):
+    """
+    Rerun, and carry every setting on the page through it.
+
+    Streamlit forgets a widget's value when a run ends without drawing that
+    widget. Half of this page's settings live in a sidebar panel built after
+    the analysis, so a button that reruns from inside the analysis ended the
+    run before they were drawn and they reverted -- which is how pressing a
+    button in step 1 silently changed the arrangement in step 3. Writing
+    them into the pending block re-asserts them at the top of the next run,
+    before any widget exists, which is the only place Streamlit allows it.
+    """
+    pending = {
+        key: st.session_state[key]
+        for key in DEFAULTS
+        if key in st.session_state and key not in NOT_A_SETTING
+    }
+    pending.update(extra or {})
+    st.session_state["_pending_settings"] = pending
+    st.rerun()
+
+
 def apply_cell_type(name):
     """Copy a cell type's defaults into the settings."""
     preset = CELL_TYPES.get(name)
@@ -3997,12 +4031,11 @@ def suggested_range_note(lo, hi):
     with right:
         if st.button("↺ Back to the suggested range",
                      key="restore_suggested_range", **STRETCH):
-            st.session_state["_pending_settings"] = {
+            rerun_keeping_settings({
                 "window_start": start,
                 "window_end": end,
                 "window_combined": (start, end),
-            }
-            st.rerun()
+            })
 
 
 def epsilon_range_control(lo_key, hi_key, floor, ceiling, step,
@@ -4252,13 +4285,12 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
             )
             if st.button("↺ Put them back on the boundaries",
                          key="reset_element_windows", **STRETCH):
-                st.session_state["_pending_settings"] = {
-                    element_window_key(term): window
-                    for term, window in automatic.items()
-                }
                 for term in terms:
                     st.session_state.pop(f"_window_touched_{term}", None)
-                st.rerun()
+                rerun_keeping_settings({
+                    element_window_key(term): window
+                    for term, window in automatic.items()
+                })
     if not drifted:
         st.caption(
             "A range is where a component takes on load: it starts at the "
@@ -4281,34 +4313,75 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
     return element_windows(active_terms(), lo, hi)
 
 
-def find_elements_control(model, lo, hi, terms):
+def fit_at_the_current_settings(model, lo, hi, terms):
     """
-    Which elements the curve can resolve, asked where the elements are.
+    Fit the curve as the page has it set, and move nothing.
 
-    Support recovery belongs next to the tick boxes it writes to. It used to
-    sit in a panel of its own further down, which put a button that clears
-    a checkbox out of sight of the checkbox it clears.
+    The page refits on every pass, so what this adds is the deliberate act
+    and the confinement: q is a fitted quantity, not a boundary, and it is
+    measured here at the boundaries already on screen rather than at
+    boundaries this button chose for itself.
     """
-    e1_now = float(st.session_state["segment_break_1"])
-    e2_now = float(st.session_state["segment_break_2"])
-    pressed = st.button(
-        "🧬 Find the elements", key="find_elements_button",
-        disabled=recommend_components is None or not terms, **STRETCH,
-    )
-    st.caption(
-        "Which of these the curve can actually resolve, judged at the "
-        f"boundaries as they stand (ε₁ = {e1_now:.3f}, ε₂ = {e2_now:.3f}). "
-        "Every subset is refitted and the one kept is the one that best "
-        "predicts points it was not fitted to. Ticks the answer."
-    )
-    if not pressed:
+    if not terms:
         return
-    applied = search_the_mixture(model, lo, hi, e1_now, e2_now)
-    found = st.session_state.get("component_search") or {}
-    if found.get("success"):
-        st.session_state["_pending_settings"] = applied
-        st.rerun()
-    st.error(found.get("error", "The element search found nothing."))
+    if wants_confinement() and hasattr(model, "scan_confinement"):
+        with st.spinner("Measuring the confinement at these boundaries…"):
+            try:
+                scan = model.scan_confinement(
+                    lo, hi,
+                    e1=float(st.session_state["segment_break_1"]),
+                    e2=float(st.session_state["segment_break_2"]),
+                    membrane=MEMBRANE_CHOICES.get(
+                        st.session_state["membrane_after_break"], "freeze"),
+                    cyto_start=CYTO_CHOICES.get(
+                        st.session_state["cyto_starts_at"], "break"),
+                    use_nucleus="nucleus" in terms,
+                    use_tension="tension" in terms,
+                    use_nucleus_shell="nucleus_shell" in terms,
+                    use_cortex="cortex" in terms,
+                    weighting=st.session_state["weighting"],
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                scan = {"success": False, "error": str(exc)}
+        if scan.get("success"):
+            st.session_state["confinement_scan"] = scan
+            st.session_state["_fitted_on_purpose"] = True
+            rerun_keeping_settings({"confinement": round(float(scan["q"]), 2)})
+    st.session_state["_fitted_on_purpose"] = True
+    rerun_keeping_settings()
+
+
+def fit_verdict():
+    """What the fit on screen came to, at the settings it was given."""
+    fit = st.session_state.get("_last_fit")
+    if not (fit and fit.get("success")):
+        st.caption(
+            "Press it and the answer appears here, with the fitted curve "
+            "below."
+        )
+        return
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    where = []
+    if fit.get("break_1") is not None:
+        where.append(f"ε₁ = {float(fit['break_1']):.3f}")
+    if fit.get("break_2") is not None:
+        where.append(f"ε₂ = {float(fit['break_2']):.3f}")
+    said = (
+        f"**R² = {fit.get('r_squared', float('nan')):.5f}**"
+        + (f", χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
+        + " at " + (", ".join(where) if where else "the range shown")
+        + f", over ε {float(fit['epsilon_range'][0]):.3f} to "
+        f"{float(fit['epsilon_range'][1]):.3f}."
+    )
+    if np.isfinite(chi) and chi > 10:
+        st.info(
+            said + " χ²/dof well above 1 means the model is missing "
+            "something real here, not that the numbers are noisy. Try the "
+            "optimisation buttons, or a different arrangement in the "
+            "settings."
+        )
+    else:
+        st.success(said)
 
 
 def boundary_grid(band, n):
@@ -4361,10 +4434,24 @@ def refine_boundaries_control(model, lo, hi, terms):
     e1_now = float(st.session_state["segment_break_1"])
     e2_now = float(st.session_state["segment_break_2"])
 
+    span = max(float(hi) - float(lo), 1e-6)
     deep = [t for t in terms if t in ("nucleus", "nucleus_shell")]
-    band2 = deep_onset_band(cell_type, lo, hi) if deep else (e2_now, e2_now)
+    declared = deep_onset_band(cell_type, lo, hi)
+    if not deep:
+        # No deep element in the model: ε₂ is not in the design at all, so
+        # every value of it gives the same fit.
+        band2 = (e2_now, e2_now)
+    elif declared != (float(lo), float(hi)):
+        band2 = declared
+    else:
+        # Nothing declared for this cell type, so the deep onset is looked
+        # for over the stretch of the curve where one could be met at all.
+        band2 = (lo + 0.30 * span, lo + 0.92 * span)
     free1 = epsilon_1_is_free(terms, membrane, cyto_start)
-    band1 = (max(lo, 0.02), min(band2[0], hi) - 0.02) if free1         else (e1_now, e1_now)
+    band1 = (
+        (lo + 0.06 * span, min(lo + 0.50 * span, band2[1] - 0.02 * span))
+        if free1 else (e1_now, e1_now)
+    )
     if band1[1] <= band1[0]:
         band1 = (e1_now, e1_now)
 
@@ -4375,50 +4462,85 @@ def refine_boundaries_control(model, lo, hi, terms):
         moving.append(f"ε₂ within {band2[0]:.2f} to {band2[1]:.2f}")
 
     pressed = st.button(
-        "📐 Refine the boundaries, inside what is known",
+        "📐 Optimise the boundaries",
         key="refine_boundaries_button", type="primary",
-        disabled=not moving, **STRETCH,
+        disabled=not terms, **STRETCH,
     )
     st.caption(
         (("Boundaries found from the curve rather than assumed: profiles "
-          + " and ".join(moving) + ". ") if moving else
-         "Nothing to refine: with these elements every boundary is fixed "
-         "by the arrangement. ")
+          + " and ".join(moving) + ", ") if moving else
+         "Profiles the boundaries, ")
+        + "and settles which element takes over where. "
         + (prior.get("why", "").capitalize() + ", so the search moves each "
-           "boundary a little inside that band rather than across the "
-           "curve. " if prior.get("why") else "")
-        + "Ranges you moved by hand are left alone."
+           "boundary inside that band rather than across the curve, and "
+           "where two hand-overs fit equally well it keeps the one this "
+           "cell type is known to take. " if prior.get("why") else "")
+        + "The components ticked above are not touched. Ranges you moved by "
+        "hand are left alone."
     )
 
     if not pressed:
         return
 
     fixed = {t for t in terms if st.session_state.get(f"_window_touched_{t}")}
-    with st.spinner("Profiling the residual over the allowed boundaries…"):
-        found = profile_boundaries(
-            model, lo, hi, terms, band1, band2, membrane, cyto_start,
+    picks = hypotheses_for(cell_type, terms=terms, exact=True)
+    with st.spinner("Profiling the residual over the allowed boundaries, "
+                    "and scoring each hand-over on points it was not fitted "
+                    "to…"):
+        outcome = analyse_curve(
+            model, lo, hi, picks,
+            weighting=st.session_state["weighting"],
+            measure_q=wants_confinement(),
+            terms_hint=terms,
+            n_grid=12, cv_repeats=3, passes=3,
+            band_1=band1 if band1[1] > band1[0] else None,
+            band_2=band2 if band2[1] > band2[0] else None,
         )
-    st.session_state["boundary_search"] = found
+    found = outcome["hypotheses"]
     st.session_state["_last_search"] = "boundaries"
-    if found.get("success"):
-        st.session_state["_pending_settings"] = {
-            "segment_break_1": round(float(found["best_break_1"]), 3),
-            "segment_break_2": round(float(found["best_break_2"]), 3),
-        }
-        if fixed:
-            st.session_state["_boundaries_left_alone"] = sorted(fixed)
-        st.rerun()
-    st.error(found.get("error", "No boundary in the allowed band fitted."))
+    if not (found and found.get("success")):
+        st.error("No boundary in the allowed band fitted this curve.")
+        return
+    st.session_state["hypothesis_search"] = found
+    if outcome["q_scan"] is not None:
+        st.session_state["confinement_scan"] = outcome["q_scan"]
+    pending = settings_from_hypothesis(found["best"], q=outcome["q"])
+    if fixed:
+        st.session_state["_boundaries_left_alone"] = sorted(fixed)
+    rerun_keeping_settings(pending)
+
+
+def _scan_q_at(model, lo, hi, terms, e1, e2, membrane, cyto_start):
+    """The confinement exponent that fits best at one pair of boundaries."""
+    try:
+        return model.scan_confinement(
+            lo, hi, e1=float(e1), e2=float(e2),
+            membrane=membrane, cyto_start=cyto_start,
+            use_nucleus="nucleus" in terms,
+            use_tension="tension" in terms,
+            use_nucleus_shell="nucleus_shell" in terms,
+            use_cortex="cortex" in terms,
+            weighting=st.session_state["weighting"],
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def profile_boundaries(model, lo, hi, terms, band1, band2,
-                       membrane="freeze", cyto_start="break", n=13):
+                       membrane="freeze", cyto_start="break", n=13, rounds=2):
     """
     The residual surface over the allowed boundary pairs, and its minimum.
 
     One exact bounded least-squares solve per node, which is what makes an
     exhaustive profile affordable and removes every question of starting
     values: there is nothing to start from.
+
+    A single grid can only ever land on its own points, and half a step on
+    a 13-point grid is enough to move a modulus, so the coarse pass is
+    followed by refinement rounds that re-grid inside one step either side
+    of the incumbent, staying inside the allowed band. Two rounds narrow
+    each boundary by about 25 times for a fraction of the cost of a fine
+    grid over the whole band.
     """
     flags = {
         "use_membrane": "membrane" in terms,
@@ -4429,26 +4551,44 @@ def profile_boundaries(model, lo, hi, terms, band1, band2,
         "use_cortex": "cortex" in terms,
     }
     trials, best = [], None
-    for e1 in boundary_grid(band1, n):
-        for e2 in boundary_grid(band2, n):
-            if float(e2) <= float(e1):
-                continue
-            try:
-                got = model.fit_composition(
-                    lo, hi, float(e1), float(e2), membrane, cyto_start,
-                    weighting=st.session_state["weighting"],
-                    fit_offset=st.session_state["fit_offset"], **flags
-                )
-            except Exception:  # pragma: no cover - defensive
-                continue
-            if not got.get("success"):
-                continue
-            trials.append({
-                "e1": float(e1), "e2": float(e2),
-                "r_squared": float(got["r_squared"]),
-            })
-            if best is None or got["r_squared"] > best["r_squared"]:
-                best = got
+    first, second = boundary_grid(band1, n), boundary_grid(band2, n)
+    for round_index in range(int(rounds) + 1):
+        for e1 in first:
+            for e2 in second:
+                if float(e2) <= float(e1):
+                    continue
+                try:
+                    got = model.fit_composition(
+                        lo, hi, float(e1), float(e2), membrane, cyto_start,
+                        weighting=st.session_state["weighting"],
+                        fit_offset=st.session_state["fit_offset"], **flags
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    continue
+                if not got.get("success"):
+                    continue
+                trials.append({
+                    "e1": float(e1), "e2": float(e2),
+                    "r_squared": float(got["r_squared"]),
+                })
+                if best is None or got["r_squared"] > best["r_squared"]:
+                    best = got
+        if best is None or round_index == int(rounds):
+            break
+        # Re-grid inside one step either side of the winner, clipped to the
+        # band: the prior is not relaxed by refining.
+        def _around(grid, centre, band):
+            if grid.size < 2:
+                return grid
+            step = (grid[-1] - grid[0]) / max(grid.size - 1, 1)
+            low = max(float(band[0]), float(centre) - step)
+            high = min(float(band[1]), float(centre) + step)
+            if high - low < 1e-9:
+                return np.array([float(np.clip(centre, band[0], band[1]))])
+            return np.linspace(low, high, max(5, int(n) // 2))
+
+        first = _around(first, best["break_1"], band1)
+        second = _around(second, best["break_2"], band2)
     if best is None:
         return {"success": False,
                 "error": "No usable fit anywhere in the allowed band."}
@@ -4512,8 +4652,7 @@ def free_placement_control(model, lo, hi, terms):
         pending.update({
             f"_window_touched_{term}": True for term in found["windows"]
         })
-        st.session_state["_pending_settings"] = pending
-        st.rerun()
+        rerun_keeping_settings(pending)
     st.error(found.get("error", "The placement search failed."))
 
 
@@ -4541,97 +4680,51 @@ def _term_symbol(term):
     return EQUATION_TERMS.get(term, (None, None, None, term))[3]
 
 
-def _subset_latex(terms):
-    """A combination of elements as a set of moduli."""
-    return r"\{" + r",\,".join(_term_symbol(t) for t in terms) + r"\}"
-
-
 def search_results_as_equations():
     """
     What the last search decided, written as the arithmetic it decided on.
 
-    A table of combinations invited the reader to compare them by eye, which
-    is exactly the comparison the cross-validation was run to replace. The
-    numbers that settled it are three: the generalisation error of each
-    candidate, the tie tolerance, and the gap between the best two.
+    A table invited the reader to compare the candidates by eye, which is
+    exactly the comparison the arithmetic was run to replace. What settled
+    it is the residual at the nodes that were tried, so that is what is
+    printed.
     """
     which = st.session_state.get("_last_search")
-    if which == "elements":
-        found = st.session_state.get("component_search")
+    if which == "boundaries":
+        found = st.session_state.get("hypothesis_search")
         if not (found and found.get("success")):
             return
         rows = sorted(found["candidates"], key=lambda r: r["cv_rmse"])
         best = found["best"]
-        tau = float(found["tie_tolerance"])
+        tau = float(found.get("tie_tolerance", float("nan")))
         lines = []
-        for row in rows[:6]:
+        for row in rows[:5]:
             mark = ""
-            if row["terms"] == best["terms"]:
-                mark = r"&& \leftarrow \text{retained}"
+            if row is best or row.get("chosen"):
+                mark = r"&& \leftarrow \text{kept}"
             elif row.get("tied_with_best"):
                 mark = r"&& \text{(within } \tau \text{)}"
             lines.append(
-                r"\mathrm{CV}\bigl(" + _subset_latex(row["terms"]) + r"\bigr) &= "
+                r"\mathrm{CV}(\varepsilon_1=" + f"{row['break_1']:.3f}"
+                + r",\,\varepsilon_2=" + f"{row['break_2']:.3f}" + r") &= "
                 + _sci_latex(row["cv_rmse"]) + r"\ \mathrm{N}" + mark
             )
         st.latex(r"\begin{aligned}" + r"\\".join(lines) + r"\end{aligned}")
-        gap = None
-        others = [r for r in rows if r["terms"] != best["terms"]]
-        if others:
-            gap = min(r["cv_rmse"] for r in others) - best["cv_rmse"]
-        st.latex(
-            r"\tau = " + _sci_latex(tau) + r"\ \mathrm{N}"
-            + (r", \qquad \Delta\mathrm{CV} = " + _sci_latex(abs(gap))
-               + r"\ \mathrm{N}" + (r" > \tau" if gap is not None
-                                    and abs(gap) > tau else r" < \tau")
-               if gap is not None else "")
-        )
-        dropped = found.get("dropped") or ()
+        if np.isfinite(tau):
+            st.latex(r"\tau = " + _sci_latex(tau) + r"\ \mathrm{N}")
         st.caption(
-            "Retained: "
-            + ", ".join(plain_name(t).lower() for t in best["terms"])
-            + (". Dropped: "
-               + ", ".join(plain_name(t).lower() for t in dropped)
-               + ", whose basis functions carry no variance the retained set "
-                 "cannot already account for."
-               if dropped else ", the whole set being separable here.")
-            + (" The gap clears the tolerance, so the selection is decided "
-               "on generalisation error alone."
-               if found.get("clear_cut") else
-               " The gap is inside the tolerance, so parsimony broke the "
-               "tie: the smaller model is the one whose moduli will "
-               "reproduce between cells.")
-        )
-        return
-
-    if which == "boundaries":
-        found = st.session_state.get("boundary_search")
-        if not (found and found.get("success")):
-            return
-        trials = sorted(found.get("trials") or [],
-                        key=lambda t: -t["r_squared"])[:5]
-        if not trials:
-            return
-        lines = []
-        for i, trial in enumerate(trials):
-            residual = max(1.0 - float(trial["r_squared"]), 0.0)
-            lines.append(
-                r"\tilde{S}(" + f"{trial['e1']:.3f}" + r",\,"
-                + f"{trial['e2']:.3f}" + r") &= " + _sci_latex(residual)
-                + (r"&& \leftarrow \text{minimum}" if i == 0 else "")
-            )
-        st.latex(r"\begin{aligned}" + r"\\".join(lines) + r"\end{aligned}")
-        st.latex(
-            r"\tilde{S} = \frac{\min_{\theta\ge0}\lVert W(F-X\theta)"
-            r"\rVert^{2}}{\lVert W(F-\bar{F})\rVert^{2}} = 1 - R^{2}"
-        )
-        st.caption(
-            f"The grid minimum sits at ε₁ = {float(found['best_break_1']):.3f}, "
-            f"ε₂ = {float(found['best_break_2']):.3f}. S̃ is the weighted "
-            "residual normalised by the total sum of squares, so it is "
-            "comparable between curves; the moduli at each grid point are "
-            "the exact bounded least-squares solution there, which is why "
-            "the surface can be profiled rather than descended."
+            f"Kept: ε₁ = {float(best['break_1']):.3f}, "
+            f"ε₂ = {float(best['break_2']):.3f}"
+            + (f", q = {float(best['confinement']):.2f}"
+               if np.isfinite(best.get("confinement", float("nan"))) else "")
+            + f" · {best['label'].lower()}. Each row is one hand-over "
+            "profiled over the allowed boundary grid at its own confinement, "
+            "then scored on points it was not fitted to; the moduli at every "
+            "node are the exact bounded least-squares solution there, which "
+            "is what makes an exhaustive profile affordable."
+            + ("" if found.get("clear_cut") else
+               " The best two are inside τ, so this curve cannot separate "
+               "them and what the cell type is known to do broke the tie.")
         )
         return
 
@@ -4657,53 +4750,6 @@ def search_results_as_equations():
             "step in it. The placement was scored on held-out points, the "
             "same criterion as the element search."
         )
-
-
-def search_the_mixture(model, lo, hi, e1, e2):
-    """
-    Which components the curve can actually see, at the boundaries just found.
-
-    Every subset of this cell type's components is fitted at the same
-    boundaries, on the same folds, and scored on points it was not fitted
-    to. Adding a term can only lower the residual on the points it was
-    fitted to, so the residual, R² and χ² cannot answer "is this component
-    real"; held-out error can, and that is the whole reason this is a
-    separate search rather than a glance at the fit.
-
-    Returns widget values for the caller to stage, and leaves the full
-    comparison in session state so the page can show its working.
-    """
-    if recommend_components is None:
-        return {}
-    try:
-        with st.spinner("Fitting every combination of components and scoring "
-                        "each on points it was not fitted to…"):
-            found = recommend_components(
-                model, lo, hi,
-                candidates=terms_for(st.session_state["cell_type"]),
-                e1=float(e1), e2=float(e2),
-                membrane=MEMBRANE_CHOICES.get(
-                    st.session_state["membrane_after_break"], "freeze"),
-                cyto_start=CYTO_CHOICES.get(
-                    st.session_state["cyto_starts_at"], "break"),
-                weighting=st.session_state["weighting"],
-                cv_repeats=3,
-            )
-    except Exception as exc:  # pragma: no cover - defensive
-        found = {"success": False, "error": str(exc)}
-    st.session_state["component_search"] = found
-    st.session_state["_last_search"] = "elements"
-    if not found.get("success"):
-        return {}
-    wanted = set(found["recommended"])
-    # Never everything off: a mixture of nothing is not a model, and the
-    # search returning it would leave the page with no fit at all.
-    if not wanted:
-        return {}
-    return {
-        f"use_{term}": term in wanted
-        for term in terms_for(st.session_state["cell_type"])
-    }
 
 
 def why_this_search(model=None):
@@ -4877,7 +4923,9 @@ def why_this_search(model=None):
         )
         st.caption(
             "Every 𝒮 ⊆ 𝒞 is refitted on each training partition at the same "
-            "changepoints and evaluated on the held-out fold. K = 5, R = 3 "
+            "changepoints and evaluated on the fold it never saw: the "
+            "criterion is how well a model predicts points it was not "
+            "fitted to. K = 5, R = 3 "
             "independent permutations, because the fold-to-fold variance on "
             "a few hundred correlated samples is itself large enough to "
             "reorder candidates that are not distinguishable."
@@ -4985,12 +5033,9 @@ def set_default_boundaries_control():
                 store = dict(st.session_state.get("learned_boundaries", {}))
                 store.pop(cell_type, None)
                 st.session_state["learned_boundaries"] = store
-                st.session_state["_pending_settings"] = default_boundaries(
-                    cell_type
-                )
                 for term in ALL_TERMS:
                     st.session_state.pop(f"_window_touched_{term}", None)
-                st.rerun()
+                rerun_keeping_settings(default_boundaries(cell_type))
         if not saved:
             return
         if second <= first:
@@ -5002,14 +5047,13 @@ def set_default_boundaries_control():
             "spread_1": None, "spread_2": None,
         }
         st.session_state["learned_boundaries"] = store
-        st.session_state["_pending_settings"] = {
-            "segment_break_1": round(float(first), 3),
-            "segment_break_2": round(float(second), 3),
-        }
         # Setting a default means the ranges should follow it again.
         for term in ALL_TERMS:
             st.session_state.pop(f"_window_touched_{term}", None)
-        st.rerun()
+        rerun_keeping_settings({
+            "segment_break_1": round(float(first), 3),
+            "segment_break_2": round(float(second), 3),
+        })
 
 
 def element_window_controls(terms, lo, hi, step, e1, e2, membrane="freeze",
@@ -6801,12 +6845,13 @@ with tab_analysis:
             )
             chosen = active_terms()
 
-            # The element search sits with the elements, because the boxes
-            # it ticks are right above it.
-            find_elements_control(model, guided_lo, guided_hi, chosen)
+            # No element search. Which components are in the model is a
+            # decision about the cell, and the boxes above are where it is
+            # made; a button that cleared them on a cross-validation score
+            # was the app arguing with the person about their own sample.
 
-            # Then the optimisation: the boundaries, inside the band the
-            # cell type is known to put them in.
+            # The optimisation: the boundaries, inside the band the cell
+            # type is known to put them in.
             optimisation_controls(model, guided_lo, guided_hi, chosen)
 
             # ------------------------------------------------- 2 · fit ---
@@ -6817,64 +6862,22 @@ with tab_analysis:
                     "🔬 Fit this cell", type="primary",
                     disabled=not chosen, key="guided_fit", **STRETCH,
                 ):
-                    # Every candidate carries exactly the components that
-                    # are ticked, so this button decides the arrangement and
-                    # the boundaries and nothing else. It used to compare
-                    # pictures with different mixtures and write the winner's
-                    # back to the tick boxes, so pressing Fit cleared boxes
-                    # nobody had touched. Which components belong in the
-                    # model is its own question, with its own criterion, and
-                    # the search button above is where it is asked.
-                    picks_now = hypotheses_for(
-                        st.session_state["cell_type"], terms=chosen, exact=True,
+                    # Fits what is on screen, and changes nothing about it.
+                    # It used to compare arrangements and write the winner's
+                    # boundaries back, so pressing Fit moved ε₁ and ε₂ off
+                    # the numbers they had just been set to. Optimising the
+                    # boundaries is the other button's job, asked for on
+                    # purpose; fitting is fitting.
+                    fit_at_the_current_settings(
+                        model, guided_lo, guided_hi, chosen,
                     )
-                    with st.spinner("Measuring the confinement, then "
-                                    "comparing the pictures of this cell…"):
-                        # The same routine as on load, searched harder: a
-                        # finer boundary grid, more cross-validation repeats
-                        # and one more pass between q and the composition.
-                        outcome = analyse_curve(
-                            model, guided_lo, guided_hi, picks_now,
-                            weighting=st.session_state["weighting"],
-                            measure_q=wants_confinement(),
-                            terms_hint=chosen,
-                            n_grid=12, cv_repeats=3, passes=3,
-                        )
-                    found = outcome["hypotheses"]
-                    if outcome["q_scan"] is not None:
-                        st.session_state["confinement_scan"] = outcome["q_scan"]
-                    if found and found.get("success"):
-                        st.session_state["hypothesis_search"] = found
-                        pending = settings_from_hypothesis(
-                            found["best"], epsilon_max=guided_hi,
-                            q=outcome["q"],
-                        )
-                        pending["window_combined"] = (guided_lo, guided_hi)
-                        st.session_state["_pending_settings"] = pending
-                        st.rerun()
-                    else:
-                        st.error("Could not fit this curve. Widen the range.")
                 st.caption(
-                    "Fits exactly the components ticked above, over the "
-                    "range and boundaries shown: this cell type's defaults "
-                    "until you change them."
-                    + (" Where two arrangements fit equally well, the one "
-                       "this cell type is known to take is kept."
-                       if component_prior().get("throughout") else
-                       " The other button is what goes looking for a "
-                       "different answer.")
+                    "Fits exactly the components ticked above, at the "
+                    "boundaries and ranges shown. It does not move them: "
+                    "that is what the optimisation buttons are for."
                 )
             with verdict_col:
-                guess = st.session_state.get("hypothesis_search")
-                if guess and guess.get("success"):
-                    (st.success if guess["clear_cut"] else st.info)(
-                        retell(guess["verdict"])
-                    )
-                else:
-                    st.caption(
-                        "Press it and the answer appears here, with the "
-                        "fitted curve below."
-                    )
+                fit_verdict()
 
             # No picture picker and no table of pictures compared. The
             # search says in one line which picture the curve supports, and
