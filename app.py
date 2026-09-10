@@ -1331,6 +1331,69 @@ def fitted_equation(fit, unit="nN", heading=True):
     copy_the_results(fit, unit)
 
 
+def moduli_with_uncertainty(fit):
+    """
+    Every fitted modulus with its standard error, and where it was measured.
+
+    The ± is the diagonal of σ²(XᵀWX)⁻¹ at the fitted boundaries: how far
+    that modulus can move before the curve stops following the points, with
+    the others free to compensate. It is the number that decides whether two
+    cells differ, so it is given the same weight on the page as the modulus
+    itself rather than being tucked under it.
+    """
+    if not (fit and fit.get("success")):
+        return
+    here = terms_for(st.session_state.get("cell_type"))
+    fitted_terms = set(fit.get("terms") or ())
+    windows = fit.get("term_windows") or {}
+    rows = []
+    for term in ALL_TERMS:
+        if term not in here:
+            continue
+        key, unit_name, std_key = MODULUS_FIELDS[term]
+        used = term in fitted_terms
+        try:
+            value = float(fit.get(key, 0.0))
+        except (TypeError, ValueError):
+            value = float("nan")
+        try:
+            error = float(fit.get(std_key, float("nan")))
+        except (TypeError, ValueError):
+            error = float("nan")
+        window = windows.get(term)
+        rows.append({
+            "component": f"{TERM_SYMBOLS.get(term, term)} "
+                         f"{plain_name(term).lower()}",
+            f"modulus": ("not in this model" if not used
+                         else f"{value:.4g} {unit_name}"),
+            "± (standard error)": (
+                "—" if not used or not np.isfinite(error)
+                else f"± {error:.3g} {unit_name}"
+            ),
+            "± (%)": (
+                "—" if not used or not np.isfinite(error) or value == 0
+                else f"{abs(error / value) * 100:.1f}%"
+            ),
+            "acts over ε": (
+                "—" if not used else
+                (f"{float(window[0]):.3f} to {float(window[1]):.3f}"
+                 if window else
+                 f"{float(fit.get('epsilon_range', (0, 1))[0]):.3f} to "
+                 f"{float(fit.get('epsilon_range', (0, 1))[1]):.3f}")
+            ),
+        })
+    if not rows:
+        return
+    flat_table(
+        pd.DataFrame(rows),
+        align_right=["modulus", "± (standard error)", "± (%)", "acts over ε"],
+        caption="A component that was in the model and came out at zero is "
+                "a measurement: the curve had no force left for it. One "
+                "reading 'not in this model' was never fitted, which is a "
+                "different statement.",
+    )
+
+
 def copy_the_results(fit, unit="nN"):
     """
     The whole fit as one block to copy into a spreadsheet.
@@ -3814,6 +3877,52 @@ def _as_float(value, fallback):
     return float(fallback) if not np.isfinite(out) else out
 
 
+def suggested_range_note(lo, hi):
+    """
+    Say that the range on screen is the one the app suggested, and why.
+
+    The range is chosen for you the moment a curve loads, and a number
+    chosen for somebody without being announced is one they have to guess
+    the provenance of. Once it has been moved, the same line says so and
+    offers the suggestion back, because "what did it start as" is otherwise
+    unanswerable without reloading the file.
+    """
+    suggested = st.session_state.get("_suggested_window")
+    if not suggested:
+        return
+    start = float(suggested["start"])
+    end = float(suggested["end"])
+    why = (
+        ("starting " + str(suggested.get("why_start") or "").strip()
+         if suggested.get("bad_contact")
+         else "starting at first contact, ε = 0")
+        + ", and ending at " + (str(suggested.get("why_end")
+                                    or "the end of the curve").strip())
+    )
+    if abs(lo - start) < 5e-4 and abs(hi - end) < 5e-4:
+        st.caption(
+            f"✅ **This is the suggested range**, ε {start:.3f} to "
+            f"{end:.3f}, chosen from this curve when it loaded: {why}. "
+            "Move either end and it becomes yours."
+        )
+        return
+    left, right = st.columns([2.4, 1])
+    with left:
+        st.caption(
+            f"This range is yours, not the suggested one. The suggestion "
+            f"was ε {start:.3f} to {end:.3f}: {why}."
+        )
+    with right:
+        if st.button("↺ Back to the suggested range",
+                     key="restore_suggested_range", **STRETCH):
+            st.session_state["_pending_settings"] = {
+                "window_start": start,
+                "window_end": end,
+                "window_combined": (start, end),
+            }
+            st.rerun()
+
+
 def epsilon_range_control(lo_key, hi_key, floor, ceiling, step,
                           label="Fitted range", help_text=None,
                           boxes=True, prefix=""):
@@ -6123,22 +6232,48 @@ with tab_analysis:
             pending = {"_fit_colour_range": None, "_fit_colour_step": 0}
             notes = []
 
+            # A new curve arrives with its components ticked. They are a
+            # property of the cell type, not of the last curve: a search
+            # that dropped the nucleus on the cell before this one was an
+            # answer about that cell, and carrying it forward silently is
+            # how a curve gets fitted with a model nobody chose for it.
+            wanted = DEFAULT_TERMS_BY_TYPE.get(
+                st.session_state["cell_type"], {}
+            )
+            here_now = terms_for(st.session_state["cell_type"])
+            if not fixed_cell_on():
+                for term in ALL_TERMS:
+                    pending[f"use_{term}"] = bool(
+                        wanted.get(term, False) and term in here_now
+                    )
+                st.session_state["component_search"] = None
+
             window = (
                 model.suggest_window() if hasattr(model, "suggest_window") else {}
             )
             if window.get("success"):
-                pending["window_end"] = round(window["epsilon_max"], 4)
-                pending["window_start"] = (
-                    round(window["epsilon_min"], 4)
-                    if window.get("bad_contact") else 0.0
-                )
-                pending["window_combined"] = (
-                    round(window["epsilon_min"], 4),
-                    round(window["epsilon_max"], 4),
-                )
+                start = (round(window["epsilon_min"], 4)
+                         if window.get("bad_contact") else 0.0)
+                end = round(window["epsilon_max"], 4)
+                pending["window_end"] = end
+                pending["window_start"] = start
+                pending["window_combined"] = (start, end)
                 notes.append(window["why_start"])
                 if window.get("bad_contact"):
                     notes.append("**the approach misbehaved near contact**")
+                # Kept so the page can say the range on screen is the
+                # suggested one, and put it back after it has been moved.
+                # A default nobody is told about is indistinguishable from
+                # an arbitrary number.
+                st.session_state["_suggested_window"] = {
+                    "start": start, "end": end,
+                    "why_start": window.get("why_start", ""),
+                    "why_end": window.get("why_end", ""),
+                    "bad_contact": bool(window.get("bad_contact")),
+                    "n_points": int(window.get("n_points", 0)),
+                }
+            else:
+                st.session_state["_suggested_window"] = None
 
             # The boundaries a new curve starts from are this cell type's,
             # not a search result. For a C2C12 that is the membrane holding
@@ -6219,6 +6354,7 @@ with tab_analysis:
                    if rupture.get("method") == "force-drop"
                    and rupture.get("epsilon") is not None else "")
             )
+            suggested_range_note(guided_lo, guided_hi)
             if guided_lo > 0:
                 st.caption(
                     "⚠️ Not starting from zero. The membrane term is "
@@ -7672,6 +7808,13 @@ with tab_analysis:
                 "estimated from the curve itself, so read χ²/dof as an "
                 "order of magnitude, not to two decimal places."
             )
+
+            # The same moduli again, each with the uncertainty the fit
+            # gives it. The tiles above round hard and put the ± in small
+            # grey type, which is the wrong size for the number that says
+            # whether two cells differ. A modulus without its uncertainty
+            # is not a measurement.
+            moduli_with_uncertainty(fit)
 
             # The model must never soften. Every basis function has a
             # non-decreasing slope and every modulus is bounded at zero, so
