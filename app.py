@@ -4237,6 +4237,13 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
                 f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
                 key=f"use_{term}", help=names[term][1],
             )
+            # The law it stands for, beside the box that switches it on. A
+            # component is a term in an equation, and the exponent is the
+            # thing that makes it a different term from its neighbour, so
+            # the name alone leaves out what the tick actually does.
+            law = (MATERIAL_LAWS.get(term) or {}).get("law")
+            if law:
+                st.caption(law)
         with range_col:
             bar = f"{key}__bar"
             pair = st.session_state[key]
@@ -4384,6 +4391,209 @@ def fit_verdict():
         st.success(said)
 
 
+def where_the_power_law_changes(fit, model, style):
+    """
+    The curve read on log-log axes, with what changes where written on it.
+
+    This replaces a section of prose about exponents. The exponent is the
+    one part of this model a person can check by hand off their own data,
+    and a plot of it against ε with the boundaries drawn on says everything
+    that prose said, in the place where it can be disagreed with.
+    """
+    if exponent_profile_figure is None or not (fit and fit.get("success")):
+        return
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    profile = st.session_state.get("_slope_profile")
+    if not (profile and len(profile.get("epsilon", []))):
+        profile = log_slope_profile(model, lo, hi)
+        st.session_state["_slope_profile"] = profile
+    eps = np.asarray(profile.get("epsilon", []), dtype=float)
+    p = np.asarray(profile.get("exponent", []), dtype=float)
+    if eps.size < 4:
+        st.caption(
+            "The slope of the log curve cannot be measured over enough of "
+            "this range to plot: too few points clear of the noise."
+        )
+        return
+
+    e1 = fit.get("break_1")
+    e2 = fit.get("break_2")
+    terms = set(fit.get("terms") or ())
+    edges = [lo]
+    for value in (e1, e2):
+        if value is not None and lo < float(value) < hi:
+            edges.append(float(value))
+    edges.append(hi)
+    edges = sorted(set(round(v, 6) for v in edges))
+
+    def mean_slope(a, b):
+        inside = (eps >= a) & (eps <= b) & np.isfinite(p)
+        return float(np.mean(p[inside])) if inside.sum() >= 2 else float("nan")
+
+    stages, notes = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        measured = mean_slope(a, b)
+        stages.append({
+            "from": a, "to": b,
+            "label": (f"slope ≈ {measured:.2f}"
+                      if np.isfinite(measured) else "slope not measurable"),
+        })
+    if e1 is not None and lo < float(e1) < hi:
+        before, after = mean_slope(lo, float(e1)), mean_slope(float(e1), hi)
+        notes.append({
+            "epsilon": float(e1),
+            "y": 0.9,
+            "ay": -46,
+            "text": (
+                f"ε₁ = {float(e1):.3f}<br>"
+                + (f"slope {before:.2f} → {after:.2f}"
+                   if np.isfinite(before) and np.isfinite(after)
+                   else "the shell hands over")
+                + "<br>" + (
+                    "the shell stops taking more; the cytoplasm carries on"
+                    if "interior" in terms else "the outer law ends"
+                )
+            ),
+        })
+    if e2 is not None and lo < float(e2) < hi and (
+            "nucleus" in terms or "nucleus_shell" in terms):
+        before, after = mean_slope(float(e1 or lo), float(e2)), mean_slope(float(e2), hi)
+        notes.append({
+            "epsilon": float(e2),
+            "y": 0.45,
+            "ax": 40,
+            "ay": -40,
+            "text": (
+                f"ε₂ = {float(e2):.3f}<br>"
+                + (f"slope {before:.2f} → {after:.2f}"
+                   if np.isfinite(before) and np.isfinite(after)
+                   else "the deep element is met")
+                + "<br>" + plain_name(
+                    "nucleus_shell" if "nucleus_shell" in terms else "nucleus"
+                ).lower() + " first carries load"
+            ),
+        })
+
+    st.plotly_chart(
+        exponent_profile_figure(
+            profile, style, e1, e2,
+            title="Where the curve changes its power law",
+            notes=notes, stages=stages,
+        ),
+        key="power_law_profile", **STRETCH,
+    )
+    st.caption(
+        "The slope of ln F against ln ε, measured on the data alone with no "
+        "fit in it: 3 while a fluid-filled shell is being stretched, 3/2 "
+        "for a Hertzian contact, 1 for a network already under tension, and "
+        "the force-weighted mean of those wherever more than one is "
+        "carrying. Confinement adds qε/(1−ε) to all of them, which is why "
+        "the measured slope climbs along the curve rather than sitting on a "
+        "constant"
+        + (f"; here q = {float(fit.get('confinement', 0.0) or 0.0):g}. "
+           if fit.get("confinement") else ". ")
+        + "The vertical lines are the boundaries the fit used, so this is "
+        "the one panel where the model can be held to the data by eye."
+    )
+
+
+def log_slope_profile(model, lo, hi):
+    """
+    The curve's local power law, ε by ε: d log F / d log ε.
+
+    This is the curve read as a physicist reads it. Each element's law is a
+    power of ε, so the slope on log-log axes is the force-weighted mean of
+    the exponents in play, and a boundary is a place where that mean moves
+    from one law to the next. Measuring it is independent of any fit, which
+    is what makes it evidence rather than a restatement of the model.
+    """
+    if not hasattr(model, "local_exponent"):
+        return {"epsilon": np.array([]), "exponent": np.array([])}
+    try:
+        eps, exponent = model.local_exponent()
+    except Exception:  # pragma: no cover - defensive
+        return {"epsilon": np.array([]), "exponent": np.array([])}
+    eps = np.asarray(eps, dtype=float)
+    exponent = np.asarray(exponent, dtype=float)
+    keep = (eps >= float(lo)) & (eps <= float(hi)) & np.isfinite(exponent)
+    return {"epsilon": eps[keep], "exponent": exponent[keep]}
+
+
+def boundaries_from_log_slope(profile, band1, band2):
+    """
+    Where the measured exponent changes, by least squares on the slope curve.
+
+    Two changepoints are placed so the exponent is as nearly constant as it
+    can be inside each of the three stretches they make. That is the
+    definition of a boundary written down directly: not where the residual
+    of a fitted force happens to be smallest, but where the curve stops
+    obeying one power law and starts obeying another.
+
+    A band of zero width means that boundary is not free -- ε₁ does nothing
+    when every outer element carries load throughout -- so it is pinned to
+    the value the band names and only the other one is searched.
+
+    Returns (ε₁, ε₂, within-segment scatter) or None when the slope cannot
+    be measured over enough of the curve to say.
+    """
+    eps = np.asarray(profile.get("epsilon", []), dtype=float)
+    p = np.asarray(profile.get("exponent", []), dtype=float)
+    if eps.size < 9:
+        return None
+
+    def allowed(band):
+        low, high = float(band[0]), float(band[1])
+        if high - low < 1e-6:
+            return [int(np.argmin(np.abs(eps - low)))], low
+        inside = np.nonzero((eps >= low - 1e-9) & (eps <= high + 1e-9))[0]
+        return [int(i) for i in inside], None
+
+    first, pinned_1 = allowed(band1)
+    second, pinned_2 = allowed(band2)
+    if not first or not second:
+        return None
+
+    def scatter(values):
+        return (float(np.sum((values - values.mean()) ** 2))
+                if values.size else 0.0)
+
+    best = None
+    for i in first:
+        if i < 2 or i > eps.size - 5:
+            continue
+        for j in second:
+            if j < i + 2 or j > eps.size - 2:
+                continue
+            cost = scatter(p[:i]) + scatter(p[i:j]) + scatter(p[j:])
+            if best is None or cost < best[2]:
+                best = (
+                    float(pinned_1 if pinned_1 is not None else eps[i]),
+                    float(pinned_2 if pinned_2 is not None else eps[j]),
+                    cost,
+                )
+    return best
+
+
+def evaluate_boundaries(model, lo, hi, terms, e1, e2, membrane, cyto_start):
+    """One fit at one pair of boundaries, for comparing candidates fairly."""
+    flags = {
+        "use_membrane": "membrane" in terms,
+        "use_interior": "interior" in terms,
+        "use_nucleus": "nucleus" in terms,
+        "use_tension": "tension" in terms,
+        "use_nucleus_shell": "nucleus_shell" in terms,
+        "use_cortex": "cortex" in terms,
+    }
+    try:
+        return model.fit_composition(
+            lo, hi, float(e1), float(e2), membrane, cyto_start,
+            weighting=st.session_state["weighting"],
+            fit_offset=st.session_state["fit_offset"], **flags
+        )
+    except Exception:  # pragma: no cover - defensive
+        return {"success": False}
+
+
 def boundary_grid(band, n):
     """A grid over a band, or the single point when the band is one."""
     a, b = float(band[0]), float(band[1])
@@ -4462,31 +4672,61 @@ def refine_boundaries_control(model, lo, hi, terms):
         moving.append(f"ε₂ within {band2[0]:.2f} to {band2[1]:.2f}")
 
     pressed = st.button(
-        "📐 Optimise the boundaries",
+        "📈 Find the boundaries from the log curve",
         key="refine_boundaries_button", type="primary",
         disabled=not terms, **STRETCH,
     )
     st.caption(
-        (("Boundaries found from the curve rather than assumed: profiles "
-          + " and ".join(moving) + ", ") if moving else
-         "Profiles the boundaries, ")
-        + "and settles which element takes over where. "
-        + (prior.get("why", "").capitalize() + ", so the search moves each "
-           "boundary inside that band rather than across the curve, and "
-           "where two hand-overs fit equally well it keeps the one this "
-           "cell type is known to take. " if prior.get("why") else "")
-        + "The components ticked above are not touched. Ranges you moved by "
-        "hand are left alone."
+        "Boundaries found from the curve rather than assumed: it reads the "
+        "curve on log-log axes, where every one of these laws is a straight "
+        "line, and puts them where its slope stops obeying one power and "
+        "starts obeying the next"
+        + ((", searching " + " and ".join(moving)) if moving else "")
+        + ". Then it fits at that placement and at the ones the residual "
+        "prefers, and keeps whichever predicts best. "
+        + (prior.get("why", "").capitalize() + ", so nothing is looked for "
+           "outside that band. " if prior.get("why") else "")
+        + "The components ticked above are not touched, and ranges you moved "
+        "by hand are left alone."
     )
+
+    show_boundary_candidates(model, lo, hi, terms, membrane, cyto_start)
 
     if not pressed:
         return
 
     fixed = {t for t in terms if st.session_state.get(f"_window_touched_{t}")}
     picks = hypotheses_for(cell_type, terms=terms, exact=True)
-    with st.spinner("Profiling the residual over the allowed boundaries, "
-                    "and scoring each hand-over on points it was not fitted "
-                    "to…"):
+    candidates = []
+    with st.spinner("Reading the slope of the log curve, then fitting at "
+                    "every placement it and the residual suggest…"):
+        # 1. What the log curve says, on its own, with no fit involved.
+        profile = log_slope_profile(model, lo, hi)
+        st.session_state["_slope_profile"] = profile
+        from_slope = boundaries_from_log_slope(profile, band1, band2)
+        if from_slope:
+            candidates.append({
+                "why": "where the log slope changes",
+                "break_1": from_slope[0], "break_2": from_slope[1],
+                "membrane": membrane, "cyto_start": cyto_start,
+            })
+        # 2. Where the boundaries stand now, so a candidate is never worse
+        #    than what it replaces without saying so.
+        candidates.append({
+            "why": "on the page now",
+            "break_1": e1_now, "break_2": e2_now,
+            "membrane": membrane, "cyto_start": cyto_start,
+        })
+        # 3. This cell type's stated default.
+        stated = default_boundaries(cell_type)
+        candidates.append({
+            "why": "this cell type's default",
+            "break_1": float(stated["segment_break_1"]),
+            "break_2": float(stated["segment_break_2"]),
+            "membrane": membrane, "cyto_start": cyto_start,
+        })
+        # 4. The full profile over the allowed band, hand-over and all,
+        #    scored on points it was not fitted to.
         outcome = analyse_curve(
             model, lo, hi, picks,
             weighting=st.session_state["weighting"],
@@ -4496,18 +4736,134 @@ def refine_boundaries_control(model, lo, hi, terms):
             band_1=band1 if band1[1] > band1[0] else None,
             band_2=band2 if band2[1] > band2[0] else None,
         )
-    found = outcome["hypotheses"]
-    st.session_state["_last_search"] = "boundaries"
-    if not (found and found.get("success")):
-        st.error("No boundary in the allowed band fitted this curve.")
+        found = outcome["hypotheses"]
+        if found and found.get("success"):
+            st.session_state["hypothesis_search"] = found
+            if outcome["q_scan"] is not None:
+                st.session_state["confinement_scan"] = outcome["q_scan"]
+            winner = found["best"]
+            candidates.append({
+                "why": "smallest held-out error",
+                "break_1": float(winner["break_1"]),
+                "break_2": float(winner["break_2"]),
+                "membrane": winner["membrane"],
+                "cyto_start": winner["cyto_start"],
+                "q": outcome["q"],
+                "cv_rmse": float(winner.get("cv_rmse", float("nan"))),
+            })
+
+        # Every placement is fitted at each hand-over the cell type allows
+        # and reported at its best one. Judging a placement at whichever
+        # hand-over happened to be on the page compares boundaries by a
+        # difference that is not about the boundaries.
+        arrangements = [
+            (spec.get("membrane", "continue"), spec.get("cyto_start", "zero"))
+            for spec in picks
+        ] or [(membrane, cyto_start)]
+        rows = []
+        for row in candidates:
+            best_fit, best_pair = None, None
+            for pair in arrangements:
+                fitted = evaluate_boundaries(
+                    model, lo, hi, terms, row["break_1"], row["break_2"],
+                    pair[0], pair[1],
+                )
+                if not fitted.get("success"):
+                    continue
+                if best_fit is None or fitted["r_squared"] > best_fit["r_squared"]:
+                    best_fit, best_pair = fitted, pair
+            if best_fit is None:
+                continue
+            row["membrane"], row["cyto_start"] = best_pair
+            row["r_squared"] = float(best_fit["r_squared"])
+            row["chi"] = float(
+                best_fit.get("chi_squared_reduced", float("nan"))
+            )
+            rows.append(row)
+
+    if not rows:
+        st.error("No placement in the allowed band fitted this curve.")
         return
-    st.session_state["hypothesis_search"] = found
-    if outcome["q_scan"] is not None:
-        st.session_state["confinement_scan"] = outcome["q_scan"]
-    pending = settings_from_hypothesis(found["best"], q=outcome["q"])
+    # The one applied is the one that predicts best where that was measured,
+    # and otherwise the closest fit. Every other row stays one click away.
+    rows.sort(key=lambda r: (-r["r_squared"],))
+    best = min(
+        rows,
+        key=lambda r: (0 if np.isfinite(r.get("cv_rmse", float("nan"))) else 1,
+                       r.get("cv_rmse", float("inf")), -r["r_squared"]),
+    )
+    st.session_state["boundary_candidates"] = rows
+    st.session_state["_last_search"] = "boundaries"
     if fixed:
         st.session_state["_boundaries_left_alone"] = sorted(fixed)
-    rerun_keeping_settings(pending)
+    rerun_keeping_settings(settings_for_boundaries(best))
+
+
+def settings_for_boundaries(row):
+    """The widget values one candidate placement stands for."""
+    pending = {
+        "segment_break_1": round(float(row["break_1"]), 4),
+        "segment_break_2": round(float(row["break_2"]), 4),
+        "model_kind": "Segmented (each part takes over in turn)",
+        "membrane_after_break": next(
+            k for k, v in MEMBRANE_CHOICES.items() if v == row["membrane"]
+        ),
+        "cyto_starts_at": next(
+            k for k, v in CYTO_CHOICES.items() if v == row["cyto_start"]
+        ),
+    }
+    if row.get("q") is not None and np.isfinite(row.get("q", float("nan"))):
+        pending["confinement"] = round(float(row["q"]), 2)
+    return pending
+
+
+def show_boundary_candidates(model, lo, hi, terms, membrane, cyto_start):
+    """
+    The placements that were tried, what each came to, and a way to take one.
+
+    A search that hands back one number asks to be trusted. A search that
+    shows the four placements it weighed, and what the curve looks like at
+    each, can be argued with, which is the only useful kind.
+    """
+    rows = st.session_state.get("boundary_candidates")
+    if not rows:
+        return
+    here = (round(float(st.session_state["segment_break_1"]), 4),
+            round(float(st.session_state["segment_break_2"]), 4))
+    st.markdown("**Placements tried**")
+    for index, row in enumerate(rows):
+        mine = (round(float(row["break_1"]), 4),
+                round(float(row["break_2"]), 4)) == here
+        c1, c2, c3, c4 = st.columns([1.5, 1.1, 1.6, 0.9])
+        c1.markdown(("**" if mine else "") + row["why"] + ("**" if mine else ""))
+        c2.markdown(
+            f"ε₁ {float(row['break_1']):.3f} · ε₂ {float(row['break_2']):.3f}"
+            + "<br><span style='font-size:0.78em;opacity:0.75'>"
+            + next(k for k, v in MEMBRANE_CHOICES.items()
+                   if v == row["membrane"])
+            + ", cytoskeleton "
+            + next(k for k, v in CYTO_CHOICES.items()
+                   if v == row["cyto_start"])
+            + "</span>",
+            unsafe_allow_html=True,
+        )
+        chi = row.get("chi", float("nan"))
+        c3.markdown(
+            f"R² {row['r_squared']:.5f}"
+            + (f" · χ²/dof {chi:.3g}" if np.isfinite(chi) else "")
+            + (f" · CV {row['cv_rmse']:.3g} N"
+               if np.isfinite(row.get("cv_rmse", float("nan"))) else "")
+        )
+        if mine:
+            c4.markdown("✅ in use")
+        elif c4.button("Use", key=f"use_boundary_{index}", **STRETCH):
+            rerun_keeping_settings(settings_for_boundaries(row))
+    st.caption(
+        "Every row is fitted the same way over the same range, so the "
+        "columns compare like with like. R² cannot choose between them on "
+        "its own, which is why the row that was applied is the one with the "
+        "smallest held-out error where that was measured."
+    )
 
 
 def _scan_q_at(model, lo, hi, terms, e1, e2, membrane, cyto_start):
@@ -4661,6 +5017,10 @@ def optimisation_controls(model, lo, hi, terms):
     if not terms:
         return
     st.markdown("##### Optimization")
+    # What every curve of this type starts from comes first: it is the
+    # decision the search is measured against, and the one worth making once
+    # for a whole experiment rather than again on every cell.
+    set_default_boundaries_control()
     refine_boundaries_control(model, lo, hi, terms)
     left_alone = st.session_state.pop("_boundaries_left_alone", None)
     if left_alone:
@@ -4672,7 +5032,6 @@ def optimisation_controls(model, lo, hi, terms):
         )
     search_results_as_equations()
     why_this_search(model)
-    set_default_boundaries_control()
 
 
 def _term_symbol(term):
@@ -8933,12 +9292,12 @@ with tab_analysis:
             st.markdown("##### The equation that was fitted")
             fitted_equation(fit, unit=style.force_unit, heading=False)
 
-            # What the powers of ε mean, at the end, where the equation they
-            # belong to has just been printed with this cell's numbers in
-            # it. The exponent is the checkable part of all of this: it is
-            # something you can read off your own curve by hand.
-            st.markdown("##### What the power law says")
-            power_law_notes(fit, model)
+            # The exponent is the checkable part of all of this, and it is
+            # a picture rather than a paragraph: the measured slope against
+            # ε, the boundaries drawn on it, and what changes at each one
+            # written inside the axes.
+            st.markdown("##### Where the curve changes its power law")
+            where_the_power_law_changes(fit, model, style)
 
             # No "how this fit was calculated" panel. What it said is now
             # said where it is needed: the criterion sits under the search
