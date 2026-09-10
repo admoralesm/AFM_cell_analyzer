@@ -4589,6 +4589,10 @@ def compare_hypotheses(
             "key": spec.get("key", spec.get("label", "?")),
             "label": spec.get("label", "?"),
             "detail": spec.get("detail", ""),
+            # Whether this arrangement is the one the cell type is known to
+            # take. It breaks ties and nothing else: a curve that says
+            # otherwise loudly enough still wins.
+            "expected": bool(spec.get("expected", False)),
             "terms": terms,
             "membrane": membrane,
             "cyto_start": cyto_start,
@@ -4629,8 +4633,12 @@ def compare_hypotheses(
         lowest["cv_spread"] + max(r["cv_spread"] for r in usable),
     )
     tied = [r for r in usable[1:] if r["cv_rmse"] - lowest["cv_rmse"] <= tolerance]
+    # Among candidates the curve cannot separate: what the cell type is
+    # known to do first, then the fewest elements left carrying nothing,
+    # then the fewest free parameters.
     best = min([lowest] + tied,
-               key=lambda r: (len(r["empty"]), r["n_params"], r["cv_rmse"]))
+               key=lambda r: (not r["expected"], len(r["empty"]),
+                              r["n_params"], r["cv_rmse"]))
     for row in usable:
         row["chosen"] = row is best
         row["tied_with_best"] = row is not best and (row in tied or row is lowest)
