@@ -2327,7 +2327,7 @@ class _CompositionMixin:
     def _best_breakpoints(
         self, lo, hi, membrane, cyto_start, use_nucleus, weighting, n_grid,
         rounds=2, use_tension=False, search_e2=None, use_nucleus_shell=False,
-        use_cortex=False,
+        use_cortex=False, band_1=None, band_2=None,
     ):
         """
         The breakpoints that fit best for one composition.
@@ -2341,7 +2341,24 @@ class _CompositionMixin:
         """
         span = hi - lo
         gap = 0.02 * span
-        first = np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid))
+        # ``band_1``/``band_2`` are prior knowledge from the caller: the
+        # interval a boundary is known to lie in for this kind of cell. A
+        # search allowed outside it does not find a better cell, it finds a
+        # cell nobody has measured, and it is what makes the answer jump
+        # about between presses.
+        def _bounded(default, band):
+            if not band:
+                return default
+            a, b = float(band[0]), float(band[1])
+            a, b = max(a, lo), min(b, hi)
+            if b - a < 1e-6:
+                return np.array([float(np.clip(a, lo, hi))])
+            return np.linspace(a, b, int(n_grid))
+
+        first = _bounded(
+            np.linspace(lo + 0.06 * span, lo + 0.50 * span, int(n_grid)),
+            band_1,
+        )
         # With no deep layer in the fit, e2 is not in the model at all: every
         # value of it gives the same design matrix, so gridding it is n_grid
         # identical fits. One value, and the search is n_grid instead of
@@ -2349,7 +2366,10 @@ class _CompositionMixin:
         if search_e2 is None:
             search_e2 = bool(use_nucleus) or bool(use_nucleus_shell)
         second = (
-            np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid))
+            _bounded(
+                np.linspace(lo + 0.30 * span, lo + 0.90 * span, int(n_grid)),
+                band_2,
+            )
             if search_e2 else np.array([hi])
         )
         best = None
@@ -2374,15 +2394,21 @@ class _CompositionMixin:
             # Re-grid inside one step either side of the winner.
             step_1 = (first[-1] - first[0]) / max(len(first) - 1, 1)
             step_2 = (second[-1] - second[0]) / max(len(second) - 1, 1)
+            floor_1 = max(lo + 1e-4, float(band_1[0])) if band_1 else lo + 1e-4
+            roof_1 = min(hi - gap, float(band_1[1])) if band_1 else hi - gap
+            floor_2 = max(lo + gap, float(band_2[0])) if band_2 else lo + gap
+            roof_2 = min(hi - 1e-4, float(band_2[1])) if band_2 else hi - 1e-4
             first = np.linspace(
-                max(lo + 1e-4, best["break_1"] - step_1),
-                min(hi - gap, best["break_1"] + step_1),
+                max(floor_1, best["break_1"] - step_1),
+                max(min(roof_1, best["break_1"] + step_1),
+                    max(floor_1, best["break_1"] - step_1)),
                 max(5, int(n_grid) // 2),
             )
             second = (
                 np.linspace(
-                    max(lo + gap, best["break_2"] - step_2),
-                    min(hi - 1e-4, best["break_2"] + step_2),
+                    max(floor_2, best["break_2"] - step_2),
+                    max(min(roof_2, best["break_2"] + step_2),
+                        max(floor_2, best["break_2"] - step_2)),
                     max(5, int(n_grid) // 2),
                 )
                 if search_e2 else second
@@ -4424,6 +4450,7 @@ def search_term_windows(
 def compare_hypotheses(
     model, epsilon_min, epsilon_max, hypotheses, weighting="uniform",
     n_folds=5, seed=0, cv_repeats=3, n_grid=9, refine_rounds=1, scan_q=False,
+    band_1=None, band_2=None,
 ):
     """
     Score a list of named, stated pictures of the cell against the curve.
@@ -4507,6 +4534,7 @@ def compare_hypotheses(
             n_grid, refine_rounds, use_tension=flags["use_tension"],
             use_nucleus_shell=flags["use_nucleus_shell"],
             use_cortex=flags["use_cortex"],
+            band_1=band_1, band_2=band_2,
         ) if (deep_here or needs_e1) else local.fit_composition(
             lo, hi, local.segment_break_1, local.segment_break_2,
             membrane, cyto_start, weighting=weighting, **flags
