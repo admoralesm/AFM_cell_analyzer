@@ -2483,7 +2483,7 @@ def case_bending_is_the_same_column_as_the_spring():
 
     source = pathlib.Path(__file__).with_name("app.py").read_text()
     check("and the app says so where the maths is shown",
-          "Is there a bending term?" in source)
+          "**Bending.**" in source)
 
 
 def case_cortical_actin_can_carry_it_first():
@@ -3189,7 +3189,7 @@ def case_components_are_recommended():
     # The mixture is the search button's job, not the fit button's: fitting
     # must never change which boxes are ticked, or a box clears while
     # somebody is looking at the curve.
-    work = button_by_label(app, "Find the elements and optimise the ranges")
+    work = button_by_label(app, "Find the elements")
     if work is None:
         check("the button is there", False)
         return
@@ -3198,9 +3198,15 @@ def case_components_are_recommended():
         return
     picked = state(app, "component_search")
     check("the search ran with the button", picked and picked.get("success"))
-    said = " ".join(str(c.value) for c in app.get("caption"))
-    check("the recommendation is on the page",
-          "Last search kept" in said, said[-400:])
+    # Equations, not a table of combinations to compare by eye: the
+    # comparison was the point of running the cross-validation.
+    formulas = " ".join(str(e.value) for e in app.get("latex"))
+    check("the combinations are reported as their held-out errors",
+          formulas.count(r"\mathrm{CV}\bigl(") >= 2, formulas[:400])
+    check("with the tie tolerance beside them",
+          r"\tau = " in formulas, formulas[:400])
+    check("and no table of combinations is left",
+          table_with(app, "components", "held-out RMSE (N)") is None)
     check("and what it kept is what is ticked",
           set(picked["recommended"])
           == {t for t in app_module.ALL_TERMS
@@ -5358,7 +5364,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Find the elements and optimise the ranges")
+    button = button_by_label(app, "Optimise the ranges")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5538,7 +5544,7 @@ def case_each_element_gets_its_own_bar():
           fit is not None and fit.get("term_windows"),
           str(fit.get("term_windows") if fit else "no fit"))
 
-    button = button_by_label(app, "Find the elements and optimise the ranges")
+    button = button_by_label(app, "Optimise the ranges")
     check("and one button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:10]))
     if button is None:
