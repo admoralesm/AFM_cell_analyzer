@@ -1168,6 +1168,17 @@ def fit_record(fit, unit="nN"):
             float(error) if error is not None and np.isfinite(float(error))
             else ""
         )
+        # The interval as two plain numbers, so a spreadsheet can draw error
+        # bars from them without anybody parsing "1.98 to 2.06" back apart.
+        if (value is not None and np.isfinite(float(value))
+                and error is not None and np.isfinite(float(error))):
+            record[f"{label} 95% low"] = max(
+                float(value) - 1.96 * float(error), 0.0
+            )
+            record[f"{label} 95% high"] = float(value) + 1.96 * float(error)
+        else:
+            record[f"{label} 95% low"] = ""
+            record[f"{label} 95% high"] = ""
     for piece in equation_pieces(fit):
         label = f"coefficient {TERM_SYMBOLS.get(piece['term'], piece['term'])} ({unit_label})"
         record[label] = piece["coefficient_N"] * factor
@@ -1374,6 +1385,15 @@ def moduli_with_uncertainty(fit):
                 "—" if not used or not np.isfinite(error) or value == 0
                 else f"{abs(error / value) * 100:.1f}%"
             ),
+            # The interval itself, not only the half-width. A modulus is
+            # bounded below at zero by the fit, so an interval that would
+            # reach past zero is reported from zero: negative stiffness is
+            # not a value this measurement can take.
+            "95% interval": (
+                "—" if not used or not np.isfinite(error)
+                else f"{max(value - 1.96 * error, 0.0):.4g} to "
+                     f"{value + 1.96 * error:.4g} {unit_name}"
+            ),
             "acts over ε": (
                 "—" if not used else
                 (f"{float(window[0]):.3f} to {float(window[1]):.3f}"
@@ -1386,11 +1406,15 @@ def moduli_with_uncertainty(fit):
         return
     flat_table(
         pd.DataFrame(rows),
-        align_right=["modulus", "± (standard error)", "± (%)", "acts over ε"],
-        caption="A component that was in the model and came out at zero is "
-                "a measurement: the curve had no force left for it. One "
-                "reading 'not in this model' was never fitted, which is a "
-                "different statement.",
+        align_right=["modulus", "± (standard error)", "± (%)",
+                     "95% interval", "acts over ε"],
+        caption="The ± is one standard error from the covariance of the "
+                "fit, σ²(XᵀWX)⁻¹, and the interval is that doubled either "
+                "way (±1.96σ), cut at zero because a modulus cannot be "
+                "negative. A component that was in the model and came out "
+                "at zero is a measurement: the curve had no force left for "
+                "it. One reading 'not in this model' was never fitted, "
+                "which is a different statement.",
     )
 
 
@@ -4211,7 +4235,7 @@ def find_boundaries_control(model, lo, hi, terms):
     c1, c2 = st.columns([1.2, 2])
     with c1:
         pressed = st.button(
-            "🔎 Find the boundaries and the best mixture",
+            "🔎 Find the elements and optimise the ranges",
             key="find_breaks_top", type="primary",
             disabled=not (can_scan or can_place), **STRETCH,
         )
@@ -4410,8 +4434,22 @@ def why_this_search(model=None):
             "Pressing the button means the boundaries are found from the "
             "curve rather than assumed, and the combination of components "
             "kept is the one that best predicts points it was not fitted "
-            "to. Both of those are decisions, and this is the argument for "
-            "making them the way this app makes them."
+            "to. Written as one problem, it solves"
+        )
+        st.latex(
+            r"\bigl(\mathcal{S}^{*},\varepsilon_1^{*},\varepsilon_2^{*}"
+            r"\bigr) \;=\; \operatorname*{arg\,min}_{\mathcal{S}\subseteq"
+            r"\mathcal{C},\;(\varepsilon_1,\varepsilon_2)\in\mathcal{G}}"
+            r"\;\mathrm{CV}\bigl(\mathcal{S},\varepsilon_1,\varepsilon_2"
+            r"\bigr) \quad\text{s.t.}\quad |\mathcal{S}| \;\text{minimal "
+            r"within}\; \tau"
+        )
+        st.caption(
+            "𝒞 is this cell type's components, 𝒢 the grid of boundary "
+            "pairs, CV the error on points the fit never saw, and τ the "
+            "tolerance below which two scores are not telling anything "
+            "apart. The five parts below are that one line, each with the "
+            "reason it takes the form it does."
         )
         st.markdown("**1 · With the boundaries fixed, the moduli are exact**")
         st.caption(
@@ -6331,12 +6369,12 @@ with tab_analysis:
 
             # The choices come before the picture, and each is made once.
 
-            st.markdown("#### 1 · What to fit")
             # The range first: it decides which points exist at all, and
-            # every material below is placed inside it. Choosing materials
+            # every component below is placed inside it. Choosing components
             # for a stretch of curve you have not chosen yet is the wrong
-            # way round.
-            st.markdown("##### Relative deformation, total range")
+            # way round, and the heading names the first thing you set
+            # rather than the whole step.
+            st.markdown("#### 1 · Relative deformation range")
             guided_lo, guided_hi = epsilon_range_control(
                 "window_start", "window_end", 0.0, eps_hi_data, step,
                 label="Fitted range, ε",
@@ -6456,6 +6494,12 @@ with tab_analysis:
                         st.rerun()
                     else:
                         st.error("Could not fit this curve. Widen the range.")
+                st.caption(
+                    "Fits exactly the components ticked above, over the "
+                    "range and boundaries shown: this cell type's defaults "
+                    "until you change them. The other button is what goes "
+                    "looking for a different answer."
+                )
             with verdict_col:
                 guess = st.session_state.get("hypothesis_search")
                 if guess and guess.get("success"):
