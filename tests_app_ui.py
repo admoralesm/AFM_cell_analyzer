@@ -2927,8 +2927,14 @@ def case_named_hypotheses_are_compared():
     check("none of them offers an in-plane spring",
           not any("tension" in p["terms"] for p in picks))
 
+    # hypotheses_for marks each picture with whether it matches the cell
+    # type's prior, so compare the pictures themselves.
+    def bare(specs):
+        return [{k: v for k, v in spec.items() if k != "expected"}
+                for spec in specs]
+
     check("the argument passed in is accepted and ignored for now",
-          app_module.cardiomyocyte_hypotheses("anything") == picks)
+          bare(app_module.cardiomyocyte_hypotheses("anything")) == bare(picks))
 
     for n, (eps, force) in curves.items():
         model = vcm_model(eps, force)
@@ -6217,27 +6223,31 @@ def case_a_new_curve_arrives_ready_to_fit():
           all(state(app, f"use_{t}", False) for t in here),
           str({t: state(app, f"use_{t}", False) for t in here}))
 
-    # And the results carry the uncertainty beside every modulus.
+    # And every modulus is quoted with its uncertainty, in the tile the
+    # modulus is in rather than in a second table of the same numbers.
     fit = state(app, "_last_fit")
     check("it was fitted on arrival", fit and fit.get("success"))
-    table = table_with(app, "modulus", "± (standard error)")
-    check("every modulus is listed with its standard error",
-          table is not None,
-          str([list(f.columns) for f in flat_tables(app)])[:300])
-    if table is not None:
-        check("one row per component of this cell type",
-              len(table) == len(here), f"{len(table)} rows for {here}")
-        check("and the ± is a number, not a blank",
-              any(str(v).startswith("±") for v in table["± (standard error)"]),
-              str(list(table["± (standard error)"])))
-        check("the interval itself is given, not only the half-width",
-              "95% interval" in table.columns
-              and any(" to " in str(v) for v in table["95% interval"]),
-              str(list(table.get("95% interval", []))))
-        check("and it never reaches below zero, which a modulus cannot",
-              all(float(str(v).split(" to ")[0]) >= 0
-                  for v in table["95% interval"] if " to " in str(v)),
-              str(list(table["95% interval"])))
+    wanted_labels = {
+        f"{app_module.TERM_SYMBOLS[t]} "
+        f"{app_module.plain_name(t, 'Cardiomyocyte').lower()}"
+        for t in here
+    }
+    tiles = [m for m in app.get("metric") if (m.label or "") in wanted_labels]
+    check("there is a tile for every component of this cell type",
+          len(tiles) == len(here), str([m.label for m in tiles]))
+    check("and the uncertainty is in the number, not under it",
+          any("±" in str(m.value) for m in tiles),
+          str([m.value for m in tiles]))
+    check("no second table repeats the moduli",
+          table_with(app, "modulus", "± (standard error)") is None)
+    # The half-open reading of a range was the bug: an element that stops
+    # taking more load has not stopped carrying it.
+    check("a component that holds is said to hold, not to stop",
+          all("stiffening to the end" in str(m.delta)
+              or "holding from" in str(m.delta)
+              or "not in this model" in str(m.delta)
+              for m in tiles),
+          str([m.delta for m in tiles]))
 
 
 def case_the_video_is_not_a_plot_marking():
