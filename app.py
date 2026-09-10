@@ -2116,6 +2116,210 @@ def stiffness_table(fit):
         )
 
 
+def range_maths(lo, hi, terms=None):
+    """
+    What the chosen range does to the fit, written as maths.
+
+    A range is not only a pair of numbers: it decides which points enter
+    the least-squares sum, and it decides the stretch of deformation each
+    material is actually measured over, which is not the same interval for
+    each of them. Printed here, under the control that sets it, so moving
+    a handle and watching these change is one gesture.
+    """
+    terms = tuple(terms or active_terms())
+    e1 = float(st.session_state["segment_break_1"])
+    e2 = float(st.session_state["segment_break_2"])
+    q = float(st.session_state.get("confinement", 0.0) or 0.0)
+    membrane = MEMBRANE_CHOICES.get(
+        st.session_state["membrane_after_break"], "freeze"
+    )
+    from_break = CYTO_CHOICES.get(
+        st.session_state["cyto_starts_at"], "break"
+    ) == "break"
+
+    st.latex(
+        r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta} \ge 0}"
+        r"\sum_{i:\ " + f"{lo:.3f}" + r" \le \varepsilon_i \le "
+        + f"{hi:.3f}" + r"} w_i \left( F_i - F(\varepsilon_i) \right)^{2}"
+    )
+    st.caption(
+        f"Only points inside the range enter the sum, so the range is part "
+        f"of the model, not a view of it. Moving either end changes every "
+        f"modulus."
+        + (f" Every term is multiplied by (1−ε)^−{q:g} across it."
+           if q else "")
+    )
+
+    # Which stretch each material is actually measured over. Two materials
+    # can share the range and still be measured on different parts of it,
+    # and that is the whole of how a fit tells them apart.
+    rows = []
+    for term in ALL_TERMS:
+        if term not in terms:
+            continue
+        if term in ("tension", "membrane"):
+            begin, end = lo, (hi if membrane == "continue" else min(e1, hi))
+            basis = (r"min(ε, ε₁)" if membrane == "freeze"
+                     else "⟨ε − ε₁⟩" if membrane == "late" else "ε")
+            basis += "³" if term == "membrane" else ""
+        elif term == "cortex":
+            begin, end, basis = lo, hi, "ε³ᐟ²"
+        elif term == "interior":
+            begin = max(lo, e1) if from_break else lo
+            end, basis = hi, ("⟨ε − ε₁⟩³ᐟ²" if from_break else "ε³ᐟ²")
+        else:
+            begin, end = max(lo, e2), hi
+            basis = ("⟨ε − ε₂⟩³" if term == "nucleus_shell"
+                     else "⟨ε − ε₂⟩³ᐟ²")
+        points = 0
+        data = (st.session_state.get("data") or {}).get("epsilon")
+        if data is not None and np.size(data):
+            data = np.asarray(data, dtype=float)
+            points = int(((data >= begin) & (data <= end)).sum())
+        rows.append({
+            "material": plain_name(term),
+            "measured over ε": f"{begin:.3f} to {max(end, begin):.3f}",
+            "points there": points,
+            "what it multiplies": basis,
+        })
+    if rows:
+        flat_table(
+            pd.DataFrame(rows),
+            align_right=["measured over ε", "points there"],
+            caption="A material is only measured where its own term is "
+                    "non-zero. Two of them sharing an interval and a power "
+                    "of ε cannot be told apart at all, however wide the "
+                    "range is made.",
+        )
+
+
+def power_law_notes(fit, model=None):
+    """
+    What each material's exponent means, and how to check it by hand.
+
+    Every term here is one power of ε. That exponent is the part of the
+    model a person can hold it to without trusting any of the fitting: the
+    slope of their own curve on log-log paper near contact should land
+    between the smallest and the largest listed, and if it does not, the
+    materials in the model are not the materials in the cell.
+    """
+    terms = set(fit.get("terms") or ())
+    if not terms:
+        return
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    rows = []
+    for term, symbol, power, shape in (
+        ("tension", "T₀", 1.0, "A_t T₀ ε"),
+        ("membrane", "Eₘ", 3.0, "A_m Eₘ ε³"),
+        ("cortex", "E_cx", 1.5, "A_i E_cx ε³ᐟ²"),
+        ("interior", "Ec", 1.5, "A_i Ec ⟨ε − ε₁⟩³ᐟ²"),
+        ("nucleus_shell", "E_ne", 3.0, "A_ne E_ne ⟨ε − ε₂⟩³"),
+        ("nucleus", "Eₙ", 1.5, "A_n Eₙ ⟨ε − ε₂⟩³ᐟ²"),
+    ):
+        if term not in terms:
+            continue
+        rows.append({
+            "material": plain_name(term),
+            "contributes": shape + (f" × (1−ε)^−{q:g}" if q else ""),
+            "slope near contact": f"{power:g}",
+            "slope at ε = 0.6": (
+                f"{power + q * 0.6 / 0.4:.2f}" if q else f"{power:g}"
+            ),
+        })
+    if not rows:
+        return
+    flat_table(
+        pd.DataFrame(rows),
+        align_right=["slope near contact", "slope at ε = 0.6"],
+    )
+    st.caption(
+        "The slope is d(ln F)/d(ln ε), which is what you read off a log-log "
+        "plot, and it is the part of this you can check by hand: measure "
+        "the slope of your own curve near contact and it should land "
+        "between the smallest and the largest listed here. 3 is a membrane "
+        "on its own, 3/2 anything Hertzian, and above 3 is the cell running "
+        "out of room. "
+        + (f"Confinement adds qε/(1−ε) to every one of them, and here "
+           f"q = {q:g}, which is why the measured slope climbs along the "
+           f"curve instead of sitting on a constant."
+           if q else "Here q = 0, so every slope is constant.")
+    )
+    separation_rule(q=q if q else None)
+    if model is not None and hasattr(model, "local_exponent"):
+        try:
+            grid, slope = model.local_exponent(window_frac=0.18)
+            good = np.isfinite(slope)
+            if good.sum() > 4:
+                st.caption(
+                    "Measured on this curve: slope "
+                    f"{float(slope[good][0]):.2f} near contact, "
+                    f"{float(slope[good][-1]):.2f} at the far end. If those "
+                    "sit outside the table above, the model has materials "
+                    "this cell does not."
+                )
+        except Exception:  # pragma: no cover - a curve too short to differentiate
+            pass
+
+
+def stiffness_table(fit):
+    """
+    What each material turned out to be, in its own units and in words.
+
+    All that is left of what used to be a retelling of the fit. The story
+    of the compression restated the boundaries already drawn on the curve,
+    and the paragraph after it restated R² and chi-squared, which are two
+    numbers standing beside it. This table is the part that said something
+    the numbers did not: what the material is, and what that stiffness is
+    like to hold.
+    """
+    if not (fit and fit.get("success")):
+        return
+
+    terms = set(fit.get("terms") or ())
+    st.markdown("##### How stiff each material turned out to be")
+    names = components_for(st.session_state["cell_type"])
+    rows = []
+    # The tension row is a tension, in newtons per metre, not a modulus. It
+    # is listed with the others because it is one of the springs, and given
+    # its own units rather than being dressed up as a stiffness it is not.
+    coat_m = float(st.session_state["protein_coat_nm"]) * 1e-9
+    for term in ALL_TERMS:
+        if term not in terms_for(st.session_state["cell_type"]):
+            continue
+        key, unit, _ = MODULUS_FIELDS[term]
+        pa_factor = (
+            1e-3 / max(coat_m, 1e-12) if term == "tension"
+            else MODULUS_SCALE[unit]
+        )
+        label, everyday = names[term]
+        used = term in terms
+        value = float(fit.get(key, 0.0)) if used else 0.0
+        rows.append(
+            {
+                "Part of the cell": label,
+                "What it is": everyday,
+                "Stiffness": f"{value:.3g} {unit}" if used else f"0 {unit}",
+                "Roughly": (
+                    "not included in this model" if not used
+                    else "the data did not need it" if value <= 0
+                    # A tension divided by the layer it sits in is a modulus,
+                    # which is the only way to put it on the same scale as
+                    # the rest.
+                    else stiffness_in_words(value * pa_factor)
+                ),
+            }
+        )
+    flat_table(pd.DataFrame(rows), align_right=["Stiffness"])
+    if "tension" in terms_for(st.session_state["cell_type"]):
+        st.caption(
+            "The protein network is quoted as a tension, in mN/m, because "
+            "that is what the curve measures: a taut sheet answers with a "
+            "force per unit length, and turning it into a stiffness needs an "
+            "assumed layer thickness (set in the sidebar). The everyday "
+            "comparison in the last column does make that conversion."
+        )
+
+
 def final_summary(fit, model, date_acquired=None):
     """
     The last thing on the page: this cell in one block, ready to be quoted.
@@ -3752,8 +3956,6 @@ def element_windows(terms=None, lo=0.0, hi=1.0):
     boundaries instead. Anything else would silently turn every fit into a
     different model.
     """
-    if not st.session_state.get("use_element_windows", False):
-        return None
     terms = tuple(terms if terms is not None else active_terms())
     out = {}
     for term in terms:
@@ -3764,7 +3966,9 @@ def element_windows(terms=None, lo=0.0, hi=1.0):
             a, b = float(window[0]), float(window[1])
         except (TypeError, ValueError, IndexError):
             continue
-        a = float(np.clip(a, lo, hi))
+        # Clamped from zero, not from the fitted range's start: an onset is
+        # where a law begins, and that is contact.
+        a = float(np.clip(a, 0.0, hi))
         b = float(np.clip(b, a, hi))
         if b > a:
             out[term] = (round(a, 4), round(b, 4))
@@ -3773,16 +3977,42 @@ def element_windows(terms=None, lo=0.0, hi=1.0):
 
 def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
                            cyto_start="break"):
-    """Where the composition would put this element, before anyone moves it."""
+    """
+    Where the composition would put this component, before anyone moves it.
+
+    A boundary outside the fitted range does not narrow anything: a shell
+    told to hold at ε₁ = 0.15 on a curve fitted from 0.27 never reaches that
+    boundary inside the range, so it acts across the whole of it. Read
+    literally, that window collapsed to nothing and took the fit with it,
+    which is what a curve with a bad contact looked like.
+    """
+    # Contact is ε = 0, not wherever the fitted range happens to start. A
+    # curve fitted from 0.27 because the approach misbehaved there is still
+    # a cell that was squashed from zero, and a shell whose law is measured
+    # from 0.27 instead is a different model with a different modulus. That
+    # was worth 0.08 of R² on the one reference curve with a bad contact.
+    lo, hi = 0.0, float(hi)
+    span = max(hi - lo, 1e-6)
+
+    def onset(value):
+        # An onset past the far end is a component never reached inside the
+        # range. It keeps a sliver at the top rather than an empty window,
+        # so the fit hands it zero rather than failing.
+        return float(np.clip(value, lo, hi - 0.01 * span))
+
     if term in ("nucleus", "nucleus_shell"):
-        return (float(np.clip(e2, lo, hi)), hi)
+        return (onset(e2), hi)
     if term == "interior" and cyto_start == "break":
-        return (float(np.clip(e1, lo, hi)), hi)
+        return (onset(e1), hi)
     if term in ("membrane", "tension"):
         if membrane == "late":
-            return (float(np.clip(e1, lo, hi)), hi)
+            return (onset(e1), hi)
         if membrane == "freeze":
-            return (lo, float(np.clip(e1, lo, hi)))
+            end = float(e1)
+            # Held at a boundary the range never reaches: it is still
+            # stretching everywhere in view.
+            return (lo, hi if end <= lo + 0.01 * span
+                    else float(np.clip(end, lo + 0.01 * span, hi)))
     return (lo, hi)
 
 
@@ -3803,21 +4033,28 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
     """
     if not terms:
         return None
-    own = st.checkbox(
-        "Set the ranges myself",
-        key="use_element_windows",
-        help="Off, each range shows where the fit will place that "
-        "component: the shell from first contact, the scaffolding from ε₁, "
-        "whatever is deeper from ε₂, with ε₁ and ε₂ found from the curve. "
-        "On, every range is yours and the fit uses exactly what you set.",
-    )
+    # Every range is editable, always, and every one is used by the fit.
+    # There is no switch: a range that follows the boundaries and a range
+    # set by hand are the same number, and the fit is identical while
+    # nothing has been moved, so a tick to choose between them was a
+    # question with no consequence.
+    own = True
     for term in terms:
         key = element_window_key(term)
         automatic = default_element_window(term, lo, hi, e1, e2, membrane,
                                            cyto_start)
-        if not own or not st.session_state.get(key):
+        # Until a range is moved by hand it follows the boundaries. Moving
+        # one marks it, and from then on it is that person's number: a fit
+        # that shifts ε₁ must not quietly undo what they set.
+        if not st.session_state.get(f"_window_touched_{term}") \
+                or not st.session_state.get(key):
             st.session_state[key] = automatic
 
+        # The bar runs from zero, not from where the fitted range starts:
+        # a law is measured from contact, and clamping it up to the range
+        # start is what turned a curve with a bad contact into a fit with
+        # no membrane in it at all.
+        floor = 0.0
         tick_col, range_col = st.columns([1.25, 2])
         with tick_col:
             st.checkbox(
@@ -3827,29 +4064,30 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
         with range_col:
             bar = f"{key}__bar"
             pair = st.session_state[key]
-            a = float(np.clip(pair[0], lo, hi - step))
+            a = float(np.clip(pair[0], floor, hi - step))
             b = float(np.clip(pair[1], a + step, hi))
             st.session_state[bar] = (a, b)
 
-            def _store(key=key, bar=bar):
+            def _store(term=term, key=key, bar=bar):
                 got = st.session_state.get(bar)
                 if got:
                     st.session_state[key] = (
                         round(float(got[0]), 4), round(float(got[1]), 4)
                     )
+                    st.session_state[f"_window_touched_{term}"] = True
 
             st.slider(
                 f"acts over ε · {plain_name(term)}",
-                min_value=float(lo), max_value=float(hi), step=float(step),
+                min_value=float(floor), max_value=float(hi), step=float(step),
                 key=bar, on_change=_store,
-                disabled=not own or not st.session_state.get(f"use_{term}"),
+                disabled=not st.session_state.get(f"use_{term}"),
                 label_visibility="collapsed",
                 help="Where this component starts carrying load and where "
                      "it stops taking more. Past the far end it holds what "
                      "it reached rather than vanishing, so the curve has no "
                      "step in it.",
             )
-    if own:
+    if True:
         automatic = {
             term: default_element_window(term, lo, hi, e1, e2, membrane,
                                          cyto_start)
@@ -3858,34 +4096,41 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
         drifted = [
             term for term in terms
             if st.session_state.get(f"use_{term}")
+            and st.session_state.get(f"_window_touched_{term}")
             and st.session_state.get(element_window_key(term)) != automatic[term]
         ]
         if drifted:
             st.caption(
-                "These ranges are yours now, so a fit that moves ε₁ or ε₂ no "
-                "longer moves them. "
+                "Moved by hand, so the boundaries no longer place "
                 + ", ".join(plain_name(t) for t in drifted)
                 + (" is" if len(drifted) == 1 else " are")
                 + " away from where the fit would put "
                 + ("it." if len(drifted) == 1 else "them.")
             )
-            if st.button("↺ Put them back where the fit wants them",
+            if st.button("↺ Put them back on the boundaries",
                          key="reset_element_windows", **STRETCH):
                 st.session_state["_pending_settings"] = {
                     element_window_key(term): window
                     for term, window in automatic.items()
                 }
+                for term in terms:
+                    st.session_state.pop(f"_window_touched_{term}", None)
                 st.rerun()
-    if not own:
+    if not drifted:
         st.caption(
-            "The ranges follow the fit: ε₁ and ε₂ are found from the curve "
-            "and the ranges move with them."
+            "Each range follows the boundaries until you move it: ε₁ and ε₂ "
+            "place them, and the ranges move when those do."
             + ("  A C2C12 usually goes membrane first, then the "
                "cytoskeleton — or both together from contact — then the "
                "nuclear envelope and what it contains, met together."
                if str(st.session_state.get("cell_type", "")).startswith("Myoblast")
                else "")
         )
+
+    # After the components, because it is a statement about the sample
+    # rather than one more component, and because ticking it takes all of
+    # them away.
+    fixed_cell_control()
     return element_windows(active_terms(), lo, hi)
 
 
@@ -3901,41 +4146,36 @@ def find_boundaries_control(model, lo, hi, terms):
     """
     if not terms:
         return
-    own = bool(st.session_state.get("use_element_windows"))
-    can_place = own and search_term_windows is not None
+    moved = any(
+        st.session_state.get(element_window_key(term)) is not None
+        and st.session_state.get(f"_window_touched_{term}")
+        for term in terms
+    )
+    can_place = moved and search_term_windows is not None
     can_scan = hasattr(model, "scan_segment_breaks")
 
-    c1, c2, c3 = st.columns([1.3, 1.3, 1.6])
+    c1, c2 = st.columns([1.2, 2])
     with c1:
         pressed = st.button(
             "🔎 Find boundaries from the data", key="find_breaks_top",
             type="primary", disabled=not (can_scan or can_place), **STRETCH,
         )
     with c2:
-        reset = st.button(
-            "↺ Back to the usual ones", key="reset_breaks_top", **STRETCH,
-            help="Puts ε₁ and ε₂ back where this cell type normally has "
-                 "them, and the component ranges with them.",
-        )
-    with c3:
         st.caption(
             f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
             f"ε₂ = {float(st.session_state['segment_break_2']):.3f}"
-            + (" · the ranges are yours, so the search moves those rather "
-               "than the boundaries." if own else
-               " · this cell type's usual placement until you press.")
+            + (" · a range has been moved by hand, so this searches the "
+               "ranges rather than the boundaries."
+               if can_place else
+               " · the default until you press this or set your own.")
         )
 
-    if reset:
-        st.session_state["_pending_settings"] = default_boundaries()
-        st.rerun()
-
-    learn_boundaries_control(model)
+    set_default_boundaries_control()
 
     if not pressed:
         return
 
-    if own:
+    if can_place:
         with st.spinner("Moving each range and scoring every placement on "
                         "points it was not fitted to…"):
             try:
@@ -3955,10 +4195,16 @@ def find_boundaries_control(model, lo, hi, terms):
                 found = {"success": False, "error": str(exc)}
         st.session_state["element_window_search"] = found
         if found.get("success"):
-            st.session_state["_pending_settings"] = {
+            pending = {
                 element_window_key(term): tuple(window)
                 for term, window in found["windows"].items()
             }
+            # A searched range is a placed range: it must not be put back on
+            # the boundaries by the next redraw.
+            pending.update({
+                f"_window_touched_{term}": True for term in found["windows"]
+            })
+            st.session_state["_pending_settings"] = pending
             st.rerun()
         st.error(found.get("error", "The placement search failed."))
         return
@@ -3980,115 +4226,76 @@ def find_boundaries_control(model, lo, hi, terms):
     st.error(found.get("error", "The boundary scan found nothing."))
 
 
-def learn_boundaries_control(model):
+def set_default_boundaries_control():
     """
-    Boundaries learned from several curves, and kept as this cell type's own.
+    Set the boundaries every new curve of this cell type starts from.
 
-    One curve's boundaries are one curve's. A placement worth starting every
-    cell from is the one several cells agree on, so this scans a batch and
-    keeps the median: the middle value rather than the mean, because one
-    curve with a bad contact should move the answer by one place in the
-    order and not by its whole distance.
+    A lab settles on a placement and then wants it back on every cell, not
+    typed again for each one. What is saved here is what the app fills in
+    the moment a curve of this type loads, and what the sidebar shows as
+    this type's boundaries.
     """
-    with st.expander("📚 Learn the usual boundaries from several curves"):
-        st.caption(
-            "Upload curves of this cell type — the same two columns as a "
-            "single one, relative deformation and force. Each is scanned on "
-            "its own, and the median ε₁ and ε₂ become what every new curve "
-            "of this cell type starts from."
-        )
-        files = st.file_uploader(
-            "Curves to learn from", type=["csv", "xlsx", "xls"],
-            accept_multiple_files=True, key="learn_boundary_files",
-        )
-        learned = st.session_state.get("learned_boundaries", {}).get(
-            st.session_state["cell_type"]
-        )
-        if learned:
-            st.caption(
-                f"Learned from {learned['n']} curve"
-                + ("s" if learned["n"] != 1 else "")
-                + f": ε₁ = {learned['break_1']:.3f}, ε₂ = "
-                f"{learned['break_2']:.3f}"
-                + (f" (spread {learned['spread_1']:.3f} and "
-                   f"{learned['spread_2']:.3f})" if learned.get("spread_1")
-                   is not None else "")
-                + ". New curves of this cell type start there."
+    cell_type = st.session_state.get("cell_type", "")
+    with st.expander("⚙️ Set the default boundaries for this cell type"):
+        now = default_boundaries(cell_type)
+        d1, d2, d3 = st.columns([1, 1, 1.2])
+        with d1:
+            first = st.number_input(
+                "Default ε₁", min_value=0.0, max_value=0.99, step=0.005,
+                format="%.3f", value=float(now["segment_break_1"]),
+                key="default_break_1_box",
             )
-            if st.button("↺ Forget them", key="forget_learned", **STRETCH):
-                st.session_state.setdefault("learned_boundaries", {}).pop(
-                    st.session_state["cell_type"], None
+        with d2:
+            second = st.number_input(
+                "Default ε₂", min_value=0.01, max_value=1.0, step=0.005,
+                format="%.3f", value=float(now["segment_break_2"]),
+                key="default_break_2_box",
+            )
+        with d3:
+            st.markdown("<div style='height:1.7rem'></div>",
+                        unsafe_allow_html=True)
+            saved = st.button("💾 Save as the default", key="save_defaults",
+                              **STRETCH)
+        st.caption(
+            f"Every new **{cell_type}** curve will start here, and the "
+            "component ranges with it. Pressing this also applies them to "
+            "the curve on screen."
+        )
+        stored = (st.session_state.get("learned_boundaries") or {}).get(cell_type)
+        if stored:
+            st.caption(
+                f"Your own defaults are in force: ε₁ = "
+                f"{stored['break_1']:.3f}, ε₂ = {stored['break_2']:.3f}."
+            )
+            if st.button("↺ Back to the built-in ones", key="forget_defaults",
+                         **STRETCH):
+                store = dict(st.session_state.get("learned_boundaries", {}))
+                store.pop(cell_type, None)
+                st.session_state["learned_boundaries"] = store
+                st.session_state["_pending_settings"] = default_boundaries(
+                    cell_type
                 )
+                for term in ALL_TERMS:
+                    st.session_state.pop(f"_window_touched_{term}", None)
                 st.rerun()
-        if not files:
+        if not saved:
             return
-        if not st.button(f"📚 Scan these {len(files)} curves",
-                         key="learn_boundaries_go", type="primary", **STRETCH):
+        if second <= first:
+            st.error("ε₂ has to be past ε₁.")
             return
-
-        found_1, found_2, failed = [], [], []
-        progress = st.progress(0.0, text="Scanning…")
-        for index, handle in enumerate(files):
-            progress.progress((index + 1) / max(len(files), 1),
-                              text=f"{handle.name}")
-            try:
-                frame = load_table(handle.getvalue(), handle.name)
-                columns = list(frame.columns)
-                eps = pd.to_numeric(
-                    frame[columns[guess_column(
-                        columns, ("reldef", "rel def", "deform", "eps", "ε",
-                                  "strain"), 0)]],
-                    errors="coerce").to_numpy(dtype=float)
-                force = pd.to_numeric(
-                    frame[columns[guess_column(columns, ("force", "f ("), 1)]],
-                    errors="coerce").to_numpy(dtype=float)
-                good = np.isfinite(eps) & np.isfinite(force)
-                order = np.argsort(eps[good], kind="stable")
-                eps, force = eps[good][order], force[good][order]
-                here = build_model(eps, force)
-                window = (here.suggest_window()
-                          if hasattr(here, "suggest_window") else {})
-                lo_here = (round(window.get("epsilon_min", 0.0), 4)
-                           if window.get("bad_contact") else 0.0)
-                hi_here = float(window.get("epsilon_max", eps.max())
-                                if window.get("success") else eps.max())
-                scan = here.scan_segment_breaks(
-                    lo_here, hi_here,
-                    terms=terms_for(st.session_state["cell_type"]),
-                    weighting=st.session_state["weighting"],
-                )
-                if scan.get("success"):
-                    found_1.append(float(scan["best_break_1"]))
-                    found_2.append(float(scan["best_break_2"]))
-                else:
-                    failed.append(f"{handle.name}: {scan.get('error', 'no fit')}")
-            except Exception as exc:
-                failed.append(f"{handle.name}: {exc}")
-        progress.empty()
-
-        if not found_1:
-            st.error("None of those curves could be scanned. "
-                     + "; ".join(failed[:3]))
-            return
-        learned = {
-            "n": len(found_1),
-            "break_1": float(np.median(found_1)),
-            "break_2": float(np.median(found_2)),
-            "spread_1": float(np.percentile(found_1, 75)
-                              - np.percentile(found_1, 25)),
-            "spread_2": float(np.percentile(found_2, 75)
-                              - np.percentile(found_2, 25)),
-        }
         store = dict(st.session_state.get("learned_boundaries", {}))
-        store[st.session_state["cell_type"]] = learned
-        st.session_state["learned_boundaries"] = store
-        if failed:
-            st.warning(f"{len(failed)} of {len(files)} could not be scanned: "
-                       + "; ".join(failed[:3]))
-        st.session_state["_pending_settings"] = {
-            "segment_break_1": round(learned["break_1"], 3),
-            "segment_break_2": round(learned["break_2"], 3),
+        store[cell_type] = {
+            "n": 0, "break_1": float(first), "break_2": float(second),
+            "spread_1": None, "spread_2": None,
         }
+        st.session_state["learned_boundaries"] = store
+        st.session_state["_pending_settings"] = {
+            "segment_break_1": round(float(first), 3),
+            "segment_break_2": round(float(second), 3),
+        }
+        # Setting a default means the ranges should follow it again.
+        for term in ALL_TERMS:
+            st.session_state.pop(f"_window_touched_{term}", None)
         st.rerun()
 
 
@@ -5811,7 +6018,6 @@ with tab_analysis:
                 )
 
             st.markdown("##### Components")
-            fixed_cell_control()
             chosen = active_terms()
             if not chosen:
                 st.warning("Tick at least one material before fitting.")
@@ -7537,107 +7743,11 @@ with tab_analysis:
                 f"thickness doubles Eₘ while the measurement is unchanged."
             )
 
-            # In both modes now: "which material carried what, where" is the
-            # question the boundaries section exists to answer, and a table
-            # of stiffnesses per stretch is the answer.
-            if fitted_coupling == "segmented" and fitted is not None:
-                # What each element is doing in each stretch, and how much of
-                # the force it carries there. This is the question the moduli
-                # alone do not answer: a modulus says how stiff, not how much
-                # of the load that stiffness actually took.
-                st.markdown("**How the materials share the load, range by range**")
-                e1, e2 = fit["break_1"], fit["break_2"]
-                membrane_mode_fit = fit.get("membrane", "freeze")
-                cyto_mode_fit = fit.get("cyto_start", "break")
-
-                def state_words(term, lo, hi):
-                    # The two membrane springs are one piece of material, so
-                    # they load and hold together.
-                    if term in ("membrane", "tension"):
-                        if hi <= e1 or membrane_mode_fit == "continue":
-                            return "loading"
-                        return "holding"
-                    if term == "cortex":
-                        return "loading"
-                    if term == "interior":
-                        if cyto_mode_fit == "zero" or lo >= e1:
-                            return "loading"
-                        return "not yet"
-                    return "loading" if lo >= e2 else "not yet"
-
-                rows = []
-                for name, lo, hi in (
-                    ("1", fit["epsilon_range"][0], e1),
-                    ("2", e1, e2),
-                    ("3", e2, fit["epsilon_range"][1]),
-                ):
-                    inside = (epsilon >= lo) & (epsilon <= hi)
-                    if not inside.any() or hi <= lo:
-                        continue
-                    share = {}
-                    for term, curve in (
-                        ("tension", tension), ("membrane", membrane),
-                        ("cortex", cortex), ("interior", interior),
-                        ("nucleus_shell", envelope), ("nucleus", nucleus),
-                    ):
-                        if curve is None:
-                            share[term] = 0.0
-                            continue
-                        at_top = float(np.nan_to_num(curve[inside][-1]))
-                        share[term] = max(at_top, 0.0)
-                    total = sum(share.values()) or 1.0
-                    row = {
-                        "range": f"{lo:.3f} to {hi:.3f}",
-                        "points": int(inside.sum()),
-                    }
-                    short = {t: plain_name(t).lower() for t in ALL_TERMS}
-                    for term, key, unit in (
-                        ("tension", "T0_mN_m", "mN/m"),
-                        ("membrane", "Em_MPa", "MPa"),
-                        ("cortex", "Ecx_kPa", "kPa"),
-                        ("interior", "Ei_kPa", "kPa"),
-                        ("nucleus_shell", "Ene_MPa", "MPa"),
-                        ("nucleus", "En_kPa", "kPa"),
-                    ):
-                        if term not in terms_for(st.session_state["cell_type"]):
-                            continue
-                        label = short[term]
-                        word = state_words(term, lo, hi)
-                        carrying = term in fitted_terms and word != "not yet"
-                        # The modulus in force here, not just in the fit as a
-                        # whole. An element not yet reached in this range
-                        # contributes exactly zero, and the row says so with a
-                        # number rather than leaving you to infer it.
-                        value = float(fit.get(key, 0.0)) if carrying else 0.0
-                        row[f"{TERM_SYMBOLS.get(term, 'E')} {label}"] = (
-                            f"{value:.4g} {unit}"
-                        )
-                        # Short cells. The long sentences were being cut off
-                        # by the table, which is worse than a word plus a
-                        # legend underneath.
-                        if term not in fitted_terms:
-                            row[label] = "off"
-                        elif word == "not yet":
-                            row[label] = "0 %  not reached"
-                        elif word == "holding":
-                            row[label] = f"{100 * share[term] / total:.0f} %  holding"
-                        else:
-                            row[label] = f"{100 * share[term] / total:.0f} %  loading"
-                    rows.append(row)
-
-                if rows:
-                    frame = pd.DataFrame(rows)
-                    flat_table(
-                        frame,
-                        align_right=[c for c in frame.columns if c != "range"],
-                    )
-                    st.caption(
-                        "**loading** carries more force as the squash "
-                        "deepens · **holding** keeps what it reached · "
-                        "**not reached** contributes exactly zero, which is "
-                        "a measurement and not a gap · **off** is not in the "
-                        "model at all."
-                    )
+            # No table of which material carried what in each stretch. The
+            # component ranges say where each one acts, the equation says
+            # what each contributes, and the moduli are printed twice
+            # already; a third table of percentages per stretch was reading
+            # the same fit for a third time.
 
             if fitted_coupling != "parallel" and st.session_state["show_components"]:
                 st.caption(
@@ -8094,10 +8204,10 @@ with tab_analysis:
                 st.markdown("**∑ What the search does, in maths**")
                 show_search_maths()
 
-            # And the answer on its own at the very bottom, after the
-            # working, in the form it would be written down in.
-            st.divider()
-            final_summary(fit, model, date_acquired)
+            # No block of the answer repeated at the foot. Every number in
+            # it is above: the moduli in the metrics row, the range and the
+            # boundaries in the sentence under the results heading, and the
+            # coefficients in the equation.
 
         section("7 · Video and database" if segmented else "6 · Video and database")
         store = st.session_state.get("onedrive_store")
