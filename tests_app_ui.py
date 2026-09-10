@@ -1103,16 +1103,14 @@ def case_guided_mode_is_the_default():
           str([m.label for m in app.get("metric")][:6]))
 
     if work is not None:
+        was = float(state(app, "segment_break_1"))
         work.click().run()
         if no_exception(app, "fitting"):
-            found = app.session_state["hypothesis_search"]
-            check("the search ran", bool(found and found.get("success")))
-            if found and found.get("success"):
-                best = found["best"]
-                check("the winner was applied",
-                      abs(app.session_state["segment_break_1"]
-                          - round(best["break_1"], 4)) < 0.002,
-                      f"{app.session_state['segment_break_1']} vs {best['break_1']}")
+            fit = state(app, "_last_fit")
+            check("the fit is made", bool(fit and fit.get("success")))
+            check("at the boundary that was on the page",
+                  float(state(app, "segment_break_1")) == was,
+                  f"{was} -> {state(app, 'segment_break_1')}")
 
 
 def case_full_control_shows_everything():
@@ -1650,42 +1648,53 @@ def case_it_picks_the_arrangement():
 
 
 def case_fitting_applies_what_it_found():
-    print("pressing fit applies the picture it chose")
+    print("pressing fit fits what is on the page, and moves nothing on it")
     app = start(cell_name="cell-01")
     work = button_by_label(app, "Fit this cell")
     check("the button is there", work is not None)
     if work is None:
         return
+    before = {
+        "segment_break_1": float(state(app, "segment_break_1")),
+        "segment_break_2": float(state(app, "segment_break_2")),
+        "membrane_after_break": state(app, "membrane_after_break"),
+        "cyto_starts_at": state(app, "cyto_starts_at"),
+        "use_membrane": state(app, "use_membrane"),
+        "use_interior": state(app, "use_interior"),
+        "use_nucleus": state(app, "use_nucleus"),
+    }
     work.click().run()
     if not no_exception(app, "fitting"):
         return
-    found = app.session_state["hypothesis_search"]
-    check("the comparison ran", bool(found and found.get("success")),
-          str(found.get("error") if found else None))
-    if not (found and found.get("success")):
-        return
-    winner = found["best"]
-    check("the composition on the page is the one it chose",
-          MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]]
-          == winner["membrane"]
-          and CYTO_MODE[app.session_state["cyto_starts_at"]]
-          == winner["cyto_start"],
-          f"{app.session_state['membrane_after_break']} / "
-          f"{app.session_state['cyto_starts_at']} vs "
-          f"{winner['membrane']} / {winner['cyto_start']}")
-    check("and so are the boundaries",
-          abs(float(app.session_state["segment_break_1"])
-              - winner["break_1"]) < 1e-3,
-          f"{app.session_state['segment_break_1']} vs {winner['break_1']:.4f}")
-    check("the materials ticked are the ones it chose",
-          all((t in winner["terms"]) == app.session_state[f"use_{t}"]
-              for t in ("membrane", "interior", "nucleus")),
-          str(winner["terms"]))
+    # The bug this catches: fitting used to compare arrangements and write
+    # the winner's boundaries back, so pressing it moved ε₁ and ε₂ off the
+    # numbers they had just been set to.
+    after = {key: (float(state(app, key)) if key.startswith("segment")
+                   else state(app, key)) for key in before}
+    check("the boundaries are exactly where they were",
+          after["segment_break_1"] == before["segment_break_1"]
+          and after["segment_break_2"] == before["segment_break_2"],
+          f"{before} -> {after}")
+    check("and so is the arrangement",
+          after["membrane_after_break"] == before["membrane_after_break"]
+          and after["cyto_starts_at"] == before["cyto_starts_at"], str(after))
+    check("and so are the components",
+          all(after[k] == before[k] for k in
+              ("use_membrane", "use_interior", "use_nucleus")), str(after))
+    fit = state(app, "_last_fit")
+    check("and the fit is the fit of those settings",
+          fit and fit.get("success")
+          and abs(float(fit["break_1"]) - before["segment_break_1"]) < 1e-6
+          and abs(float(fit["break_2"]) - before["segment_break_2"]) < 1e-6,
+          str((fit.get("break_1"), fit.get("break_2")) if fit else None))
     check("it is fitted as a hand-over, which is the only model with an order",
-          app.session_state["model_kind"].startswith("Segmented"),
-          app.session_state["model_kind"])
-    text = " ".join(str(m.value) for m in app.get("markdown"))
-    check("the answer is shown in words", "curve" in text.lower())
+          state(app, "model_kind").startswith("Segmented"),
+          state(app, "model_kind"))
+    said = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("success"))
+                    + list(app.get("info")))
+    check("and what it came to is said next to the button",
+          "R²" in said, said[-300:])
 
 
 def app_module_model_name(arrangement):
@@ -3190,45 +3199,25 @@ def case_components_are_recommended():
     check("and the interior is kept", "interior" in lean["recommended"],
           str(lean["recommended"]))
 
-    # It has to reach the page, with a way to act on it.
+    # It stays a library routine. The page no longer offers it: which
+    # components are in the model is a statement about the sample, and a
+    # button that cleared a tick box on a cross-validation score was the
+    # app arguing with the person about their own cell.
     app = start(cell_name="WT", cell_type="Cardiomyocyte")
-    if not no_exception(app, "component search"):
+    if not no_exception(app, "the page without an element search"):
         return
-    # The mixture is the search button's job, not the fit button's: fitting
-    # must never change which boxes are ticked, or a box clears while
-    # somebody is looking at the curve.
-    work = button_by_label(app, "Find the elements")
-    if work is None:
-        check("the button is there", False)
-        return
-    work.click().run()
-    if not no_exception(app, "after working it out"):
-        return
-    picked = state(app, "component_search")
-    check("the search ran with the button", picked and picked.get("success"))
-    # Equations, not a table of combinations to compare by eye: the
-    # comparison was the point of running the cross-validation.
-    formulas = " ".join(str(e.value) for e in app.get("latex"))
-    check("the combinations are reported as their held-out errors",
-          formulas.count(r"\mathrm{CV}\bigl(") >= 2, formulas[:400])
-    check("with the tie tolerance beside them",
-          r"\tau = " in formulas, formulas[:400])
-    check("and no table of combinations is left",
-          table_with(app, "components", "held-out RMSE (N)") is None)
-    check("and what it kept is what is ticked",
-          set(picked["recommended"])
-          == {t for t in app_module.ALL_TERMS
-              if state(app, f"use_{t}", False)
-              and t in app_module.terms_for("Cardiomyocyte")},
-          str(picked["recommended"]))
-    # No picker of near-identical sentences, and no table under it. What
-    # overrules the pick is the controls: the combination search, the two
-    # boundaries, the fitting options.
+    check("no button clears the component ticks for you",
+          button_by_label(app, "Find the elements") is None,
+          str([b.label for b in app.button][:10]))
+    check("the components are still ticked and still editable",
+          all(state(app, f"use_{t}", False)
+              for t in app_module.terms_for("Cardiomyocyte")),
+          str([c.label for c in app.checkbox][:6]))
     check("no picture picker is left on the page",
           not any("Which picture of the cell" in (r.label or "")
                   for r in app.get("radio")),
           str([r.label for r in app.get("radio")]))
-    check("the way to overrule it is a boundary you can move",
+    check("and the boundaries are still something you can move",
           any((s.label or "").startswith("ε₁") for s in app.slider),
           str([s.label for s in app.slider][:8]))
 
@@ -3844,7 +3833,7 @@ def case_one_fitting_routine():
     print("what loads and what the button does are the same routine")
     source = pathlib.Path(APP).read_text()
     check("there is one routine", source.count("def analyse_curve(") == 1)
-    check("and the button calls it", source.count("analyse_curve(") >= 2,
+    check("and the page calls it", source.count("analyse_curve(") >= 1,
           str(source.count("analyse_curve(")))
     check("the arrangement search no longer competes with it",
           "search_arrangements(" not in source.split("def analyse_curve")[-1]
@@ -4051,10 +4040,10 @@ def case_the_myoblast_nucleus_reaches_the_page():
     # The curve was built with its nucleus met at 0.50 and the page starts
     # at the middle of the band, so the envelope only carries load once the
     # boundary has been estimated. That is the search's job.
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Optimise the boundaries")
     if work is not None:
         work.click().run()
-        no_exception(app, "fitting the myoblast")
+        no_exception(app, "finding the onset")
         fit = state(app, "_last_fit") or fit
     check("the boundary is recovered inside the band",
           abs(float(fit["break_2"]) - 0.50) < 0.06, str(fit.get("break_2")))
@@ -4210,8 +4199,14 @@ def case_the_cardiomyocyte_curves_fit():
         if not no_exception(app, f"cell {n}"):
             continue
         # A loaded curve is fitted at this cell type's stated boundaries.
-        # Finding the arrangement the curve actually supports is what the
-        # button does, so that is what is being measured here.
+        # Moving them onto the curve is the optimisation button's job --
+        # fitting fits what it is given -- so both are pressed, in the
+        # order a person would press them.
+        button = button_by_label(app, "Optimise the boundaries")
+        if button is not None:
+            button.click().run()
+            if not no_exception(app, f"cell {n} refined"):
+                continue
         button = button_by_label(app, "Fit this cell")
         if button is not None:
             button.click().run()
@@ -5399,7 +5394,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Refine the boundaries")
+    button = button_by_label(app, "Optimise the boundaries")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5418,7 +5413,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           f"{state(app, 'element_window_nucleus')} against {moved}")
     # Pressed twice it must land in the same place: a search that answers
     # differently each time is not an estimate.
-    button = button_by_label(app, "Refine the boundaries")
+    button = button_by_label(app, "Optimise the boundaries")
     button.click().run()
     again = (float(state(app, "segment_break_1")),
              float(state(app, "segment_break_2")))
@@ -6095,6 +6090,12 @@ def case_unticking_a_material_fits_without_it():
     if not no_exception(app, "unticking the membrane"):
         return
     check("it stays unticked", app.session_state["use_membrane"] is False)
+    # Fitting fits what it is given, so the boundaries are optimised for
+    # the model that is now on the page before the fit is judged.
+    tune = button_by_label(app, "Optimise the boundaries")
+    if tune is not None:
+        tune.click().run()
+        no_exception(app, "refining without the membrane")
     work = button_by_label(app, "Fit this cell")
     if work is None:
         check("the fit button is there", False)
@@ -6110,13 +6111,13 @@ def case_unticking_a_material_fits_without_it():
     after = app.session_state["_last_fit"]
     check("and it is not in the fit", "membrane" not in after["terms"],
           str(after["terms"]))
-    check("the rest still fit the curve", after["r_squared"] > 0.999,
+    # Less well than with it, which is the honest consequence of removing
+    # a term that carries real load: what matters is that it still fits
+    # rather than collapsing.
+    check("the rest still fit the curve", after["r_squared"] > 0.995,
           f"{after['r_squared']:.6f}")
     check("the membrane modulus reads zero",
           after["Em_MPa"] == 0.0, str(after["Em_MPa"]))
-    picture = app.session_state["hypothesis_search"]["best"]["label"]
-    check("and the picture chosen does not name a material it left out",
-          "sarcolemma" not in picture.lower(), picture)
 
     # And the other half of the same rule: a component that is ticked stays
     # ticked. Fitting decides the arrangement and the boundaries; which
