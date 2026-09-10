@@ -4040,7 +4040,7 @@ def case_the_myoblast_nucleus_reaches_the_page():
     # The curve was built with its nucleus met at 0.50 and the page starts
     # at the middle of the band, so the envelope only carries load once the
     # boundary has been estimated. That is the search's job.
-    work = button_by_label(app, "Optimise the boundaries")
+    work = button_by_label(app, "Find the boundaries from the log curve")
     if work is not None:
         work.click().run()
         no_exception(app, "finding the onset")
@@ -4202,7 +4202,7 @@ def case_the_cardiomyocyte_curves_fit():
         # Moving them onto the curve is the optimisation button's job --
         # fitting fits what it is given -- so both are pressed, in the
         # order a person would press them.
-        button = button_by_label(app, "Optimise the boundaries")
+        button = button_by_label(app, "Find the boundaries from the log curve")
         if button is not None:
             button.click().run()
             if not no_exception(app, f"cell {n} refined"):
@@ -5025,8 +5025,9 @@ def case_the_controls_sit_above_the_curve():
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
           > source.index('st.markdown("#### Fitting results")'))
-    check("and the power law after that",
-          source.index('st.markdown("##### What the power law says")')
+    check("and the power-law picture after that",
+          source.index(
+              'st.markdown("##### Where the curve changes its power law")')
           > source.index('st.markdown("##### The equation that was fitted")'))
 
     app = start(cell_name="cell-01")
@@ -5034,7 +5035,7 @@ def case_the_controls_sit_above_the_curve():
         return
     text = " ".join(str(m.value) for m in app.get("markdown"))
     for wanted in ("Fitting results", "The equation that was fitted",
-                   "What the power law says"):
+                   "Where the curve changes its power law"):
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
     check("the settings are behind one line, not three",
@@ -5150,18 +5151,23 @@ def case_the_range_carries_its_own_maths():
     if not no_exception(app, "range maths"):
         return
     said = " ".join(str(m.value) for m in app.get("markdown"))
-    check("what the power law says is written out at the end",
-          "What the power law says" in said, said[-400:])
+    check("the power law is a picture at the end, not a paragraph",
+          "Where the curve changes its power law" in said, said[-400:])
     formulas = " ".join(str(getattr(e, "value", "")) for e in app.get("latex"))
     check("the least-squares sum is written with the range in it",
           "arg\\min" in formulas or "argmin" in formulas.replace(" ", ""),
           formulas[:200])
-    table = table_with(app, "material", "contributes")
-    check("and each material's own law is listed", table is not None)
-    if table is not None:
-        check("with the slope it implies near contact",
-              "slope near contact" in table.columns, str(list(table.columns)))
-        check("for every material in the fit", len(table) >= 2, str(len(table)))
+    # The laws sit beside the tick boxes now, one line each, rather than in
+    # a table further down: a component is a term in an equation, and the
+    # exponent is what makes it a different term from its neighbour.
+    import app as app_module
+    said_all = " ".join(str(c.value) for c in app.get("caption"))
+    laws = [app_module.MATERIAL_LAWS[t]["law"]
+            for t in app_module.terms_for("Myoblast (C2C12)")]
+    check("and each component carries its own law beside it",
+          all(law in said_all for law in laws), str(laws))
+    check("with the exponent in it, which is what tells them apart",
+          all(mark in said_all for mark in ("ε³", "³ᐟ²")), said_all[:200])
 
 
 def case_the_page_ends_with_the_answer():
@@ -5394,7 +5400,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Optimise the boundaries")
+    button = button_by_label(app, "Find the boundaries from the log curve")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5413,7 +5419,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           f"{state(app, 'element_window_nucleus')} against {moved}")
     # Pressed twice it must land in the same place: a search that answers
     # differently each time is not an estimate.
-    button = button_by_label(app, "Optimise the boundaries")
+    button = button_by_label(app, "Find the boundaries from the log curve")
     button.click().run()
     again = (float(state(app, "segment_break_1")),
              float(state(app, "segment_break_2")))
@@ -6092,7 +6098,7 @@ def case_unticking_a_material_fits_without_it():
     check("it stays unticked", app.session_state["use_membrane"] is False)
     # Fitting fits what it is given, so the boundaries are optimised for
     # the model that is now on the page before the fit is judged.
-    tune = button_by_label(app, "Optimise the boundaries")
+    tune = button_by_label(app, "Find the boundaries from the log curve")
     if tune is not None:
         tune.click().run()
         no_exception(app, "refining without the membrane")
@@ -6251,6 +6257,78 @@ def case_a_new_curve_arrives_ready_to_fit():
           str([m.delta for m in tiles]))
 
 
+def case_the_boundaries_come_from_the_log_curve():
+    print("the boundaries are read off the log slope, and the placements "
+          "tried are shown")
+    import app as app_module
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "before the boundary search"):
+        return
+
+    # The defaults panel is the first thing under Optimization: it is the
+    # decision the search is measured against.
+    source = pathlib.Path(APP).read_text()
+    body = source.split('st.markdown("##### Optimization")')[-1]
+    check("the defaults panel comes first under Optimization",
+          body.index("set_default_boundaries_control()")
+          < body.index("refine_boundaries_control("), body[:200])
+
+    work = button_by_label(app, "Find the boundaries from the log curve")
+    check("the button says where the boundaries come from", work is not None,
+          str([b.label for b in app.button][:8]))
+    if work is None:
+        return
+    work.click().run()
+    if not no_exception(app, "the log-slope search"):
+        return
+
+    rows = state(app, "boundary_candidates")
+    check("several placements were tried, not one", rows and len(rows) >= 3,
+          str(len(rows or [])))
+    if not rows:
+        return
+    check("one of them is the log curve's own answer",
+          any("log slope" in row["why"] for row in rows),
+          str([row["why"] for row in rows]))
+    check("and one is what was on the page, so nothing changes unseen",
+          any("on the page" in row["why"] for row in rows),
+          str([row["why"] for row in rows]))
+    check("every row carries what it came to",
+          all(np.isfinite(row["r_squared"]) for row in rows),
+          str([row.get("r_squared") for row in rows]))
+    applied = (round(float(state(app, "segment_break_1")), 3),
+               round(float(state(app, "segment_break_2")), 3))
+    check("the best one was applied",
+          any((round(row["break_1"], 3), round(row["break_2"], 3)) == applied
+              for row in rows), str(applied))
+
+    # And any other row can be taken with one press.
+    others = [i for i, row in enumerate(rows)
+              if (round(row["break_1"], 3), round(row["break_2"], 3)) != applied]
+    if others:
+        pick = rows[others[0]]
+        take = button_by_label(app, "Use")
+        check("the others are one button away", take is not None,
+              str([b.label for b in app.button][:10]))
+        if take is not None:
+            take.click().run()
+            no_exception(app, "taking another placement")
+            check("and pressing it applies that placement",
+                  abs(float(state(app, "segment_break_2"))
+                      - pick["break_2"]) < 1e-3,
+                  f"{state(app, 'segment_break_2')} vs {pick['break_2']}")
+
+    # The slope profile is measured from the data, with no fit in it.
+    profile = state(app, "_slope_profile")
+    check("the log slope was measured along the curve",
+          profile is not None and len(profile.get("epsilon", [])) > 5,
+          str(len(profile.get("epsilon", [])) if profile else 0))
+
+    said = " ".join(str(m.value) for m in app.get("markdown"))
+    check("and the prose about power laws is gone",
+          "What the power law says" not in said)
+
+
 def case_the_video_is_not_a_plot_marking():
     print("the video belongs to the record and the morphology, not the plot")
     app = start(cell_name="cell-01")
@@ -6345,6 +6423,7 @@ if __name__ == "__main__":
         case_a_fixed_cell_is_one_hertzian_solid,
         case_unticking_a_material_fits_without_it,
         case_a_new_curve_arrives_ready_to_fit,
+        case_the_boundaries_come_from_the_log_curve,
         case_the_video_is_not_a_plot_marking,
         case_the_nucleus_is_a_balloon_too,
         case_the_myoblast_nucleus_reaches_the_page,
