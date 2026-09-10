@@ -1294,32 +1294,30 @@ def fitted_equation(fit, unit="nN", heading=True):
         error = fit.get(std_key)
         relative = _relative_error(piece, fit)
         coefficient = piece["coefficient_N"] * factor
+        # The moduli themselves are not repeated here: they are quoted with
+        # their uncertainties in the results above. What this table is for
+        # is the arithmetic between a modulus and the number in front of the
+        # shape of ε, which is nowhere else.
         rows.append({
             "element": piece["name"],
-            "modulus": (f"{float(value):.4g} {unit_name}"
-                        if value is not None and np.isfinite(float(value))
-                        else "n/a"),
-            "± (fit)": (f"{float(error):.2g} {unit_name}"
-                        if error is not None and np.isfinite(float(error))
-                        else "n/a"),
-            "± (%)": (f"{relative * 100:.1f}%"
-                      if np.isfinite(relative) else "n/a"),
             "prefactor (N/Pa)": f"{piece['prefactor']:.5g}",
             f"coefficient ({unit_label})": (
                 f"{coefficient:.5g}"
                 + (f" ± {coefficient * relative:.2g}"
                    if np.isfinite(relative) else "")
             ),
+            "± (%)": (f"{relative * 100:.1f}%"
+                      if np.isfinite(relative) else "n/a"),
         })
     flat_table(
         pd.DataFrame(rows),
-        align_right=["modulus", "± (fit)", "± (%)", "prefactor (N/Pa)",
-                     f"coefficient ({unit_label})"],
-        caption="Each coefficient is that element's prefactor times its "
-                "modulus: the number in front of its shape of ε above. The "
-                "± is the standard error from the covariance of the fit, "
-                "σ²(XᵀWX)⁻¹, so a modulus and its own coefficient carry the "
-                "same fractional uncertainty.",
+        align_right=["prefactor (N/Pa)", f"coefficient ({unit_label})",
+                     "± (%)"],
+        caption="Each coefficient is that element's geometric prefactor "
+                "times its modulus. The prefactor is fixed before fitting, "
+                "so the coefficient carries exactly the fractional "
+                "uncertainty of the modulus, and the ± on both is the "
+                "standard error from the covariance of the fit, σ²(XᵀWX)⁻¹.",
     )
     worst = fit.get("worst_pair")
     correlation = abs(fit.get("worst_correlation", 0.0) or 0.0)
@@ -1332,14 +1330,11 @@ def fitted_equation(fit, unit="nN", heading=True):
             f"is what the ± above is measuring. Widening the range, "
             f"especially towards ε = 0, is what separates them."
         )
-    chi = fit.get("chi_squared_reduced", float("nan"))
+    # R², χ²/dof and the RMSE are on the tiles above; what is not up there
+    # is how many parameters bought them and how well conditioned the
+    # design was.
     st.caption(
-        f"R² = {fit.get('r_squared', float('nan')):.5f}"
-        + (f" (adjusted {fit['adj_r_squared']:.5f})"
-           if np.isfinite(fit.get("adj_r_squared", np.nan)) else "")
-        + (f" · χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
-        + f" · RMSE = {fit.get('rmse', float('nan')):.4g} N"
-        + f" · {int(fit.get('n_points', 0))} points"
+        f"{int(fit.get('n_points', 0))} points"
         + f" · {int(fit.get('n_params', 0))} free parameters"
         + f" · weighted {fit.get('weighting', 'uniform')}"
         + (f" · κ(X) = {float(fit['condition_number']):.4g}"
@@ -1351,80 +1346,29 @@ def fitted_equation(fit, unit="nN", heading=True):
     copy_the_results(fit, unit)
 
 
-def moduli_with_uncertainty(fit):
+def element_support(term, fit):
     """
-    Every fitted modulus with its standard error, and where it was measured.
+    Where this element carries load, said so it cannot be misread.
 
-    The ± is the diagonal of σ²(XᵀWX)⁻¹ at the fitted boundaries: how far
-    that modulus can move before the curve stops following the points, with
-    the others free to compensate. It is the number that decides whether two
-    cells differ, so it is given the same weight on the page as the modulus
-    itself rather than being tucked under it.
+    The upper edge of an element's window is where it stops taking *more*
+    load, not where its contribution ends: past it the element holds what it
+    reached, so the force it carries continues to the end of the curve. A
+    bare interval said the opposite -- "membrane 0.000 to 0.277" reads as a
+    sarcolemma that stops carrying at 0.277, which is not what the model
+    does and not what a sarcolemma does.
     """
     if not (fit and fit.get("success")):
-        return
-    here = terms_for(st.session_state.get("cell_type"))
-    fitted_terms = set(fit.get("terms") or ())
-    windows = fit.get("term_windows") or {}
-    rows = []
-    for term in ALL_TERMS:
-        if term not in here:
-            continue
-        key, unit_name, std_key = MODULUS_FIELDS[term]
-        used = term in fitted_terms
-        try:
-            value = float(fit.get(key, 0.0))
-        except (TypeError, ValueError):
-            value = float("nan")
-        try:
-            error = float(fit.get(std_key, float("nan")))
-        except (TypeError, ValueError):
-            error = float("nan")
-        window = windows.get(term)
-        rows.append({
-            "component": f"{TERM_SYMBOLS.get(term, term)} "
-                         f"{plain_name(term).lower()}",
-            f"modulus": ("not in this model" if not used
-                         else f"{value:.4g} {unit_name}"),
-            "± (standard error)": (
-                "—" if not used or not np.isfinite(error)
-                else f"± {error:.3g} {unit_name}"
-            ),
-            "± (%)": (
-                "—" if not used or not np.isfinite(error) or value == 0
-                else f"{abs(error / value) * 100:.1f}%"
-            ),
-            # The interval itself, not only the half-width. A modulus is
-            # bounded below at zero by the fit, so an interval that would
-            # reach past zero is reported from zero: negative stiffness is
-            # not a value this measurement can take.
-            "95% interval": (
-                "—" if not used or not np.isfinite(error)
-                else f"{max(value - 1.96 * error, 0.0):.4g} to "
-                     f"{value + 1.96 * error:.4g} {unit_name}"
-            ),
-            "acts over ε": (
-                "—" if not used else
-                (f"{float(window[0]):.3f} to {float(window[1]):.3f}"
-                 if window else
-                 f"{float(fit.get('epsilon_range', (0, 1))[0]):.3f} to "
-                 f"{float(fit.get('epsilon_range', (0, 1))[1]):.3f}")
-            ),
-        })
-    if not rows:
-        return
-    flat_table(
-        pd.DataFrame(rows),
-        align_right=["modulus", "± (standard error)", "± (%)",
-                     "95% interval", "acts over ε"],
-        caption="The ± is one standard error from the covariance of the "
-                "fit, σ²(XᵀWX)⁻¹, and the interval is that doubled either "
-                "way (±1.96σ), cut at zero because a modulus cannot be "
-                "negative. A component that was in the model and came out "
-                "at zero is a measurement: the curve had no force left for "
-                "it. One reading 'not in this model' was never fitted, "
-                "which is a different statement.",
-    )
+        return ""
+    if term not in (fit.get("terms") or ()):
+        return "not in this model"
+    window = (fit.get("term_windows") or {}).get(term)
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    if not window:
+        return f"from ε {lo:.3f}, stiffening to the end"
+    a, b = float(window[0]), float(window[1])
+    if b >= hi - 1e-6:
+        return f"from ε {a:.3f}, stiffening to the end"
+    return f"from ε {a:.3f}, holding from {b:.3f}"
 
 
 def copy_the_results(fit, unit="nN"):
@@ -3295,6 +3239,29 @@ HYPOTHESES = {
 }
 
 
+def agrees_with_prior(spec, cell_type=None):
+    """
+    Whether one arrangement is consistent with what this cell type does.
+
+    An element the cell type carries throughout cannot be arranged so that
+    it stops. "Membrane holds what it reached at ε₁" is a legitimate
+    arrangement for a cell whose shell does that; for a C2C12, whose
+    sarcolemma goes on taking load to the end, it is a picture of a
+    different cell, and offering it to the comparison is how the fit came
+    back saying the membrane stopped carrying at the first boundary.
+    """
+    throughout = component_prior(cell_type).get("throughout") or ()
+    if not throughout:
+        return True
+    if ("membrane" in throughout
+            and spec.get("membrane", "continue") != "continue"):
+        return False
+    if ("interior" in throughout
+            and spec.get("cyto_start", "zero") != "zero"):
+        return False
+    return True
+
+
 def hypotheses_for(cell_type, terms=None, exact=False):
     """
     The named pictures to test for this cell type.
@@ -3323,6 +3290,11 @@ def hypotheses_for(cell_type, terms=None, exact=False):
         found = cardiomyocyte_hypotheses()
     else:
         found = HYPOTHESES.get(cell_type, [])
+    # Marked, not filtered. What is known about a cell type breaks a tie in
+    # its favour; it does not overrule a curve that says something else
+    # loudly, because "usually" is what the prior claims and no more.
+    found = [dict(spec, expected=agrees_with_prior(spec, cell_type))
+             for spec in found]
     if terms is None:
         return found
 
@@ -4289,8 +4261,12 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
                 st.rerun()
     if not drifted:
         st.caption(
-            "Each range follows the boundaries until you move it: ε₁ and ε₂ "
-            "place them, and the ranges move when those do."
+            "A range is where a component takes on load: it starts at the "
+            "near edge and stops taking **more** at the far edge, holding "
+            "what it reached to the end of the curve, so nothing ever drops "
+            "out of the force. Each one follows the boundaries until you "
+            "move it: ε₁ and ε₂ place them, and the ranges move when those "
+            "do."
             + ("  A C2C12 usually goes membrane first, then the "
                "cytoskeleton — or both together from contact — then the "
                "nuclear envelope and what it contains, met together."
@@ -6881,8 +6857,12 @@ with tab_analysis:
                 st.caption(
                     "Fits exactly the components ticked above, over the "
                     "range and boundaries shown: this cell type's defaults "
-                    "until you change them. The other button is what goes "
-                    "looking for a different answer."
+                    "until you change them."
+                    + (" Where two arrangements fit equally well, the one "
+                       "this cell type is known to take is kept."
+                       if component_prior().get("throughout") else
+                       " The other button is what goes looking for a "
+                       "different answer.")
                 )
             with verdict_col:
                 guess = st.session_state.get("hypothesis_search")
@@ -8195,21 +8175,24 @@ with tab_analysis:
             for slot, (label, value, unit, term) in enumerate(moduli_shown):
                 used = term in fitted_terms
                 std = fit.get(MODULUS_FIELDS[term][2], float("nan"))
+                # The uncertainty goes in the number, not under it. A
+                # modulus quoted alone is not a measurement, and it is the ±
+                # that decides whether two cells differ, so it is the same
+                # size as the thing it qualifies.
+                if not used:
+                    shown = f"0 {unit}"
+                elif np.isfinite(std) and value > 0:
+                    shown = f"{value:.3g} ± {std:.2g} {unit}"
+                else:
+                    shown = f"{value:.3g} {unit}"
                 if not used:
                     note = "not in this model"
                 elif value <= 0:
-                    note = "came out at zero"
-                elif np.isfinite(std):
-                    note = f"± {std:.2g}"
-                elif term in ("nucleus", "nucleus_shell"):
-                    note = f"from ε = {fit.get('break_2', model.nucleus_onset):.3f}"
+                    note = "came out at zero · " + element_support(term, fit)
                 else:
-                    note = " "
+                    note = element_support(term, fit)
                 metric_cols[slot].metric(
-                    label,
-                    f"{0.0 if not used else value:.3g} {unit}",
-                    delta=note,
-                    delta_color="off",
+                    label, shown, delta=note, delta_color="off",
                 )
             metric_cols[quality_slots[0]].metric(
                 "R²", f"{fit['r_squared']:.4f}",
@@ -8242,12 +8225,10 @@ with tab_analysis:
                 "order of magnitude, not to two decimal places."
             )
 
-            # The same moduli again, each with the uncertainty the fit
-            # gives it. The tiles above round hard and put the ± in small
-            # grey type, which is the wrong size for the number that says
-            # whether two cells differ. A modulus without its uncertainty
-            # is not a measurement.
-            moduli_with_uncertainty(fit)
+            # No second table of the same moduli. Each is quoted with its
+            # own uncertainty in the tile above, which is where a modulus
+            # belongs; everything else about it is in the equation and the
+            # copy block below.
 
             # The model must never soften. Every basis function has a
             # non-decreasing slope and every modulus is bounded at zero, so
