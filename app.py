@@ -8,6 +8,7 @@ with the diagnostics needed to tell a real measurement from a bad window.
 
 from __future__ import annotations
 
+import csv
 import importlib
 import io
 import json
@@ -1097,6 +1098,127 @@ def _sci_latex(value, digits=3):
     return f"{mantissa:.{digits}g} \\times 10^{{{power}}}"
 
 
+def _relative_error(piece, fit):
+    """One coefficient's fractional uncertainty, or nan where there is none.
+
+    A coefficient is a fixed geometric prefactor times a fitted modulus, so
+    the fractional uncertainty of the two is the same number and the units
+    the modulus is reported in cannot change it.
+    """
+    key, _unit, std_key = MODULUS_FIELDS[piece["term"]]
+    try:
+        value = float(fit.get(key))
+        error = float(fit.get(std_key))
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(value) and np.isfinite(error)) or value == 0:
+        return float("nan")
+    return abs(error / value)
+
+
+def _coefficient_latex(piece, fit, factor):
+    """A coefficient written with its uncertainty, where the fit has one."""
+    value = piece["coefficient_N"] * factor
+    relative = _relative_error(piece, fit)
+    if not np.isfinite(relative) or relative <= 0:
+        return _sci_latex(value)
+    return (r"(" + _sci_latex(value) + r" \pm "
+            + _sci_latex(value * relative, digits=2) + r")")
+
+
+def fit_record(fit, unit="nN"):
+    """
+    Everything this fit measured, as one flat record of name → value.
+
+    Flat and unformatted on purpose. This is what gets pasted into a
+    spreadsheet, and a number that arrived as "2.01 MPa" is text that Excel
+    will not average. Units live in the column names, values are plain
+    floats, and the two rows are in the same order, so one paste is a row of
+    a growing table.
+    """
+    if not (fit and fit.get("success")):
+        return {}
+    factor, unit_label = FORCE_UNITS.get(unit, (1e9, "nN"))
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    record = {
+        "Cell ID": st.session_state.get("cell_name", ""),
+        "Cell type": st.session_state.get("cell_type", ""),
+        "Experiment date": str(st.session_state.get("date_acquired", "")),
+        "Cell height (um)": st.session_state.get("cell_height_um", ""),
+        "Spring constant (N/m)": st.session_state.get("spring_constant", ""),
+        "eps min": round(lo, 4),
+        "eps max": round(hi, 4),
+        "eps1": (round(float(fit["break_1"]), 4)
+                 if fit.get("break_1") is not None else ""),
+        "eps2": (round(float(fit["break_2"]), 4)
+                 if fit.get("break_2") is not None else ""),
+        "q (confinement)": round(float(fit.get("confinement", 0.0) or 0.0), 4),
+    }
+    for term in ALL_TERMS:
+        if term not in (fit.get("terms") or ()):
+            continue
+        key, unit_name, std_key = MODULUS_FIELDS[term]
+        value = fit.get(key)
+        error = fit.get(std_key)
+        label = f"{plain_name(term)} {key.split('_')[0]} ({unit_name})"
+        record[label] = (float(value)
+                         if value is not None and np.isfinite(float(value))
+                         else "")
+        record[f"± {label}"] = (
+            float(error) if error is not None and np.isfinite(float(error))
+            else ""
+        )
+    for piece in equation_pieces(fit):
+        label = f"coefficient {TERM_SYMBOLS.get(piece['term'], piece['term'])} ({unit_label})"
+        record[label] = piece["coefficient_N"] * factor
+        relative = _relative_error(piece, fit)
+        record[f"± {label}"] = (
+            piece["coefficient_N"] * factor * relative
+            if np.isfinite(relative) else ""
+        )
+    record.update({
+        "R2": float(fit.get("r_squared", float("nan"))),
+        "adjusted R2": float(fit.get("adj_r_squared", float("nan"))),
+        "chi2": float(fit.get("chi_squared", float("nan"))),
+        "chi2 per dof": float(fit.get("chi_squared_reduced", float("nan"))),
+        "RMSE (N)": float(fit.get("rmse", float("nan"))),
+        "n points": int(fit.get("n_points", 0)),
+        "free parameters": int(fit.get("n_params", 0)),
+        "weighting": fit.get("weighting", "uniform"),
+        "membrane past eps1": fit.get("membrane", ""),
+        "cytoskeleton starts": fit.get("cyto_start", ""),
+        "worst basis correlation": (
+            abs(float(fit["worst_correlation"]))
+            if fit.get("worst_correlation") is not None
+            and np.isfinite(fit.get("worst_correlation", float("nan"))) else ""
+        ),
+    })
+    return record
+
+
+def _tsv(record):
+    """A record as two tab-separated lines: headers, then values."""
+
+    def cell(value):
+        if isinstance(value, float):
+            if not np.isfinite(value):
+                return ""
+            return f"{value:.6g}"
+        return str(value)
+
+    return ("\t".join(record.keys()) + "\n"
+            + "\t".join(cell(v) for v in record.values()))
+
+
+def _csv(record):
+    """The same record as CSV, quoted properly, for the download button."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(list(record.keys()))
+    writer.writerow(_tsv(record).split("\n")[1].split("\t"))
+    return buffer.getvalue()
+
+
 def fitted_equation(fit, unit="nN", heading=True):
     """
     The model that fits best, written out twice: as symbols and as numbers.
@@ -1126,7 +1248,7 @@ def fitted_equation(fit, unit="nN", heading=True):
         r"\frac{F(\varepsilon)}{\mathrm{" + unit_label + r"}} = " + confine
         + bracket_open
         + " + ".join(
-            _sci_latex(p["coefficient_N"] * factor) + r"\," + p["basis"]
+            _coefficient_latex(p, fit, factor) + r"\," + p["basis"]
             for p in pieces
         )
         + bracket_close
@@ -1155,6 +1277,8 @@ def fitted_equation(fit, unit="nN", heading=True):
         key, unit_name, std_key = MODULUS_FIELDS[piece["term"]]
         value = fit.get(key)
         error = fit.get(std_key)
+        relative = _relative_error(piece, fit)
+        coefficient = piece["coefficient_N"] * factor
         rows.append({
             "element": piece["name"],
             "modulus": (f"{float(value):.4g} {unit_name}"
@@ -1163,263 +1287,84 @@ def fitted_equation(fit, unit="nN", heading=True):
             "± (fit)": (f"{float(error):.2g} {unit_name}"
                         if error is not None and np.isfinite(float(error))
                         else "n/a"),
+            "± (%)": (f"{relative * 100:.1f}%"
+                      if np.isfinite(relative) else "n/a"),
             "prefactor (N/Pa)": f"{piece['prefactor']:.5g}",
-            f"coefficient ({unit_label})": f"{piece['coefficient_N'] * factor:.5g}",
+            f"coefficient ({unit_label})": (
+                f"{coefficient:.5g}"
+                + (f" ± {coefficient * relative:.2g}"
+                   if np.isfinite(relative) else "")
+            ),
         })
     flat_table(
         pd.DataFrame(rows),
-        align_right=["modulus", "± (fit)", "prefactor (N/Pa)",
+        align_right=["modulus", "± (fit)", "± (%)", "prefactor (N/Pa)",
                      f"coefficient ({unit_label})"],
         caption="Each coefficient is that element's prefactor times its "
-                "modulus: the number in front of its shape of ε above.",
-    )
-
-
-def show_fit_maths(fit, model):
-    """
-    The arithmetic behind the numbers, with this cell's values in it.
-
-    A modulus with no working shown is a number to be trusted or not. Written
-    out with the prefactors and the basis functions, it can be checked.
-    """
-    if not (fit and fit.get("success")):
-        st.caption("Fit the curve and the working appears here.")
-        return
-
-    terms = set(fit.get("terms") or ())
-    e1 = fit.get("break_1")
-    e2 = fit.get("break_2")
-    segmented = fit.get("coupling") == "segmented"
-
-    st.markdown("**1 · The model that was fitted**")
-    if segmented:
-        membrane_basis = (
-            r"\varepsilon^{3}" if fit.get("membrane") == "continue"
-            else r"\min(\varepsilon,\ \varepsilon_1)^{3}"
-        )
-        cyto_basis = (
-            r"\varepsilon^{3/2}" if fit.get("cyto_start") == "zero"
-            else r"\langle \varepsilon - \varepsilon_1 \rangle^{3/2}"
-        )
-        pieces = []
-        if "tension" in terms:
-            # Same held basis as the elastic term: one shell, one history.
-            pieces.append(
-                r"A_t T_0\,"
-                + (r"\varepsilon" if fit.get("membrane") == "continue"
-                   else r"\min(\varepsilon,\ \varepsilon_1)")
-            )
-        if "membrane" in terms:
-            pieces.append(r"A_m E_m\," + membrane_basis)
-        if "interior" in terms:
-            pieces.append(r"A_i E_c\," + cyto_basis)
-        if "nucleus" in terms:
-            pieces.append(r"A_n E_n \langle \varepsilon - \varepsilon_2 \rangle^{3/2}")
-        st.latex(r"F(\varepsilon) = " + " + ".join(pieces))
-        st.caption(
-            "⟨x⟩ is x when x is positive and zero otherwise, so a term "
-            "contributes nothing before its boundary. Every term shares the "
-            "same ε and the forces add: the elements are side by side, not "
-            "stacked."
-        )
-        if "tension" in terms:
-            st.caption(
-                "The first two terms are both the membrane. T₀ is the "
-                "in-plane tension already in the protein network, which "
-                "resists the area the cell has to gain as it flattens and so "
-                "answers in proportion to ε; Eₘ is the shell's elastic "
-                "resistance to that same area strain, which only bites when "
-                "the strain is large and so goes as ε³. They rise at "
-                "different rates, which is the only reason a fit can tell "
-                "them apart, and they stop together, because they are one "
-                "piece of material."
-            )
-    else:
-        st.latex(
-            r"F(\varepsilon) = A_m E_m \varepsilon^{3} + A_i E_c "
-            r"\varepsilon^{3/2} + A_n E_n \langle \varepsilon - "
-            r"\varepsilon_0 \rangle^{3/2}"
-        )
-
-    # Every element, its law, and what that law does to the slope. The
-    # exponent is the checkable part: a log-log slope is something you can
-    # read off the curve yourself and hold the model to.
-    q = float(st.session_state.get("confinement", 0.0) or 0.0)
-    laws = []
-    for term, symbol, power, shape in (
-        ("tension", "T₀", 1.0, "A_t T₀ ε"),
-        ("membrane", "Eₘ", 3.0, "A_m Eₘ ε³"),
-        ("interior", "Ec", 1.5, "A_i Ec ε³ᐟ²"),
-        ("nucleus", "Eₙ", 1.5, "A_n Eₙ ⟨ε − ε₂⟩³ᐟ²"),
-    ):
-        if term not in terms:
-            continue
-        laws.append({
-            "element": term_name(term),
-            "what it contributes": shape + (f" × (1−ε)^−{q:g}" if q else ""),
-            "slope near contact": f"{power:g}",
-            "slope at ε = 0.6": (
-                f"{power + q * 0.6 / 0.4:.2f}" if q else f"{power:g}"
-            ),
-        })
-    if laws:
-        st.markdown("**1b · What each element does to the slope**")
-        flat_table(
-            pd.DataFrame(laws),
-            align_right=["slope near contact", "slope at ε = 0.6"],
-        )
-        st.caption(
-            "The slope is d(ln F)/d(ln ε), which is what you read off a "
-            "log-log plot, and it is the part of this you can check by hand: "
-            "measure the slope of your own curve near contact and it should "
-            "land between the smallest and largest listed here. Confinement "
-            "adds qε/(1−ε) to every one of them, which is why the measured "
-            "slope climbs along the curve instead of sitting on a constant. "
-            + (f"Here q = {q:g}." if q else "Here q = 0, so it does not.")
-        )
-        if any(t in terms for t in ("interior", "nucleus")) and "membrane" in terms:
-            st.caption(
-                "Two elements with the same exponent and the same starting "
-                "point cannot be separated by any fit, however good: they are "
-                "one element wearing two names. That is why the two interior "
-                "layers are given different onsets and the two membrane "
-                "springs different laws."
-            )
-
-    st.markdown("**1c · The same model with this cell's numbers in it**")
-    fitted_equation(fit, unit=st.session_state.get("force_unit", "nN")
-                    if st.session_state.get("force_unit") != "auto" else "nN",
-                    heading=False)
-
-    st.markdown("**2 · The geometry, fixed before fitting**")
-    st.latex(
-        r"A_m = \frac{2\pi h_m R_0}{1-\nu_m} \qquad "
-        r"A_i = \frac{\sqrt{2}\, R_0^{2}}{3(1-\nu_i^{2})} \qquad "
-        r"A_n = \frac{\sqrt{2}\, R_n^{2}}{3(1-\nu_n^{2})}"
-    )
-    st.caption(
-        "Aₘ is Lulevich 2006 eq 3, the balloon of incompressible fluid; "
-        "Aᵢ is eq 6, a homogeneous sphere compressed between two plates, "
-        "which is what that paper fits to dead cells (4 to 7.5 kPa) and "
-        "fixed cells (150 to 230 kPa). Note that eq 6 carries R₀², not "
-        "√R₀·h₀^1.5: the two agree only for a sphere with h₀ = 2R₀, and "
-        "differ by about 2.5× for the shapes here."
-    )
-    # What the paper says about bending, checked rather than assumed.
-    share = model.bending_share(0.30) if hasattr(model, "bending_share") else None
-    bend_N = (
-        model.bending_force(0.30, fit.get("Em", 0.0))
-        if hasattr(model, "bending_force") else None
-    )
-    if share is not None:
-        st.caption(
-            "**Is there a bending term?** There is, and Lulevich writes it "
-            "out: eq 1 carries F_bend = π Eₘ h² ε^½ / 2√2 beside the "
-            "stretching term. Its exponent is ½, so it is a shape of its "
-            "own, not a rename of anything else in the model. What eq 2 "
-            "then says is that it is negligible: the ratio of bending to "
-            f"stretching is (h/R)/ε^5/2, which on this cell is "
-            f"{float(share):.3f} at ε = 0.30"
-            + (f", and the bending force there works out at "
-               f"{bend_N * 1e9:.2g} nN"
-               if bend_N is not None and np.isfinite(bend_N) else "")
-            + ". That is why it is not fitted: a column that small has a "
-            "modulus the curve cannot determine, and offering it would "
-            "hand the solver a term to hide errors in."
-        )
-
-    deep_here = "nucleus" in terms
-    st.code(
-        f"h0 = {model.cell_height:.4g} m        (cell height)\n"
-        f"R0 = {fit.get('R0', 0.0):.4g} m        (cell radius)\n"
-        + (
-            (
-                f"Rn = {fit.get('R0', 0.0):.4g} m        "
-                f"({term_name('nucleus').lower()} run the length of the "
-                f"cell, so the deep term uses the cell's own radius)\n"
-                if st.session_state["cell_type"] in DEEP_USES_CELL_RADIUS else
-                f"Rn = {fit.get('R_nucleus', 0.0):.4g} m        "
-                f"({term_name('nucleus').lower()} radius)\n"
-            ) if deep_here else ""
-        ) +
-        f"hm = {model.h_membrane:.4g} m        (membrane thickness)\n"
-        f"Am = {fit.get('Am', float('nan')):.6g} N/Pa\n"
-        f"Ai = {fit.get('Ai', float('nan')):.6g} N/Pa"
-        + (f"\nAn = {fit.get('An', float('nan')):.6g} N/Pa" if deep_here else "")
-        + (f"\nhne = {fit.get('h_envelope', float('nan')):.4g} m       "
-           f"(envelope thickness)"
-           f"\nAne = {fit.get('An_shell', float('nan')):.6g} N/Pa   "
-           f"(F = Ane*Ene*<eps-eps2>^3, the same cube law as the cell's "
-           f"own shell)"
-           if "nucleus_shell" in terms else "")
-        + (f"\nAt = {fit.get('At', float('nan')):.6g} m        "
-           f"(F = At*T0*eps)" if "tension" in terms else ""),
-        language="text",
-    )
-
-    st.markdown("**3 · Why this is a linear solve**")
-    st.latex(
-        r"\mathbf{F} = \mathbf{X}\,\boldsymbol{\theta}, \qquad "
-        + r"\boldsymbol{\theta} = ("
-        + ",\ ".join(
-            s for s, on in (
-                (r"T_0", "tension" in terms), (r"E_m", "membrane" in terms),
-                (r"E_c", "interior" in terms), (r"E_n", deep_here),
-            ) if on
-        )
-        + r")"
-    )
-    st.latex(
-        r"\hat{\boldsymbol{\theta}} = \arg\min_{\boldsymbol{\theta}\ \ge\ 0}"
-        r"\ \lVert \mathbf{W}(\mathbf{X}\boldsymbol{\theta} - \mathbf{F}) \rVert^{2}"
-    )
-    st.caption(
-        "With the boundaries held fixed the basis functions do not depend on "
-        "the moduli, so the moduli enter linearly. That makes this one "
-        "bounded least-squares solve with a single answer, not a search that "
-        "can land in the wrong place. The bound at zero is why a term the "
-        "data does not want comes back at exactly 0. Weighting "
-        f"here: {fit.get('weighting', 'uniform')}."
-    )
-
-    st.markdown("**4 · The answer for this cell**")
-    rows = []
-    for term in ALL_TERMS:
-        if term not in terms_for(st.session_state["cell_type"]):
-            continue
-        label, (key, unit, _) = TERM_SYMBOLS[term], MODULUS_FIELDS[term]
-        used = term in terms
-        rows.append(
-            f"{label:4} = {0.0 if not used else fit.get(key, 0.0):<12.6g} {unit}"
-            + ("" if used else "   (not in this model)")
-        )
-    boundary = ""
-    if segmented and e1 is not None and e2 is not None:
-        boundary = f"\nε1 = {e1:.4f}    ε2 = {e2:.4f}"
-    st.code(
-        "\n".join(rows)
-        + boundary
-        + f"\n\nR²   = {fit.get('r_squared', float('nan')):.6f}"
-        + f"\nRMSE = {fit.get('rmse', float('nan')):.4g} N"
-        + f"\nn    = {fit.get('n_points', 0)} points"
-        + f"\n\nMembrane areal modulus Em·hm = "
-        f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.5g} mN/m",
-        language="text",
-    )
-    st.caption(
-        "Eₘ·hₘ is what the ε³ term measures. Eₘ is that divided by the "
-        "assumed membrane thickness, so it moves with that assumption while "
-        "the measurement does not."
+                "modulus: the number in front of its shape of ε above. The "
+                "± is the standard error from the covariance of the fit, "
+                "σ²(XᵀWX)⁻¹, so a modulus and its own coefficient carry the "
+                "same fractional uncertainty.",
     )
     worst = fit.get("worst_pair")
-    if worst and abs(fit.get("worst_correlation", 0.0) or 0.0) > 0.97:
+    correlation = abs(fit.get("worst_correlation", 0.0) or 0.0)
+    if worst and correlation > 0.97:
         st.caption(
-            f"Over this range the {term_name(worst[0]).lower()} and "
-            f"{term_name(worst[1]).lower()} basis functions "
-            f"have correlation {abs(fit['worst_correlation']):.4f}. Their sum "
-            f"is well determined; the split between them is only as good as "
-            f"that number is below 1. Widening the range, especially towards "
-            f"ε = 0, is what separates them."
+            f"⚠️ Over this range the {term_name(worst[0]).lower()} and "
+            f"{term_name(worst[1]).lower()} basis functions have correlation "
+            f"{correlation:.4f}. Their sum is well determined; the split "
+            f"between them is only as good as that number is below 1, which "
+            f"is what the ± above is measuring. Widening the range, "
+            f"especially towards ε = 0, is what separates them."
+        )
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    st.caption(
+        f"R² = {fit.get('r_squared', float('nan')):.5f}"
+        + (f" (adjusted {fit['adj_r_squared']:.5f})"
+           if np.isfinite(fit.get("adj_r_squared", np.nan)) else "")
+        + (f" · χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
+        + f" · RMSE = {fit.get('rmse', float('nan')):.4g} N"
+        + f" · {int(fit.get('n_points', 0))} points"
+        + f" · {int(fit.get('n_params', 0))} free parameters"
+        + f" · weighted {fit.get('weighting', 'uniform')}."
+    )
+    copy_the_results(fit, unit)
+
+
+def copy_the_results(fit, unit="nN"):
+    """
+    The whole fit as one block to copy into a spreadsheet.
+
+    Two tab-separated lines, headers then values, which is exactly what a
+    spreadsheet expects from the clipboard: paste it into A1 and it lands
+    one number per cell. Every number the fit produced is here, each beside
+    its own uncertainty, so a cell can be added to a growing table without
+    anybody retyping a modulus and losing a digit.
+    """
+    record = fit_record(fit, unit)
+    if not record:
+        return
+    with st.expander("📋 Copy these results into a spreadsheet",
+                     expanded=False):
+        st.code(_tsv(record), language="text")
+        st.caption(
+            "Tab separated, headers on the first line. Copy both lines, "
+            "click a cell in Excel and paste: each value lands in its own "
+            "column, in the same order every time, so cell after cell "
+            "stacks into one table. Uncertainties are the ± columns and the "
+            "moduli are plain numbers, with the units in the headings, so "
+            "they can be averaged as they are."
+        )
+        st.download_button(
+            "⬇️ Or download it as a CSV",
+            data=_csv(record),
+            file_name=(
+                f"{st.session_state.get('cell_name', 'cell') or 'cell'}"
+                "_fit.csv"
+            ),
+            mime="text/csv",
+            key="download_fit_record",
+            **STRETCH,
         )
 
 
@@ -1472,8 +1417,10 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
        first.
     2. They are scored on points they were not fitted to, and the winner
        brings its q back with it.
-    3. Which materials the curve needs at all is asked once, at the
-       boundaries the winner chose.
+
+    What it does not do is change the mixture. Every candidate carries the
+    components that are ticked, so this decides the arrangement and the
+    boundaries and nothing else.
     """
     out = {"q": None, "q_scan": None, "hypotheses": None, "components": None}
     try:
@@ -1536,16 +1483,10 @@ def analyse_curve(model, lo, hi, picks, weighting, measure_q, terms_hint,
                     best["r_squared"] = refit["r_squared"]
                     best["fit"] = refit
 
-    try:
-        out["components"] = recommend_components(
-            model, lo, hi,
-            candidates=terms_for(st.session_state["cell_type"]),
-            e1=e1, e2=e2, membrane=best["membrane"],
-            cyto_start=best["cyto_start"], weighting=weighting,
-            cv_repeats=cv_repeats,
-        )
-    except Exception:  # pragma: no cover - defensive
-        out["components"] = None
+    # Which components belong in the model is not asked here. It is its own
+    # question with its own criterion, it belongs to the search button, and
+    # asking it as part of every fit meant a fit could silently untick a box
+    # while the person watched the curve.
     return out
 
 
@@ -1797,34 +1738,6 @@ def safe_frame(frame):
     out = frame.copy()
     out.columns = names
     return out
-
-
-def how_it_was_fitted(fit):
-    """
-    One sentence saying how this fit was made, above the numbers it made.
-
-    The range, the weighting and the confinement are decisions, and a
-    modulus quoted without them is a number nobody else can reproduce. It
-    is a sentence rather than a table because a table of seven rows that
-    restate the controls above it is a table nobody reads twice.
-    """
-    if not (fit and fit.get("success")):
-        return
-    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
-    q = float(fit.get("confinement", 0.0) or 0.0)
-    st.caption(
-        f"Fitted over ε = {lo:.3f} to {hi:.3f}, "
-        f"{int(fit.get('n_points', 0))} points, weighted "
-        f"{fit.get('weighting', 'uniform')}"
-        + (f", confinement q = {q:.2f}" if q else "")
-        + (f". ε₁ = {float(fit['break_1']):.3f}"
-           if fit.get("break_1") is not None else "")
-        + (f", ε₂ = {float(fit['break_2']):.3f}"
-           if fit.get("break_2") is not None else "")
-        + ". Boundaries were found from the curve: several arrangements "
-        "were fitted, each at its own best pair, and the one kept is the "
-        "one that best predicts points it was not fitted to."
-    )
 
 
 def sub_panel(title, flat=False, expanded=False):
@@ -3279,11 +3192,16 @@ HYPOTHESES = {
 }
 
 
-def hypotheses_for(cell_type, terms=None):
+def hypotheses_for(cell_type, terms=None, exact=False):
     """
     The named pictures to test for this cell type.
 
     ``terms`` restricts them to the materials that are actually ticked.
+    ``exact`` goes further: every picture carries exactly that mixture, so
+    the comparison is over arrangements alone and fitting can never change
+    which boxes are ticked. Which components are in the model is a separate
+    question with its own criterion, asked by the search button, and a fit
+    that quietly answered it as a side effect was answering it twice.
     Without that, unticking a material had no effect at all: every picture
     carried its own list of terms and the winner wrote them straight back,
     so a box you had just cleared reappeared with a modulus beside it. A
@@ -3307,6 +3225,33 @@ def hypotheses_for(cell_type, terms=None):
 
     keep = set(terms)
     trimmed, seen = [], set()
+    if exact:
+        whole = tuple(term for term in ALL_TERMS if term in keep)
+        if not whole:
+            return []
+        for spec in found:
+            membrane = spec.get("membrane", "continue")
+            if "membrane" not in whole:
+                membrane = "continue"
+            signature = (membrane, spec.get("cyto_start", "zero"))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            label, detail = spec["label"], spec.get("detail", "")
+            if whole != tuple(spec["terms"]):
+                # A name that lists a material the picture no longer has is
+                # a name that lies, and it is the name the page prints as
+                # the answer.
+                label = " + ".join(plain_name(term) for term in whole)
+                if membrane == "late":
+                    label += ", membrane from ε₁"
+                detail = "the components you ticked" + (
+                    ", with the deeper layer met at ε₂"
+                    if "nucleus" in whole else ""
+                )
+            trimmed.append(dict(spec, terms=whole, membrane=membrane,
+                                label=label, detail=detail))
+        return trimmed
     for spec in found:
         here = tuple(term for term in spec["terms"] if term in keep)
         if not here:
@@ -4157,19 +4102,23 @@ def find_boundaries_control(model, lo, hi, terms):
     c1, c2 = st.columns([1.2, 2])
     with c1:
         pressed = st.button(
-            "🔎 Find boundaries from the data", key="find_breaks_top",
-            type="primary", disabled=not (can_scan or can_place), **STRETCH,
+            "🔎 Find the boundaries and the best mixture",
+            key="find_breaks_top", type="primary",
+            disabled=not (can_scan or can_place), **STRETCH,
         )
     with c2:
         st.caption(
             f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
-            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}"
+            f"ε₂ = {float(st.session_state['segment_break_2']):.3f} · "
+            + ", ".join(plain_name(t).lower() for t in terms)
             + (" · a range has been moved by hand, so this searches the "
                "ranges rather than the boundaries."
                if can_place else
                " · the default until you press this or set your own.")
         )
 
+    why_this_search(model)
+    last_mixture_note()
     set_default_boundaries_control()
 
     if not pressed:
@@ -4204,6 +4153,9 @@ def find_boundaries_control(model, lo, hi, terms):
             pending.update({
                 f"_window_touched_{term}": True for term in found["windows"]
             })
+            e1 = float(st.session_state["segment_break_1"])
+            e2 = float(st.session_state["segment_break_2"])
+            pending.update(search_the_mixture(model, lo, hi, e1, e2))
             st.session_state["_pending_settings"] = pending
             st.rerun()
         st.error(found.get("error", "The placement search failed."))
@@ -4218,12 +4170,270 @@ def find_boundaries_control(model, lo, hi, terms):
         except Exception as exc:  # pragma: no cover - defensive
             found = {"success": False, "error": str(exc)}
     if found.get("success"):
-        st.session_state["_pending_settings"] = {
-            "segment_break_1": round(float(found["best_break_1"]), 3),
-            "segment_break_2": round(float(found["best_break_2"]), 3),
-        }
+        e1 = round(float(found["best_break_1"]), 3)
+        e2 = round(float(found["best_break_2"]), 3)
+        pending = {"segment_break_1": e1, "segment_break_2": e2}
+        # And, at those boundaries, which components the curve can actually
+        # see. The two questions are asked in this order because the answer
+        # to the second depends on the first: a component judged at the
+        # wrong boundary is being judged on the wrong basis function.
+        pending.update(search_the_mixture(model, lo, hi, e1, e2))
+        st.session_state["_pending_settings"] = pending
         st.rerun()
     st.error(found.get("error", "The boundary scan found nothing."))
+
+
+def search_the_mixture(model, lo, hi, e1, e2):
+    """
+    Which components the curve can actually see, at the boundaries just found.
+
+    Every subset of this cell type's components is fitted at the same
+    boundaries, on the same folds, and scored on points it was not fitted
+    to. Adding a term can only lower the residual on the points it was
+    fitted to, so the residual, R² and χ² cannot answer "is this component
+    real"; held-out error can, and that is the whole reason this is a
+    separate search rather than a glance at the fit.
+
+    Returns widget values for the caller to stage, and leaves the full
+    comparison in session state so the page can show its working.
+    """
+    if recommend_components is None:
+        return {}
+    try:
+        with st.spinner("Fitting every combination of components and scoring "
+                        "each on points it was not fitted to…"):
+            found = recommend_components(
+                model, lo, hi,
+                candidates=terms_for(st.session_state["cell_type"]),
+                e1=float(e1), e2=float(e2),
+                membrane=MEMBRANE_CHOICES.get(
+                    st.session_state["membrane_after_break"], "freeze"),
+                cyto_start=CYTO_CHOICES.get(
+                    st.session_state["cyto_starts_at"], "break"),
+                weighting=st.session_state["weighting"],
+                cv_repeats=3,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        found = {"success": False, "error": str(exc)}
+    st.session_state["component_search"] = found
+    if not found.get("success"):
+        return {}
+    wanted = set(found["recommended"])
+    # Never everything off: a mixture of nothing is not a model, and the
+    # search returning it would leave the page with no fit at all.
+    if not wanted:
+        return {}
+    return {
+        f"use_{term}": term in wanted
+        for term in terms_for(st.session_state["cell_type"])
+    }
+
+
+def last_mixture_note():
+    """What the last mixture search decided, and by how much."""
+    found = st.session_state.get("component_search")
+    if not (found and found.get("success")):
+        return
+    best = found["best"]
+    kept = ", ".join(plain_name(t).lower() for t in best["terms"])
+    dropped = found.get("dropped") or ()
+    margin = ""
+    others = [
+        row for row in found["candidates"] if row["terms"] != best["terms"]
+    ]
+    if others:
+        gap = min(row["cv_rmse"] for row in others) - best["cv_rmse"]
+        margin = (
+            f" It predicts held-out points {abs(gap) / max(best['cv_rmse'], 1e-30) * 100:.0f}% "
+            + ("better than" if gap > 0 else "no better than")
+            + " the next combination"
+            + (", so this one is the clear answer." if found.get("clear_cut")
+               else ", which is inside the tie tolerance, so the smaller "
+                    "mixture was taken.")
+        )
+    st.caption(
+        f"Last search kept **{kept}**"
+        + (" and dropped " + ", ".join(plain_name(t).lower() for t in dropped)
+           + ", the curve carrying no separable evidence for "
+           + ("it" if len(dropped) == 1 else "them")
+           if dropped else ", every component it was offered")
+        + "." + margin
+    )
+    with st.expander("The combinations compared", expanded=False):
+        rows = []
+        for row in sorted(found["candidates"], key=lambda r: r["cv_rmse"]):
+            rows.append({
+                "components": ", ".join(
+                    plain_name(t).lower() for t in row["terms"]
+                ),
+                "held-out RMSE (N)": f"{row['cv_rmse']:.4g}",
+                "spread": f"{row['cv_spread']:.2g}",
+                "R²": f"{row['r_squared']:.5f}",
+                "free moduli": str(row["n_terms"]),
+                "came out at zero": (
+                    ", ".join(plain_name(t).lower() for t in row["empty"])
+                    or "—"
+                ),
+                "": "✅ kept" if row.get("recommended")
+                    else ("tied" if row.get("tied_with_best") else ""),
+            })
+        flat_table(
+            pd.DataFrame(rows),
+            align_right=["held-out RMSE (N)", "spread", "R²", "free moduli"],
+            caption=f"Tie tolerance τ = {found['tie_tolerance']:.4g} N. "
+                    "Anything within τ of the lowest counts as tied, and "
+                    "among tied combinations the smallest one is kept.",
+        )
+
+
+def why_this_search(model=None):
+    """
+    The mathematics the search button follows, written out.
+
+    Not decoration. Every choice below is forced by a property of this
+    model, and someone quoting a modulus from this app is entitled to the
+    argument for why the boundary it was measured at is the boundary the
+    curve has.
+    """
+    with st.expander("∑ Why the boundaries and the mixture come out this way",
+                     expanded=False):
+        st.caption(
+            "Pressing the button means the boundaries are found from the "
+            "curve rather than assumed, and the combination of components "
+            "kept is the one that best predicts points it was not fitted "
+            "to. Both of those are decisions, and this is the argument for "
+            "making them the way this app makes them."
+        )
+        st.markdown("**1 · With the boundaries fixed, the moduli are exact**")
+        st.caption(
+            "Every component contributes its own shape of ε multiplied by "
+            "its own modulus, and the forces add, so at fixed ε₁ and ε₂ the "
+            "model is linear in the moduli:"
+        )
+        st.latex(
+            r"F(\varepsilon) \;=\; \sum_k a_k E_k\, g_k(\varepsilon;"
+            r"\varepsilon_1,\varepsilon_2) \;=\; X(\varepsilon_1,"
+            r"\varepsilon_2)\,\theta, \qquad \theta_k = a_k E_k \ge 0"
+        )
+        st.latex(
+            r"\hat{\theta} \;=\; \arg\min_{\theta \ge 0} \;\bigl\| W\bigl("
+            r"F - X(\varepsilon_1,\varepsilon_2)\theta\bigr) \bigr\|^{2}"
+        )
+        st.caption(
+            "That is one bounded least-squares solve: an exact answer, with "
+            "no starting guess and no local minimum to fall into. θ ≥ 0 "
+            "because a material cannot pull the probe in, which is also why "
+            "a component that comes back at exactly zero is a measurement "
+            "and not a failure."
+        )
+
+        st.markdown("**2 · The boundaries are found by profiling, not by "
+                    "gradient**")
+        st.latex(
+            r"S(\varepsilon_1,\varepsilon_2) \;=\; \min_{\theta \ge 0} "
+            r"\bigl\| W\bigl(F - X(\varepsilon_1,\varepsilon_2)\theta\bigr) "
+            r"\bigr\|^{2}, \qquad (\hat{\varepsilon}_1,\hat{\varepsilon}_2) "
+            r"= \arg\min S"
+        )
+        st.caption(
+            "The boundaries sit inside min(·) and ⟨·⟩, so S is continuous "
+            "but has a kink wherever a boundary crosses a data point: its "
+            "derivative jumps, and a gradient method steps straight across "
+            "the minimum. So S is evaluated on a grid of (ε₁, ε₂), each "
+            "point an exact solve of step 1, and the grid is then re-laid "
+            "inside one step either side of the winner, twice, narrowing it "
+            "by about 25 times."
+        )
+
+        st.markdown("**3 · Why a boundary is there at all**")
+        st.caption(
+            "Each law is a power of ε, so the slope of the curve on log-log "
+            "axes is the force-weighted average of those powers:"
+        )
+        st.latex(
+            r"\frac{d\log F}{d\log \varepsilon} \;=\; \sum_k w_k\,p_k, "
+            r"\qquad w_k = \frac{a_k E_k g_k}{\sum_j a_j E_j g_j}"
+        )
+        st.caption(
+            "with p = 3 for a stretching shell, 3/2 for a Hertzian contact "
+            "and 1 for a network already under tension. A boundary is where "
+            "the weights move from one component to the next, so the slope "
+            "swings from one exponent towards another, and that swing is "
+            "exactly what makes S smallest there. The measured slope is "
+            "printed further down the page, so the boundary the search "
+            "chose can be checked against the curve by hand."
+        )
+
+        st.markdown("**4 · Which components belong in the model**")
+        st.caption(
+            "This cannot be read off the fit. The models are nested, so "
+            "adding a component can only lower the residual on the points "
+            "it was fitted to: RSS, R² and χ² all improve for a component "
+            "that is not there. Held-out error does not."
+        )
+        st.latex(
+            r"\mathrm{CV}(\mathcal{S}) = \frac{1}{R}\sum_{r=1}^{R}"
+            r"\frac{1}{K}\sum_{k=1}^{K} \sqrt{\frac{1}{|f_k|}"
+            r"\sum_{i \in f_k}\bigl(F_i - \hat{F}^{(-k)}_{\mathcal{S}}"
+            r"(\varepsilon_i)\bigr)^{2}}"
+        )
+        st.caption(
+            "Every subset 𝒮 of the components is fitted at the boundaries "
+            "from step 2, on the same folds, and asked to predict the fold "
+            "it never saw. K = 5 folds, R = 3 different random splits, "
+            "because one split of a few hundred points is noisy enough to "
+            "reorder combinations that are genuinely tied."
+        )
+
+        st.markdown("**5 · The tie rule, and why it favours the smaller "
+                    "mixture**")
+        st.latex(
+            r"\tau = \max\bigl(0.05\,\mathrm{CV}_{\min},\; s_{\min} + "
+            r"\max_j s_j\bigr)"
+        )
+        st.caption(
+            "s is how much a combination's score moves between splits. A "
+            "gap smaller than that is not evidence, so everything within τ "
+            "of the lowest is called tied and the smallest mixture wins."
+        )
+        st.latex(
+            r"\operatorname{Var}(\hat{\theta}_k) \;=\; \frac{\sigma^{2}}"
+            r"{(1-\rho^{2})\,\lVert x_k \rVert^{2}}"
+        )
+        st.caption(
+            "That is the reason, not a preference for tidiness. Two basis "
+            "functions with correlation ρ have a well-determined sum and a "
+            "split between them whose variance grows as 1/(1 − ρ²). A "
+            "component the curve cannot separate does not give a wrong "
+            "modulus so much as an unstable one, which wanders from cell to "
+            "cell while its neighbour absorbs the difference. Dropping it "
+            "is what makes the numbers poolable. The correlation actually "
+            "reached is reported with the fit."
+        )
+
+        st.markdown("**6 · Why these laws, and no others**")
+        st.caption(
+            "A fit can only separate two components whose force laws differ "
+            "in shape or in where they begin. Two terms with the same power "
+            "of ε and the same onset are one term wearing two names, and no "
+            "amount of data will split them, which is why every component "
+            "here has either its own exponent or its own boundary."
+        )
+        share = (model.bending_share(0.30)
+                 if hasattr(model, "bending_share") else None)
+        st.caption(
+            "**Is there a bending term?** There is, and Lulevich writes it "
+            "out: eq 1 carries F_bend = π Eₘ h² ε^½ / 2√2 beside the "
+            "stretching term. Its exponent is ½, so it is a shape of its "
+            "own, not a rename of anything else in the model. What eq 2 "
+            "then says is that it is negligible: the ratio of bending to "
+            "stretching is (h/R)/ε^5/2"
+            + (f", which on this cell is {float(share):.3g} at ε = 0.30"
+               if share is not None and np.isfinite(float(share)) else "")
+            + ". That is why it is not offered: a column that small has a "
+            "modulus the curve cannot determine, and a term the curve "
+            "cannot see is a place for the solver to hide its errors."
+        )
 
 
 def set_default_boundaries_control():
@@ -6073,8 +6283,16 @@ with tab_analysis:
                     "🔬 Fit this cell", type="primary",
                     disabled=not chosen, key="guided_fit", **STRETCH,
                 ):
+                    # Every candidate carries exactly the components that
+                    # are ticked, so this button decides the arrangement and
+                    # the boundaries and nothing else. It used to compare
+                    # pictures with different mixtures and write the winner's
+                    # back to the tick boxes, so pressing Fit cleared boxes
+                    # nobody had touched. Which components belong in the
+                    # model is its own question, with its own criterion, and
+                    # the search button above is where it is asked.
                     picks_now = hypotheses_for(
-                        st.session_state["cell_type"], terms=chosen
+                        st.session_state["cell_type"], terms=chosen, exact=True,
                     )
                     with st.spinner("Measuring the confinement, then "
                                     "comparing the pictures of this cell…"):
@@ -6091,8 +6309,6 @@ with tab_analysis:
                     found = outcome["hypotheses"]
                     if outcome["q_scan"] is not None:
                         st.session_state["confinement_scan"] = outcome["q_scan"]
-                    if outcome["components"] is not None:
-                        st.session_state["component_search"] = outcome["components"]
                     if found and found.get("success"):
                         st.session_state["hypothesis_search"] = found
                         pending = settings_from_hypothesis(
@@ -6330,43 +6546,11 @@ with tab_analysis:
         # into when it is not drawn here.
         sharing_slot = st.container()
 
-        # Which materials the curve can see at all. A recommendation, in one
-        # line, next to a button: it is advice, and the ticks in step 1 stay
-        # yours. It goes with the controls, above the curve, because acting
-        # on it changes what is fitted.
-        if guided:
-          if True:
-            picked = st.session_state.get("component_search")
-            if picked and picked.get("success"):
-                names_here = components_for(st.session_state["cell_type"])
-                wanted = picked["recommended"]
-                current = active_terms()
-                listed = ", ".join(plain_name(t) for t in wanted)
-                if set(wanted) == set(current):
-                    st.caption(
-                        f"**Materials this curve can see:** {listed}. That is "
-                        f"what is ticked."
-                    )
-                else:
-                    rec1, rec2 = st.columns([2.4, 1])
-                    with rec1:
-                        st.caption(
-                            f"**Materials this curve can see:** {listed}"
-                            + ("" if picked["clear_cut"] else
-                               " (other combinations do about as well)")
-                            + ("" if not picked["dropped"] else
-                               ". Nothing to measure in "
-                               + ", ".join(plain_name(t).lower()
-                                           for t in picked["dropped"]))
-                            + "."
-                        )
-                    with rec2:
-                        if st.button("Use these", key="use_recommended",
-                                     **STRETCH):
-                            st.session_state["_pending_settings"] = {
-                                f"use_{t}": (t in wanted) for t in ALL_TERMS
-                            }
-                            st.rerun()
+        # No second opinion on which materials to use down here. The mixture
+        # is decided in one place now, by the search button in step 1, which
+        # applies what it finds and shows the combinations it compared. Two
+        # places offering different answers to the same question is how the
+        # ticks and the fit came apart in the first place.
 
         # ---------------------------------------------------- exploration ---
         # Only in full control. In guided mode the boundaries are found and
@@ -7420,7 +7604,6 @@ with tab_analysis:
                 # straight off the two numbers beside R². Three of those
                 # were duplicates and the fourth was noise.
                 st.markdown("#### Fitting results")
-                how_it_was_fitted(fit)
 
             # All three moduli, always. A term that was not in the model reads
             # 0 and says so, rather than disappearing: a blank column in a
@@ -8197,8 +8380,11 @@ with tab_analysis:
             st.markdown("##### What the power law says")
             power_law_notes(fit, model)
 
-            with st.expander("∑ How this fit was calculated", expanded=False):
-                show_fit_maths(fit, model)
+            # No "how this fit was calculated" panel. What it said is now
+            # said where it is needed: the criterion sits under the search
+            # button that applies it, and the equation below carries the
+            # range, the boundaries, the confinement and every fitted number
+            # with its uncertainty.
 
             with diagnostics_box:
                 st.markdown("**∑ What the search does, in maths**")
