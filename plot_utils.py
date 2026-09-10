@@ -1341,7 +1341,8 @@ def balloon_figure(
 
 
 def exponent_profile_figure(profile, style: PlotStyle, break_1=None, break_2=None,
-                            title="What power law is the curve following?"):
+                            title="What power law is the curve following?",
+                            notes=None, stages=None):
     """
     Local log-log slope against deformation.
 
@@ -1380,6 +1381,44 @@ def exponent_profile_figure(profile, style: PlotStyle, break_1=None, break_2=Non
                 annotation_text=label, annotation_position="top",
                 annotation_font_size=max(10, style.tick_size - 6),
             )
+    # Shaded stages, drawn under everything, so the three stretches the
+    # boundaries make are readable without tracing the vertical lines up.
+    for index, stage in enumerate(stages or []):
+        try:
+            x0, x1 = float(stage["from"]), float(stage["to"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (x1 > x0):
+            continue
+        fig.add_vrect(
+            x0=x0, x1=x1, layer="below", line_width=0,
+            fillcolor=("#000000" if index % 2 else "#7f7f7f"), opacity=0.05,
+        )
+        if stage.get("label"):
+            fig.add_annotation(
+                x=(x0 + x1) / 2.0, y=4.15, text=stage["label"],
+                showarrow=False, xanchor="center", yanchor="top",
+                font=dict(size=max(10, style.tick_size - 7)),
+                bgcolor="rgba(255,255,255,0.72)", borderpad=2,
+            )
+
+    # The notes live inside the axes. A note in the margin is the first
+    # thing a narrow screen throws away, and these are the whole point of
+    # the panel: they say what changed and where.
+    for note in notes or []:
+        try:
+            x = float(note["epsilon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        fig.add_annotation(
+            x=x, y=float(note.get("y", 0.55)), text=str(note.get("text", "")),
+            showarrow=True, arrowhead=2, arrowsize=0.9, arrowwidth=1.2,
+            ax=float(note.get("ax", 0)), ay=float(note.get("ay", -34)),
+            font=dict(size=max(10, style.tick_size - 7)),
+            align="left", bgcolor="rgba(255,255,255,0.86)",
+            bordercolor="#8c8c8c", borderwidth=1, borderpad=3,
+        )
+
     _base_layout(fig, style, title)
     fig.update_layout(
         height=max(360, int(style.height * 0.78)),
