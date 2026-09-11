@@ -84,6 +84,10 @@ ADVANCED_MODE = "Spring-network models (advanced)"
 
 def start(**state):
     state.setdefault("c2c12_fit_mode", ADVANCED_MODE)
+    # The page fits only on ▶ Fit & plot. These cases were written against
+    # a page that refitted on every change, so they keep that, through the
+    # setting the page still honours without showing it.
+    state.setdefault("live_fit", True)
     app = AppTest.from_file(APP, default_timeout=180)
     app.run()
     eps, force = synthetic()
@@ -310,25 +314,40 @@ def case_c2c12_opens_on_the_four_regime_fit():
     check("the components are stacked on the plot by default",
           state(app, "pw_view") == "stacked", str(state(app, "pw_view")))
 
+    # One button: a change waits on the control board until ▶ Fit & plot.
+    fit_plot = lambda: app.button(key="pw_fit_plot").click().run()  # noqa: E731
+    before = state(app, "results")["fit"]["piecewise"]["boundaries_pct"]
+    app.radio(key="pw_method").set_value("typed").run()
     app.number_input(key="pw_b2").set_value(35.0).run()
-    if no_exception(app, "moving a boundary"):
+    if no_exception(app, "typing a boundary"):
+        waiting = state(app, "results")["fit"]["piecewise"]["boundaries_pct"]
+        check("a typed boundary waits for the button",
+              waiting[2] == before[2], f"{waiting} vs {before}")
+        said = " ".join(str(m.value) for m in app.get("markdown"))
+        check("and the board says it has changes not applied",
+              "does not show yet" in said, said[:200])
+    fit_plot()
+    if no_exception(app, "▶ Fit & plot"):
         moved = state(app, "results")["fit"]["piecewise"]["boundaries_pct"]
-        check("moving a boundary refits at once", moved[2] == 35.0, str(moved))
+        check("▶ Fit & plot fits at the typed boundary", moved[2] == 35.0,
+              str(moved))
 
-    app.button(key="pw_reset").click().run()
+    app.checkbox(key="pw_reset_board").check().run()
     if no_exception(app, "putting the defaults back"):
-        check("the reset puts the C2C12 defaults back",
+        check("the reset puts the C2C12 defaults back on the board",
               [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]
               == [5.0, 50.0, 75.0],
               str([state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]))
+    fit_plot()
 
     check("the membrane acts throughout by default",
           state(app, "pw_membrane_throughout") is True
           and state(app, "results")["fit"]["piecewise"]["membrane_throughout"])
 
-    # The component bars and the plot are one setting: move a bar and the
-    # fit, and so every curve drawn from it, uses the new range.
+    # The component bars and the plot are one setting: move a bar, press
+    # the button, and the fit and every curve drawn from it use the range.
     app.slider(key="pw_range_K_cyto").set_value((5.0, 30.0)).run()
+    fit_plot()
     if no_exception(app, "moving a component's range"):
         ranges = state(app, "results")["fit"]["piecewise"]["component_ranges_pct"]
         check("the fit uses the range on the bar",
@@ -338,6 +357,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
               tuple(round(v, 2) for v in app.slider(key="pw_range_K_cyto").value)
               == (5.0, 30.0), str(app.slider(key="pw_range_K_cyto").value))
     app.slider(key="pw_range_K_nucleus").set_value((45.0, 60.0)).run()
+    fit_plot()
     if no_exception(app, "moving a component's start"):
         check("moving a start moves its boundary",
               state(app, "pw_b2") == 45.0, str(state(app, "pw_b2")))
@@ -345,9 +365,10 @@ def case_c2c12_opens_on_the_four_regime_fit():
               state(app, "results")["fit"]["piecewise"]["boundaries_pct"][2]
               == 45.0,
               str(state(app, "results")["fit"]["piecewise"]["boundaries_pct"]))
-    app.button(key="pw_reset").click().run()
+    app.checkbox(key="pw_reset_board").check().run()
 
-    app.button(key="pw_find").click().run()
+    app.radio(key="pw_method").set_value("refined").run()
+    fit_plot()
     if no_exception(app, "finding the boundaries"):
         placements = state(app, "pw_placements") or {}
         check("the boundaries were placed again",
@@ -366,6 +387,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
     # Choosing the power law alone, which misses 0.999 on this curve, hands
     # over to a route that reaches it and says why.
     app.radio(key="pw_method").set_value("power").run()
+    fit_plot()
     if no_exception(app, "choosing the power law alone"):
         chosen = state(app, "pw_selected") or {}
         check("a route below the target hands over to one that meets it",
@@ -375,6 +397,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
 
     # The contact line can be switched off: its slope is then held at 0.
     app.checkbox(key="pw_use_k_align").uncheck().run()
+    fit_plot()
     if no_exception(app, "switching the contact line off"):
         pw = state(app, "results")["fit"]["piecewise"]
         check("the contact slope is held at zero",
@@ -382,6 +405,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
               and "k_align" in pw["components_off"],
               str(pw["coefficients"].get("k_align")))
     app.checkbox(key="pw_use_k_align").check().run()
+    fit_plot()
     # A fitted cell can be kept for the All cells tab under its own name.
     app.text_input(key="cell_name").input("cell-A").run()
     app.button(key="pw_add").click().run()
@@ -396,7 +420,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
         "Segmented (each part takes over in turn)").run()
     if no_exception(app, "switching to segmented sharing"):
         check("and segmented sharing is one click away",
-              button_by_label(app, "Fit θ̂: bounded least squares") is not None,
+              button_by_label(app, "Fit & plot") is not None,
               str([b.label for b in app.button][:12]))
         check("with the same ε₂, where the nucleus is reached",
               abs(100.0 * state(app, "segment_break_2") - e2_before) < 1e-6,
@@ -801,7 +825,10 @@ def case_database_section_without_a_fit():
     app.run()
     if not no_exception(app, "no fit yet"):
         return
-    check("no fit has been made", app.session_state["_last_fit"] is None)
+    # A new curve is fitted once on arrival; after that only ▶ Fit & plot
+    # refits. The section below is on the page either way.
+    check("the new curve was fitted once on arrival",
+          app.session_state["_last_fit"] is not None)
     uploader_labels = [u.label for u in app.get("file_uploader")]
     check("the video uploader is reachable with no fit",
           any("compression video" in (l or "").lower() for l in uploader_labels),
@@ -1261,7 +1288,7 @@ def case_guided_mode_is_the_default():
                   for r in app.get("radio")),
           str([r.label for r in app.get("radio")]))
 
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     check("the one-press button is there", work is not None)
 
     text = " ".join(str(m.value) for m in app.get("markdown"))
@@ -1303,10 +1330,10 @@ def case_full_control_shows_everything():
         return
     # There is one page now, so "full control" is the page: the button is
     # on it, and so are the choices it needs.
-    check("the fit button is on it", button_by_label(app, "Fit θ̂: bounded least squares")
+    check("the fit button is on it", button_by_label(app, "Fit & plot")
           is not None)
     check("and so is the range",
-          any("1 · Relative deformation range" in str(m.value)
+          any("Relative deformation range" in str(m.value)
               for m in app.get("markdown")))
     check("the expert search button is still there",
           button_by_label(app, "Select composition by cross-validation") is not None)
@@ -1732,25 +1759,16 @@ def case_guided_order_follows_the_work():
     # the parts and how they share the load, then the fit.
     # Choices first, in one place and made once; then the fit; then
     # everything the fit produced.
-    check("step 1 is the range",
-          any("1 · Relative deformation range" in h for h in headings), order)
-    check("step 2 is the fit itself",
-          any("2 · Fit" in h for h in headings), order)
-    positions = [
-        next(i for i, h in enumerate(headings) if key in h)
-        for key in ("1 · Relative deformation range", "2 · Fit")
-    ]
-    check("and they are in that order", positions == sorted(positions),
-          str(positions))
-    check("the results come after both",
-          all(positions[-1] < i for i, h in enumerate(headings)
-              if "turned out to be" in h), order)
+    check("the choices are one control board",
+          any("Fitting options" in h for h in headings), order)
+    check("with the one button at its head",
+          button_by_label(app, "Fit & plot") is not None)
     check("no expander labels are raw markdown",
           not any((e.label or "").startswith("#") for e in app.get("expander")),
           str([e.label for e in app.get("expander")]))
 
     # The button has to be reachable without opening anything.
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     check("the button is on the page", work is not None)
     check("and it is the primary action",
           work is not None and work.proto.type == "primary")
@@ -1768,7 +1786,7 @@ def case_guided_order_follows_the_work():
         app.session_state[f"use_{term}"] = False
     app.run()
     if no_exception(app, "no parts selected"):
-        work = button_by_label(app, "Fit θ̂: bounded least squares")
+        work = button_by_label(app, "Fit & plot")
         check("with nothing ticked the button is disabled",
               work is not None and work.disabled is True)
 
@@ -1836,7 +1854,7 @@ def case_it_picks_the_arrangement():
 def case_fitting_applies_what_it_found():
     print("pressing fit fits what is on the page, and moves nothing on it")
     app = start(cell_name="cell-01")
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     check("the button is there", work is not None)
     if work is None:
         return
@@ -1903,11 +1921,11 @@ def case_guided_range_is_settable():
     said = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
     check("it is labelled",
-          "1 · Relative deformation range" in said, said[:200])
+          "Relative deformation range" in said, said[:200])
     check("and it comes before the components, since it decides which "
           "points exist at all",
-          said.index("1 · Relative deformation range")
-          < said.index("Components"), said[:200])
+          said.index("Relative deformation range")
+          < said.index("Components and the ranges"), said[:200])
     check("and it has a handle at each end, not just at the far one",
           isinstance(slider.value, (list, tuple)) and len(slider.value) == 2,
           str(slider.value))
@@ -1942,7 +1960,7 @@ def case_guided_range_is_settable():
           bar is not None and abs(bar.value[0]) < 1e-6
           and abs(bar.value[1] - 0.35) < 0.01, str(bar.value))
 
-    button_by_label(app, "Fit θ̂: bounded least squares").click().run()
+    button_by_label(app, "Fit & plot").click().run()
     if not no_exception(app, "search over the chosen range"):
         return
     fit = app.session_state["_last_fit"]
@@ -2491,10 +2509,11 @@ def case_sharing_controls_sit_with_the_parts():
         if str(m.value).strip().startswith("####")
     ]
     check("the materials and the range are chosen in one place",
-          any("1 · Relative deformation range" in h for h in headings), str(headings))
+          any("Fitting options" in h for h in headings), str(headings))
 
     radios = [r.label for r in app.get("radio")]
-    for wanted in ("How the cell is modelled", "After ε₁ the membrane…",
+    # How the components share the load is the board's first choice now.
+    for wanted in ("How the components share the load", "After ε₁ the membrane…",
                    "The cytoskeleton starts…"):
         check(f"“{wanted[:28]}…” is on the page", wanted in radios, str(radios))
 
@@ -2587,17 +2606,19 @@ def case_the_curve_comes_first():
     # fit, look rather than look, scroll, choose.
     # Two columns: every parameter in one block on the left, and the
     # curve, the results and the copy block on the right, from one fit.
-    check("the curve is staked out in the right-hand column",
-          source.index("fit_left, fit_right = st.columns(")
-          < source.index("with fit_right:")
+    # The graph and the results on top; under them the control board, one
+    # block with every parameter and the one button.
+    check("the curve is staked out above the control board",
+          source.index("plot_col, res_col = st.columns(")
           < source.index("curve_slot = st.container()")
-          < source.index("with fit_left:")
-          < source.index('st.markdown("#### 1 · Relative deformation range")'),
-          "curve_slot is not in the right-hand column")
-    check("and the choices are one block on the left",
-          'st.markdown("### ⚙️ Fit parameters")' in source
-          and source.index("fit_block.__enter__()")
-          < source.index('st.markdown("#### 1 · Relative deformation range")')
+          < source.index("results_area = st.container()")
+          < source.index("fit_block = st.container(border=True)")
+          < source.index('st.markdown("**Relative deformation range**")'),
+          "curve_slot is not above the board")
+    check("and the choices are one board under it, headed by the button",
+          source.index("fit_block.__enter__()")
+          < source.index('"▶ Fit & plot", type="primary", key="guided_fit"')
+          < source.index('st.markdown("**Relative deformation range**")')
           < source.index("fit_block.__exit__(None, None, None)"))
     check("and the plot is drawn into it",
           "plot_col = curve_slot" in source)
@@ -2608,11 +2629,11 @@ def case_the_curve_comes_first():
           "video_target = video_slot" in source)
 
     check("the fit button sits with the choices",
-          button_by_label(app, "Fit θ̂: bounded least squares") is not None,
+          button_by_label(app, "Fit & plot") is not None,
           str([b.label for b in app.button]))
-    check("and there is exactly one fit button in guided mode",
-          source.count('"🔬 Fit θ̂: bounded least squares at ε₁, ε₂"') == 1,
-          str(source.count('"🔬 Fit θ̂: bounded least squares at ε₁, ε₂"')))
+    check("and there is one fit button per way of sharing the load",
+          source.count('"▶ Fit & plot", type="primary"') == 2,
+          str(source.count('"▶ Fit & plot", type="primary"')))
 
     # Explore the curve is gone from the guided flow.
     labels = [e.label or "" for e in app.get("expander")]
@@ -4062,7 +4083,7 @@ def case_one_fitting_routine():
     check("and it fits the measured curve", on_load["r_squared"] > 0.9995,
           f"R2 {on_load['r_squared']:.6f}")
 
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     check("the fit button is there", work is not None)
     if work is None:
         return
@@ -4404,7 +4425,7 @@ def case_the_cardiomyocyte_curves_fit():
             button.click().run()
             if not no_exception(app, f"cell {n} refined"):
                 continue
-        button = button_by_label(app, "Fit θ̂: bounded least squares")
+        button = button_by_label(app, "Fit & plot")
         if button is not None:
             button.click().run()
             if not no_exception(app, f"cell {n} fitted"):
@@ -5048,7 +5069,7 @@ def case_the_zoom_survives_a_refit():
     # refitted: that is what keeps the zoom. Two runs of the same page with
     # the same curve must produce the same one.
     first = str(app_module.view_token())
-    button = button_by_label(app, "Fit θ̂: bounded least squares")
+    button = button_by_label(app, "Fit & plot")
     if button is not None:
         button.click().run()
         no_exception(app, "refitting while zoomed")
@@ -5180,19 +5201,19 @@ def case_the_controls_sit_above_the_curve():
     # the page should read.
     check("in guided mode the settings are one collapsed line, not three panels",
           source.count("flat=guided") >= 3, str(source.count("flat=guided")))
-    check("and that line is in the parameter block, not in the sidebar",
+    check("and that line is on the control board, not in the sidebar",
           "settings_box = st.expander(" in source
           and "settings_box = st.sidebar.expander(" not in source
           and source.index("fit_block.__enter__()")
           < source.index("settings_box = st.expander(")
           < source.index("fit_block.__exit__(None, None, None)"),
           "the fit assumptions are not in the parameter block")
-    check("the working sits with the results, in the right-hand column",
+    check("the working sits under the control board",
           "diagnostics_box = st.expander(" in source
           and "diagnostics_box = st.sidebar.expander(" not in source
-          and source.index("with fit_right:")
+          and source.index("fit_block = st.container(border=True)")
           < source.index("diagnostics_box = st.expander(")
-          < source.index("with fit_left:"))
+          < source.index("fit_block.__enter__()"))
     check("and the verdict is written from the fit it describes",
           "fit_verdict(fit)" in source
           and "apply_plot_layers(figure, shown_style, fit)" in source)
@@ -5644,7 +5665,7 @@ def case_the_ranges_follow_the_fit():
     # describing a model that is no longer the one on the page.
     before = bar("interior")
     widget_by_label(app, "slider", "Fitted range").set_value((0.0, 0.40)).run()
-    button = button_by_label(app, "Fit θ̂: bounded least squares")
+    button = button_by_label(app, "Fit & plot")
     if button is not None:
         button.click().run()
         if not no_exception(app, "refit over a shorter range"):
@@ -6284,7 +6305,7 @@ def case_unticking_a_material_fits_without_it():
     if tune is not None:
         tune.click().run()
         no_exception(app, "refining without the membrane")
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     if work is None:
         check("the fit button is there", False)
         return
@@ -6320,7 +6341,7 @@ def case_unticking_a_material_fits_without_it():
         return
     ticked = {t for t in ("membrane", "interior", "nucleus")
               if state(app, f"use_{t}", False)}
-    work = button_by_label(app, "Fit θ̂: bounded least squares")
+    work = button_by_label(app, "Fit & plot")
     if work is None:
         return
     work.click().run()
@@ -6596,13 +6617,13 @@ def case_the_plot_says_what_the_ranges_say():
     import app as app_module
     source = pathlib.Path(APP).read_text()
     body = source.split('section("3 · Nonlinear fitting")')[-1]
-    check("the curve is staked out beside the component ranges",
-          body.index("with fit_right:")
-          < body.index("curve_slot = st.container()")
+    check("the curve is staked out above the component ranges",
+          body.index("curve_slot = st.container()")
           < body.index("component_controls("), body[:200])
-    check("and the fit button is in the parameter block",
+    check("and the fit button heads the control board",
           body.index("fit_block.__enter__()")
-          < body.index('st.markdown("#### 2 · Fit")'), body[:200])
+          < body.index('"▶ Fit & plot", type="primary", key="guided_fit"')
+          < body.index("component_controls("), body[:200])
 
     # A curve whose deep element carries real force, so every element has a
     # curve of its own to check.
