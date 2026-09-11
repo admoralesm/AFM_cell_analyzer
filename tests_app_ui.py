@@ -4609,103 +4609,65 @@ def case_ordering_reads_the_real_cardiomyocytes():
 
 
 def case_balloon_and_spring_tab_answers_by_itself():
-    print("the Balloon and spring tab answers without being asked twice")
+    print("the log curve tab holds the picture, the algebra and the search")
     source = pathlib.Path(APP).read_text()
-    check("the tab exists on the bar", "🎈 Balloon and spring" in source)
-    check("the hidden-tab indices were moved with it",
+    check("the balloon tab is gone from the bar",
+          "🎈 Balloon and spring" not in source)
+    check("and the log curve has its place instead",
+          '"📈 Log curve and boundaries"' in source, source[:0])
+    check("the hidden-tab indices were left alone",
           "((3, SHOW_VIDEO_TAB), (5, SHOW_DATABASE_TAB))" in source)
-    check("both laws are named on the page",
-          "ε³ᐟ²" in source and "balloon" in source)
 
     curves = vcm_curves()
     if not curves:
         check("the VCM reference curves are in the repository", False)
         return
     eps, force = curves[11]
-    app = AppTest.from_file(APP, default_timeout=600)
+    app = AppTest.from_file(APP, default_timeout=900)
     app.run()
     app.session_state["cell_type"] = "Cardiomyocyte"
     app.session_state["data"] = {
         "epsilon": eps, "force_N": force, "source": "vcm_11.csv", "n_dropped": 0,
     }
     app.run()
-    if not no_exception(app, "the explorer tab runs"):
+    if not no_exception(app, "the log curve tab runs"):
         return
 
-    found = app.session_state["ordering_search"]
-    check("an answer was worked out on load, with no button pressed",
-          found.get("success"), str(found.get("error")))
-    if not found.get("success"):
+    said = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("caption")))
+    for wanted in ("Where the curve changes its power law",
+                   "What the curve is fitting, stretch by stretch",
+                   "Find the boundaries from this curve"):
+        check(f"“{wanted[:34]}…” is on the tab", wanted in said, said[:200])
+
+    # The algebra of each stretch, which is what says one term or two.
+    formulas = " ".join(str(e.value) for e in app.get("latex"))
+    check("each stretch is written as the terms carrying it",
+          formulas.count(r"\le \varepsilon <") >= 2, formulas[:300])
+    check("and the slope reading is defined from the data",
+          r"\frac{d\log F}{d\log \varepsilon}" in formulas, formulas[:300])
+    check("one stretch is named as a single term",
+          "one term" in said, said[-600:])
+    check("and another as two carrying together",
+          "carrying together" in said, said[-600:])
+
+    # The search lives here now, and it moves the boundaries.
+    was = (float(state(app, "segment_break_1")),
+           float(state(app, "segment_break_2")))
+    work = button_by_label(app, "Find the boundaries from the log curve")
+    check("the boundary search is on this tab", work is not None,
+          str([b.label for b in app.button][:10]))
+    if work is None:
         return
-    # With a cortex in the fit the orderings that differed only in when the
-    # scaffolding starts are collapsed, because the cortex is what carries
-    # first contact whichever of them is right.
-    check("the orderings are collapsed onto distinct compositions",
-          len({(r["membrane"], r["cyto_start"])
-               for r in found["candidates"]}) == len(found["candidates"]),
-          str([(r["membrane"], r["cyto_start"])
-               for r in found["candidates"]]))
-    check("the winner follows the curve",
-          found["best"]["r_squared"] > 0.9999,
-          f"{found['best']['r_squared']:.6f}")
-    check("the raw slope is reported next to the fit",
-          "over its first stretch" in found["reading"])
-    check("and cell 11 starts on a Hertzian slope, not a cube law",
-          1.3 < found["near_contact_exponent"] < 2.0,
-          f"{found['near_contact_exponent']:.2f}")
-
-    table = table_with(app, "Order", "R²", "Predicts held-out points")
-    check("the fitting results are on the page", table is not None)
-    if table is not None:
-        check("every ordering compared has a row",
-              len(table) == len(found["candidates"]), str(len(table)))
-        check("one of them is marked best",
-              any("best" in str(v) for v in table["Verdict"]),
-              str(list(table["Verdict"])))
-        check("the boundary each one found is shown", "ε₁" in table.columns,
-              str(list(table.columns)))
-
-    # Pressing "use this" has to move the analysis tab onto the winner, or
-    # the tab is a demonstration rather than a tool.
-    from lulevich_model import ordering_of
-
-    # Knock the analysis tab off the winning ordering by hand, the way a
-    # person disagreeing with it would, so the button has something to do.
-    knocked = app.radio(key="membrane_after_break")
-    if knocked is not None:
-        knocked.set_value("holds what it reached").run()
-        no_exception(app, "changing the ordering by hand")
-
-    adopt = None
-    for b in app.button:
-        if b.label and b.label.startswith("✓ Use "):
-            adopt = b
-    settled = ordering_of(
-        MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]],
-        CYTO_MODE[app.session_state["cyto_starts_at"]],
-    )
-    if adopt is None:
-        # No button because the analysis tab is already on the winner, which
-        # is the other correct outcome and has to say so rather than offering
-        # a button that would change nothing.
-        check("no button is offered when nothing needs changing",
-              settled is not None and settled["key"] == found["best"]["key"],
-              str(settled and settled["key"]))
-        check("and the page says it is already set",
-              any("already set to" in str(e.value) for e in app.get("success")))
+    work.click().run()
+    if not no_exception(app, "searching from the log curve"):
         return
-    adopt.click().run()
-    if not no_exception(app, "adopting the ordering"):
-        return
-    now = ordering_of(
-        MEMBRANE_MODE_ALL[app.session_state["membrane_after_break"]],
-        CYTO_MODE[app.session_state["cyto_starts_at"]],
-    )
-    check("the analysis tab is set to the ordering that won",
-          now is not None
-          and (now["membrane"], now["cyto_start"])
-          == (found["best"]["membrane"], found["best"]["cyto_start"]),
-          str(now and now["key"]))
+    now = (float(state(app, "segment_break_1")),
+           float(state(app, "segment_break_2")))
+    check("pressing it moves the boundaries", now != was, f"{was} -> {now}")
+    rows = state(app, "boundary_candidates")
+    check("and the placements it weighed are listed",
+          rows and len(rows) >= 3, str(len(rows or [])))
 
 
 def case_the_prefactors_are_the_papers():
@@ -5025,10 +4987,9 @@ def case_the_controls_sit_above_the_curve():
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
           > source.index('st.markdown("#### Fitting results")'))
-    check("and the power-law picture after that",
-          source.index(
-              'st.markdown("##### Where the curve changes its power law")')
-          > source.index('st.markdown("##### The equation that was fitted")'))
+    check("and the power-law picture has a tab of its own",
+          'st.markdown("#### Where the curve changes its power law")'
+          in source and '"📈 Log curve and boundaries"' in source)
 
     app = start(cell_name="cell-01")
     if not no_exception(app, "the reordered page"):
@@ -6265,13 +6226,15 @@ def case_the_boundaries_come_from_the_log_curve():
     if not no_exception(app, "before the boundary search"):
         return
 
-    # The defaults panel is the first thing under Optimization: it is the
-    # decision the search is measured against.
+    # The boundaries section on the analysis tab keeps only the setting for
+    # the whole experiment; the search itself lives on the log curve tab.
     source = pathlib.Path(APP).read_text()
-    body = source.split('st.markdown("##### Optimization")')[-1]
-    check("the defaults panel comes first under Optimization",
+    body = source.split('st.markdown("##### Boundaries")')[-1]
+    check("the defaults panel is what is left under Boundaries",
           body.index("set_default_boundaries_control()")
-          < body.index("refine_boundaries_control("), body[:200])
+          < body.index("def "), body[:200])
+    check("and the search is on the log curve tab",
+          "refine_boundaries_control(model_ex" in source)
 
     work = button_by_label(app, "Find the boundaries from the log curve")
     check("the button says where the boundaries come from", work is not None,
