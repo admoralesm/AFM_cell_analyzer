@@ -15,6 +15,9 @@ sys.path.insert(0, str(HERE))
 
 from piecewise_fit import (  # noqa: E402
     C2C12_BOUNDARIES_PCT,
+    component_curve,
+    find_boundaries,
+    joint_sse,
     Geometry,
     fit_piecewise,
     piecewise_moduli,
@@ -26,30 +29,45 @@ TRUE = dict(k_align=2e-10, C0=1e-10, K_shell=1e-13, K_cyto=2e-11,
             K_nucleus=5e-12, K_nuc_cyto=2e-10, K_core=2e-9)
 
 
-def truth(x, t=TRUE):
-    """The spec's four laws, chained exactly as the fit chains them."""
+def truth(x, t=TRUE, b=(5.0, 40.0, 60.0), membrane_throughout=True):
+    """
+    The four laws, chained exactly as the fit chains them.
+
+    With the membrane acting throughout, the shell's K_shell*(x - e1)^3 keeps
+    rising through regimes 3 and 4 on top of the other elements.
+    """
     x = np.asarray(x, dtype=float)
-    f5 = t["k_align"] * 5 + t["C0"]
-    f40 = f5 + t["K_shell"] * 35 ** 3 + t["K_cyto"] * 35 ** 1.5
-    f60 = f40 + t["K_nucleus"] * 20 ** 3 + t["K_nuc_cyto"] * 20 ** 1.5
+    e1, e2, e3 = b
     d = lambda a: np.clip(x - a, 0.0, None)  # noqa: E731
+    shell = t["K_shell"] * d(e1) ** 3
+    carry = shell if membrane_throughout else 0.0
+    f1 = t["k_align"] * e1 + t["C0"]
+    f2 = f1 + t["K_shell"] * (e2 - e1) ** 3 + t["K_cyto"] * (e2 - e1) ** 1.5
+    f3 = (f2 + t["K_nucleus"] * (e3 - e2) ** 3 + t["K_nuc_cyto"] * (e3 - e2) ** 1.5
+          + (t["K_shell"] * ((e3 - e1) ** 3 - (e2 - e1) ** 3)
+             if membrane_throughout else 0.0))
     return np.where(
-        x < 5, t["k_align"] * x + t["C0"],
+        x < e1, t["k_align"] * x + t["C0"],
         np.where(
-            x < 40, f5 + t["K_shell"] * d(5) ** 3 + t["K_cyto"] * d(5) ** 1.5,
+            x < e2, f1 + shell + t["K_cyto"] * d(e1) ** 1.5,
             np.where(
-                x < 60,
-                f40 + t["K_nucleus"] * d(40) ** 3 + t["K_nuc_cyto"] * d(40) ** 1.5,
-                f60 + t["K_core"] * d(60) ** 1.5,
+                x < e3,
+                f2 + t["K_nucleus"] * d(e2) ** 3 + t["K_nuc_cyto"] * d(e2) ** 1.5
+                + (carry - t["K_shell"] * (e2 - e1) ** 3
+                   if membrane_throughout else 0.0),
+                f3 + t["K_core"] * d(e3) ** 1.5
+                + (carry - t["K_shell"] * (e3 - e1) ** 3
+                   if membrane_throughout else 0.0),
             ),
         ),
     )
 
 
-def curve(noise=0.0, top=91.2, n=1200, seed=0, t=TRUE):
+def curve(noise=0.0, top=91.2, n=1200, seed=0, t=TRUE, b=(5.0, 40.0, 60.0),
+          membrane_throughout=True):
     x = np.linspace(0.0, top, n)
     rng = np.random.default_rng(seed)
-    return x / 100.0, truth(x, t) + rng.normal(0.0, noise, n)
+    return x / 100.0, truth(x, t, b, membrane_throughout) + rng.normal(0.0, noise, n)
 
 
 GEOMETRY = Geometry(cell_height=8.09e-6, cell_radius=4.45e-6,
@@ -66,6 +84,33 @@ def test_recovers_every_coefficient_on_a_clean_curve():
         got = r["coefficients"][name]
         assert np.isclose(got, want, rtol=1e-6, atol=1e-18), (name, got, want)
     assert r["r_squared"] > 0.999999
+
+
+def test_the_spec_as_first_written_is_still_there():
+    # carry=() holds the shell at the force it reached at e2, which is the
+    # specification's R3 and R4 exactly.
+    eps, f = curve(membrane_throughout=False)
+    r = fit_piecewise(eps, f, carry=())
+    for name, want in TRUE.items():
+        assert np.isclose(r["coefficients"][name], want, rtol=1e-6, atol=1e-18), name
+
+
+def test_the_membrane_acts_throughout():
+    eps, f = curve(noise=0.2e-9)
+    r = fit_piecewise(eps, f)
+    reg = {x["key"]: x for x in r["regimes"]}
+    # Carried into R3 and R4 with the value R2 measured, not refitted.
+    for key in ("R3", "R4"):
+        carried = reg[key]["carried"]["K_shell"]
+        assert carried["value"] == reg["R2"]["params"]["K_shell"]["value"]
+        assert carried["onset_pct"] == 5.0
+    # Its own curve runs from e1 to the end of the fit.
+    x, shell = component_curve(r, "K_shell")
+    assert x[0] == 5.0 and np.isclose(x[-1], 91.2)
+    assert shell[0] == 0.0 and np.all(np.diff(shell) >= 0)
+    # And ignoring it on a curve that has it is measurably worse.
+    held = fit_piecewise(eps, f, carry=())
+    assert r["rmse"] < held["rmse"]
 
 
 def test_the_curve_is_continuous_at_every_boundary():
@@ -166,6 +211,64 @@ def test_boundaries_can_be_moved():
     assert r["success"]
     assert r["boundaries_pct"] == (0.0, 4.0, 35.0, 65.0, 85.0)
     assert set(r["anchors"]) == {"F_4pct", "F_35pct", "F_65pct"}
+
+
+# ------------------------------------------------------ boundary search ---
+
+def test_the_search_finds_boundaries_that_were_moved():
+    true = (7.0, 36.0, 64.0)
+    eps, f = curve(noise=0.5e-9, n=1500, b=true)
+    found = find_boundaries(eps, f)
+    assert found["success"]
+    assert found["strength"] == "strong", found["delta_bic"]
+    for key, want in zip(("eps1", "eps2", "eps3"), true):
+        iv = found["intervals"][key]
+        assert iv["lo95"] - 0.3 <= want <= iv["hi95"] + 0.3, (key, iv, want)
+    # The two boundaries the curve pins down, pinned down.
+    assert abs(found["best_pct"][1] - 36.0) < 0.6
+    assert abs(found["best_pct"][2] - 64.0) < 0.6
+
+
+def test_the_search_keeps_the_spec_when_the_spec_is_right():
+    # Boundaries exactly at 5 / 40 / 60: moving them must not pay for itself.
+    for seed in range(3):
+        eps, f = curve(noise=0.5e-9, n=1500, seed=seed)
+        found = find_boundaries(eps, f)
+        assert found["delta_bic"] < 0, (seed, found["delta_bic"])
+        assert found["strength"] == "none"
+        assert abs(found["best_pct"][2] - 60.0) < 0.6
+
+
+def test_the_search_stays_inside_its_bands_and_can_hold_one_fixed():
+    eps, f = curve(noise=0.5e-9, n=1200, b=(7.0, 36.0, 64.0))
+    found = find_boundaries(eps, f, bands_pct=((5.0, 5.0), (38.0, 45.0), (55.0, 62.0)))
+    b1, b2, b3 = found["best_pct"]
+    assert b1 == 5.0
+    assert 38.0 <= b2 <= 45.0 and 55.0 <= b3 <= 62.0
+    # ε₃ wants 64 % and is not allowed past 62 %: it says so.
+    assert b3 == 62.0 and found["intervals"]["eps3"]["at_band_edge"]
+
+
+def test_the_search_uses_the_page_settings():
+    # A bound that forbids the nuclear envelope changes S, so it is used.
+    eps, f = curve(noise=0.5e-9, n=1200)
+    free = joint_sse(eps, f)
+    capped = joint_sse(eps, f, settings={"K_nucleus": {"upper": 0.0}})
+    assert capped > free
+    held = joint_sse(eps, f, carry=())
+    assert held != free
+
+
+def test_the_joint_curve_is_never_worse_than_the_chain():
+    # The joint S is the best continuous curve of the same family, so the
+    # sequential fit at the same boundaries can only match or exceed it.
+    eps, f = curve(noise=0.5e-9, n=1200)
+    for b in ((0, 5, 40, 60, 91.2), (0, 4, 37, 63, 91.2)):
+        r = fit_piecewise(eps, f, boundaries_pct=b)
+        x = eps * 100
+        m = (x >= 0) & (x <= 91.2)
+        seq = np.nansum((f[m] - predict_piecewise(eps[m], r)) ** 2)
+        assert joint_sse(eps, f, boundaries_pct=b) <= seq * (1 + 1e-9)
 
 
 # --------------------------------------------------------------- moduli ---
