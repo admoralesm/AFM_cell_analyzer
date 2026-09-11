@@ -17,6 +17,7 @@ from piecewise_fit import (  # noqa: E402
     C2C12_BOUNDARIES_PCT,
     boundaries_from_power_law,
     component_curve,
+    component_force,
     component_ranges,
     find_boundaries,
     power_law_profile,
@@ -234,6 +235,11 @@ def additive(x, t, ranges):
     for name, p in POWERS.items():
         a, u = ranges[name]
         out = out + t[name] * np.clip(np.minimum(x, u) - a, 0.0, None) ** p
+    if t.get("A_lamina"):
+        a, u = ranges["A_lamina"]
+        inside = (x >= a) & (x <= u)
+        out = out + t["A_lamina"] * np.where(
+            inside, np.sin(np.pi * (x - a) / (u - a)) ** 2, 0.0)
     return out
 
 
@@ -241,7 +247,8 @@ def test_default_ranges():
     r = component_ranges()
     assert r == {"k_align": (0.0, 5.0), "K_shell": (5.0, 91.2),
                  "K_cyto": (5.0, 40.0), "K_nucleus": (40.0, 60.0),
-                 "K_nuc_cyto": (40.0, 60.0), "K_core": (60.0, 91.2)}, r
+                 "K_nuc_cyto": (40.0, 60.0), "A_lamina": (40.0, 60.0),
+                 "K_core": (60.0, 91.2)}, r
     assert component_ranges(carry=())["K_shell"] == (5.0, 40.0)
 
 
@@ -249,6 +256,30 @@ def test_the_default_model_is_the_additive_one():
     x = np.linspace(0, 91.2, 1500)
     f = additive(x, TRUE, component_ranges())
     assert np.allclose(f, truth(x), rtol=1e-12, atol=1e-20)
+
+
+def test_the_stacked_layers_add_up_to_the_fit():
+    """Each element's own force, held past its until, sums to the curve."""
+    eps, f = curve(noise=0.3e-9, n=1500)
+    names = ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto",
+             "A_lamina", "K_core")
+    for until in ({}, {"K_cyto": 30.0, "K_nucleus": 80.0, "K_core": 85.0}):
+        r = fit_piecewise(eps, f, settings={n: {"until": u} for n, u in until.items()})
+        x = np.linspace(0.0, 91.2, 2001)
+        layers = [component_force(r, n, x) for n in names]
+        total = sum(layer for layer in layers if layer is not None)
+        fitted = predict_piecewise(x / 100.0, r)
+        assert np.allclose(total, fitted, rtol=1e-9, atol=1e-18), \
+            float(np.nanmax(np.abs(total - fitted)))
+        # A layer is zero before its element starts and constant after it
+        # stops, so its thickness changes only over [s, u].
+        for n, layer in zip(names, layers):
+            if layer is None or n in ("k_align", "A_lamina"):
+                continue
+            a, u = r["ranges"][n]
+            assert np.all(layer[x < a - 1e-9] == 0.0), n
+            after = layer[x > u + 1e-9]
+            assert after.size == 0 or np.ptp(after) == 0.0, n
 
 
 def test_an_element_can_stop_early_or_keep_going():
@@ -280,6 +311,31 @@ def test_a_range_that_no_longer_fits_its_regime_falls_back():
     assert r["K_nucleus"] == (45.0, 60.0)
 
 
+def test_the_nuclear_lamina_lump_is_fitted():
+    # A curve with the little lump at about 50 %: the lamina taking load
+    # and giving way over the nuclear regime, 50-75 %.
+    from piecewise_fit import lamina_summary
+    b = (0, 5.0, 50.0, 75.0, 91.2)
+    carry_all = ("K_shell", "K_cyto", "K_nuc_cyto", "K_nucleus", "K_core")
+    t = dict(TRUE, A_lamina=4e-9)
+    x = np.linspace(0, 91.2, 1500)
+    f = additive(x, t, component_ranges(b, carry=carry_all))
+    r = fit_piecewise(x / 100, f, boundaries_pct=b, carry=carry_all)
+    assert np.isclose(r["coefficients"]["A_lamina"], 4e-9, rtol=1e-6)
+    for name, want in TRUE.items():
+        assert np.isclose(r["coefficients"][name], want, rtol=1e-6, atol=1e-18), name
+    # It leaves the anchors alone: zero, with zero slope, at both ends.
+    assert all(abs(g) < 1e-20 for g in r["continuity_gaps_N"].values())
+    lam = lamina_summary(r, GEOMETRY)
+    assert lam["present"] and np.isclose(lam["peak_pct"], 62.5)
+    assert np.isclose(lam["work_J"], 4e-9 * 12.5 * 8.09e-6 / 100)
+    # And a curve without one says so.
+    f0 = additive(x, TRUE, component_ranges(b, carry=carry_all))
+    r0 = fit_piecewise(x / 100, f0, boundaries_pct=b, carry=carry_all)
+    assert r0["coefficients"]["A_lamina"] < 1e-15
+    assert not any("A_lamina" in w for w in r0["warnings"])
+
+
 def test_switching_an_element_off_takes_it_out():
     x = np.linspace(0, 91.2, 1200)
     t = dict(TRUE, K_nuc_cyto=0.0)
@@ -300,8 +356,9 @@ def test_the_search_finds_boundaries_that_were_moved():
     for key, want in zip(("eps1", "eps2", "eps3"), true):
         iv = found["intervals"][key]
         assert iv["lo95"] - 0.3 <= want <= iv["hi95"] + 0.3, (key, iv, want)
-    # The two boundaries the curve pins down, pinned down.
-    assert abs(found["best_pct"][1] - 36.0) < 0.6
+    # The boundaries the curve pins down, pinned down. ε₂ trades a little
+    # with the lamina lump, which can take up some of an onset's curvature.
+    assert abs(found["best_pct"][1] - 36.0) < 3.0
     assert abs(found["best_pct"][2] - 64.0) < 0.6
 
 
