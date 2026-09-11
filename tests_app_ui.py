@@ -5104,6 +5104,10 @@ def case_the_controls_sit_above_the_curve():
           "st.sidebar.expander(\n                \"⚙️ Change what the fit assumed\""
           in source or 'settings_box = st.sidebar.expander(' in source,
           "settings box is not in the sidebar")
+    check("the working sits on the page under the fit, not in the settings",
+          "diagnostics_box = st.expander(" in source
+          and "diagnostics_box = st.sidebar.expander(" not in source
+          and 'working = st.expander("🔍 The working, in detail"' in source)
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
           > source.index('section("4 · Fitting results")'))
