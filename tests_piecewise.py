@@ -282,6 +282,63 @@ def test_the_stacked_layers_add_up_to_the_fit():
             assert after.size == 0 or np.ptp(after) == 0.0, n
 
 
+FOUR = dict(k_align=2e-10, C0=1e-10, K_shell=1e-13, K_cyto=2e-11,
+            K_nucleus=5e-12, K_core=2e-9)
+FOUR_CARRY = ("K_shell", "K_cyto", "K_nucleus", "K_core")
+
+
+def four_regimes():
+    """The page's model: the spring network's four components + contact."""
+    import dataclasses
+    from piecewise_fit import C2C12_REGIMES
+    return tuple(dataclasses.replace(
+        r, terms=tuple(t for t in r.terms if t.name not in ("K_nuc_cyto", "A_lamina")))
+        for r in C2C12_REGIMES)
+
+
+def four_curve(b=(5.0, 45.0, 68.0), noise=0.3e-9, n=1500, t=FOUR):
+    """Contact to e1, then every element from its start to the end."""
+    x = np.linspace(0.0, 91.2, n)
+    d = lambda a: np.clip(x - a, 0.0, None)  # noqa: E731
+    f = (np.where(x < b[0], t["k_align"] * x, t["k_align"] * b[0]) + t["C0"]
+         + t["K_shell"] * d(b[0]) ** 3 + t["K_cyto"] * d(b[0]) ** 1.5
+         + t["K_nucleus"] * d(b[1]) ** 3 + t["K_core"] * d(b[2]) ** 1.5)
+    return x / 100.0, f + np.random.default_rng(0).normal(0.0, noise, n)
+
+
+def test_the_four_component_model_recovers_its_curve():
+    eps, f = four_curve()
+    r = fit_piecewise(eps, f, boundaries_pct=(0.0, 5.0, 45.0, 68.0, 91.2),
+                      regimes=four_regimes(), carry=FOUR_CARRY)
+    assert set(r["coefficients"]) == {"C0", "k_align", "K_shell", "K_cyto",
+                                      "K_nucleus", "K_core"}
+    assert r["r_squared"] > 0.9999, r["r_squared"]
+    for name in ("K_shell", "K_nucleus", "K_core"):
+        assert np.isclose(r["coefficients"][name], FOUR[name], rtol=0.1), name
+    found = find_boundaries(eps, f, end_pct=91.2, regimes=four_regimes(),
+                            carry=FOUR_CARRY,
+                            bands_pct=((1.0, 5.0), (44.0, 62.0), (59.0, 97.0)),
+                            span_pct=(15.0, 35.0))
+    assert found["success"]
+    assert abs(found["best_pct"][1] - 45.0) < 2.0, found["best_pct"]
+    assert abs(found["best_pct"][2] - 68.0) < 3.0, found["best_pct"]
+
+
+def test_the_contact_slope_can_be_switched_off():
+    eps, f = four_curve()
+    r = fit_piecewise(eps, f, boundaries_pct=(0.0, 5.0, 45.0, 68.0, 91.2),
+                      regimes=four_regimes(), carry=FOUR_CARRY,
+                      settings={"k_align": {"lower": 0.0, "upper": 0.0}})
+    assert r["coefficients"]["k_align"] == 0.0
+    r1 = r["regimes"][0]
+    x = eps[eps * 100 < 5.0] * 100
+    # Only the offset is fitted: the mean of the first stretch.
+    assert np.isclose(r["coefficients"]["C0"], np.mean(f[: x.size]), rtol=1e-6)
+    assert r1["params"]["k_align"]["at_bound"]
+    # And the curve is still continuous into the next regime.
+    assert max(abs(v) for v in (r.get("continuity_gaps_N") or {0: 0}).values()) < 1e-15
+
+
 def test_an_element_can_stop_early_or_keep_going():
     # The cytoskeleton stops at 30 % inside its regime; the nuclear
     # envelope keeps stretching to 75 %, past the start of regime 4.
