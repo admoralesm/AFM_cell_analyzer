@@ -289,6 +289,26 @@ def case_c2c12_opens_on_the_four_regime_fit():
           state(app, "pw_membrane_throughout") is True
           and state(app, "results")["fit"]["piecewise"]["membrane_throughout"])
 
+    # The component bars and the plot are one setting: move a bar and the
+    # fit, and so every curve drawn from it, uses the new range.
+    app.slider(key="pw_range_K_cyto").set_value((5.0, 30.0)).run()
+    if no_exception(app, "moving a component's range"):
+        ranges = state(app, "results")["fit"]["piecewise"]["component_ranges_pct"]
+        check("the fit uses the range on the bar",
+              [round(v, 2) for v in ranges["K_cyto"]] == [5.0, 30.0],
+              str(ranges["K_cyto"]))
+        check("and the bar still shows it after the refit",
+              tuple(round(v, 2) for v in app.slider(key="pw_range_K_cyto").value)
+              == (5.0, 30.0), str(app.slider(key="pw_range_K_cyto").value))
+    app.slider(key="pw_range_K_nucleus").set_value((45.0, 60.0)).run()
+    if no_exception(app, "moving a component's start"):
+        check("moving a start moves its boundary",
+              state(app, "pw_b2") == 45.0, str(state(app, "pw_b2")))
+        check("for every component that starts there",
+              tuple(app.slider(key="pw_range_K_nuc_cyto").value)[0] == 45.0,
+              str(app.slider(key="pw_range_K_nuc_cyto").value))
+    app.button(key="pw_reset").click().run()
+
     app.button(key="pw_find").click().run()
     if no_exception(app, "finding the boundaries"):
         found = state(app, "pw_boundary_search") or {}
