@@ -114,6 +114,24 @@ HAS_WINDOW_SEARCH = _pull(_model_module, "lulevich_model.py",
 if not HAS_WINDOW_SEARCH:
     search_term_windows = None
 
+# The four-regime, C0-anchored C2C12 fit. Optional in the same way: without
+# piecewise_fit.py the C2C12 page falls back to the other models rather than
+# refusing to start.
+try:
+    _piecewise_module = importlib.import_module("piecewise_fit")
+except Exception:  # pragma: no cover - only on a half-updated deploy
+    _piecewise_module = None
+HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
+    "C2C12_BOUNDARIES_PCT",
+    "C2C12_REGIMES",
+    "Geometry",
+    "fit_piecewise",
+    "piecewise_moduli",
+    "predict_piecewise",
+    "probe_correction",
+    "regime_curves",
+), required=False)
+
 if MISSING_PIECES:
     st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
     st.error(
@@ -596,8 +614,9 @@ DEFAULTS = {
     # control set the same two numbers, so switching between them
     # never changes what is being fitted.
     "window_start": 0.0,
-    # Acquisition, recorded with the cell rather than used by the fit.
-    "probe_diameter_um": 0.0,
+    # Acquisition. The probe diameter is also used by the four-regime C2C12
+    # fit, which corrects its Hertzian terms for the curvature of the sphere.
+    "probe_diameter_um": 40.0,
     "approach_speed_um_s": 2.0,
     "poisson_membrane": 0.50,
     "poisson_interior": 0.50,
@@ -614,6 +633,20 @@ DEFAULTS = {
     "onset_mode": "Scan for best",
     "_scanned_onset": None,
     # fitting
+    # A C2C12 curve is fitted with the four-regime piecewise model by
+    # default: fixed regimes, one anchored fit, nothing to set before the
+    # answer appears. The spring-network models are the other choice.
+    "c2c12_fit_mode": "4-regime piecewise (C2C12)",
+    # Where regimes 2, 3 and 4 start and where the fit ends, in PERCENT
+    # relative deformation. Regime 1 always starts at 0 %.
+    "pw_b1": 5.0,
+    "pw_b2": 40.0,
+    "pw_b3": 60.0,
+    "pw_end": 91.2,
+    # Per-coefficient initial guesses and bounds the user has changed, as
+    # {name: {"p0": .., "lower": .., "upper": ..}}. Empty means the spec's.
+    "pw_settings": {},
+    "pw_log_y": False,
     # Guided by default: most people opening this want a number, not a
     # spring network. Everything is still one expander away.
     "ui_mode": "Guided · plain language",
@@ -4422,6 +4455,608 @@ def fit_verdict():
         st.success(said)
 
 
+# ====================================================== four-regime C2C12 ==
+#
+# The C2C12 fit a person reaches for first: four regimes met in turn, each
+# anchored to the force the one before it ended on, so the curve is
+# continuous everywhere and the fit has nothing to converge but four small
+# convex problems. No components to tick, no windows, no searches. The
+# curve loads and the answer is on the page.
+
+PIECEWISE_MODE = "4-regime piecewise (C2C12)"
+ADVANCED_MODE = "Spring-network models (advanced)"
+FIT_MODES = (PIECEWISE_MODE, ADVANCED_MODE)
+PIECEWISE_CELL_TYPES = ("Myoblast (C2C12)",)
+PW_BOUNDARY_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end")
+PW_COLORS = {"R1": "#7f8c8d", "R2": "#2ca02c", "R3": "#1f77b4", "R4": "#9467bd"}
+PW_BANDS = {"R1": "rgba(127,140,141,0.10)", "R2": "rgba(44,160,44,0.08)",
+            "R3": "rgba(31,119,180,0.08)", "R4": "rgba(148,103,189,0.08)"}
+# Where each coefficient's modulus goes in the record and the sheet, which
+# were laid out for the spring-network models. The two that have no column
+# there get their own.
+PW_TERM_OF = {
+    "K_shell": "membrane", "K_cyto": "interior",
+    "K_nucleus": "nucleus_shell", "K_core": "nucleus",
+}
+
+
+def piecewise_offered(cell_type=None):
+    """Whether this cell type has the four-regime fit at all."""
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    # A fixed cell is one cross-linked solid, not four regimes of a living
+    # one, so ticking it hands the curve to the models that describe that.
+    return (bool(HAS_PIECEWISE) and cell_type in PIECEWISE_CELL_TYPES
+            and not fixed_cell_on())
+
+
+def piecewise_on():
+    """Whether the curve on the page is being fitted with the four regimes."""
+    return (
+        piecewise_offered()
+        and st.session_state.get("c2c12_fit_mode", PIECEWISE_MODE) == PIECEWISE_MODE
+    )
+
+
+def fit_mode_control():
+    """The one choice above the fit, drawn only where there is a choice."""
+    if not piecewise_offered():
+        return False
+    if st.session_state.get("c2c12_fit_mode") not in FIT_MODES:
+        st.session_state["c2c12_fit_mode"] = PIECEWISE_MODE
+    st.radio(
+        "Fitting model",
+        FIT_MODES,
+        key="c2c12_fit_mode",
+        horizontal=True,
+        help="The 4-regime model fits the whole curve in one press: contact, "
+        "cell stretch + cytoskeleton, nuclear envelope, dense nuclear "
+        "packing, each anchored to where the last one ended. The "
+        "spring-network models are the membrane / cytoskeleton / nucleus "
+        "fits with searchable boundaries.",
+    )
+    return piecewise_on()
+
+
+def piecewise_boundaries():
+    """(0, b1, b2, b3, end) in percent, as the page has them."""
+    return (0.0,) + tuple(
+        float(st.session_state.get(key, DEFAULTS[key])) for key in PW_BOUNDARY_KEYS
+    )
+
+
+def piecewise_settings():
+    """The user's changes to initial guesses and bounds, cleaned."""
+    stored = st.session_state.get("pw_settings") or {}
+    return {k: dict(v) for k, v in stored.items() if isinstance(v, dict)}
+
+
+def _pw_number(text):
+    """'1e-9', '0', 'inf', '-inf' or blank -> float, or None if unreadable."""
+    text = str(text).strip().lower().replace("∞", "inf").replace("+", "")
+    if text in ("", "none", "nan"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _pw_text(value):
+    """A float as the editor shows it: short, and inf spelled out."""
+    value = float(value)
+    if np.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    if value == 0:
+        return "0"
+    return f"{value:.4g}"
+
+
+def piecewise_geometry(model, probe_um=None, coat_nm=None):
+    """What the modulus conversion needs, from the model the page built."""
+    if probe_um is None:
+        probe_um = st.session_state.get("probe_diameter_um", 0.0)
+    if coat_nm is None:
+        coat_nm = st.session_state.get("protein_coat_nm", 200.0)
+    probe_um = float(probe_um or 0.0)
+    return Geometry(
+        cell_height=float(model.cell_height),
+        cell_radius=float(model.R0),
+        nucleus_radius=float(model.R_nucleus),
+        probe_radius=probe_um * 0.5e-6 if probe_um > 0 else None,
+        membrane_thickness=float(model.h_membrane),
+        envelope_thickness=float(getattr(model, "h_envelope", 40e-9)),
+        coat_thickness=float(coat_nm) * 1e-9,
+        nu_membrane=float(model.nu_m),
+        nu_interior=float(model.nu_i),
+        nu_nucleus=float(model.nu_n),
+    )
+
+
+def run_piecewise_fit(model, epsilon, force_N):
+    """Fit and convert, at the page's boundaries and settings."""
+    result = fit_piecewise(
+        epsilon, force_N,
+        boundaries_pct=piecewise_boundaries(),
+        settings=piecewise_settings(),
+    )
+    if result.get("success"):
+        result["moduli"] = piecewise_moduli(result, piecewise_geometry(model))
+    return result
+
+
+def pressure_text(value, se=None):
+    """A modulus in the unit that reads best: Pa, kPa or MPa."""
+    if value is None or not np.isfinite(value):
+        return "—"
+    for factor, unit in ((1e6, "MPa"), (1e3, "kPa"), (1.0, "Pa")):
+        if abs(value) >= factor or unit == "Pa":
+            text = f"{value / factor:.3g} {unit}"
+            if se is not None and np.isfinite(se):
+                text = f"{value / factor:.3g} ± {se / factor:.2g} {unit}"
+            return text
+    return f"{value:.3g} Pa"
+
+
+def piecewise_as_fit(result, model, probe_um=None, settings=None):
+    """
+    The four-regime result in the shape the rest of the page reads.
+
+    The database, the download and the results tab were written against the
+    spring-network fits. Rather than teach each of them a second shape, the
+    four moduli that have a column there are put in it, and everything else
+    rides along under ``piecewise``.
+    """
+    moduli = result.get("moduli") or {}
+    b = result["boundaries_pct"]
+
+    def e(name):
+        row = moduli.get(name) or {}
+        return float(row.get("E_Pa", float("nan"))), float(row.get("E_se_Pa", float("nan")))
+
+    shell, shell_se = e("K_shell")
+    cyto, cyto_se = e("K_cyto")
+    envelope, envelope_se = e("K_nucleus")
+    peri, peri_se = e("K_nuc_cyto")
+    core, core_se = e("K_core")
+    align, _align_se = e("k_align")
+    tension = float((moduli.get("k_align") or {}).get("tension_N_per_m", float("nan")))
+
+    def finite(v):
+        return float(v) if np.isfinite(v) else 0.0
+
+    spans = {
+        "alignment": (b[0] / 100, b[1] / 100),
+        "membrane": (b[1] / 100, b[2] / 100),
+        "interior": (b[1] / 100, b[2] / 100),
+        "nucleus_shell": (b[2] / 100, b[3] / 100),
+        "perinuclear": (b[2] / 100, b[3] / 100),
+        "nucleus": (b[3] / 100, result["epsilon_range"][1]),
+    }
+    flat = {}
+    for name, row in moduli.items():
+        flat[f"{name}"] = row["K"]
+        flat[f"{name}_se"] = row["K_se"]
+        flat[f"{row['symbol']}_Pa"] = row["E_Pa"]
+        flat[f"{row['symbol']}_se_Pa"] = row["E_se_Pa"]
+    flat["C0_N"] = result["coefficients"].get("C0", float("nan"))
+    flat.update({f"{k}_N": v for k, v in result["anchors"].items()})
+
+    fit = {
+        "success": True,
+        "coupling": "piecewise",
+        "model_label": PIECEWISE_MODE,
+        "terms": ("membrane", "interior", "nucleus_shell", "nucleus"),
+        "Em": finite(shell), "Em_MPa": finite(shell) / 1e6,
+        "Em_MPa_std": finite(shell_se) / 1e6,
+        "Ei": finite(cyto), "Ei_kPa": finite(cyto) / 1e3,
+        "Ei_kPa_std": finite(cyto_se) / 1e3,
+        "Ene": finite(envelope), "Ene_MPa": finite(envelope) / 1e6,
+        "Ene_MPa_std": finite(envelope_se) / 1e6,
+        "En": finite(core), "En_kPa": finite(core) / 1e3,
+        "En_kPa_std": finite(core_se) / 1e3,
+        "E_nc_kPa": finite(peri) / 1e3, "E_nc_kPa_std": finite(peri_se) / 1e3,
+        "E_align_kPa": finite(align) / 1e3,
+        "T_align_mN_m": finite(tension) * 1e3,
+        "membrane_areal_modulus": finite(shell) * float(model.h_membrane),
+        "r_squared": result["r_squared"],
+        "adj_r_squared": result.get("adj_r_squared", float("nan")),
+        "chi_squared": result.get("chi_squared", float("nan")),
+        "chi_squared_reduced": result.get("chi_squared_reduced", float("nan")),
+        "noise_sigma": result.get("noise_sigma", float("nan")),
+        "rmse": result["rmse"],
+        "n_points": result["n_points"],
+        "epsilon_range": tuple(result["epsilon_range"]),
+        "weighting": "uniform",
+        "warnings": list(result.get("warnings", [])),
+        "R0": float(model.R0),
+        "R_nucleus": float(model.R_nucleus),
+        # The two boundaries the sheet has columns for: where the nuclear
+        # regime starts and where the dense packing does.
+        "break_1": b[2] / 100.0,
+        "break_2": b[3] / 100.0,
+        "Km_kT": float("nan"),
+        "piecewise": {
+            "boundaries_pct": list(b),
+            "coefficients": dict(result["coefficients"]),
+            "anchors_N": dict(result["anchors"]),
+            "spans": {k: list(v) for k, v in spans.items()},
+            "flat": flat,
+            "probe_diameter_um": float(
+                st.session_state.get("probe_diameter_um", 0.0)
+                if probe_um is None else probe_um
+            ),
+            "settings": piecewise_settings() if settings is None else settings,
+        },
+    }
+    return fit
+
+
+def piecewise_stage_plan(result):
+    """The regimes as the record's stage plan: which elements, over what."""
+    names = {
+        "R1": ["alignment"], "R2": ["membrane", "interior"],
+        "R3": ["nucleus_shell", "perinuclear_cytoskeleton"], "R4": ["nucleus"],
+    }
+    return [
+        {"terms": names.get(r["key"], [r["key"]]),
+         "range": (r["domain_pct"][0] / 100.0, r["domain_pct"][1] / 100.0)}
+        for r in result.get("regimes") or []
+    ]
+
+
+def piecewise_figure(epsilon, force_N, result, style, log_y=False):
+    """The data, the four fitted laws, the regimes and the anchors."""
+    x = np.asarray(epsilon, dtype=float) * 100.0
+    y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
+    scale = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
+    fig = go.Figure()
+    b = result["boundaries_pct"]
+    for regime in result["regimes"]:
+        a, z = regime["domain_pct"]
+        fig.add_vrect(
+            x0=a, x1=z, fillcolor=PW_BANDS.get(regime["key"], "rgba(0,0,0,0.05)"),
+            line_width=0, layer="below",
+            annotation_text=regime["key"], annotation_position="top left",
+            annotation_font_size=13,
+        )
+    keep = (y > 0) if log_y else np.ones_like(y, dtype=bool)
+    fig.add_trace(go.Scatter(
+        x=x[keep], y=y[keep], mode="markers", name="Experimental data",
+        marker={"color": style.data_color, "size": max(3, int(style.marker_size * 0.55))},
+    ))
+    for key, xs, fs in regime_curves(result):
+        regime = next(r for r in result["regimes"] if r["key"] == key)
+        fig.add_trace(go.Scatter(
+            x=xs, y=fs * scale, mode="lines",
+            name=f"{key} · {regime['title']}",
+            line={"color": PW_COLORS.get(key, "#000000"),
+                  "width": max(2, int(style.line_width * 0.8))},
+        ))
+    anchor_x, anchor_y, anchor_text = [], [], []
+    for name, value in result["anchors"].items():
+        where = float(name.split("_")[1].replace("pct", ""))
+        anchor_x.append(where)
+        anchor_y.append(value * scale)
+        anchor_text.append(f"{name.replace('pct', '%')} = {value * scale:.4g} {unit}")
+    if anchor_x:
+        fig.add_trace(go.Scatter(
+            x=anchor_x, y=anchor_y, mode="markers", name="C0 anchors",
+            marker={"symbol": "diamond", "size": 12, "color": "#ffffff",
+                    "line": {"color": "#000000", "width": 2}},
+            text=anchor_text, hovertemplate="%{text}<extra></extra>",
+        ))
+    for boundary in b[1:-1]:
+        fig.add_vline(x=boundary, line_dash="dot", line_color="#555555",
+                      line_width=1)
+    fig.update_layout(
+        height=int(style.height), template="simple_white",
+        margin={"l": 70, "r": 20, "t": 30, "b": 60},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02,
+                "xanchor": "left", "x": 0.0},
+        xaxis_title="Relative deformation (%)",
+        yaxis_title=f"Force ({unit})",
+    )
+    if log_y:
+        fig.update_yaxes(type="log")
+    return fig
+
+
+def piecewise_residual_figure(epsilon, force_N, fitted, style):
+    """Data minus fit, in the display unit."""
+    residual, unit = from_newtons(
+        np.asarray(force_N, dtype=float) - np.asarray(fitted, dtype=float),
+        style.force_unit,
+    )
+    fig = go.Figure(go.Scatter(
+        x=np.asarray(epsilon, dtype=float) * 100.0, y=residual, mode="markers",
+        marker={"size": 4, "color": "#555555"}, name="residual",
+    ))
+    fig.add_hline(y=0, line_color="#000000", line_width=1)
+    fig.update_layout(height=260, template="simple_white",
+                      margin={"l": 70, "r": 20, "t": 10, "b": 50},
+                      xaxis_title="Relative deformation (%)",
+                      yaxis_title=f"Residual ({unit})", showlegend=False)
+    return fig
+
+
+def piecewise_parameter_editor():
+    """Initial guesses and bounds, one row per coefficient, editable."""
+    stored = piecewise_settings()
+    rows = []
+    for regime in C2C12_REGIMES:
+        for term in regime.terms:
+            if term.name == "k_align":
+                continue
+            mine = stored.get(term.name, {})
+            rows.append({
+                "Regime": regime.key,
+                "Coefficient": term.name,
+                "Law": f"dx^{term.power:g}",
+                "Initial guess": _pw_text(mine.get("p0", term.p0)),
+                "Lower bound": _pw_text(mine.get("lower", term.lower)),
+                "Upper bound": _pw_text(mine.get("upper", term.upper)),
+            })
+    frame = pd.DataFrame(rows)
+    edited = st.data_editor(
+        frame, key="pw_param_editor", hide_index=True, num_rows="fixed",
+        disabled=["Regime", "Coefficient", "Law"],
+        **STRETCH,
+    )
+    wanted, problems = {}, []
+    defaults = {t.name: t for r in C2C12_REGIMES for t in r.terms}
+    for _, row in edited.iterrows():
+        name = row["Coefficient"]
+        term = defaults[name]
+        values = {}
+        for column, key in (("Initial guess", "p0"), ("Lower bound", "lower"),
+                            ("Upper bound", "upper")):
+            number = _pw_number(row[column])
+            if number is None:
+                problems.append(f"{name}: '{row[column]}' is not a number")
+                number = getattr(term, key)
+            values[key] = number
+        if values["lower"] >= values["upper"]:
+            problems.append(f"{name}: the lower bound must be below the upper")
+            values["lower"], values["upper"] = term.lower, term.upper
+        changed = {k: v for k, v in values.items() if v != getattr(term, k)}
+        if changed:
+            wanted[name] = changed
+    if wanted != stored:
+        st.session_state["pw_settings"] = wanted
+    for problem in problems:
+        st.caption(f"⚠️ {problem}; using the default instead.")
+    st.caption(
+        "Every regime is linear in its coefficients once its anchor is "
+        "fixed, so the fit has one best answer inside the bounds. The "
+        "initial guess is where Trust-Region Reflective starts; it can slow "
+        "the solver down but cannot change the answer. Bounds do change it: "
+        "a coefficient sitting on its bound is flagged in the results."
+    )
+
+
+def keep_unrendered_settings():
+    """
+    Hold on to the spring-network settings while the four-regime fit is up.
+
+    Streamlit drops a widget's value at the end of any run that does not
+    draw it, and with the four-regime fit on screen none of the other
+    models' controls are drawn. Writing each value back to itself keeps it,
+    so switching to the advanced models finds them as they were left.
+    Called at the very end of the run, when every widget that is going to
+    be drawn has been: those refuse the write and are skipped (they are
+    kept by being drawn), and nothing drawn afterwards can complain that
+    its value was set through session state.
+    """
+    for key in DEFAULTS:
+        if key in NOT_A_SETTING or key.startswith("_"):
+            continue
+        if key not in st.session_state:
+            continue
+        try:
+            st.session_state[key] = st.session_state[key]
+        except Exception:
+            pass
+
+
+def piecewise_section(model, epsilon, force_N, rupture):
+    """
+    The whole four-regime step: boundaries, fit, curve, numbers.
+
+    Returns (fit, fitted, stage_plan) for the database section below, with
+    ``fit`` None when there is nothing to show.
+    """
+    if st.session_state.pop("_pw_editor_reset", False):
+        st.session_state.pop("pw_param_editor", None)
+
+    st.caption(
+        "Fits itself as soon as a curve is loaded, and refits the moment a "
+        "boundary, guess or bound changes. Each regime starts from the force "
+        "the previous one ended on (a hard anchor, not a free parameter), so "
+        "the fitted curve is continuous from 0 % to the end."
+    )
+
+    top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
+    st.markdown("#### 1 · Regime boundaries (% relative deformation)")
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1.25])
+    with c1:
+        st.number_input("R2 starts", 0.5, 99.0, step=0.5, format="%.1f",
+                        key="pw_b1", help="End of the contact/alignment zone.")
+    with c2:
+        st.number_input("R3 starts", 1.0, 99.0, step=0.5, format="%.1f",
+                        key="pw_b2", help="Where the nuclear envelope is reached.")
+    with c3:
+        st.number_input("R4 starts", 1.0, 99.5, step=0.5, format="%.1f",
+                        key="pw_b3", help="Where dense intranuclear packing starts.")
+    with c4:
+        st.number_input("Fit ends", 1.0, 100.0, step=0.1, format="%.1f",
+                        key="pw_end", help="The last point fitted.")
+    with c5:
+        st.write("")
+        spec = tuple(DEFAULTS[k] for k in PW_BOUNDARY_KEYS)
+        if st.button("↺ 5 / 40 / 60 / 91.2 %", key="pw_reset",
+                     help="Put the boundaries, initial guesses and bounds "
+                     "back to the C2C12 specification.", **STRETCH):
+            rerun_keeping_settings({
+                **dict(zip(PW_BOUNDARY_KEYS, spec)),
+                "pw_settings": {},
+                "_pw_editor_reset": True,
+            })
+
+    bounds = piecewise_boundaries()
+    note = []
+    if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
+        at = float(rupture["epsilon"]) * 100.0
+        if bounds[0] < at < min(bounds[-1], top):
+            note.append(f"the force drops at {at:.1f} % (possible rupture); set "
+                        f"**Fit ends** to {at:.1f} to leave out what follows")
+    if note:
+        st.caption("ℹ️ " + "; ".join(note) + ".")
+
+    with st.expander("Initial guesses and bounds", expanded=False):
+        piecewise_parameter_editor()
+
+    result = run_piecewise_fit(model, epsilon, force_N)
+    style = current_style(force_N)
+
+    st.markdown("#### 2 · Fit")
+    if not result.get("success"):
+        st.error(f"Could not fit: {result.get('error', 'unknown error')}")
+        for warning in result.get("warnings", []):
+            st.caption(f"⚠️ {warning}")
+        return None, None, []
+
+    chi = result.get("chi_squared_reduced", float("nan"))
+    gaps = result.get("continuity_gaps_N") or {}
+    worst_gap = max((abs(v) for v in gaps.values()), default=0.0)
+    gap_disp, gap_unit = from_newtons(worst_gap, style.force_unit)
+    st.success(
+        f"**R² = {result['r_squared']:.5f}**"
+        + (f" · χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
+        + f" · {result['n_points']} points from {bounds[0]:g} to "
+        f"{result['epsilon_range'][1] * 100:.1f} % · continuity gap "
+        f"{float(gap_disp):.1g} {gap_unit} (exact by construction)"
+    )
+
+    st.checkbox("Log force axis", key="pw_log_y")
+    st.plotly_chart(
+        piecewise_figure(epsilon, force_N, result, style,
+                         log_y=bool(st.session_state.get("pw_log_y"))),
+        key="pw_curve", **STRETCH,
+    )
+    fitted = predict_piecewise(epsilon, result)
+    with st.expander("Residuals", expanded=False):
+        st.plotly_chart(
+            piecewise_residual_figure(epsilon, force_N, fitted, style),
+            key="pw_residuals", **STRETCH,
+        )
+
+    moduli = result.get("moduli") or {}
+    st.markdown("#### 3 · Young's moduli")
+    order = ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core", "k_align")
+    cols = st.columns(3)
+    for i, name in enumerate(order):
+        row = moduli.get(name)
+        if not row:
+            continue
+        label = f"{row['symbol']} · {row['element']}"
+        with cols[i % 3]:
+            st.metric(label, pressure_text(row["E_Pa"]) if row["fitted"] else "not fitted",
+                      help=f"From {name} in {row['regime']}: {row['law']}. "
+                      + (row.get("note") or ""))
+            if row["at_bound"]:
+                st.caption("⚠️ on its bound: not resolved on this curve")
+
+    table = []
+    for regime in result["regimes"]:
+        a, z = regime["domain_pct"]
+        for name, p in regime["params"].items():
+            row = moduli.get(name, {})
+            value, unit = p["value"], ("N" if name == "C0" else f"N/%^{p['power']:g}")
+            table.append({
+                "Regime": regime["key"],
+                "Domain (%)": f"{a:g}–{z:g}",
+                "Points": regime["n_points"],
+                "R²": (f"{regime['r_squared']:.4f}"
+                       if np.isfinite(regime["r_squared"]) else "—"),
+                "Coefficient": name,
+                "Value ± SE": (
+                    "—" if not np.isfinite(value) else
+                    f"{value:.4g}" + (f" ± {p['se']:.2g}" if np.isfinite(p["se"]) else "")
+                ) + f" {unit}",
+                "Initial": "—" if not np.isfinite(p["p0"]) else f"{p['p0']:.3g}",
+                "Bounds": f"[{_pw_text(p['lower'])}, {_pw_text(p['upper'])}]",
+                "Modulus": row.get("symbol", ""),
+                "E ± SE": (pressure_text(row["E_Pa"], row["E_se_Pa"])
+                           if row else ""),
+                "Flag": "on bound" if p.get("at_bound") else "",
+            })
+    flat_table(
+        pd.DataFrame(table),
+        align_right=["Points", "R²", "Value ± SE", "Initial", "E ± SE"],
+        caption="Coefficients are in newtons per percent to the power of the "
+        "law; the modulus is E = K·100^p / A with A the element's analytical "
+        "prefactor (see the geometry below). C0 is regime 1's intercept.",
+    )
+
+    anchors_disp = " · ".join(
+        f"{name.replace('pct', '%')} = "
+        f"{float(from_newtons(value, style.force_unit)[0]):.4g} "
+        f"{from_newtons(value, style.force_unit)[1]}"
+        for name, value in result["anchors"].items()
+    )
+    st.caption(f"**Anchors passed forward:** {anchors_disp}")
+
+    geometry = piecewise_geometry(model)
+    c_cell = probe_correction(geometry.cell_radius, geometry.probe_radius)
+    c_nuc = probe_correction(geometry.nucleus_radius, geometry.probe_radius)
+    st.caption(
+        f"**Geometry used:** h₀ = {geometry.cell_height * 1e6:.2f} µm · "
+        f"R₀ = {geometry.cell_radius * 1e6:.2f} µm · "
+        f"Rₙ = {geometry.nucleus_radius * 1e6:.2f} µm · "
+        + (f"probe radius {geometry.probe_radius * 1e6:.1f} µm "
+           f"(Hertz correction {c_cell:.3f} on R₀, {c_nuc:.3f} on Rₙ)"
+           if geometry.probe_radius else "flat probe (no curvature correction)")
+        + f" · hₘ = {geometry.membrane_thickness * 1e9:.1f} nm · "
+        f"envelope {geometry.envelope_thickness * 1e9:.0f} nm · "
+        f"ν = {geometry.nu_membrane:.2f}/{geometry.nu_interior:.2f}/"
+        f"{geometry.nu_nucleus:.2f}. Height, radii and thicknesses are set in "
+        "section 1 and under **Cell geometry** in the sidebar."
+    )
+
+    for warning in result.get("warnings", []):
+        st.warning(warning, icon="⚠️")
+
+    export = pd.DataFrame([
+        {
+            "coefficient": name, "regime": row["regime"], "element": row["element"],
+            "K": row["K"], "K_se": row["K_se"], "power": row["power"],
+            "modulus": row["symbol"], "E_Pa": row["E_Pa"], "E_se_Pa": row["E_se_Pa"],
+            "prefactor_N_per_Pa": row["prefactor_N_per_Pa"],
+            "probe_correction": row["probe_correction"],
+            "at_bound": row["at_bound"],
+        }
+        for name, row in moduli.items()
+    ])
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "📥 Coefficients and moduli (CSV)", data=export.to_csv(index=False),
+            file_name=f"{st.session_state.get('cell_name') or 'cell'}_4regime.csv",
+            mime="text/csv", key="pw_download", **STRETCH,
+        )
+    with d2:
+        with st.expander("📋 Copy as a row"):
+            header = ["cell"] + [f"{r['symbol']}_Pa" for r in moduli.values()] + ["R2"]
+            values = [st.session_state.get("cell_name") or ""] + [
+                f"{r['E_Pa']:.6g}" for r in moduli.values()
+            ] + [f"{result['r_squared']:.6f}"]
+            st.code("\t".join(header) + "\n" + "\t".join(values), language=None)
+
+    fit = piecewise_as_fit(result, model)
+    return fit, fitted, piecewise_stage_plan(result)
+
+
 def share_of_force_plot(fit, model, style):
     """
     What the log curve's slope means, drawn: who is carrying the load, where.
@@ -6267,6 +6902,14 @@ def current_fit_settings():
             for term in ALL_TERMS
         },
         "combined_window": list(st.session_state.get("window_combined", (0.0, 1.0))),
+        # The four-regime C2C12 fit: which fit was on, where its regimes
+        # were, and any initial guess or bound changed from the spec.
+        "fit_mode": (
+            st.session_state.get("c2c12_fit_mode", "")
+            if piecewise_offered() else ""
+        ),
+        "piecewise_boundaries_pct": list(piecewise_boundaries()),
+        "piecewise_settings": piecewise_settings(),
     }
 
 
@@ -6441,6 +7084,9 @@ def cell_record(fit, epsilon, force_N, fitted, date_acquired, stage_plan):
             for stage in stage_plan
         ],
         "warnings": list(fit.get("warnings", [])),
+        # The four-regime fit's own numbers: every coefficient, modulus and
+        # anchor. Absent for the spring-network models.
+        "piecewise": fit.get("piecewise"),
         "source_file": st.session_state["data"].get("source", ""),
         "video_url": st.session_state.get("video_link", ""),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -6517,10 +7163,20 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "at_max": round(relaxed * stretch, 1),
         }
 
+    piecewise = fit.get("piecewise") or {}
+    if piecewise:
+        combination = "4 regimes at " + " / ".join(
+            f"{b:g}" for b in piecewise.get("boundaries_pct", [])
+        ) + " %, C0-anchored"
+
     def span(term):
         """The stretch of deformation this modulus was actually measured on."""
         if term not in terms:
             return "not fitted"
+        if piecewise:
+            lo_hi = (piecewise.get("spans") or {}).get(term)
+            if lo_hi:
+                return f"{float(lo_hi[0]):.3f} to {float(lo_hi[1]):.3f}"
         if not segmented or e1 is None or e2 is None:
             return f"{lo:.3f} to {hi:.3f}"
         if term in ("membrane", "tension"):
@@ -6573,8 +7229,19 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             "membrane_areal": round(
                 float(fit.get("membrane_areal_modulus", 0.0)) * 1e3, 5
             ),
-            "model": st.session_state["model_kind"],
+            "model": fit.get("model_label") or st.session_state["model_kind"],
             "combination": combination,
+            # Only the four-regime fit has these two: the cytoskeleton around
+            # the nucleus in regime 3, and the apparent contact modulus of
+            # regime 1. Blank for every other model.
+            "E_nc": (round(float(fit.get("E_nc_kPa", 0.0)), 6)
+                     if piecewise else ""),
+            "E_align": (round(float(fit.get("E_align_kPa", 0.0)), 6)
+                        if piecewise else ""),
+            "piecewise": (
+                json.dumps(piecewise.get("flat", {}), default=float)
+                if piecewise else ""
+            ),
             "break_1": round(float(e1), 4) if e1 is not None else "",
             "break_2": round(float(e2), 4) if e2 is not None else "",
             "fit_range": f"{lo:.3f} to {hi:.3f}",
@@ -6680,6 +7347,45 @@ def refit_stored_cell(store, cell_id, settings):
     merged.update(settings)
     record["settings"] = merged
     model = model_from_record(record, curve)
+
+    if (
+        HAS_PIECEWISE
+        and merged.get("fit_mode") == PIECEWISE_MODE
+        and merged.get("cell_type") in PIECEWISE_CELL_TYPES
+    ):
+        # A cell stored from the four-regime fit is refitted with it, at
+        # its own boundaries, guesses, bounds and probe.
+        probe_um = float(merged.get("probe_diameter_um", 0.0) or 0.0)
+        result = fit_piecewise(
+            model.epsilon, model.force,
+            boundaries_pct=merged.get("piecewise_boundaries_pct")
+            or C2C12_BOUNDARIES_PCT,
+            settings=merged.get("piecewise_settings") or {},
+        )
+        if not result.get("success"):
+            raise ArchiveError(f"{cell_id}: {result.get('error', 'fit failed')}")
+        result["moduli"] = piecewise_moduli(
+            result,
+            piecewise_geometry(model, probe_um=probe_um,
+                               coat_nm=merged.get("protein_coat_nm", 200.0)),
+        )
+        fit = piecewise_as_fit(result, model, probe_um=probe_um,
+                               settings=merged.get("piecewise_settings") or {})
+        record.update({
+            "coupling": "piecewise",
+            "Em_MPa": float(fit["Em_MPa"]),
+            "Ec_kPa": float(fit["Ei_kPa"]),
+            "En_kPa": float(fit["En_kPa"]),
+            "r_squared": float(fit["r_squared"]),
+            "epsilon_min": float(fit["epsilon_range"][0]),
+            "epsilon_max": float(fit["epsilon_range"][1]),
+            "n_points": int(fit["n_points"]),
+            "piecewise": fit["piecewise"],
+            "refit_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        record.pop("curve_csv", None)
+        store.save_cell(record)
+        return record
 
     terms = tuple(settings.get("terms") or ("membrane", "interior"))
     lo, hi = settings.get("combined_window", [0.02, 0.4])
@@ -7551,10 +8257,11 @@ with tab_analysis:
             "Probe sphere diameter (µm)",
             min_value=0.0, max_value=200.0, step=1.0, format="%.1f",
             key="probe_diameter_um",
-            help="The microsphere glued to the cantilever. Recorded with the "
-            "cell, not used by the fit: a sphere several times wider than "
-            "the cell presses on it as a flat plate, which is the geometry "
-            "this model assumes. 0 means not recorded.",
+            help="The microsphere glued to the cantilever. The four-regime "
+            "C2C12 fit uses it to correct its Hertzian (ε^1.5) moduli for "
+            "the curvature of the sphere; the other models treat the probe "
+            "as a flat plate and only record it. 0 means not recorded, "
+            "which is treated as flat.",
         )
     with c7:
         st.number_input(
@@ -7809,2204 +8516,2239 @@ with tab_analysis:
             return (lo, hi) if lo < hi else fallback
 
         section("3 · Nonlinear fitting")
-        # One page, not two. There used to be a plain-language mode and an
-        # every-setting mode, which meant every change had to be made twice
-        # and half the app was only reachable by knowing a radio existed.
-        # This is that page: the choices, the button, the curve, the numbers
-        # and the maths, with everything the fit assumed one click away in
-        # the sidebar. `guided` stays as the flag the layout is written
-        # against rather than being spelled out of two hundred branches.
-        guided = True
-
-        if guided:
-            names = components_for(st.session_state["cell_type"])
-            here = terms_for(st.session_state["cell_type"])
-
-            # The choices come before the picture, and each is made once.
-
-            # The range first: it decides which points exist at all, and
-            # every component below is placed inside it. Choosing components
-            # for a stretch of curve you have not chosen yet is the wrong
-            # way round, and the heading names the first thing you set
-            # rather than the whole step.
-            st.markdown("#### 1 · Relative deformation range")
-            guided_lo, guided_hi = epsilon_range_control(
-                "window_start", "window_end", 0.0, eps_hi_data, step,
-                label="Fitted range, ε",
-                help_text="Drag either end, or type it below. The near end "
-                          "is normally 0, because the model describes a "
-                          "cell from first contact.",
+        piecewise_mode = fit_mode_control()
+        if piecewise_mode:
+            # The four-regime fit is the whole of this step. Nothing below
+            # it in the spring-network flow applies, so none of it is drawn.
+            segmented = False
+            fit, fitted, stage_plan = piecewise_section(
+                model, epsilon, force_N, rupture,
             )
-            inside = int(
-                ((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum()
-            )
-            st.caption(
-                f"ε {guided_lo:.3f} to {guided_hi:.3f} · {inside} of "
-                f"{epsilon.size} points"
-                + (f" · rupture near ε = {rupture['epsilon']:.3f}"
-                   if rupture.get("method") == "force-drop"
-                   and rupture.get("epsilon") is not None else "")
-            )
-            rng1, rng2 = st.columns([2.6, 1])
-            with rng1:
-                suggested_range_note(guided_lo, guided_hi)
-            with rng2:
-                send_to_plot_button(
-                    "range",
-                    f"Fitted range · ε {guided_lo:.3f} to {guided_hi:.3f}",
-                    {"lo": round(float(guided_lo), 4),
-                     "hi": round(float(guided_hi), 4)},
-                    key="range_main",
-                    help_text="Shades the stretch that is being fitted.",
-                )
-            if guided_lo > 0:
-                st.caption(
-                    "⚠️ Not starting from zero. The membrane term is "
-                    "measured from first contact, so a start above 0 only "
-                    "makes sense when the approach itself misbehaved. "
-                    "Set it back to 0 to fit through it."
-                )
-
-            st.markdown("##### Components")
-            chosen = active_terms()
-            if not chosen:
-                st.warning("Tick at least one material before fitting.")
-
-            # A range for each material, and the equation that follows from
-            # them. This is the whole of what the fit assumes, said where
-            # the choices are made rather than in a panel further down.
-            # Off the last fit where there is one, so the ranges show what
-            # was actually fitted rather than what the page was set to
-            # before the search moved it. A range showing the wrong place is
-            # worse than none: it is a claim about the model that is untrue.
-            _shown = st.session_state.get("_last_fit")
-            if _shown and _shown.get("success"):
-                _e1 = float(_shown.get("break_1",
-                                       st.session_state["segment_break_1"]))
-                _e2 = float(_shown.get("break_2",
-                                       st.session_state["segment_break_2"]))
-                _mem = _shown.get(
-                    "membrane",
-                    MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
-                )
-                _cyto = _shown.get(
-                    "cyto_start",
-                    CYTO_CHOICES[st.session_state["cyto_starts_at"]],
-                )
-            else:
-                _e1 = float(st.session_state["segment_break_1"])
-                _e2 = float(st.session_state["segment_break_2"])
-                _mem = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
-                _cyto = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
-            st.session_state["_bars_drawn_with"] = (
-                round(_e1, 4), round(_e2, 4), _mem, _cyto,
-                round(float(guided_hi), 4),
-            )
-            # One row per component: whether it is in the model, and the
-            # stretch of the squash it acts on. The two belong together --
-            # ticking a component and then finding its range three headings
-            # away was two decisions about one thing.
-            component_controls(
-                here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
-            )
-            chosen = active_terms()
-
-            # The curve goes directly under the ranges that shape it. Every
-            # bar above moves something drawn below, and a control whose
-            # effect is two screens away is a control used blind.
-            curve_slot = st.container()
-
-            # No element search. Which components are in the model is a
-            # decision about the cell, and the boxes above are where it is
-            # made; a button that cleared them on a cross-validation score
-            # was the app arguing with the person about their own sample.
-
-            # The boundaries and the log curve they are read off have a
-            # tab of their own. They were here, above the fit button, which
-            # put a panel of search results and a page of mathematics
-            # between choosing the components and seeing the curve.
-            optimisation_controls(model, guided_lo, guided_hi, chosen)
-
-            # ------------------------------------------------- 2 · fit ---
-            st.markdown("#### 2 · Fit")
-            fit_col, verdict_col = st.columns([1, 2.4])
-            with fit_col:
-                if st.button(
-                    "🔬 Fit this cell", type="primary",
-                    disabled=not chosen, key="guided_fit", **STRETCH,
-                ):
-                    # Fits what is on screen, and changes nothing about it.
-                    # It used to compare arrangements and write the winner's
-                    # boundaries back, so pressing Fit moved ε₁ and ε₂ off
-                    # the numbers they had just been set to. Optimising the
-                    # boundaries is the other button's job, asked for on
-                    # purpose; fitting is fitting.
-                    fit_at_the_current_settings(
-                        model, guided_lo, guided_hi, chosen,
-                    )
-                send_to_plot_button(
-                    "quality", "R², χ²/dof and the range fitted",
-                    {"key": "quality"}, key="quality_beside_fit",
-                    help_text="Puts how well it fits, and over what, in a "
-                              "box on the curve, kept up to date.",
-                )
-                st.caption(
-                    "Fits exactly the components ticked above, at the "
-                    "boundaries and ranges shown. It does not move them: "
-                    "that is what the optimisation buttons are for."
-                )
-            with verdict_col:
-                fit_verdict()
-
-            # No picture picker and no table of pictures compared. The
-            # search says in one line which picture the curve supports, and
-            # the way to overrule it is the controls below: change the
-            # combination, or move a boundary, and the page refits. A radio
-            # of five near-identical sentences and a table underneath it was
-            # a paragraph of reading in the middle of the one step that is
-            # meant to be press-and-look.
-
-        # Staked out above, right under the component ranges, and filled
-        # once the fit exists: Streamlit draws things where they were
-        # created, not where the code that fills them runs.
-        if not guided:
-            curve_slot = st.container()
-        video_slot = st.container()
-
-        # Everything the fit decided for you, under the curve rather than
-        # between the button and it. In guided mode all of it lives behind
-        # this one collapsed line: three panels of settings in the middle of
-        # a page whose whole promise is "press the button" was three panels
-        # to scroll past. The controls still exist, and every one of them
-        # still holds its value, because a setting that is not drawn is a
-        # setting Streamlit forgets.
-        settings_box = None
-        if guided:
-            # In the sidebar, where every other setting in this app already
-            # lives. It cannot be dropped altogether: a control Streamlit
-            # does not draw is a control whose value it forgets, and these
-            # hold the weighting, the boundaries and the arrangement. Out of
-            # the page's way, still one click from anywhere on it.
-            # A second sidebar panel, staked out now and filled once the fit
-            # exists. The working belongs somewhere: off the page, but not
-            # nowhere, or a curve that fits badly has nothing to look at.
-            diagnostics_box = st.sidebar.expander(
-                "🔍 The working, in detail", expanded=False
-            )
-            settings_box = st.sidebar.expander(
-                "⚙️ Change what the fit assumed", expanded=False
-            )
-            settings_box.__enter__()
-            st.caption(
-                "Every one of these was chosen by the fit. Open it only to "
-                "overrule that, and the page refits with what you choose."
-            )
-            # The unconstrained placement search lives here rather than on
-            # the page: it rewrites every range at once and ignores what is
-            # known about the cell type, which is the right tool rarely and
-            # a surprise often.
-            free_placement_control(model, guided_lo, guided_hi, active_terms())
-
-        if not guided:
-            st.divider()
-
-        # Flat inside the box: Streamlit cannot nest an expander in an
-        # expander, so in guided mode these are headings rather than panels
-        # of their own.
-        model_panel = open_panel(
-            "⚙️ Change how the materials share the load", guided,
-            flat=guided,
-        )
-
-        if guided:
-            share_of_load_maths()
-            st.radio(
-                "How the cell is modelled",
-                list(MODELS.keys()),
-                key="model_kind",
-                label_visibility="collapsed",
-            )
-            st.caption(MODELS[st.session_state["model_kind"]])
+            # Not written to _last_fit: that is the spring-network flow's
+            # memory of its own last fit, and it redraws from it in shapes
+            # this result does not have.
+            if fit is not None:
+                st.session_state["results"] = {
+                    "cell_name": st.session_state["cell_name"],
+                    "cell_type": st.session_state["cell_type"],
+                    "date_acquired": str(date_acquired),
+                    "cell_height_um": st.session_state["cell_height_um"],
+                    "spring_constant": st.session_state["spring_constant"],
+                    "video_link": st.session_state["video_link"],
+                    "epsilon": epsilon,
+                    "force_N": force_N,
+                    "fitted_N": fitted,
+                    "membrane_N": None,
+                    "interior_N": None,
+                    "nucleus_N": None,
+                    "fit": fit,
+                    "fit_windows": [],
+                    "source": data["source"],
+                    "timestamp": datetime.now(),
+                }
         else:
-            element_col, model_col = st.columns([1, 1.5])
-            with model_col:
-                st.markdown("**2 · How they share the load**")
+            # One page, not two. There used to be a plain-language mode and an
+            # every-setting mode, which meant every change had to be made twice
+            # and half the app was only reachable by knowing a radio existed.
+            # This is that page: the choices, the button, the curve, the numbers
+            # and the maths, with everything the fit assumed one click away in
+            # the sidebar. `guided` stays as the flag the layout is written
+            # against rather than being spelled out of two hundred branches.
+            guided = True
+
+            if guided:
+                names = components_for(st.session_state["cell_type"])
+                here = terms_for(st.session_state["cell_type"])
+
+                # The choices come before the picture, and each is made once.
+
+                # The range first: it decides which points exist at all, and
+                # every component below is placed inside it. Choosing components
+                # for a stretch of curve you have not chosen yet is the wrong
+                # way round, and the heading names the first thing you set
+                # rather than the whole step.
+                st.markdown("#### 1 · Relative deformation range")
+                guided_lo, guided_hi = epsilon_range_control(
+                    "window_start", "window_end", 0.0, eps_hi_data, step,
+                    label="Fitted range, ε",
+                    help_text="Drag either end, or type it below. The near end "
+                              "is normally 0, because the model describes a "
+                              "cell from first contact.",
+                )
+                inside = int(
+                    ((epsilon >= guided_lo) & (epsilon <= guided_hi)).sum()
+                )
+                st.caption(
+                    f"ε {guided_lo:.3f} to {guided_hi:.3f} · {inside} of "
+                    f"{epsilon.size} points"
+                    + (f" · rupture near ε = {rupture['epsilon']:.3f}"
+                       if rupture.get("method") == "force-drop"
+                       and rupture.get("epsilon") is not None else "")
+                )
+                rng1, rng2 = st.columns([2.6, 1])
+                with rng1:
+                    suggested_range_note(guided_lo, guided_hi)
+                with rng2:
+                    send_to_plot_button(
+                        "range",
+                        f"Fitted range · ε {guided_lo:.3f} to {guided_hi:.3f}",
+                        {"lo": round(float(guided_lo), 4),
+                         "hi": round(float(guided_hi), 4)},
+                        key="range_main",
+                        help_text="Shades the stretch that is being fitted.",
+                    )
+                if guided_lo > 0:
+                    st.caption(
+                        "⚠️ Not starting from zero. The membrane term is "
+                        "measured from first contact, so a start above 0 only "
+                        "makes sense when the approach itself misbehaved. "
+                        "Set it back to 0 to fit through it."
+                    )
+
+                st.markdown("##### Components")
+                chosen = active_terms()
+                if not chosen:
+                    st.warning("Tick at least one material before fitting.")
+
+                # A range for each material, and the equation that follows from
+                # them. This is the whole of what the fit assumes, said where
+                # the choices are made rather than in a panel further down.
+                # Off the last fit where there is one, so the ranges show what
+                # was actually fitted rather than what the page was set to
+                # before the search moved it. A range showing the wrong place is
+                # worse than none: it is a claim about the model that is untrue.
+                _shown = st.session_state.get("_last_fit")
+                if _shown and _shown.get("success"):
+                    _e1 = float(_shown.get("break_1",
+                                           st.session_state["segment_break_1"]))
+                    _e2 = float(_shown.get("break_2",
+                                           st.session_state["segment_break_2"]))
+                    _mem = _shown.get(
+                        "membrane",
+                        MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
+                    )
+                    _cyto = _shown.get(
+                        "cyto_start",
+                        CYTO_CHOICES[st.session_state["cyto_starts_at"]],
+                    )
+                else:
+                    _e1 = float(st.session_state["segment_break_1"])
+                    _e2 = float(st.session_state["segment_break_2"])
+                    _mem = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
+                    _cyto = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
+                st.session_state["_bars_drawn_with"] = (
+                    round(_e1, 4), round(_e2, 4), _mem, _cyto,
+                    round(float(guided_hi), 4),
+                )
+                # One row per component: whether it is in the model, and the
+                # stretch of the squash it acts on. The two belong together --
+                # ticking a component and then finding its range three headings
+                # away was two decisions about one thing.
+                component_controls(
+                    here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
+                )
+                chosen = active_terms()
+
+                # The curve goes directly under the ranges that shape it. Every
+                # bar above moves something drawn below, and a control whose
+                # effect is two screens away is a control used blind.
+                curve_slot = st.container()
+
+                # No element search. Which components are in the model is a
+                # decision about the cell, and the boxes above are where it is
+                # made; a button that cleared them on a cross-validation score
+                # was the app arguing with the person about their own sample.
+
+                # The boundaries and the log curve they are read off have a
+                # tab of their own. They were here, above the fit button, which
+                # put a panel of search results and a page of mathematics
+                # between choosing the components and seeing the curve.
+                optimisation_controls(model, guided_lo, guided_hi, chosen)
+
+                # ------------------------------------------------- 2 · fit ---
+                st.markdown("#### 2 · Fit")
+                fit_col, verdict_col = st.columns([1, 2.4])
+                with fit_col:
+                    if st.button(
+                        "🔬 Fit this cell", type="primary",
+                        disabled=not chosen, key="guided_fit", **STRETCH,
+                    ):
+                        # Fits what is on screen, and changes nothing about it.
+                        # It used to compare arrangements and write the winner's
+                        # boundaries back, so pressing Fit moved ε₁ and ε₂ off
+                        # the numbers they had just been set to. Optimising the
+                        # boundaries is the other button's job, asked for on
+                        # purpose; fitting is fitting.
+                        fit_at_the_current_settings(
+                            model, guided_lo, guided_hi, chosen,
+                        )
+                    send_to_plot_button(
+                        "quality", "R², χ²/dof and the range fitted",
+                        {"key": "quality"}, key="quality_beside_fit",
+                        help_text="Puts how well it fits, and over what, in a "
+                                  "box on the curve, kept up to date.",
+                    )
+                    st.caption(
+                        "Fits exactly the components ticked above, at the "
+                        "boundaries and ranges shown. It does not move them: "
+                        "that is what the optimisation buttons are for."
+                    )
+                with verdict_col:
+                    fit_verdict()
+
+                # No picture picker and no table of pictures compared. The
+                # search says in one line which picture the curve supports, and
+                # the way to overrule it is the controls below: change the
+                # combination, or move a boundary, and the page refits. A radio
+                # of five near-identical sentences and a table underneath it was
+                # a paragraph of reading in the middle of the one step that is
+                # meant to be press-and-look.
+
+            # Staked out above, right under the component ranges, and filled
+            # once the fit exists: Streamlit draws things where they were
+            # created, not where the code that fills them runs.
+            if not guided:
+                curve_slot = st.container()
+            video_slot = st.container()
+
+            # Everything the fit decided for you, under the curve rather than
+            # between the button and it. In guided mode all of it lives behind
+            # this one collapsed line: three panels of settings in the middle of
+            # a page whose whole promise is "press the button" was three panels
+            # to scroll past. The controls still exist, and every one of them
+            # still holds its value, because a setting that is not drawn is a
+            # setting Streamlit forgets.
+            settings_box = None
+            if guided:
+                # In the sidebar, where every other setting in this app already
+                # lives. It cannot be dropped altogether: a control Streamlit
+                # does not draw is a control whose value it forgets, and these
+                # hold the weighting, the boundaries and the arrangement. Out of
+                # the page's way, still one click from anywhere on it.
+                # A second sidebar panel, staked out now and filled once the fit
+                # exists. The working belongs somewhere: off the page, but not
+                # nowhere, or a curve that fits badly has nothing to look at.
+                diagnostics_box = st.sidebar.expander(
+                    "🔍 The working, in detail", expanded=False
+                )
+                settings_box = st.sidebar.expander(
+                    "⚙️ Change what the fit assumed", expanded=False
+                )
+                settings_box.__enter__()
+                st.caption(
+                    "Every one of these was chosen by the fit. Open it only to "
+                    "overrule that, and the page refits with what you choose."
+                )
+                # The unconstrained placement search lives here rather than on
+                # the page: it rewrites every range at once and ignores what is
+                # known about the cell type, which is the right tool rarely and
+                # a surprise often.
+                free_placement_control(model, guided_lo, guided_hi, active_terms())
+
+            if not guided:
+                st.divider()
+
+            # Flat inside the box: Streamlit cannot nest an expander in an
+            # expander, so in guided mode these are headings rather than panels
+            # of their own.
+            model_panel = open_panel(
+                "⚙️ Change how the materials share the load", guided,
+                flat=guided,
+            )
+
+            if guided:
+                share_of_load_maths()
                 st.radio(
                     "How the cell is modelled",
                     list(MODELS.keys()),
                     key="model_kind",
                     label_visibility="collapsed",
-                    help="Segmented treats the compression as stretches with "
-                    "different materials bearing the load. The others assume "
-                    "every material acts across the whole curve, which is "
-                    "what makes them fail on a curve that changes character "
-                    "partway along.",
                 )
                 st.caption(MODELS[st.session_state["model_kind"]])
-                if MODEL_KEYS[st.session_state["model_kind"]] == "segmented":
-                    st.caption(
-                        "For this cell type, in order: "
-                        + " → ".join(
-                            plain_name(t).lower()
-                            for t in terms_for(st.session_state["cell_type"])
-                            if t != "tension"
-                        )
-                        + "."
-                    )
-            with element_col:
-                st.markdown("**1 · Which materials**")
-                names = components_for(st.session_state["cell_type"])
-                fixed_cell_control()
-                for term in terms_for(st.session_state["cell_type"]):
-                    st.checkbox(
-                        f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
-                        key=f"use_{term}",
-                    )
-
-        active = active_terms()
-        kind = MODEL_KEYS[st.session_state["model_kind"]]
-        segmented = kind == "segmented"
-        coupling = kind
-        cardiomyocyte_model = st.session_state["model_kind"].startswith(
-            "Cardiomyocyte"
-        )
-
-        if cardiomyocyte_model:
-            st.warning(
-                "**This model is provisional.** It is built from your "
-                "description of the Morales Maldonado picture, a strong "
-                "shell around fluid that does not compress, not from the "
-                "paper's equations, which I could not reach. Send me the "
-                "force-versus-deformation equation and I will replace it. "
-                "**Segmented** is the one to use meanwhile: it carries the "
-                "materials, the order and the boundaries.",
-                icon="⚠️",
-            )
-
-        if segmented:
-            st.markdown("**3 · What each one does at the first boundary**")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.radio(
-                    "After ε₁ the membrane…",
-                    list(MEMBRANE_CHOICES.keys()),
-                    key="membrane_after_break",
-                    help="“Holds what it reached” means the membrane stops adding "
-                    "force above ε₁ and keeps the force it had there, so the whole "
-                    "of the extra load goes to the cytoskeleton. “Keeps stiffening” "
-                    "means the ε³ term carries on rising underneath the others.",
-                )
-            with c2:
-                st.radio(
-                    "The cytoskeleton starts…",
-                    list(CYTO_CHOICES.keys()),
-                    key="cyto_starts_at",
-                    help="“At ε₁” means the cytoskeleton only begins to bear load "
-                    "once the membrane hands over. “From the very start” means both "
-                    "carry load together from first contact.",
-                )
-            membrane_mode = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
-            cyto_mode = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
-            if "cortex" in terms_for(st.session_state["cell_type"]):
-                st.caption(
-                    "With a cortex in the model it is the cortex that "
-                    "carries the load from first contact, so the general "
-                    "scaffolding is set to start at ε₁. Starting both at "
-                    "zero would make them one Hertzian term with two names, "
-                    "and the fit would split them arbitrarily."
-                )
-            st.caption(
-                f"→ {composition_label(membrane_mode, cyto_mode)}."
-                + (f" The {term_name('nucleus').lower()} always joins at ε₂."
-                   if has_deep_term() else
-                   " There is no deep element in this model, so ε₂ is not "
-                   "used.")
-            )
-        else:
-            membrane_mode, cyto_mode = "freeze", "break"
-
-        # The picture, drawn from the choices immediately above it and
-        # redrawn the moment one of them changes. It is the point of putting
-        # the controls and the diagram together: a radio labelled "the
-        # cytoskeleton starts at ε₁" means very little until you watch the
-        # gap appear under its spring.
-        if guided:
-            live = current_style(force_N)
-            # Drawn just past the first boundary, where every choice above is
-            # visible at once: which springs are loading, which is locked and
-            # which has not been reached. A slider for this was one more
-            # widget on a page that has too many.
-            preview_at = float(np.clip(
-                float(st.session_state["segment_break_1"]) * 1.35,
-                0.05, max(0.06, float(st.session_state["window_end"])),
-            ))
-            st.plotly_chart(
-                cell_schematic(
-                    live,
-                    **figure_kwargs(
-                        cell_schematic,
-                        coupling=("series" if coupling == "series"
-                                  else "hybrid" if coupling.startswith("hybrid")
-                                  else "parallel"),
-                        epsilon=float(preview_at),
-                        cell_height_um=st.session_state["cell_height_um"],
-                        break_1=float(st.session_state["segment_break_1"]),
-                        break_2=float(st.session_state["segment_break_2"]),
-                        membrane_mode=membrane_mode,
-                        cyto_start=cyto_mode,
-                        labels=components_for(st.session_state["cell_type"]),
-                        show_nucleus="nucleus" in active,
-                        show_nucleus_shell="nucleus_shell" in active,
-                        show_tension="tension" in active,
-                        height=330,
-                    ),
-                ),
-                key="sharing_preview",
-                **STRETCH,
-            )
-            st.caption(
-                "Drawn from the choices above, and redrawn as you change "
-                "them. A gap over a spring means that element is not "
-                "carrying load yet; a locked block means it has stopped "
-                "taking more. Nothing here is fitted — it is what you are "
-                "about to ask the fit to assume."
-            )
-
-        close_panel(model_panel)
-
-        # Kept so the plot code below has something to write the diagram
-        # into when it is not drawn here.
-        sharing_slot = st.container()
-
-        # No second opinion on which materials to use down here. The mixture
-        # is decided in one place now, by the search button in step 1, which
-        # applies what it finds and shows the combinations it compared. Two
-        # places offering different answers to the same question is how the
-        # ticks and the fit came apart in the first place.
-
-        # ---------------------------------------------------- exploration ---
-        # Only in full control. In guided mode the boundaries are found and
-        # applied automatically, so a second, manual way of finding them was
-        # a section to scroll past rather than a step to take.
-        if segmented and not guided:
-            explore_panel = open_panel("🔬 Explore the curve", guided)
-            if not guided:
-                section("4 · Explore the curve")
-            e1_col, e2_col = st.columns([1, 2])
-            with e1_col:
-                if st.button("🔬 Find the segments", type="secondary", **STRETCH):
-                    with st.spinner("Measuring the exponent along the curve…"):
-                        st.session_state["exploration"] = model.explore_segments(
-                            terms=active or ("membrane", "interior", "nucleus")
-                        )
-                st.caption(
-                    "Scans for the two boundaries, then measures the power law each "
-                    "stage actually follows: 3 for the membrane, 3/2 for a Hertzian "
-                    "contact."
-                )
-            exploration = st.session_state.get("exploration")
-            with e2_col:
-                if exploration and exploration.get("success"):
-                    if exploration["confident"]:
-                        st.success(
-                            f"ε₁ = {exploration['break_1']:.3f}, "
-                            f"ε₂ = {exploration['break_2']:.3f}. Each stage follows "
-                            f"the law the model assigns it."
-                        )
-                    else:
-                        st.warning(
-                            f"ε₁ = {exploration['break_1']:.3f}, "
-                            f"ε₂ = {exploration['break_2']:.3f}, but the evidence is "
-                            f"weak. See the notes below."
-                        )
-                    if st.button("✓ Use these breakpoints", type="primary", **STRETCH):
-                        st.session_state["_pending_settings"] = {
-                            "segment_break_1": round(float(exploration["break_1"]), 3),
-                            "segment_break_2": round(float(exploration["break_2"]), 3),
-                        }
-                        st.rerun()
-                elif exploration:
-                    st.error(exploration.get("error", "Exploration failed."))
-
-            if exploration and exploration.get("success"):
-                flat_table(
-                    pd.DataFrame(
-                        [
-                            {
-                                "stage": row["stage"],
-                                "ε from": round(row["range"][0], 3),
-                                "ε to": round(row["range"][1], 3),
-                                "points": row["n_points"],
-                                "exponent measured": (
-                                    round(row["measured_exponent"], 2)
-                                    if np.isfinite(row["measured_exponent"])
-                                    else None
-                                ),
-                                "expected": row["expected_exponent"],
-                                "power-law R²": (
-                                    round(row["power_law_r2"], 3)
-                                    if np.isfinite(row["power_law_r2"]) else None
-                                ),
-                                "modulus": row["modulus_label"],
-                            }
-                            for row in exploration["stages"]
-                        ]
-                    ),
-                    align_right=[
-                        "ε from", "ε to", "points", "exponent measured",
-                        "expected", "power-law R²",
-                    ],
-                )
-                st.caption(
-                    "A blank exponent means that stage does not rise far enough above "
-                    "the noise for its power law to be measured. The breakpoint still "
-                    "comes from the fit, but nothing independently confirms the shape."
-                )
-                for note in exploration["notes"]:
-                    st.warning(note)
-                st.plotly_chart(
-                    exponent_profile_figure(
-                        exploration["profile"], current_style(force_N),
-                        exploration["break_1"], exploration["break_2"],
-                    ),
-                    key="exponent_profile",
-                    **STRETCH,
-                )
-
-        if segmented and not guided:
-            close_panel(explore_panel)
-
-        # --------------------------------------------------------- ranges ---
-        range_panel = open_panel(
-            "📏 Where each material takes over", guided, flat=guided,
-        )
-        if not guided:
-            section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
-        st.caption(
-            f"Data spans ε = {eps_lo_data:.3f} to {eps_hi_data:.3f}. "
-            f"Auto-detected usable region: {auto_window[0]:.3f} to "
-            f"{auto_window[1]:.3f} ({auto_range['n_points']} points) · "
-            f"rupture: {auto_range['rupture_method']}"
-        )
-
-        # One range, one pair of numbers, wherever it is set from. In guided
-        # mode it was set at the top of the page and repeating the control
-        # here would give the page two of them, so this only reports it.
-        #
-        # The near end is normally zero: the membrane term is ε³ measured
-        # from first contact, so a range starting anywhere else is fitting a
-        # curve the model does not describe. It moves when the approach
-        # itself misbehaved, which is a probe catching and slipping rather
-        # than a soft cell, and those points drive the membrane modulus to
-        # zero if they are kept.
-        if guided:
-            fit_lo, fit_hi = range_bounds(
-                "window_start", "window_end", 0.0, eps_hi_data, step,
-            )
-            st.caption(
-                f"Fitting ε = {fit_lo:.3f} to {fit_hi:.3f}, set at the top of "
-                "the page under **What to fit**."
-            )
-        else:
-            fit_lo, fit_hi = epsilon_range_control(
-                "window_start", "window_end",
-                0.0 if segmented else eps_lo_data, eps_hi_data, step,
-                label="Fitted range, ε",
-                help_text="The stretch of the curve the fit is measured on. "
-                          "Drag either end, or type it in the boxes.",
-            )
-        st.session_state["window_combined"] = (fit_lo, fit_hi)
-        st.caption(f"{int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())} points")
-
-        # The sidebar button only asks for the scan; it runs here, where the
-        # model, the chosen range and the composition all exist. A sidebar
-        # widget is built before any of them.
-        if st.session_state.pop("_want_confinement_scan", False):
-            if hasattr(model, "scan_confinement"):
-                with st.spinner("Refitting across a range of q…"):
-                    st.session_state["confinement_scan"] = model.scan_confinement(
-                        fit_lo, fit_hi,
-                        e1=float(st.session_state["segment_break_1"]),
-                        e2=float(st.session_state["segment_break_2"]),
-                        membrane=MEMBRANE_CHOICES.get(
-                            st.session_state["membrane_after_break"], "freeze"
-                        ),
-                        cyto_start=CYTO_CHOICES.get(
-                            st.session_state["cyto_starts_at"], "break"
-                        ),
-                        use_nucleus="nucleus" in active,
-                        use_tension="tension" in active,
-                        weighting=st.session_state["weighting"],
-                    )
             else:
-                st.session_state["confinement_scan"] = {
-                    "success": False,
-                    "error": "This needs an up to date lulevich_model.py.",
-                }
-
-        term_windows = {}
-        stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
-        staged = False
-        break_1 = float(st.session_state["segment_break_1"])
-        break_2 = float(st.session_state["segment_break_2"])
-
-        highlight_window = None
-
-        if segmented:
-            st.markdown("**Segment table**")
-            st.caption(
-                "Type the boundaries directly. The segments are contiguous, so the "
-                "end of one is the start of the next: editing a row's ε end moves "
-                "that boundary."
-            )
-            # The row names follow the composition chosen above, so the table
-            # always says what is actually carrying load in each stretch.
-            seg_1_name = (
-                "1 · membrane + cytoskeleton" if cyto_mode == "zero"
-                else "1 · membrane, ε³"
-            )
-            seg_2_name = (
-                "2 · membrane + cytoskeleton" if membrane_mode == "continue"
-                else "2 · cytoskeleton, membrane holding"
-            )
-            seg_3_name = (
-                "3 · " + ("membrane + " if membrane_mode == "continue" else "")
-                + "cytoskeleton + nucleus"
-            )
-            # No table of segments. It said what each component does either
-            # side of each boundary, which is what the component ranges up
-            # in "3 · Nonlinear fitting" now show directly, and it was a
-            # second, editable copy of two numbers that already have their
-            # own sliders below.
-
-            # Each boundary on its own, because most of the time only one
-            # of them is wrong. The table above moves them together and is
-            # the wrong tool for nudging ε₂ while ε₁ stays put.
-            bc1, bc2 = st.columns(2)
-            with bc1:
-                boundary_control(
-                    "segment_break_1", "ε₁ · where the first hand-over is",
-                    lower=float(fit_lo), upper=float(break_2) - 0.005,
-                    step=float(step),
-                    help_text="Where the first material hands over. Nothing "
-                              "else moves with it.",
-                )
-            with bc2:
-                boundary_control(
-                    "segment_break_2", "ε₂ · where the deeper one is met",
-                    lower=float(break_1) + 0.005, upper=float(fit_hi),
-                    step=float(step),
-                    help_text="Where the deeper material is met. Nothing "
-                              "else moves with it.",
-                    disabled=not has_deep_term(),
-                )
-
-            # Which segment to shade on the curve. Editing a boundary is much
-            # easier when you can see the stretch of data it moves.
-            st.radio(
-                "Highlight on the plot",
-                ["(none)", "Segment 1", "Segment 2", "Segment 3", "Whole fitted range"],
-                key="highlight_segment",
-                horizontal=True,
-            )
-            highlight_bounds = {
-                "Segment 1": (fit_lo, break_1, seg_1_name),
-                "Segment 2": (break_1, break_2, seg_2_name),
-                "Segment 3": (break_2, fit_hi, seg_3_name),
-                "Whole fitted range": (fit_lo, fit_hi, "fitted range"),
-            }
-            highlight_window = highlight_bounds.get(
-                st.session_state["highlight_segment"]
-            )
-
-            b1, b2 = st.columns([1, 1])
-            with b1:
-                if st.button("🔎 Find the boundaries from the data", **STRETCH):
-                    with st.spinner("Scanning boundaries…"):
-                        scan_breaks = model.scan_segment_breaks(
-                            fit_lo, fit_hi, terms=active or ("membrane", "interior"),
-                            weighting=st.session_state["weighting"],
-                        )
-                        # And where the curve's own power law changes, which
-                        # is a second opinion arrived at a different way:
-                        # the scan above asks which boundaries fit best, this
-                        # asks where the log-log slope stops being one thing
-                        # and starts being another. When they agree the
-                        # boundary is real; when they do not, that is worth
-                        # knowing before quoting a modulus either side of it.
-                        try:
-                            grid_e, grid_slope = model.local_exponent(
-                                window_frac=0.18
-                            )
-                            st.session_state["_power_law_check"] = {
-                                "epsilon": list(map(float, grid_e)),
-                                "exponent": list(map(float, grid_slope)),
-                            }
-                        except Exception:
-                            st.session_state["_power_law_check"] = None
-                    if scan_breaks.get("success"):
-                        st.session_state["_pending_settings"] = {
-                            "segment_break_1": round(float(scan_breaks["best_break_1"]), 3),
-                            "segment_break_2": round(float(scan_breaks["best_break_2"]), 3),
-                        }
-                        st.rerun()
-                    else:
-                        st.error(scan_breaks.get("error", "Boundary scan failed."))
-                st.caption(
-                    "Moves the two boundaries only, keeping the combination you "
-                    "picked above, and checks them against the curve's own "
-                    "power law."
-                )
-                profile = st.session_state.get("_power_law_check")
-                if profile and len(profile.get("epsilon", [])) > 4:
-                    grid = np.asarray(profile["epsilon"], dtype=float)
-                    slope = np.asarray(profile["exponent"], dtype=float)
-                    good = np.isfinite(slope)
-                    if good.sum() > 4:
-                        def slope_at(where):
-                            index = int(np.argmin(np.abs(grid[good] - where)))
-                            return float(slope[good][index])
-                        e1_now = float(st.session_state["segment_break_1"])
-                        e2_now = float(st.session_state["segment_break_2"])
-                        st.caption(
-                            f"Measured log-log slope: "
-                            f"{slope_at(grid[good][0]):.2f} near contact, "
-                            f"{slope_at(e1_now):.2f} at ε₁ = {e1_now:.3f}, "
-                            f"{slope_at(e2_now):.2f} at ε₂ = {e2_now:.3f}, "
-                            f"{slope_at(grid[good][-1]):.2f} at the far end. "
-                            "3 is a membrane on its own, 3/2 a Hertzian "
-                            "network on its own, and anything above 3 is the "
-                            "cell running out of room. A boundary should sit "
-                            "where that number is changing, not where it is "
-                            "flat."
-                        )
-            # Applying a winning combination means writing four widget keys,
-            # which Streamlit only allows before those widgets exist. So both
-            # the search button and the table's apply button stage the values
-            # and rerun; the fit then happens with them already in place.
-            apply_labels = {
-                (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
-                for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
-            }
-
-            def stage_combination(row):
-                m_label, c_label = apply_labels[(row["membrane"], row["cyto_start"])]
-                return {
-                    "segment_break_1": round(float(row["break_1"]), 3),
-                    "segment_break_2": round(float(row["break_2"]), 3),
-                    "membrane_after_break": m_label,
-                    "cyto_starts_at": c_label,
-                    "use_nucleus": bool(row["use_nucleus"]) and has_deep_term(),
-                }
-
-            with b2:
-                can_search = hasattr(model, "search_compositions")
-                if st.button(
-                    "🧩 Find the best combination and fit it", type="primary",
-                    disabled=not can_search, **STRETCH,
-                ) and can_search:
-                    with st.spinner(
-                        "Fitting all four combinations at their own best "
-                        "boundaries and cross-validating each…"
-                    ):
-                        found = model.search_compositions(
-                            fit_lo, fit_hi,
-                            weighting=st.session_state["weighting"],
-                            # A cell type with no deep element must not be
-                            # offered one here either. Two searches on one
-                            # page that disagree about what the cell is made
-                            # of is worse than having only one of them.
-                            nucleus_mode=(
-                                "search" if has_deep_term() else "off"
-                            ),
-                        )
-                    st.session_state["composition_search"] = found
-                    if found.get("success"):
-                        # Go straight to the answer: apply the winner and let
-                        # the fit below run with it, so one press gives one
-                        # fitted line rather than a table to act on.
-                        st.session_state["_pending_settings"] = stage_combination(
-                            found["best"]
-                        )
-                        st.rerun()
-                st.caption(
-                    "Searches all four ways the membrane and cytoskeleton can share "
-                    "the first boundary, each with its own best ε₁ and ε₂, ranks "
-                    "them on data they were not fitted to, and applies the winner."
-                    if can_search else
-                    "Needs an up to date `lulevich_model.py`."
-                )
-
-            search = st.session_state.get("composition_search")
-            if search and search.get("success"):
-                st.info(retell(search["verdict"]))
-                shows_tension = any(
-                    row.get("use_tension") for row in search["candidates"]
-                )
-                flat_table(
-                    pd.DataFrame(
-                        [
-                            {
-                                "combination": retell(row["label"]),
-                                "ε₁": f"{row['break_1']:.3f}",
-                                "ε₂": f"{row['break_2']:.3f}",
-                                **(
-                                    {"T₀ (mN/m)": f"{row.get('T0_mN_m', 0.0):.4g}"}
-                                    if shows_tension else {}
-                                ),
-                                "Eₘ (MPa)": f"{row['Em_MPa']:.4g}",
-                                "E_c (kPa)": f"{row['Ec_kPa']:.4g}",
-                                "Eₙ (kPa)": f"{row['En_kPa']:.4g}",
-                                "R²": f"{row['r_squared']:.5f}",
-                                "CV RMSE": f"{row['cv_rmse']:.4g}",
-                                "ΔAICc": f"{row['delta_aicc']:.1f}",
-                                "note": " · ".join(
-                                    part for part in (
-                                        "picked" if row is search["best"] else "",
-                                        "ties with the pick"
-                                        if row.get("tied_with_best") else "",
-                                        ", ".join(row["empty_terms"]) + " came out zero"
-                                        if row.get("empty_terms") else "",
-                                        ", ".join(row.get("idle_breaks", []))
-                                        + " unused here"
-                                        if row.get("idle_breaks") else "",
-                                    ) if part
-                                ),
-                            }
-                            for row in search["candidates"]
-                        ]
-                    ),
-                    align_right=[
-                        "ε₁", "ε₂", "T₀ (mN/m)", "Eₘ (MPa)", "E_c (kPa)",
-                        "Eₙ (kPa)", "R²", "CV RMSE", "ΔAICc",
-                    ],
-                )
-                st.caption(
-                    "Ranked by cross-validated error, which asks how well each "
-                    "combination predicts points it was not fitted on, averaged "
-                    "over several different fold splits. Candidates closer than "
-                    "the amount that number moves between splits are called tied, "
-                    "and the pick among tied candidates is the one with the fewest "
-                    "free moduli. ΔAICc is shown but does not decide the order: on "
-                    "these curves it is confident about differences the held-out "
-                    "error says are not there."
-                )
-                best = search["best"]
-                # Shown with this cell type's names; matched back on the
-                # model's own label, which is what the candidates carry.
-                shown_to_row = {
-                    retell(row["label"]): row for row in search["candidates"]
-                }
-                choice_names = list(shown_to_row)
-                best_shown = retell(best["label"])
-                a1, a2 = st.columns([2, 1])
-                with a1:
-                    picked = st.selectbox(
-                        "Override the pick", choice_names,
-                        index=choice_names.index(best_shown)
-                        if best_shown in choice_names else 0,
-                        key="composition_pick",
-                        help="The winner is already applied. Use this only to try "
-                        "one of the others.",
-                    )
-                with a2:
-                    st.markdown("<div style='height:1.7rem'></div>",
-                                unsafe_allow_html=True)
-                    if st.button("✓ Use this one instead", **STRETCH):
-                        row = shown_to_row[picked]
-                        st.session_state["_pending_settings"] = stage_combination(row)
-                        st.rerun()
-                st.caption(
-                    f"Applied: ε₁ = {best['break_1']:.3f}, ε₂ = "
-                    f"{best['break_2']:.3f}, "
-                    f"{'with' if best['use_nucleus'] else 'without'} the "
-                    f"{term_name('nucleus').lower()}."
-                )
-            elif search:
-                st.error(search.get("error", "The combination search failed."))
-
-            if break_2 <= break_1:
-                st.error("Segment 2 must end after segment 1.")
-            else:
-                st.caption(
-                    "The force is continuous across both boundaries by "
-                    "construction, so moving one never puts a step in the curve."
-                )
-
-        elif coupling in ("hybrid_ps", "hybrid_sp"):
-            h1, h2 = st.columns([1, 2])
-            with h1:
-                st.radio("Crossover ε", ["Scan for best", "Set manually"],
-                         key="crossover_mode", horizontal=True)
-            with h2:
-                st.slider("ε at which the load path changes", 0.0, 1.0, step=0.01,
-                          key="crossover",
-                          disabled=st.session_state["crossover_mode"] == "Scan for best")
-
-        elif coupling == "parallel":
-            st.radio(
-                "Fitting procedure", ["All at once", "Stage by stage"],
-                key="procedure", horizontal=True,
-                help="Stage by stage measures each element on its own window, "
-                "which helps when the moduli come out correlated.",
-            )
-            staged = st.session_state["procedure"] == "Stage by stage"
-            if staged:
-                st.caption("A window per element; same stage number = fitted together.")
-                window_cols = st.columns(max(1, len(active))) if active else [st]
-                for i, term in enumerate(active):
-                    key = f"window_term_{term}"
-                    st.session_state[key] = clamp_range(
-                        st.session_state.get(key),
-                        default_window_for((term,), auto_window, eps_lo_data, eps_hi_data),
-                    )
-                    with window_cols[i % len(window_cols)]:
-                        lo, hi = st.slider(
-                            term_label(term), min_value=eps_lo_data,
-                            max_value=eps_hi_data, step=step, key=key,
-                        )
-                        term_windows[term] = (lo, hi)
-                        st.selectbox(f"Stage for {term_label(term)}", [1, 2, 3],
-                                     key=f"stage_of_{term}", label_visibility="collapsed")
-                stage_plan = []
-                for stage_no, terms in stage_groups(active):
-                    spans = [term_windows[t] for t in terms if t in term_windows]
-                    if spans:
-                        stage_plan.append(
-                            {"terms": terms,
-                             "range": (min(s[0] for s in spans), max(s[1] for s in spans))}
-                        )
-                if stage_plan:
-                    fit_lo = min(s["range"][0] for s in stage_plan)
-                    fit_hi = max(s["range"][1] for s in stage_plan)
-
-        r1, r2 = st.columns([1, 3])
-        with r1:
-            if st.button("↺ Reset ranges", **STRETCH):
-                st.session_state["_pending_clear_windows"] = True
-                st.rerun()
-        with r2:
-            range_label = "Fitted range"
-            targets = ["(off)", range_label] + [
-                term_label(t) for t in (active if staged else [])
-            ]
-            st.session_state["_drag_keys"] = {
-                range_label: "window_range"
-            }
-            st.session_state["_drag_keys"].update(
-                {term_label(t): f"window_term_{t}" for t in (active if staged else [])}
-            )
-            st.selectbox("Drag on the plot to set", targets, key="drag_target")
-
-        # Flat when guided, because this already sits inside the settings
-        # box and Streamlit refuses an expander inside an expander.
-        with sub_panel("⚙️ Advanced fitting options", flat=guided):
-            a1, a2 = st.columns(2)
-            with a1:
-                st.selectbox(
-                    "Weighting", ["uniform", "relative", "noise"], key="weighting",
-                    help="How much each point counts. A whole-cell curve "
-                    "spans four decades of force, so **uniform** is decided "
-                    "almost entirely by its last tenth and can miss the "
-                    "first half by tens of per cent without the residual sum "
-                    "noticing. **relative** weights by 1/|F|, so every decade "
-                    "counts the same and the fit holds everywhere; it is the "
-                    "default for a cardiomyocyte. **noise** weights by 1/σ "
-                    "measured from the curve, the maximum-likelihood choice "
-                    "and the one χ²/dof assumes.",
-                )
-                st.checkbox("Fit a constant force offset", key="fit_offset")
-            with a2:
-                st.slider("Refinement passes (staged fits)", 1, 8,
-                          key="refine_iterations")
-                st.checkbox("Seed staged fits from all-at-once", key="seed_parallel")
-            st.checkbox("Refit live as settings change", key="live_fit")
-
-        # ------------------------------------------------- saved presets ---
-        with sub_panel("💾 Saved windows", flat=guided):
-            p1, p2 = st.columns([2, 1])
-            with p1:
-                preset_name = st.text_input(
-                    "Preset name",
-                    placeholder="e.g. C2C12 standard",
-                    key="preset_name",
-                    label_visibility="collapsed",
-                )
-            with p2:
-                if st.button("Save current", **STRETCH):
-                    name = (preset_name or "").strip()
-                    if not name:
-                        st.warning("Give the preset a name first.")
-                    else:
-                        st.session_state["range_presets"][name] = {
-                            # Stored under its old key so presets saved by
-                            # earlier versions still load.
-                            "coupling": st.session_state["model_kind"],
-                            "procedure": st.session_state["procedure"],
-                            "segment_break_1": float(st.session_state["segment_break_1"]),
-                            "segment_break_2": float(st.session_state["segment_break_2"]),
-                            "membrane_after_break": st.session_state["membrane_after_break"],
-                            "cyto_starts_at": st.session_state["cyto_starts_at"],
-                            "combined_window": [float(fit_lo), float(fit_hi)],
-                            "term_windows": {
-                                t: [float(w[0]), float(w[1])]
-                                for t, w in term_windows.items()
-                            },
-                            "crossover": float(st.session_state["crossover"]),
-                            "cell_type": st.session_state["cell_type"],
-                            "terms": list(active),
-                            "stages": [
-                                {"terms": list(s["terms"]), "range": list(s["range"])}
-                                for s in stage_plan
-                            ],
-                            "stage_of": {t: st.session_state[f"stage_of_{t}"] for t in active},
-                            "nucleus_onset": st.session_state["nucleus_onset"],
-                            "saved_at": datetime.now().isoformat(timespec="seconds"),
-                        }
-                        st.success(f"Saved “{name}”.")
-
-            presets = st.session_state["range_presets"]
-            if presets:
-                a1, a2, a3 = st.columns([2, 1, 1])
-                with a1:
-                    chosen = st.selectbox(
-                        "Preset", list(presets.keys()), key="preset_choice",
+                element_col, model_col = st.columns([1, 1.5])
+                with model_col:
+                    st.markdown("**2 · How they share the load**")
+                    st.radio(
+                        "How the cell is modelled",
+                        list(MODELS.keys()),
+                        key="model_kind",
                         label_visibility="collapsed",
+                        help="Segmented treats the compression as stretches with "
+                        "different materials bearing the load. The others assume "
+                        "every material acts across the whole curve, which is "
+                        "what makes them fail on a curve that changes character "
+                        "partway along.",
                     )
-                with a2:
-                    if st.button("Apply this preset", key="apply_preset",
-                                 **STRETCH):
-                        apply_preset(presets[chosen], eps_lo_data, eps_hi_data)
-                        st.rerun()
-                with a3:
-                    if st.button("Delete", **STRETCH):
-                        presets.pop(chosen, None)
-                        st.rerun()
+                    st.caption(MODELS[st.session_state["model_kind"]])
+                    if MODEL_KEYS[st.session_state["model_kind"]] == "segmented":
+                        st.caption(
+                            "For this cell type, in order: "
+                            + " → ".join(
+                                plain_name(t).lower()
+                                for t in terms_for(st.session_state["cell_type"])
+                                if t != "tension"
+                            )
+                            + "."
+                        )
+                with element_col:
+                    st.markdown("**1 · Which materials**")
+                    names = components_for(st.session_state["cell_type"])
+                    fixed_cell_control()
+                    for term in terms_for(st.session_state["cell_type"]):
+                        st.checkbox(
+                            f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
+                            key=f"use_{term}",
+                        )
 
-                flat_table(
-                    pd.DataFrame(
-                        [
-                            {
-                                "preset": name,
-                                "model": pre.get("coupling", "?"),
-                                "ε₁": pre.get("segment_break_1"),
-                                "ε₂": pre.get("segment_break_2"),
-                                "cell type": pre.get("cell_type", "?"),
-                                "windows": " | ".join(
-                                    " + ".join(term_label(t) for t in st_["terms"])
-                                    + f" {st_['range'][0]:.3f} to {st_['range'][1]:.3f}"
-                                    for st_ in pre.get("stages", [])
-                                ),
-                                "saved": pre.get("saved_at", ""),
-                            }
-                            for name, pre in presets.items()
-                        ]
-                    ),
-                    align_right=["ε₁", "ε₂"],
-                )
-
-            e1, e2 = st.columns(2)
-            with e1:
-                st.download_button(
-                    "📥 Export presets",
-                    data=json.dumps(presets, indent=2),
-                    file_name="afm_fit_windows.json",
-                    mime="application/json",
-                    disabled=not presets,
-                    **STRETCH,
-                )
-            with e2:
-                imported = st.file_uploader(
-                    "Import presets (.json)", type=["json"], key="preset_upload"
-                )
-                if imported is not None:
-                    try:
-                        incoming = json.loads(imported.getvalue().decode("utf-8"))
-                        st.session_state["range_presets"].update(incoming)
-                        st.success(f"Imported {len(incoming)} preset(s).")
-                    except Exception as exc:
-                        st.error(f"Could not read that preset file: {exc}")
-            hint(
-                "Presets live in this browser session. Export them to a file to keep "
-                "them between visits or share them with the rest of the lab."
+            active = active_terms()
+            kind = MODEL_KEYS[st.session_state["model_kind"]]
+            segmented = kind == "segmented"
+            coupling = kind
+            cardiomyocyte_model = st.session_state["model_kind"].startswith(
+                "Cardiomyocyte"
             )
 
-        # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
-        close_panel(range_panel)
+            if cardiomyocyte_model:
+                st.warning(
+                    "**This model is provisional.** It is built from your "
+                    "description of the Morales Maldonado picture, a strong "
+                    "shell around fluid that does not compress, not from the "
+                    "paper's equations, which I could not reach. Send me the "
+                    "force-versus-deformation equation and I will replace it. "
+                    "**Segmented** is the one to use meanwhile: it carries the "
+                    "materials, the order and the boundaries.",
+                    icon="⚠️",
+                )
 
-        fit_panel = open_panel("🔧 Fitting options", guided, flat=guided)
-        if not guided:
-            section("6 · Fit" if segmented else "5 · Fit")
-
-        scan = None
-        if (
-            "nucleus" in active
-            and coupling == "parallel"
-            and st.session_state["onset_mode"] == "Scan for best"
-        ):
-            scan = model.scan_nucleus_onset(
-                fit_lo, fit_hi, terms=active,
-                weighting=st.session_state["weighting"],
-                fit_offset=st.session_state["fit_offset"],
-            )
-            if scan.get("success"):
-                model.nucleus_onset = scan["best_onset"]
-                st.session_state["_scanned_onset"] = float(scan["best_onset"])
-                if not scan["well_determined"]:
-                    st.warning(
-                        "The nucleus onset scan is flat: every ε₀ fits about equally "
-                        "well, so this curve does not locate the nucleus."
-                    )
-
-        # Two ways to press it, one button. A flag set beside the curve is
-        # read here, where the fit actually happens: a second st.button with
-        # the same job would be a duplicate widget key, and Streamlit
-        # refuses those outright.
-        run = (
-            st.session_state["live_fit"]
-            or st.button("🚀 Fit curve", type="primary")
-            or st.session_state.pop("_fit_from_curve", False)
-        )
-
-        # A fit has to survive a rerun. Uploading a video, ticking a checkbox
-        # or opening a tab all rerun the script, and with live refitting off
-        # nothing recomputes the fit, so it used to vanish and take the whole
-        # database section with it. Keep the last good one and reuse it.
-        fit_signature = repr(
-            (
-                data.get("source"),
-                int(epsilon.size),
-                float(force_N[0]) if force_N.size else 0.0,
-                float(force_N[-1]) if force_N.size else 0.0,
-                sorted(current_fit_settings().items(), key=lambda kv: kv[0]),
-                round(fit_lo, 6), round(fit_hi, 6),
-                round(break_1, 6), round(break_2, 6),
-                kind,
-            )
-        )
-
-        fit = None
-        comparison = None
-        if run and not active:
-            st.warning("Select at least one element above.")
-        elif run and segmented and break_2 <= break_1:
-            st.error("Set ε₂ above ε₁ before fitting.")
-        elif run:
             if segmented:
-                # fit_composition covers what fit_segmented did and adds the
-                # two choices about the first boundary, so it is the one path.
-                # An older lulevich_model.py has only the fixed version.
-                if hasattr(model, "fit_composition"):
-                    fit = model.fit_composition(
-                        fit_lo, fit_hi, e1=break_1, e2=break_2,
-                        membrane=membrane_mode,
-                        cyto_start=cyto_mode,
-                        use_membrane="membrane" in active,
-                        use_interior="interior" in active,
-                        use_nucleus="nucleus" in active,
-                        use_tension="tension" in active,
-                        use_nucleus_shell="nucleus_shell" in active,
-                        use_cortex="cortex" in active,
-                        weighting=st.session_state["weighting"],
-                        fit_offset=st.session_state["fit_offset"],
-                        **figure_kwargs(
-                            model.fit_composition,
-                            term_windows=element_windows(
-                                active, fit_lo, fit_hi
-                            ),
-                        ),
+                st.markdown("**3 · What each one does at the first boundary**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.radio(
+                        "After ε₁ the membrane…",
+                        list(MEMBRANE_CHOICES.keys()),
+                        key="membrane_after_break",
+                        help="“Holds what it reached” means the membrane stops adding "
+                        "force above ε₁ and keeps the force it had there, so the whole "
+                        "of the extra load goes to the cytoskeleton. “Keeps stiffening” "
+                        "means the ε³ term carries on rising underneath the others.",
                     )
-                else:
-                    fit = model.fit_segmented(
-                        fit_lo, fit_hi, e1=break_1, e2=break_2, terms=active,
-                        weighting=st.session_state["weighting"],
-                        fit_offset=st.session_state["fit_offset"],
+                with c2:
+                    st.radio(
+                        "The cytoskeleton starts…",
+                        list(CYTO_CHOICES.keys()),
+                        key="cyto_starts_at",
+                        help="“At ε₁” means the cytoskeleton only begins to bear load "
+                        "once the membrane hands over. “From the very start” means both "
+                        "carry load together from first contact.",
                     )
-            elif coupling == "auto":
-                with st.spinner("Fitting every model and comparing…"):
-                    comparison = compare_couplings(model, fit_lo, fit_hi, terms=active)
-                if comparison.get("success"):
-                    fit = comparison["fits"][comparison["best"]["coupling"]]
-                else:
-                    st.error(comparison.get("error", "Could not compare models."))
-            elif coupling == "series":
-                fit = model.fit_series(
-                    fit_lo, fit_hi, terms=active,
-                    weighting=st.session_state["weighting"],
-                )
-            elif coupling in ("hybrid_ps", "hybrid_sp"):
-                order = ("parallel-then-series" if coupling == "hybrid_ps"
-                         else "series-then-parallel")
-                if st.session_state["crossover_mode"] == "Scan for best":
-                    scan_x = model.scan_crossover(fit_lo, fit_hi, terms=active, order=order)
-                    if scan_x.get("success"):
-                        fit = scan_x["best"]
-                        st.caption(f"Best crossover ε = {scan_x['best_crossover']:.3f}")
-                    else:
-                        st.error(scan_x.get("error", "Hybrid scan failed."))
-                else:
-                    crossover = float(np.clip(st.session_state["crossover"],
-                                              fit_lo + 1e-4, fit_hi - 1e-4))
-                    fit = model.fit_hybrid(fit_lo, fit_hi, crossover, terms=active,
-                                           order=order)
-            elif staged and len(stage_plan) > 1:
-                fit = model.fit_staged(
-                    stage_plan,
-                    weighting=st.session_state["weighting"],
-                    fit_offset=st.session_state["fit_offset"],
-                    refine_iterations=st.session_state["refine_iterations"],
-                    seed_parallel=st.session_state["seed_parallel"],
-                )
-            else:
-                fit = model.fit(
-                    epsilon_min=fit_lo, epsilon_max=fit_hi, terms=active,
-                    fit_offset=st.session_state["fit_offset"],
-                    weighting=st.session_state["weighting"],
-                )
-
-        close_panel(fit_panel)
-        if settings_box is not None:
-            settings_box.__exit__(None, None, None)
-
-        # The video and database section below runs whether or not there is a
-        # fit, so the names it reads have to exist either way.
-        fitted = membrane = interior = nucleus = None
-
-        stale_fit = False
-        if fit is not None and fit.get("success"):
-            # How much each modulus depends on where the boundaries were put.
-            # Done once, here, rather than in the panel that displays it: this
-            # runs when a fit happens, that runs on every rerun.
-            if fit.get("coupling") == "segmented" and hasattr(
-                model, "breakpoint_spread"
-            ):
-                try:
-                    fit["breakpoint_spread"] = model.breakpoint_spread(
-                        fit["epsilon_range"][0], fit["epsilon_range"][1],
-                        fit["break_1"], fit["break_2"],
-                        fit.get("membrane", "freeze"),
-                        fit.get("cyto_start", "break"),
-                        use_nucleus="nucleus" in (fit.get("terms") or ()),
-                        weighting=fit.get("weighting", "uniform"),
-                        use_tension="tension" in (fit.get("terms") or ()),
-                    )
-                except Exception:
-                    fit["breakpoint_spread"] = None
-            st.session_state["_last_fit"] = fit
-            st.session_state["_last_fit_signature"] = fit_signature
-            # The bars in "What to fit" were drawn earlier in this same pass,
-            # from the fit that existed then. If this one moved a boundary
-            # they are now showing the old placement, which is a claim about
-            # the model that is not true any more. One redraw fixes it, and
-            # the guard stops a fit that never settles from spinning.
-            _now = (
-                round(float(fit.get("break_1", 0.0)), 4),
-                round(float(fit.get("break_2", 0.0)), 4),
-                fit.get("membrane"), fit.get("cyto_start"),
-                round(float(fit.get("epsilon_range", (0, 1))[1]), 4),
-            )
-            if (
-                not st.session_state.get("use_element_windows", False)
-                and st.session_state.get("_bars_drawn_with") is not None
-                and st.session_state["_bars_drawn_with"] != _now
-                and st.session_state.get("_bars_redrawn_for") != _now
-            ):
-                st.session_state["_bars_redrawn_for"] = _now
-                st.rerun()
-        elif fit is None and st.session_state.get("_last_fit") is not None:
-            # Nothing asked for a fit on this run, so show the last good one
-            # rather than an empty page.
-            fit = st.session_state["_last_fit"]
-            stale_fit = (
-                st.session_state.get("_last_fit_signature") != fit_signature
-            )
-            if stale_fit:
-                st.info(
-                    "Showing the previous fit. Something has changed since it "
-                    "was made, so press **Fit curve** to bring it up to date, "
-                    "or switch on live refitting in Advanced fitting options."
-                )
-
-        if comparison and comparison.get("success"):
-            st.info(retell(comparison["verdict"]))
-            flat_table(
-                pd.DataFrame(
-                    [
-                        {
-                            "model": row["label"],
-                            "R²": f"{row['r_squared']:.5f}",
-                            "ΔAICc": f"{row['delta_aicc']:.1f}",
-                            "weight": f"{row['weight']:.3f}",
-                            "CV RMSE": f"{row['cv_rmse']:.3g}",
-                            "params": row["n_params"],
-                        }
-                        for row in comparison["candidates"]
-                    ]
-                ),
-                align_right=["R²", "ΔAICc", "weight", "CV RMSE", "params"],
-            )
-            st.caption(
-                "ΔAICc under 2 means the curve cannot tell those models apart. A "
-                "wrong model can still reach R² > 0.99 with badly wrong moduli, "
-                "which is why this table exists."
-            )
-
-        if fit is None:
-            st.info("Press **Fit curve**, or turn on live refitting in the sidebar.")
-        elif not fit.get("success"):
-            st.error(fit.get("error", "Fit failed."))
-        else:
-            En_value = fit.get("En", 0.0)
-            fitted_coupling = fit.get("coupling", "parallel")
-            params = (fit.get("Em", 0.0), fit.get("Ei", 0.0), En_value)
-            params = tuple(0.0 if not np.isfinite(v) else v for v in params)
-            T0_value = float(fit.get("T0", 0.0) or 0.0)
-            if not np.isfinite(T0_value):
-                T0_value = 0.0
-            Ene_value = float(fit.get("Ene", 0.0) or 0.0)
-            if not np.isfinite(Ene_value):
-                Ene_value = 0.0
-            Ecx_value = float(fit.get("Ecx", 0.0) or 0.0)
-            if not np.isfinite(Ecx_value):
-                Ecx_value = 0.0
-            envelope = cortex = None
-
-            if fitted_coupling == "segmented":
-                # Draw the components with the same basis the fit used, or the
-                # curves would not add up to the line through the data.
-                tension_basis = None
-                if hasattr(model, "composition_basis"):
-                    basis = figure_kwargs(
-                        model.composition_basis,
-                        term_windows=fit.get("term_windows"),
-                    )
-                    basis = model.composition_basis(
-                        epsilon, fit["break_1"], fit["break_2"],
-                        fit.get("membrane", "freeze"),
-                        fit.get("cyto_start", "break"),
-                        **basis,
-                    )
-                    membrane_basis = basis["membrane"]
-                    cyto_basis = basis["interior"]
-                    nucleus_basis = basis["nucleus"]
-                    tension_basis = basis["tension"]
-                    envelope_basis = basis["nucleus_shell"]
-                    cortex_basis = basis["cortex"]
-                elif hasattr(model, "composition_terms"):
-                    membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
-                        epsilon, fit["break_1"], fit["break_2"],
-                        fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
-                    )
-                else:
-                    membrane_basis, cyto_basis, nucleus_basis = model.segment_terms(
-                        epsilon, fit["break_1"], fit["break_2"]
-                    )
-                tension = (
-                    tension_basis * T0_value
-                    if (tension_basis is not None and T0_value) else None
-                )
-                envelope = (
-                    envelope_basis * Ene_value
-                    if (envelope_basis is not None and Ene_value) else None
-                )
-                cortex = (
-                    cortex_basis * Ecx_value
-                    if (cortex_basis is not None and Ecx_value) else None
-                )
-                fitted = (
-                    membrane_basis * params[0]
-                    + cyto_basis * params[1]
-                    + nucleus_basis * params[2]
-                    + (tension if tension is not None else 0.0)
-                    + (envelope if envelope is not None else 0.0)
-                    + (cortex if cortex is not None else 0.0)
-                    + fit.get("force_offset", 0.0)
-                )
-                membrane = membrane_basis * params[0]
-                interior = cyto_basis * params[1]
-                nucleus = nucleus_basis * params[2] if params[2] else None
-            elif fitted_coupling == "parallel":
-                fitted = model.combined_model(
-                    epsilon, params[0], params[1],
-                    fit.get("force_offset", 0.0), En=params[2],
-                )
-                # In parallel the elements share the deformation, so each one's
-                # force is a separate curve that adds up to the total.
-                membrane = model.balloon_model_cubic(epsilon, params[0])
-                interior = model.hertzian_contact_model(epsilon, params[1])
-                nucleus = model.nucleus_model(epsilon, params[2]) if params[2] else None
-                tension = None
-            else:
-                base_coupling = "series" if fitted_coupling == "series" else "hybrid"
-                fitted = model.predict(
-                    epsilon, params, base_coupling,
-                    fit.get("crossover"),
-                    fit.get("order", "parallel-then-series"),
-                )
-                # In series every element carries the whole force, so there are
-                # no separate force curves to draw; what differs between them is
-                # how much of the deformation each one takes.
-                membrane = interior = nucleus = tension = None
-                envelope = cortex = None
-
-            # The model is only claimed over the range it was fitted on.
-            # Drawn past that it is extrapolation, and a power law far outside
-            # its window flattens into a line that looks like a result. NaN
-            # outside the window makes plotly stop the line at the last
-            # fitted point instead.
-            # Use the range the fit actually recorded, not the sliders, so a
-            # slider moved after the fit cannot punch NaNs into the residuals.
-            drawn_lo, drawn_hi = fit.get("epsilon_range", (fit_lo, fit_hi))
-
-            def clip_to_window(values):
-                if values is None:
-                    return None
-                out = np.array(values, dtype=float, copy=True)
-                out[(epsilon < drawn_lo) | (epsilon > drawn_hi)] = np.nan
-                return out
-
-            def clip_to_support(values, term):
-                """An element's own curve starts where the element does."""
-                out = clip_to_window(values)
-                if out is None:
-                    return None
-                window = (fit.get("term_windows") or {}).get(term)
-                if window:
-                    out[epsilon < float(window[0])] = np.nan
-                return out
-
-            fitted = clip_to_window(fitted)
-            tension = clip_to_support(tension, "tension")
-            membrane = clip_to_support(membrane, "membrane")
-            interior = clip_to_support(interior, "interior")
-            nucleus = clip_to_support(nucleus, "nucleus")
-            envelope = clip_to_support(envelope, "nucleus_shell")
-            cortex = clip_to_support(cortex, "cortex")
-
-            deformation_shares = None
-            if fitted_coupling in ("series", "hybrid"):
-                peak = float(np.nanmax(np.abs(force_N))) if force_N.size else 0.0
-                pieces = {}
-                if params[0] > 0:
-                    pieces["membrane"] = (peak / (model.Am * params[0])) ** (1.0 / 3.0)
-                if params[1] > 0:
-                    pieces["interior"] = (peak / (model.Ai * params[1])) ** (2.0 / 3.0)
-                if params[2] > 0:
-                    onset = fit.get("nucleus_force_onset", 0.0)
-                    pieces["nucleus"] = (
-                        max(peak - onset, 0.0) / (model.An * params[2])
-                    ) ** (2.0 / 3.0)
-                total = sum(pieces.values())
-                if total > 0:
-                    deformation_shares = {k: v / total for k, v in pieces.items()}
-
-            if fitted_coupling == "segmented":
-                # Straight from the element ranges, so a band behind the
-                # curve says the same thing as the algebra under the log
-                # plot. Hard-coded as membrane / cytoskeleton / cytoskeleton
-                # plus nucleus, it stopped being true the moment an element
-                # was given a range of its own -- and on a C2C12, whose
-                # sarcolemma carries throughout, it was never true at all.
-                windows_for_plot = stage_bands(fit)
-            else:
-                windows_for_plot = [
-                        {
-                            "range": tuple(s["range"]),
-                            "label": " + ".join(term_label(t) for t in s["terms"]),
-                            "color": STAGE_COLORS[i % len(STAGE_COLORS)],
-                        }
-                        for i, s in enumerate(stage_plan)
-                ]
-
-            st.session_state["results"] = {
-                "cell_name": st.session_state["cell_name"],
-                "cell_type": st.session_state["cell_type"],
-                "date_acquired": str(date_acquired),
-                "cell_height_um": st.session_state["cell_height_um"],
-                "spring_constant": st.session_state["spring_constant"],
-                "video_link": st.session_state["video_link"],
-                "epsilon": epsilon,
-                "force_N": force_N,
-                "fitted_N": fitted,
-                "membrane_N": membrane,
-                "interior_N": interior,
-                "nucleus_N": nucleus,
-                "fit": fit,
-                "fit_windows": windows_for_plot,
-                "source": data["source"],
-                "timestamp": datetime.now(),
-            }
-
-            if guided:
-                # No retelling of the fit in words. It restated the
-                # boundaries already drawn on the curve, printed the moduli
-                # a second time under the ones below, and ended with a
-                # sentence about chi-squared that a person could read
-                # straight off the two numbers beside R². Three of those
-                # were duplicates and the fourth was noise.
-                section("4 · Fitting results")
-                fitting_results_rows(fit, style)
-
-            rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
-            sigma_disp, sigma_unit = from_newtons(
-                fit.get("noise_sigma", float("nan")), style.force_unit
-            )
-            st.caption(
-                f"RMSE {float(rmse_disp):.3g} {rmse_unit} · measured noise "
-                f"±{float(sigma_disp):.3g} {sigma_unit} per point. "
-                "χ²/dof compares the residuals against that noise: about 1 "
-                "means the model is as close to the points as the scatter "
-                "allows, and much above 1 means it is missing something real. "
-                "R² can still look excellent when χ²/dof is in the hundreds, "
-                "which is exactly when the model is wrong. The noise is "
-                "estimated from the curve itself, so read χ²/dof as an "
-                "order of magnitude, not to two decimal places."
-            )
-
-            # No second table of the same moduli. Each is quoted with its
-            # own uncertainty in the tile above, which is where a modulus
-            # belongs; everything else about it is in the equation and the
-            # copy block below.
-
-            # The model must never soften. Every basis function has a
-            # non-decreasing slope and every modulus is bounded at zero, so
-            # this holds by construction; it is checked rather than asserted
-            # because a future term could break it silently, and a cell that
-            # appeared to soften under load would be a physical claim nobody
-            # meant to make.
-            if fitted is not None:
-                drawn = np.isfinite(fitted)
-                if drawn.sum() > 5:
-                    e_drawn, f_drawn = epsilon[drawn], fitted[drawn]
-                    slope = np.diff(f_drawn) / np.maximum(np.diff(e_drawn), 1e-12)
-                    softening = float(np.min(np.diff(slope))) if slope.size > 2 else 0.0
-                    falls = float(np.min(np.diff(f_drawn))) if f_drawn.size > 1 else 0.0
-                    if falls < -1e-15 or softening < -abs(np.max(slope)) * 1e-6:
-                        st.warning(
-                            "The fitted curve is not stiffening monotonically, "
-                            "which no combination of these elements should be "
-                            "able to do. Treat this fit as suspect and tell "
-                            "whoever maintains the app.",
-                            icon="⚠️",
-                        )
-
-            # How well it fits, band by band, as a percentage. R² and the
-            # residual sum are both dominated by the last tenth of a curve
-            # that spans four decades, so both can look perfect while the
-            # first half is out by a third. This is the number that says
-            # whether the model follows the curve where you are looking.
-            if fitted is not None:
-                inside = (epsilon >= fit["epsilon_range"][0]) & (
-                    epsilon <= fit["epsilon_range"][1]
-                )
-                bands, worst_band = [], 0.0
-                edges = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 1.01])
-                for lo_b, hi_b in zip(edges[:-1], edges[1:]):
-                    here = inside & (epsilon >= lo_b) & (epsilon < hi_b)
-                    here &= np.isfinite(fitted)
-                    if here.sum() < 5:
-                        continue
-                    measured = force_N[here]
-                    scale = np.mean(np.abs(measured))
-                    if scale <= 0:
-                        continue
-                    miss = float(np.mean(fitted[here] - measured) / scale)
-                    worst_band = max(worst_band, abs(miss))
-                    bands.append({
-                        "ε from": f"{lo_b:.2f}",
-                        "to": f"{min(hi_b, 1.0):.2f}",
-                        "points": int(here.sum()),
-                        "typical force there": (
-                            f"{float(from_newtons(scale, style.force_unit)[0]):.3g} "
-                            f"{style.force_unit}"
-                        ),
-                        "model is out by": f"{100 * miss:+.1f} %",
-                    })
-                # Working, not answer. In guided mode the page is meant to
-                # read curve, numbers, maths, database, and every extra
-                # panel between them is one more thing to scroll past.
-                if bands:
-                    with diagnostics_box:
-                        st.markdown(
-                            f"**📊 How well it fits, stretch by stretch** "
-                            f"(worst {100 * worst_band:.1f} %)"
-                        )
-                        flat_table(
-                            pd.DataFrame(bands),
-                            align_right=["points", "typical force there",
-                                         "model is out by"],
-                        )
-                        st.caption(
-                            "The percentage is the average signed miss in "
-                            "that stretch, as a fraction of the force there. "
-                            "R² and χ² are both dominated by the largest "
-                            "forces, so a curve spanning four decades can "
-                            "read R² = 0.99999 while the first half is out "
-                            "by a third; this table is where that shows. "
-                            "Weighting, in Advanced fitting options, is what "
-                            "trades one end against the other: **uniform** "
-                            "buys the top of the curve, **relative** spreads "
-                            "the error evenly."
-                        )
-                        if worst_band > 0.15 and st.session_state["weighting"] == "uniform":
-                            st.warning(
-                                f"The model is out by {100 * worst_band:.0f} % "
-                                f"somewhere, and the fit is weighted "
-                                f"uniformly, which means the low-force end "
-                                f"was barely counted. Switching the weighting "
-                                f"to **relative** usually brings this under "
-                                f"5 % everywhere without hurting the top of "
-                                f"the curve."
-                            )
-
-            # What the squash did to the sarcomeres. Geometry rather than a
-            # fitted result: the sarcomeres are not a spring in this model,
-            # they are part of the one incompressible interior. This is the
-            # check that says whether the cell was squashed through a range
-            # where muscle still behaves like muscle.
-            if (
-                st.session_state["cell_type"] in HAS_SARCOMERES
-                and hasattr(model, "sarcomere_report")
-            ):
-                # An onset belongs to a deep spring. Without one there is
-                # nothing switching on, so the read-out covers the whole
-                # fitted range rather than quoting a boundary that is not in
-                # the model.
-                deep_onset = (
-                    fit.get("break_2") if "nucleus" in (fit.get("terms") or ())
-                    else None
-                )
-                free = model.sarcomere_report(
-                    fit["epsilon_range"][1], onset=deep_onset,
-                    spread=float(st.session_state["sarcomere_spread"]),
-                )
-                held = model.sarcomere_report(
-                    fit["epsilon_range"][1], onset=deep_onset, spread=0.0,
-                )
-                with diagnostics_box:
-                    st.markdown("**🧬 What the squash did to the sarcomeres**")
-                    s1, s2, s3 = st.columns(3)
-                    s1.metric(
-                        "Relaxed", f"{free['relaxed_nm']:.0f} nm",
-                        delta=f"about {free['n_along_cell']:.0f} along the cell",
-                        delta_color="off",
-                    )
-                    s2.metric(
-                        f"At ε = {free['epsilon_max']:.2f}",
-                        f"{free['at_epsilon_max_nm']:.0f} nm",
-                        delta=f"{100 * (free['stretch'] - 1):+.0f} %",
-                        delta_color="off",
-                    )
-                    if "at_onset_nm" in free:
-                        s3.metric(
-                            f"Where they engage, ε₂ = {free['onset']:.2f}",
-                            f"{free['at_onset_nm']:.0f} nm",
-                        )
+                membrane_mode = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
+                cyto_mode = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
+                if "cortex" in terms_for(st.session_state["cell_type"]):
                     st.caption(
-                        "Squashing a cardiomyocyte does not shorten its "
-                        "sarcomeres, it lengthens them. The myofibrils run "
-                        "along the cell, across the direction of the squash, "
-                        "and a cell that keeps its volume has to spread "
-                        "sideways by as much as it loses in height, which "
-                        "pulls them out: L = L₀ (1 − ε)^(−s∕2), where s is "
-                        "how much of that spreading runs along the "
-                        "myofibrils, set in the sidebar. This is geometry, "
-                        "not a fitted number, and nothing above depends on it."
+                        "With a cortex in the model it is the cortex that "
+                        "carries the load from first contact, so the general "
+                        "scaffolding is set to start at ε₁. Starting both at "
+                        "zero would make them one Hertzian term with two names, "
+                        "and the fit would split them arbitrarily."
                     )
-                    if float(st.session_state["sarcomere_spread"]) > 0:
-                        st.caption(
-                            f"Held at its ends instead, the same cell would "
-                            f"keep its sarcomeres at "
-                            f"{held['at_epsilon_max_nm']:.0f} nm throughout. "
-                            f"A real attached cell lies between, so read "
-                            f"{held['at_epsilon_max_nm']:.0f} to "
-                            f"{free['at_epsilon_max_nm']:.0f} nm as the "
-                            f"bounds at ε = {free['epsilon_max']:.2f}."
-                        )
-                    if free["beyond_working_range"]:
-                        st.warning(
-                            f"Past ε = {free['epsilon_at_limit']:.2f} the "
-                            f"sarcomeres are longer than "
-                            f"{free['working_limit_nm']:.0f} nm, where actin "
-                            f"and myosin overlap stops improving and force "
-                            f"falls away with further stretch. Your fitted "
-                            f"range reaches ε = {free['epsilon_max']:.2f}, "
-                            f"which is {free['at_epsilon_max_nm']:.0f} nm. "
-                            f"Over that stretch the interior modulus "
-                            f"measures passive structure pulled beyond its "
-                            f"working length, not contractile machinery at a "
-                            f"length it ever works at. That may be exactly "
-                            f"what you mean to measure; it is worth saying "
-                            f"which."
-                        )
-
-            # How much each number depends on where the boundaries landed.
-            # A standard error is computed with the boundaries held fixed, so
-            # on a curve where the boundaries are not well determined it can
-            # be small next to a modulus that is not determined at all. This
-            # is the part that catches that.
-            spread = fit.get("breakpoint_spread")
-            fitted_terms = set(fit.get("terms") or active)
-            if spread and spread.get("success") and spread["n_accepted"] > 1:
-                loose_rows, spread_rows = [], []
-                for key, unit, term in (
-                    ("T0_mN_m", "mN/m", "tension"),
-                    ("Em_MPa", "MPa", "membrane"),
-                    ("Ei_kPa", "kPa", "interior"),
-                    ("En_kPa", "kPa", "nucleus"),
-                ):
-                    if term not in fitted_terms:
-                        continue
-                    band = spread["ranges"].get(key)
-                    if not band or not np.isfinite(band["relative"]):
-                        continue
-                    spread_rows.append(
-                        {
-                            "modulus": components_for(
-                                st.session_state["cell_type"]
-                            )[term][0],
-                            "best fit": f"{band['value']:.4g} {unit}",
-                            "but anywhere in": (
-                                f"{band['low']:.4g} to {band['high']:.4g} {unit}"
-                            ),
-                            "how loose": f"{100 * band['relative']:.0f} % of itself",
-                        }
-                    )
-                    if band["relative"] > 0.5:
-                        loose_rows.append(term)
-                if spread_rows:
-                    with diagnostics_box:
-                        st.markdown(
-                            "**📏 How much do these numbers depend on where "
-                            "the boundaries were put?**"
-                        )
-                        st.caption(
-                            f"ε₁ and ε₂ are fitted too, and "
-                            f"{spread['n_accepted']} placements of them fit "
-                            f"this curve within its own noise "
-                            f"(ε₁ from {spread['break_1_range'][0]:.3f} to "
-                            f"{spread['break_1_range'][1]:.3f}, ε₂ from "
-                            f"{spread['break_2_range'][0]:.3f} to "
-                            f"{spread['break_2_range'][1]:.3f}). This is the "
-                            f"range each modulus takes across all of them, "
-                            f"which is a truer error bar than the ± beside "
-                            f"each number: that one is worked out with the "
-                            f"boundaries held fixed, as though they were known."
-                        )
-                        flat_table(
-                            pd.DataFrame(spread_rows),
-                            align_right=["best fit", "but anywhere in",
-                                         "how loose"],
-                        )
-                        if loose_rows:
-                            st.warning(
-                                "**"
-                                + " and ".join(
-                                    components_for(
-                                        st.session_state["cell_type"]
-                                    )[t][0] for t in loose_rows
-                                )
-                                + "** moves by more than half its own value "
-                                "across boundaries this curve cannot tell "
-                                "apart. Quote it with that range, not with "
-                                "the ± above. A wider fitted range, or more "
-                                "points near ε = 0, is what narrows it."
-                            )
-
-            st.caption(
-                f"Membrane areal modulus Eₘ·h = "
-                f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.4g} mN/m, which is what "
-                f"the ε³ term actually determines. Eₘ itself is that divided by the "
-                f"assumed bilayer thickness of "
-                f"{st.session_state['membrane_thickness_nm']:.1f} nm, so halving the "
-                f"thickness doubles Eₘ while the measurement is unchanged."
-            )
-
-            # No table of which material carried what in each stretch. The
-            # component ranges say where each one acts, the equation says
-            # what each contributes, and the moduli are printed twice
-            # already; a third table of percentages per stretch was reading
-            # the same fit for a third time.
-
-            if fitted_coupling != "parallel" and st.session_state["show_components"]:
                 st.caption(
-                    "Element curves are not drawn for series or hybrid coupling: "
-                    "every element carries the same force there, so they would be "
-                    "three copies of the total. The deformation share each one "
-                    "takes is in the diagram beside the plot."
+                    f"→ {composition_label(membrane_mode, cyto_mode)}."
+                    + (f" The {term_name('nucleus').lower()} always joins at ε₂."
+                       if has_deep_term() else
+                       " There is no deep element in this model, so ε₂ is not "
+                       "used.")
                 )
-
-            # A modulus of exactly zero is the solver saying it did not want
-            # that term. Usually that is informative; in one case it is two
-            # settings cancelling each other, and saying which is the whole
-            # difference between a useful message and a confusing one.
-            zeroed = [
-                label for label, key, term in (
-                    ("Eₘ", "Em_MPa", "membrane"),
-                    ("E_c", "Ei_kPa", "interior"),
-                    ("Eₙ", "En_kPa", "nucleus"),
-                )
-                if term in fitted_terms and float(fit.get(key, 0.0)) <= 0
-            ]
-            if zeroed:
-                message = (
-                    f"{' and '.join(zeroed)} came back at exactly zero, which "
-                    f"means the fit found no work for that term to do."
-                )
-                if (
-                    "Eₘ" in zeroed
-                    and fit.get("membrane") == "freeze"
-                    and fit.get("cyto_start") == "zero"
-                ):
-                    message += (
-                        "  **Here the two choices above are cancelling each "
-                        "other.** If the cytoskeleton is loaded from the very "
-                        "start, freezing the membrane at ε₁ leaves its term a "
-                        "flat constant for the rest of the curve, and a "
-                        "constant cannot describe anything the cytoskeleton "
-                        "is not already describing, so the solver sets it to "
-                        "zero. For a cell whose membrane and cytoskeleton are "
-                        "coupled from first contact, set the membrane to "
-                        "**keeps stiffening**: both then act everywhere, which "
-                        "is what coupled means."
-                    )
-                st.warning(message)
-
-            # The dropped-spring sentence is already on the page, next to
-            # the model selector that caused it, with a button that fixes it.
-            # Repeating it here reads as a second, different problem.
-            said_already = set()
-            if fit.get("dropped_terms"):
-                said_already = set(dropped_term_warning(fit["dropped_terms"]))
-            for message in fit["warnings"]:
-                if message in said_already:
-                    continue
-                st.warning(message)
-
-            # ------------------------------------------------ plot + panel
-            video_ready = (
-                not VIDEO_IMPORT_ERROR
-                and st.session_state.get("video_path")
-                and st.session_state.get("video_info")
-                and os.path.exists(st.session_state["video_path"])
-                and st.session_state["video_show_panel"]
-            )
-            show_schematic = st.session_state["show_schematic"]
-
-            selected_eps = float(np.clip(fit_hi, eps_lo_data, eps_hi_data))
-            if video_ready or show_schematic:
-                selected_eps = st.slider(
-                    "Show the cell at ε =",
-                    min_value=eps_lo_data,
-                    max_value=eps_hi_data,
-                    step=step,
-                    key="sync_eps",
-                )
-            nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
-            highlight = (float(epsilon[nearest]), float(force_N[nearest]))
-
-            # The curve goes into the slot staked out at the top of the
-            # page. The cell diagram no longer sits beside it: it belongs
-            # with the question it answers, which is how the elements share
-            # the load, and squeezing both into a side column is what made
-            # them illegible.
-            plot_weight = float(st.session_state["plot_width"])
-            if guided:
-                plot_col = curve_slot
-                # The equation and the working go at the foot of the page
-                # now, after the numbers, rather than in a panel above the
-                # curve: the page reads choose, fit, look, then what the
-                # cell did, then the maths.
-                # The diagram is already drawn live in Step 2, from the same
-                # settings. Drawing it again here would be the same picture
-                # twice on one page.
-                panel_cols = []
             else:
-                side_panels = int(bool(video_ready)) + int(bool(show_schematic))
-                if side_panels:
-                    widths = [plot_weight] + [1.0] * side_panels
-                    columns = st.columns(widths)
-                    plot_col = columns[0]
-                    panel_cols = columns[1:]
-                else:
-                    # Even with no side panel, keep the chart from spanning
-                    # the whole page; the spare column is left empty.
-                    plot_col, spare = st.columns(
-                        [plot_weight, max(0.01, 4.0 - plot_weight)]
-                    )
-                    panel_cols = []
+                membrane_mode, cyto_mode = "freeze", "break"
 
-            with plot_col:
-                # Built once and reused for the save button. Building it twice
-                # doubled the work on every rerun for two identical figures.
-                figure = force_curve_figure(
-                    epsilon,
-                    force_N,
-                    style,
-                    **figure_kwargs(
-                        force_curve_figure,
-                        title=st.session_state["cell_name"]
-                        or "Force vs relative deformation",
-                        fit_force_N=fitted,
-                        membrane_N=membrane,
-                        interior_N=interior,
-                        nucleus_N=nucleus,
-                        nucleus_shell_N=envelope,
-                        cortex_N=cortex,
-                        deep_label=plain_name("nucleus").lower(),
-                        cortex_label=plain_name("cortex").lower(),
-                        interior_label=plain_name("interior").lower(),
-                        fit_window=windows_for_plot,
-                        rupture_epsilon=rupture.get("epsilon")
-                        if rupture.get("method") == "force-drop"
-                        else None,
-                        highlight=highlight
-                        if (video_ready or show_schematic) else None,
-                        highlight_window=highlight_window,
-                    ),
-                )
-                figure = apply_plot_layers(figure, style)
+            # The picture, drawn from the choices immediately above it and
+            # redrawn the moment one of them changes. It is the point of putting
+            # the controls and the diagram together: a radio labelled "the
+            # cytoskeleton starts at ε₁" means very little until you watch the
+            # gap appear under its spring.
+            if guided:
+                live = current_style(force_N)
+                # Drawn just past the first boundary, where every choice above is
+                # visible at once: which springs are loading, which is locked and
+                # which has not been reached. A slider for this was one more
+                # widget on a page that has too many.
+                preview_at = float(np.clip(
+                    float(st.session_state["segment_break_1"]) * 1.35,
+                    0.05, max(0.06, float(st.session_state["window_end"])),
+                ))
                 st.plotly_chart(
-                    figure,
-                    key="main_fit_plot",
-                    **plot_selection_kwargs(),
+                    cell_schematic(
+                        live,
+                        **figure_kwargs(
+                            cell_schematic,
+                            coupling=("series" if coupling == "series"
+                                      else "hybrid" if coupling.startswith("hybrid")
+                                      else "parallel"),
+                            epsilon=float(preview_at),
+                            cell_height_um=st.session_state["cell_height_um"],
+                            break_1=float(st.session_state["segment_break_1"]),
+                            break_2=float(st.session_state["segment_break_2"]),
+                            membrane_mode=membrane_mode,
+                            cyto_start=cyto_mode,
+                            labels=components_for(st.session_state["cell_type"]),
+                            show_nucleus="nucleus" in active,
+                            show_nucleus_shell="nucleus_shell" in active,
+                            show_tension="tension" in active,
+                            height=330,
+                        ),
+                    ),
+                    key="sharing_preview",
                     **STRETCH,
                 )
-                apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
+                st.caption(
+                    "Drawn from the choices above, and redrawn as you change "
+                    "them. A gap over a spring means that element is not "
+                    "carrying load yet; a locked block means it has stopped "
+                    "taking more. Nothing here is fitted — it is what you are "
+                    "about to ask the fit to assume."
+                )
 
-                o1, o2 = st.columns([2, 1])
-                with o1:
-                    plot_layer_table()
-                    with st.expander("🎛️ Plot options", expanded=False):
-                        plot_option_controls()
-                with o2:
-                    save_plot_controls(figure, fit, date_acquired)
+            close_panel(model_panel)
 
-            panel_index = 0
-            if show_schematic and panel_index < len(panel_cols):
-                with panel_cols[panel_index]:
-                    if st.session_state["schematic_style"].startswith("Balloon"):
-                        st.plotly_chart(
-                            balloon_figure(
-                                style,
-                                **figure_kwargs(
-                                    balloon_figure,
-                                    epsilon=selected_eps,
-                                    cell_height_um=st.session_state["cell_height_um"],
-                                    labels=components_for(
-                                        st.session_state["cell_type"]
-                                    ),
-                                    show_nucleus="nucleus" in active,
-                                    show_nucleus_shell="nucleus_shell" in active,
-                                    show_tension="tension" in active,
-                                    deep_onset=(
-                                        fit.get("break_2")
-                                        if "nucleus" in (fit.get("terms") or ())
+            # Kept so the plot code below has something to write the diagram
+            # into when it is not drawn here.
+            sharing_slot = st.container()
+
+            # No second opinion on which materials to use down here. The mixture
+            # is decided in one place now, by the search button in step 1, which
+            # applies what it finds and shows the combinations it compared. Two
+            # places offering different answers to the same question is how the
+            # ticks and the fit came apart in the first place.
+
+            # ---------------------------------------------------- exploration ---
+            # Only in full control. In guided mode the boundaries are found and
+            # applied automatically, so a second, manual way of finding them was
+            # a section to scroll past rather than a step to take.
+            if segmented and not guided:
+                explore_panel = open_panel("🔬 Explore the curve", guided)
+                if not guided:
+                    section("4 · Explore the curve")
+                e1_col, e2_col = st.columns([1, 2])
+                with e1_col:
+                    if st.button("🔬 Find the segments", type="secondary", **STRETCH):
+                        with st.spinner("Measuring the exponent along the curve…"):
+                            st.session_state["exploration"] = model.explore_segments(
+                                terms=active or ("membrane", "interior", "nucleus")
+                            )
+                    st.caption(
+                        "Scans for the two boundaries, then measures the power law each "
+                        "stage actually follows: 3 for the membrane, 3/2 for a Hertzian "
+                        "contact."
+                    )
+                exploration = st.session_state.get("exploration")
+                with e2_col:
+                    if exploration and exploration.get("success"):
+                        if exploration["confident"]:
+                            st.success(
+                                f"ε₁ = {exploration['break_1']:.3f}, "
+                                f"ε₂ = {exploration['break_2']:.3f}. Each stage follows "
+                                f"the law the model assigns it."
+                            )
+                        else:
+                            st.warning(
+                                f"ε₁ = {exploration['break_1']:.3f}, "
+                                f"ε₂ = {exploration['break_2']:.3f}, but the evidence is "
+                                f"weak. See the notes below."
+                            )
+                        if st.button("✓ Use these breakpoints", type="primary", **STRETCH):
+                            st.session_state["_pending_settings"] = {
+                                "segment_break_1": round(float(exploration["break_1"]), 3),
+                                "segment_break_2": round(float(exploration["break_2"]), 3),
+                            }
+                            st.rerun()
+                    elif exploration:
+                        st.error(exploration.get("error", "Exploration failed."))
+
+                if exploration and exploration.get("success"):
+                    flat_table(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "stage": row["stage"],
+                                    "ε from": round(row["range"][0], 3),
+                                    "ε to": round(row["range"][1], 3),
+                                    "points": row["n_points"],
+                                    "exponent measured": (
+                                        round(row["measured_exponent"], 2)
+                                        if np.isfinite(row["measured_exponent"])
                                         else None
                                     ),
-                                    # A cardiomyocyte is a shell holding
-                                    # fluid, and the model does not
-                                    # discriminate a nucleus from the rest
-                                    # of the interior, so nothing in the
-                                    # picture should look like one.
-                                    interior=(
-                                        "fluid"
-                                        if st.session_state["cell_type"]
-                                        in INCOMPRESSIBLE_INTERIOR else "spring"
+                                    "expected": row["expected_exponent"],
+                                    "power-law R²": (
+                                        round(row["power_law_r2"], 3)
+                                        if np.isfinite(row["power_law_r2"]) else None
                                     ),
-                                ),
-                            ),
-                            key="balloon_plot",
-                            **STRETCH,
-                        )
-                    else:
-                        st.plotly_chart(
-                            cell_schematic(
-                                style,
-                                **figure_kwargs(
-                                    cell_schematic,
-                                    coupling=(
-                                        "series" if fitted_coupling == "series"
-                                        else "hybrid" if fitted_coupling == "hybrid"
-                                        else "parallel"
-                                    ),
-                                    shares=deformation_shares,
-                                    epsilon=selected_eps,
-                                    cell_height_um=st.session_state["cell_height_um"],
-                                    cell_radius_um=fit["R0"] * 1e6,
-                                    nucleus_radius_um=fit.get(
-                                        "R_nucleus", fit["R0"] * 0.35
-                                    ) * 1e6,
-                                    membrane_thickness_nm=st.session_state[
-                                        "membrane_thickness_nm"
-                                    ],
-                                    nucleus_onset=model.nucleus_onset
-                                    if "nucleus" in active else None,
-                                    break_1=fit.get("break_1"),
-                                    break_2=fit.get("break_2"),
-                                    membrane_mode=fit.get("membrane", "freeze"),
-                                    cyto_start=fit.get("cyto_start", "break"),
-                                    labels=components_for(st.session_state["cell_type"]),
-                                    Em_MPa=fit["Em_MPa"],
-                                    Ei_kPa=fit["Ei_kPa"],
-                                    En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
-                                    Ene_MPa=(
-                                        fit.get("Ene_MPa")
-                                        if "nucleus_shell" in active else None
-                                    ),
-                                    T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
-                                    show_nucleus="nucleus" in active,
-                                    show_nucleus_shell="nucleus_shell" in active,
-                                    show_tension="tension" in active,
-                                ),
-                            ),
-                            key="schematic_plot",
-                            **STRETCH,
-                        )
-                panel_index += 1
-
-            # In guided mode the video frame goes under the curve rather
-            # than beside it, for the same reason as the diagram.
-            video_target = None
-            if video_ready:
-                if guided:
-                    video_target = video_slot
-                elif panel_index < len(panel_cols):
-                    video_target = panel_cols[panel_index]
-            if video_target is not None:
-                with video_target:
-                    vinfo = st.session_state["video_info"]
-                    frame_index = va.frame_for_epsilon(
-                        selected_eps,
-                        st.session_state["video_contact_frame"],
-                        st.session_state["video_end_frame"] or (vinfo["n_frames"] - 1),
-                        float(epsilon.max()),
+                                    "modulus": row["modulus_label"],
+                                }
+                                for row in exploration["stages"]
+                            ]
+                        ),
+                        align_right=[
+                            "ε from", "ε to", "points", "exponent measured",
+                            "expected", "power-law R²",
+                        ],
                     )
-                    # Through the shared reader, so a box drawn by hand and a
-                    # scale taken from the probe on the video tab apply here
-                    # too. This panel used to call the detector directly and
-                    # ignore both.
-                    vframe, vdet, vnuc, vprobe, vscale = detection_at(frame_index)
-                    if vframe is None:
-                        st.info("Frame unavailable.")
-                    else:
-                        force_here, unit_here = from_newtons(highlight[1], style.force_unit)
-                        snap = va.annotate(
-                            vframe, vdet, label=f"ε = {highlight[0]:.3f}",
-                            nucleus=vnuc, probe=vprobe,
-                        )
-                        st.image(
-                            va.crop(snap, vdet) if vdet and vdet.get("found") else snap,
-                            caption=f"Frame {frame_index} · ε = {highlight[0]:.3f} · "
-                            f"F = {float(force_here):.3g} {unit_here}",
-                            **STRETCH,
-                        )
-                        if vdet and vdet.get("found"):
-                            height_note = f"Cell height {vdet['height_px']:.0f} px"
-                            if vscale:
-                                height_note += (
-                                    f" · {vdet['height_px'] * vscale:.2f} µm"
-                                )
-                            if vdet.get("manual"):
-                                height_note += " · outlined by hand"
-                            st.caption(height_note)
-                        st.download_button(
-                            "📷 Save screenshot",
-                            data=png_bytes(snap),
-                            file_name=(
-                                f"{st.session_state['cell_name'] or 'cell'}"
-                                f"_eps{highlight[0]:.3f}.png"
-                            ),
-                            mime="image/png",
-                            **STRETCH,
-                        )
-
-            # ------------------------------------------------- diagnostics
-            with diagnostics_box:
-                st.markdown("**🔍 Fit diagnostics**")
-                # One column per material actually in the fit, and never a
-                # column for one that is not: a share of the load reported
-                # for a material the model does not have reads as a
-                # measurement of it.
-                shares = [
-                    (f"{plain_name('membrane')} share at ε_max",
-                     fit.get("membrane_fraction_at_max", np.nan)),
-                    (f"{plain_name('interior')} share",
-                     fit.get("interior_fraction_at_max", np.nan)),
-                ]
-                if "nucleus" in (fit.get("terms") or ()):
-                    shares.append((f"{plain_name('nucleus')} share",
-                                   fit.get("nucleus_fraction_at_max", np.nan)))
-                share_cols = st.columns(len(shares) + 1)
-                for column, (label, value) in zip(share_cols, shares):
-                    column.metric(
-                        label,
-                        f"{100 * value:.1f} %" if np.isfinite(value) else "n/a",
+                    st.caption(
+                        "A blank exponent means that stage does not rise far enough above "
+                        "the noise for its power law to be measured. The breakpoint still "
+                        "comes from the fit, but nothing independently confirms the shape."
                     )
-                if fit.get("mode") == "staged":
-                    share_cols[-1].metric("Refinement passes", fit["n_iterations"])
+                    for note in exploration["notes"]:
+                        st.warning(note)
+                    st.plotly_chart(
+                        exponent_profile_figure(
+                            exploration["profile"], current_style(force_N),
+                            exploration["break_1"], exploration["break_2"],
+                        ),
+                        key="exponent_profile",
+                        **STRETCH,
+                    )
+
+            if segmented and not guided:
+                close_panel(explore_panel)
+
+            # --------------------------------------------------------- ranges ---
+            range_panel = open_panel(
+                "📏 Where each material takes over", guided, flat=guided,
+            )
+            if not guided:
+                section("5 · Deformation ranges" if segmented else "4 · Deformation ranges")
+            st.caption(
+                f"Data spans ε = {eps_lo_data:.3f} to {eps_hi_data:.3f}. "
+                f"Auto-detected usable region: {auto_window[0]:.3f} to "
+                f"{auto_window[1]:.3f} ({auto_range['n_points']} points) · "
+                f"rupture: {auto_range['rupture_method']}"
+            )
+
+            # One range, one pair of numbers, wherever it is set from. In guided
+            # mode it was set at the top of the page and repeating the control
+            # here would give the page two of them, so this only reports it.
+            #
+            # The near end is normally zero: the membrane term is ε³ measured
+            # from first contact, so a range starting anywhere else is fitting a
+            # curve the model does not describe. It moves when the approach
+            # itself misbehaved, which is a probe catching and slipping rather
+            # than a soft cell, and those points drive the membrane modulus to
+            # zero if they are kept.
+            if guided:
+                fit_lo, fit_hi = range_bounds(
+                    "window_start", "window_end", 0.0, eps_hi_data, step,
+                )
+                st.caption(
+                    f"Fitting ε = {fit_lo:.3f} to {fit_hi:.3f}, set at the top of "
+                    "the page under **What to fit**."
+                )
+            else:
+                fit_lo, fit_hi = epsilon_range_control(
+                    "window_start", "window_end",
+                    0.0 if segmented else eps_lo_data, eps_hi_data, step,
+                    label="Fitted range, ε",
+                    help_text="The stretch of the curve the fit is measured on. "
+                              "Drag either end, or type it in the boxes.",
+                )
+            st.session_state["window_combined"] = (fit_lo, fit_hi)
+            st.caption(f"{int(((epsilon >= fit_lo) & (epsilon <= fit_hi)).sum())} points")
+
+            # The sidebar button only asks for the scan; it runs here, where the
+            # model, the chosen range and the composition all exist. A sidebar
+            # widget is built before any of them.
+            if st.session_state.pop("_want_confinement_scan", False):
+                if hasattr(model, "scan_confinement"):
+                    with st.spinner("Refitting across a range of q…"):
+                        st.session_state["confinement_scan"] = model.scan_confinement(
+                            fit_lo, fit_hi,
+                            e1=float(st.session_state["segment_break_1"]),
+                            e2=float(st.session_state["segment_break_2"]),
+                            membrane=MEMBRANE_CHOICES.get(
+                                st.session_state["membrane_after_break"], "freeze"
+                            ),
+                            cyto_start=CYTO_CHOICES.get(
+                                st.session_state["cyto_starts_at"], "break"
+                            ),
+                            use_nucleus="nucleus" in active,
+                            use_tension="tension" in active,
+                            weighting=st.session_state["weighting"],
+                        )
                 else:
-                    share_cols[-1].metric(
-                        "Condition number",
-                        f"{fit['condition_number']:.1f}"
-                        if np.isfinite(fit.get("condition_number", np.nan))
-                        else "n/a",
-                        help="How separable the terms are over this window. Above ~30 "
-                        "the split between them is unreliable even though their sum "
-                        "is well determined.",
+                    st.session_state["confinement_scan"] = {
+                        "success": False,
+                        "error": "This needs an up to date lulevich_model.py.",
+                    }
+
+            term_windows = {}
+            stage_plan = [{"terms": active, "range": (fit_lo, fit_hi)}]
+            staged = False
+            break_1 = float(st.session_state["segment_break_1"])
+            break_2 = float(st.session_state["segment_break_2"])
+
+            highlight_window = None
+
+            if segmented:
+                st.markdown("**Segment table**")
+                st.caption(
+                    "Type the boundaries directly. The segments are contiguous, so the "
+                    "end of one is the start of the next: editing a row's ε end moves "
+                    "that boundary."
+                )
+                # The row names follow the composition chosen above, so the table
+                # always says what is actually carrying load in each stretch.
+                seg_1_name = (
+                    "1 · membrane + cytoskeleton" if cyto_mode == "zero"
+                    else "1 · membrane, ε³"
+                )
+                seg_2_name = (
+                    "2 · membrane + cytoskeleton" if membrane_mode == "continue"
+                    else "2 · cytoskeleton, membrane holding"
+                )
+                seg_3_name = (
+                    "3 · " + ("membrane + " if membrane_mode == "continue" else "")
+                    + "cytoskeleton + nucleus"
+                )
+                # No table of segments. It said what each component does either
+                # side of each boundary, which is what the component ranges up
+                # in "3 · Nonlinear fitting" now show directly, and it was a
+                # second, editable copy of two numbers that already have their
+                # own sliders below.
+
+                # Each boundary on its own, because most of the time only one
+                # of them is wrong. The table above moves them together and is
+                # the wrong tool for nudging ε₂ while ε₁ stays put.
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    boundary_control(
+                        "segment_break_1", "ε₁ · where the first hand-over is",
+                        lower=float(fit_lo), upper=float(break_2) - 0.005,
+                        step=float(step),
+                        help_text="Where the first material hands over. Nothing "
+                                  "else moves with it.",
+                    )
+                with bc2:
+                    boundary_control(
+                        "segment_break_2", "ε₂ · where the deeper one is met",
+                        lower=float(break_1) + 0.005, upper=float(fit_hi),
+                        step=float(step),
+                        help_text="Where the deeper material is met. Nothing "
+                                  "else moves with it.",
+                        disabled=not has_deep_term(),
                     )
 
-                mask = fit["mask"]
-                st.plotly_chart(
-                    residual_figure(epsilon[mask], (force_N - fitted)[mask], style),
-                    key="residual_plot",
-                    **STRETCH,
+                # Which segment to shade on the curve. Editing a boundary is much
+                # easier when you can see the stretch of data it moves.
+                st.radio(
+                    "Highlight on the plot",
+                    ["(none)", "Segment 1", "Segment 2", "Segment 3", "Whole fitted range"],
+                    key="highlight_segment",
+                    horizontal=True,
+                )
+                highlight_bounds = {
+                    "Segment 1": (fit_lo, break_1, seg_1_name),
+                    "Segment 2": (break_1, break_2, seg_2_name),
+                    "Segment 3": (break_2, fit_hi, seg_3_name),
+                    "Whole fitted range": (fit_lo, fit_hi, "fitted range"),
+                }
+                highlight_window = highlight_bounds.get(
+                    st.session_state["highlight_segment"]
                 )
 
-                if fit.get("mode") == "staged":
-                    st.markdown("**Convergence across passes**")
+                b1, b2 = st.columns([1, 1])
+                with b1:
+                    if st.button("🔎 Find the boundaries from the data", **STRETCH):
+                        with st.spinner("Scanning boundaries…"):
+                            scan_breaks = model.scan_segment_breaks(
+                                fit_lo, fit_hi, terms=active or ("membrane", "interior"),
+                                weighting=st.session_state["weighting"],
+                            )
+                            # And where the curve's own power law changes, which
+                            # is a second opinion arrived at a different way:
+                            # the scan above asks which boundaries fit best, this
+                            # asks where the log-log slope stops being one thing
+                            # and starts being another. When they agree the
+                            # boundary is real; when they do not, that is worth
+                            # knowing before quoting a modulus either side of it.
+                            try:
+                                grid_e, grid_slope = model.local_exponent(
+                                    window_frac=0.18
+                                )
+                                st.session_state["_power_law_check"] = {
+                                    "epsilon": list(map(float, grid_e)),
+                                    "exponent": list(map(float, grid_slope)),
+                                }
+                            except Exception:
+                                st.session_state["_power_law_check"] = None
+                        if scan_breaks.get("success"):
+                            st.session_state["_pending_settings"] = {
+                                "segment_break_1": round(float(scan_breaks["best_break_1"]), 3),
+                                "segment_break_2": round(float(scan_breaks["best_break_2"]), 3),
+                            }
+                            st.rerun()
+                        else:
+                            st.error(scan_breaks.get("error", "Boundary scan failed."))
                     st.caption(
-                        "Each pass refits every stage with the other terms held at "
-                        "their current values. "
-                        + (
-                            "The sequence started from a parallel fit over the whole "
-                            "region, which stops the first stage from absorbing the "
-                            "force that belongs to the later ones."
-                            if fit.get("seeded")
-                            else "Seeding is off, so pass 1 is the plain unseeded "
-                            "staged result."
-                        )
+                        "Moves the two boundaries only, keeping the combination you "
+                        "picked above, and checks them against the curve's own "
+                        "power law."
                     )
-                    flat_table(
-                        pd.DataFrame(fit["iterations"]).round(
-                            {"Em_MPa": 4, "Ei_kPa": 4, "En_kPa": 4}
-                        ).astype(str),
+                    profile = st.session_state.get("_power_law_check")
+                    if profile and len(profile.get("epsilon", [])) > 4:
+                        grid = np.asarray(profile["epsilon"], dtype=float)
+                        slope = np.asarray(profile["exponent"], dtype=float)
+                        good = np.isfinite(slope)
+                        if good.sum() > 4:
+                            def slope_at(where):
+                                index = int(np.argmin(np.abs(grid[good] - where)))
+                                return float(slope[good][index])
+                            e1_now = float(st.session_state["segment_break_1"])
+                            e2_now = float(st.session_state["segment_break_2"])
+                            st.caption(
+                                f"Measured log-log slope: "
+                                f"{slope_at(grid[good][0]):.2f} near contact, "
+                                f"{slope_at(e1_now):.2f} at ε₁ = {e1_now:.3f}, "
+                                f"{slope_at(e2_now):.2f} at ε₂ = {e2_now:.3f}, "
+                                f"{slope_at(grid[good][-1]):.2f} at the far end. "
+                                "3 is a membrane on its own, 3/2 a Hertzian "
+                                "network on its own, and anything above 3 is the "
+                                "cell running out of room. A boundary should sit "
+                                "where that number is changing, not where it is "
+                                "flat."
+                            )
+                # Applying a winning combination means writing four widget keys,
+                # which Streamlit only allows before those widgets exist. So both
+                # the search button and the table's apply button stage the values
+                # and rerun; the fit then happens with them already in place.
+                apply_labels = {
+                    (MEMBRANE_CHOICES[m], CYTO_CHOICES[c]): (m, c)
+                    for m in MEMBRANE_CHOICES for c in CYTO_CHOICES
+                }
+
+                def stage_combination(row):
+                    m_label, c_label = apply_labels[(row["membrane"], row["cyto_start"])]
+                    return {
+                        "segment_break_1": round(float(row["break_1"]), 3),
+                        "segment_break_2": round(float(row["break_2"]), 3),
+                        "membrane_after_break": m_label,
+                        "cyto_starts_at": c_label,
+                        "use_nucleus": bool(row["use_nucleus"]) and has_deep_term(),
+                    }
+
+                with b2:
+                    can_search = hasattr(model, "search_compositions")
+                    if st.button(
+                        "🧩 Find the best combination and fit it", type="primary",
+                        disabled=not can_search, **STRETCH,
+                    ) and can_search:
+                        with st.spinner(
+                            "Fitting all four combinations at their own best "
+                            "boundaries and cross-validating each…"
+                        ):
+                            found = model.search_compositions(
+                                fit_lo, fit_hi,
+                                weighting=st.session_state["weighting"],
+                                # A cell type with no deep element must not be
+                                # offered one here either. Two searches on one
+                                # page that disagree about what the cell is made
+                                # of is worse than having only one of them.
+                                nucleus_mode=(
+                                    "search" if has_deep_term() else "off"
+                                ),
+                            )
+                        st.session_state["composition_search"] = found
+                        if found.get("success"):
+                            # Go straight to the answer: apply the winner and let
+                            # the fit below run with it, so one press gives one
+                            # fitted line rather than a table to act on.
+                            st.session_state["_pending_settings"] = stage_combination(
+                                found["best"]
+                            )
+                            st.rerun()
+                    st.caption(
+                        "Searches all four ways the membrane and cytoskeleton can share "
+                        "the first boundary, each with its own best ε₁ and ε₂, ranks "
+                        "them on data they were not fitted to, and applies the winner."
+                        if can_search else
+                        "Needs an up to date `lulevich_model.py`."
+                    )
+
+                search = st.session_state.get("composition_search")
+                if search and search.get("success"):
+                    st.info(retell(search["verdict"]))
+                    shows_tension = any(
+                        row.get("use_tension") for row in search["candidates"]
                     )
                     flat_table(
                         pd.DataFrame(
                             [
                                 {
-                                    "stage": i + 1,
-                                    "terms": ", ".join(
-                                        term_label(t) for t in plan["terms"]
+                                    "combination": retell(row["label"]),
+                                    "ε₁": f"{row['break_1']:.3f}",
+                                    "ε₂": f"{row['break_2']:.3f}",
+                                    **(
+                                        {"T₀ (mN/m)": f"{row.get('T0_mN_m', 0.0):.4g}"}
+                                        if shows_tension else {}
                                     ),
-                                    "ε window": f"{plan['range'][0]:.3f} to {plan['range'][1]:.3f}",
-                                    "points": res["n_points"],
-                                    "R² in window": f"{float(res['r_squared']):.4f}",
+                                    "Eₘ (MPa)": f"{row['Em_MPa']:.4g}",
+                                    "E_c (kPa)": f"{row['Ec_kPa']:.4g}",
+                                    "Eₙ (kPa)": f"{row['En_kPa']:.4g}",
+                                    "R²": f"{row['r_squared']:.5f}",
+                                    "CV RMSE": f"{row['cv_rmse']:.4g}",
+                                    "ΔAICc": f"{row['delta_aicc']:.1f}",
+                                    "note": " · ".join(
+                                        part for part in (
+                                            "picked" if row is search["best"] else "",
+                                            "ties with the pick"
+                                            if row.get("tied_with_best") else "",
+                                            ", ".join(row["empty_terms"]) + " came out zero"
+                                            if row.get("empty_terms") else "",
+                                            ", ".join(row.get("idle_breaks", []))
+                                            + " unused here"
+                                            if row.get("idle_breaks") else "",
+                                        ) if part
+                                    ),
                                 }
-                                for i, (plan, res) in enumerate(
-                                    zip(fit["stage_plan"], fit["stages"])
-                                )
+                                for row in search["candidates"]
                             ]
                         ),
-                        align_right=["points", "R² in window"],
+                        align_right=[
+                            "ε₁", "ε₂", "T₀ (mN/m)", "Eₘ (MPa)", "E_c (kPa)",
+                            "Eₙ (kPa)", "R²", "CV RMSE", "ΔAICc",
+                        ],
+                    )
+                    st.caption(
+                        "Ranked by cross-validated error, which asks how well each "
+                        "combination predicts points it was not fitted on, averaged "
+                        "over several different fold splits. Candidates closer than "
+                        "the amount that number moves between splits are called tied, "
+                        "and the pick among tied candidates is the one with the fewest "
+                        "free moduli. ΔAICc is shown but does not decide the order: on "
+                        "these curves it is confident about differences the held-out "
+                        "error says are not there."
+                    )
+                    best = search["best"]
+                    # Shown with this cell type's names; matched back on the
+                    # model's own label, which is what the candidates carry.
+                    shown_to_row = {
+                        retell(row["label"]): row for row in search["candidates"]
+                    }
+                    choice_names = list(shown_to_row)
+                    best_shown = retell(best["label"])
+                    a1, a2 = st.columns([2, 1])
+                    with a1:
+                        picked = st.selectbox(
+                            "Override the pick", choice_names,
+                            index=choice_names.index(best_shown)
+                            if best_shown in choice_names else 0,
+                            key="composition_pick",
+                            help="The winner is already applied. Use this only to try "
+                            "one of the others.",
+                        )
+                    with a2:
+                        st.markdown("<div style='height:1.7rem'></div>",
+                                    unsafe_allow_html=True)
+                        if st.button("✓ Use this one instead", **STRETCH):
+                            row = shown_to_row[picked]
+                            st.session_state["_pending_settings"] = stage_combination(row)
+                            st.rerun()
+                    st.caption(
+                        f"Applied: ε₁ = {best['break_1']:.3f}, ε₂ = "
+                        f"{best['break_2']:.3f}, "
+                        f"{'with' if best['use_nucleus'] else 'without'} the "
+                        f"{term_name('nucleus').lower()}."
+                    )
+                elif search:
+                    st.error(search.get("error", "The combination search failed."))
+
+                if break_2 <= break_1:
+                    st.error("Segment 2 must end after segment 1.")
+                else:
+                    st.caption(
+                        "The force is continuous across both boundaries by "
+                        "construction, so moving one never puts a step in the curve."
+                    )
+
+            elif coupling in ("hybrid_ps", "hybrid_sp"):
+                h1, h2 = st.columns([1, 2])
+                with h1:
+                    st.radio("Crossover ε", ["Scan for best", "Set manually"],
+                             key="crossover_mode", horizontal=True)
+                with h2:
+                    st.slider("ε at which the load path changes", 0.0, 1.0, step=0.01,
+                              key="crossover",
+                              disabled=st.session_state["crossover_mode"] == "Scan for best")
+
+            elif coupling == "parallel":
+                st.radio(
+                    "Fitting procedure", ["All at once", "Stage by stage"],
+                    key="procedure", horizontal=True,
+                    help="Stage by stage measures each element on its own window, "
+                    "which helps when the moduli come out correlated.",
+                )
+                staged = st.session_state["procedure"] == "Stage by stage"
+                if staged:
+                    st.caption("A window per element; same stage number = fitted together.")
+                    window_cols = st.columns(max(1, len(active))) if active else [st]
+                    for i, term in enumerate(active):
+                        key = f"window_term_{term}"
+                        st.session_state[key] = clamp_range(
+                            st.session_state.get(key),
+                            default_window_for((term,), auto_window, eps_lo_data, eps_hi_data),
+                        )
+                        with window_cols[i % len(window_cols)]:
+                            lo, hi = st.slider(
+                                term_label(term), min_value=eps_lo_data,
+                                max_value=eps_hi_data, step=step, key=key,
+                            )
+                            term_windows[term] = (lo, hi)
+                            st.selectbox(f"Stage for {term_label(term)}", [1, 2, 3],
+                                         key=f"stage_of_{term}", label_visibility="collapsed")
+                    stage_plan = []
+                    for stage_no, terms in stage_groups(active):
+                        spans = [term_windows[t] for t in terms if t in term_windows]
+                        if spans:
+                            stage_plan.append(
+                                {"terms": terms,
+                                 "range": (min(s[0] for s in spans), max(s[1] for s in spans))}
+                            )
+                    if stage_plan:
+                        fit_lo = min(s["range"][0] for s in stage_plan)
+                        fit_hi = max(s["range"][1] for s in stage_plan)
+
+            r1, r2 = st.columns([1, 3])
+            with r1:
+                if st.button("↺ Reset ranges", **STRETCH):
+                    st.session_state["_pending_clear_windows"] = True
+                    st.rerun()
+            with r2:
+                range_label = "Fitted range"
+                targets = ["(off)", range_label] + [
+                    term_label(t) for t in (active if staged else [])
+                ]
+                st.session_state["_drag_keys"] = {
+                    range_label: "window_range"
+                }
+                st.session_state["_drag_keys"].update(
+                    {term_label(t): f"window_term_{t}" for t in (active if staged else [])}
+                )
+                st.selectbox("Drag on the plot to set", targets, key="drag_target")
+
+            # Flat when guided, because this already sits inside the settings
+            # box and Streamlit refuses an expander inside an expander.
+            with sub_panel("⚙️ Advanced fitting options", flat=guided):
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.selectbox(
+                        "Weighting", ["uniform", "relative", "noise"], key="weighting",
+                        help="How much each point counts. A whole-cell curve "
+                        "spans four decades of force, so **uniform** is decided "
+                        "almost entirely by its last tenth and can miss the "
+                        "first half by tens of per cent without the residual sum "
+                        "noticing. **relative** weights by 1/|F|, so every decade "
+                        "counts the same and the fit holds everywhere; it is the "
+                        "default for a cardiomyocyte. **noise** weights by 1/σ "
+                        "measured from the curve, the maximum-likelihood choice "
+                        "and the one χ²/dof assumes.",
+                    )
+                    st.checkbox("Fit a constant force offset", key="fit_offset")
+                with a2:
+                    st.slider("Refinement passes (staged fits)", 1, 8,
+                              key="refine_iterations")
+                    st.checkbox("Seed staged fits from all-at-once", key="seed_parallel")
+                st.checkbox("Refit live as settings change", key="live_fit")
+
+            # ------------------------------------------------- saved presets ---
+            with sub_panel("💾 Saved windows", flat=guided):
+                p1, p2 = st.columns([2, 1])
+                with p1:
+                    preset_name = st.text_input(
+                        "Preset name",
+                        placeholder="e.g. C2C12 standard",
+                        key="preset_name",
+                        label_visibility="collapsed",
+                    )
+                with p2:
+                    if st.button("Save current", **STRETCH):
+                        name = (preset_name or "").strip()
+                        if not name:
+                            st.warning("Give the preset a name first.")
+                        else:
+                            st.session_state["range_presets"][name] = {
+                                # Stored under its old key so presets saved by
+                                # earlier versions still load.
+                                "coupling": st.session_state["model_kind"],
+                                "procedure": st.session_state["procedure"],
+                                "segment_break_1": float(st.session_state["segment_break_1"]),
+                                "segment_break_2": float(st.session_state["segment_break_2"]),
+                                "membrane_after_break": st.session_state["membrane_after_break"],
+                                "cyto_starts_at": st.session_state["cyto_starts_at"],
+                                "combined_window": [float(fit_lo), float(fit_hi)],
+                                "term_windows": {
+                                    t: [float(w[0]), float(w[1])]
+                                    for t, w in term_windows.items()
+                                },
+                                "crossover": float(st.session_state["crossover"]),
+                                "cell_type": st.session_state["cell_type"],
+                                "terms": list(active),
+                                "stages": [
+                                    {"terms": list(s["terms"]), "range": list(s["range"])}
+                                    for s in stage_plan
+                                ],
+                                "stage_of": {t: st.session_state[f"stage_of_{t}"] for t in active},
+                                "nucleus_onset": st.session_state["nucleus_onset"],
+                                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                            }
+                            st.success(f"Saved “{name}”.")
+
+                presets = st.session_state["range_presets"]
+                if presets:
+                    a1, a2, a3 = st.columns([2, 1, 1])
+                    with a1:
+                        chosen = st.selectbox(
+                            "Preset", list(presets.keys()), key="preset_choice",
+                            label_visibility="collapsed",
+                        )
+                    with a2:
+                        if st.button("Apply this preset", key="apply_preset",
+                                     **STRETCH):
+                            apply_preset(presets[chosen], eps_lo_data, eps_hi_data)
+                            st.rerun()
+                    with a3:
+                        if st.button("Delete", **STRETCH):
+                            presets.pop(chosen, None)
+                            st.rerun()
+
+                    flat_table(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "preset": name,
+                                    "model": pre.get("coupling", "?"),
+                                    "ε₁": pre.get("segment_break_1"),
+                                    "ε₂": pre.get("segment_break_2"),
+                                    "cell type": pre.get("cell_type", "?"),
+                                    "windows": " | ".join(
+                                        " + ".join(term_label(t) for t in st_["terms"])
+                                        + f" {st_['range'][0]:.3f} to {st_['range'][1]:.3f}"
+                                        for st_ in pre.get("stages", [])
+                                    ),
+                                    "saved": pre.get("saved_at", ""),
+                                }
+                                for name, pre in presets.items()
+                            ]
+                        ),
+                        align_right=["ε₁", "ε₂"],
+                    )
+
+                e1, e2 = st.columns(2)
+                with e1:
+                    st.download_button(
+                        "📥 Export presets",
+                        data=json.dumps(presets, indent=2),
+                        file_name="afm_fit_windows.json",
+                        mime="application/json",
+                        disabled=not presets,
+                        **STRETCH,
+                    )
+                with e2:
+                    imported = st.file_uploader(
+                        "Import presets (.json)", type=["json"], key="preset_upload"
+                    )
+                    if imported is not None:
+                        try:
+                            incoming = json.loads(imported.getvalue().decode("utf-8"))
+                            st.session_state["range_presets"].update(incoming)
+                            st.success(f"Imported {len(incoming)} preset(s).")
+                        except Exception as exc:
+                            st.error(f"Could not read that preset file: {exc}")
+                hint(
+                    "Presets live in this browser session. Export them to a file to keep "
+                    "them between visits or share them with the rest of the lab."
+                )
+
+            # ----------------------------------------------------------- fit ---        # ------------------------------------------------------------- fit ---
+            close_panel(range_panel)
+
+            fit_panel = open_panel("🔧 Fitting options", guided, flat=guided)
+            if not guided:
+                section("6 · Fit" if segmented else "5 · Fit")
+
+            scan = None
+            if (
+                "nucleus" in active
+                and coupling == "parallel"
+                and st.session_state["onset_mode"] == "Scan for best"
+            ):
+                scan = model.scan_nucleus_onset(
+                    fit_lo, fit_hi, terms=active,
+                    weighting=st.session_state["weighting"],
+                    fit_offset=st.session_state["fit_offset"],
+                )
+                if scan.get("success"):
+                    model.nucleus_onset = scan["best_onset"]
+                    st.session_state["_scanned_onset"] = float(scan["best_onset"])
+                    if not scan["well_determined"]:
+                        st.warning(
+                            "The nucleus onset scan is flat: every ε₀ fits about equally "
+                            "well, so this curve does not locate the nucleus."
+                        )
+
+            # Two ways to press it, one button. A flag set beside the curve is
+            # read here, where the fit actually happens: a second st.button with
+            # the same job would be a duplicate widget key, and Streamlit
+            # refuses those outright.
+            run = (
+                st.session_state["live_fit"]
+                or st.button("🚀 Fit curve", type="primary")
+                or st.session_state.pop("_fit_from_curve", False)
+            )
+
+            # A fit has to survive a rerun. Uploading a video, ticking a checkbox
+            # or opening a tab all rerun the script, and with live refitting off
+            # nothing recomputes the fit, so it used to vanish and take the whole
+            # database section with it. Keep the last good one and reuse it.
+            fit_signature = repr(
+                (
+                    data.get("source"),
+                    int(epsilon.size),
+                    float(force_N[0]) if force_N.size else 0.0,
+                    float(force_N[-1]) if force_N.size else 0.0,
+                    sorted(current_fit_settings().items(), key=lambda kv: kv[0]),
+                    round(fit_lo, 6), round(fit_hi, 6),
+                    round(break_1, 6), round(break_2, 6),
+                    kind,
+                )
+            )
+
+            fit = None
+            comparison = None
+            if run and not active:
+                st.warning("Select at least one element above.")
+            elif run and segmented and break_2 <= break_1:
+                st.error("Set ε₂ above ε₁ before fitting.")
+            elif run:
+                if segmented:
+                    # fit_composition covers what fit_segmented did and adds the
+                    # two choices about the first boundary, so it is the one path.
+                    # An older lulevich_model.py has only the fixed version.
+                    if hasattr(model, "fit_composition"):
+                        fit = model.fit_composition(
+                            fit_lo, fit_hi, e1=break_1, e2=break_2,
+                            membrane=membrane_mode,
+                            cyto_start=cyto_mode,
+                            use_membrane="membrane" in active,
+                            use_interior="interior" in active,
+                            use_nucleus="nucleus" in active,
+                            use_tension="tension" in active,
+                            use_nucleus_shell="nucleus_shell" in active,
+                            use_cortex="cortex" in active,
+                            weighting=st.session_state["weighting"],
+                            fit_offset=st.session_state["fit_offset"],
+                            **figure_kwargs(
+                                model.fit_composition,
+                                term_windows=element_windows(
+                                    active, fit_lo, fit_hi
+                                ),
+                            ),
+                        )
+                    else:
+                        fit = model.fit_segmented(
+                            fit_lo, fit_hi, e1=break_1, e2=break_2, terms=active,
+                            weighting=st.session_state["weighting"],
+                            fit_offset=st.session_state["fit_offset"],
+                        )
+                elif coupling == "auto":
+                    with st.spinner("Fitting every model and comparing…"):
+                        comparison = compare_couplings(model, fit_lo, fit_hi, terms=active)
+                    if comparison.get("success"):
+                        fit = comparison["fits"][comparison["best"]["coupling"]]
+                    else:
+                        st.error(comparison.get("error", "Could not compare models."))
+                elif coupling == "series":
+                    fit = model.fit_series(
+                        fit_lo, fit_hi, terms=active,
+                        weighting=st.session_state["weighting"],
+                    )
+                elif coupling in ("hybrid_ps", "hybrid_sp"):
+                    order = ("parallel-then-series" if coupling == "hybrid_ps"
+                             else "series-then-parallel")
+                    if st.session_state["crossover_mode"] == "Scan for best":
+                        scan_x = model.scan_crossover(fit_lo, fit_hi, terms=active, order=order)
+                        if scan_x.get("success"):
+                            fit = scan_x["best"]
+                            st.caption(f"Best crossover ε = {scan_x['best_crossover']:.3f}")
+                        else:
+                            st.error(scan_x.get("error", "Hybrid scan failed."))
+                    else:
+                        crossover = float(np.clip(st.session_state["crossover"],
+                                                  fit_lo + 1e-4, fit_hi - 1e-4))
+                        fit = model.fit_hybrid(fit_lo, fit_hi, crossover, terms=active,
+                                               order=order)
+                elif staged and len(stage_plan) > 1:
+                    fit = model.fit_staged(
+                        stage_plan,
+                        weighting=st.session_state["weighting"],
+                        fit_offset=st.session_state["fit_offset"],
+                        refine_iterations=st.session_state["refine_iterations"],
+                        seed_parallel=st.session_state["seed_parallel"],
                     )
                 else:
-                    st.markdown("**How much does the answer depend on the window?**")
-                    sens = model.range_sensitivity(
-                        fit_lo,
-                        fit_hi,
-                        terms=active,
+                    fit = model.fit(
+                        epsilon_min=fit_lo, epsilon_max=fit_hi, terms=active,
                         fit_offset=st.session_state["fit_offset"],
                         weighting=st.session_state["weighting"],
                     )
-                    s1, s2 = st.columns(2)
-                    s1.metric(
-                        "Eₘ spread",
-                        f"{100 * sens['Em_relative_spread']:.1f} %"
-                        if np.isfinite(sens["Em_relative_spread"])
-                        else "n/a",
-                    )
-                    s2.metric(
-                        "Ec spread",
-                        f"{100 * sens['Ei_relative_spread']:.1f} %"
-                        if np.isfinite(sens["Ei_relative_spread"])
-                        else "n/a",
-                    )
-                    st.caption(
-                        "Range of each modulus across shrinking upper bounds, as a "
-                        "fraction of its mean. Under ~10 % the fit is robust; much "
-                        "more means the curve does not constrain the terms separately."
-                    )
-                    figure = sensitivity_figure(sens["trials"], style)
-                    if figure is not None:
-                        st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
 
-                if scan and scan.get("success"):
-                    st.markdown(f"**{plain_name('nucleus')} onset scan**")
-                    st.caption(
-                        "R² against the assumed onset. A sharp peak means the curve "
-                        "locates the nucleus; a flat line means it does not."
-                    )
-                    st.line_chart(
-                        pd.DataFrame(scan["trials"]).set_index("onset")[["r_squared"]],
-                        height=240,
+            close_panel(fit_panel)
+            if settings_box is not None:
+                settings_box.__exit__(None, None, None)
+
+            # The video and database section below runs whether or not there is a
+            # fit, so the names it reads have to exist either way.
+            fitted = membrane = interior = nucleus = None
+
+            stale_fit = False
+            if fit is not None and fit.get("success"):
+                # How much each modulus depends on where the boundaries were put.
+                # Done once, here, rather than in the panel that displays it: this
+                # runs when a fit happens, that runs on every rerun.
+                if fit.get("coupling") == "segmented" and hasattr(
+                    model, "breakpoint_spread"
+                ):
+                    try:
+                        fit["breakpoint_spread"] = model.breakpoint_spread(
+                            fit["epsilon_range"][0], fit["epsilon_range"][1],
+                            fit["break_1"], fit["break_2"],
+                            fit.get("membrane", "freeze"),
+                            fit.get("cyto_start", "break"),
+                            use_nucleus="nucleus" in (fit.get("terms") or ()),
+                            weighting=fit.get("weighting", "uniform"),
+                            use_tension="tension" in (fit.get("terms") or ()),
+                        )
+                    except Exception:
+                        fit["breakpoint_spread"] = None
+                st.session_state["_last_fit"] = fit
+                st.session_state["_last_fit_signature"] = fit_signature
+                # The bars in "What to fit" were drawn earlier in this same pass,
+                # from the fit that existed then. If this one moved a boundary
+                # they are now showing the old placement, which is a claim about
+                # the model that is not true any more. One redraw fixes it, and
+                # the guard stops a fit that never settles from spinning.
+                _now = (
+                    round(float(fit.get("break_1", 0.0)), 4),
+                    round(float(fit.get("break_2", 0.0)), 4),
+                    fit.get("membrane"), fit.get("cyto_start"),
+                    round(float(fit.get("epsilon_range", (0, 1))[1]), 4),
+                )
+                if (
+                    not st.session_state.get("use_element_windows", False)
+                    and st.session_state.get("_bars_drawn_with") is not None
+                    and st.session_state["_bars_drawn_with"] != _now
+                    and st.session_state.get("_bars_redrawn_for") != _now
+                ):
+                    st.session_state["_bars_redrawn_for"] = _now
+                    st.rerun()
+            elif fit is None and st.session_state.get("_last_fit") is not None:
+                # Nothing asked for a fit on this run, so show the last good one
+                # rather than an empty page.
+                fit = st.session_state["_last_fit"]
+                stale_fit = (
+                    st.session_state.get("_last_fit_signature") != fit_signature
+                )
+                if stale_fit:
+                    st.info(
+                        "Showing the previous fit. Something has changed since it "
+                        "was made, so press **Fit curve** to bring it up to date, "
+                        "or switch on live refitting in Advanced fitting options."
                     )
 
-                st.markdown("**Geometry prefactors actually used**")
-                st.code(
-                    f"h0 = {fit['cell_height'] * 1e6:.3f} um\n"
-                    f"R0 = {fit['R0'] * 1e6:.3f} um\n"
-                    + (
-                        f"R_deep = {fit.get('R0', 0.0) * 1e6:.3f} um   "
-                        f"(the cell's own, since the deep layer runs its "
-                        f"length)\n"
-                        if st.session_state["cell_type"] in HAS_SARCOMERES
-                        else f"R_deep = "
-                             f"{fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
-                    ) +
-                    f"h_membrane = {st.session_state['membrane_thickness_nm']:.2f} nm\n"
-                    f"Am = {fit['Am']:.4e} N/Pa   (F_membrane = Am*Em*eps^3)\n"
-                    f"Ai = {fit['Ai']:.4e} N/Pa   (F_cyto = Ai*Ec*eps^1.5)\n"
-                    f"An = {fit.get('An', float('nan')):.4e} N/Pa   "
-                    f"(F_deep = An*En*<eps-eps2>^1.5)",
-                    language="text",
+            if comparison and comparison.get("success"):
+                st.info(retell(comparison["verdict"]))
+                flat_table(
+                    pd.DataFrame(
+                        [
+                            {
+                                "model": row["label"],
+                                "R²": f"{row['r_squared']:.5f}",
+                                "ΔAICc": f"{row['delta_aicc']:.1f}",
+                                "weight": f"{row['weight']:.3f}",
+                                "CV RMSE": f"{row['cv_rmse']:.3g}",
+                                "params": row["n_params"],
+                            }
+                            for row in comparison["candidates"]
+                        ]
+                    ),
+                    align_right=["R²", "ΔAICc", "weight", "CV RMSE", "params"],
+                )
+                st.caption(
+                    "ΔAICc under 2 means the curve cannot tell those models apart. A "
+                    "wrong model can still reach R² > 0.99 with badly wrong moduli, "
+                    "which is why this table exists."
                 )
 
-            # ---------------------------------------------- the maths last
-            # The page reads: choose, fit, look at the curve, read what the
-            # cell did, and only then the equation and the working. Putting
-            # the maths under the plot, as it was, meant scrolling past it
-            # to reach the numbers it was the working for.
-            e1_col, e2_col = st.columns([2.6, 1])
-            with e1_col:
-                st.markdown("##### The equation that was fitted")
-            with e2_col:
-                send_to_plot_button(
-                    "equation", "The fitted equation",
-                    {"text": equation_text(fit, style.force_unit)},
-                    key="equation",
-                    help_text="Writes the equation with this cell's numbers "
-                              "in a box on the curve.",
+            if fit is None:
+                st.info("Press **Fit curve**, or turn on live refitting in the sidebar.")
+            elif not fit.get("success"):
+                st.error(fit.get("error", "Fit failed."))
+            else:
+                En_value = fit.get("En", 0.0)
+                fitted_coupling = fit.get("coupling", "parallel")
+                params = (fit.get("Em", 0.0), fit.get("Ei", 0.0), En_value)
+                params = tuple(0.0 if not np.isfinite(v) else v for v in params)
+                T0_value = float(fit.get("T0", 0.0) or 0.0)
+                if not np.isfinite(T0_value):
+                    T0_value = 0.0
+                Ene_value = float(fit.get("Ene", 0.0) or 0.0)
+                if not np.isfinite(Ene_value):
+                    Ene_value = 0.0
+                Ecx_value = float(fit.get("Ecx", 0.0) or 0.0)
+                if not np.isfinite(Ecx_value):
+                    Ecx_value = 0.0
+                envelope = cortex = None
+
+                if fitted_coupling == "segmented":
+                    # Draw the components with the same basis the fit used, or the
+                    # curves would not add up to the line through the data.
+                    tension_basis = None
+                    if hasattr(model, "composition_basis"):
+                        basis = figure_kwargs(
+                            model.composition_basis,
+                            term_windows=fit.get("term_windows"),
+                        )
+                        basis = model.composition_basis(
+                            epsilon, fit["break_1"], fit["break_2"],
+                            fit.get("membrane", "freeze"),
+                            fit.get("cyto_start", "break"),
+                            **basis,
+                        )
+                        membrane_basis = basis["membrane"]
+                        cyto_basis = basis["interior"]
+                        nucleus_basis = basis["nucleus"]
+                        tension_basis = basis["tension"]
+                        envelope_basis = basis["nucleus_shell"]
+                        cortex_basis = basis["cortex"]
+                    elif hasattr(model, "composition_terms"):
+                        membrane_basis, cyto_basis, nucleus_basis = model.composition_terms(
+                            epsilon, fit["break_1"], fit["break_2"],
+                            fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
+                        )
+                    else:
+                        membrane_basis, cyto_basis, nucleus_basis = model.segment_terms(
+                            epsilon, fit["break_1"], fit["break_2"]
+                        )
+                    tension = (
+                        tension_basis * T0_value
+                        if (tension_basis is not None and T0_value) else None
+                    )
+                    envelope = (
+                        envelope_basis * Ene_value
+                        if (envelope_basis is not None and Ene_value) else None
+                    )
+                    cortex = (
+                        cortex_basis * Ecx_value
+                        if (cortex_basis is not None and Ecx_value) else None
+                    )
+                    fitted = (
+                        membrane_basis * params[0]
+                        + cyto_basis * params[1]
+                        + nucleus_basis * params[2]
+                        + (tension if tension is not None else 0.0)
+                        + (envelope if envelope is not None else 0.0)
+                        + (cortex if cortex is not None else 0.0)
+                        + fit.get("force_offset", 0.0)
+                    )
+                    membrane = membrane_basis * params[0]
+                    interior = cyto_basis * params[1]
+                    nucleus = nucleus_basis * params[2] if params[2] else None
+                elif fitted_coupling == "parallel":
+                    fitted = model.combined_model(
+                        epsilon, params[0], params[1],
+                        fit.get("force_offset", 0.0), En=params[2],
+                    )
+                    # In parallel the elements share the deformation, so each one's
+                    # force is a separate curve that adds up to the total.
+                    membrane = model.balloon_model_cubic(epsilon, params[0])
+                    interior = model.hertzian_contact_model(epsilon, params[1])
+                    nucleus = model.nucleus_model(epsilon, params[2]) if params[2] else None
+                    tension = None
+                else:
+                    base_coupling = "series" if fitted_coupling == "series" else "hybrid"
+                    fitted = model.predict(
+                        epsilon, params, base_coupling,
+                        fit.get("crossover"),
+                        fit.get("order", "parallel-then-series"),
+                    )
+                    # In series every element carries the whole force, so there are
+                    # no separate force curves to draw; what differs between them is
+                    # how much of the deformation each one takes.
+                    membrane = interior = nucleus = tension = None
+                    envelope = cortex = None
+
+                # The model is only claimed over the range it was fitted on.
+                # Drawn past that it is extrapolation, and a power law far outside
+                # its window flattens into a line that looks like a result. NaN
+                # outside the window makes plotly stop the line at the last
+                # fitted point instead.
+                # Use the range the fit actually recorded, not the sliders, so a
+                # slider moved after the fit cannot punch NaNs into the residuals.
+                drawn_lo, drawn_hi = fit.get("epsilon_range", (fit_lo, fit_hi))
+
+                def clip_to_window(values):
+                    if values is None:
+                        return None
+                    out = np.array(values, dtype=float, copy=True)
+                    out[(epsilon < drawn_lo) | (epsilon > drawn_hi)] = np.nan
+                    return out
+
+                def clip_to_support(values, term):
+                    """An element's own curve starts where the element does."""
+                    out = clip_to_window(values)
+                    if out is None:
+                        return None
+                    window = (fit.get("term_windows") or {}).get(term)
+                    if window:
+                        out[epsilon < float(window[0])] = np.nan
+                    return out
+
+                fitted = clip_to_window(fitted)
+                tension = clip_to_support(tension, "tension")
+                membrane = clip_to_support(membrane, "membrane")
+                interior = clip_to_support(interior, "interior")
+                nucleus = clip_to_support(nucleus, "nucleus")
+                envelope = clip_to_support(envelope, "nucleus_shell")
+                cortex = clip_to_support(cortex, "cortex")
+
+                deformation_shares = None
+                if fitted_coupling in ("series", "hybrid"):
+                    peak = float(np.nanmax(np.abs(force_N))) if force_N.size else 0.0
+                    pieces = {}
+                    if params[0] > 0:
+                        pieces["membrane"] = (peak / (model.Am * params[0])) ** (1.0 / 3.0)
+                    if params[1] > 0:
+                        pieces["interior"] = (peak / (model.Ai * params[1])) ** (2.0 / 3.0)
+                    if params[2] > 0:
+                        onset = fit.get("nucleus_force_onset", 0.0)
+                        pieces["nucleus"] = (
+                            max(peak - onset, 0.0) / (model.An * params[2])
+                        ) ** (2.0 / 3.0)
+                    total = sum(pieces.values())
+                    if total > 0:
+                        deformation_shares = {k: v / total for k, v in pieces.items()}
+
+                if fitted_coupling == "segmented":
+                    # Straight from the element ranges, so a band behind the
+                    # curve says the same thing as the algebra under the log
+                    # plot. Hard-coded as membrane / cytoskeleton / cytoskeleton
+                    # plus nucleus, it stopped being true the moment an element
+                    # was given a range of its own -- and on a C2C12, whose
+                    # sarcolemma carries throughout, it was never true at all.
+                    windows_for_plot = stage_bands(fit)
+                else:
+                    windows_for_plot = [
+                            {
+                                "range": tuple(s["range"]),
+                                "label": " + ".join(term_label(t) for t in s["terms"]),
+                                "color": STAGE_COLORS[i % len(STAGE_COLORS)],
+                            }
+                            for i, s in enumerate(stage_plan)
+                    ]
+
+                st.session_state["results"] = {
+                    "cell_name": st.session_state["cell_name"],
+                    "cell_type": st.session_state["cell_type"],
+                    "date_acquired": str(date_acquired),
+                    "cell_height_um": st.session_state["cell_height_um"],
+                    "spring_constant": st.session_state["spring_constant"],
+                    "video_link": st.session_state["video_link"],
+                    "epsilon": epsilon,
+                    "force_N": force_N,
+                    "fitted_N": fitted,
+                    "membrane_N": membrane,
+                    "interior_N": interior,
+                    "nucleus_N": nucleus,
+                    "fit": fit,
+                    "fit_windows": windows_for_plot,
+                    "source": data["source"],
+                    "timestamp": datetime.now(),
+                }
+
+                if guided:
+                    # No retelling of the fit in words. It restated the
+                    # boundaries already drawn on the curve, printed the moduli
+                    # a second time under the ones below, and ended with a
+                    # sentence about chi-squared that a person could read
+                    # straight off the two numbers beside R². Three of those
+                    # were duplicates and the fourth was noise.
+                    section("4 · Fitting results")
+                    fitting_results_rows(fit, style)
+
+                rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
+                sigma_disp, sigma_unit = from_newtons(
+                    fit.get("noise_sigma", float("nan")), style.force_unit
                 )
-            fitted_equation(fit, unit=style.force_unit, heading=False)
+                st.caption(
+                    f"RMSE {float(rmse_disp):.3g} {rmse_unit} · measured noise "
+                    f"±{float(sigma_disp):.3g} {sigma_unit} per point. "
+                    "χ²/dof compares the residuals against that noise: about 1 "
+                    "means the model is as close to the points as the scatter "
+                    "allows, and much above 1 means it is missing something real. "
+                    "R² can still look excellent when χ²/dof is in the hundreds, "
+                    "which is exactly when the model is wrong. The noise is "
+                    "estimated from the curve itself, so read χ²/dof as an "
+                    "order of magnitude, not to two decimal places."
+                )
 
-            # The picture of the exponent is not here: it is the whole of
-            # the Log curve and boundaries tab, with the placements tried
-            # and the algebra of each stretch beside it. Drawing it twice
-            # was two panels to keep in step.
-            st.caption(
-                "The measured exponent, the boundaries drawn on it and the "
-                "algebra of each stretch are on the **📈 Log curve and "
-                "boundaries** tab."
-            )
+                # No second table of the same moduli. Each is quoted with its
+                # own uncertainty in the tile above, which is where a modulus
+                # belongs; everything else about it is in the equation and the
+                # copy block below.
 
-            # No "how this fit was calculated" panel. What it said is now
-            # said where it is needed: the criterion sits under the search
-            # button that applies it, and the equation below carries the
-            # range, the boundaries, the confinement and every fitted number
-            # with its uncertainty.
+                # The model must never soften. Every basis function has a
+                # non-decreasing slope and every modulus is bounded at zero, so
+                # this holds by construction; it is checked rather than asserted
+                # because a future term could break it silently, and a cell that
+                # appeared to soften under load would be a physical claim nobody
+                # meant to make.
+                if fitted is not None:
+                    drawn = np.isfinite(fitted)
+                    if drawn.sum() > 5:
+                        e_drawn, f_drawn = epsilon[drawn], fitted[drawn]
+                        slope = np.diff(f_drawn) / np.maximum(np.diff(e_drawn), 1e-12)
+                        softening = float(np.min(np.diff(slope))) if slope.size > 2 else 0.0
+                        falls = float(np.min(np.diff(f_drawn))) if f_drawn.size > 1 else 0.0
+                        if falls < -1e-15 or softening < -abs(np.max(slope)) * 1e-6:
+                            st.warning(
+                                "The fitted curve is not stiffening monotonically, "
+                                "which no combination of these elements should be "
+                                "able to do. Treat this fit as suspect and tell "
+                                "whoever maintains the app.",
+                                icon="⚠️",
+                            )
 
-            with diagnostics_box:
-                st.markdown("**∑ What the search does, in maths**")
-                show_search_maths()
+                # How well it fits, band by band, as a percentage. R² and the
+                # residual sum are both dominated by the last tenth of a curve
+                # that spans four decades, so both can look perfect while the
+                # first half is out by a third. This is the number that says
+                # whether the model follows the curve where you are looking.
+                if fitted is not None:
+                    inside = (epsilon >= fit["epsilon_range"][0]) & (
+                        epsilon <= fit["epsilon_range"][1]
+                    )
+                    bands, worst_band = [], 0.0
+                    edges = np.array([0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 1.01])
+                    for lo_b, hi_b in zip(edges[:-1], edges[1:]):
+                        here = inside & (epsilon >= lo_b) & (epsilon < hi_b)
+                        here &= np.isfinite(fitted)
+                        if here.sum() < 5:
+                            continue
+                        measured = force_N[here]
+                        scale = np.mean(np.abs(measured))
+                        if scale <= 0:
+                            continue
+                        miss = float(np.mean(fitted[here] - measured) / scale)
+                        worst_band = max(worst_band, abs(miss))
+                        bands.append({
+                            "ε from": f"{lo_b:.2f}",
+                            "to": f"{min(hi_b, 1.0):.2f}",
+                            "points": int(here.sum()),
+                            "typical force there": (
+                                f"{float(from_newtons(scale, style.force_unit)[0]):.3g} "
+                                f"{style.force_unit}"
+                            ),
+                            "model is out by": f"{100 * miss:+.1f} %",
+                        })
+                    # Working, not answer. In guided mode the page is meant to
+                    # read curve, numbers, maths, database, and every extra
+                    # panel between them is one more thing to scroll past.
+                    if bands:
+                        with diagnostics_box:
+                            st.markdown(
+                                f"**📊 How well it fits, stretch by stretch** "
+                                f"(worst {100 * worst_band:.1f} %)"
+                            )
+                            flat_table(
+                                pd.DataFrame(bands),
+                                align_right=["points", "typical force there",
+                                             "model is out by"],
+                            )
+                            st.caption(
+                                "The percentage is the average signed miss in "
+                                "that stretch, as a fraction of the force there. "
+                                "R² and χ² are both dominated by the largest "
+                                "forces, so a curve spanning four decades can "
+                                "read R² = 0.99999 while the first half is out "
+                                "by a third; this table is where that shows. "
+                                "Weighting, in Advanced fitting options, is what "
+                                "trades one end against the other: **uniform** "
+                                "buys the top of the curve, **relative** spreads "
+                                "the error evenly."
+                            )
+                            if worst_band > 0.15 and st.session_state["weighting"] == "uniform":
+                                st.warning(
+                                    f"The model is out by {100 * worst_band:.0f} % "
+                                    f"somewhere, and the fit is weighted "
+                                    f"uniformly, which means the low-force end "
+                                    f"was barely counted. Switching the weighting "
+                                    f"to **relative** usually brings this under "
+                                    f"5 % everywhere without hurting the top of "
+                                    f"the curve."
+                                )
 
-            # No block of the answer repeated at the foot. Every number in
-            # it is above: the moduli in the metrics row, the range and the
-            # boundaries in the sentence under the results heading, and the
-            # coefficients in the equation.
+                # What the squash did to the sarcomeres. Geometry rather than a
+                # fitted result: the sarcomeres are not a spring in this model,
+                # they are part of the one incompressible interior. This is the
+                # check that says whether the cell was squashed through a range
+                # where muscle still behaves like muscle.
+                if (
+                    st.session_state["cell_type"] in HAS_SARCOMERES
+                    and hasattr(model, "sarcomere_report")
+                ):
+                    # An onset belongs to a deep spring. Without one there is
+                    # nothing switching on, so the read-out covers the whole
+                    # fitted range rather than quoting a boundary that is not in
+                    # the model.
+                    deep_onset = (
+                        fit.get("break_2") if "nucleus" in (fit.get("terms") or ())
+                        else None
+                    )
+                    free = model.sarcomere_report(
+                        fit["epsilon_range"][1], onset=deep_onset,
+                        spread=float(st.session_state["sarcomere_spread"]),
+                    )
+                    held = model.sarcomere_report(
+                        fit["epsilon_range"][1], onset=deep_onset, spread=0.0,
+                    )
+                    with diagnostics_box:
+                        st.markdown("**🧬 What the squash did to the sarcomeres**")
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric(
+                            "Relaxed", f"{free['relaxed_nm']:.0f} nm",
+                            delta=f"about {free['n_along_cell']:.0f} along the cell",
+                            delta_color="off",
+                        )
+                        s2.metric(
+                            f"At ε = {free['epsilon_max']:.2f}",
+                            f"{free['at_epsilon_max_nm']:.0f} nm",
+                            delta=f"{100 * (free['stretch'] - 1):+.0f} %",
+                            delta_color="off",
+                        )
+                        if "at_onset_nm" in free:
+                            s3.metric(
+                                f"Where they engage, ε₂ = {free['onset']:.2f}",
+                                f"{free['at_onset_nm']:.0f} nm",
+                            )
+                        st.caption(
+                            "Squashing a cardiomyocyte does not shorten its "
+                            "sarcomeres, it lengthens them. The myofibrils run "
+                            "along the cell, across the direction of the squash, "
+                            "and a cell that keeps its volume has to spread "
+                            "sideways by as much as it loses in height, which "
+                            "pulls them out: L = L₀ (1 − ε)^(−s∕2), where s is "
+                            "how much of that spreading runs along the "
+                            "myofibrils, set in the sidebar. This is geometry, "
+                            "not a fitted number, and nothing above depends on it."
+                        )
+                        if float(st.session_state["sarcomere_spread"]) > 0:
+                            st.caption(
+                                f"Held at its ends instead, the same cell would "
+                                f"keep its sarcomeres at "
+                                f"{held['at_epsilon_max_nm']:.0f} nm throughout. "
+                                f"A real attached cell lies between, so read "
+                                f"{held['at_epsilon_max_nm']:.0f} to "
+                                f"{free['at_epsilon_max_nm']:.0f} nm as the "
+                                f"bounds at ε = {free['epsilon_max']:.2f}."
+                            )
+                        if free["beyond_working_range"]:
+                            st.warning(
+                                f"Past ε = {free['epsilon_at_limit']:.2f} the "
+                                f"sarcomeres are longer than "
+                                f"{free['working_limit_nm']:.0f} nm, where actin "
+                                f"and myosin overlap stops improving and force "
+                                f"falls away with further stretch. Your fitted "
+                                f"range reaches ε = {free['epsilon_max']:.2f}, "
+                                f"which is {free['at_epsilon_max_nm']:.0f} nm. "
+                                f"Over that stretch the interior modulus "
+                                f"measures passive structure pulled beyond its "
+                                f"working length, not contractile machinery at a "
+                                f"length it ever works at. That may be exactly "
+                                f"what you mean to measure; it is worth saying "
+                                f"which."
+                            )
 
-        section("7 · Video and database" if segmented else "6 · Video and database")
+                # How much each number depends on where the boundaries landed.
+                # A standard error is computed with the boundaries held fixed, so
+                # on a curve where the boundaries are not well determined it can
+                # be small next to a modulus that is not determined at all. This
+                # is the part that catches that.
+                spread = fit.get("breakpoint_spread")
+                fitted_terms = set(fit.get("terms") or active)
+                if spread and spread.get("success") and spread["n_accepted"] > 1:
+                    loose_rows, spread_rows = [], []
+                    for key, unit, term in (
+                        ("T0_mN_m", "mN/m", "tension"),
+                        ("Em_MPa", "MPa", "membrane"),
+                        ("Ei_kPa", "kPa", "interior"),
+                        ("En_kPa", "kPa", "nucleus"),
+                    ):
+                        if term not in fitted_terms:
+                            continue
+                        band = spread["ranges"].get(key)
+                        if not band or not np.isfinite(band["relative"]):
+                            continue
+                        spread_rows.append(
+                            {
+                                "modulus": components_for(
+                                    st.session_state["cell_type"]
+                                )[term][0],
+                                "best fit": f"{band['value']:.4g} {unit}",
+                                "but anywhere in": (
+                                    f"{band['low']:.4g} to {band['high']:.4g} {unit}"
+                                ),
+                                "how loose": f"{100 * band['relative']:.0f} % of itself",
+                            }
+                        )
+                        if band["relative"] > 0.5:
+                            loose_rows.append(term)
+                    if spread_rows:
+                        with diagnostics_box:
+                            st.markdown(
+                                "**📏 How much do these numbers depend on where "
+                                "the boundaries were put?**"
+                            )
+                            st.caption(
+                                f"ε₁ and ε₂ are fitted too, and "
+                                f"{spread['n_accepted']} placements of them fit "
+                                f"this curve within its own noise "
+                                f"(ε₁ from {spread['break_1_range'][0]:.3f} to "
+                                f"{spread['break_1_range'][1]:.3f}, ε₂ from "
+                                f"{spread['break_2_range'][0]:.3f} to "
+                                f"{spread['break_2_range'][1]:.3f}). This is the "
+                                f"range each modulus takes across all of them, "
+                                f"which is a truer error bar than the ± beside "
+                                f"each number: that one is worked out with the "
+                                f"boundaries held fixed, as though they were known."
+                            )
+                            flat_table(
+                                pd.DataFrame(spread_rows),
+                                align_right=["best fit", "but anywhere in",
+                                             "how loose"],
+                            )
+                            if loose_rows:
+                                st.warning(
+                                    "**"
+                                    + " and ".join(
+                                        components_for(
+                                            st.session_state["cell_type"]
+                                        )[t][0] for t in loose_rows
+                                    )
+                                    + "** moves by more than half its own value "
+                                    "across boundaries this curve cannot tell "
+                                    "apart. Quote it with that range, not with "
+                                    "the ± above. A wider fitted range, or more "
+                                    "points near ε = 0, is what narrows it."
+                                )
+
+                st.caption(
+                    f"Membrane areal modulus Eₘ·h = "
+                    f"{fit.get('membrane_areal_modulus', 0.0) * 1e3:.4g} mN/m, which is what "
+                    f"the ε³ term actually determines. Eₘ itself is that divided by the "
+                    f"assumed bilayer thickness of "
+                    f"{st.session_state['membrane_thickness_nm']:.1f} nm, so halving the "
+                    f"thickness doubles Eₘ while the measurement is unchanged."
+                )
+
+                # No table of which material carried what in each stretch. The
+                # component ranges say where each one acts, the equation says
+                # what each contributes, and the moduli are printed twice
+                # already; a third table of percentages per stretch was reading
+                # the same fit for a third time.
+
+                if fitted_coupling != "parallel" and st.session_state["show_components"]:
+                    st.caption(
+                        "Element curves are not drawn for series or hybrid coupling: "
+                        "every element carries the same force there, so they would be "
+                        "three copies of the total. The deformation share each one "
+                        "takes is in the diagram beside the plot."
+                    )
+
+                # A modulus of exactly zero is the solver saying it did not want
+                # that term. Usually that is informative; in one case it is two
+                # settings cancelling each other, and saying which is the whole
+                # difference between a useful message and a confusing one.
+                zeroed = [
+                    label for label, key, term in (
+                        ("Eₘ", "Em_MPa", "membrane"),
+                        ("E_c", "Ei_kPa", "interior"),
+                        ("Eₙ", "En_kPa", "nucleus"),
+                    )
+                    if term in fitted_terms and float(fit.get(key, 0.0)) <= 0
+                ]
+                if zeroed:
+                    message = (
+                        f"{' and '.join(zeroed)} came back at exactly zero, which "
+                        f"means the fit found no work for that term to do."
+                    )
+                    if (
+                        "Eₘ" in zeroed
+                        and fit.get("membrane") == "freeze"
+                        and fit.get("cyto_start") == "zero"
+                    ):
+                        message += (
+                            "  **Here the two choices above are cancelling each "
+                            "other.** If the cytoskeleton is loaded from the very "
+                            "start, freezing the membrane at ε₁ leaves its term a "
+                            "flat constant for the rest of the curve, and a "
+                            "constant cannot describe anything the cytoskeleton "
+                            "is not already describing, so the solver sets it to "
+                            "zero. For a cell whose membrane and cytoskeleton are "
+                            "coupled from first contact, set the membrane to "
+                            "**keeps stiffening**: both then act everywhere, which "
+                            "is what coupled means."
+                        )
+                    st.warning(message)
+
+                # The dropped-spring sentence is already on the page, next to
+                # the model selector that caused it, with a button that fixes it.
+                # Repeating it here reads as a second, different problem.
+                said_already = set()
+                if fit.get("dropped_terms"):
+                    said_already = set(dropped_term_warning(fit["dropped_terms"]))
+                for message in fit["warnings"]:
+                    if message in said_already:
+                        continue
+                    st.warning(message)
+
+                # ------------------------------------------------ plot + panel
+                video_ready = (
+                    not VIDEO_IMPORT_ERROR
+                    and st.session_state.get("video_path")
+                    and st.session_state.get("video_info")
+                    and os.path.exists(st.session_state["video_path"])
+                    and st.session_state["video_show_panel"]
+                )
+                show_schematic = st.session_state["show_schematic"]
+
+                selected_eps = float(np.clip(fit_hi, eps_lo_data, eps_hi_data))
+                if video_ready or show_schematic:
+                    selected_eps = st.slider(
+                        "Show the cell at ε =",
+                        min_value=eps_lo_data,
+                        max_value=eps_hi_data,
+                        step=step,
+                        key="sync_eps",
+                    )
+                nearest = int(np.argmin(np.abs(epsilon - selected_eps)))
+                highlight = (float(epsilon[nearest]), float(force_N[nearest]))
+
+                # The curve goes into the slot staked out at the top of the
+                # page. The cell diagram no longer sits beside it: it belongs
+                # with the question it answers, which is how the elements share
+                # the load, and squeezing both into a side column is what made
+                # them illegible.
+                plot_weight = float(st.session_state["plot_width"])
+                if guided:
+                    plot_col = curve_slot
+                    # The equation and the working go at the foot of the page
+                    # now, after the numbers, rather than in a panel above the
+                    # curve: the page reads choose, fit, look, then what the
+                    # cell did, then the maths.
+                    # The diagram is already drawn live in Step 2, from the same
+                    # settings. Drawing it again here would be the same picture
+                    # twice on one page.
+                    panel_cols = []
+                else:
+                    side_panels = int(bool(video_ready)) + int(bool(show_schematic))
+                    if side_panels:
+                        widths = [plot_weight] + [1.0] * side_panels
+                        columns = st.columns(widths)
+                        plot_col = columns[0]
+                        panel_cols = columns[1:]
+                    else:
+                        # Even with no side panel, keep the chart from spanning
+                        # the whole page; the spare column is left empty.
+                        plot_col, spare = st.columns(
+                            [plot_weight, max(0.01, 4.0 - plot_weight)]
+                        )
+                        panel_cols = []
+
+                with plot_col:
+                    # Built once and reused for the save button. Building it twice
+                    # doubled the work on every rerun for two identical figures.
+                    figure = force_curve_figure(
+                        epsilon,
+                        force_N,
+                        style,
+                        **figure_kwargs(
+                            force_curve_figure,
+                            title=st.session_state["cell_name"]
+                            or "Force vs relative deformation",
+                            fit_force_N=fitted,
+                            membrane_N=membrane,
+                            interior_N=interior,
+                            nucleus_N=nucleus,
+                            nucleus_shell_N=envelope,
+                            cortex_N=cortex,
+                            deep_label=plain_name("nucleus").lower(),
+                            cortex_label=plain_name("cortex").lower(),
+                            interior_label=plain_name("interior").lower(),
+                            fit_window=windows_for_plot,
+                            rupture_epsilon=rupture.get("epsilon")
+                            if rupture.get("method") == "force-drop"
+                            else None,
+                            highlight=highlight
+                            if (video_ready or show_schematic) else None,
+                            highlight_window=highlight_window,
+                        ),
+                    )
+                    figure = apply_plot_layers(figure, style)
+                    st.plotly_chart(
+                        figure,
+                        key="main_fit_plot",
+                        **plot_selection_kwargs(),
+                        **STRETCH,
+                    )
+                    apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
+
+                    o1, o2 = st.columns([2, 1])
+                    with o1:
+                        plot_layer_table()
+                        with st.expander("🎛️ Plot options", expanded=False):
+                            plot_option_controls()
+                    with o2:
+                        save_plot_controls(figure, fit, date_acquired)
+
+                panel_index = 0
+                if show_schematic and panel_index < len(panel_cols):
+                    with panel_cols[panel_index]:
+                        if st.session_state["schematic_style"].startswith("Balloon"):
+                            st.plotly_chart(
+                                balloon_figure(
+                                    style,
+                                    **figure_kwargs(
+                                        balloon_figure,
+                                        epsilon=selected_eps,
+                                        cell_height_um=st.session_state["cell_height_um"],
+                                        labels=components_for(
+                                            st.session_state["cell_type"]
+                                        ),
+                                        show_nucleus="nucleus" in active,
+                                        show_nucleus_shell="nucleus_shell" in active,
+                                        show_tension="tension" in active,
+                                        deep_onset=(
+                                            fit.get("break_2")
+                                            if "nucleus" in (fit.get("terms") or ())
+                                            else None
+                                        ),
+                                        # A cardiomyocyte is a shell holding
+                                        # fluid, and the model does not
+                                        # discriminate a nucleus from the rest
+                                        # of the interior, so nothing in the
+                                        # picture should look like one.
+                                        interior=(
+                                            "fluid"
+                                            if st.session_state["cell_type"]
+                                            in INCOMPRESSIBLE_INTERIOR else "spring"
+                                        ),
+                                    ),
+                                ),
+                                key="balloon_plot",
+                                **STRETCH,
+                            )
+                        else:
+                            st.plotly_chart(
+                                cell_schematic(
+                                    style,
+                                    **figure_kwargs(
+                                        cell_schematic,
+                                        coupling=(
+                                            "series" if fitted_coupling == "series"
+                                            else "hybrid" if fitted_coupling == "hybrid"
+                                            else "parallel"
+                                        ),
+                                        shares=deformation_shares,
+                                        epsilon=selected_eps,
+                                        cell_height_um=st.session_state["cell_height_um"],
+                                        cell_radius_um=fit["R0"] * 1e6,
+                                        nucleus_radius_um=fit.get(
+                                            "R_nucleus", fit["R0"] * 0.35
+                                        ) * 1e6,
+                                        membrane_thickness_nm=st.session_state[
+                                            "membrane_thickness_nm"
+                                        ],
+                                        nucleus_onset=model.nucleus_onset
+                                        if "nucleus" in active else None,
+                                        break_1=fit.get("break_1"),
+                                        break_2=fit.get("break_2"),
+                                        membrane_mode=fit.get("membrane", "freeze"),
+                                        cyto_start=fit.get("cyto_start", "break"),
+                                        labels=components_for(st.session_state["cell_type"]),
+                                        Em_MPa=fit["Em_MPa"],
+                                        Ei_kPa=fit["Ei_kPa"],
+                                        En_kPa=fit.get("En_kPa") if "nucleus" in active else None,
+                                        Ene_MPa=(
+                                            fit.get("Ene_MPa")
+                                            if "nucleus_shell" in active else None
+                                        ),
+                                        T0_mN_m=fit.get("T0_mN_m") if "tension" in active else None,
+                                        show_nucleus="nucleus" in active,
+                                        show_nucleus_shell="nucleus_shell" in active,
+                                        show_tension="tension" in active,
+                                    ),
+                                ),
+                                key="schematic_plot",
+                                **STRETCH,
+                            )
+                    panel_index += 1
+
+                # In guided mode the video frame goes under the curve rather
+                # than beside it, for the same reason as the diagram.
+                video_target = None
+                if video_ready:
+                    if guided:
+                        video_target = video_slot
+                    elif panel_index < len(panel_cols):
+                        video_target = panel_cols[panel_index]
+                if video_target is not None:
+                    with video_target:
+                        vinfo = st.session_state["video_info"]
+                        frame_index = va.frame_for_epsilon(
+                            selected_eps,
+                            st.session_state["video_contact_frame"],
+                            st.session_state["video_end_frame"] or (vinfo["n_frames"] - 1),
+                            float(epsilon.max()),
+                        )
+                        # Through the shared reader, so a box drawn by hand and a
+                        # scale taken from the probe on the video tab apply here
+                        # too. This panel used to call the detector directly and
+                        # ignore both.
+                        vframe, vdet, vnuc, vprobe, vscale = detection_at(frame_index)
+                        if vframe is None:
+                            st.info("Frame unavailable.")
+                        else:
+                            force_here, unit_here = from_newtons(highlight[1], style.force_unit)
+                            snap = va.annotate(
+                                vframe, vdet, label=f"ε = {highlight[0]:.3f}",
+                                nucleus=vnuc, probe=vprobe,
+                            )
+                            st.image(
+                                va.crop(snap, vdet) if vdet and vdet.get("found") else snap,
+                                caption=f"Frame {frame_index} · ε = {highlight[0]:.3f} · "
+                                f"F = {float(force_here):.3g} {unit_here}",
+                                **STRETCH,
+                            )
+                            if vdet and vdet.get("found"):
+                                height_note = f"Cell height {vdet['height_px']:.0f} px"
+                                if vscale:
+                                    height_note += (
+                                        f" · {vdet['height_px'] * vscale:.2f} µm"
+                                    )
+                                if vdet.get("manual"):
+                                    height_note += " · outlined by hand"
+                                st.caption(height_note)
+                            st.download_button(
+                                "📷 Save screenshot",
+                                data=png_bytes(snap),
+                                file_name=(
+                                    f"{st.session_state['cell_name'] or 'cell'}"
+                                    f"_eps{highlight[0]:.3f}.png"
+                                ),
+                                mime="image/png",
+                                **STRETCH,
+                            )
+
+                # ------------------------------------------------- diagnostics
+                with diagnostics_box:
+                    st.markdown("**🔍 Fit diagnostics**")
+                    # One column per material actually in the fit, and never a
+                    # column for one that is not: a share of the load reported
+                    # for a material the model does not have reads as a
+                    # measurement of it.
+                    shares = [
+                        (f"{plain_name('membrane')} share at ε_max",
+                         fit.get("membrane_fraction_at_max", np.nan)),
+                        (f"{plain_name('interior')} share",
+                         fit.get("interior_fraction_at_max", np.nan)),
+                    ]
+                    if "nucleus" in (fit.get("terms") or ()):
+                        shares.append((f"{plain_name('nucleus')} share",
+                                       fit.get("nucleus_fraction_at_max", np.nan)))
+                    share_cols = st.columns(len(shares) + 1)
+                    for column, (label, value) in zip(share_cols, shares):
+                        column.metric(
+                            label,
+                            f"{100 * value:.1f} %" if np.isfinite(value) else "n/a",
+                        )
+                    if fit.get("mode") == "staged":
+                        share_cols[-1].metric("Refinement passes", fit["n_iterations"])
+                    else:
+                        share_cols[-1].metric(
+                            "Condition number",
+                            f"{fit['condition_number']:.1f}"
+                            if np.isfinite(fit.get("condition_number", np.nan))
+                            else "n/a",
+                            help="How separable the terms are over this window. Above ~30 "
+                            "the split between them is unreliable even though their sum "
+                            "is well determined.",
+                        )
+
+                    mask = fit["mask"]
+                    st.plotly_chart(
+                        residual_figure(epsilon[mask], (force_N - fitted)[mask], style),
+                        key="residual_plot",
+                        **STRETCH,
+                    )
+
+                    if fit.get("mode") == "staged":
+                        st.markdown("**Convergence across passes**")
+                        st.caption(
+                            "Each pass refits every stage with the other terms held at "
+                            "their current values. "
+                            + (
+                                "The sequence started from a parallel fit over the whole "
+                                "region, which stops the first stage from absorbing the "
+                                "force that belongs to the later ones."
+                                if fit.get("seeded")
+                                else "Seeding is off, so pass 1 is the plain unseeded "
+                                "staged result."
+                            )
+                        )
+                        flat_table(
+                            pd.DataFrame(fit["iterations"]).round(
+                                {"Em_MPa": 4, "Ei_kPa": 4, "En_kPa": 4}
+                            ).astype(str),
+                        )
+                        flat_table(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "stage": i + 1,
+                                        "terms": ", ".join(
+                                            term_label(t) for t in plan["terms"]
+                                        ),
+                                        "ε window": f"{plan['range'][0]:.3f} to {plan['range'][1]:.3f}",
+                                        "points": res["n_points"],
+                                        "R² in window": f"{float(res['r_squared']):.4f}",
+                                    }
+                                    for i, (plan, res) in enumerate(
+                                        zip(fit["stage_plan"], fit["stages"])
+                                    )
+                                ]
+                            ),
+                            align_right=["points", "R² in window"],
+                        )
+                    else:
+                        st.markdown("**How much does the answer depend on the window?**")
+                        sens = model.range_sensitivity(
+                            fit_lo,
+                            fit_hi,
+                            terms=active,
+                            fit_offset=st.session_state["fit_offset"],
+                            weighting=st.session_state["weighting"],
+                        )
+                        s1, s2 = st.columns(2)
+                        s1.metric(
+                            "Eₘ spread",
+                            f"{100 * sens['Em_relative_spread']:.1f} %"
+                            if np.isfinite(sens["Em_relative_spread"])
+                            else "n/a",
+                        )
+                        s2.metric(
+                            "Ec spread",
+                            f"{100 * sens['Ei_relative_spread']:.1f} %"
+                            if np.isfinite(sens["Ei_relative_spread"])
+                            else "n/a",
+                        )
+                        st.caption(
+                            "Range of each modulus across shrinking upper bounds, as a "
+                            "fraction of its mean. Under ~10 % the fit is robust; much "
+                            "more means the curve does not constrain the terms separately."
+                        )
+                        figure = sensitivity_figure(sens["trials"], style)
+                        if figure is not None:
+                            st.plotly_chart(figure, key="sensitivity_plot", **STRETCH)
+
+                    if scan and scan.get("success"):
+                        st.markdown(f"**{plain_name('nucleus')} onset scan**")
+                        st.caption(
+                            "R² against the assumed onset. A sharp peak means the curve "
+                            "locates the nucleus; a flat line means it does not."
+                        )
+                        st.line_chart(
+                            pd.DataFrame(scan["trials"]).set_index("onset")[["r_squared"]],
+                            height=240,
+                        )
+
+                    st.markdown("**Geometry prefactors actually used**")
+                    st.code(
+                        f"h0 = {fit['cell_height'] * 1e6:.3f} um\n"
+                        f"R0 = {fit['R0'] * 1e6:.3f} um\n"
+                        + (
+                            f"R_deep = {fit.get('R0', 0.0) * 1e6:.3f} um   "
+                            f"(the cell's own, since the deep layer runs its "
+                            f"length)\n"
+                            if st.session_state["cell_type"] in HAS_SARCOMERES
+                            else f"R_deep = "
+                                 f"{fit.get('R_nucleus', float('nan')) * 1e6:.3f} um\n"
+                        ) +
+                        f"h_membrane = {st.session_state['membrane_thickness_nm']:.2f} nm\n"
+                        f"Am = {fit['Am']:.4e} N/Pa   (F_membrane = Am*Em*eps^3)\n"
+                        f"Ai = {fit['Ai']:.4e} N/Pa   (F_cyto = Ai*Ec*eps^1.5)\n"
+                        f"An = {fit.get('An', float('nan')):.4e} N/Pa   "
+                        f"(F_deep = An*En*<eps-eps2>^1.5)",
+                        language="text",
+                    )
+
+                # ---------------------------------------------- the maths last
+                # The page reads: choose, fit, look at the curve, read what the
+                # cell did, and only then the equation and the working. Putting
+                # the maths under the plot, as it was, meant scrolling past it
+                # to reach the numbers it was the working for.
+                e1_col, e2_col = st.columns([2.6, 1])
+                with e1_col:
+                    st.markdown("##### The equation that was fitted")
+                with e2_col:
+                    send_to_plot_button(
+                        "equation", "The fitted equation",
+                        {"text": equation_text(fit, style.force_unit)},
+                        key="equation",
+                        help_text="Writes the equation with this cell's numbers "
+                                  "in a box on the curve.",
+                    )
+                fitted_equation(fit, unit=style.force_unit, heading=False)
+
+                # The picture of the exponent is not here: it is the whole of
+                # the Log curve and boundaries tab, with the placements tried
+                # and the algebra of each stretch beside it. Drawing it twice
+                # was two panels to keep in step.
+                st.caption(
+                    "The measured exponent, the boundaries drawn on it and the "
+                    "algebra of each stretch are on the **📈 Log curve and "
+                    "boundaries** tab."
+                )
+
+                # No "how this fit was calculated" panel. What it said is now
+                # said where it is needed: the criterion sits under the search
+                # button that applies it, and the equation below carries the
+                # range, the boundaries, the confinement and every fitted number
+                # with its uncertainty.
+
+                with diagnostics_box:
+                    st.markdown("**∑ What the search does, in maths**")
+                    show_search_maths()
+
+                # No block of the answer repeated at the foot. Every number in
+                # it is above: the moduli in the metrics row, the range and the
+                # boundaries in the sentence under the results heading, and the
+                # coefficients in the equation.
+
+        section(
+            "4 · Video and database" if piecewise_mode
+            else "7 · Video and database" if segmented
+            else "6 · Video and database"
+        )
         store = st.session_state.get("onedrive_store")
         ready = store is not None
 
@@ -11296,15 +12038,34 @@ with tab_results:
             st.write(f"Fitted: {results['timestamp']:%Y-%m-%d %H:%M}")
         with c2:
             st.markdown("**Mechanics**")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Eₘ", f"{fit['Em_MPa']:.3g} MPa")
-            m2.metric("Eᵢ", f"{fit['Ei_kPa']:.3g} kPa")
-            m3.metric("R²", f"{fit['r_squared']:.4f}")
-            st.caption(
-                f"Window ε ∈ [{fit['epsilon_range'][0]:.3f}, {fit['epsilon_range'][1]:.3f}] · "
-                f"{fit['n_points']} points · {fit['weighting']} weighting · "
-                f"bending constant Kₘ = {fit['Km_kT']:.3g} k_BT"
-            )
+            if fit.get("coupling") == "piecewise":
+                # The four-regime fit has six moduli, not two, and no
+                # bending constant.
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("E_shell", f"{fit['Em_MPa']:.3g} MPa")
+                m2.metric("E_cyto", f"{fit['Ei_kPa']:.3g} kPa")
+                m3.metric("E_ne", f"{fit['Ene_MPa']:.3g} MPa")
+                m4.metric("R²", f"{fit['r_squared']:.4f}")
+                m5, m6, m7, _m8 = st.columns(4)
+                m5.metric("E_nc", f"{fit.get('E_nc_kPa', 0.0):.3g} kPa")
+                m6.metric("E_core", f"{fit['En_kPa']:.3g} kPa")
+                m7.metric("E_align (apparent)", f"{fit.get('E_align_kPa', 0.0):.3g} kPa")
+                bounds = fit["piecewise"]["boundaries_pct"]
+                st.caption(
+                    "4-regime piecewise fit, regimes at "
+                    + " / ".join(f"{b:g}" for b in bounds) + " % · "
+                    f"{fit['n_points']} points"
+                )
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Eₘ", f"{fit['Em_MPa']:.3g} MPa")
+                m2.metric("Eᵢ", f"{fit['Ei_kPa']:.3g} kPa")
+                m3.metric("R²", f"{fit['r_squared']:.4f}")
+                st.caption(
+                    f"Window ε ∈ [{fit['epsilon_range'][0]:.3f}, {fit['epsilon_range'][1]:.3f}] · "
+                    f"{fit['n_points']} points · {fit['weighting']} weighting · "
+                    f"bending constant Kₘ = {fit.get('Km_kT', float('nan')):.3g} k_BT"
+                )
 
         st.plotly_chart(
             force_curve_figure(
@@ -11370,6 +12131,13 @@ with tab_export:
             "source": results["source"],
             "analysed_at": results["timestamp"].isoformat(),
         }
+        if fit.get("piecewise"):
+            # Every coefficient, modulus and anchor of the four-regime fit,
+            # flat so the CSV gets one column each.
+            summary["piecewise_boundaries_pct"] = " / ".join(
+                f"{b:g}" for b in fit["piecewise"]["boundaries_pct"]
+            )
+            summary.update(fit["piecewise"]["flat"])
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -11422,3 +12190,9 @@ with tab_export:
                 mime="application/json",
                 **STRETCH,
             )
+
+
+# ------------------------------------------------ settings kept offstage --
+# Last thing in the run, on purpose: see keep_unrendered_settings.
+if globals().get("piecewise_mode"):
+    keep_unrendered_settings()
