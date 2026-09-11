@@ -761,11 +761,19 @@ DEFAULTS = {
     # for the membrane acting throughout), so it follows the boundaries.
     "pw_until": {},
     # Each component in the model or not. Off holds its coefficient at 0.
-    "pw_use_k_align": True,
+    # The model the page opens on is the four main components: membrane,
+    # cytoskeleton, nuclear envelope and the inside of the nucleus. The
+    # contact / alignment line over [0, ε₁) is a secondary option, off
+    # unless it is asked for: it fits the probe settling onto the cell,
+    # which is an artefact of the measurement rather than the cell.
+    "pw_use_k_align": False,
     "pw_use_K_shell": True,
     "pw_use_K_cyto": True,
     "pw_use_K_nucleus": True,
     "pw_use_K_core": True,
+    # Which number the combination search keeps the best of.
+    "pw_combo_criterion": "adj_r2",
+    "legacy_combo_criterion": "adj_r2",
     # The cells fitted so far this session, each with its own boundaries,
     # moduli and curve, for the All cells tab.
     "pw_collection": {},
@@ -4639,6 +4647,106 @@ def fit_at_the_current_settings(model, lo, hi, terms):
     rerun_keeping_settings({"_fit_from_curve": True})
 
 
+def legacy_combination_search(model, lo, hi, here, criterion):
+    """
+    Fit every combination of this cell type's components, once each.
+
+    Nothing else moves: the boundaries, the ranges, the weighting and the
+    confinement are the ones on the board, so the only difference between
+    the rows is which components are in the model. Each fit is one linear
+    solve, which is why trying all of them is affordable.
+    """
+    if not hasattr(model, "fit_composition") or not here:
+        return None
+    pool = [term for term in ALL_TERMS if term in here][:6]
+    if not pool:
+        return None
+    e1 = float(st.session_state["segment_break_1"])
+    e2 = float(st.session_state["segment_break_2"])
+    membrane = MEMBRANE_CHOICES.get(
+        st.session_state["membrane_after_break"], "freeze")
+    cyto = CYTO_CHOICES.get(st.session_state["cyto_starts_at"], "break")
+    rows = []
+    for mask in range(1, 1 << len(pool)):
+        on = tuple(term for index, term in enumerate(pool)
+                   if mask >> index & 1)
+        try:
+            fit = model.fit_composition(
+                lo, hi, e1=e1, e2=e2, membrane=membrane, cyto_start=cyto,
+                use_membrane="membrane" in on,
+                use_interior="interior" in on,
+                use_nucleus="nucleus" in on,
+                use_tension="tension" in on,
+                use_nucleus_shell="nucleus_shell" in on,
+                use_cortex="cortex" in on,
+                weighting=st.session_state["weighting"],
+                fit_offset=st.session_state["fit_offset"],
+                **figure_kwargs(model.fit_composition,
+                                term_windows=element_windows(on, lo, hi)),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            fit = {"success": False, "error": str(exc)}
+        ok = bool(fit.get("success"))
+        rows.append({
+            "on": on,
+            "label": " + ".join(plain_name(t).lower() for t in on),
+            "ok": ok,
+            "r2": float(fit.get("r_squared", float("nan"))) if ok else float("nan"),
+            "adj_r2": criterion_value(fit, "adj_r2") if ok else float("nan"),
+            "bic": -criterion_value(fit, "bic") if ok else float("nan"),
+            "n_params": int(fit.get("n_params") or len(on)) if ok else 0,
+            "score": criterion_value(fit, criterion) if ok else float("-inf"),
+            "error": "" if ok else str(fit.get("error", "did not fit")),
+        })
+    scored = [row for row in rows if np.isfinite(row["score"])]
+    # Ties go to the model with fewer components: on this curve they are the
+    # same fit, and the smaller one is the one that can be believed.
+    best = (max(scored, key=lambda r: (round(r["score"], 9), -len(r["on"])))
+            if scored else None)
+    return {"criterion": criterion, "rows": rows, "best": best,
+            "eps": (e1, e2), "range": (float(lo), float(hi))}
+
+
+def legacy_combination_table(found):
+    """The combinations tried on this page, best first."""
+    if not found:
+        st.caption(
+            "Press **🔎 Find the best combination** on the control board: "
+            "every combination of this cell type's components is fitted at "
+            "the boundaries on the board and compared here."
+        )
+        return
+    criterion = found.get("criterion", "adj_r2")
+    best = found.get("best") or {}
+    rows = sorted(found["rows"],
+                  key=lambda r: (-r["score"] if np.isfinite(r["score"])
+                                 else float("inf")))
+    flat_table(
+        pd.DataFrame([
+            {
+                "combination": row["label"],
+                "kept": "★" if row["on"] == best.get("on") else "",
+                "R²": f"{row['r2']:.5f}" if np.isfinite(row["r2"]) else "—",
+                "adjusted R²": (f"{row['adj_r2']:.5f}"
+                                if np.isfinite(row["adj_r2"]) else "—"),
+                "BIC": f"{row['bic']:.1f}" if np.isfinite(row["bic"]) else "—",
+                "coefficients m": row["n_params"],
+                "": row["error"],
+            }
+            for row in rows
+        ]),
+        align_right=["R²", "adjusted R²", "BIC", "coefficients m"],
+    )
+    e1, e2 = found.get("eps", (float("nan"), float("nan")))
+    st.caption(
+        f"Judged by **{PW_CRITERIA.get(criterion, criterion)}**, every row "
+        f"fitted at ε₁ = {e1:.3f}, ε₂ = {e2:.3f} over the range on the "
+        "board. Only which components are in the model differs between the "
+        "rows."
+    )
+    st.caption(PW_CRITERION_HELP.get(criterion, ""))
+
+
 def fit_verdict(fit=None):
     """What the fit on screen came to, at the settings it was given."""
     if fit is None:
@@ -5705,6 +5813,58 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     return fig
 
 
+def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
+                         fit_id_text="", n_points=None):
+    """
+    What is on the graph above, in one line, written from the same fit.
+
+    The plot is read from a distance and the legend only names things; this
+    says what is actually drawn right now, which components with which
+    ranges, which are left out, where the boundaries are and what the
+    shaded first stretch means. It is written from ``result``, the applied
+    fit, so it cannot describe a plot that is not there.
+    """
+    b = result.get("boundaries_pct") or ()
+    ranges = result.get("ranges") or {}
+    drawn, left_out = [], []
+    for name, label, _symbol, _colour, _law in PW_COMPONENTS:
+        if name in off:
+            left_out.append(label)
+            continue
+        a, u = ranges.get(name, (float("nan"), float("nan")))
+        drawn.append(f"{label} [{a:.1f}, {u:.1f}] %"
+                     if np.isfinite(a) else label)
+    how = ("stacked, so the layers add up to F̂" if view == "stacked" and not log_y
+           else "each drawn from zero over its own range")
+    parts = [
+        "**On the graph now:** the data"
+        + (f" ({int(n_points)} points)" if n_points else "")
+        + " and the fitted curve F̂"
+        + (f" of `fit {fit_id_text}`" if fit_id_text else "")
+        + (f", R² = {result['r_squared']:.5f}"
+           if np.isfinite(result.get("r_squared", float("nan"))) else ""),
+        ("components " + how + ": " + "; ".join(drawn)) if drawn
+        else "no components (all of them are switched off)",
+    ]
+    if left_out:
+        parts.append("switched off, so neither fitted nor drawn: "
+                     + ", ".join(left_out))
+    if len(b) >= 5:
+        parts.append(
+            f"boundaries ε₁ = {b[1]:.2f} %, ε₂ = {b[2]:.2f} %, "
+            f"ε₃ = {b[3]:.2f} %, fitted to x_end = {b[4]:.1f} %"
+        )
+        parts.append(
+            f"the shaded stretch [0, {b[1]:.2f}) % is the contact artefact"
+            + (", fitted by the contact line" if "k_align" not in off
+               else ", carried by the constant C₀ alone")
+        )
+    parts.append("force axis logarithmic" if log_y else "force axis linear")
+    parts.append("the bars under the curve are the same ranges, one row per "
+                 "component")
+    st.caption(" · ".join(parts) + ".")
+
+
 def profile_figure(found, index):
     """One boundary's profile likelihood: Δ(−2 ln L) across its band."""
     key = ("eps1", "eps2", "eps3")[index]
@@ -6087,7 +6247,8 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
         start, until = ranges[name]
         cell = grid[index % columns] if grid else st.container()
         cell.__enter__()
-        on = st.session_state.get(f"pw_use_{name}", True)
+        on = st.session_state.get(f"pw_use_{name}",
+                                  DEFAULTS.get(f"pw_use_{name}", True))
         # Laid out for the narrow parameter column: the name and what the
         # fit made of it on one line, the range bar under them at full width.
         c_name, c_out = st.columns([1.7, 1])
@@ -6095,13 +6256,18 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
         with c_name:
             st.checkbox(
                 f"{label}", key=f"pw_use_{name}",
-                help=("Off holds the contact slope at zero: the first stretch, "
-                      "to ε₁, is then the constant C₀ and nothing else. ε₁ "
-                      "still marks where the membrane and cytoskeleton start."
+                help=("A secondary component, off unless it is asked for. "
+                      "On, it fits a straight line over the first stretch, "
+                      "[0, ε₁), where the probe is settling onto the cell. "
+                      "Off, that stretch is the constant C₀ and nothing "
+                      "else, and ε₁ still marks where the membrane and the "
+                      "cytoskeleton start."
                       if name == "k_align" else
-                      "Off holds this component at zero, and it leaves the "
-                      "plot and the fit."))
-            st.caption(law)
+                      "One of the four main components, on by default. Off "
+                      "holds it at zero, and it leaves the plot and the "
+                      "fit."))
+            st.caption(law + (" · secondary, off by default"
+                              if name == "k_align" else ""))
         with c_bar:
             key = f"pw_range_{name}"
             # Set from the model every run, before the bar is drawn, so the
@@ -6150,7 +6316,8 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
         r"$s_j \in \{\varepsilon_1, \varepsilon_2, \varepsilon_3\}$ is shared "
         r"by the rows that start there; $u_j$ is the row's own. "
         "The dashed curve and the bar of the same colour on the plot are this "
-        "row."
+        "row. A ticked row is fitted and drawn; an unticked row is in "
+        "neither, so the ticks and the graph always say the same thing."
     )
     return slots
 
@@ -6189,6 +6356,153 @@ PW_ROW_LABELS = dict(PW_METHODS)
 # When the chosen route misses the R² target, the others are tried in this
 # order and the first that reaches it is used.
 PW_FALLBACK = ("refined", "everything", "power", "defaults")
+
+
+# ------------------------------------------------ which components at all --
+#
+# Ticking components by hand answers "does this one help?" one press at a
+# time. The search answers it for every combination at once: it fits each
+# of them at the boundaries on the board and keeps the best by a number
+# that is named on the button, so the answer is a table rather than an
+# opinion. The first combination is the four main components, which is
+# what the page opens on.
+
+# Which number to keep the best of. Each is written so that bigger is
+# better, so the search is one argmax.
+PW_CRITERIA = {
+    "adj_r2": "adjusted R²",
+    "r2": "R²",
+    "bic": "BIC (fewest components that still fit)",
+}
+PW_CRITERION_HELP = {
+    "adj_r2": r"$\bar R^2 = 1 - (1-R^2)\dfrac{n-1}{n-m-1}$: closeness of fit "
+              r"with the number of coefficients $m$ charged for. The usual "
+              r"choice.",
+    "r2": r"$R^2 = 1 - \dfrac{\sum (F_i - \hat F_i)^2}{\sum (F_i-\bar F)^2}$: "
+          r"closeness alone. It never falls when a component is added, so it "
+          r"tends to pick the biggest model.",
+    "bic": r"$\mathrm{BIC} = n\ln(S/n) + m\ln n$, kept smallest: the harshest "
+           r"charge per coefficient, so it picks the smallest model the curve "
+           r"actually needs.",
+}
+# Membrane and cytoskeleton carry R1 and R2, so every combination has them;
+# the other three are what the search is about. The four main components
+# come first: that is the model the page opens on, and ties go to it.
+PW_COMBINATIONS = (
+    ("K_shell", "K_cyto", "K_nucleus", "K_core"),
+    ("K_shell", "K_cyto", "K_nucleus"),
+    ("K_shell", "K_cyto", "K_core"),
+    ("K_shell", "K_cyto"),
+    ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_core"),
+    ("k_align", "K_shell", "K_cyto", "K_nucleus"),
+    ("k_align", "K_shell", "K_cyto", "K_core"),
+    ("k_align", "K_shell", "K_cyto"),
+)
+
+
+def combination_label(on):
+    """A combination of components, written with the names on the board."""
+    names = [label for name, label, *_ in PW_COMPONENTS if name in on]
+    return " + ".join(names) if names else "nothing"
+
+
+def criterion_value(result, criterion):
+    """The chosen number, written so that bigger is always better."""
+    n = int(result.get("n_points") or 0)
+    m = int(result.get("n_params") or 0)
+    r2 = float(result.get("r_squared", float("nan")))
+    if criterion == "r2":
+        return r2
+    if criterion == "adj_r2":
+        adj = result.get("adj_r_squared")
+        if adj is not None and np.isfinite(adj):
+            return float(adj)
+        if n - m - 1 <= 0:
+            return float("-inf")
+        return 1.0 - (1.0 - r2) * (n - 1) / (n - m - 1)
+    if criterion == "bic":
+        rmse = float(result.get("rmse", float("nan")))
+        if not (n > 0 and np.isfinite(rmse) and rmse > 0):
+            return float("-inf")
+        # -BIC, so the best is still the largest.
+        return -(n * np.log(rmse ** 2) + m * np.log(n))
+    return r2
+
+
+def pw_combination_search(epsilon, force_N, criterion):
+    """
+    Fit every combination of components at the boundaries on the board.
+
+    Nothing is placed and nothing else is changed: ε, the ranges, p₀ and
+    the bounds are the ones on the board, so the only difference between
+    the rows is which components are in the model. Returns the rows in the
+    order they were tried, each with its score, and the winner first in
+    ``best``.
+    """
+    bounds = piecewise_boundaries()
+    settings, untils, carry = (piecewise_settings(), piecewise_until(),
+                               piecewise_carry())
+    rows = []
+    for on in PW_COMBINATIONS:
+        off = tuple(n for n in PW_SWITCHABLE if n not in on)
+        result = fit_piecewise(
+            epsilon, force_N, boundaries_pct=bounds, regimes=PW_REGIMES,
+            settings=effective_piecewise_settings(settings, untils, off),
+            carry=carry,
+        )
+        ok = bool(result.get("success"))
+        rows.append({
+            "on": tuple(on), "off": off, "label": combination_label(on),
+            "ok": ok,
+            "r2": float(result.get("r_squared", float("nan"))) if ok else float("nan"),
+            "adj_r2": (criterion_value(result, "adj_r2") if ok else float("nan")),
+            "bic": (-criterion_value(result, "bic") if ok else float("nan")),
+            "n_params": int(result.get("n_params") or 0) if ok else 0,
+            "score": criterion_value(result, criterion) if ok else float("-inf"),
+            "error": "" if ok else result.get("error", "the fit is not defined here"),
+        })
+    scored = [r for r in rows if np.isfinite(r["score"])]
+    best = max(scored, key=lambda r: r["score"]) if scored else None
+    return {"criterion": criterion, "rows": rows, "best": best,
+            "boundaries_pct": tuple(float(v) for v in bounds)}
+
+
+def combination_search_table(found):
+    """The combinations the search tried, best first, with what decided it."""
+    if not found:
+        st.caption(
+            "Press **🔎 Find the best combination** on the board and every "
+            "combination of components is fitted at the boundaries on the "
+            "board, then compared here."
+        )
+        return
+    criterion = found.get("criterion", "adj_r2")
+    best = found.get("best") or {}
+    rows = sorted(found["rows"],
+                  key=lambda r: (-r["score"] if np.isfinite(r["score"])
+                                 else float("inf")))
+    frame = pd.DataFrame([
+        {
+            "combination": row["label"],
+            "kept": "★" if row["on"] == best.get("on") else "",
+            "R²": f"{row['r2']:.5f}" if np.isfinite(row["r2"]) else "—",
+            "adjusted R²": (f"{row['adj_r2']:.5f}"
+                            if np.isfinite(row["adj_r2"]) else "—"),
+            "BIC": f"{row['bic']:.1f}" if np.isfinite(row["bic"]) else "—",
+            "coefficients m": row["n_params"],
+            "": row["error"],
+        }
+        for row in rows
+    ])
+    flat_table(frame, align_right=["R²", "adjusted R²", "BIC", "coefficients m"])
+    b = found.get("boundaries_pct") or ()
+    st.caption(
+        f"Judged by **{PW_CRITERIA.get(criterion, criterion)}**"
+        + (f", every row fitted at ε = ({b[1]:.2f}, {b[2]:.2f}, {b[3]:.2f}) %, "
+           f"x_end = {b[4]:.1f} %" if len(b) >= 5 else "")
+        + ". Only which components are in the model differs between the rows."
+    )
+    st.caption(PW_CRITERION_HELP.get(criterion, ""))
 
 
 def _pw_score(placement, epsilon, force_N, model):
@@ -6562,7 +6876,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
     # ================================================= the control board
     board = st.container(border=True)
     with board:
-        head1, head2 = st.columns([1, 2.2])
+        head1, head2, head3 = st.columns([1, 1, 1.6])
         with head1:
             pressed = st.button(
                 "▶ Fit & plot", type="primary", key="pw_fit_plot",
@@ -6571,7 +6885,33 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "and the results.",
                 **STRETCH,
             )
-        status_slot = head2.empty()
+        with head2:
+            refreshed = st.button(
+                "🔄 Refresh graph", key="pw_refresh",
+                help="Redraws the graph and the results at exactly what the "
+                "board holds now. Moves no boundary and chooses nothing: "
+                "the same fit the board describes, drawn again.",
+                **STRETCH,
+            )
+        with head3:
+            st.selectbox(
+                "judged by", list(PW_CRITERIA), format_func=PW_CRITERIA.get,
+                key="pw_combo_criterion", label_visibility="collapsed",
+                help="Which number the search below keeps the best of.",
+            )
+            criterion = st.session_state.get("pw_combo_criterion", "adj_r2")
+            searched = st.button(
+                f"🔎 Find the best combination based on "
+                f"{PW_CRITERIA[criterion]}",
+                key="pw_find_combo",
+                help="Fits all "
+                f"{len(PW_COMBINATIONS)} combinations of the components at "
+                "the boundaries on the board, keeps the best by this "
+                "number, ticks it here and redraws. The combinations are "
+                "compared in the table under 'Component combinations'.",
+                **STRETCH,
+            )
+        status_slot = st.empty()
         st.markdown("#### 🎛️ Fitting options")
         t1, t2, t3 = st.columns([1.05, 1.25, 0.9], gap="medium")
         with t1:
@@ -6660,7 +7000,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
                            key="pw_reset_board",
                            help="ε = " + " / ".join(f"{v:g}" for v in spec)
                            + " %, the specification's ranges, p₀ and bounds, "
-                           "every component on. Applied with ▶ Fit & plot."):
+                           "the four main components on and the contact line "
+                           "off. Applied with ▶ Fit & plot."):
                 rerun_keeping_settings({
                     **dict(zip(PW_BOUNDARY_KEYS, spec)),
                     "pw_settings": {},
@@ -6669,10 +7010,33 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     "pw_method": "typed",
                     **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
                     **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
-                    **{f"pw_use_{n}": True for n in PW_SWITCHABLE},
+                    **{f"pw_use_{n}": DEFAULTS[f"pw_use_{n}"]
+                       for n in PW_SWITCHABLE},
                     "pw_reset_board": False,
                     "_pw_editor_reset": True,
                 })
+
+    # 🔎 Find the best combination: every combination fitted where the board
+    # says, the best by the chosen number ticked on the board and applied.
+    if searched:
+        with st.spinner(f"Fitting {len(PW_COMBINATIONS)} combinations of the "
+                        "components at these boundaries…"):
+            found_combo = pw_combination_search(epsilon, force_N, criterion)
+        st.session_state["pw_combo_search"] = found_combo
+        best = found_combo.get("best")
+        if best is None:
+            st.error("No combination of components fits this curve at these "
+                     "boundaries. Move ε, or press ▶ Fit & plot to place it.")
+        else:
+            rerun_keeping_settings({
+                **{f"pw_use_{n}": (n in best["on"]) for n in PW_SWITCHABLE},
+                "_pw_apply": True,
+            })
+
+    # 🔄 Refresh graph: draw the board as it stands, moving nothing.
+    if refreshed:
+        apply_board()
+        applied = st.session_state["pw_applied"]["values"]
 
     # ▶ Fit & plot: place ε if the route says so, then apply the board.
     if pressed:
@@ -6794,6 +7158,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     ),
                     key="pw_curve", **STRETCH,
                 )
+                # What is on the graph right now, in one line, under it.
+                piecewise_graph_note(
+                    result, off=off_now,
+                    view=st.session_state.get("pw_view", "stacked"),
+                    log_y=log_y, fit_id_text=fid,
+                    n_points=int(np.size(epsilon)),
+                )
                 fitted = predict_piecewise(epsilon, result)
 
         with results_slot:
@@ -6826,10 +7197,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
             fit_explainer(fit, result if ok else None)
 
         # ---- what decided it, from the same fit ------------------------
-        t_routes, t_coef, t_model, t_set, t_work = st.tabs([
-            "ε routes compared", "θ̂ by regime", "Model F(x)",
-            "Settings used", "🔍 Working",
+        t_routes, t_combo, t_coef, t_model, t_set, t_work = st.tabs([
+            "ε routes compared", "Component combinations", "θ̂ by regime",
+            "Model F(x)", "Settings used", "🔍 Working",
         ])
+        with t_combo:
+            combination_search_table(st.session_state.get("pw_combo_search"))
         with t_routes:
             if placements:
                 piecewise_placement_table(placements, piecewise_boundaries(),
@@ -9402,6 +9775,47 @@ def components_note(fit):
         )
 
 
+def legacy_graph_note(fit, epsilon=None):
+    """
+    What is on the curve above, in one line, under it.
+
+    Written from the fit that was drawn, so it describes the picture on
+    screen rather than what the board would draw next.
+    """
+    n = int(np.size(epsilon)) if epsilon is not None else 0
+    if not (fit and fit.get("success")):
+        st.caption(
+            "**On the graph now:** the measured curve"
+            + (f" ({n} points)" if n else "")
+            + " only. Press **▶ Fit & plot** and the fitted curve, its "
+            "components and its boundaries are drawn on it."
+        )
+        return
+    drawn = [f"{plain_name(term).lower()} ({element_support(term, fit)})"
+             for term in ALL_TERMS if term in (fit.get("terms") or ())]
+    lo, hi = fit.get("epsilon_range", (float("nan"), float("nan")))
+    parts = [
+        "**On the graph now:** the data"
+        + (f" ({n} points)" if n else "")
+        + " and the fitted curve"
+        + (f" of `fit {fit['fit_id']}`" if fit.get("fit_id") else "")
+        + (f", R² = {fit['r_squared']:.5f}"
+           if np.isfinite(fit.get("r_squared", float("nan"))) else ""),
+        ("components, each over its own stretch: " + "; ".join(drawn))
+        if drawn else "no separate components",
+    ]
+    edges = fit_edges(fit)
+    if edges:
+        parts.append("boundaries " + ", ".join(f"{name} = {value:.3f}"
+                                               for value, name in edges)
+                     + (" (drawn)" if layer_on("boundaries")
+                        else " (lines hidden)"))
+    if np.isfinite(lo) and np.isfinite(hi):
+        parts.append(f"fitted over ε {lo:.3f} to {hi:.3f}"
+                     + (", shaded" if layer_on("range") else ""))
+    st.caption(" · ".join(parts) + ".")
+
+
 def boundaries_note(fit):
     """The boundaries of the fit on the plot, and any the next fit will move."""
     if not (fit and fit.get("success")):
@@ -11692,7 +12106,9 @@ with tab_analysis:
             # board until it is pressed.
             fit_block = results_area = verdict_slot = boundaries_slot = None
             board_status = None
-            fit_pressed = False
+            fit_pressed = refresh_pressed = combo_pressed = False
+            legacy_criterion = st.session_state.get("legacy_combo_criterion",
+                                                    "adj_r2")
             if guided:
                 plot_col, res_col = st.columns([1.75, 1], gap="large")
                 with plot_col:
@@ -11710,7 +12126,7 @@ with tab_analysis:
                     "🔍 The working, in detail", expanded=False
                 )
                 fit_block.__enter__()
-                head1, head2 = st.columns([1, 2.2])
+                head1, head2, head3 = st.columns([1, 1, 1.6])
                 with head1:
                     fit_pressed = st.button(
                         "▶ Fit & plot", type="primary", key="guided_fit",
@@ -11720,7 +12136,37 @@ with tab_analysis:
                         "the graph and the results.",
                         **STRETCH,
                     )
-                board_status = head2.empty()
+                with head2:
+                    refresh_pressed = st.button(
+                        "🔄 Refresh graph", key="guided_refresh",
+                        disabled=not active_terms(),
+                        help="Redraws the graph and the results at exactly "
+                        "what the board holds now. Moves no boundary and "
+                        "chooses nothing.",
+                        **STRETCH,
+                    )
+                with head3:
+                    st.selectbox(
+                        "judged by", list(PW_CRITERIA),
+                        format_func=PW_CRITERIA.get,
+                        key="legacy_combo_criterion",
+                        label_visibility="collapsed",
+                        help="Which number the search below keeps the best of.",
+                    )
+                    legacy_criterion = st.session_state.get(
+                        "legacy_combo_criterion", "adj_r2")
+                    combo_pressed = st.button(
+                        "🔎 Find the best combination based on "
+                        + PW_CRITERIA[legacy_criterion],
+                        key="guided_find_combo",
+                        help="Fits every combination of this cell type's "
+                        "components at the boundaries on the board, keeps "
+                        "the best by this number, ticks it here and "
+                        "redraws. The combinations are compared under "
+                        "**Component combinations** below the curve.",
+                        **STRETCH,
+                    )
+                board_status = st.empty()
                 st.markdown("#### 🎛️ Fitting options")
                 tile1, tile2, tile3 = st.columns([1.05, 1.25, 0.9], gap="medium")
                 with tile1:
@@ -11803,6 +12249,30 @@ with tab_analysis:
                 components_slot = st.container()
                 chosen = active_terms()
 
+
+            # 🔎 Find the best combination, now that the range is known:
+            # every combination fitted where the board says, the winner
+            # ticked on the board and fitted again as the page's fit.
+            if guided and combo_pressed:
+                with st.spinner("Fitting every combination of the components "
+                                "at these boundaries…"):
+                    found_combo = legacy_combination_search(
+                        model, guided_lo, guided_hi, here, legacy_criterion)
+                if not found_combo or not found_combo.get("best"):
+                    st.error("No combination of the components fits this "
+                             "curve at these boundaries.")
+                else:
+                    st.session_state["legacy_combo_search"] = found_combo
+                    best = found_combo["best"]
+                    rerun_keeping_settings({
+                        **{f"use_{term}": (term in best["on"])
+                           for term in here},
+                        "_fit_from_curve": True,
+                    })
+
+            # 🔄 Refresh graph: fit at what the board holds, moving nothing.
+            if guided and refresh_pressed and chosen:
+                rerun_keeping_settings({"_fit_from_curve": True})
 
             # ▶ Fit & plot, now that the range, the components and the
             # boundaries on the board are known.
@@ -13559,6 +14029,8 @@ with tab_analysis:
                         **STRETCH,
                     )
                     apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
+                    # What is on the graph right now, in one line, under it.
+                    legacy_graph_note(fit, epsilon)
 
                     # One row of nesting at most: this sits in a column
                     # already, and the layer list has columns of its own.
@@ -13568,6 +14040,11 @@ with tab_analysis:
                         st.markdown("**Plot options**")
                         plot_option_controls()
                         save_plot_controls(figure, fit, date_acquired)
+
+                    with st.expander("🔎 Component combinations compared",
+                                     expanded=False):
+                        legacy_combination_table(
+                            st.session_state.get("legacy_combo_search"))
 
                 panel_index = 0
                 if show_schematic and panel_index < len(panel_cols):
