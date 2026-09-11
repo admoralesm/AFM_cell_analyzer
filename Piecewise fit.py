@@ -568,8 +568,10 @@ def fit_piecewise(
                         f"by its bounds, so it was not fitted."
                     )
                 elif at_bound[j]:
-                    where = "its lower bound" if np.isclose(
-                        params[j], t.lower, atol=1e-300) else "its upper bound"
+                    near_lower = (not np.isfinite(t.upper)) or (
+                        np.isfinite(t.lower)
+                        and abs(params[j] - t.lower) <= abs(params[j] - t.upper))
+                    where = "its lower bound" if near_lower else "its upper bound"
                     warnings.append(
                         f"{t.name} in {regime.key} settled on {where} "
                         f"({params[j]:.3g}). The data wanted it further out; "
@@ -973,6 +975,7 @@ def find_boundaries(
     fine_step=0.1,
     profile_step=0.25,
     min_width=2.0,
+    span_pct=None,
 ):
     """
     The e1, e2, e3 that maximise the likelihood of the four-regime model.
@@ -987,8 +990,11 @@ def find_boundaries(
     3. A profile of each boundary across its band with the others at the
        optimum: Delta(-2 ln L) = n ln(S / S_min), giving 68 % (<= 1) and
        95 % (<= 3.84) intervals.
-    4. The specification scored the same way:
-       Delta BIC = n ln(S_spec / S_min) - 3 ln n.
+    4. The reference placement ``spec_pct`` scored the same way:
+       Delta BIC = n ln(S_ref / S_min) - 3 ln n.
+
+    ``span_pct`` = (low, high) additionally holds e3 - e2 inside that
+    range: for a C2C12, how long the nuclear bump lasts once it is met.
     """
     x_all, f_all = _prepare(epsilon, force_N)
     regimes = with_settings(regimes, settings)
@@ -1003,9 +1009,13 @@ def find_boundaries(
     width = float(min_width)
     needs = [len(r.terms) + (1 if r.free_offset else 0) + 2 for r in regimes]
 
+    span = tuple(float(v) for v in span_pct) if span_pct else None
+
     def valid(b):
         edges = (0.0,) + tuple(b) + (end,)
         if any(e1 - e0 < width for e0, e1 in zip(edges, edges[1:])):
+            return False
+        if span and not (span[0] - 1e-9 <= b[2] - b[1] <= span[1] + 1e-9):
             return False
         for i, need in enumerate(needs):
             last = i == len(needs) - 1
@@ -1116,25 +1126,25 @@ def find_boundaries(
         delta_m2lnl = delta_bic = float("nan")
 
     if not np.isfinite(delta_bic):
-        verdict = ("The specification's boundaries cannot be fitted on this "
-                   "curve, so the found ones are the only placement.")
+        verdict = ("The reference boundaries cannot be fitted on this curve, "
+                   "so the found ones are the only placement.")
         strength = "only"
     elif delta_bic > 6:
-        verdict = ("Strong evidence for the found boundaries: they fit "
-                   "better than the specification's by more than the cost "
-                   "of choosing three numbers.")
+        verdict = ("Strong evidence: the curve itself places the boundaries "
+                   "here, by more than the cost of choosing three numbers.")
         strength = "strong"
     elif delta_bic > 2:
-        verdict = "Positive evidence for the found boundaries."
+        verdict = "Positive evidence that the curve places the boundaries here."
         strength = "positive"
     elif delta_bic > 0:
-        verdict = ("Weak evidence: the found boundaries fit a little better, "
-                   "hardly more than choosing them costs.")
+        verdict = ("Weak evidence: this placement fits a little better than "
+                   "the reference, hardly more than choosing it costs.")
         strength = "weak"
     else:
-        verdict = ("No evidence for moving them: the improvement is smaller "
-                   "than the cost of choosing three numbers, so the "
-                   "specification's boundaries describe this curve as well.")
+        verdict = ("The curve does not pin the boundaries down more tightly "
+                   "than the constraints do: the reference placement fits "
+                   "about as well. Read the intervals as how far each one "
+                   "could move.")
         strength = "none"
 
     return {
@@ -1152,6 +1162,7 @@ def find_boundaries(
         "intervals": intervals,
         "profiles": curves,
         "bands_pct": tuple(bands),
+        "span_pct": span,
         "carry": carry,
         "n_evaluations": len(cache),
     }
