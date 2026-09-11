@@ -236,11 +236,15 @@ def four_regime_curve(n=900, noise_N=0.2e-9):
     f40 = f5 + ks * 35 ** 3 + kc * 35 ** 1.5
     f60 = f40 + kn * 20 ** 3 + knc * 20 ** 1.5
     d = lambda a: np.clip(x - a, 0.0, None)  # noqa: E731
+    # The membrane acts throughout: its cube law keeps rising after 40 %.
+    shell = ks * d(5) ** 3
+    f60 = f60 + ks * (55 ** 3 - 35 ** 3)
     force = np.where(
         x < 5, k * x + c0,
-        np.where(x < 40, f5 + ks * d(5) ** 3 + kc * d(5) ** 1.5,
-                 np.where(x < 60, f40 + kn * d(40) ** 3 + knc * d(40) ** 1.5,
-                          f60 + kcore * d(60) ** 1.5)))
+        np.where(x < 40, f5 + shell + kc * d(5) ** 1.5,
+                 np.where(x < 60, f40 + kn * d(40) ** 3 + knc * d(40) ** 1.5
+                          + shell - ks * 35 ** 3,
+                          f60 + kcore * d(60) ** 1.5 + shell - ks * 55 ** 3)))
     rng = np.random.default_rng(1)
     return x / 100.0, force + noise_N * rng.standard_normal(n)
 
@@ -280,6 +284,26 @@ def case_c2c12_opens_on_the_four_regime_fit():
     if no_exception(app, "putting the spec back"):
         check("the reset puts the spec's boundaries back",
               state(app, "pw_b2") == 40.0, str(state(app, "pw_b2")))
+
+    check("the membrane acts throughout by default",
+          state(app, "pw_membrane_throughout") is True
+          and state(app, "results")["fit"]["piecewise"]["membrane_throughout"])
+
+    app.button(key="pw_find").click().run()
+    if no_exception(app, "finding the boundaries"):
+        found = state(app, "pw_boundary_search") or {}
+        check("the boundary search ran", found.get("success") is True,
+              str(found.get("error")))
+        used = [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]
+        fitted = state(app, "results")["fit"]["piecewise"]
+        check("and the fit on the page is at the boundaries it left",
+              [round(v, 2) for v in fitted["boundaries_pct"][1:4]]
+              == [round(v, 2) for v in used],
+              f"{fitted['boundaries_pct']} vs {used}")
+        check("which says where they came from",
+              "search" in fitted["boundary_source"]
+              or "specification" in fitted["boundary_source"],
+              fitted["boundary_source"])
 
     app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
     if no_exception(app, "switching to the spring-network models"):
