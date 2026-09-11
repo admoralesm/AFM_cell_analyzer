@@ -545,19 +545,35 @@ def fit_piecewise(
             # answer and needs none.
             k0 = (f[-1] - f[0]) / (x[-1] - x[0]) if x[-1] > x[0] else 0.0
             c0 = float(np.mean(f_all[:10]))
-            design = np.column_stack([x ** p for p in powers] + [np.ones_like(x)])
-            sol, *_ = np.linalg.lstsq(design, f, rcond=None)
-            predicted = design @ sol
-            cov = _covariance(design, f - predicted, np.ones(design.shape[1], bool))
-            slope, offset = float(sol[0]), float(sol[1])
+            term0 = regime.terms[0]
+            held = bool(np.isfinite(term0.lower) and term0.lower == term0.upper)
+            if held:
+                # The contact slope switched off (or pinned): held at its
+                # bound, and only the offset C0 is fitted, F = k x + C0.
+                slope = float(term0.lower)
+                offset = float(np.mean(f - slope * x))
+                predicted = slope * x + offset
+                resid = f - predicted
+                se_c0 = (float(np.std(resid, ddof=1) / np.sqrt(resid.size))
+                         if resid.size > 1 else float("nan"))
+                se_k = 0.0
+            else:
+                design = np.column_stack([x ** p for p in powers] + [np.ones_like(x)])
+                sol, *_ = np.linalg.lstsq(design, f, rcond=None)
+                predicted = design @ sol
+                cov = _covariance(design, f - predicted, np.ones(design.shape[1], bool))
+                slope, offset = float(sol[0]), float(sol[1])
+                se_k = float(np.sqrt(max(cov[0, 0], 0.0)))
+                se_c0 = float(np.sqrt(max(cov[1, 1], 0.0)))
             entry["params"][names[0]] = {
-                "value": slope, "se": float(np.sqrt(max(cov[0, 0], 0.0))),
-                "p0": float(k0), "lower": -np.inf, "upper": np.inf,
-                "power": 1.0, "at_bound": False,
+                "value": slope, "se": se_k,
+                "p0": float(k0), "lower": term0.lower if held else -np.inf,
+                "upper": term0.upper if held else np.inf,
+                "power": 1.0, "at_bound": held,
                 "start": float(a), "until": float(b),
             }
             entry["params"]["C0"] = {
-                "value": offset, "se": float(np.sqrt(max(cov[1, 1], 0.0))),
+                "value": offset, "se": se_c0,
                 "p0": c0, "lower": -np.inf, "upper": np.inf, "power": 0.0,
                 "at_bound": False,
             }
