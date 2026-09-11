@@ -264,10 +264,16 @@ def case_c2c12_opens_on_the_four_regime_fit():
     fit = (state(app, "results") or {}).get("fit") or {}
     check("it has fitted without anything being pressed",
           fit.get("coupling") == "piecewise", str(fit.get("coupling")))
-    check("at the spec's boundaries",
-          [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3", "pw_end")]
-          == [5.0, 40.0, 60.0, 91.2],
-          str([state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3", "pw_end")]))
+    # Its boundaries are found from the curve at once, inside the C2C12
+    # constraints: contact under 5 %, nucleus met at 44 to 62 %, dense
+    # packing 15 to 35 % after that.
+    e1, e2, e3 = (state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3"))
+    check("with its boundaries found inside the C2C12 constraints",
+          1.0 <= e1 <= 5.0 and 44.0 <= e2 <= 62.0 and 15.0 <= e3 - e2 <= 35.0,
+          str((e1, e2, e3)))
+    check("and saying so",
+          "constraints" in state(app, "results")["fit"]["piecewise"]["boundary_source"],
+          state(app, "results")["fit"]["piecewise"]["boundary_source"])
     labels = [m.label for m in app.metric]
     for symbol in ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core", "E_align"):
         check(f"{symbol} is on the page", any(symbol in l for l in labels),
@@ -281,9 +287,11 @@ def case_c2c12_opens_on_the_four_regime_fit():
         check("moving a boundary refits at once", moved[2] == 35.0, str(moved))
 
     app.button(key="pw_reset").click().run()
-    if no_exception(app, "putting the spec back"):
-        check("the reset puts the spec's boundaries back",
-              state(app, "pw_b2") == 40.0, str(state(app, "pw_b2")))
+    if no_exception(app, "putting the defaults back"):
+        check("the reset puts the C2C12 defaults back",
+              [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]
+              == [5.0, 50.0, 75.0],
+              str([state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]))
 
     check("the membrane acts throughout by default",
           state(app, "pw_membrane_throughout") is True
@@ -321,8 +329,7 @@ def case_c2c12_opens_on_the_four_regime_fit():
               == [round(v, 2) for v in used],
               f"{fitted['boundaries_pct']} vs {used}")
         check("which says where they came from",
-              "search" in fitted["boundary_source"]
-              or "specification" in fitted["boundary_source"],
+              "constraints" in fitted["boundary_source"],
               fitted["boundary_source"])
 
     app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
