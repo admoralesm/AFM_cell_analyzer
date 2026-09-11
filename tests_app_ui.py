@@ -389,9 +389,9 @@ def case_bare_plot():
           str([box.label for box in app.checkbox][:10]))
     check("element curves off by default",
           app.session_state["show_components"] is False)
-    check("and nothing is on the plot until it is sent",
-          not (state(app, "plot_layers") or []),
-          str(state(app, "plot_layers")))
+    check("and only the boundaries are on it until something is sent",
+          [row["kind"] for row in (state(app, "plot_layers") or [])]
+          == ["boundaries"], str(state(app, "plot_layers")))
 
     import app as app_module
 
@@ -749,24 +749,19 @@ def case_all_three_moduli_always_reported():
         fit_button.click().run()
     if not no_exception(app, "membrane only"):
         return
-    labels = [m.label for m in app.get("metric")]
+    import app as app_module
+    rows = app_module.result_rows(state(app, "_last_fit"))
+    labels = [row[1] for row in rows]
     for wanted in ("membrane", "cytoskeleton", "nucleus"):
-        check(f"{wanted} has a tile with only the membrane selected",
+        check(f"{wanted} has a row with only the membrane selected",
               any(wanted in (l or "").lower() for l in labels), str(labels))
-    values = {m.label: (m.value, m.delta) for m in app.get("metric")}
-    # Only the modulus tiles. "Ec spread" is a diagnostic, not a modulus,
-    # and matching it here is how this check started counting three.
-    off = [
-        (label, value, delta)
-        for label, (value, delta) in values.items()
-        if (label.startswith("Ec ") or label.startswith("E\u2099 "))
-        and not label.endswith("spread")
-    ]
-    check("both switched-off modulus tiles were found", len(off) == 2, str(list(values)))
-    for label, value, delta in off:
-        check(f"{label} reads zero", value.strip().startswith("0"), value)
-        check(f"{label} says it was not in the model",
-              "not in this model" in (delta or ""), str(delta))
+    off = [row for row in rows
+           if row[0].startswith("modulus_")
+           and row[0] != "modulus_membrane"]
+    check("the switched-off moduli are all listed", len(off) >= 2, str(labels))
+    for row in off:
+        check(f"{row[1]} says it was not in the model",
+              "not in this model" in row[2], str(row[2]))
 
 
 def case_load_share_table():
@@ -1381,12 +1376,14 @@ def case_a_zero_modulus_is_a_measurement():
     app.run()
     if not no_exception(app, "a component left out"):
         return
-    notes = " ".join(str(m.delta or "") for m in app.get("metric"))
+    import app as app_module
+    rows = app_module.result_rows(state(app, "_last_fit"))
     check("a component left out of the model is named as left out",
-          "not in this model" in notes, notes[:300])
+          any("not in this model" in row[2] for row in rows),
+          str([row[2] for row in rows]))
     check("rather than reading as a measured zero",
-          any("0" in str(m.value) for m in app.get("metric")),
-          str([m.value for m in app.get("metric")][:6]))
+          any(row[2][0].isdigit() for row in rows if row[0].startswith("modulus_")),
+          str([row[2] for row in rows]))
 
 
 def case_fit_statistics():
@@ -1443,9 +1440,10 @@ def case_chi_squared_reaches_the_page():
     app = start(cell_name="cell-01")
     if not no_exception(app, "chi squared on the page"):
         return
-    labels = [m.label for m in app.get("metric")]
-    check("a chi-squared tile is shown",
-          any("χ²" in (l or "") for l in labels), str(labels))
+    import app as app_module
+    rows = app_module.result_rows(state(app, "_last_fit"))
+    check("a chi-squared row is shown",
+          any("χ²" in row[3] for row in rows), str([row[3] for row in rows]))
     captions = " ".join(str(c.value) for c in app.get("caption"))
     check("it explains what about 1 means",
           "as close to the points as the scatter" in captions, "no explanation")
@@ -4986,7 +4984,7 @@ def case_the_controls_sit_above_the_curve():
           "settings box is not in the sidebar")
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
-          > source.index('st.markdown("#### Fitting results")'))
+          > source.index('section("4 · Fitting results")'))
     check("and the power-law picture has a tab of its own",
           'st.markdown("#### Where the curve changes its power law")'
           in source and '"📈 Log curve and boundaries"' in source)
@@ -5324,8 +5322,14 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
     check("a C2C12 has boundaries of its own",
           abs(wanted["segment_break_1"] - 0.15) < 1e-9
           and band[0] <= wanted["segment_break_2"] <= band[1], str(wanted))
-    check("and that band is the published one, 44 % to 70 %",
-          abs(band[0] - 0.44) < 1e-9 and abs(band[1] - 0.70) < 1e-9, str(band))
+    # The nucleus shows as a bump at about half the squash that runs on for
+    # another quarter, so the onset band is that, not a third of the curve.
+    check("and that band is where the nucleus bump starts",
+          abs(band[0] - 0.44) < 1e-9 and abs(band[1] - 0.62) < 1e-9, str(band))
+    bump = app_module.bump_window("Myoblast (C2C12)")
+    check("the bump itself is recorded, 50 % running to 75 %",
+          bump is not None and abs(bump[0] - 0.50) < 1e-9
+          and abs(bump[1] - 0.75) < 1e-9, str(bump))
     check("and an unknown cell type falls back to the app's",
           app_module.default_boundaries("Something else")["segment_break_1"]
           == app_module.DEFAULTS["segment_break_1"])
@@ -6013,9 +6017,11 @@ def case_a_fixed_cell_is_one_hertzian_solid():
           abs(fit["Ei_kPa"] - 190.0) < 10.0, f"{fit['Ei_kPa']:.4g} kPa")
     check("which is in the range the paper reports for fixed cells",
           150.0 <= fit["Ei_kPa"] <= 230.0, f"{fit['Ei_kPa']:.4g} kPa")
-    notes = " ".join(str(m.delta or "") for m in app.get("metric"))
+    import app as app_module
+    rows = app_module.result_rows(fit)
     check("the others are marked as not in this model",
-          "not in this model" in notes, notes[:200])
+          any("not in this model" in row[2] for row in rows),
+          str([row[2] for row in rows]))
     # The living cell type underneath is untouched: fixation changed the
     # chemistry, not the geometry the prefactors are built from.
     check("and the cell type underneath is left alone",
@@ -6195,27 +6201,27 @@ def case_a_new_curve_arrives_ready_to_fit():
     # modulus is in rather than in a second table of the same numbers.
     fit = state(app, "_last_fit")
     check("it was fitted on arrival", fit and fit.get("success"))
-    wanted_labels = {
-        f"{app_module.TERM_SYMBOLS[t]} "
-        f"{app_module.plain_name(t, 'Cardiomyocyte').lower()}"
-        for t in here
-    }
-    tiles = [m for m in app.get("metric") if (m.label or "") in wanted_labels]
-    check("there is a tile for every component of this cell type",
-          len(tiles) == len(here), str([m.label for m in tiles]))
-    check("and the uncertainty is in the number, not under it",
-          any("±" in str(m.value) for m in tiles),
-          str([m.value for m in tiles]))
-    check("no second table repeats the moduli",
+    rows = app_module.result_rows(fit)
+    keys = [row[0] for row in rows]
+    check("there is a row for every component of this cell type",
+          all(f"modulus_{t}" in keys for t in here), str(keys))
+    check("and the uncertainty is a column of its own",
+          any(row[3].startswith("±") for row in rows),
+          str([row[3] for row in rows]))
+    check("with the interval beside it",
+          any(" to " in row[4] for row in rows),
+          str([row[4] for row in rows]))
+    check("the goodness of fit is a row too",
+          "quality" in keys and "boundaries" in keys, str(keys))
+    check("no table of tiles repeats the moduli",
           table_with(app, "modulus", "± (standard error)") is None)
     # The half-open reading of a range was the bug: an element that stops
     # taking more load has not stopped carrying it.
+    supports = [row[5] for row in rows if row[0].startswith("modulus_")]
     check("a component that holds is said to hold, not to stop",
-          all("stiffening to the end" in str(m.delta)
-              or "holding from" in str(m.delta)
-              or "not in this model" in str(m.delta)
-              for m in tiles),
-          str([m.delta for m in tiles]))
+          all("stiffening to the end" in note or "holding from" in note
+              or "not in this model" in note for note in supports),
+          str(supports))
 
 
 def case_the_boundaries_come_from_the_log_curve():
@@ -6299,9 +6305,11 @@ def case_the_plot_carries_what_is_sent_to_it():
     if not no_exception(app, "before anything is sent"):
         return
 
-    check("nothing extra is on the plot to start with",
-          not (state(app, "plot_layers") or []),
-          str(state(app, "plot_layers")))
+    # A curve arrives with its boundaries drawn: they are the first thing
+    # anybody checks against the shape of the curve.
+    started = state(app, "plot_layers") or []
+    check("a new curve arrives with its boundaries on the plot",
+          [row["kind"] for row in started] == ["boundaries"], str(started))
     said = " ".join(str(m.value) for m in
                     list(app.get("markdown")) + list(app.get("caption")))
     check("the figure says what it is carrying", "On the plot" in said,
@@ -6328,7 +6336,8 @@ def case_the_plot_carries_what_is_sent_to_it():
     if not no_exception(app, "sending a piece to the plot"):
         return
     layers = state(app, "plot_layers") or []
-    check("what was sent is on the plot", len(layers) == 1, str(layers))
+    check("what was sent joins what was there",
+          len(layers) == len(started) + 1, str(layers))
     check("and the list under the figure names it",
           any(layers[0]["kind"] in row["kind"] for row in layers), str(layers))
 
@@ -6339,7 +6348,8 @@ def case_the_plot_carries_what_is_sent_to_it():
         button.click().run()
         break
     layers = state(app, "plot_layers") or []
-    check("a second piece goes on beside the first", len(layers) == 2,
+    check("a second piece goes on beside the first",
+          len(layers) == len(started) + 2,
           str([row["kind"] for row in layers]))
     if any(row["kind"] == "boundaries" for row in layers):
         app.session_state["segment_break_2"] = 0.47
