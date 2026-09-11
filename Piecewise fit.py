@@ -24,6 +24,14 @@ R2 keeps rising, with that same K_shell, through R3 and R4, which fit what
 is left on top of it (``carry``; pass ``carry=()`` for the laws exactly as
 written above).
 
+Each element also has a range of its own (:func:`component_ranges`): it
+starts where its regime starts and stops adding load at its own ``until``,
+holding what it reached after. By default that is its regime's end (the
+fit's end for the membrane); an earlier ``until`` stops it inside its
+regime, a later one carries it on into the next. Written out, the model is
+
+    F(x) = F(e1) + sum_j K_j * [min(x, until_j) - start_j]_+ ^ p_j,  x >= e1
+
 The three inner boundaries (e1, e2, e3 = 5, 40, 60 %) can be placed by
 :func:`find_boundaries`, which profiles the likelihood of the same model
 over them and compares the result with the specification by BIC.
@@ -63,6 +71,7 @@ __all__ = [
     "predict_piecewise",
     "regime_curves",
     "component_curve",
+    "component_ranges",
     "find_boundaries",
     "joint_design",
     "joint_sse",
@@ -87,6 +96,10 @@ class Term:
     # Which element this coefficient describes, for the modulus conversion.
     element: str = ""
     label: str = ""
+    # Where this element stops adding load, in percent. NaN means the end of
+    # its own regime (or the end of the fit for a carried element). Past it
+    # the element holds the force it reached, so the curve has no step.
+    until: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -157,8 +170,8 @@ def with_settings(regimes, settings):
     """
     The regimes with the user's initial guesses and bounds applied.
 
-    ``settings`` maps a coefficient name to any of ``p0``, ``lower`` and
-    ``upper``. Names that are not in the regimes are ignored, so a stored
+    ``settings`` maps a coefficient name to any of ``p0``, ``lower``,
+    ``upper`` and ``until`` (where the element stops adding load, percent). Names that are not in the regimes are ignored, so a stored
     setting for a coefficient that no longer exists cannot break a fit.
     """
     settings = settings or {}
@@ -168,7 +181,7 @@ def with_settings(regimes, settings):
         for term in regime.terms:
             wanted = settings.get(term.name) or {}
             changes = {}
-            for key in ("p0", "lower", "upper"):
+            for key in ("p0", "lower", "upper", "until"):
                 if key in wanted and wanted[key] is not None:
                     try:
                         changes[key] = float(wanted[key])
@@ -316,6 +329,46 @@ def _bounded_linear_fit(A, y, p0, lower, upper):
 
 # ============================================================ the pipeline ==
 
+def _resolve_ranges(regimes, bounds, carry=()):
+    """
+    {name: (start, until)} in percent, for every coefficient.
+
+    An element starts where its own regime starts: that is the point its
+    law is measured from, dx = x - start. It stops adding load at
+    ``until``: by default the end of its regime, or the end of the fit for
+    an element in ``carry``. An ``until`` inside the regime stops it early;
+    one past the regime carries it, with the value it was fitted at, into
+    the regimes after. Past ``until`` it holds the force it reached.
+    """
+    end = float(bounds[-1])
+    carry = tuple(carry or ())
+    out = {}
+    for i, regime in enumerate(regimes):
+        a, b = float(bounds[i]), float(bounds[i + 1])
+        for term in regime.terms:
+            if regime.free_offset:
+                out[term.name] = (a, b)
+                continue
+            u = term.until
+            if u is None or not np.isfinite(u) or u <= a:
+                u = end if term.name in carry else b
+            out[term.name] = (a, float(min(max(u, a + 1e-6), end)))
+    return out
+
+
+def component_ranges(boundaries_pct=C2C12_BOUNDARIES_PCT, regimes=C2C12_REGIMES,
+                     settings=None, carry=("K_shell",)):
+    """
+    Where each element acts, {name: (start_pct, until_pct)}.
+
+    The one place this is decided. The fit, the boundary search, the
+    curves drawn for each element and the range controls on the page all
+    read it, so they cannot disagree.
+    """
+    return _resolve_ranges(with_settings(regimes, settings),
+                           [float(b) for b in boundaries_pct], carry)
+
+
 def fit_piecewise(
     epsilon,
     force_N,
@@ -399,7 +452,8 @@ def fit_piecewise(
     regime_out = []
     chain_broken = False
     carry = tuple(carry or ())
-    carried = []   # [{"name", "power", "onset_pct", "value", "se"}]
+    ranges = _resolve_ranges(regimes, bounds, carry)
+    carried = []   # [{"name", "power", "onset_pct", "until_pct", "value"}]
 
     for i, regime in enumerate(regimes):
         a, b = bounds[i], bounds[i + 1]
@@ -466,6 +520,7 @@ def fit_piecewise(
                 "value": slope, "se": float(np.sqrt(max(cov[0, 0], 0.0))),
                 "p0": float(k0), "lower": -np.inf, "upper": np.inf,
                 "power": 1.0, "at_bound": False,
+                "start": float(a), "until": float(b),
             }
             entry["params"]["C0"] = {
                 "value": offset, "se": float(np.sqrt(max(cov[1, 1], 0.0))),
@@ -477,8 +532,13 @@ def fit_piecewise(
             entry["engine"] = "linear least squares"
             anchor = slope * b + offset
         else:
-            dx = x - a
-            design = np.column_stack([dx ** p for p in powers])
+            # Each element's law runs from the regime's start to its own
+            # end, and holds what it reached after that.
+            untils = np.array([ranges[t.name][1] for t in regime.terms])
+            design = np.column_stack([
+                (np.minimum(x, untils[j]) - a) ** powers[j]
+                for j in range(len(powers))
+            ])
             # What the carried elements add on top of the anchor here. Zero
             # at the regime's start, so the anchor is still the force there.
             known = _carried_force(carried, x, a)
@@ -499,6 +559,7 @@ def fit_piecewise(
                     "p0": float(t.p0), "lower": float(t.lower),
                     "upper": float(t.upper), "power": float(t.power),
                     "at_bound": bool(at_bound[j]),
+                    "start": float(a), "until": float(untils[j]),
                 }
                 coefficients[t.name] = float(params[j])
                 if at_bound[j] and t.lower == t.upper:
@@ -516,13 +577,15 @@ def fit_piecewise(
                     )
             entry["engine"] = engine
             anchor = anchor + float(
-                sum(params[j] * (b - a) ** powers[j] for j in range(len(powers)))
+                sum(params[j] * (min(b, untils[j]) - a) ** powers[j]
+                    for j in range(len(powers)))
             ) + float(_carried_force(carried, np.array([b]), a)[0])
             for j, t in enumerate(regime.terms):
-                if t.name in carry:
+                if untils[j] > b + 1e-9:
                     carried.append({
                         "name": t.name, "power": float(t.power),
-                        "onset_pct": float(a), "value": float(params[j]),
+                        "onset_pct": float(a), "until_pct": float(untils[j]),
+                        "value": float(params[j]),
                         "se": entry["params"][t.name]["se"],
                         "from_regime": regime.key,
                     })
@@ -548,6 +611,7 @@ def fit_piecewise(
         "coefficients": coefficients,
         "anchors": anchors,
         "carry": carry,
+        "ranges": {k: (float(v[0]), float(v[1])) for k, v in ranges.items()},
         "epsilon_range": (bounds[0] / 100.0, reach / 100.0),
         "warnings": warnings,
     }
@@ -601,9 +665,10 @@ def _carried_force(carried, x, a):
         if not np.isfinite(value) or value == 0.0:
             continue
         onset, power = float(c["onset_pct"]), float(c["power"])
+        until = float(c.get("until_pct", np.inf))
         out = out + value * (
-            np.clip(x - onset, 0.0, None) ** power
-            - max(a - onset, 0.0) ** power
+            np.clip(np.minimum(x, until) - onset, 0.0, None) ** power
+            - max(min(a, until) - onset, 0.0) ** power
         )
     return out
 
@@ -618,36 +683,35 @@ def _regime_force(regime, x):
     if regime["anchor_in_N"] is None:
         name = next(k for k in params if k != "C0")
         return params[name]["value"] * x + params["C0"]["value"]
-    dx = np.clip(x - a, 0.0, None)
     out = np.full(x.shape, float(regime["anchor_in_N"]))
     for p in params.values():
-        out = out + p["value"] * dx ** p["power"]
+        until = float(p.get("until", np.inf))
+        out = out + p["value"] * np.clip(np.minimum(x, until) - a, 0.0, None) ** p["power"]
     return out + _carried_force(list((regime.get("carried") or {}).values()), x, a)
 
 
 def component_curve(result, name, n=300):
     """
-    One element's own force from its onset to the end of the fit.
+    One element's own force over the stretch it acts on: (x_pct, F_N).
 
-    For a carried element (the cell shell, by default) this is the whole
-    stretch it acts over; for any other it is its own regime. Returns
-    (x_pct, F_N), or None when the element was not fitted.
+    From its start to its own ``until``, the same range the fit gave it, so
+    the line on the plot and the range on the page are one number. None
+    when the element was not fitted. The contact term is its straight line
+    including C0; every other element is measured from its own start.
     """
     regimes = result.get("regimes") or []
     home = next((r for r in regimes if name in r["params"]), None)
     if home is None or not home["fitted"]:
         return None
-    value = home["params"][name]["value"]
-    power = home["params"][name]["power"]
-    if not np.isfinite(value):
+    p = home["params"][name]
+    if not np.isfinite(p["value"]):
         return None
-    onset = home["domain_pct"][0]
-    end = home["domain_pct"][1]
-    if name in (result.get("carry") or ()):
-        fitted = [r for r in regimes if r["fitted"]]
-        end = fitted[-1]["domain_pct"][1] if fitted else end
-    x = np.linspace(onset, end, n)
-    return x, value * (x - onset) ** power
+    start = float(p.get("start", home["domain_pct"][0]))
+    until = float(p.get("until", home["domain_pct"][1]))
+    x = np.linspace(start, until, n)
+    if home["anchor_in_N"] is None:
+        return x, p["value"] * x + home["params"]["C0"]["value"]
+    return x, p["value"] * (x - start) ** p["power"]
 
 
 def predict_piecewise(epsilon, result):
@@ -766,6 +830,7 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
     anchor = np.zeros(len(names))
     carried = []
     carry = tuple(carry or ())
+    ranges = _resolve_ranges(regimes, bounds, carry)
     for i, regime in enumerate(regimes):
         a, b = bounds[i], bounds[i + 1]
         last = i == len(regimes) - 1
@@ -783,15 +848,18 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
         rows = np.tile(anchor, (xm.size, 1))
         after = anchor.copy()
         for term in regime.terms:
-            rows[:, col[term.name]] += (xm - a) ** term.power
-            after[col[term.name]] += (b - a) ** term.power
-        for name, power, onset in carried:
-            rows[:, col[name]] += (np.clip(xm - onset, 0.0, None) ** power
-                                   - max(a - onset, 0.0) ** power)
-            after[col[name]] += (b - onset) ** power - max(a - onset, 0.0) ** power
+            u = ranges[term.name][1]
+            rows[:, col[term.name]] += (np.minimum(xm, u) - a) ** term.power
+            after[col[term.name]] += (min(b, u) - a) ** term.power
+        for name, power, onset, u in carried:
+            base = max(min(a, u) - onset, 0.0) ** power
+            rows[:, col[name]] += (np.clip(np.minimum(xm, u) - onset, 0.0, None)
+                                   ** power - base)
+            after[col[name]] += max(min(b, u) - onset, 0.0) ** power - base
         for term in regime.terms:
-            if term.name in carry:
-                carried.append((term.name, float(term.power), float(a)))
+            u = ranges[term.name][1]
+            if u > b + 1e-9:
+                carried.append((term.name, float(term.power), float(a), float(u)))
         X[mask] = rows
         anchor = after
     return X, covered, names, lower, upper
