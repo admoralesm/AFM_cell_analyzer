@@ -165,15 +165,15 @@ def _missing_pieces():
         ("fit_composition", "the segmented fit"),
         ("search_compositions", "the “Try every combination” search"),
         ("composition_terms", "the fitted components on the plot"),
-        ("composition_curve", "the Balloon and spring tab"),
+        ("composition_curve", "the component curves on the plot"),
     ):
         if not hasattr(LulevichModel, method):
             stale.append(("lulevich_model.py", feature))
 
-    if compare_orderings is None:
-        stale.append(("lulevich_model.py", "the ordering comparison"))
-    if ordering_figure is None:
-        stale.append(("plot_utils.py", "the ordering chart"))
+    if not hasattr(LulevichModel, "local_exponent"):
+        stale.append(("lulevich_model.py", "the log-slope reading"))
+    if exponent_profile_figure is None:
+        stale.append(("plot_utils.py", "the power-law chart"))
 
     return stale
 
@@ -2514,6 +2514,20 @@ def view_token():
         bool(st.session_state.get("log_scale")),
         st.session_state.get("x_axis_mode"),
         st.session_state.get("y_axis_mode"),
+        # And the ranges. A view kept across a change of range is a view of
+        # where the curve used to be: the fitted stretch moves, the axes
+        # stay, and the panel looks empty until somebody double-clicks it.
+        # Pressing Fit changes none of these, so a zoom still survives that,
+        # which is the case the held view exists for.
+        round(float(st.session_state.get("window_start", 0.0)), 4),
+        round(float(st.session_state.get("window_end", 1.0)), 4),
+        round(float(st.session_state.get("segment_break_1", 0.0)), 4),
+        round(float(st.session_state.get("segment_break_2", 0.0)), 4),
+        tuple(
+            tuple(np.round(st.session_state.get(element_window_key(term))
+                           or (0.0, 0.0), 4))
+            for term in ALL_TERMS
+        ),
     ))
 
 
@@ -4391,6 +4405,121 @@ def fit_verdict():
         st.success(said)
 
 
+def stage_algebra(fit):
+    """
+    Each stretch of the squash, written as the sum of terms carrying it.
+
+    The boundaries are where the number of terms changes, so the useful
+    description of a boundary is the algebra either side of it: one term or
+    two, which two, and what exponent their sum therefore shows. Said in
+    words it is a paragraph; said as equations it is three lines that can be
+    checked against the slope plotted above.
+    """
+    if not (fit and fit.get("success")):
+        st.caption("Fit the curve and the algebra of each stretch appears here.")
+        return
+    terms = [t for t in ALL_TERMS if t in (fit.get("terms") or ())]
+    if not terms:
+        return
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    windows = fit.get("term_windows") or {}
+    q = float(fit.get("confinement", 0.0) or 0.0)
+
+    def support(term):
+        window = windows.get(term)
+        if window:
+            return float(window[0]), float(window[1])
+        return lo, hi
+
+    # The edges are wherever a term starts or stops taking more load.
+    edges = {round(lo, 6), round(hi, 6)}
+    for term in terms:
+        a, b = support(term)
+        for value in (a, b):
+            if lo < value < hi:
+                edges.add(round(float(value), 6))
+    edges = sorted(edges)
+
+    rows = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b - a < 1e-6:
+            continue
+        middle = 0.5 * (a + b)
+        rising, held = [], []
+        for term in terms:
+            start, stop = support(term)
+            if middle < start:
+                continue
+            (rising if middle < stop else held).append(term)
+        rows.append((a, b, rising, held))
+    if not rows:
+        return
+
+    lines = []
+    for a, b, rising, held in rows:
+        pieces = []
+        for term in rising:
+            a_tex, e_tex = EQUATION_TERMS[term][2], EQUATION_TERMS[term][3]
+            pieces.append(f"{a_tex} {e_tex}\\," + _basis_latex(term, fit))
+        for term in held:
+            a_tex, e_tex = EQUATION_TERMS[term][2], EQUATION_TERMS[term][3]
+            pieces.append(
+                r"\underbrace{" + f"{a_tex} {e_tex}" + r"\,\mathrm{const}}"
+                r"_{\text{held}}"
+            )
+        body = " + ".join(pieces) if pieces else r"0"
+        if q:
+            body = r"(1-\varepsilon)^{-" + f"{q:g}" + r"}\left[" + body + r"\right]"
+        lines.append(
+            f"{a:.3f} \\le \\varepsilon < {b:.3f}:&\\quad F = " + body
+        )
+    st.latex(r"\begin{aligned}" + r"\\[2pt]".join(lines) + r"\end{aligned}")
+
+    described = []
+    for a, b, rising, held in rows:
+        n = len(rising)
+        names = " and ".join(plain_name(t).lower() for t in rising) or "nothing"
+        exponents = sorted({_exponent_of(t, fit) for t in rising})
+        if n == 0:
+            said = "no element is still taking load"
+        elif n == 1:
+            said = (f"one term: {names} alone, so the slope here is its own "
+                    f"exponent, {exponents[0]:g}")
+        else:
+            said = (
+                f"{n} terms carrying together: {names}. Their exponents are "
+                + ", ".join(f"{value:g}" for value in exponents)
+                + ", so the measured slope sits between them, at whichever "
+                "the force is weighted towards"
+            )
+        if held:
+            said += (
+                ", with "
+                + " and ".join(plain_name(t).lower() for t in held)
+                + " holding what "
+                + ("it" if len(held) == 1 else "they")
+                + " reached and taking no more"
+            )
+        described.append(f"**ε {a:.3f} to {b:.3f}** — {said}.")
+    st.markdown("\n\n".join(described))
+    if q:
+        st.caption(
+            f"Every stretch is multiplied by the confinement factor "
+            f"(1−ε)^−{q:g}, which adds qε/(1−ε) to the slope everywhere and "
+            "is why the measured exponent climbs inside a stretch where the "
+            "algebra has not changed."
+        )
+
+
+def _exponent_of(term, fit):
+    """The power of ε this term rises with."""
+    if term == "tension":
+        return 1.0
+    if term in ("membrane", "nucleus_shell"):
+        return 3.0
+    return 1.5
+
+
 def where_the_power_law_changes(fit, model, style):
     """
     The curve read on log-log axes, with what changes where written on it.
@@ -5016,22 +5145,17 @@ def optimisation_controls(model, lo, hi, terms):
     """The optimisation step: what it decided, and the argument for how."""
     if not terms:
         return
-    st.markdown("##### Optimization")
-    # What every curve of this type starts from comes first: it is the
-    # decision the search is measured against, and the one worth making once
-    # for a whole experiment rather than again on every cell.
+    st.markdown("##### Boundaries")
+    st.caption(
+        f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
+        f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
+        "They are read off the log curve on the **📈 Log curve and "
+        "boundaries** tab, which is also where the placements tried and the "
+        "algebra of each stretch live."
+    )
+    # What every curve of this type starts from stays here: it is a setting
+    # for the whole experiment, not an analysis of this cell.
     set_default_boundaries_control()
-    refine_boundaries_control(model, lo, hi, terms)
-    left_alone = st.session_state.pop("_boundaries_left_alone", None)
-    if left_alone:
-        st.caption(
-            "Left as you set "
-            + ", ".join(plain_name(t).lower() for t in left_alone)
-            + ": those ranges were moved by hand, so the new boundaries did "
-            "not touch them."
-        )
-    search_results_as_equations()
-    why_this_search(model)
 
 
 def _term_symbol(term):
@@ -6791,7 +6915,7 @@ SHOW_DATABASE_TAB = False
 ) = st.tabs(
     [
         "📊 Force curve analysis",
-        "🎈 Balloon and spring",
+        "📈 Log curve and boundaries",
         "🎥 Compression video",
         "🔧 Create curve (Igor)",
         "📋 Database",
@@ -7209,8 +7333,10 @@ with tab_analysis:
             # made; a button that cleared them on a cross-validation score
             # was the app arguing with the person about their own sample.
 
-            # The optimisation: the boundaries, inside the band the cell
-            # type is known to put them in.
+            # The boundaries and the log curve they are read off have a
+            # tab of their own. They were here, above the fit button, which
+            # put a panel of search results and a page of mathematics
+            # between choosing the components and seeing the curve.
             optimisation_controls(model, guided_lo, guided_hi, chosen)
 
             # ------------------------------------------------- 2 · fit ---
@@ -9292,12 +9418,15 @@ with tab_analysis:
             st.markdown("##### The equation that was fitted")
             fitted_equation(fit, unit=style.force_unit, heading=False)
 
-            # The exponent is the checkable part of all of this, and it is
-            # a picture rather than a paragraph: the measured slope against
-            # ε, the boundaries drawn on it, and what changes at each one
-            # written inside the axes.
-            st.markdown("##### Where the curve changes its power law")
-            where_the_power_law_changes(fit, model, style)
+            # The picture of the exponent is not here: it is the whole of
+            # the Log curve and boundaries tab, with the placements tried
+            # and the algebra of each stretch beside it. Drawing it twice
+            # was two panels to keep in step.
+            st.caption(
+                "The measured exponent, the boundaries drawn on it and the "
+                "algebra of each stretch are on the **📈 Log curve and "
+                "boundaries** tab."
+            )
 
             # No "how this fit was calculated" panel. What it said is now
             # said where it is needed: the criterion sits under the search
@@ -9532,180 +9661,13 @@ with tab_analysis:
 # fits a cell, this one asks what shape of cell the curve is describing.
 
 with tab_explore:
-    section("The model, balloon by balloon")
-
-    _explore_terms = terms_for(st.session_state["cell_type"])
-    _explore_names = components_for(st.session_state["cell_type"])
-
-    intro_left, intro_right = st.columns([1.15, 1])
-    with intro_left:
-        st.markdown(
-            "Squash a cell between two plates and only two kinds of thing "
-            "can push back, and they push back with different shapes.\n\n"
-            "**🎈 A balloon.** A thin shell around something that does not "
-            "compress. Flattening it forces the shell to gain area, and a "
-            "shell resists gaining area harder the more it has already "
-            "gained. Its force rises as **ε³**: slow at first, then very "
-            "fast.\n\n"
-            "**🕸️ A spring.** A material filling a space, squeezed between "
-            "two flat plates. That is a Hertzian contact and its force rises "
-            "as **ε³ᐟ²**: it answers immediately and then flattens off.\n\n"
-            "A cell can have more than one of each. A "
-            f"{st.session_state['cell_type'].split(' (')[0].lower()} is "
-            f"modelled with **{len(_explore_terms)}**:"
-        )
-        st.markdown(
-            "\n".join(
-                f"- {_explore_names[term][0]} — "
-                f"{'balloon' if MATERIAL_LAWS[term]['exponent'] == '3' else 'spring'}"
-                f", rises as ε^{MATERIAL_LAWS[term]['exponent']}, "
-                f"{MATERIAL_LAWS[term]['role']}"
-                for term in _explore_terms
-            )
-        )
-        st.caption(
-            "A nucleus is a balloon inside a balloon: an envelope that "
-            "resists being stretched around a filling that resists being "
-            "squeezed. It is the same pair as the cell itself, met deeper "
-            "in, which is why it needs two terms and not one."
-            if "nucleus_shell" in _explore_terms else
-            "Whichever is loaded at first contact sets the slope there, and "
-            "that slope is measurable without fitting anything."
-        )
-        st.latex(
-            r"F(\varepsilon)\;=\;\underbrace{A_m E_m\,\varepsilon^{3}}"
-            r"_{\text{balloon}}\;+\;"
-            r"\underbrace{A_i E_c\,\langle \varepsilon-\varepsilon_1\rangle^{3/2}}"
-            r"_{\text{spring}}"
-            + (r"\;+\;\underbrace{A_{ne} E_{ne}\,\langle \varepsilon-"
-               r"\varepsilon_2\rangle^{3}}_{\text{nuclear balloon}}\;+\;"
-               r"\underbrace{A_n E_n\,\langle \varepsilon-\varepsilon_2"
-               r"\rangle^{3/2}}_{\text{its filling}}"
-               if "nucleus_shell" in _explore_terms else "")
-        )
-        st.caption(
-            "Every prefactor is geometry, not fitted: Aₘ = 2πh R₀/(1−ν) "
-            "for the cell's shell"
-            + (", A_ne = 2πh_ne R_n/(1−ν_n) for the deeper balloon, the same "
-               "Lulevich law with its own radius and its own shell thickness"
-               if "nucleus_shell" in _explore_terms else "")
-            + "; Aᵢ = √2 R₀² / 3(1−ν²) for a Hertzian contact, which is "
-            "Lulevich's eq 6. Only "
-            "the moduli are free, which is why the shapes have to do the "
-            "separating."
-        )
-    with intro_right:
-        # Both pictures, because they are two views of one model and each
-        # answers a question the other cannot. The balloon says what the
-        # cell is; the spring diagram says what the fit computes.
-        here_terms = terms_for(st.session_state["cell_type"])
-        fluid_inside = st.session_state["cell_type"] in INCOMPRESSIBLE_INTERIOR
-        if balloon_figure is not None:
-            st.plotly_chart(
-                balloon_figure(
-                    current_style(),
-                    **figure_kwargs(
-                        balloon_figure, epsilon=0.35,
-                        interior="fluid" if fluid_inside else "spring",
-                        labels=components_for(st.session_state["cell_type"]),
-                        show_nucleus="nucleus" in here_terms,
-                        show_nucleus_shell="nucleus_shell" in here_terms,
-                        show_tension="tension" in here_terms,
-                        cell_height_um=st.session_state["cell_height_um"],
-                        height=340,
-                    ),
-                ),
-                key="explore_balloon", **STRETCH,
-            )
-        st.caption(
-            "A shell holding fluid that does not compress, so everything the "
-            "plates do goes into the shell and into the network strung "
-            "across it."
-            if fluid_inside else
-            "A balloon with a spring inside it, and inside that a shorter "
-            "balloon with a spring of its own: the nucleus has a skin too. "
-            "Each balloon resists being stretched, each spring resists being "
-            "squeezed, and the four are told apart by the laws they follow."
-        )
-        st.plotly_chart(
-            cell_schematic(
-                current_style(),
-                **figure_kwargs(
-                    cell_schematic, epsilon=0.35, coupling="parallel",
-                    cell_height_um=st.session_state["cell_height_um"],
-                    labels=components_for(st.session_state["cell_type"]),
-                    show_nucleus="nucleus" in here_terms,
-                    show_nucleus_shell="nucleus_shell" in here_terms,
-                    show_tension="tension" in here_terms,
-                    height=330,
-                ),
-            ),
-            key="explore_schematic", **STRETCH,
-        )
-        st.caption(
-            "The same cell as a mechanics diagram: a fixed dish, a platen "
-            "carrying the force, and one spring per material between them. "
-            "This is what the fit actually solves."
-        )
-
-    st.divider()
-    section("Which one answers first")
-
-    st.markdown(
-        "In the cells Lulevich compressed the membrane answers first and the "
-        "cytoskeleton joins later. That is the order in every drawing of this "
-        "model, and it is where the classic ε³-then-ε³ᐟ² picture comes from.\n\n"
-        "A cardiomyocyte need not do that, and the reason is its own "
-        "structure. Its membrane is strong, but a strong shell that is not "
-        "yet stretched still contributes nothing: stiffness only shows up "
-        "once there is strain to resist. Meanwhile the cortex under it is "
-        "tied to the membrane through the costameres and the interior is "
-        "packed with myofibrils, so there may be no stretch at all where the "
-        "shell deforms on its own. Then the spring answers first and the "
-        "balloon arrives later, and hard."
-    )
-
-    order_cards = st.columns(len(ORDERINGS) or 1)
-    for card, spec in zip(order_cards, ORDERINGS):
-        with card:
-            st.markdown(f"**{spec['label']}**")
-            st.caption(spec["story"])
-            st.markdown(
-                f"Near contact: **ε^{spec['near_contact']:.1f}**"
-                if spec["near_contact"] != 1.9 else
-                "Near contact: **between 3/2 and 3**"
-            )
-
-    st.caption(
-        "All four use the same two springs with the same geometry. Only the "
-        "order changes, so any difference in how well they fit is a "
-        "difference about the order and nothing else."
-    )
-
-    with st.expander("📋 The materials, the law each obeys, and why they separate"):
-        materials_table(
-            terms_for(st.session_state["cell_type"]),
-            caption=(
-                "Every material this cell type can be fitted with. The last "
-                "column is the one that decides whether a modulus means "
-                "anything."
-            ),
-        )
-        separation_rule()
-
-    st.divider()
-    section("What this curve says")
+    section("The log curve, and the boundaries it says the cell has")
 
     explore_data = st.session_state.get("data")
     if not explore_data:
         st.info(
             "Load a force curve in the **Force curve analysis** tab and the "
-            "answer for that cell appears here."
-        )
-    elif compare_orderings is None or ordering_figure is None:
-        st.error(
-            "This tab needs the current `lulevich_model.py` and "
-            "`plot_utils.py`. Copy them into the repository and reboot."
+            "curve's own power law appears here."
         )
     else:
         eps_ex = explore_data["epsilon"]
@@ -9725,206 +9687,61 @@ with tab_explore:
             max(hi_ex - 1e-3, 0.0),
         ))
         terms_ex = active_terms() or ("membrane", "interior")
-
         st.caption(
-            f"Using ε = {lo_ex:.3f} to {hi_ex:.3f} and the elements ticked in "
-            "the analysis tab ("
+            f"ε = {lo_ex:.3f} to {hi_ex:.3f}, with the components ticked on "
+            "the analysis tab: "
             + ", ".join(plain_name(t).lower() for t in terms_ex)
-            + "). Change either there and press the button again."
+            + ". Change either there and this follows."
         )
 
-        # Once per curve, automatically. The whole point of this tab is to
-        # answer a question, and a tab that opens on an empty panel and a
-        # button has not answered it.
-        order_key = (
-            explore_data["source"], int(eps_ex.size),
-            st.session_state["cell_type"], round(lo_ex, 4), round(hi_ex, 4),
-            terms_ex,
-        )
-        run_now = st.button(
-            "🔎 Work out which order this curve follows", type="primary",
-            key="run_ordering",
-        )
-        if run_now or st.session_state.get("_ordering_key") != order_key:
-            st.session_state["_ordering_key"] = order_key
-            with st.spinner("Fitting each order to the curve…"):
-                try:
-                    st.session_state["ordering_search"] = compare_orderings(
-                        model_ex, lo_ex, hi_ex, terms=terms_ex,
-                        weighting=st.session_state["weighting"],
-                        cv_repeats=2, n_grid=8,
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    st.session_state["ordering_search"] = {
-                        "success": False, "error": str(exc),
-                    }
-
-        found_order = st.session_state.get("ordering_search")
-        if not found_order:
-            st.info("Press the button to compare the orders on this curve.")
-        elif not found_order.get("success"):
-            st.warning(found_order.get("error", "Could not compare the orders."))
-        else:
-            winner = found_order["best"]
-            (st.success if found_order["clear_cut"] else st.info)(
-                retell(found_order["verdict"])
-            )
-            st.markdown(retell(found_order["reading"]))
-
-            # ------------------------------------------------ the picture
-            grid = np.linspace(lo_ex, hi_ex, 400)
-            curves = []
-            for row in found_order["candidates"]:
-                try:
-                    predicted = model_ex.composition_curve(grid, row["fit"])
-                except Exception:  # pragma: no cover - defensive
-                    continue
-                curves.append({
-                    "label": row["short"],
-                    "epsilon": grid,
-                    "force_N": predicted,
-                    "break_1": row["break_1"],
-                    "chosen": bool(row.get("chosen")),
-                })
-            inside = (eps_ex >= lo_ex) & (eps_ex <= hi_ex)
-            st.plotly_chart(
-                ordering_figure(
-                    eps_ex[inside], force_ex[inside], style_ex, curves,
-                ),
-                key="ordering_chart", **STRETCH,
-            )
-            st.caption(
-                "Log force, because the orders differ near contact and on a "
-                "linear axis that part of the curve is a flat line along the "
-                "bottom. Where the lines lie on top of each other, this "
-                "curve cannot tell those orders apart."
-            )
-
-            profile_eps, profile_exp = model_ex.local_exponent(window_frac=0.18)
-            st.plotly_chart(
-                ordering_slope_figure(
-                    {"epsilon": profile_eps, "exponent": profile_exp},
-                    style_ex,
-                    measured=found_order["near_contact_exponent"],
-                    upto=found_order["near_contact_upto"],
-                    expected=[(1.9, "both together")],
-                ),
-                key="ordering_slope", **STRETCH,
-            )
-            st.caption(
-                "The slope measured straight from the data, with no model "
-                "fitted. It starts on whichever spring is loaded first and "
-                "climbs past 3 as the cell runs out of room to be squashed "
-                "into."
-            )
-
-            # ------------------------------------------------ the numbers
-            st.markdown("##### The fits, side by side")
-            rows_order = []
-            for row in found_order["candidates"]:
-                rows_order.append({
-                    "Order": row["short"],
-                    "What it assumes": retell(row["detail"]),
-                    "Slope it predicts near contact":
-                        f"{row['near_contact']:.2g}",
-                    "ε₁": f"{row['break_1']:.3f}",
-                    f"Eₘ {plain_name('membrane').lower()} (MPa)":
-                        f"{row['Em_MPa']:.3g}",
-                    f"Ec {plain_name('interior').lower()} (kPa)":
-                        f"{row['Ec_kPa']:.3g}",
-                    "R²": f"{row['r_squared']:.5f}",
-                    "Predicts held-out points": f"{row['cv_rmse']:.3g}",
-                    "Verdict": "← best" if row.get("chosen")
-                    else ("ties" if row.get("tied_with_best") else ""),
-                })
-            flat_table(
-                pd.DataFrame(rows_order),
-                align_right=[
-                    "Slope it predicts near contact", "ε₁",
-                    f"Eₘ {plain_name('membrane').lower()} (MPa)",
-                    f"Ec {plain_name('interior').lower()} (kPa)",
-                    "R²", "Predicts held-out points",
-                ],
-                caption=(
-                    "“Predicts held-out points” is the error on points each "
-                    "fit was not fitted to, in newtons; lower is better, and "
-                    "it is the column the winner is chosen on. R² cannot "
-                    "choose between these, because a fit can always lower "
-                    "its residual on the points it was given."
-                ),
-            )
-            if any(row["Em_MPa"] <= 0 or row["Ec_kPa"] <= 0
-                   for row in found_order["candidates"]):
-                st.caption(
-                    "A modulus of 0 means that order left the spring carrying "
-                    "nothing: the fit could not find any load for it to take "
-                    "in the place that order puts it. That is the clearest "
-                    "way an order can be wrong."
-                )
-
-            # ------------------------------------------------- act on it
-            current_order = ordering_of(
-                MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
-                CYTO_CHOICES[st.session_state["cyto_starts_at"]],
-            )
-            already = current_order is not None and (
-                current_order["key"] == winner["key"]
-            )
-            if already:
-                st.success(
-                    f"The analysis tab is already set to **{winner['short']}**, "
-                    f"so its fit is the one this tab is recommending.",
-                    icon="✅",
-                )
-            else:
-                use1, use2 = st.columns([1, 2])
-                with use1:
-                    if st.button(f"✓ Use “{winner['short']}”", type="primary",
-                                 key="adopt_ordering", **STRETCH):
-                        st.session_state["_pending_settings"] = {
-                            "model_kind":
-                                "Segmented (each part takes over in turn)",
-                            "membrane_after_break": next(
-                                k for k, v in MEMBRANE_CHOICES.items()
-                                if v == winner["membrane"]
-                            ),
-                            "cyto_starts_at": next(
-                                k for k, v in CYTO_CHOICES.items()
-                                if v == winner["cyto_start"]
-                            ),
-                            "segment_break_1": round(float(winner["break_1"]), 4),
-                            "segment_break_2": round(float(winner["break_2"]), 4),
-                        }
-                        st.rerun()
-                with use2:
-                    st.caption(
-                        "Sets the analysis tab to this order and to the "
-                        "boundaries it found, then refits there. Nothing "
-                        "about which elements are ticked changes."
-                    )
-
-    with st.expander("Why the order can be read off a curve at all"):
         st.markdown(
-            "Because a fit can only separate terms whose **shapes** differ, "
-            "and these two differ in the one place it matters. Near first "
-            "contact ε³ is negligible next to ε³ᐟ²: at ε = 0.05 the cube law "
-            "has fallen by 8000 while the Hertzian law has fallen by only "
-            "90. So the first stretch of the curve is carried by whichever "
-            "spring is loaded there, and its slope on a log-log plot is that "
-            "spring's exponent.\n\n"
-            "That is why the measurement above is worth as much as the fit. "
-            "The slope near contact uses no model, no geometry and no "
-            "prefactors; it is the raw shape of the data. When it and the "
-            "fit agree, the answer rests on two independent legs.\n\n"
-            "Two things it cannot do. It cannot tell you *which* network is "
-            "the Hertzian one, only that a Hertzian one is loaded: cortical "
-            "actin and myofibrils obey the same law and are told apart by "
-            "when they start, which is an assumption about the cell rather "
-            "than a reading from the curve. And past about ε = 0.5 every "
-            "exponent here climbs, because the cell is running out of room "
-            "rather than because a new spring arrived; that is what the "
-            "confinement term (1−ε)^−q absorbs."
+            "Every law in this model is a straight line on log-log axes, "
+            "and a different one: a stretching shell rises as ε³, a "
+            "Hertzian contact as ε³ᐟ², a network already under tension as "
+            "ε. So the slope of ln F against ln ε **is** the reading of "
+            "which law is carrying the load, taken from the data with no "
+            "model in it, and a boundary is where that reading changes."
         )
+        st.latex(
+            r"p(\varepsilon) \;=\; \frac{d\log F}{d\log \varepsilon} "
+            r"\;=\; \sum_k w_k\,p_k, \qquad "
+            r"w_k = \frac{a_k E_k g_k(\varepsilon)}"
+            r"{\sum_j a_j E_j g_j(\varepsilon)}"
+        )
+
+        st.markdown("#### Where the curve changes its power law")
+        where_the_power_law_changes(
+            st.session_state.get("_last_fit"), model_ex, style_ex,
+        )
+
+        st.markdown("#### What the curve is fitting, stretch by stretch")
+        stage_algebra(st.session_state.get("_last_fit"))
+
+        with st.expander(
+            "📋 The materials, the law each obeys, and why they separate"
+        ):
+            materials_table(
+                terms_for(st.session_state["cell_type"]),
+                caption=(
+                    "Every material this cell type can be fitted with. The "
+                    "last column is the one that decides whether a modulus "
+                    "means anything."
+                ),
+            )
+            separation_rule()
+
+        st.markdown("#### Find the boundaries from this curve")
+        refine_boundaries_control(model_ex, lo_ex, hi_ex, terms_ex)
+        left_alone = st.session_state.pop("_boundaries_left_alone", None)
+        if left_alone:
+            st.caption(
+                "Left as you set "
+                + ", ".join(plain_name(t).lower() for t in left_alone)
+                + ": those ranges were moved by hand, so the new boundaries "
+                "did not touch them."
+            )
+        search_results_as_equations()
+        why_this_search(model_ex)
 
 
 # ==================================================== TAB 3: video analysis ==
