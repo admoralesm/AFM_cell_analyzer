@@ -6376,6 +6376,75 @@ def case_the_plot_carries_what_is_sent_to_it():
               str(state(app, "plot_layers")))
 
 
+def case_the_plot_says_what_the_ranges_say():
+    print("the ranges sit above the curve, and the curve draws what they say")
+    import app as app_module
+    source = pathlib.Path(APP).read_text()
+    body = source.split('section("3 · Nonlinear fitting")')[-1]
+    check("the curve is staked out under the component ranges",
+          body.index("curve_slot = st.container()")
+          > body.index("component_controls("), body[:200])
+    check("and above the fit button",
+          body.index("curve_slot = st.container()")
+          < body.index('st.markdown("#### 2 · Fit")'), body[:200])
+
+    # A curve whose deep element carries real force, so every element has a
+    # curve of its own to check.
+    eps, force = synthetic(En_kPa=30.0)
+    app = AppTest.from_file(APP, default_timeout=600)
+    app.run()
+    app.session_state["cell_name"] = "bands"
+    app.session_state["show_components"] = True
+    app.session_state["data"] = {
+        "epsilon": eps, "force_N": force, "source": "s.csv", "n_dropped": 0,
+    }
+    app.run()
+    if not no_exception(app, "a curve with every element carrying"):
+        return
+
+    fit = state(app, "_last_fit")
+    results = state(app, "results")
+    windows = (fit or {}).get("term_windows") or {}
+    check("the fit carries a range per element", bool(windows), str(windows))
+    if not (windows and results):
+        return
+
+    # The bands behind the curve are the element ranges, not a hard-coded
+    # membrane / cytoskeleton / nucleus story that stopped being true the
+    # moment an element was given a range of its own.
+    bands = results.get("fit_windows") or []
+    edges = sorted({round(float(v), 4)
+                    for band in bands for v in band["range"]})
+    wanted = sorted({round(float(v), 4)
+                     for window in windows.values() for v in window})
+    check("the bands break where the elements do",
+          all(any(abs(edge - value) < 1e-3 for edge in edges)
+              for value in wanted), f"{edges} against {wanted}")
+    deep = [band for band in bands
+            if "nucleus" in band["label"] or "nuclear" in band["label"]]
+    check("the band carrying the deep element starts at its onset",
+          deep and abs(float(deep[0]["range"][0])
+                       - float(windows["nucleus"][0])) < 1e-3,
+          str([band["range"] for band in bands]))
+    check("and every band names who is carrying it",
+          all(band["label"] and band["label"] != "nothing carrying"
+              for band in bands), str([band["label"] for band in bands]))
+
+    # Each element's own curve starts where the element starts.
+    for name, term in (("membrane_N", "membrane"), ("interior_N", "interior"),
+                       ("nucleus_N", "nucleus")):
+        drawn = results.get(name)
+        if drawn is None:
+            continue
+        good = np.isfinite(drawn)
+        if not good.any():
+            continue
+        first = float(np.asarray(results["epsilon"])[good].min())
+        check(f"the {term} curve begins at its own onset",
+              first >= float(windows[term][0]) - 1e-3,
+              f"drawn from {first:.3f}, window {windows[term]}")
+
+
 def case_the_video_is_not_a_plot_marking():
     print("the video belongs to the record and the morphology, not the plot")
     app = start(cell_name="cell-01")
@@ -6472,6 +6541,7 @@ if __name__ == "__main__":
         case_a_new_curve_arrives_ready_to_fit,
         case_the_boundaries_come_from_the_log_curve,
         case_the_plot_carries_what_is_sent_to_it,
+        case_the_plot_says_what_the_ranges_say,
         case_the_video_is_not_a_plot_marking,
         case_the_nucleus_is_a_balloon_too,
         case_the_myoblast_nucleus_reaches_the_page,
