@@ -547,6 +547,7 @@ DEFAULTS = {
     # it does not deserve half the checkbox list, and two boxes that are
     # both ticked in every real session is two boxes too many.
     "show_data_and_fit": True,
+    "plot_layers": [],
     "show_component_heights": False,
     # Relative deformation runs 0 to 1 by definition, so that is the honest
     # default: two cells squashed to different depths then look different,
@@ -756,19 +757,25 @@ DEFAULTS = {
 # Streamlit refuses a write to a widget's key once that widget has been built
 # this run. Buttons further down the page therefore stage their changes here
 # and rerun, and this block applies them before anything is drawn.
+# Everything that belongs to one cell rather than to the session. The
+# connections, the geometry and the display settings are deliberately not in
+# this list: they are the setup, and a person working through a plate sets
+# them once. It is also the list the new-cell button tells the rerun not to
+# carry, so the clear below is not undone a dozen lines later.
+NEW_CELL_CLEARS = (
+    "data", "results", "_last_fit", "_last_fit_signature", "_plot_png",
+    "cell_name", "cell_notes", "exploration", "composition_search",
+    "arrangement_search", "component_search", "confinement_scan",
+    "hypothesis_search", "boundary_search", "boundary_candidates",
+    "element_window_search", "plot_layers", "_auto_picked", "_auto_notes",
+    "_suggested_window", "_slope_profile",
+    "video_path", "video_info", "video_track",
+    "video_name", "video_link", "eps_percent_fix",
+    "video_saved_frame", "video_saved_frame_index",
+)
+
 if st.session_state.pop("_start_new_cell", False):
-    # Everything that belongs to one cell. Connections, geometry defaults and
-    # display settings are deliberately not in this list: they are the
-    # session's setup, not the cell's data.
-    for key in (
-        "data", "results", "_last_fit", "_last_fit_signature", "_plot_png",
-        "cell_name", "cell_notes", "exploration", "composition_search",
-        "arrangement_search", "component_search", "confinement_scan",
-        "hypothesis_search", "_auto_picked", "_auto_notes",
-        "video_path", "video_info", "video_track",
-        "video_name", "video_link", "eps_percent_fix",
-        "video_saved_frame", "video_saved_frame_index",
-    ):
+    for key in NEW_CELL_CLEARS:
         st.session_state[key] = DEFAULTS.get(key)
     # What each upload box last handed over. Cleared with the rest, or
     # re-uploading the same file for the next cell would look like no change
@@ -776,10 +783,14 @@ if st.session_state.pop("_start_new_cell", False):
     st.session_state["_video_seen"] = {}
     for key in [k for k in st.session_state if k.startswith("window_")]:
         del st.session_state[key]
-    st.session_state["_pending_settings"] = {
+    # Merged, not replaced: the button staged the session's settings here so
+    # they survive a run that never draws their widgets.
+    staged = dict(st.session_state.get("_pending_settings") or {})
+    staged.update({
         "window_start": DEFAULTS["window_start"],
         "window_end": DEFAULTS["window_end"],
-    }
+    })
+    st.session_state["_pending_settings"] = staged
 
 if st.session_state.pop("_pending_clear_windows", False):
     for _stale in [k for k in st.session_state if k.startswith("window_")]:
@@ -2374,52 +2385,34 @@ def plot_option_controls():
     are looking at belongs next to it: in a sidebar expander nobody
     finds it, and the plot keeps its markings while the person hunts.
     """
-    st.markdown("**What is drawn on the curve**")
-    bare = st.checkbox(
-        "Data and fit only", key="bare_plot",
-        help="Strips everything except the measured points and the one "
-        "fitted Lulevich curve: no bands, no markers, no element curves, "
-        "no legend. This is the figure version.",
-    )
+    # Two extras and no more. The data and the fitted curve are always
+    # drawn -- a plot without them is not a plot of anything -- and
+    # everything else that used to be a switch here is sent to the figure
+    # from the place that computed it, which leaves a row saying so.
+    st.markdown("**Extras drawn on the curve**")
     st.caption(
-        "Everything below is off while “Data and fit only” is on."
-        if bare else "Or switch off individual pieces:"
+        "The measured points and the fitted curve are always on. Anything "
+        "else comes from a 📤 Send to plot button and is listed under the "
+        "figure."
     )
     st.checkbox(
-        "The measured points and the fitted curve", key="show_data_and_fit",
-        help="Both are on for every normal plot, so they are one switch. "
-        "Off leaves the axes and the markings with nothing drawn on them, "
-        "which is only useful for making a blank to draw on by hand.",
-    )
-    st.checkbox(
-        "Element curves", key="show_components", disabled=bare,
-        help="Each element's own contribution drawn "
-        "apart. They are parts of the one fit, not separate fits.",
-    )
-    st.checkbox(
-        "Shaded segment bands", key="show_fit_window", disabled=bare,
-        help="The coloured blocks behind the curve marking each segment. "
-        "This also hides the highlighted segment.",
-    )
-    st.checkbox(
-        "Rupture marker", key="show_rupture_marker", disabled=bare,
-        help="The dash-dotted line where the force drops.",
-    )
-    st.checkbox(
-        "Height of each component", key="show_component_heights", disabled=bare,
-        help="Labels each element curve at the right-hand end with the "
-        "force it is carrying there, so you can read each contribution "
-        "off the plot without hovering.",
+        "Shaded segment bands", key="show_fit_window",
+        help="The coloured blocks behind the curve marking each stretch "
+        "between the boundaries.",
     )
     st.checkbox(
         "Note saying which range was fitted", key="show_range_note",
-        disabled=bare,
         help="A line in the corner with the stretch of the curve the "
         "numbers came from, how many points that was, and how well the "
         "model followed it. A figure that leaves the room without its "
         "range on it cannot be checked later.",
     )
-    st.checkbox("Legend", key="show_legend", disabled=bare)
+    st.checkbox(
+        "Element curves", key="show_components",
+        help="Each element's own contribution drawn apart. They are parts "
+        "of the one fit, not separate fits.",
+    )
+    st.checkbox("Legend", key="show_legend")
 
     st.markdown("**Axes**")
     ax1, ax2 = st.columns(2)
@@ -3738,7 +3731,8 @@ NOT_A_SETTING = (
 )
 
 
-def rerun_keeping_settings(extra=None):
+def rerun_keeping_settings(extra=None, forget=()):
+    """See below; ``forget`` names settings this rerun should NOT carry."""
     """
     Rerun, and carry every setting on the page through it.
 
@@ -3754,6 +3748,7 @@ def rerun_keeping_settings(extra=None):
         key: st.session_state[key]
         for key in DEFAULTS
         if key in st.session_state and key not in NOT_A_SETTING
+        and key not in set(forget)
     }
     pending.update(extra or {})
     st.session_state["_pending_settings"] = pending
@@ -4520,6 +4515,219 @@ def _exponent_of(term, fit):
     return 1.5
 
 
+# ---------------------------------------------------------------- layers --
+#
+# What the plot carries beyond the data and the fit is chosen one piece at a
+# time, by sending it there from wherever that piece is computed. A figure
+# built from a panel of switches is a figure whose contents somebody has to
+# remember; a figure built by sending things to it says what is on it,
+# because the sending left a row behind.
+
+LAYER_KINDS = ("boundaries", "range", "equation", "moduli", "quality", "note")
+
+
+def plot_layers():
+    """Everything currently sent to the plot, oldest first."""
+    return list(st.session_state.get("plot_layers") or [])
+
+
+def send_to_plot(kind, label, payload):
+    """Put one piece on the plot, replacing any earlier piece of that kind."""
+    layers = [row for row in plot_layers() if row["kind"] != kind]
+    layers.append({"kind": kind, "label": label, "payload": payload})
+    st.session_state["plot_layers"] = layers
+
+
+# Layers whose content is read live from the page every time the figure is
+# drawn, rather than frozen at the moment they were sent. The boundaries and
+# the fitted range are like that on purpose: a plot showing where ε₁ used to
+# be is worse than one not showing it at all.
+LIVE_LAYERS = ("boundaries", "range")
+
+
+def send_to_plot_button(kind, label, payload, key, help_text=None):
+    """A 📤 Send to plot button for one piece of the results."""
+    on_plot = any(row["kind"] == kind for row in plot_layers())
+    if on_plot and kind in LIVE_LAYERS:
+        st.button("✅ On the plot", key=f"send_{key}", disabled=True,
+                  help="It follows the numbers on this page, so it is "
+                       "already up to date. Take it off under the figure.",
+                  **STRETCH)
+        return
+    if st.button(
+        ("🔄 Refresh on the plot" if on_plot else "📤 Send to plot"),
+        key=f"send_{key}", help=help_text, **STRETCH,
+    ):
+        send_to_plot(kind, label, payload)
+        rerun_keeping_settings()
+
+
+def apply_plot_layers(figure, style):
+    """
+    Draw whatever has been sent to the plot onto the figure.
+
+    Done here rather than inside the figure builder because a layer is a
+    decision made on the page, not a property of the curve: the builder
+    draws the measurement, this draws what somebody chose to say about it.
+    """
+    boxes = []
+    for row in plot_layers():
+        kind, payload = row["kind"], row["payload"]
+        if kind in LIVE_LAYERS:
+            payload = live_payload(kind)
+        if kind == "boundaries":
+            e1, e2 = payload.get("e1"), payload.get("e2")
+            for value, name, colour in ((e1, "ε₁", "#2ca02c"),
+                                        (e2, "ε₂", "#e377c2")):
+                if value is None:
+                    continue
+                figure.add_vline(
+                    x=float(value), line=dict(color=colour, width=2, dash="dot"),
+                    annotation_text=f"{name} = {float(value):.3f}",
+                    annotation_position="top",
+                    annotation_font_size=max(10, style.tick_size - 6),
+                    annotation_font_color=colour,
+                )
+        elif kind == "range":
+            lo, hi = payload.get("lo"), payload.get("hi")
+            if lo is not None and hi is not None and float(hi) > float(lo):
+                figure.add_vrect(
+                    x0=float(lo), x1=float(hi), layer="below", line_width=0,
+                    fillcolor="#7f7f7f", opacity=0.08,
+                    annotation_text=f"fitted ε {float(lo):.3f}–{float(hi):.3f}",
+                    annotation_position="bottom left",
+                    annotation_font_size=max(10, style.tick_size - 7),
+                )
+        else:
+            text = str(payload.get("text", "")).strip()
+            if text:
+                boxes.append(text)
+    # Text boxes stack down the left, inside the axes, so a narrow screen
+    # cannot clip them off.
+    for index, text in enumerate(boxes):
+        figure.add_annotation(
+            xref="paper", yref="paper", x=0.02, y=0.98 - 0.16 * index,
+            xanchor="left", yanchor="top", text=text, showarrow=False,
+            align="left", font=dict(size=max(10, style.tick_size - 7)),
+            bgcolor="rgba(255,255,255,0.86)", bordercolor="#8c8c8c",
+            borderwidth=1, borderpad=4,
+        )
+    return figure
+
+
+def plot_layer_table():
+    """What is on the plot, with a way to take each piece off again."""
+    layers = plot_layers()
+    st.markdown("**On the plot**")
+    st.caption(
+        "The measured points and the fitted curve are always drawn. "
+        "Everything else here was sent from somewhere on the page, and "
+        "comes off again with ✕."
+    )
+    if not layers:
+        st.caption("Nothing else sent yet.")
+        return
+    for index, row in enumerate(layers):
+        left, right = st.columns([5, 1])
+        label = (live_label(row["kind"]) if row["kind"] in LIVE_LAYERS
+                 else row["label"])
+        left.markdown(label)
+        if right.button("✕", key=f"drop_layer_{index}",
+                        help="Take this off the plot"):
+            remaining = plot_layers()
+            del remaining[index]
+            st.session_state["plot_layers"] = remaining
+            rerun_keeping_settings()
+    if st.button("Clear the plot", key="clear_plot_layers", **STRETCH):
+        st.session_state["plot_layers"] = []
+        rerun_keeping_settings()
+
+
+def moduli_text(fit):
+    """The fitted moduli with their uncertainties, as one block of text."""
+    lines = []
+    for term in ALL_TERMS:
+        if term not in (fit.get("terms") or ()):
+            continue
+        key, unit_name, std_key = MODULUS_FIELDS[term]
+        value = fit.get(key)
+        error = fit.get(std_key, float("nan"))
+        if value is None:
+            continue
+        line = f"{TERM_SYMBOLS.get(term, term)} = {float(value):.4g}"
+        if error is not None and np.isfinite(error):
+            line += f" ± {float(error):.2g}"
+        lines.append(line + f" {unit_name}")
+    return "<br>".join(lines)
+
+
+def quality_text(fit):
+    """R², χ²/dof and the range, as one block of text."""
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    parts = [f"R² = {float(fit.get('r_squared', float('nan'))):.5f}"]
+    if np.isfinite(chi):
+        parts.append(f"χ²/dof = {chi:.3g}")
+    parts.append(f"ε {lo:.3f}–{hi:.3f}, {int(fit.get('n_points', 0))} points")
+    return "<br>".join(parts)
+
+
+def equation_text(fit, unit="nN"):
+    """The fitted equation with this cell's numbers, as one line of text."""
+    pieces = equation_pieces(fit)
+    if not pieces:
+        return ""
+    factor, unit_label = FORCE_UNITS.get(unit, (1e9, "nN"))
+    q = float(fit.get("confinement", 0.0) or 0.0)
+    shapes = {
+        "tension": "ε", "membrane": "ε³", "cortex": "ε³ᐟ²",
+        "interior": "⟨ε−ε₁⟩³ᐟ²", "nucleus_shell": "⟨ε−ε₂⟩³",
+        "nucleus": "⟨ε−ε₂⟩³ᐟ²",
+    }
+    body = " + ".join(
+        f"{piece['coefficient_N'] * factor:.3g}·{shapes.get(piece['term'], 'ε')}"
+        for piece in pieces
+    )
+    if q:
+        body = f"(1−ε)^−{q:g} [ {body} ]"
+    return f"F/{unit_label} = {body}"
+
+
+def live_payload(kind):
+    """What a live layer should draw, read from the page as it stands now."""
+    if kind == "boundaries":
+        return boundaries_payload()
+    return {
+        "lo": round(float(st.session_state.get("window_start", 0.0)), 4),
+        "hi": round(float(st.session_state.get("window_end", 1.0)), 4),
+    }
+
+
+def live_label(kind):
+    """How a live layer reads in the list of what is on the plot."""
+    payload = live_payload(kind)
+    if kind == "boundaries":
+        return (f"Boundaries · ε₁ = {payload['e1']:.3f}, "
+                f"ε₂ = {payload['e2']:.3f} · follows the page")
+    return (f"Fitted range · ε {payload['lo']:.3f} to {payload['hi']:.3f}"
+            " · follows the page")
+
+
+def boundaries_payload():
+    """The boundaries as they stand, ready to send to the plot."""
+    return {
+        "e1": round(float(st.session_state["segment_break_1"]), 4),
+        "e2": round(float(st.session_state["segment_break_2"]), 4),
+    }
+
+
+def boundaries_label():
+    """How a boundary layer reads in the list of what is on the plot."""
+    payload = boundaries_payload()
+    return (f"Boundaries · ε₁ = {payload['e1']:.3f}, "
+            f"ε₂ = {payload['e2']:.3f}")
+
+
 def where_the_power_law_changes(fit, model, style):
     """
     The curve read on log-log axes, with what changes where written on it.
@@ -5146,13 +5354,22 @@ def optimisation_controls(model, lo, hi, terms):
     if not terms:
         return
     st.markdown("##### Boundaries")
-    st.caption(
-        f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
-        f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
-        "They are read off the log curve on the **📈 Log curve and "
-        "boundaries** tab, which is also where the placements tried and the "
-        "algebra of each stretch live."
-    )
+    b1, b2 = st.columns([2.2, 1])
+    with b1:
+        st.caption(
+            f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
+            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
+            "They are read off the log curve on the **📈 Log curve and "
+            "boundaries** tab, which is also where the placements tried and "
+            "the algebra of each stretch live."
+        )
+    with b2:
+        send_to_plot_button(
+            "boundaries", boundaries_label(), boundaries_payload(),
+            key="boundaries_main",
+            help_text="Draws ε₁ and ε₂ on the curve. Press it again after "
+                      "moving them and the plot follows.",
+        )
     # What every curve of this type starts from stays here: it is a setting
     # for the whole experiment, not an analysis of this cell.
     set_default_boundaries_control()
@@ -6349,15 +6566,12 @@ with st.sidebar:
     )
 
     with st.expander("📐 Cell geometry", expanded=True):
-        st.number_input(
-            "Cell height h₀ (μm)",
-            min_value=0.1,
-            max_value=100.0,
-            step=0.01,
-            format="%.2f",
-            key="cell_height_um",
-            help="Initial (undeformed) height. Sets both the geometry prefactors "
-            "and the conversion from relative deformation to indentation.",
+        # The height itself is on the page, in Cell information, because it
+        # is a measurement of this cell rather than a setting for the
+        # session. What is left here is what follows from it.
+        st.caption(
+            f"Cell height h₀ = {st.session_state['cell_height_um']:.2f} μm, "
+            "set with the rest of the cell's details on the page."
         )
         st.radio(
             "Cell radius R₀",
@@ -6611,8 +6825,9 @@ with st.sidebar:
         st.checkbox("Show grid", key="show_grid")
         st.checkbox("Log-log axes", key="log_scale", help="A power law is a straight line here.")
         st.caption(
-            "What is drawn on the curve is set under the plot itself, "
-            "in **Plot options**."
+            "The data and the fitted curve are always drawn. Anything else "
+            "on the figure was sent there from the page, and is listed "
+            "under it."
         )
 
         st.markdown("**Panels beside the curve**")
@@ -6953,7 +7168,11 @@ with tab_analysis:
     with new1:
         if st.button("🆕 Start a new cell", **STRETCH):
             st.session_state["_start_new_cell"] = True
-            st.rerun()
+            # The cell's own fields are cleared by the block at the top of
+            # the script; everything else has to be carried through the
+            # rerun by hand, because half of it lives in widgets this run
+            # will not reach.
+            rerun_keeping_settings(forget=NEW_CELL_CLEARS)
     with new2:
         st.caption(
             "Clears the curve, the fit, the video and the name, and leaves "
@@ -6983,8 +7202,18 @@ with tab_analysis:
             help="Deflection sensitivity from the calibration ramp. Recorded so "
             "the numbers can be traced back to the calibration they came from.",
         )
-    c5, c6, c7 = st.columns(3)
+    c5, c6, c7, c8 = st.columns(4)
     with c5:
+        st.number_input(
+            "Cell height h₀ (μm)",
+            min_value=0.1, max_value=100.0, step=0.01, format="%.2f",
+            key="cell_height_um",
+            help="Initial (undeformed) height. It belongs with the cell, not "
+            "with the display settings: it sets both the geometry "
+            "prefactors and the conversion from relative deformation to "
+            "indentation, so it is measured per cell.",
+        )
+    with c6:
         st.number_input(
             "Probe sphere diameter (µm)",
             min_value=0.0, max_value=200.0, step=1.0, format="%.1f",
@@ -6994,7 +7223,7 @@ with tab_analysis:
             "the cell presses on it as a flat plate, which is the geometry "
             "this model assumes. 0 means not recorded.",
         )
-    with c6:
+    with c7:
         st.number_input(
             "Approach speed (µm/s)",
             min_value=0.0, max_value=500.0, step=0.5, format="%.2f",
@@ -7003,7 +7232,7 @@ with tab_analysis:
             "moduli belong to the speed they were measured at and only "
             "compare with cells squashed at the same one.",
         )
-    with c7:
+    with c8:
         st.text_input("Operator", placeholder="initials", key="operator")
     st.text_input("Notes", placeholder="passage, treatment, anything worth keeping",
                   key="cell_notes")
@@ -7020,8 +7249,10 @@ with tab_analysis:
             f"more on a cell this tall is close enough to flat."
         )
     hint(
-        f"Cell height h₀ = {st.session_state['cell_height_um']:.2f} μm — set it in the "
-        "sidebar under **Cell geometry**, it directly scales both moduli."
+        f"Cell height h₀ = {st.session_state['cell_height_um']:.2f} μm scales "
+        "both moduli directly, so it is measured per cell and kept with the "
+        "cell. The radius it implies, and everything else geometric, is in "
+        "the sidebar under **Cell geometry**."
     )
 
     section("2 · Load force curve")
@@ -7275,7 +7506,18 @@ with tab_analysis:
                    if rupture.get("method") == "force-drop"
                    and rupture.get("epsilon") is not None else "")
             )
-            suggested_range_note(guided_lo, guided_hi)
+            rng1, rng2 = st.columns([2.6, 1])
+            with rng1:
+                suggested_range_note(guided_lo, guided_hi)
+            with rng2:
+                send_to_plot_button(
+                    "range",
+                    f"Fitted range · ε {guided_lo:.3f} to {guided_hi:.3f}",
+                    {"lo": round(float(guided_lo), 4),
+                     "hi": round(float(guided_hi), 4)},
+                    key="range_main",
+                    help_text="Shades the stretch that is being fitted.",
+                )
             if guided_lo > 0:
                 st.caption(
                     "⚠️ Not starting from zero. The membrane term is "
@@ -8640,7 +8882,22 @@ with tab_analysis:
                 # sentence about chi-squared that a person could read
                 # straight off the two numbers beside R². Three of those
                 # were duplicates and the fourth was noise.
-                st.markdown("#### Fitting results")
+                r1, r2, r3 = st.columns([2.4, 1, 1])
+                with r1:
+                    st.markdown("#### Fitting results")
+                with r2:
+                    send_to_plot_button(
+                        "moduli", "The moduli, with their uncertainties",
+                        {"text": moduli_text(fit)}, key="moduli",
+                        help_text="Writes the moduli in a box on the curve.",
+                    )
+                with r3:
+                    send_to_plot_button(
+                        "quality", "R², χ²/dof and the range fitted",
+                        {"text": quality_text(fit)}, key="quality",
+                        help_text="Writes how well it fits, and over what, "
+                                  "in a box on the curve.",
+                    )
 
             # All three moduli, always. A term that was not in the model reads
             # 0 and says so, rather than disappearing: a blank column in a
@@ -9114,6 +9371,7 @@ with tab_analysis:
                         highlight_window=highlight_window,
                     ),
                 )
+                figure = apply_plot_layers(figure, style)
                 st.plotly_chart(
                     figure,
                     key="main_fit_plot",
@@ -9124,6 +9382,7 @@ with tab_analysis:
 
                 o1, o2 = st.columns([2, 1])
                 with o1:
+                    plot_layer_table()
                     with st.expander("🎛️ Plot options", expanded=False):
                         plot_option_controls()
                 with o2:
@@ -9415,7 +9674,17 @@ with tab_analysis:
             # cell did, and only then the equation and the working. Putting
             # the maths under the plot, as it was, meant scrolling past it
             # to reach the numbers it was the working for.
-            st.markdown("##### The equation that was fitted")
+            e1_col, e2_col = st.columns([2.6, 1])
+            with e1_col:
+                st.markdown("##### The equation that was fitted")
+            with e2_col:
+                send_to_plot_button(
+                    "equation", "The fitted equation",
+                    {"text": equation_text(fit, style.force_unit)},
+                    key="equation",
+                    help_text="Writes the equation with this cell's numbers "
+                              "in a box on the curve.",
+                )
             fitted_equation(fit, unit=style.force_unit, heading=False)
 
             # The picture of the exponent is not here: it is the whole of
