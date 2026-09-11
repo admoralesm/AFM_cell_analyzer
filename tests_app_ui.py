@@ -378,20 +378,20 @@ def case_search_flags_what_it_cannot_see():
 
 
 def case_bare_plot():
-    print("one switch strips the plot to data and fit")
+    print("the plot is data and fit, and nothing else unless it is sent")
     app = start()
-    switch = None
-    for box in app.checkbox:
-        if "data and fit only" in (box.label or "").lower():
-            switch = box
-    check("bare-plot switch present", switch is not None)
-    if switch is None:
-        return
+    # The bare switch is gone: a plot without its data is not a plot of
+    # anything, so data and fit are not optional, and everything else
+    # arrives by being sent rather than by being left switched on.
+    check("there is no bare-plot switch to hunt for",
+          not any("data and fit only" in (box.label or "").lower()
+                  for box in app.checkbox),
+          str([box.label for box in app.checkbox][:10]))
     check("element curves off by default",
           app.session_state["show_components"] is False)
-    switch.set_value(True).run()
-    if not no_exception(app, "bare plot"):
-        return
+    check("and nothing is on the plot until it is sent",
+          not (state(app, "plot_layers") or []),
+          str(state(app, "plot_layers")))
 
     import app as app_module
 
@@ -1004,24 +1004,24 @@ def case_plot_options_are_under_the_plot():
     if not no_exception(app, "plot options"):
         return
     labels = [c.label for c in app.checkbox]
-    for wanted in ("Data and fit only",
-                   "The measured points and the fitted curve",
-                   "Element curves", "Shaded segment bands", "Legend"):
+    for wanted in ("Element curves", "Shaded segment bands", "Legend",
+                   "Note saying which range was fitted"):
         check(f"“{wanted}” is on the page", wanted in labels, str(labels))
 
     text = " ".join(
         str(m.value) for m in list(app.get("markdown")) + list(app.get("caption"))
     )
     check("the sidebar points at the new place",
-          "Plot options" in text, "no pointer found")
+          "Plot options" in text or "sent there from the page" in text,
+          "no pointer found")
 
-    # Ticking it must actually strip the plot.
-    switch = widget_by_label(app, "checkbox", "Data and fit only")
+    # Ticking one must actually change the figure.
+    switch = widget_by_label(app, "checkbox", "Shaded segment bands")
     check("the switch is reachable", switch is not None)
     if switch is not None:
         switch.set_value(True).run()
-        no_exception(app, "bare plot from under the plot")
-        check("the switch stuck", app.session_state["bare_plot"] is True)
+        no_exception(app, "turning the bands on")
+        check("the switch stuck", state(app, "show_fit_window") is True)
 
 
 def case_save_the_plot():
@@ -1922,9 +1922,9 @@ def case_fit_only_plot():
     boxes = [c.label for c in app.checkbox
              if "measured points" in (c.label or "").lower()
              or "fitted curve" in (c.label or "").lower()]
-    check("one checkbox covers the points and the curve together",
-          len(boxes) == 1, str(boxes))
-    check("and it is on to begin with",
+    check("no checkbox can take the data or the curve off the plot",
+          not boxes, str(boxes))
+    check("and both are drawn",
           state(app, "show_data_and_fit") is True,
           str(state(app, "show_data_and_fit")))
 
@@ -6292,6 +6292,80 @@ def case_the_boundaries_come_from_the_log_curve():
           "What the power law says" not in said)
 
 
+def case_the_plot_carries_what_is_sent_to_it():
+    print("the plot draws the data and the fit, plus whatever is sent to it")
+    import app as app_module
+    app = start(cell_name="cell-01")
+    if not no_exception(app, "before anything is sent"):
+        return
+
+    check("nothing extra is on the plot to start with",
+          not (state(app, "plot_layers") or []),
+          str(state(app, "plot_layers")))
+    said = " ".join(str(m.value) for m in
+                    list(app.get("markdown")) + list(app.get("caption")))
+    check("the figure says what it is carrying", "On the plot" in said,
+          said[:200])
+    # The panel of switches is gone: the data and the fit are not optional,
+    # and everything else arrives by being sent.
+    check("there is no “what is drawn” panel any more",
+          "What is drawn on the curve" not in said, said[:200])
+    labels = [c.label for c in app.checkbox]
+    check("the extras left are the bands and the range",
+          any("Shaded segment bands" in (l or "") for l in labels)
+          and any("range was fitted" in (l or "") for l in labels),
+          str(labels[:12]))
+    check("and data and fit is not a switch, because it is always on",
+          not any("measured points and the fitted curve" in (l or "")
+                  for l in labels), str(labels[:12]))
+
+    sends = [b for b in app.button if (b.label or "").startswith("📤")]
+    check("every part of the results can be sent to the plot",
+          len(sends) >= 4, str([b.label for b in app.button][:12]))
+    if not sends:
+        return
+    sends[0].click().run()
+    if not no_exception(app, "sending a piece to the plot"):
+        return
+    layers = state(app, "plot_layers") or []
+    check("what was sent is on the plot", len(layers) == 1, str(layers))
+    check("and the list under the figure names it",
+          any(layers[0]["kind"] in row["kind"] for row in layers), str(layers))
+
+    # A layer that follows the page: moving a boundary moves what is drawn,
+    # rather than leaving a line where the boundary used to be.
+    sends = [b for b in app.button if (b.label or "").startswith("📤")]
+    for button in sends:
+        button.click().run()
+        break
+    layers = state(app, "plot_layers") or []
+    check("a second piece goes on beside the first", len(layers) == 2,
+          str([row["kind"] for row in layers]))
+    if any(row["kind"] == "boundaries" for row in layers):
+        app.session_state["segment_break_2"] = 0.47
+        app.run()
+        said = " ".join(str(m.value) for m in app.get("markdown"))
+        check("the boundary layer follows the page rather than freezing",
+              "ε₂ = 0.470" in said, said[-300:])
+
+    drops = [b for b in app.button if b.label == "✕"]
+    check("each piece comes off again", len(drops) == len(layers),
+          f"{len(drops)} crosses for {len(layers)} layers")
+    if drops:
+        drops[0].click().run()
+        no_exception(app, "taking a piece off the plot")
+        check("and taking one off leaves the rest",
+              len(state(app, "plot_layers") or []) == len(layers) - 1,
+              str(state(app, "plot_layers")))
+
+    clear = button_by_label(app, "Clear the plot")
+    if clear is not None:
+        clear.click().run()
+        check("and the plot can be cleared in one press",
+              not (state(app, "plot_layers") or []),
+              str(state(app, "plot_layers")))
+
+
 def case_the_video_is_not_a_plot_marking():
     print("the video belongs to the record and the morphology, not the plot")
     app = start(cell_name="cell-01")
@@ -6387,6 +6461,7 @@ if __name__ == "__main__":
         case_unticking_a_material_fits_without_it,
         case_a_new_curve_arrives_ready_to_fit,
         case_the_boundaries_come_from_the_log_curve,
+        case_the_plot_carries_what_is_sent_to_it,
         case_the_video_is_not_a_plot_marking,
         case_the_nucleus_is_a_balloon_too,
         case_the_myoblast_nucleus_reaches_the_page,
