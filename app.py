@@ -6808,6 +6808,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     st.session_state["pw_collection"] = collection
                     rerun_keeping_settings()
 
+        # ---- how it is done, for an undergraduate, with these numbers --
+        with st.expander("📘 How the fit is done — the maths, step by step",
+                         expanded=False):
+            fit_explainer(fit, result if ok else None)
+
         # ---- what decided it, from the same fit ------------------------
         t_routes, t_coef, t_model, t_set, t_work = st.tabs([
             "ε routes compared", "θ̂ by regime", "Model F(x)",
@@ -8011,7 +8016,9 @@ def result_rows(fit):
         rows.append((
             f"modulus_{term}",
             label,
-            f"{value:.4g} {unit_name}",
+            # The value with its ± beside it, the way it is quoted.
+            (f"{value:.4g} ± {error:.3g} {unit_name}" if np.isfinite(error)
+             else f"{value:.4g} {unit_name}"),
             (f"± {error:.3g} {unit_name}" if np.isfinite(error) else "—"),
             (f"{max(value - 1.96 * error, 0.0):.4g} to "
              f"{value + 1.96 * error:.4g} {unit_name}"
@@ -8035,7 +8042,9 @@ def result_rows(fit):
             rows.append((
                 f"modulus_{term}",
                 f"{symbol} {EXTRA_NAMES[term].lower()}",
-                (f"{value:.4g} {unit_name}" if np.isfinite(value) else "—"),
+                ("—" if not np.isfinite(value) else
+                 f"{value:.4g} ± {error:.3g} {unit_name}" if np.isfinite(error)
+                 else f"{value:.4g} {unit_name}"),
                 (f"± {error:.3g} {unit_name}" if np.isfinite(error) else "—"),
                 (f"{max(value - 1.96 * error, 0.0):.4g} to "
                  f"{value + 1.96 * error:.4g} {unit_name}"
@@ -8082,6 +8091,276 @@ EXTRA_NAMES = {
 }
 
 
+def _pm(value, error, unit="", digits=4):
+    """value ± error, both in the same unit, as the page quotes them."""
+    if value is None or not np.isfinite(float(value)):
+        return "—"
+    text = f"{float(value):.{digits}g}"
+    if error is not None and np.isfinite(float(error)):
+        text += f" ± {float(error):.3g}"
+    return text + (f" {unit}" if unit else "")
+
+
+def fit_explainer(fit, result=None):
+    """
+    How the fit on the page was done, for an undergraduate, with this
+    cell's own numbers in every step.
+
+    The same eight steps whichever way the load is shared: what was
+    measured, the model, why the powers are 3 and 3/2, why the fit is
+    linear, least squares, the uncertainty, from stiffness to modulus, and
+    how good the fit is. The piecewise sharing adds the regime-by-regime
+    steps and where ε comes from.
+    """
+    if not (fit and fit.get("success")):
+        st.caption("Fit the curve and the working appears here, with its numbers.")
+        return
+    piecewise = bool(fit.get("piecewise")) and result is not None
+    n = int(fit.get("n_points", 0))
+    h0 = float(st.session_state.get("cell_height_um", float("nan")))
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+
+    st.markdown("#### 1 · What was measured")
+    st.markdown(
+        "The probe squeezes the cell by a distance $\\delta$. Dividing by the "
+        f"cell's height $h_0 = {h0:.3g}$ µm gives the **relative deformation** "
+        "$\\varepsilon = \\delta / h_0$"
+        + (" (written as a percentage, $x = 100\\,\\varepsilon$)" if piecewise else "")
+        + f". The curve is $n = {n}$ pairs $(\\varepsilon_i, F_i)$, from "
+        f"{eps_text(lo, fit)} to {eps_text(hi, fit, bare=True)}."
+    )
+
+    st.markdown("#### 2 · The model: a sum of springs")
+    st.markdown(
+        "The cell is treated as a few parts pushing back at once. Each part "
+        "has a **shape** $\\phi_j$ (how its force grows with the squeeze, "
+        "fixed by physics) and a **stiffness** $\\theta_j$ (how strong it is, "
+        "the unknown the fit finds). The force is their sum:"
+    )
+    st.latex(r"\hat F(x) \;=\; \sum_j \theta_j\,\phi_j(x)")
+    if piecewise:
+        b = fit["piecewise"]["boundaries_pct"]
+        st.latex(
+            r"\hat F(x) = C_0 + k\,\min(x,\varepsilon_1)"
+            r" + K_m\,[x-\varepsilon_1]_+^{3} + K_c\,[x-\varepsilon_1]_+^{3/2}"
+            r" + K_{ne}\,[x-\varepsilon_2]_+^{3} + K_n\,[x-\varepsilon_3]_+^{3/2}"
+        )
+        st.markdown(
+            "$[y]_+ = \\max(y, 0)$: a part adds nothing until the squeeze "
+            "reaches the boundary where it starts, "
+            f"$\\varepsilon_1 = {b[1]:.1f}\\,\\%$ (membrane and cytoskeleton), "
+            f"$\\varepsilon_2 = {b[2]:.1f}\\,\\%$ (nuclear envelope), "
+            f"$\\varepsilon_3 = {b[3]:.1f}\\,\\%$ (inside the nucleus). "
+            "Before $\\varepsilon_1$ only the contact line $C_0 + kx$ acts: the "
+            "probe settling onto the cell."
+        )
+    else:
+        pieces = equation_pieces(fit)
+        if pieces:
+            st.latex(r"\hat F(\varepsilon) = " + " + ".join(
+                f"{p['symbols']}\\,{p['basis']}" for p in pieces))
+        st.markdown(
+            "$\\langle y \\rangle = \\max(y, 0)$: a part adds nothing until "
+            "the squeeze reaches the boundary where it starts. Each $a$ is a "
+            "number fixed by the cell's geometry, so the unknowns are the "
+            "Young's moduli $E$ themselves."
+        )
+
+    st.markdown("#### 3 · Why the powers are 3 and 3/2")
+    st.markdown(
+        "**A solid ball pressed by a flat plate** (the cytoskeleton, the inside "
+        "of the nucleus) follows Hertz's law: the contact area grows as it is "
+        "pressed, and"
+    )
+    st.latex(r"F = \tfrac{4}{3}\,E^*\sqrt{R}\;\delta^{3/2}"
+             r"\quad\Longrightarrow\quad F \propto \varepsilon^{3/2}")
+    st.markdown(
+        "**A thin skin around a filled cell** (the membrane, the nuclear "
+        "envelope) must stretch as the cell is flattened. The stretch of its "
+        "area grows as $\\varepsilon^2$, the tension it carries grows with the "
+        "stretch, and the force on the plate is tension times the curvature "
+        "it pushes through, which gives one more power of $\\varepsilon$:"
+    )
+    st.latex(r"F \propto E\,h\,\varepsilon^{2}\cdot\varepsilon"
+             r"\quad\Longrightarrow\quad F \propto \varepsilon^{3}")
+    st.markdown(
+        "So on log–log axes each part is a straight line: slope 3 for a skin, "
+        "3/2 for a solid (see the 📈 Log curve and boundaries tab)."
+    )
+
+    st.markdown("#### 4 · Why the fit is a straight-line problem")
+    st.markdown(
+        "Once the boundaries are fixed, the shapes $\\phi_j$ are known "
+        "numbers at every measured point. Only the stiffnesses are unknown, "
+        "and they enter **linearly**, exactly as the slope and intercept of a "
+        "straight line do. Stacking one equation per point gives a matrix "
+        "problem:"
+    )
+    st.latex(r"\begin{pmatrix}F_1\\ \vdots\\ F_n\end{pmatrix} \approx "
+             r"\underbrace{\begin{pmatrix}\phi_1(x_1) & \cdots & \phi_m(x_1)\\"
+             r"\vdots & & \vdots\\ \phi_1(x_n) & \cdots & \phi_m(x_n)\end{pmatrix}}"
+             r"_{X}\begin{pmatrix}\theta_1\\ \vdots\\ \theta_m\end{pmatrix},"
+             r"\qquad \mathbf F \approx X\boldsymbol\theta")
+
+    st.markdown("#### 5 · Least squares: the best stiffnesses")
+    st.markdown(
+        "The fit chooses the $\\theta_j$ that make the total squared miss "
+        "between the curve and the model as small as possible:"
+    )
+    st.latex(r"S(\boldsymbol\theta) = \sum_{i=1}^{n}\bigl(F_i - \hat F(x_i)\bigr)^2"
+             r" = \lVert \mathbf F - X\boldsymbol\theta\rVert^2")
+    st.markdown(
+        "Setting $\\partial S/\\partial\\theta_j = 0$ for every $j$ gives the "
+        "**normal equations**, whose solution is the best fit:"
+    )
+    st.latex(r"X^{\mathsf T}X\,\hat{\boldsymbol\theta} = X^{\mathsf T}\mathbf F"
+             r"\quad\Longrightarrow\quad \hat{\boldsymbol\theta} = "
+             r"(X^{\mathsf T}X)^{-1}X^{\mathsf T}\mathbf F")
+    st.markdown(
+        "A stiffness cannot be negative, so the solver looks for the best "
+        "$\\boldsymbol\\theta$ with every $\\theta_j \\ge 0$ (bounded least "
+        "squares). When a part is not needed it lands on 0, and the page "
+        "says so."
+    )
+
+    if piecewise:
+        st.markdown("#### 5b · Regime by regime")
+        st.markdown(
+            "The piecewise way of sharing the load fits the curve one stretch "
+            "at a time, from the contact inwards. Regime $k$ only fits the "
+            "parts that **start** in it; the parts that started earlier keep "
+            "the stiffness already found ($C_k$), and the regime starts from "
+            "the force the one before it ended on, so the curve has no jumps "
+            "($C^0$ continuity):"
+        )
+        st.latex(r"\hat F_k(x) = \hat F_{k-1}(\varepsilon_{k-1}) + C_k(x) + "
+                 r"\sum_{j\,\in\,k}\theta_j\,\phi_j(x),\qquad "
+                 r"x\in[\varepsilon_{k-1},\varepsilon_k)")
+        flat_table(pd.DataFrame([
+            {"regime": r["key"],
+             "x (%)": f"{r['domain_pct'][0]:.1f}–{r['domain_pct'][1]:.1f}",
+             "points": r["n_points"],
+             "fitted here": ", ".join(
+                 ("contact line (k, C₀)" if n_ == "k_align" else
+                  next((c[1].split(" ", 1)[1].lower() for c in PW_COMPONENTS
+                        if c[0] == n_), n_))
+                 for n_ in r["params"] if n_ != "C0") or "—",
+             "R²_k": (f"{r['r_squared']:.4f}" if np.isfinite(r["r_squared"]) else "—")}
+            for r in result["regimes"]
+        ]), align_right=["points", "R²_k"])
+        st.markdown(
+            "**Where ε₁, ε₂, ε₃ come from.** For a single power law "
+            "$F = a x^{p}$, $\\ln F = \\ln a + p\\ln x$: the slope on log–log "
+            "axes *is* the power. The local slope"
+        )
+        st.latex(r"p(x) = \frac{d\ln F}{d\ln x}")
+        st.markdown(
+            "jumps where a new part joins in, so the boundaries are placed where "
+            "$p$ bends, inside the C2C12 bands, and then every nearby "
+            "placement is fitted and the one with the smallest $S$ is kept. "
+            f"Here: **{fit['piecewise'].get('boundary_source', '')}**."
+        )
+
+    st.markdown("#### 6 · The ± : how sure is each number?")
+    st.markdown(
+        "The misses $r_i = F_i - \\hat F(x_i)$ that are left measure the noise. "
+        "With $m$ fitted numbers,"
+    )
+    st.latex(r"\hat\sigma^2 = \frac{S_{\min}}{n-m},\qquad "
+             r"\operatorname{Cov}(\hat{\boldsymbol\theta}) = "
+             r"\hat\sigma^2\,(X^{\mathsf T}X)^{-1},\qquad "
+             r"\mathrm{SE}(\hat\theta_j) = \sqrt{\operatorname{Cov}_{jj}}")
+    st.markdown(
+        "Every value on this page is quoted as **best fit ± SE**. About 95 % "
+        "of the time the true value lies within $\\hat\\theta \\pm 1.96\\,"
+        "\\mathrm{SE}$, which is the interval in the results table. A large SE "
+        "means the curve cannot tell that part apart from the others."
+    )
+
+    st.markdown("#### 7 · From stiffness to Young's modulus")
+    if piecewise:
+        st.markdown(
+            "Each stiffness is the part's Young's modulus times a number set "
+            "by the geometry, $A_j$ (in N/Pa). Because $x$ is in % and the "
+            "formulas use $\\varepsilon = x/100$, a power $p$ brings a factor "
+            "$100^{p}$:"
+        )
+        st.latex(r"E_j = \frac{100^{\,p_j}\,K_j}{A_j},\qquad "
+                 r"\mathrm{SE}(E_j) = \frac{100^{\,p_j}\,\mathrm{SE}(K_j)}{A_j}")
+        st.latex(r"A_{\text{skin}} = \frac{2\pi h\,R}{1-\nu},\qquad "
+                 r"A_{\text{Hertz}} = \frac{\sqrt2\,R^2}{3(1-\nu^2)}\,c(R)")
+        moduli = result.get("moduli") or {}
+        rows = []
+        for key_, label, symbol, _c, _law in PW_COMPONENTS:
+            m = moduli.get(key_)
+            if not m:
+                continue
+            unit, scale = DISPLAY_UNIT.get(m["symbol"], ("kPa", 1e3))
+            rows.append({
+                "part": label.split(" ", 1)[1],
+                "p": f"{m['power']:g}",
+                "K ± SE (N/%ᵖ)": _pm(m.get("K"), m.get("K_se"), digits=4),
+                "A (N/Pa)": ("see below" if key_ == "k_align" else
+                             f"{m['prefactor_N_per_Pa']:.4g}"
+                             if np.isfinite(m.get("prefactor_N_per_Pa", float("nan")))
+                             else "—"),
+                "E ± SE": (modulus_display(m["symbol"], m["E_Pa"], m["E_se_Pa"])
+                           if key_ not in (fit["piecewise"].get("components_off") or ())
+                           else "off"),
+            })
+        if rows:
+            flat_table(pd.DataFrame(rows),
+                       align_right=["p", "K ± SE (N/%ᵖ)", "A (N/Pa)", "E ± SE"],
+                       caption="The contact line is the one exception to "
+                       "E = 100ᵖK/A: its slope k is read as a tension over the "
+                       "cell's footprint, T = 100k/(2πR₀²/h₀), and E_align = "
+                       "T/h_coat is an apparent modulus of the surface coat.")
+    else:
+        st.markdown(
+            "Here the model is written with the moduli themselves: each term is "
+            "$a_k E_k$ times its shape, and $a_k$ (N/Pa) is fixed by the "
+            "geometry before the fit. So the fit returns $E_k$ directly, and "
+            "its SE with it."
+        )
+        rows = []
+        for piece in equation_pieces(fit):
+            key, unit_name, std_key = MODULUS_FIELDS[piece["term"]]
+            rows.append({
+                "part": piece["name"],
+                "shape": SHAPE_MARKS.get(piece["term"], ("", "", ""))[2],
+                "a (N/Pa)": f"{piece['prefactor']:.4g}",
+                "E ± SE": _pm(fit.get(key), fit.get(std_key), unit_name),
+            })
+        if rows:
+            flat_table(pd.DataFrame(rows), align_right=["a (N/Pa)", "E ± SE"])
+
+    st.markdown("#### 8 · How good is the fit?")
+    r2 = float(fit.get("r_squared", float("nan")))
+    chi = float(fit.get("chi_squared_reduced", float("nan")))
+    st.latex(r"R^2 = 1 - \frac{\sum_i (F_i-\hat F_i)^2}{\sum_i (F_i-\bar F)^2}"
+             + (f" = {r2:.5f}" if np.isfinite(r2) else ""))
+    st.latex(r"\chi^2_\nu = \frac{1}{n-m}\sum_i\frac{(F_i-\hat F_i)^2}{\sigma^2}"
+             + (f" = {chi:.3g}" if np.isfinite(chi) else ""))
+    st.markdown(
+        "$R^2$ is the share of the curve's variation the model explains (1 is "
+        "perfect). $\\chi^2_\\nu$ compares the misses with the noise "
+        "$\\sigma$ measured on the curve: about 1 means the model is as close "
+        "as the noise allows; much more than 1 means it is missing something "
+        "real, even when $R^2$ looks excellent."
+    )
+
+
+def results_tab_metrics(fit):
+    """The moduli and R² as tiles, each value with its ± beside it."""
+    tiles = [(row[1].split(" ", 1)[0], row[2]) for row in result_rows(fit)
+             if row[0].startswith("modulus_") and row[2] != "not in this model"]
+    tiles.append(("R²", f"{float(fit.get('r_squared', float('nan'))):.5f}"))
+    for start in range(0, len(tiles), 3):
+        cols = st.columns(3)
+        for col, (label, value) in zip(cols, tiles[start:start + 3]):
+            col.metric(label, value)
+
+
 def row_text(key, fit, unit="nN"):
     """One results row as the text a plot box should carry."""
     if key == "equation":
@@ -8090,7 +8369,7 @@ def row_text(key, fit, unit="nN"):
         if row[0] != key:
             continue
         pieces = [f"<b>{row[1]}</b>", row[2]]
-        if row[3] not in ("—", ""):
+        if row[3] not in ("—", "") and "±" not in row[2]:
             pieces.append(row[3])
         if row[4] not in ("—", ""):
             pieces.append(row[4])
@@ -8113,15 +8392,24 @@ def fitting_results_rows(fit, style, send=True, compact=False):
         return
     if compact:
         # Beside the graph: one table, the same rows and the same strings.
+        def quoted(value, error):
+            # Moduli already carry their ± beside the value; the quality
+            # and boundary rows put their second number beside the first.
+            if "±" in value or error in ("—", ""):
+                return value
+            return f"{value} · {error}"
+
         flat_table(
             pd.DataFrame([
-                {"": label, "value": value, "±": error, "95 % interval": interval,
-                 "where / how": note}
+                {"": label, "value ± SE": quoted(value, error),
+                 "95 % interval": interval, "where / how": note}
                 for _key, label, value, error, interval, note in rows
             ]),
-            align_right=["value", "±", "95 % interval"],
-            caption="± is one standard error of the fit, σ²(XᵀWX)⁻¹; the "
-                    "interval is ±1.96σ, cut at zero.",
+            align_right=["value ± SE", "95 % interval"],
+            caption="Each value is quoted as best fit ± one standard error, "
+                    "SE = √diag[σ̂²(XᵀX)⁻¹]; the interval is ±1.96 SE, cut "
+                    "at zero. How these are worked out is under 📘 How the fit "
+                    "is done.",
         )
         return
     widths = [1.5, 1.3, 1.2, 1.7, 1.6] + ([0.9] if send else [])
@@ -11376,6 +11664,10 @@ with tab_analysis:
                 with res_col:
                     results_area = st.container()
                 fit_block = st.container(border=True)
+                explainer_box = st.expander(
+                    "📘 How the fit is done — the maths, step by step",
+                    expanded=False,
+                )
                 diagnostics_box = st.expander(
                     "🔍 The working, in detail", expanded=False
                 )
@@ -12588,6 +12880,8 @@ with tab_analysis:
                 if boundaries_slot is not None:
                     with boundaries_slot:
                         boundaries_note(fit)
+                with explainer_box:
+                    fit_explainer(fit)
                 if board_status is not None:
                     waiting = (fit is None or stale_fit)
                     board_status.markdown(
@@ -14953,18 +15247,9 @@ with tab_results:
             if fit.get("coupling") == "piecewise":
                 # The four-regime fit has six moduli, not two, and no
                 # bending constant.
-                # Written exactly as on the analysis tab, in the same units,
-                # so the two tabs show one set of numbers.
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Eₘ", modulus_display("E_shell", fit["Em"]))
-                m2.metric("Ec", modulus_display("E_cyto", fit["Ei"]))
-                m3.metric("E_ne", modulus_display("E_ne", fit["Ene"]))
-                m4, m5, m6 = st.columns(3)
-                m4.metric("Eₙ", modulus_display("E_core", fit["En"]))
-                m5.metric("E_align", "off" if "k_align" in (
-                    fit["piecewise"].get("components_off") or ())
-                    else modulus_display("E_align", fit.get("E_align_kPa", 0.0) * 1e3))
-                m6.metric("R²", f"{fit['r_squared']:.5f}")
+                # The same rows, the same strings, as the analysis tab:
+                # each value with its ± beside it.
+                results_tab_metrics(fit)
                 if fit.get("fit_id"):
                     st.caption(f"fit {fit['fit_id']}, the same fit as on the "
                                "📊 Force curve analysis tab.")
@@ -14980,10 +15265,7 @@ with tab_results:
                        if fit["piecewise"].get("membrane_throughout") else "")
                 )
             else:
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Eₘ", f"{fit['Em_MPa']:.3g} MPa")
-                m2.metric("Eᵢ", f"{fit['Ei_kPa']:.3g} kPa")
-                m3.metric("R²", f"{fit['r_squared']:.4f}")
+                results_tab_metrics(fit)
                 st.caption(
                     f"Window ε ∈ [{fit['epsilon_range'][0]:.3f}, {fit['epsilon_range'][1]:.3f}] · "
                     f"{fit['n_points']} points · {fit['weighting']} weighting · "
