@@ -189,6 +189,28 @@ HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "regime_curves",
 ), required=False)
 
+# The components the page fits: the spring network's four (membrane,
+# cytoskeleton, nuclear envelope, inside the nucleus) plus the contact
+# line, which can be switched off. The engine's specification also has a
+# perinuclear cytoskeleton and a lamina lump; they are left out here so
+# that every way of sharing the load fits the same four components.
+PW_REMOVED = ("K_nuc_cyto", "A_lamina")
+if HAS_PIECEWISE:
+    import dataclasses as _dataclasses
+    PW_REGIMES = tuple(
+        _dataclasses.replace(
+            regime,
+            terms=tuple(t for t in regime.terms if t.name not in PW_REMOVED),
+            title=("Nuclear envelope stretch" if regime.key == "R3"
+                   else regime.title),
+            equation=("F₃(x) = K_nucleus·(x−ε₂)³ + F(ε₂)" if regime.key == "R3"
+                      else regime.equation),
+        )
+        for regime in C2C12_REGIMES
+    )
+else:
+    PW_REGIMES = ()
+
 if _piecewise_module is not None and not HAS_PIECEWISE:
     _stale = [name for name in (
         "C2C12_BOUNDARIES_PCT", "C2C12_REGIMES", "Geometry",
@@ -739,12 +761,11 @@ DEFAULTS = {
     # for the membrane acting throughout), so it follows the boundaries.
     "pw_until": {},
     # Each component in the model or not. Off holds its coefficient at 0.
+    "pw_use_k_align": True,
     "pw_use_K_shell": True,
     "pw_use_K_cyto": True,
     "pw_use_K_nucleus": True,
-    "pw_use_K_nuc_cyto": True,
     "pw_use_K_core": True,
-    "pw_use_A_lamina": True,
     # The cells fitted so far this session, each with its own boundaries,
     # moduli and curve, for the All cells tab.
     "pw_collection": {},
@@ -1378,8 +1399,6 @@ def fit_record(fit, unit="nN"):
             error = float(fit.get(f"{key}_std", float("nan")))
             record[label] = value
             record[f"± {label}"] = error
-        record["lamina work W_L (fJ)"] = float(fit.get("lamina_work_fJ", float("nan")))
-        record["lamina peak (%)"] = float(fit.get("lamina_peak_pct", float("nan")))
         b = pw.get("boundaries_pct") or ()
         for name, value in zip(("eps1 (%)", "eps2 (%)", "eps3 (%)", "x_end (%)"),
                                list(b)[1:5]):
@@ -1387,8 +1406,7 @@ def fit_record(fit, unit="nN"):
         record["eps route"] = pw.get("boundary_source", "")
         record["membrane throughout"] = bool(pw.get("membrane_throughout"))
         flat = pw.get("flat") or {}
-        for name in ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto",
-                     "K_core"):
+        for name in ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_core"):
             if name in flat:
                 record[f"{name} (N/%^p)"] = float(flat[name])
                 record[f"± {name}"] = float(flat.get(f"{name}_se", float("nan")))
@@ -4737,11 +4755,11 @@ SHARING_MATHS = {
         r"\varepsilon(F) = \sum_k (F / a_k E_k)^{1/p_k}",
 }
 SHARING_HELP = {
-    PW_SHARE: "The same components, met in four regimes: contact, membrane "
-              "+ cytoskeleton from ε₁, nuclear envelope (+ lamina) from ε₂, "
-              "the inside of the nucleus from ε₃. Each regime is fitted from "
-              "the force the last one ended on (C⁰), and carried components "
-              "keep their fitted law.",
+    PW_SHARE: "The same four components, met in four regimes: contact (can "
+              "be switched off), membrane + cytoskeleton from ε₁, nuclear "
+              "envelope from ε₂, the inside of the nucleus from ε₃. Each "
+              "regime is fitted from the force the last one ended on (C⁰), "
+              "and carried components keep their fitted law.",
 }
 
 
@@ -4831,10 +4849,6 @@ PW_COMPONENTS = (
      r"$K_{cyto}\,[\min(x,u)-s]_+^{3/2}$"),
     ("K_nucleus", "🟦 Nuclear envelope", "E_ne", "#1f77b4",
      r"$K_{ne}\,[\min(x,u)-s]_+^{3}$"),
-    ("K_nuc_cyto", "🟩 Perinuclear cytoskeleton", "E_nc", "#2ca02c",
-     r"$K_{nc}\,[\min(x,u)-s]_+^{3/2}$"),
-    ("A_lamina", "🟫 Nuclear lamina (lump)", "A_L", "#8c564b",
-     r"$A_L\sin^2\!\big(\pi\,\frac{x-\varepsilon_2}{\varepsilon_3-\varepsilon_2}\big)$"),
     ("K_core", "🟪 Inside the nucleus", "Eₙ", "#9467bd",
      r"$K_{core}\,[\min(x,u)-s]_+^{3/2}$"),
 )
@@ -4864,9 +4878,9 @@ def modulus_display(symbol, value_pa, se_pa=None):
 PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
 # Which boundary each component starts at: its regime's start. Moving a
 # component's start moves that boundary, and every component sharing it.
-PW_START_INDEX = {"K_shell": 1, "K_cyto": 1, "K_nucleus": 2,
-                  "K_nuc_cyto": 2, "A_lamina": 2, "K_core": 3}
-PW_SWITCHABLE = tuple(PW_START_INDEX)
+PW_START_INDEX = {"K_shell": 1, "K_cyto": 1, "K_nucleus": 2, "K_core": 3}
+# Every component can be switched off, the contact line included.
+PW_SWITCHABLE = ("k_align",) + tuple(PW_START_INDEX)
 
 
 def effective_piecewise_settings(settings=None, untils=None, off=()):
@@ -4907,7 +4921,7 @@ def piecewise_model_settings():
 def piecewise_ranges(bounds=None):
     """{coefficient: (start, until)} in percent, as the fit will use them."""
     return component_ranges(
-        bounds or piecewise_boundaries(),
+        bounds or piecewise_boundaries(), regimes=PW_REGIMES,
         settings=piecewise_model_settings(), carry=piecewise_carry(),
     )
 
@@ -4916,7 +4930,7 @@ def piecewise_ranges(bounds=None):
 # to, so the prior written for those elements speaks for these.
 PW_ELEMENT_OF = {
     "membrane": ("K_shell",),
-    "interior": ("K_cyto", "K_nuc_cyto"),
+    "interior": ("K_cyto",),
     "nucleus_shell": ("K_nucleus",),
     "nucleus": ("K_core",),
 }
@@ -5102,11 +5116,13 @@ def run_piecewise_fit(model, epsilon, force_N):
     result = fit_piecewise(
         epsilon, force_N,
         boundaries_pct=piecewise_boundaries(),
+        regimes=PW_REGIMES,
         settings=piecewise_model_settings(),
         carry=piecewise_carry(),
     )
     if result.get("success"):
-        result["moduli"] = piecewise_moduli(result, piecewise_geometry(model))
+        result["moduli"] = piecewise_moduli(result, piecewise_geometry(model),
+                                            regimes=PW_REGIMES)
     return result
 
 
@@ -5510,13 +5526,17 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         grid = np.unique(np.concatenate(
             [grid, [v for v in marks if b[0] <= v <= end]]))
         for name, label, symbol, colour, _law in PW_COMPONENTS:
-            if name in off:
+            # The contact layer carries C₀ as well, so with its slope off it
+            # stays, as the offset, or the layers would not add up to F̂.
+            if name in off and name != "k_align":
                 continue
             layer = component_force(result, name, grid)
             if layer is None:
                 continue
             a, u = ranges.get(name, (grid[0], grid[-1]))
-            legend_names.append(f"{label} · [{a:.1f}, {u:.1f}] %")
+            legend_names.append(
+                "⬛ C₀ offset (contact slope off)" if name in off
+                else f"{label} · [{a:.1f}, {u:.1f}] %")
             fig.add_trace(go.Scatter(
                 x=grid, y=layer * scale, mode="lines", stackgroup="components",
                 name=legend_names[-1],
@@ -5693,7 +5713,7 @@ def piecewise_parameter_editor():
     """Initial guesses and bounds, one row per coefficient, editable."""
     stored = piecewise_settings()
     rows = []
-    for regime in C2C12_REGIMES:
+    for regime in PW_REGIMES:
         for term in regime.terms:
             if term.name == "k_align":
                 continue
@@ -5714,7 +5734,7 @@ def piecewise_parameter_editor():
         **STRETCH,
     )
     wanted, problems = {}, []
-    defaults = {t.name: t for r in C2C12_REGIMES for t in r.terms}
+    defaults = {t.name: t for r in PW_REGIMES for t in r.terms}
     for _, row in edited.iterrows():
         name = row["Coefficient"]
         term = defaults[name]
@@ -5818,7 +5838,7 @@ def piecewise_placement_table(placements, bounds, target, selected):
     """
     rows = placements.get("rows") or {}
     inner = tuple(round(float(v), 2) for v in bounds[1:4])
-    symbols = ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core")
+    symbols = ("E_shell", "E_cyto", "E_ne", "E_core")
     heads = {s_: f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})" for s_ in symbols}
 
     def same(key):
@@ -6020,18 +6040,20 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None):
     slots = {}
     for name, label, symbol, colour, law in PW_COMPONENTS:
         start, until = ranges[name]
-        on = name == "k_align" or st.session_state.get(f"pw_use_{name}", True)
+        on = st.session_state.get(f"pw_use_{name}", True)
         # Laid out for the narrow parameter column: the name and what the
         # fit made of it on one line, the range bar under them at full width.
         c_name, c_out = st.columns([1.7, 1])
         c_bar = st.container()
         with c_name:
-            if name == "k_align":
-                st.markdown(f"**{label}**")
-            else:
-                st.checkbox(f"{label}", key=f"pw_use_{name}",
-                            help="Off holds this component at zero, and it "
-                            "leaves the plot and the fit.")
+            st.checkbox(
+                f"{label}", key=f"pw_use_{name}",
+                help=("Off holds the contact slope at zero: the first stretch, "
+                      "to ε₁, is then the constant C₀ and nothing else. ε₁ "
+                      "still marks where the membrane and cytoskeleton start."
+                      if name == "k_align" else
+                      "Off holds this component at zero, and it leaves the "
+                      "plot and the fit."))
             st.caption(law)
         with c_bar:
             key = f"pw_range_{name}"
@@ -6043,7 +6065,10 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None):
             st.slider(
                 f"{label} acts over (%)", min_value=0.0, max_value=float(end),
                 step=0.1, key=key, on_change=_pw_range_moved, args=(name,),
-                disabled=not on, label_visibility="collapsed",
+                # The contact bar is ε₁ itself, so it stays movable when
+                # the contact slope is off.
+                disabled=not on and name != "k_align",
+                label_visibility="collapsed",
                 help="Left end: where it starts carrying load, which is its "
                 "regime's boundary, so it moves that boundary. Right end: "
                 "where it stops adding load; past it the component holds "
@@ -6118,12 +6143,14 @@ def _pw_score(placement, epsilon, force_N, model):
     bounds = (0.0,) + tuple(float(v) for v in placement) + (
         float(st.session_state.get("pw_end", DEFAULTS["pw_end"])),)
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                           regimes=PW_REGIMES,
                            settings=piecewise_model_settings(),
                            carry=piecewise_carry())
     if not result.get("success"):
         return {"best_pct": tuple(placement), "r2": float("nan"),
                 "moduli": {}, "error": result.get("error", "")}
-    moduli = piecewise_moduli(result, piecewise_geometry(model))
+    moduli = piecewise_moduli(result, piecewise_geometry(model),
+                              regimes=PW_REGIMES)
     fitted = [r for r in result["regimes"] if r["fitted"] and r["key"] != "R1"]
     worst = min(fitted, key=lambda r: r["r_squared"]) if fitted else None
     return {
@@ -6143,7 +6170,7 @@ def compute_placements(model, epsilon, force_N):
     """
     bands, span = piecewise_bands(), piecewise_span()
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
-    common = dict(end_pct=end, span_pct=span,
+    common = dict(end_pct=end, span_pct=span, regimes=PW_REGIMES,
                   settings=piecewise_model_settings(), carry=piecewise_carry())
     out = {"signature": piecewise_signature(epsilon, force_N), "rows": {},
            "searches": {}, "errors": {}}
@@ -6362,7 +6389,7 @@ def collection_name():
 def collection_record(name, source, height_um, epsilon, force_N, result,
                       geometry, route=""):
     """One cell as the collection keeps it: its curve, its ε, its numbers."""
-    moduli = piecewise_moduli(result, geometry)
+    moduli = piecewise_moduli(result, geometry, regimes=PW_REGIMES)
     lamina = lamina_summary(result, geometry) or {}
     return {
         "name": name, "source": source, "height_um": float(height_um),
@@ -6855,7 +6882,7 @@ def piecewise_coefficient_table(result, moduli):
 CELL_COLORS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
                "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173")
-COLLECTION_SYMBOLS = ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core", "E_align")
+COLLECTION_SYMBOLS = ("E_shell", "E_cyto", "E_ne", "E_core", "E_align")
 
 
 def refit_collection_cell(record, height_um=None):
@@ -6864,6 +6891,7 @@ def refit_collection_cell(record, height_um=None):
     eps, force = record["epsilon"], record["force_N"]
     model = build_model(eps, force, height_um=height)
     result = fit_piecewise(eps, force, boundaries_pct=record["bounds_pct"],
+                           regimes=PW_REGIMES,
                            settings=record.get("settings") or {},
                            carry=tuple(record.get("carry") or ()))
     if not result.get("success"):
@@ -6887,6 +6915,7 @@ def fit_cell_from_file(name, epsilon, force_N, height_um):
     bounds = (0.0,) + tuple(placement) + (
         float(st.session_state.get("pw_end", DEFAULTS["pw_end"])),)
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                           regimes=PW_REGIMES,
                            settings=piecewise_model_settings(),
                            carry=piecewise_carry())
     if not result.get("success"):
@@ -6911,8 +6940,6 @@ def collection_frame(collection):
             **{f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})":
                round(rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1], 4)
                for s_ in COLLECTION_SYMBOLS},
-            "A_L (nN)": round(rec.get("lamina_A_N", float("nan")) * 1e9, 4),
-            "W_L (fJ)": round(rec.get("lamina_work_J", float("nan")) * 1e15, 4),
         })
     return pd.DataFrame(rows)
 
@@ -7211,8 +7238,6 @@ def all_cells_tab():
                    [rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1]
                     for rec in cells],
                    DISPLAY_UNIT[s_][0]) for s_ in COLLECTION_SYMBOLS]
-    quantities.append(("A_L (lamina)", [rec.get("lamina_A_N", float("nan")) * 1e9
-                                        for rec in cells], "nN"))
     for start in range(0, len(quantities), 4):
         cols = st.columns(4)
         for col, (symbol, values, unit_) in zip(cols, quantities[start:start + 4]):
@@ -7844,9 +7869,14 @@ def result_rows(fit):
             element_support(term, fit),
         ))
     if fit.get("piecewise"):
-        # The components only the regime-by-regime sharing separates: the
-        # perinuclear cytoskeleton, the contact line and the lamina lump.
+        # The one component only the regime-by-regime sharing has: the
+        # contact line of the first stretch, which can be switched off.
+        switched_off = set(fit["piecewise"].get("components_off") or ())
         for term, symbol, key, unit_name in EXTRA_PIECEWISE_ROWS:
+            if term == "alignment" and "k_align" in switched_off:
+                rows.append((f"modulus_{term}", f"{symbol} {EXTRA_NAMES[term].lower()}",
+                             "off", "—", "—", "switched off: F = C₀ to ε₁"))
+                continue
             try:
                 value = float(fit.get(key, float("nan")))
                 error = float(fit.get(f"{key}_std", float("nan")))
@@ -7893,9 +7923,7 @@ def result_rows(fit):
 # The rows only the regime-by-regime sharing has, after the four it shares
 # with every other way: (support key, symbol, fit field, unit).
 EXTRA_PIECEWISE_ROWS = (
-    ("perinuclear", "E_nc", "E_nc_kPa", "kPa"),
     ("alignment", "E_align", "E_align_kPa", "kPa"),
-    ("lamina", "A_L", "A_lamina_nN", "nN"),
 )
 EXTRA_NAMES = {
     "perinuclear": "Perinuclear cytoskeleton",
@@ -8090,12 +8118,23 @@ def where_the_power_law_changes(fit, model, style):
     and a plot of it against ε with the boundaries drawn on says everything
     that prose said, in the place where it can be disagreed with.
     """
-    if exponent_profile_figure is None or not (fit and fit.get("success")):
+    if exponent_profile_figure is None:
         return
-    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    if not (fit and fit.get("success")):
+        # No fit yet: the curve's own slope still says everything it says,
+        # over the range chosen on the analysis tab, with no boundaries.
+        fit = None
+        eps_all = np.asarray(model.epsilon, dtype=float)
+        lo = float(st.session_state.get("window_start", 0.0))
+        hi = float(st.session_state.get("window_end", float(np.nanmax(eps_all))))
+        lo, hi = max(lo, 0.0), min(hi, float(np.nanmax(eps_all)))
+    else:
+        lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
     profile = st.session_state.get("_slope_profile")
-    if not (profile and len(profile.get("epsilon", []))):
+    if not (profile and len(profile.get("epsilon", []))
+            and tuple(profile.get("_range", ())) == (round(lo, 4), round(hi, 4))):
         profile = log_slope_profile(model, lo, hi)
+        profile["_range"] = (round(lo, 4), round(hi, 4))
         st.session_state["_slope_profile"] = profile
     eps = np.asarray(profile.get("epsilon", []), dtype=float)
     p = np.asarray(profile.get("exponent", []), dtype=float)
@@ -8106,11 +8145,16 @@ def where_the_power_law_changes(fit, model, style):
         )
         return
 
-    e1 = fit.get("break_1")
-    e2 = fit.get("break_2")
-    terms = set(fit.get("terms") or ())
+    # The boundaries the fit on the analysis tab has: the lines on its
+    # curve, whichever way it shares the load.
+    named = dict((name, value) for value, name in fit_edges(fit)) if fit else {}
+    piecewise = bool(fit and fit.get("piecewise"))
+    e1 = named.get("ε₁")
+    e2 = named.get("ε₂")
+    e3 = named.get("ε₃")
+    terms = set((fit or {}).get("terms") or ())
     edges = [lo]
-    for value in (e1, e2):
+    for value in (e1, e2, e3):
         if value is not None and lo < float(value) < hi:
             edges.append(float(value))
     edges.append(hi)
@@ -8140,6 +8184,7 @@ def where_the_power_law_changes(fit, model, style):
                    if np.isfinite(before) and np.isfinite(after)
                    else "the shell hands over")
                 + "<br>" + (
+                    "membrane and cytoskeleton start" if piecewise else
                     "the shell stops taking more; the cytoplasm carries on"
                     if "interior" in terms else "the outer law ends"
                 )
@@ -8164,14 +8209,29 @@ def where_the_power_law_changes(fit, model, style):
             ),
         })
 
-    st.plotly_chart(
-        exponent_profile_figure(
-            profile, style, e1, e2,
-            title="Where the curve changes its power law",
-            notes=notes, stages=stages,
-        ),
-        key="power_law_profile", **STRETCH,
+    if e3 is not None and lo < float(e3) < hi:
+        before, after = mean_slope(float(e2 or lo), float(e3)), mean_slope(float(e3), hi)
+        notes.append({
+            "epsilon": float(e3),
+            "y": 0.2,
+            "ax": 40,
+            "ay": -30,
+            "text": (
+                f"ε₃ = {float(e3):.3f}<br>"
+                + (f"slope {before:.2f} → {after:.2f}"
+                   if np.isfinite(before) and np.isfinite(after) else "")
+                + "<br>the inside of the nucleus carries load"
+            ),
+        })
+    figure = exponent_profile_figure(
+        profile, style, e1, e2,
+        title="Where the curve changes its power law",
+        notes=notes, stages=stages,
     )
+    if e3 is not None and lo < float(e3) < hi:
+        figure.add_vline(x=float(e3), line=dict(color="#9467bd", width=2,
+                                                dash="dot"))
+    st.plotly_chart(figure, key="power_law_profile", **STRETCH)
     st.caption(
         "The slope of ln F against ln ε, measured on the data alone with no "
         "fit in it: 3 while a fluid-filled shell is being stretched, 3/2 "
@@ -8181,10 +8241,115 @@ def where_the_power_law_changes(fit, model, style):
         "the measured slope climbs along the curve rather than sitting on a "
         "constant"
         + (f"; here q = {float(fit.get('confinement', 0.0) or 0.0):g}. "
-           if fit.get("confinement") else ". ")
-        + "The vertical lines are the boundaries the fit used, so this is "
-        "the one panel where the model can be held to the data by eye."
+           if fit and fit.get("confinement") else ". ")
+        + ("The vertical lines are the boundaries the fit used, so this is "
+           "the one panel where the model can be held to the data by eye."
+           if fit else "Fit the curve on the analysis tab and its boundaries "
+           "are drawn on this.")
     )
+
+
+def shown_fit():
+    """The fit the analysis tab is showing now, whichever way it shares."""
+    if piecewise_on():
+        return (st.session_state.get("results") or {}).get("fit")
+    return st.session_state.get("_last_fit")
+
+
+def log_log_figure(epsilon, force_N, fitted_N, fit, style):
+    """
+    The curve itself on log-log axes: the data, the fit, the boundaries.
+
+    Every law in the model is a straight line here, of slope 3 or 3/2, so a
+    stretch that runs straight is one law carrying the load and a bend is a
+    boundary. The boundaries are drawn as lines of the plot's own, in data
+    coordinates, so they sit where they belong on a log axis.
+    """
+    x = np.asarray(epsilon, dtype=float)
+    y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
+    keep = (x > 0) & (y > 0) & np.isfinite(y)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x[keep], y=y[keep], mode="markers", name="Experimental data",
+        marker={"color": style.data_color, "size": max(3, int(style.marker_size * 0.55))},
+    ))
+    if fitted_N is not None:
+        fy, _ = from_newtons(np.asarray(fitted_N, dtype=float), style.force_unit)
+        good = (x > 0) & np.isfinite(fy) & (fy > 0)
+        fig.add_trace(go.Scatter(
+            x=x[good], y=fy[good], mode="lines", name="Fitted curve",
+            line={"color": style.fit_color or "#000000", "width": 2.5},
+        ))
+    if keep.any():
+        y_lo, y_hi = float(np.min(y[keep])), float(np.max(y[keep]))
+        for value, name in (fit_edges(fit) if fit else []):
+            if value <= 0:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[value, value], y=[y_lo, y_hi], mode="lines",
+                name=f"{name} = {eps_text(value, fit, bare=True)}",
+                line={"color": "#222222", "width": 1.5, "dash": "dash"},
+                hoverinfo="skip",
+            ))
+        # Slope 3 and slope 3/2 through the middle of the data, to hold the
+        # curve against by eye.
+        xm = float(np.median(x[keep]))
+        ym = float(np.median(y[keep]))
+        xs = np.array([float(np.min(x[keep])), float(np.max(x[keep]))])
+        for power, colour, label in ((3.0, "#2ca02c", "slope 3 (shell)"),
+                                     (1.5, "#9467bd", "slope 3/2 (Hertz)")):
+            fig.add_trace(go.Scatter(
+                x=xs, y=ym * (xs / xm) ** power, mode="lines", name=label,
+                line={"color": colour, "width": 1, "dash": "dot"},
+                hoverinfo="skip",
+            ))
+            fig.update_yaxes(range=[np.log10(max(y_lo, 1e-30)) - 0.2,
+                                    np.log10(y_hi) + 0.2])
+    fig.update_layout(
+        height=460, template="simple_white",
+        margin={"l": 70, "r": 20, "t": 30, "b": 90},
+        legend={"orientation": "h", "yref": "container", "y": 0.005,
+                "yanchor": "bottom", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Relative deformation ε (log)", "type": "log"},
+        yaxis={"title": f"Force ({unit}, log)", "type": "log"},
+    )
+    return fig
+
+
+def piecewise_share_figure(result, style):
+    """Who carries the load where: each component's share of F̂, stacked."""
+    b = result["boundaries_pct"]
+    x = np.linspace(max(float(b[0]), 0.2), float(b[-1]), 400)
+    total = predict_piecewise(x / 100.0, result)
+    fig = go.Figure()
+    off = piecewise_off()
+    for name, label, _symbol, colour, _law in PW_COMPONENTS:
+        if component_force is None:
+            break
+        layer = component_force(result, name, x)
+        if layer is None or (name in off and name != "k_align"):
+            continue
+        share = np.where(np.abs(total) > 0, layer / total, np.nan)
+        fig.add_trace(go.Scatter(
+            x=x, y=100.0 * share, mode="lines", stackgroup="share",
+            name=label, line={"color": colour, "width": 0.8},
+            fillcolor=_rgba(colour, 0.35),
+        ))
+    for value, name in zip(b[1:4], EPS_NAMES):
+        fig.add_trace(go.Scatter(
+            x=[value, value], y=[0, 100], mode="lines", name=f"{name} = {value:.1f} %",
+            line={"color": "#222222", "width": 1.2, "dash": "dash"},
+            hoverinfo="skip",
+        ))
+    fig.update_layout(
+        height=360, template="simple_white",
+        margin={"l": 70, "r": 20, "t": 30, "b": 90},
+        legend={"orientation": "h", "yref": "container", "y": 0.005,
+                "yanchor": "bottom", "x": 0.0, "xanchor": "left"},
+        xaxis={"title": "Relative deformation x (%)"},
+        yaxis={"title": "share of F̂ (%)", "range": [0, 100]},
+    )
+    return fig
 
 
 def log_slope_profile(model, lo, hi):
@@ -9659,11 +9824,10 @@ def send_cell_to_sheet(manager, fit, date_acquired):
             ),
             "model": fit.get("model_label") or st.session_state["model_kind"],
             "combination": combination,
-            # Only the four-regime fit has these two: the cytoskeleton around
-            # the nucleus in regime 3, and the apparent contact modulus of
-            # regime 1. Blank for every other model.
-            "E_nc": (round(float(fit.get("E_nc_kPa", 0.0)), 6)
-                     if piecewise else ""),
+            # Only the piecewise sharing has the apparent contact modulus of
+            # regime 1. The perinuclear cytoskeleton is no longer one of the
+            # components, so its column stays blank.
+            "E_nc": "",
             "E_align": (round(float(fit.get("E_align_kPa", 0.0)), 6)
                         if piecewise else ""),
             "piecewise": (
@@ -9788,6 +9952,7 @@ def refit_stored_cell(store, cell_id, settings):
             model.epsilon, model.force,
             boundaries_pct=merged.get("piecewise_boundaries_pct")
             or C2C12_BOUNDARIES_PCT,
+            regimes=PW_REGIMES,
             settings=effective_piecewise_settings(
                 merged.get("piecewise_settings") or {},
                 merged.get("piecewise_until") or {},
@@ -9802,6 +9967,7 @@ def refit_stored_cell(store, cell_id, settings):
             result,
             piecewise_geometry(model, probe_um=probe_um,
                                coat_nm=merged.get("protein_coat_nm", 200.0)),
+            regimes=PW_REGIMES,
         )
         fit = piecewise_as_fit(result, model, probe_um=probe_um,
                                settings=merged.get("piecewise_settings") or {},
@@ -13511,12 +13677,24 @@ with tab_explore:
             max(hi_ex - 1e-3, 0.0),
         ))
         terms_ex = active_terms() or ("membrane", "interior")
-        st.caption(
-            f"ε = {lo_ex:.3f} to {hi_ex:.3f}, with the components ticked on "
-            "the analysis tab: "
-            + ", ".join(plain_name(t).lower() for t in terms_ex)
-            + ". Change either there and this follows."
-        )
+        fit_ex = shown_fit()
+        pw_ex = bool(fit_ex and fit_ex.get("piecewise"))
+        if pw_ex:
+            on_ex = [label.split(" ", 1)[1].lower() for name, label, *_ in
+                     PW_COMPONENTS if name not in piecewise_off()]
+            st.caption(
+                f"Piecewise sharing, ε₁, ε₂, ε₃ as on the analysis tab"
+                + (f" (`fit {fit_ex['fit_id']}`)" if fit_ex.get("fit_id") else "")
+                + ", with " + ", ".join(on_ex) + ". Change them there and "
+                "this follows."
+            )
+        else:
+            st.caption(
+                f"ε = {lo_ex:.3f} to {hi_ex:.3f}, with the components ticked on "
+                "the analysis tab: "
+                + ", ".join(plain_name(t).lower() for t in terms_ex)
+                + ". Change either there and this follows."
+            )
 
         st.markdown(
             "Every law in this model is a straight line on log-log axes, "
@@ -13533,17 +13711,42 @@ with tab_explore:
             r"{\sum_j a_j E_j g_j(\varepsilon)}"
         )
 
+        st.markdown("#### The curve on log-log axes")
+        results_ex = st.session_state.get("results") or {}
+        st.plotly_chart(
+            log_log_figure(
+                eps_ex, force_ex,
+                results_ex.get("fitted_N") if fit_ex is not None
+                and results_ex.get("fit") is fit_ex else None,
+                fit_ex, style_ex,
+            ),
+            key="log_log_curve", **STRETCH,
+        )
+        st.caption(
+            "ln F against ln ε: a law F ∝ εᵖ is a straight line of slope p, "
+            "so a straight stretch is one law and a bend is a boundary. The "
+            "dotted lines have slope 3 (a stretching shell) and 3/2 (a "
+            "Hertzian contact); the dashed ones are the fit's boundaries."
+        )
+
         st.markdown("#### Where the curve changes its power law")
-        where_the_power_law_changes(
-            st.session_state.get("_last_fit"), model_ex, style_ex,
-        )
+        where_the_power_law_changes(fit_ex, model_ex, style_ex)
 
-        share_of_force_plot(
-            st.session_state.get("_last_fit"), model_ex, style_ex,
-        )
-
-        st.markdown("#### What the curve is fitting, stretch by stretch")
-        stage_algebra(st.session_state.get("_last_fit"))
+        if pw_ex:
+            pw_result_ex = results_ex.get("piecewise_result")
+            if pw_result_ex:
+                st.markdown("#### Who carries the load, where")
+                st.plotly_chart(piecewise_share_figure(pw_result_ex, style_ex),
+                                key="pw_share_plot", **STRETCH)
+                st.markdown("#### What the curve is fitting, stretch by stretch")
+                for line in piecewise_equations_latex(
+                        pw_result_ex["boundaries_pct"],
+                        pw_result_ex.get("ranges") or {}, piecewise_off()):
+                    st.latex(line)
+        else:
+            share_of_force_plot(fit_ex, model_ex, style_ex)
+            st.markdown("#### What the curve is fitting, stretch by stretch")
+            stage_algebra(fit_ex)
 
         with st.expander(
             "📋 The materials, the law each obeys, and why they separate"
@@ -13559,17 +13762,30 @@ with tab_explore:
             separation_rule()
 
         st.markdown("#### Find the boundaries from this curve")
-        refine_boundaries_control(model_ex, lo_ex, hi_ex, terms_ex)
-        left_alone = st.session_state.pop("_boundaries_left_alone", None)
-        if left_alone:
+        if pw_ex:
             st.caption(
-                "Left as you set "
-                + ", ".join(plain_name(t).lower() for t in left_alone)
-                + ": those ranges were moved by hand, so the new boundaries "
-                "did not touch them."
+                "With piecewise sharing, ε₁, ε₂, ε₃ are placed by **▶ Place "
+                "ε₁, ε₂, ε₃** on the analysis tab, which compares the power "
+                "law read off this curve with fitting everything; the routes "
+                "are in its **ε routes compared** tab."
             )
-        search_results_as_equations()
-        why_this_search(model_ex)
+            placements_ex = st.session_state.get("pw_placements") or {}
+            power_ex = placements_ex.get("power") or {}
+            if power_ex.get("success"):
+                st.plotly_chart(power_law_figure(power_ex, piecewise_boundaries()),
+                                key="pw_power_law_explore", **STRETCH)
+        else:
+            refine_boundaries_control(model_ex, lo_ex, hi_ex, terms_ex)
+            left_alone = st.session_state.pop("_boundaries_left_alone", None)
+            if left_alone:
+                st.caption(
+                    "Left as you set "
+                    + ", ".join(plain_name(t).lower() for t in left_alone)
+                    + ": those ranges were moved by hand, so the new "
+                    "boundaries did not touch them."
+                )
+            search_results_as_equations()
+            why_this_search(model_ex)
 
 
 # ==================================================== TAB 3: video analysis ==
@@ -14562,17 +14778,16 @@ with tab_results:
                 # bending constant.
                 # Written exactly as on the analysis tab, in the same units,
                 # so the two tabs show one set of numbers.
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3 = st.columns(3)
                 m1.metric("Eₘ", modulus_display("E_shell", fit["Em"]))
                 m2.metric("Ec", modulus_display("E_cyto", fit["Ei"]))
                 m3.metric("E_ne", modulus_display("E_ne", fit["Ene"]))
-                m4.metric("R²", f"{fit['r_squared']:.5f}")
-                m5, m6, m7, m8 = st.columns(4)
-                m5.metric("E_nc", modulus_display("E_nc", fit.get("E_nc_kPa", 0.0) * 1e3))
-                m6.metric("Eₙ", modulus_display("E_core", fit["En"]))
-                m7.metric("E_align", modulus_display("E_align",
-                                                     fit.get("E_align_kPa", 0.0) * 1e3))
-                m8.metric("A_L (lamina)", f"{fit.get('A_lamina_nN', 0.0):.4g} nN")
+                m4, m5, m6 = st.columns(3)
+                m4.metric("Eₙ", modulus_display("E_core", fit["En"]))
+                m5.metric("E_align", "off" if "k_align" in (
+                    fit["piecewise"].get("components_off") or ())
+                    else modulus_display("E_align", fit.get("E_align_kPa", 0.0) * 1e3))
+                m6.metric("R²", f"{fit['r_squared']:.5f}")
                 if fit.get("fit_id"):
                     st.caption(f"fit {fit['fit_id']}, the same fit as on the "
                                "📊 Force curve analysis tab.")
