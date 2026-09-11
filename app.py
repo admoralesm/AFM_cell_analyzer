@@ -642,10 +642,13 @@ DEFAULTS = {
     # answer appears. The spring-network models are the other choice.
     "c2c12_fit_mode": "4-regime piecewise (C2C12)",
     # Where regimes 2, 3 and 4 start and where the fit ends, in PERCENT
-    # relative deformation. Regime 1 always starts at 0 %.
+    # relative deformation. Regime 1 always starts at 0 %. These are the
+    # C2C12 prior's (see piecewise_prior): contact under 5 %, the nucleus
+    # met at about 50 % and its bump over about 25 % later. Each new curve
+    # has its boundaries found inside those constraints straight away.
     "pw_b1": 5.0,
-    "pw_b2": 40.0,
-    "pw_b3": 60.0,
+    "pw_b2": 50.0,
+    "pw_b3": 75.0,
     "pw_end": 91.2,
     # Per-coefficient initial guesses and bounds the user has changed, as
     # {name: {"p0": .., "lower": .., "upper": ..}}. Empty means the spec's.
@@ -665,11 +668,13 @@ DEFAULTS = {
     "pw_use_K_nucleus": True,
     "pw_use_K_nuc_cyto": True,
     "pw_use_K_core": True,
-    # Where the boundary search may put ε₁, ε₂ and ε₃, in percent: around
-    # the specification's 5 / 40 / 60.
-    "pw_band1_lo": 2.0, "pw_band1_hi": 10.0,
-    "pw_band2_lo": 30.0, "pw_band2_hi": 50.0,
-    "pw_band3_lo": 50.0, "pw_band3_hi": 70.0,
+    # The C2C12 constraints the boundaries are found inside, in percent:
+    # ε₁ (end of the contact artefact) under 5 %, ε₂ (nucleus met) in the
+    # prior's 44 to 62 %, and ε₃ - ε₂ (how long the nuclear bump lasts)
+    # 25 % give or take 10. Set from piecewise_prior; editable on the page.
+    "pw_band1_lo": 1.0, "pw_band1_hi": 5.0,
+    "pw_band2_lo": 44.0, "pw_band2_hi": 62.0,
+    "pw_span_lo": 15.0, "pw_span_hi": 35.0,
     # The last boundary search, with the curve and settings it was run on.
     "pw_boundary_search": None,
     # Guided by default: most people opening this want a number, not a
@@ -831,6 +836,7 @@ NEW_CELL_CLEARS = (
     "video_path", "video_info", "video_track",
     "video_name", "video_link", "eps_percent_fix",
     "video_saved_frame", "video_saved_frame_index", "pw_boundary_search",
+    "_pw_auto_found",
 )
 
 if st.session_state.pop("_start_new_cell", False):
@@ -4494,8 +4500,8 @@ ADVANCED_MODE = "Spring-network models (advanced)"
 FIT_MODES = (PIECEWISE_MODE, ADVANCED_MODE)
 PIECEWISE_CELL_TYPES = ("Myoblast (C2C12)",)
 PW_BOUNDARY_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end")
-PW_BAND_KEYS = (("pw_band1_lo", "pw_band1_hi"), ("pw_band2_lo", "pw_band2_hi"),
-                ("pw_band3_lo", "pw_band3_hi"))
+PW_BAND_KEYS = (("pw_band1_lo", "pw_band1_hi"), ("pw_band2_lo", "pw_band2_hi"))
+PW_SPAN_KEYS = ("pw_span_lo", "pw_span_hi")
 # The names the boundaries go by everywhere: on the inputs, on the curve,
 # in the results and in the sheet (ε₁ and ε₂ are its two boundary columns).
 EPS_NAMES = ("ε₁", "ε₂", "ε₃")
@@ -4630,19 +4636,111 @@ def piecewise_ranges(bounds=None):
     )
 
 
+# Which of the app's C2C12 elements each four-regime coefficient belongs
+# to, so the prior written for those elements speaks for these.
+PW_ELEMENT_OF = {
+    "membrane": ("K_shell",),
+    "interior": ("K_cyto", "K_nuc_cyto"),
+    "nucleus_shell": ("K_nucleus",),
+    "nucleus": ("K_core",),
+}
+
+
+def piecewise_prior(cell_type=None):
+    """
+    The C2C12 constraints the boundaries are found inside, in percent.
+
+    Read from the app's own C2C12 prior (COMPONENT_PRIORS), the one place
+    what is known about the cell is written down:
+
+    * the contact artefact is under 5 % (ε₁ between 1 and 5 %);
+    * the sarcolemma and the cytoskeleton carry load from first contact to
+      the end;
+    * the nucleus is met as a bump at about 50 % that runs on for about
+      another 25 %, so ε₂ sits in the prior's onset band (44 to 62 %) and
+      ε₃, where dense packing takes over, about 25 % after it (give or take
+      10);
+    * once met, the nucleus, envelope and contents alike, keeps carrying
+      load to the end.
+    """
+    prior = component_prior(cell_type or "Myoblast (C2C12)")
+    lo, hi = deep_onset_band(cell_type or "Myoblast (C2C12)", 0.0, 1.0)
+    bump = prior.get("bump") or {"from": 0.50, "span": 0.25}
+    span = float(bump.get("span", 0.25)) * 100.0
+    start = float(bump.get("from", 0.50)) * 100.0
+    to_end = set(prior.get("throughout") or ()) | set(
+        prior.get("runs_to_the_end") or ())
+    carry = tuple(c for element in ("membrane", "interior", "nucleus_shell",
+                                    "nucleus")
+                  if element in to_end for c in PW_ELEMENT_OF[element])
+    return {
+        "eps1_band": (1.0, 5.0),
+        "eps2_band": (round(lo * 100.0, 2), round(hi * 100.0, 2)),
+        "span_band": (max(5.0, span - 10.0), span + 10.0),
+        "defaults": (5.0, start, start + span),
+        "carry": carry,
+        "why": prior.get("why", ""),
+    }
+
+
+def piecewise_defaults():
+    """(ε₁, ε₂, ε₃, end) a curve starts from before its own are found."""
+    return tuple(piecewise_prior()["defaults"]) + (DEFAULTS["pw_end"],)
+
+
 def piecewise_carry():
-    """The coefficients carried past their own regime: the membrane, or none."""
-    return ("K_shell",) if st.session_state.get(
-        "pw_membrane_throughout", True) else ()
+    """
+    The components that keep acting to the end of the fit.
+
+    The prior's: membrane and cytoskeleton from first contact, the nucleus
+    once met. The membrane's tick takes it out of that list.
+    """
+    carry = piecewise_prior()["carry"]
+    if not st.session_state.get("pw_membrane_throughout", True):
+        carry = tuple(c for c in carry if c != "K_shell")
+    return carry
+
+
+def piecewise_span():
+    """ε₃ − ε₂, low and high, in percent: how long the nuclear bump lasts."""
+    return tuple(sorted(float(st.session_state.get(k, DEFAULTS[k]))
+                        for k in PW_SPAN_KEYS))
 
 
 def piecewise_bands():
-    """The three search bands, each (low, high) in percent, low <= high."""
-    return tuple(
+    """
+    The three search bands, (low, high) in percent.
+
+    ε₃'s is where ε₂'s band and the bump's length allow it; the search also
+    holds ε₃ − ε₂ inside the bump's length for every placement it tries.
+    """
+    b1, b2 = (
         tuple(sorted((float(st.session_state.get(lo, DEFAULTS[lo])),
                       float(st.session_state.get(hi, DEFAULTS[hi])))))
         for lo, hi in PW_BAND_KEYS
     )
+    span = piecewise_span()
+    end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
+    b3 = (b2[0] + span[0], max(b2[0] + span[0], min(b2[1] + span[1], end - 2.0)))
+    return (b1, b2, b3)
+
+
+def constraint_notes(bounds):
+    """Where the boundaries in use break the C2C12 constraints, if anywhere."""
+    (l1, h1), (l2, h2), _b3 = piecewise_bands()
+    s_lo, s_hi = piecewise_span()
+    e1, e2, e3 = (float(v) for v in bounds[1:4])
+    notes = []
+    if not l1 - 1e-6 <= e1 <= h1 + 1e-6:
+        notes.append(f"ε₁ = {e1:.1f} % is outside the contact zone "
+                     f"({l1:g}–{h1:g} %)")
+    if not l2 - 1e-6 <= e2 <= h2 + 1e-6:
+        notes.append(f"ε₂ = {e2:.1f} % is outside where a C2C12 nucleus is "
+                     f"met ({l2:g}–{h2:g} %)")
+    if not s_lo - 1e-6 <= e3 - e2 <= s_hi + 1e-6:
+        notes.append(f"ε₃ − ε₂ = {e3 - e2:.1f} % is outside the nuclear "
+                     f"bump's length ({s_lo:g}–{s_hi:g} %)")
+    return notes
 
 
 def piecewise_signature(epsilon, force_N):
@@ -4654,7 +4752,7 @@ def piecewise_signature(epsilon, force_N):
         sorted((k, sorted(v.items())) for k, v in piecewise_model_settings().items()),
         piecewise_carry(),
         round(float(st.session_state.get("pw_end", DEFAULTS["pw_end"])), 4),
-        piecewise_bands(),
+        piecewise_bands(), piecewise_span(),
     ))
 
 
@@ -4671,13 +4769,11 @@ def current_search(epsilon, force_N):
 def boundary_source(bounds, found=None):
     """Where the boundaries in use came from, in a few words."""
     inner = tuple(round(float(b), 2) for b in bounds[1:4])
-    spec = tuple(round(float(b), 2) for b in C2C12_BOUNDARIES_PCT[1:4])
+    defaults = tuple(round(float(b), 2) for b in piecewise_defaults()[:3])
     if found and inner == tuple(round(float(b), 2) for b in found["best_pct"]):
-        return "found by the boundary search"
-    if inner == spec:
-        if found and found.get("strength") == "none":
-            return "the specification, kept by the boundary search"
-        return "the specification"
+        return "found from this curve within the C2C12 constraints"
+    if inner == defaults:
+        return "the C2C12 defaults"
     return "set by hand"
 
 
@@ -4886,33 +4982,44 @@ def piecewise_stage_plan(result):
     ]
 
 
-def add_boundary_lines(fig, bounds, scale=1.0, end_label=True):
+def add_boundary_lines(fig, bounds, scale=1.0, end_label=True, top=0.965):
     """
     ε₁, ε₂, ε₃ (and the end of the fit) as labelled lines on a figure.
 
     ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
-    0.01 for one in ε as a fraction. Drawn against the whole figure's
-    height, so on the four-regime plot each line runs through the curve and
-    the component ranges under it alike.
+    0.01 for one in ε as a fraction. Each line runs the whole height of the
+    figure; its label sits just inside the top of the curve's panel, on a
+    white tag, below the legend rather than tangled in it. Labels whose
+    lines are close together are staggered so they never overlap.
     """
-    lines = list(zip(EPS_NAMES, bounds[1:4]))
+    lines = [(name, float(value), False) for name, value in zip(EPS_NAMES, bounds[1:4])]
     if end_label:
-        lines.append(("end", bounds[-1]))
-    for name, value in lines:
-        x = float(value) * scale
-        is_end = name == "end"
+        lines.append(("end", float(bounds[-1]), True))
+    span = max(float(bounds[-1]) - float(bounds[0]), 1.0)
+    level, last_x = 0, None
+    for name, value, is_end in lines:
+        x = value * scale
         fig.add_shape(
             type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
-            line={"color": "#888888" if is_end else "#333333",
+            line={"color": "#888888" if is_end else "#222222",
                   "width": 1 if is_end else 1.5,
                   "dash": "dot" if is_end else "dash"},
             layer="above",
         )
+        # Drop a label a step if its line is close to the one before it.
+        level = (level + 1) % 3 if (last_x is not None
+                                    and value - last_x < 0.09 * span) else 0
+        last_x = value
         fig.add_annotation(
-            x=x, y=1.0, xref="x", yref="paper", showarrow=False,
-            text=f"{name} = {float(value):.1f} %", xanchor="left",
-            yanchor="bottom", font={"size": 12 if not is_end else 11,
-                                    "color": "#555555" if is_end else "#111111"},
+            x=x, y=top - 0.06 * level, xref="x", yref="paper", showarrow=False,
+            text=(f"<b>{name}</b> = {value:.1f} %" if not is_end
+                  else f"end = {value:.1f} %"),
+            xanchor="right" if is_end else "center", yanchor="top",
+            font={"size": 14 if not is_end else 11,
+                  "color": "#555555" if is_end else "#111111"},
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#222222" if not is_end else "#aaaaaa",
+            borderwidth=1, borderpad=3,
         )
     return fig
 
@@ -5208,16 +5315,16 @@ def piecewise_search_panel(found, bounds):
             f"95 %: {row['lo95']:.2f}–{row['hi95']:.2f}){edge}"
         )
     dbic = found["delta_bic"]
-    source = boundary_source(bounds, found)
-    kept = source.startswith("the specification, kept")
+    ref = " / ".join(f"{v:g}" for v in found["spec_pct"])
     box = st.success if found["strength"] in ("strong", "positive", "only") \
         else st.info
     box(
-        "🎯 **Boundary search**, most likely placement: " + " · ".join(parts)
-        + (f" · ΔBIC = {dbic:.1f} against 5 / 40 / 60 %. " if np.isfinite(dbic) else ". ")
+        "🎯 **Boundaries found from this curve within the C2C12 "
+        "constraints:** " + " · ".join(parts)
+        + (f" · ΔBIC = {dbic:.1f} against the defaults {ref} %. "
+           if np.isfinite(dbic) else ". ")
         + found["verdict"]
         + (" **In use.**" if in_use else
-           " **Kept 5 / 40 / 60 %.**" if kept else
            " *The boundaries in use have been changed since.*")
     )
     if not in_use:
@@ -5251,16 +5358,18 @@ def piecewise_search_panel(found, bounds):
         st.latex(r"\Delta(-2\ln L)(\varepsilon_j)=n\ln\frac{S}{S_{min}}"
                  r"\;\le 1\ (68\,\%),\ \le 3.84\ (95\,\%)")
         st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{spec}}{S_{min}}-3\ln n")
+        span = found.get("span_pct")
         st.caption(
             f"Searched ε₁ ∈ {found['bands_pct'][0][0]:g}–{found['bands_pct'][0][1]:g} %, "
-            f"ε₂ ∈ {found['bands_pct'][1][0]:g}–{found['bands_pct'][1][1]:g} %, "
-            f"ε₃ ∈ {found['bands_pct'][2][0]:g}–{found['bands_pct'][2][1]:g} % "
-            f"(coarse grid, then coordinate descent at 0.1 %), "
+            f"ε₂ ∈ {found['bands_pct'][1][0]:g}–{found['bands_pct'][1][1]:g} %"
+            + (f", ε₃ − ε₂ ∈ {span[0]:g}–{span[1]:g} %" if span else
+               f", ε₃ ∈ {found['bands_pct'][2][0]:g}–{found['bands_pct'][2][1]:g} %")
+            + " (coarse grid, then coordinate descent at 0.1 %), "
             f"{found['n_evaluations']} placements, n = {found['n_points']} points "
             f"up to {found['end_pct']:.1f} %. ΔBIC above 6 is strong evidence "
-            "for the found boundaries, 2 to 6 positive, below 0 none: the "
-            "3 ln n term is the price of letting the data choose three "
-            "numbers. The intervals assume independent noise; residuals that "
+            "that the curve itself places the boundaries there rather than "
+            "at the defaults, 2 to 6 positive, below 0 none: the 3 ln n term "
+            "is the price of letting the data choose three numbers. The intervals assume independent noise; residuals that "
             "run in long stretches make them narrower than they should be. "
             "The coefficients and moduli are then fitted sequentially, "
             "exactly as specified, at the boundaries in use."
@@ -5309,10 +5418,15 @@ def _pw_range_moved(name):
             untils.pop(name, None)
         else:
             untils[name] = round(hi, 2)
-    elif abs(hi - regime_end) < 0.05:
-        untils.pop(name, None)
     else:
-        untils[name] = round(hi, 2)
+        # Where it ends when nobody has moved it: the end of the fit for a
+        # component the C2C12 prior has acting to the end, its regime's
+        # end otherwise. Put back there, it follows again.
+        default_end = end if name in piecewise_carry() else regime_end
+        if abs(hi - default_end) < 0.05:
+            untils.pop(name, None)
+        else:
+            untils[name] = round(hi, 2)
     st.session_state["pw_until"] = untils
 
 
@@ -5401,7 +5515,64 @@ def piecewise_section(model, epsilon, force_N, rupture):
     )
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
+
+    def run_search():
+        """The most likely ε₁, ε₂, ε₃ inside the C2C12 constraints."""
+        found = find_boundaries(
+            epsilon, force_N,
+            end_pct=float(st.session_state["pw_end"]),
+            bands_pct=piecewise_bands(),
+            span_pct=piecewise_span(),
+            spec_pct=piecewise_defaults()[:3],
+            settings=piecewise_model_settings(),
+            carry=piecewise_carry(),
+        )
+        if found.get("success"):
+            found["signature"] = piecewise_signature(epsilon, force_N)
+            st.session_state["pw_boundary_search"] = found
+        return found
+
+    # A new curve has its boundaries found as soon as it is on the page.
+    # Done before the boundary inputs are drawn, so they can be written
+    # directly and the page is right on its first draw.
+    data = st.session_state.get("data") or {}
+    curve_key = repr((data.get("source"), int(np.size(epsilon)),
+                      round(float(force_N[-1]), 15) if np.size(force_N) else 0.0))
+    if st.session_state.get("_pw_auto_found") != curve_key:
+        st.session_state["_pw_auto_found"] = curve_key
+        with st.spinner("Finding this curve's boundaries within the C2C12 "
+                        "constraints…"):
+            found = run_search()
+        if found.get("success"):
+            for key, value in zip(PW_BOUNDARY_KEYS, found["best_pct"]):
+                st.session_state[key] = round(float(value), 2)
+        else:
+            st.warning(
+                "Could not place the boundaries inside the C2C12 constraints "
+                f"on this curve ({found.get('error', 'no valid placement')}), "
+                "so the defaults are used. A curve that stops before the "
+                "nucleus is met has no ε₂ or ε₃ to find.",
+                icon="⚠️",
+            )
+
     st.markdown("#### 1 · Regime boundaries (% relative deformation)")
+    prior = piecewise_prior()
+    (l1, h1), (l2, h2), _b3 = piecewise_bands()
+    s_lo, s_hi = piecewise_span()
+    st.info(
+        "**C2C12 constraints the boundaries are found inside** "
+        "(the app's C2C12 prior):\n"
+        f"- **ε₁**, end of the contact artefact: {l1:g}–{h1:g} %.\n"
+        "- **Membrane and cytoskeleton** carry load from ε₁ to the end of "
+        "the fit.\n"
+        f"- **ε₂**, the nucleus is met: {l2:g}–{h2:g} % (a bump at about "
+        f"{prior['defaults'][1]:g} %).\n"
+        f"- **ε₃**, dense intranuclear packing, comes when that bump is "
+        f"over: ε₃ − ε₂ = {s_lo:g}–{s_hi:g} %.\n"
+        "- **Nuclear envelope and contents** keep carrying load to the end "
+        "once met.",
+        icon="🧬",
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.number_input(f"{EPS_NAMES[0]} · R2 starts (%)", 0.5, 99.0, step=0.5,
@@ -5418,34 +5589,44 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         "by the boundary search: it decides which points are "
                         "fitted at all.")
 
+    for note in constraint_notes(piecewise_boundaries()):
+        st.caption(f"⚠️ {note}. Set by hand; press **Find the boundaries** "
+                   "to put them back inside the constraints.")
+
     b1, b2, b3 = st.columns([1.3, 1, 1])
-    spec = tuple(DEFAULTS[k] for k in PW_BOUNDARY_KEYS)
+    spec = piecewise_defaults()
     with b1:
         find = st.button(
-            "🎯 Find the best boundaries", type="primary", key="pw_find",
-            help="Moves ε₁, ε₂ and ε₃ to where the four-regime model, with "
-            "your equations, guesses, bounds and membrane setting, is most "
-            "likely, searching the bands around 5 / 40 / 60 %.",
+            "🎯 Find the boundaries", type="primary", key="pw_find",
+            help="Places ε₁, ε₂ and ε₃ where the four-regime model, with your "
+            "equations, guesses, bounds and component ranges, is most likely "
+            "for this curve, inside the C2C12 constraints above. Done "
+            "automatically for every new curve; press it again after "
+            "changing the model.",
             **STRETCH,
         )
     with b2:
-        if st.button("↺ Back to 5 / 40 / 60 / 91.2 %", key="pw_reset",
-                     help="The specification's boundaries, component "
-                     "ranges, initial guesses and bounds.", **STRETCH):
+        if st.button("↺ C2C12 defaults " + " / ".join(f"{v:g}" for v in spec)
+                     + " %", key="pw_reset",
+                     help="The C2C12 defaults for the boundaries, and the "
+                     "specification's component ranges, initial guesses "
+                     "and bounds.", **STRETCH):
             rerun_keeping_settings({
                 **dict(zip(PW_BOUNDARY_KEYS, spec)),
                 "pw_settings": {},
                 "pw_until": {},
                 "pw_membrane_throughout": True,
+                **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
+                **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
                 **{f"pw_use_{name}": True for name in PW_SWITCHABLE},
                 "_pw_editor_reset": True,
             })
     with b3:
         st.write("")
 
-    with st.expander("Boundary search bands", expanded=False):
-        st.caption("Where the search may put each boundary, in percent. "
-                   "Set both ends to the same value to hold one fixed.")
+    with st.expander("Edit the C2C12 constraints", expanded=False):
+        st.caption("Where the boundaries may go, in percent. Set both ends "
+                   "of one to the same value to hold it fixed.")
         for i, (lo_key, hi_key) in enumerate(PW_BAND_KEYS):
             l, h = st.columns(2)
             with l:
@@ -5454,24 +5635,24 @@ def piecewise_section(model, epsilon, force_N, rupture):
             with h:
                 st.number_input(f"{EPS_NAMES[i]} to", 0.5, 99.0, step=0.5,
                                 format="%.1f", key=hi_key)
+        l, h = st.columns(2)
+        with l:
+            st.number_input("ε₃ − ε₂ (nuclear bump) from", 1.0, 90.0,
+                            step=0.5, format="%.1f", key=PW_SPAN_KEYS[0])
+        with h:
+            st.number_input("ε₃ − ε₂ (nuclear bump) to", 1.0, 90.0,
+                            step=0.5, format="%.1f", key=PW_SPAN_KEYS[1])
+        why = prior.get("why") or ""
+        if why:
+            st.caption("From the app's C2C12 prior: " + why + ".")
 
     if find:
         with st.spinner("Profiling the likelihood over ε₁, ε₂ and ε₃…"):
-            found = find_boundaries(
-                epsilon, force_N,
-                end_pct=float(st.session_state["pw_end"]),
-                bands_pct=piecewise_bands(),
-                settings=piecewise_model_settings(),
-                carry=piecewise_carry(),
-            )
+            found = run_search()
         if found.get("success"):
-            found["signature"] = piecewise_signature(epsilon, force_N)
-            st.session_state["pw_boundary_search"] = found
-            # The best boundaries are the ones the information criterion
-            # prefers: the most likely placement when the curve supports
-            # moving them (ΔBIC > 0), the specification when it does not.
-            best = (found["best_pct"] if found["strength"] != "none"
-                    else C2C12_BOUNDARIES_PCT[1:4])
+            # The most likely placement inside the constraints: every
+            # boundary it can take already respects them.
+            best = found["best_pct"]
             rerun_keeping_settings({
                 "pw_b1": round(float(best[0]), 2),
                 "pw_b2": round(float(best[1]), 2),
@@ -9161,6 +9342,9 @@ with tab_analysis:
             pending.update({key: DEFAULTS[key] for key in PW_BOUNDARY_KEYS})
             pending["pw_until"] = {}
             st.session_state["pw_boundary_search"] = None
+            # And its boundaries are then found inside the C2C12
+            # constraints the first time the four-regime fit draws it.
+            st.session_state["_pw_auto_found"] = None
 
             # No search here. Loading a curve used to run the whole
             # comparison and apply its winner, so the boundaries on screen
