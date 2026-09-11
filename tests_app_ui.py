@@ -352,10 +352,22 @@ def case_c2c12_opens_on_the_four_regime_fit():
               or "No placement reaches" in chosen.get("reason", ""),
               chosen.get("reason", ""))
 
+    # The lamina lump is part of every fit, and a fitted cell can be kept
+    # for the All cells tab under its own name.
+    check("the nuclear lamina lump is fitted",
+          "A_lamina" in state(app, "results")["fit"]["piecewise"]["coefficients"])
+    app.text_input(key="cell_name").input("cell-A").run()
+    app.button(key="pw_add").click().run()
+    if no_exception(app, "adding the cell to the collection"):
+        kept = state(app, "pw_collection") or {}
+        check("the cell is in the collection with its own ε",
+              "cell-A" in kept and len(kept["cell-A"]["bounds_pct"]) == 5,
+              str(list(kept)))
+
     app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
     if no_exception(app, "switching to the spring-network models"):
         check("and the spring-network fit is one click away",
-              button_by_label(app, "Fit this cell") is not None,
+              button_by_label(app, "Fit θ̂: bounded least squares") is not None,
               str([b.label for b in app.button][:12]))
 
 
@@ -416,7 +428,7 @@ def case_highlight():
 def case_search_applies_in_one_press():
     print("one press searches and applies the winner")
     app = start()
-    button = button_by_label(app, "Find the best combination and fit it")
+    button = button_by_label(app, "Select composition by cross-validation")
     check("search button present", button is not None)
     if button is None:
         return
@@ -462,7 +474,7 @@ def case_search_applies_in_one_press():
           MEMBRANE_MODE[after[2]] == best["membrane"]
           and CYTO_MODE[after[3]] == best["cyto_start"])
 
-    override = button_by_label(app, "Use this one instead")
+    override = button_by_label(app, "Apply this (ε₁, ε₂)")
     check("override button present", override is not None)
     if override is not None:
         override.click().run()
@@ -589,7 +601,7 @@ def case_preset_round_trip():
     if name_box is None:
         return
     name_box.set_value("test preset").run()
-    save = button_by_label(app, "Save current")
+    save = button_by_label(app, "Save windows as preset")
     check("save button present", save is not None)
     if save is None:
         return
@@ -612,7 +624,7 @@ def case_preset_round_trip():
     widget_by_label(app, "radio", "the membrane").set_value(
         "holds what it reached"
     ).run()
-    apply = button_by_label(app, "Apply this preset")
+    apply = button_by_label(app, "Apply preset")
     if apply is not None:
         apply.click().run()
         if no_exception(app, "apply preset"):
@@ -885,7 +897,7 @@ def case_all_three_moduli_always_reported():
         )
         if box is not None:
             box.uncheck().run()
-    fit_button = button_by_label(app, "Fit curve")
+    fit_button = button_by_label(app, "Fit θ̂ (current settings)")
     if fit_button is not None:
         fit_button.click().run()
     if not no_exception(app, "membrane only"):
@@ -1214,7 +1226,7 @@ def case_guided_mode_is_the_default():
                   for r in app.get("radio")),
           str([r.label for r in app.get("radio")]))
 
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     check("the one-press button is there", work is not None)
 
     text = " ".join(str(m.value) for m in app.get("markdown"))
@@ -1256,13 +1268,13 @@ def case_full_control_shows_everything():
         return
     # There is one page now, so "full control" is the page: the button is
     # on it, and so are the choices it needs.
-    check("the fit button is on it", button_by_label(app, "Fit this cell")
+    check("the fit button is on it", button_by_label(app, "Fit θ̂: bounded least squares")
           is not None)
     check("and so is the range",
           any("1 · Relative deformation range" in str(m.value)
               for m in app.get("markdown")))
     check("the expert search button is still there",
-          button_by_label(app, "Find the best combination and fit it") is not None)
+          button_by_label(app, "Select composition by cross-validation") is not None)
     check("the retelling of the fit is gone from here too",
           not any("What this cell did as it was squashed" in str(m.value)
                   for m in app.get("markdown")))
@@ -1703,7 +1715,7 @@ def case_guided_order_follows_the_work():
           str([e.label for e in app.get("expander")]))
 
     # The button has to be reachable without opening anything.
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     check("the button is on the page", work is not None)
     check("and it is the primary action",
           work is not None and work.proto.type == "primary")
@@ -1721,7 +1733,7 @@ def case_guided_order_follows_the_work():
         app.session_state[f"use_{term}"] = False
     app.run()
     if no_exception(app, "no parts selected"):
-        work = button_by_label(app, "Fit this cell")
+        work = button_by_label(app, "Fit θ̂: bounded least squares")
         check("with nothing ticked the button is disabled",
               work is not None and work.disabled is True)
 
@@ -1789,7 +1801,7 @@ def case_it_picks_the_arrangement():
 def case_fitting_applies_what_it_found():
     print("pressing fit fits what is on the page, and moves nothing on it")
     app = start(cell_name="cell-01")
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     check("the button is there", work is not None)
     if work is None:
         return
@@ -1895,7 +1907,7 @@ def case_guided_range_is_settable():
           bar is not None and abs(bar.value[0]) < 1e-6
           and abs(bar.value[1] - 0.35) < 0.01, str(bar.value))
 
-    button_by_label(app, "Fit this cell").click().run()
+    button_by_label(app, "Fit θ̂: bounded least squares").click().run()
     if not no_exception(app, "search over the chosen range"):
         return
     fit = app.session_state["_last_fit"]
@@ -2499,7 +2511,7 @@ def case_sharing_controls_sit_with_the_parts():
 def case_boundaries_are_checked_against_the_power_law():
     print("the boundary scan is checked against the curve's own slope")
     app = start(cell_name="cell-01", ui_mode="Full control · every setting")
-    button = button_by_label(app, "Find the boundaries from the data")
+    button = button_by_label(app, "Estimate ε₁, ε₂: grid")
     check("the button is there", button is not None)
     if button is None:
         return
@@ -2551,11 +2563,11 @@ def case_the_curve_comes_first():
           "video_target = video_slot" in source)
 
     check("the fit button sits with the choices",
-          button_by_label(app, "Fit this cell") is not None,
+          button_by_label(app, "Fit θ̂: bounded least squares") is not None,
           str([b.label for b in app.button]))
     check("and there is exactly one fit button in guided mode",
-          source.count('"🔬 Fit this cell"') == 1,
-          str(source.count('"🔬 Fit this cell"')))
+          source.count('"🔬 Fit θ̂: bounded least squares at ε₁, ε₂"') == 1,
+          str(source.count('"🔬 Fit θ̂: bounded least squares at ε₁, ε₂"')))
 
     # Explore the curve is gone from the guided flow.
     labels = [e.label or "" for e in app.get("expander")]
@@ -3560,7 +3572,7 @@ def case_cardiomyocyte_defaults_match_the_experiment():
           abs(float(app.session_state["confinement"]) - 1.10) < 1e-9,
           str(app.session_state["confinement"]))
     check("with a button to measure it from this curve instead",
-          button_by_label(app, "Measure q from this curve") is not None,
+          button_by_label(app, "Estimate q") is not None,
           str([b.label for b in app.button][:12]))
     for key, want in (("cell_height_um", 19.0), ("radius_aspect", 0.55),
                       ("membrane_thickness_nm", 8.0)):
@@ -4005,7 +4017,7 @@ def case_one_fitting_routine():
     check("and it fits the measured curve", on_load["r_squared"] > 0.9995,
           f"R2 {on_load['r_squared']:.6f}")
 
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     check("the fit button is there", work is not None)
     if work is None:
         return
@@ -4180,7 +4192,7 @@ def case_the_myoblast_nucleus_reaches_the_page():
     # The curve was built with its nucleus met at 0.50 and the page starts
     # at the middle of the band, so the envelope only carries load once the
     # boundary has been estimated. That is the search's job.
-    work = button_by_label(app, "Find the boundaries from the log curve")
+    work = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     if work is not None:
         work.click().run()
         no_exception(app, "finding the onset")
@@ -4342,12 +4354,12 @@ def case_the_cardiomyocyte_curves_fit():
         # Moving them onto the curve is the optimisation button's job --
         # fitting fits what it is given -- so both are pressed, in the
         # order a person would press them.
-        button = button_by_label(app, "Find the boundaries from the log curve")
+        button = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
         if button is not None:
             button.click().run()
             if not no_exception(app, f"cell {n} refined"):
                 continue
-        button = button_by_label(app, "Fit this cell")
+        button = button_by_label(app, "Fit θ̂: bounded least squares")
         if button is not None:
             button.click().run()
             if not no_exception(app, f"cell {n} fitted"):
@@ -4755,8 +4767,11 @@ def case_balloon_and_spring_tab_answers_by_itself():
           "🎈 Balloon and spring" not in source)
     check("and the log curve has its place instead",
           '"📈 Log curve and boundaries"' in source, source[:0])
-    check("the hidden-tab indices were left alone",
-          "((3, SHOW_VIDEO_TAB), (5, SHOW_DATABASE_TAB))" in source)
+    # The hideable tabs moved to the end of the bar, positions 7 and 8, so
+    # the CSS that hides them cannot catch a button of a smaller tab bar
+    # inside a page.
+    check("the hidden tabs are the last two on the bar",
+          "((7, SHOW_VIDEO_TAB), (8, SHOW_DATABASE_TAB))" in source)
 
     curves = vcm_curves()
     if not curves:
@@ -4794,7 +4809,7 @@ def case_balloon_and_spring_tab_answers_by_itself():
     # The search lives here now, and it moves the boundaries.
     was = (float(state(app, "segment_break_1")),
            float(state(app, "segment_break_2")))
-    work = button_by_label(app, "Find the boundaries from the log curve")
+    work = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     check("the boundary search is on this tab", work is not None,
           str([b.label for b in app.button][:10]))
     if work is None:
@@ -4988,7 +5003,7 @@ def case_the_zoom_survives_a_refit():
     # refitted: that is what keeps the zoom. Two runs of the same page with
     # the same curve must produce the same one.
     first = str(app_module.view_token())
-    button = button_by_label(app, "Fit this cell")
+    button = button_by_label(app, "Fit θ̂: bounded least squares")
     if button is not None:
         button.click().run()
         no_exception(app, "refitting while zoomed")
@@ -5120,10 +5135,12 @@ def case_the_controls_sit_above_the_curve():
     # the page should read.
     check("in guided mode the settings are one collapsed line, not three panels",
           source.count("flat=guided") >= 3, str(source.count("flat=guided")))
-    check("and that line is in the sidebar, off the page entirely",
-          "st.sidebar.expander(\n                \"⚙️ Change what the fit assumed\""
-          in source or 'settings_box = st.sidebar.expander(' in source,
-          "settings box is not in the sidebar")
+    check("and that line is on the page, under 2 · Fit, not in the sidebar",
+          "settings_box = st.expander(" in source
+          and "settings_box = st.sidebar.expander(" not in source
+          and source.index("settings_box = st.expander(")
+          < source.index("diagnostics_box = st.expander("),
+          "the fit assumptions are not under the Fit step")
     check("the working sits on the page under the fit, not in the settings",
           "diagnostics_box = st.expander(" in source
           and "diagnostics_box = st.sidebar.expander(" not in source
@@ -5144,7 +5161,7 @@ def case_the_controls_sit_above_the_curve():
         check(f"“{wanted}” is on the page", wanted in text, text[:300])
     labels = [e.label for e in app.expander] if hasattr(app, "expander") else []
     check("the settings are behind one line, not three",
-          sum(1 for l in labels if "Change what the fit assumed" in str(l)) == 1,
+          sum(1 for l in labels if "Fit assumptions" in str(l)) == 1,
           str(labels))
     for gone in ("What each material is, and how they are told apart",
                  "🔍 Fit diagnostics",
@@ -5157,10 +5174,10 @@ def case_the_controls_sit_above_the_curve():
               gone not in labels, str(labels))
     # Still reachable, still working, just not in the way.
     check("the combination search is still reachable",
-          button_by_label(app, "Find the best combination") is not None,
+          button_by_label(app, "Select composition") is not None,
           str([b.label for b in app.button][:12]))
     check("so is the boundary search",
-          button_by_label(app, "Find the boundaries from the data") is not None,
+          button_by_label(app, "Estimate ε₁, ε₂: grid") is not None,
           str([b.label for b in app.button][:12]))
     check("and the advanced fitting options",
           "Advanced fitting options" in text, text[:200])
@@ -5511,7 +5528,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           str(type(state(app, "hypothesis_search"))))
 
     # And the button is what goes looking.
-    button = button_by_label(app, "Find the boundaries from the log curve")
+    button = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     check("there is a button to find them from the curve", button is not None,
           str([b.label for b in app.button][:10]))
     if button is None:
@@ -5530,7 +5547,7 @@ def case_a_new_curve_starts_from_the_cell_type_defaults():
           f"{state(app, 'element_window_nucleus')} against {moved}")
     # Pressed twice it must land in the same place: a search that answers
     # differently each time is not an estimate.
-    button = button_by_label(app, "Find the boundaries from the log curve")
+    button = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     button.click().run()
     again = (float(state(app, "segment_break_1")),
              float(state(app, "segment_break_2")))
@@ -5576,7 +5593,7 @@ def case_the_ranges_follow_the_fit():
     # describing a model that is no longer the one on the page.
     before = bar("interior")
     widget_by_label(app, "slider", "Fitted range").set_value((0.0, 0.40)).run()
-    button = button_by_label(app, "Fit this cell")
+    button = button_by_label(app, "Fit θ̂: bounded least squares")
     if button is not None:
         button.click().run()
         if not no_exception(app, "refit over a shorter range"):
@@ -5605,7 +5622,7 @@ def case_the_ranges_follow_the_fit():
     check("it says that range no longer follows the boundaries",
           "Moved by hand" in said, said[-300:])
     check("and offers to put it back",
-          button_by_label(app, "Put them back on the boundaries")
+          button_by_label(app, "Reset windows to ε₁, ε₂")
           is not None, str([b.label for b in app.button][:14]))
 
 
@@ -5703,7 +5720,7 @@ def case_each_element_gets_its_own_bar():
 
     # The unconstrained placement search moved to the settings, because it
     # overwrites every range at once and knows nothing about the cell type.
-    button = button_by_label(app, "Search the ranges freely")
+    button = button_by_label(app, "Unconstrained window search")
     check("and one button that places them by arithmetic",
           button is not None, str([b.label for b in app.button][:14]))
     if button is None:
@@ -6212,11 +6229,11 @@ def case_unticking_a_material_fits_without_it():
     check("it stays unticked", app.session_state["use_membrane"] is False)
     # Fitting fits what it is given, so the boundaries are optimised for
     # the model that is now on the page before the fit is judged.
-    tune = button_by_label(app, "Find the boundaries from the log curve")
+    tune = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     if tune is not None:
         tune.click().run()
         no_exception(app, "refining without the membrane")
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     if work is None:
         check("the fit button is there", False)
         return
@@ -6252,7 +6269,7 @@ def case_unticking_a_material_fits_without_it():
         return
     ticked = {t for t in ("membrane", "interior", "nucleus")
               if state(app, f"use_{t}", False)}
-    work = button_by_label(app, "Fit this cell")
+    work = button_by_label(app, "Fit θ̂: bounded least squares")
     if work is None:
         return
     work.click().run()
@@ -6389,7 +6406,7 @@ def case_the_boundaries_come_from_the_log_curve():
     check("and the search is on the log curve tab",
           "refine_boundaries_control(model_ex" in source)
 
-    work = button_by_label(app, "Find the boundaries from the log curve")
+    work = button_by_label(app, "Estimate ε₁, ε₂: d ln F")
     check("the button says where the boundaries come from", work is not None,
           str([b.label for b in app.button][:8]))
     if work is None:
@@ -6423,7 +6440,7 @@ def case_the_boundaries_come_from_the_log_curve():
               if (round(row["break_1"], 3), round(row["break_2"], 3)) != applied]
     if others:
         pick = rows[others[0]]
-        take = button_by_label(app, "Use")
+        take = button_by_label(app, "Apply this row")
         check("the others are one button away", take is not None,
               str([b.label for b in app.button][:10]))
         if take is not None:
