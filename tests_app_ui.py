@@ -289,6 +289,21 @@ def case_c2c12_opens_on_the_four_regime_fit():
               str(labels))
     check("the fit follows the curve", fit.get("r_squared", 0) > 0.999,
           str(fit.get("r_squared")))
+    # One fit on the right: the block to paste carries the fingerprint and
+    # the ε of the fit in the results, which is the fit on the curve.
+    blocks = [str(c.value) for c in app.get("code")]
+    record = next((b for b in blocks if b.startswith("Fit ID\t")), None)
+    if record:
+        row = dict(zip(*(line.split("\t") for line in record.split("\n"))))
+        bounds = fit["piecewise"]["boundaries_pct"]
+        check("the block to paste is the fit in the results",
+              row.get("Fit ID") == fit.get("fit_id")
+              and abs(float(row["eps2 (%)"]) - bounds[2]) < 1e-3,
+              f"{row.get('Fit ID')} vs {fit.get('fit_id')}")
+    else:
+        check("there is a block to paste", False, str(blocks)[:200])
+    check("the components are stacked on the plot by default",
+          state(app, "pw_view") == "stacked", str(state(app, "pw_view")))
 
     app.number_input(key="pw_b2").set_value(35.0).run()
     if no_exception(app, "moving a boundary"):
@@ -2550,10 +2565,20 @@ def case_the_curve_comes_first():
     # so it appears above them however far down the code that builds it is.
     # The plot is staked out after the choices, so the page reads choose,
     # fit, look rather than look, scroll, choose.
-    check("the curve is staked out after the choices",
-          source.index("curve_slot = st.container()")
-          > source.index('st.markdown("#### 1 · Relative deformation range")'),
-          "curve_slot is too early")
+    # Two columns: every parameter in one block on the left, and the
+    # curve, the results and the copy block on the right, from one fit.
+    check("the curve is staked out in the right-hand column",
+          source.index("fit_left, fit_right = st.columns(")
+          < source.index("with fit_right:")
+          < source.index("curve_slot = st.container()")
+          < source.index("with fit_left:")
+          < source.index('st.markdown("#### 1 · Relative deformation range")'),
+          "curve_slot is not in the right-hand column")
+    check("and the choices are one block on the left",
+          'st.markdown("### ⚙️ Fit parameters")' in source
+          and source.index("fit_block.__enter__()")
+          < source.index('st.markdown("#### 1 · Relative deformation range")')
+          < source.index("fit_block.__exit__(None, None, None)"))
     check("and the plot is drawn into it",
           "plot_col = curve_slot" in source)
     check("the diagram goes with the question it answers, not beside the plot",
@@ -5135,16 +5160,22 @@ def case_the_controls_sit_above_the_curve():
     # the page should read.
     check("in guided mode the settings are one collapsed line, not three panels",
           source.count("flat=guided") >= 3, str(source.count("flat=guided")))
-    check("and that line is on the page, under 2 · Fit, not in the sidebar",
+    check("and that line is in the parameter block, not in the sidebar",
           "settings_box = st.expander(" in source
           and "settings_box = st.sidebar.expander(" not in source
-          and source.index("settings_box = st.expander(")
-          < source.index("diagnostics_box = st.expander("),
-          "the fit assumptions are not under the Fit step")
-    check("the working sits on the page under the fit, not in the settings",
+          and source.index("fit_block.__enter__()")
+          < source.index("settings_box = st.expander(")
+          < source.index("fit_block.__exit__(None, None, None)"),
+          "the fit assumptions are not in the parameter block")
+    check("the working sits with the results, in the right-hand column",
           "diagnostics_box = st.expander(" in source
           and "diagnostics_box = st.sidebar.expander(" not in source
-          and 'working = st.expander("🔍 The working, in detail"' in source)
+          and source.index("with fit_right:")
+          < source.index("diagnostics_box = st.expander(")
+          < source.index("with fit_left:"))
+    check("and the verdict is written from the fit it describes",
+          "fit_verdict(fit)" in source
+          and "apply_plot_layers(figure, shown_style, fit)" in source)
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
           > source.index('section("4 · Fitting results")'))
@@ -5212,7 +5243,7 @@ def case_the_button_says_what_it_will_do():
           not any("How this fit was calculated" in (p or "") for p in panels),
           str(panels))
     blocks = [str(c.value) for c in app.get("code")]
-    record = next((b for b in blocks if b.startswith("Cell ID\t")), None)
+    record = next((b for b in blocks if b.startswith("Fit ID\t")), None)
     check("the block is two tab separated lines, headers then values",
           record is not None and len(record.split("\n")) == 2
           and len(record.split("\n")[0].split("\t"))
@@ -6545,11 +6576,12 @@ def case_the_plot_says_what_the_ranges_say():
     import app as app_module
     source = pathlib.Path(APP).read_text()
     body = source.split('section("3 · Nonlinear fitting")')[-1]
-    check("the curve is staked out under the component ranges",
-          body.index("curve_slot = st.container()")
-          > body.index("component_controls("), body[:200])
-    check("and above the fit button",
-          body.index("curve_slot = st.container()")
+    check("the curve is staked out beside the component ranges",
+          body.index("with fit_right:")
+          < body.index("curve_slot = st.container()")
+          < body.index("component_controls("), body[:200])
+    check("and the fit button is in the parameter block",
+          body.index("fit_block.__enter__()")
           < body.index('st.markdown("#### 2 · Fit")'), body[:200])
 
     # A curve whose deep element carries real force, so every element has a
