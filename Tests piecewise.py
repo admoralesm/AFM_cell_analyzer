@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE))
 from piecewise_fit import (  # noqa: E402
     C2C12_BOUNDARIES_PCT,
     component_curve,
+    component_ranges,
     find_boundaries,
     joint_sse,
     Geometry,
@@ -211,6 +212,79 @@ def test_boundaries_can_be_moved():
     assert r["success"]
     assert r["boundaries_pct"] == (0.0, 4.0, 35.0, 65.0, 85.0)
     assert set(r["anchors"]) == {"F_4pct", "F_35pct", "F_65pct"}
+
+
+# ------------------------------------------------------ component ranges ---
+
+POWERS = {"K_shell": 3.0, "K_cyto": 1.5, "K_nucleus": 3.0,
+          "K_nuc_cyto": 1.5, "K_core": 1.5}
+
+
+def additive(x, t, ranges):
+    """
+    The model written the other way round: the contact line to e1, then
+    every element adding K*(x - start)^p over its own range and holding
+    what it reached after. The chained fit has to agree with this exactly.
+    """
+    x = np.asarray(x, dtype=float)
+    e1 = ranges["k_align"][1]
+    out = np.where(x < e1, t["k_align"] * x + t["C0"], t["k_align"] * e1 + t["C0"])
+    for name, p in POWERS.items():
+        a, u = ranges[name]
+        out = out + t[name] * np.clip(np.minimum(x, u) - a, 0.0, None) ** p
+    return out
+
+
+def test_default_ranges():
+    r = component_ranges()
+    assert r == {"k_align": (0.0, 5.0), "K_shell": (5.0, 91.2),
+                 "K_cyto": (5.0, 40.0), "K_nucleus": (40.0, 60.0),
+                 "K_nuc_cyto": (40.0, 60.0), "K_core": (60.0, 91.2)}, r
+    assert component_ranges(carry=())["K_shell"] == (5.0, 40.0)
+
+
+def test_the_default_model_is_the_additive_one():
+    x = np.linspace(0, 91.2, 1500)
+    f = additive(x, TRUE, component_ranges())
+    assert np.allclose(f, truth(x), rtol=1e-12, atol=1e-20)
+
+
+def test_an_element_can_stop_early_or_keep_going():
+    # The cytoskeleton stops at 30 % inside its regime; the nuclear
+    # envelope keeps stretching to 75 %, past the start of regime 4.
+    settings = {"K_cyto": {"until": 30.0}, "K_nucleus": {"until": 75.0}}
+    ranges = component_ranges(settings=settings)
+    assert ranges["K_cyto"] == (5.0, 30.0) and ranges["K_nucleus"] == (40.0, 75.0)
+    x = np.linspace(0, 91.2, 1500)
+    f = additive(x, TRUE, ranges)
+    r = fit_piecewise(x / 100, f, settings=settings)
+    for name, want in TRUE.items():
+        assert np.isclose(r["coefficients"][name], want, rtol=1e-6, atol=1e-18), name
+    assert r["ranges"] == ranges
+    assert all(abs(g) < 1e-20 for g in r["continuity_gaps_N"].values())
+    # Each element's drawn curve covers exactly its range.
+    for name, (a, u) in ranges.items():
+        xs, _ = component_curve(r, name)
+        assert np.isclose(xs[0], a) and np.isclose(xs[-1], u), name
+    # And the joint curve of the search agrees at the truth.
+    assert joint_sse(x / 100, f, settings=settings) < 1e-25
+
+
+def test_a_range_that_no_longer_fits_its_regime_falls_back():
+    # A hand-set end left behind by a boundary that has since moved past it
+    # goes back to the regime's own end rather than breaking the fit.
+    r = component_ranges(boundaries_pct=(0, 5, 45, 60, 91.2),
+                         settings={"K_nucleus": {"until": 42.0}})
+    assert r["K_nucleus"] == (45.0, 60.0)
+
+
+def test_switching_an_element_off_takes_it_out():
+    x = np.linspace(0, 91.2, 1200)
+    t = dict(TRUE, K_nuc_cyto=0.0)
+    f = additive(x, t, component_ranges())
+    r = fit_piecewise(x / 100, f, settings={"K_nuc_cyto": {"lower": 0.0, "upper": 0.0}})
+    assert r["coefficients"]["K_nuc_cyto"] == 0.0
+    assert np.isclose(r["coefficients"]["K_nucleus"], TRUE["K_nucleus"], rtol=1e-6)
 
 
 # ------------------------------------------------------ boundary search ---
