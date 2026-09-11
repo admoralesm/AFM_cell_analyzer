@@ -4496,6 +4496,74 @@ def share_of_force_plot(fit, model, style):
     )
 
 
+def stage_rows(fit):
+    """
+    The stretches the boundaries make, and who is carrying load in each.
+
+    One place decides this: the bands drawn behind the curve, the algebra
+    printed under the log plot and the sentence describing each stretch all
+    come from here, so a band on the figure cannot disagree with the
+    equation under it. It used to be hard-coded as membrane, then
+    cytoskeleton, then cytoskeleton plus nucleus, which stopped being true
+    the moment an element was given a range of its own.
+
+    Returns [(from, to, rising, held)] where ``rising`` are the elements
+    still taking more load over that stretch and ``held`` those carrying
+    what they already reached.
+    """
+    if not (fit and fit.get("success")):
+        return []
+    terms = [t for t in ALL_TERMS if t in (fit.get("terms") or ())]
+    if not terms:
+        return []
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    windows = fit.get("term_windows") or {}
+
+    def support(term):
+        window = windows.get(term)
+        if window:
+            return float(window[0]), float(window[1])
+        return lo, hi
+
+    edges = {round(lo, 6), round(hi, 6)}
+    for term in terms:
+        a, b = support(term)
+        for value in (a, b):
+            if lo < value < hi:
+                edges.add(round(float(value), 6))
+    rows = []
+    for a, b in zip(sorted(edges)[:-1], sorted(edges)[1:]):
+        if b - a < 1e-6:
+            continue
+        middle = 0.5 * (a + b)
+        rising, held = [], []
+        for term in terms:
+            start, stop = support(term)
+            if middle < start:
+                continue
+            (rising if middle < stop else held).append(term)
+        rows.append((a, b, rising, held))
+    return rows
+
+
+def stage_bands(fit):
+    """The stretches as bands for the plot, labelled by who carries them."""
+    bands = []
+    for index, (a, b, rising, held) in enumerate(stage_rows(fit)):
+        carrying = rising or held
+        label = " + ".join(plain_name(term).lower() for term in carrying)
+        if held and rising:
+            label += " (" + ", ".join(
+                plain_name(term).lower() for term in held
+            ) + " holding)"
+        bands.append({
+            "range": (a, b),
+            "label": label or "nothing carrying",
+            "color": STAGE_COLORS[index % len(STAGE_COLORS)],
+        })
+    return bands
+
+
 def stage_algebra(fit):
     """
     Each stretch of the squash, written as the sum of terms carrying it.
@@ -4509,40 +4577,8 @@ def stage_algebra(fit):
     if not (fit and fit.get("success")):
         st.caption("Fit the curve and the algebra of each stretch appears here.")
         return
-    terms = [t for t in ALL_TERMS if t in (fit.get("terms") or ())]
-    if not terms:
-        return
-    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
-    windows = fit.get("term_windows") or {}
     q = float(fit.get("confinement", 0.0) or 0.0)
-
-    def support(term):
-        window = windows.get(term)
-        if window:
-            return float(window[0]), float(window[1])
-        return lo, hi
-
-    # The edges are wherever a term starts or stops taking more load.
-    edges = {round(lo, 6), round(hi, 6)}
-    for term in terms:
-        a, b = support(term)
-        for value in (a, b):
-            if lo < value < hi:
-                edges.add(round(float(value), 6))
-    edges = sorted(edges)
-
-    rows = []
-    for a, b in zip(edges[:-1], edges[1:]):
-        if b - a < 1e-6:
-            continue
-        middle = 0.5 * (a + b)
-        rising, held = [], []
-        for term in terms:
-            start, stop = support(term)
-            if middle < start:
-                continue
-            (rising if middle < stop else held).append(term)
-        rows.append((a, b, rising, held))
+    rows = stage_rows(fit)
     if not rows:
         return
 
@@ -7875,6 +7911,11 @@ with tab_analysis:
             )
             chosen = active_terms()
 
+            # The curve goes directly under the ranges that shape it. Every
+            # bar above moves something drawn below, and a control whose
+            # effect is two screens away is a control used blind.
+            curve_slot = st.container()
+
             # No element search. Which components are in the model is a
             # decision about the cell, and the boxes above are where it is
             # made; a button that cleared them on a cross-validation score
@@ -7925,11 +7966,11 @@ with tab_analysis:
             # a paragraph of reading in the middle of the one step that is
             # meant to be press-and-look.
 
-        # The curve goes here, under the choices and the fit button, so the
-        # page reads choose, fit, look. Streamlit runs top to bottom and the
-        # fit does not exist yet, so the containers are staked out and
-        # filled once it does.
-        curve_slot = st.container()
+        # Staked out above, right under the component ranges, and filled
+        # once the fit exists: Streamlit draws things where they were
+        # created, not where the code that fills them runs.
+        if not guided:
+            curve_slot = st.container()
         video_slot = st.container()
 
         # Everything the fit decided for you, under the curve rather than
@@ -9124,13 +9165,23 @@ with tab_analysis:
                 out[(epsilon < drawn_lo) | (epsilon > drawn_hi)] = np.nan
                 return out
 
+            def clip_to_support(values, term):
+                """An element's own curve starts where the element does."""
+                out = clip_to_window(values)
+                if out is None:
+                    return None
+                window = (fit.get("term_windows") or {}).get(term)
+                if window:
+                    out[epsilon < float(window[0])] = np.nan
+                return out
+
             fitted = clip_to_window(fitted)
-            tension = clip_to_window(tension)
-            membrane = clip_to_window(membrane)
-            interior = clip_to_window(interior)
-            nucleus = clip_to_window(nucleus)
-            envelope = clip_to_window(envelope)
-            cortex = clip_to_window(cortex)
+            tension = clip_to_support(tension, "tension")
+            membrane = clip_to_support(membrane, "membrane")
+            interior = clip_to_support(interior, "interior")
+            nucleus = clip_to_support(nucleus, "nucleus")
+            envelope = clip_to_support(envelope, "nucleus_shell")
+            cortex = clip_to_support(cortex, "cortex")
 
             deformation_shares = None
             if fitted_coupling in ("series", "hybrid"):
@@ -9150,14 +9201,13 @@ with tab_analysis:
                     deformation_shares = {k: v / total for k, v in pieces.items()}
 
             if fitted_coupling == "segmented":
-                windows_for_plot = [
-                    {"range": (fit_lo, fit["break_1"]), "label": "membrane",
-                     "color": "#2ca02c"},
-                    {"range": (fit["break_1"], fit["break_2"]), "label": "cytoskeleton",
-                     "color": "#9467bd"},
-                    {"range": (fit["break_2"], fit_hi), "label": "cytoskeleton + nucleus",
-                     "color": "#e377c2"},
-                ]
+                # Straight from the element ranges, so a band behind the
+                # curve says the same thing as the algebra under the log
+                # plot. Hard-coded as membrane / cytoskeleton / cytoskeleton
+                # plus nucleus, it stopped being true the moment an element
+                # was given a range of its own -- and on a C2C12, whose
+                # sarcolemma carries throughout, it was never true at all.
+                windows_for_plot = stage_bands(fit)
             else:
                 windows_for_plot = [
                         {
