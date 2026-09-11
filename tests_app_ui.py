@@ -228,23 +228,17 @@ def no_exception(app, name):
 # ---------------------------------------------------------------- cases ---
 
 def four_regime_curve(n=900, noise_N=0.2e-9):
-    """A curve built from the four-regime laws, with the spec's boundaries."""
+    """
+    A curve built from the page's model: the contact line to ε₁ = 5 %, then
+    the membrane and cytoskeleton from ε₁, the nuclear envelope from ε₂ = 45 %
+    and the inside of the nucleus from ε₃ = 68 %, each acting to the end.
+    """
     x = np.linspace(0.0, 91.2, n)
     k, c0 = 2e-10, 1e-10
-    ks, kc, kn, knc, kcore = 1e-13, 2e-11, 5e-12, 2e-10, 2e-9
-    f5 = k * 5 + c0
-    f40 = f5 + ks * 35 ** 3 + kc * 35 ** 1.5
-    f60 = f40 + kn * 20 ** 3 + knc * 20 ** 1.5
+    ks, kc, kn, kcore = 1e-13, 2e-11, 5e-12, 2e-9
     d = lambda a: np.clip(x - a, 0.0, None)  # noqa: E731
-    # The membrane acts throughout: its cube law keeps rising after 40 %.
-    shell = ks * d(5) ** 3
-    f60 = f60 + ks * (55 ** 3 - 35 ** 3)
-    force = np.where(
-        x < 5, k * x + c0,
-        np.where(x < 40, f5 + shell + kc * d(5) ** 1.5,
-                 np.where(x < 60, f40 + kn * d(40) ** 3 + knc * d(40) ** 1.5
-                          + shell - ks * 35 ** 3,
-                          f60 + kcore * d(60) ** 1.5 + shell - ks * 55 ** 3)))
+    force = (np.where(x < 5, k * x, k * 5) + c0 + ks * d(5) ** 3
+             + kc * d(5) ** 1.5 + kn * d(45) ** 3 + kcore * d(68) ** 1.5)
     rng = np.random.default_rng(1)
     return x / 100.0, force + noise_N * rng.standard_normal(n)
 
@@ -286,9 +280,14 @@ def case_c2c12_opens_on_the_four_regime_fit():
     # One model: the piecewise results are written with the spring
     # network's symbols, in the same table as every other way of sharing.
     said = " ".join(str(m.value) for m in app.get("markdown"))
-    for symbol in ("Eₘ", "Ec", "E_ne", "E_nc", "Eₙ", "E_align", "A_L"):
+    for symbol in ("Eₘ", "Ec", "E_ne", "Eₙ", "E_align"):
         check(f"{symbol} is in the results", f"**{symbol} " in said,
               said[:300])
+    # The spring network's four components, plus the contact line.
+    coefficients = set(fit["piecewise"]["coefficients"])
+    check("only the four components and the contact line are fitted",
+          coefficients == {"C0", "k_align", "K_shell", "K_cyto", "K_nucleus",
+                           "K_core"}, str(sorted(coefficients)))
     check("the way the load is shared is the first choice, piecewise first",
           app.radio(key="load_sharing").value.startswith("Piecewise")
           and list(app.radio(key="load_sharing").options)[0].startswith("Piecewise"),
@@ -342,9 +341,10 @@ def case_c2c12_opens_on_the_four_regime_fit():
     if no_exception(app, "moving a component's start"):
         check("moving a start moves its boundary",
               state(app, "pw_b2") == 45.0, str(state(app, "pw_b2")))
-        check("for every component that starts there",
-              tuple(app.slider(key="pw_range_K_nuc_cyto").value)[0] == 45.0,
-              str(app.slider(key="pw_range_K_nuc_cyto").value))
+        check("and the fit on the plot has that boundary",
+              state(app, "results")["fit"]["piecewise"]["boundaries_pct"][2]
+              == 45.0,
+              str(state(app, "results")["fit"]["piecewise"]["boundaries_pct"]))
     app.button(key="pw_reset").click().run()
 
     app.button(key="pw_find").click().run()
@@ -373,10 +373,16 @@ def case_c2c12_opens_on_the_four_regime_fit():
               or "No placement reaches" in chosen.get("reason", ""),
               chosen.get("reason", ""))
 
-    # The lamina lump is part of every fit, and a fitted cell can be kept
-    # for the All cells tab under its own name.
-    check("the nuclear lamina lump is fitted",
-          "A_lamina" in state(app, "results")["fit"]["piecewise"]["coefficients"])
+    # The contact line can be switched off: its slope is then held at 0.
+    app.checkbox(key="pw_use_k_align").uncheck().run()
+    if no_exception(app, "switching the contact line off"):
+        pw = state(app, "results")["fit"]["piecewise"]
+        check("the contact slope is held at zero",
+              pw["coefficients"]["k_align"] == 0.0
+              and "k_align" in pw["components_off"],
+              str(pw["coefficients"].get("k_align")))
+    app.checkbox(key="pw_use_k_align").check().run()
+    # A fitted cell can be kept for the All cells tab under its own name.
     app.text_input(key="cell_name").input("cell-A").run()
     app.button(key="pw_add").click().run()
     if no_exception(app, "adding the cell to the collection"):
