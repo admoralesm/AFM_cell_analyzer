@@ -129,6 +129,8 @@ HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "component_curve",
     "component_ranges",
     "find_boundaries",
+    "boundaries_from_power_law",
+    "power_law_profile",
     "fit_piecewise",
     "piecewise_moduli",
     "predict_piecewise",
@@ -677,6 +679,12 @@ DEFAULTS = {
     "pw_span_lo": 15.0, "pw_span_hi": 35.0,
     # The last boundary search, with the curve and settings it was run on.
     "pw_boundary_search": None,
+    # How the boundaries are placed, and the R² every fit has to reach.
+    "pw_method": "refined",
+    "pw_target_r2": 0.999,
+    # Every route's placement for this curve, scored, and the one in use.
+    "pw_placements": None,
+    "pw_selected": None,
     # Guided by default: most people opening this want a number, not a
     # spring network. Everything is still one expander away.
     "ui_mode": "Guided · plain language",
@@ -836,7 +844,7 @@ NEW_CELL_CLEARS = (
     "video_path", "video_info", "video_track",
     "video_name", "video_link", "eps_percent_fix",
     "video_saved_frame", "video_saved_frame_index", "pw_boundary_search",
-    "_pw_auto_found",
+    "_pw_auto_found", "pw_placements", "pw_selected",
 )
 
 if st.session_state.pop("_start_new_cell", False):
@@ -3814,7 +3822,7 @@ NOT_A_SETTING = (
     "video_track", "video_saved_frame", "exploration", "composition_search",
     "arrangement_search", "component_search", "confinement_scan",
     "hypothesis_search", "boundary_search", "element_window_search",
-    "pw_boundary_search",
+    "pw_boundary_search", "pw_placements", "pw_selected",
 )
 
 
@@ -4756,22 +4764,18 @@ def piecewise_signature(epsilon, force_N):
     ))
 
 
-def current_search(epsilon, force_N):
-    """The stored boundary search, if it belongs to this curve and model."""
-    found = st.session_state.get("pw_boundary_search")
-    if not (found and found.get("success")):
-        return None
-    if found.get("signature") != piecewise_signature(epsilon, force_N):
-        return None
-    return found
-
-
-def boundary_source(bounds, found=None):
+def boundary_source(bounds, placements=None):
     """Where the boundaries in use came from, in a few words."""
     inner = tuple(round(float(b), 2) for b in bounds[1:4])
+    rows = (placements or {}).get("rows") or {}
+    selected = (st.session_state.get("pw_selected") or {}).get("key")
+    # The row in use first, so two routes landing on the same numbers are
+    # reported as the one that was chosen.
+    for key in ([selected] if selected else []) + list(PW_FALLBACK):
+        row = rows.get(key)
+        if row and inner == tuple(round(float(v), 2) for v in row["best_pct"]):
+            return PW_ROW_LABELS[key]
     defaults = tuple(round(float(b), 2) for b in piecewise_defaults()[:3])
-    if found and inner == tuple(round(float(b), 2) for b in found["best_pct"]):
-        return "found from this curve within the C2C12 constraints"
     if inner == defaults:
         return "the C2C12 defaults"
     return "set by hand"
@@ -4852,7 +4856,7 @@ def pressure_text(value, se=None):
 
 
 def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
-                     off=None):
+                     off=None, placements=None):
     """
     The four-regime result in the shape the rest of the page reads.
 
@@ -4952,7 +4956,7 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
             "membrane_throughout": "K_shell" in (result.get("carry") or ()),
             "component_ranges_pct": {k: list(v) for k, v in ranges.items()},
             "components_off": list(piecewise_off() if off is None else off),
-            "boundary_source": boundary_source(b, found),
+            "boundary_source": boundary_source(b, placements),
             "boundary_search": (
                 {
                     "best_pct": list(found["best_pct"]),
@@ -4960,9 +4964,21 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
                     "strength": found["strength"],
                     "intervals": found["intervals"],
                 }
-                if found and boundary_source(b, found).startswith("found")
+                if found and tuple(round(float(v), 2) for v in b[1:4])
+                == tuple(round(float(v), 2) for v in found["best_pct"])
                 else None
             ),
+            "placement": {
+                "method": PW_ROW_LABELS.get(
+                    st.session_state.get("pw_method", "refined"), ""),
+                "reason": (st.session_state.get("pw_selected") or {}).get("reason", ""),
+                "target_r2": float(st.session_state.get("pw_target_r2", 0.999)),
+                "routes": {
+                    PW_ROW_LABELS[k]: {"eps_pct": list(v["best_pct"]),
+                                       "r_squared": v["r2"]}
+                    for k, v in ((placements or {}).get("rows") or {}).items()
+                },
+            },
             "settings": piecewise_settings() if settings is None else settings,
         },
     }
@@ -4982,46 +4998,99 @@ def piecewise_stage_plan(result):
     ]
 
 
-def add_boundary_lines(fig, bounds, scale=1.0, end_label=True, top=0.965):
+# Label tags are placed in pixels, so how wide a tag is has to be guessed
+# before plotly draws it. These are generous for a 13 px font.
+TAG_CHAR_PX = 8.0
+TAG_PAD_PX = 14.0
+TAG_ROW_PX = 24
+ASSUMED_PLOT_PX = 700.0
+
+
+def tag_levels(positions, texts, x_span, plot_px=ASSUMED_PLOT_PX, x_max=None):
     """
-    ε₁, ε₂, ε₃ (and the end of the fit) as labelled lines on a figure.
+    Where each tag goes so that no two overlap and none runs off the plot.
+
+    A tag normally starts just right of its line. One that would run past
+    the right edge of the plot (``x_max``) is put on the line's left
+    instead. Tags are then laid out left to right, each on the lowest row
+    whose last tag ends before this one starts, widths estimated from the
+    text. Returns ([(row, "left" | "right"), ...], rows needed).
+    """
+    px_per_unit = plot_px / max(float(x_span), 1e-9)
+    x_max = float(x_max) if x_max is not None else float("inf")
+    spans = []
+    for x, text in zip(positions, texts):
+        width = (len(text) * TAG_CHAR_PX + TAG_PAD_PX) / px_per_unit
+        side = "right" if x + width > x_max else "left"
+        spans.append((x - width, x, side) if side == "right" else (x, x + width, side))
+    order = sorted(range(len(spans)), key=lambda i: spans[i][0])
+    ends, placed = [], [None] * len(spans)
+    for i in order:
+        left, right, side = spans[i]
+        for row, last in enumerate(ends):
+            if left >= last:
+                ends[row] = right
+                placed[i] = (row, side)
+                break
+        else:
+            ends.append(right)
+            placed[i] = (len(ends) - 1, side)
+    return placed, max(len(ends), 1)
+
+
+def add_boundary_lines(fig, bounds, scale=1.0, end_label=True, x_span=None,
+                       x_max=None):
+    """
+    ε₁, ε₂, ε₃ (and the end of the fit) as lines with tags above the plot.
+
+    Each line runs the whole height of the plot and on up into the top
+    margin to its tag, so the tag never sits on the data, the fitted
+    curves, the legend or another line. Tags that would touch go on
+    separate rows, and one that would run off the right edge turns to the
+    left of its line. Returns the number of rows, so the caller can make
+    the top margin tall enough.
 
     ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
-    0.01 for one in ε as a fraction. Each line runs the whole height of the
-    figure; its label sits just inside the top of the curve's panel, on a
-    white tag, below the legend rather than tangled in it. Labels whose
-    lines are close together are staggered so they never overlap.
+    0.01 for one in ε as a fraction. ``x_span`` and ``x_max`` are the x
+    axis's width and right edge, in percent.
     """
-    lines = [(name, float(value), False) for name, value in zip(EPS_NAMES, bounds[1:4])]
+    lines = [(f"{name} = {float(v):.1f} %", float(v), False, name)
+             for name, v in zip(EPS_NAMES, bounds[1:4])]
     if end_label:
-        lines.append(("end", float(bounds[-1]), True))
-    span = max(float(bounds[-1]) - float(bounds[0]), 1.0)
-    level, last_x = 0, None
-    for name, value, is_end in lines:
+        lines.append((f"end = {float(bounds[-1]):.1f} %", float(bounds[-1]),
+                      True, "end"))
+    span = float(x_span) if x_span else max(float(bounds[-1]) - float(bounds[0]), 1.0) * 1.05
+    placed, n_rows = tag_levels([v for _t, v, _e, _n in lines],
+                                [t for t, _v, _e, _n in lines], span,
+                                x_max=x_max if x_max is not None else span)
+    for (text, value, is_end, name), (row, side) in zip(lines, placed):
         x = value * scale
         fig.add_shape(
             type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
             line={"color": "#888888" if is_end else "#222222",
                   "width": 1 if is_end else 1.5,
                   "dash": "dot" if is_end else "dash"},
-            layer="above",
+            layer="below",
         )
-        # Drop a label a step if its line is close to the one before it.
-        level = (level + 1) % 3 if (last_x is not None
-                                    and value - last_x < 0.09 * span) else 0
-        last_x = value
+        # The line carries on above the plot, in pixels, up to its own tag,
+        # so a tag on a higher row is still plainly attached to its line.
+        fig.add_shape(
+            type="line", xref="x", yref="paper", ysizemode="pixel",
+            yanchor=1.0, x0=x, x1=x, y0=0, y1=4 + TAG_ROW_PX * row + 10,
+            line={"color": "#888888" if is_end else "#222222", "width": 1},
+        )
         fig.add_annotation(
-            x=x, y=top - 0.06 * level, xref="x", yref="paper", showarrow=False,
-            text=(f"<b>{name}</b> = {value:.1f} %" if not is_end
-                  else f"end = {value:.1f} %"),
-            xanchor="right" if is_end else "center", yanchor="top",
-            font={"size": 14 if not is_end else 11,
+            x=x, y=1.0, xref="x", yref="paper", showarrow=False,
+            text=(text if is_end else text.replace(name, f"<b>{name}</b>", 1)),
+            xanchor=side, yanchor="bottom", xshift=3 if side == "left" else -3,
+            yshift=4 + TAG_ROW_PX * row,
+            font={"size": 13 if not is_end else 11,
                   "color": "#555555" if is_end else "#111111"},
-            bgcolor="rgba(255,255,255,0.9)",
+            bgcolor="rgba(255,255,255,0.95)",
             bordercolor="#222222" if not is_end else "#aaaaaa",
-            borderwidth=1, borderpad=3,
+            borderwidth=1, borderpad=2,
         )
-    return fig
+    return n_rows
 
 
 def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
@@ -5045,11 +5114,15 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
     ranges = result.get("ranges") or {}
     for regime in result["regimes"]:
         a, z = regime["domain_pct"]
+        # The regime's name inside its band, at the top left and nudged off
+        # the boundary line; the curve rises to the right, so that corner is
+        # the one the data leave empty.
         fig.add_vrect(
             x0=a, x1=z, fillcolor=PW_BANDS.get(regime["key"], "rgba(0,0,0,0.05)"),
             line_width=0, layer="below",
-            annotation_text=regime["key"], annotation_position="bottom left",
+            annotation_text=regime["key"], annotation_position="top left",
             annotation_font_size=12, annotation_font_color="#666666",
+            annotation_xshift=6, annotation_yshift=-4,
         )
     keep = (y > 0) if log_y else np.ones_like(y, dtype=bool)
     fig.add_trace(go.Scatter(
@@ -5123,13 +5196,21 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
                 showlegend=False,
                 hovertemplate=f"{symbol} holds what it reached<extra></extra>",
             ))
-    add_boundary_lines(fig, b)
+    x_lo = min(0.0, float(np.nanmin(x)) if x.size else 0.0) - 1.0
+    x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
+    tag_rows = add_boundary_lines(fig, b, x_span=x_hi - x_lo, x_max=x_hi)
+    n_legend = 3 + sum(1 for c in PW_COMPONENTS if c[0] not in off)
     fig.update_layout(
-        height=int(style.height * 1.3), template="simple_white",
-        margin={"l": 80, "r": 20, "t": 40, "b": 60},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.04,
-                "xanchor": "left", "x": 0.0},
-        xaxis={"title": "Relative deformation (%)", "anchor": "y2"},
+        height=int(style.height * 1.3) + TAG_ROW_PX * tag_rows,
+        template="simple_white",
+        # Top: room for the ε tags, one row each. Bottom: the x axis, then
+        # the legend under it, so nothing is drawn over the data.
+        margin={"l": 80, "r": 20, "t": 16 + TAG_ROW_PX * tag_rows,
+                "b": 90 + 22 * ((n_legend + 2) // 3)},
+        legend={"orientation": "h", "yanchor": "top", "y": -0.14,
+                "xanchor": "left", "x": 0.0, "font": {"size": 12}},
+        xaxis={"title": "Relative deformation (%)", "anchor": "y2",
+               "range": [x_lo, x_hi]},
         yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0]},
         yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
                 "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
@@ -5299,53 +5380,103 @@ def piecewise_equations_latex(bounds, ranges, off=()):
     ]
 
 
-def piecewise_search_panel(found, bounds):
-    """What the boundary search found, how sure it is, and the maths."""
-    if not found:
-        return
-    iv = found["intervals"]
-    in_use = boundary_source(bounds, found).startswith("found")
-    parts = []
-    for i, key in enumerate(("eps1", "eps2", "eps3")):
-        row = iv[key]
-        edge = " ⚠️ at the band edge" if row["at_band_edge"] else ""
-        parts.append(
-            f"**{EPS_NAMES[i]} = {row['best']:.2f} %** "
-            f"(68 %: {row['lo68']:.2f}–{row['hi68']:.2f}, "
-            f"95 %: {row['lo95']:.2f}–{row['hi95']:.2f}){edge}"
-        )
-    dbic = found["delta_bic"]
-    ref = " / ".join(f"{v:g}" for v in found["spec_pct"])
-    box = st.success if found["strength"] in ("strong", "positive", "only") \
-        else st.info
-    box(
-        "🎯 **Boundaries found from this curve within the C2C12 "
-        "constraints:** " + " · ".join(parts)
-        + (f" · ΔBIC = {dbic:.1f} against the defaults {ref} %. "
-           if np.isfinite(dbic) else ". ")
-        + found["verdict"]
-        + (" **In use.**" if in_use else
-           " *The boundaries in use have been changed since.*")
+def piecewise_placement_table(placements, bounds, target, selected):
+    """
+    Every route's boundaries, its fit and its Young's moduli, side by side.
+
+    The point of the table: which placement to believe is decided by what
+    each one does to the fit and to the moduli, and a person can see all of
+    it at once and pick another row.
+    """
+    rows = placements.get("rows") or {}
+    inner = tuple(round(float(v), 2) for v in bounds[1:4])
+    symbols = ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core")
+
+    def same(key):
+        row = rows.get(key)
+        return bool(row) and inner == tuple(round(float(v), 2)
+                                            for v in row["best_pct"])
+
+    # One row marked in use: the chosen one when it is what is on the page,
+    # otherwise the first that matches it.
+    chosen = (selected or {}).get("key")
+    in_use_key = chosen if same(chosen) else next(
+        (k for k in ("refined", "power", "everything", "defaults") if same(k)),
+        None)
+    table = []
+    for key in ("refined", "power", "everything", "defaults"):
+        row = rows.get(key)
+        if not row:
+            if key in (placements.get("errors") or {}):
+                table.append({"Placement": PW_ROW_LABELS[key], "ε₁ (%)": "—",
+                              "ε₂ (%)": "—", "ε₃ (%)": "—", "R²": "—",
+                              f"≥ {target:g}": "could not place",
+                              **{s_: "" for s_ in symbols}, "In use": ""})
+            continue
+        r2 = row["r2"]
+        in_use = key == in_use_key
+        table.append({
+            "Placement": PW_ROW_LABELS[key],
+            "ε₁ (%)": f"{row['best_pct'][0]:.2f}",
+            "ε₂ (%)": f"{row['best_pct'][1]:.2f}",
+            "ε₃ (%)": f"{row['best_pct'][2]:.2f}",
+            "R²": f"{r2:.5f}" if np.isfinite(r2) else "—",
+            f"≥ {target:g}": ("✅" if np.isfinite(r2) and r2 >= target
+                              else "⚠️ " + (f"{row['worst'][0]} {row['worst'][1]:.3f}"
+                                            if row.get("worst") else "")),
+            **{s_: pressure_text(row["moduli"].get(s_)) for s_ in symbols},
+            "In use": "◀ in use" if in_use else "",
+        })
+    st.markdown("##### Where each route puts the boundaries, and what it gives")
+    flat_table(
+        pd.DataFrame(table),
+        align_right=["ε₁ (%)", "ε₂ (%)", "ε₃ (%)", "R²"] + list(symbols),
+        caption="Each row is the whole four-regime fit at that placement, with "
+        "the equations, guesses, bounds and component ranges on this page. "
+        "A ⚠️ names the regime that fits worst. The Young's moduli are the "
+        "ones that placement gives; the one in use is the one below.",
     )
-    if not in_use:
-        best = found["best_pct"]
-        if st.button(
-            "Use the most likely placement "
-            + " / ".join(f"{v:.2f}" for v in best) + " %",
-            key="pw_use_found",
-        ):
-            rerun_keeping_settings({
-                "pw_b1": round(float(best[0]), 2),
-                "pw_b2": round(float(best[1]), 2),
-                "pw_b3": round(float(best[2]), 2),
-            })
-    st.caption("How they were found, with the likelihood profiles, is under "
-               "**🔍 The working, in detail**, below the fit.")
+    reason = (selected or {}).get("reason")
+    if reason:
+        st.caption("**In use:** " + reason)
+    cols = st.columns(len(rows))
+    for col, key in zip(cols, [k for k in ("refined", "power", "everything",
+                                           "defaults") if k in rows]):
+        with col:
+            st.button(f"Use: {PW_ROW_LABELS[key]}", key=f"pw_use_{key}_row",
+                      on_click=_pw_use_row, args=(key,), **STRETCH)
+    power = placements.get("power") or {}
+    if power.get("success"):
+        with st.expander("📈 The power law this curve follows (log–log slope)",
+                         expanded=False):
+            st.caption(
+                "The local exponent p = d ln F / d ln x, read straight off "
+                "the data. Each element is a power law, so p follows the laws "
+                "carrying load, and where it turns upward hardest a new "
+                "element has started: those turns are the power-law "
+                "boundaries. The dotted lines are the mean exponent in each "
+                "stretch."
+            )
+            st.plotly_chart(power_law_figure(power, bounds),
+                            key="pw_power_law", **STRETCH)
 
 
 def piecewise_search_maths(found):
     """How the boundaries were found: the maths and the three profiles."""
-    st.markdown("**🎯 How the boundaries were found**")
+    st.markdown("**🎯 How the boundaries were found by fitting everything**")
+    iv = found["intervals"]
+    ref = " / ".join(f"{v:g}" for v in found["spec_pct"])
+    st.markdown(
+        " · ".join(
+            f"{EPS_NAMES[i]} = {iv[k]['best']:.2f} % (68 %: {iv[k]['lo68']:.2f}–"
+            f"{iv[k]['hi68']:.2f}, 95 %: {iv[k]['lo95']:.2f}–{iv[k]['hi95']:.2f})"
+            + (" ⚠️ at the edge of its constraint" if iv[k]["at_band_edge"] else "")
+            for i, k in enumerate(("eps1", "eps2", "eps3"))
+        )
+        + (f" · ΔBIC = {found['delta_bic']:.1f} against {ref} %. "
+           if np.isfinite(found["delta_bic"]) else ". ")
+        + found["verdict"]
+    )
     st.markdown(
         "Once ε₁, ε₂, ε₃ are fixed, the continuous four-regime curve is "
         "linear in all seven coefficients, because every anchor is itself "
@@ -5362,7 +5493,7 @@ def piecewise_search_maths(found):
              r"\hat\varepsilon=\arg\min S")
     st.latex(r"\Delta(-2\ln L)(\varepsilon_j)=n\ln\frac{S}{S_{min}}"
              r"\;\le 1\ (68\,\%),\ \le 3.84\ (95\,\%)")
-    st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{default}}{S_{min}}-3\ln n")
+    st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{reference}}{S_{min}}-3\ln n")
     span = found.get("span_pct")
     st.caption(
         f"Searched ε₁ ∈ {found['bands_pct'][0][0]:g}–{found['bands_pct'][0][1]:g} %, "
@@ -5500,6 +5631,273 @@ def piecewise_components_panel(bounds):
     return slots
 
 
+# How the boundaries are placed. Two routes, and the one that chains them:
+# read the bends off the curve's log-log slope (no model at all), or fit
+# the whole model for every placement and keep the likeliest, or let the
+# first tell the second where to look. Each is scored by the fit it gives
+# and the Young's moduli that come out, side by side, so which one to
+# believe is a table, not a leap of faith.
+PW_METHODS = {
+    "refined": "📈→🎯 Power law, then fit everything",
+    "power": "📈 Power law only",
+    "everything": "🎯 Fit everything only",
+}
+PW_METHOD_HELP = {
+    "refined": "The log-log slope says roughly where the curve bends; the "
+               "whole model is then fitted for every placement within 15 % "
+               "of those bends, inside the C2C12 constraints, and the one "
+               "that fits best is kept. Recommended.",
+    "power": "Boundaries where the curve's log-log slope bends most sharply. "
+             "Reads the curve without any model, so it is independent "
+             "evidence, but it is only as sharp as the smoothing allows: "
+             "typically within a few percent.",
+    "everything": "The whole model fitted for every placement inside the "
+                  "C2C12 constraints, keeping the likeliest one. The "
+                  "Young's moduli are then the ones of the best overall fit.",
+}
+PW_ROW_LABELS = dict(PW_METHODS, defaults="C2C12 defaults")
+# When the chosen route misses the R² target, the others are tried in this
+# order and the first that reaches it is used.
+PW_FALLBACK = ("refined", "everything", "power", "defaults")
+
+
+def _pw_score(placement, epsilon, force_N, model):
+    """Fit at one placement; its R², worst regime and moduli."""
+    bounds = (0.0,) + tuple(float(v) for v in placement) + (
+        float(st.session_state.get("pw_end", DEFAULTS["pw_end"])),)
+    result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                           settings=piecewise_model_settings(),
+                           carry=piecewise_carry())
+    if not result.get("success"):
+        return {"best_pct": tuple(placement), "r2": float("nan"),
+                "moduli": {}, "error": result.get("error", "")}
+    moduli = piecewise_moduli(result, piecewise_geometry(model))
+    fitted = [r for r in result["regimes"] if r["fitted"] and r["key"] != "R1"]
+    worst = min(fitted, key=lambda r: r["r_squared"]) if fitted else None
+    return {
+        "best_pct": tuple(round(float(v), 2) for v in placement),
+        "r2": float(result["r_squared"]),
+        "worst": (worst["key"], float(worst["r_squared"])) if worst else None,
+        "moduli": {row["symbol"]: float(row["E_Pa"]) for row in moduli.values()},
+    }
+
+
+def compute_placements(model, epsilon, force_N):
+    """
+    Every route's boundaries for this curve, each scored by its own fit.
+
+    Returns {"signature", "rows": {key: score}, "power": ..., "searches":
+    {key: find_boundaries result}}.
+    """
+    bands, span = piecewise_bands(), piecewise_span()
+    end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
+    common = dict(end_pct=end, span_pct=span,
+                  settings=piecewise_model_settings(), carry=piecewise_carry())
+    out = {"signature": piecewise_signature(epsilon, force_N), "rows": {},
+           "searches": {}, "errors": {}}
+    # 1 · the power law, read straight off the curve
+    power = boundaries_from_power_law(
+        power_law_profile(epsilon, force_N, end_pct=end), bands, span)
+    out["power"] = power
+    if power.get("success"):
+        out["rows"]["power"] = _pw_score(power["best_pct"], epsilon, force_N, model)
+        # 2 · fitting everything, near where the power law says to look
+        near = tuple((max(b[0], p - 15.0), min(b[1], p + 15.0))
+                     for b, p in zip(bands, power["best_pct"]))
+        found = find_boundaries(epsilon, force_N, bands_pct=near,
+                                spec_pct=power["best_pct"], **common)
+        if found.get("success"):
+            out["searches"]["refined"] = found
+            out["rows"]["refined"] = _pw_score(found["best_pct"], epsilon, force_N, model)
+        else:
+            out["errors"]["refined"] = found.get("error", "")
+    else:
+        out["errors"]["power"] = power.get("error", "")
+    # 3 · fitting everything over the whole constraint range
+    found = find_boundaries(epsilon, force_N, bands_pct=bands,
+                            spec_pct=piecewise_defaults()[:3], **common)
+    if found.get("success"):
+        out["searches"]["everything"] = found
+        out["rows"]["everything"] = _pw_score(found["best_pct"], epsilon, force_N, model)
+    else:
+        out["errors"]["everything"] = found.get("error", "")
+    # and the defaults, for reference
+    out["rows"]["defaults"] = _pw_score(piecewise_defaults()[:3], epsilon, force_N, model)
+    return out
+
+
+def select_placement(placements, method, target):
+    """
+    Which placement to use: the chosen route's, unless it misses the target.
+
+    Returns (key, reason). A route below the R² target hands over to the
+    first in PW_FALLBACK that reaches it; when none does, the best fit is
+    used and the reason says so.
+    """
+    rows = placements.get("rows") or {}
+
+    def r2(key):
+        value = (rows.get(key) or {}).get("r2", float("nan"))
+        return value if np.isfinite(value) else -np.inf
+
+    if method in rows and r2(method) >= target:
+        return method, (f"{PW_ROW_LABELS[method]} reaches R² = {r2(method):.5f} "
+                        f"≥ {target:g}.")
+    for key in PW_FALLBACK:
+        if key in rows and r2(key) >= target:
+            said = (f"{PW_ROW_LABELS[method]} reached R² = {r2(method):.5f}, "
+                    f"below the {target:g} target"
+                    if method in rows else
+                    f"{PW_ROW_LABELS[method]} could not place the boundaries")
+            return key, (f"{said}, so {PW_ROW_LABELS[key]} is used "
+                         f"(R² = {r2(key):.5f}).")
+    if not rows:
+        return None, "No placement could be fitted."
+    key = max(rows, key=r2)
+    return key, (f"No placement reaches R² ≥ {target:g}; the best, "
+                 f"{PW_ROW_LABELS[key]} (R² = {r2(key):.5f}), is used. See "
+                 "which regime fits worst in the table.")
+
+
+def _pw_apply_selection():
+    """Callback: the route or the target changed, so re-choose and apply."""
+    placements = st.session_state.get("pw_placements")
+    if not placements:
+        return
+    key, reason = select_placement(
+        placements, st.session_state.get("pw_method", "refined"),
+        float(st.session_state.get("pw_target_r2", 0.999)))
+    if key is None:
+        return
+    for k, v in zip(PW_BOUNDARY_KEYS, placements["rows"][key]["best_pct"]):
+        st.session_state[k] = round(float(v), 2)
+    st.session_state["pw_selected"] = {"key": key, "reason": reason}
+
+
+def _pw_use_row(key):
+    """Callback: use one row of the placement table as it is."""
+    placements = st.session_state.get("pw_placements") or {}
+    row = (placements.get("rows") or {}).get(key)
+    if not row:
+        return
+    for k, v in zip(PW_BOUNDARY_KEYS, row["best_pct"]):
+        st.session_state[k] = round(float(v), 2)
+    st.session_state["pw_selected"] = {
+        "key": key, "reason": f"{PW_ROW_LABELS[key]}, chosen from the table."}
+
+
+def current_placements(epsilon, force_N):
+    """The stored placements, if they belong to this curve and model."""
+    placements = st.session_state.get("pw_placements")
+    if placements and placements.get("signature") == piecewise_signature(
+            epsilon, force_N):
+        return placements
+    return None
+
+
+def power_law_figure(power, bounds):
+    """The curve's local exponent, where it bends, and the boundaries."""
+    prof = power.get("profile") or {}
+    x = np.asarray(prof.get("x_pct", []), dtype=float)
+    p = np.asarray(prof.get("exponent", []), dtype=float)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=p, mode="lines", name="d ln F / d ln x",
+                             line={"color": "#1f77b4", "width": 2.5}))
+    for seg in power.get("segments") or []:
+        if np.isfinite(seg["mean_exponent"]):
+            fig.add_trace(go.Scatter(
+                x=[seg["from_pct"], seg["to_pct"]],
+                y=[seg["mean_exponent"]] * 2, mode="lines",
+                line={"color": "#aaaaaa", "width": 1, "dash": "dot"},
+                showlegend=False,
+                hovertemplate=f"mean exponent {seg['mean_exponent']:.2f}<extra></extra>",
+            ))
+    levels = add_boundary_lines(fig, (0.0,) + tuple(power["best_pct"]) + (bounds[-1],),
+                                end_label=False,
+                                x_span=float(x.max() - x.min()) if x.size else None,
+                                x_max=float(x.max()) if x.size else None)
+    fig.update_layout(
+        height=300, template="simple_white", showlegend=False,
+        margin={"l": 60, "r": 20, "t": 30 + 24 * levels, "b": 50},
+        xaxis_title="Relative deformation (%)",
+        yaxis_title="local exponent p",
+    )
+    return fig
+
+
+def piecewise_settings_used(result, geometry, target, source):
+    """
+    Every setting the fit on the page used, read from the fit itself.
+
+    Built from what was passed to the fit and what came back, never from
+    the widgets alone, so it cannot show a setting the fit did not use.
+    The spring-network options that have no part in this fit are named as
+    such, so a value set for them is not mistaken for part of this one.
+    """
+    b = result["boundaries_pct"]
+    ranges = result.get("ranges") or {}
+    off = piecewise_off()
+    rows = [
+        ("Model", "4-regime piecewise, fitted regime by regime (R1 → R4), "
+                  "each anchored at the force the one before it ended on",
+         "fixed"),
+        ("Boundary placement", f"{PW_ROW_LABELS.get(st.session_state.get('pw_method', 'refined'), '')} "
+                               f"· in use: {source}",
+         "How to place the boundaries"),
+        ("Boundaries", ", ".join(f"{n} = {v:.2f} %" for n, v in zip(EPS_NAMES, b[1:4]))
+         + f", end = {b[4]:.1f} %", "Regime boundaries"),
+        ("R² target", f"≥ {target:g} · this fit {result['r_squared']:.5f} "
+                      + ("✅" if result["r_squared"] >= target else "⚠️"),
+         "Fit must reach R² ≥"),
+    ]
+    (l1, h1), (l2, h2), _b3 = piecewise_bands()
+    s_lo, s_hi = piecewise_span()
+    rows.append(("C2C12 constraints", f"ε₁ {l1:g}–{h1:g} %, ε₂ {l2:g}–{h2:g} %, "
+                                      f"ε₃ − ε₂ {s_lo:g}–{s_hi:g} %",
+                 "Edit the C2C12 constraints"))
+    for name, label, _symbol, _colour, _law in PW_COMPONENTS:
+        a, u = ranges.get(name, (float("nan"), float("nan")))
+        rows.append((f"{label}", "off (held at 0)" if name in off
+                     else f"acts over {a:.2f}–{u:.2f} %", "Components"))
+    for regime in result["regimes"]:
+        for name, p in regime["params"].items():
+            if name == "C0" or name == "k_align":
+                continue
+            rows.append((f"{name} guess and bounds",
+                         f"p0 {p['p0']:.3g}, [{_pw_text(p['lower'])}, "
+                         f"{_pw_text(p['upper'])}]"
+                         + (" (switched off)" if name in off else ""),
+                         "Initial guesses and bounds"))
+    rows += [
+        ("k_align, C0", "straight-line least squares on R1, no bounds", "fixed"),
+        ("Weighting", "uniform: every point counts the same (ordinary least "
+                      "squares)", "fixed"),
+        ("Solver", " · ".join(f"{r['key']}: {r['engine'] or 'not fitted'}"
+                              for r in result["regimes"]), "fixed"),
+        ("Cell height h₀", f"{geometry.cell_height * 1e6:.2f} µm", "1 · Cell information"),
+        ("Cell radius R₀", f"{geometry.cell_radius * 1e6:.2f} µm "
+                           f"({st.session_state.get('radius_mode', '')})",
+         "sidebar · Cell geometry"),
+        ("Nucleus radius Rₙ", f"{geometry.nucleus_radius * 1e6:.2f} µm "
+                              f"({st.session_state.get('nucleus_radius_mode', '')})",
+         "sidebar · Cell geometry"),
+        ("Probe", (f"{geometry.probe_radius * 2e6:.1f} µm sphere"
+                   if geometry.probe_radius else "flat (not recorded)"),
+         "1 · Cell information"),
+        ("Membrane / envelope / coat thickness",
+         f"{geometry.membrane_thickness * 1e9:.1f} / "
+         f"{geometry.envelope_thickness * 1e9:.0f} / "
+         f"{geometry.coat_thickness * 1e9:.0f} nm", "sidebar"),
+        ("Poisson ratios (membrane / interior / nucleus)",
+         f"{geometry.nu_membrane:.2f} / {geometry.nu_interior:.2f} / "
+         f"{geometry.nu_nucleus:.2f}", "sidebar"),
+        ("Not used by this fit",
+         "the weighting, confinement q, nucleus onset and arrangement "
+         "settings belong to the spring-network models", "—"),
+    ]
+    return pd.DataFrame(rows, columns=["Setting", "Used in this fit", "Set in"])
+
+
 def piecewise_section(model, epsilon, force_N, rupture):
     """
     The whole four-regime step: boundaries, fit, curve, numbers.
@@ -5520,52 +5918,46 @@ def piecewise_section(model, epsilon, force_N, rupture):
     )
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
+    target = float(st.session_state.get("pw_target_r2", 0.999))
 
-    def run_search():
-        """The most likely ε₁, ε₂, ε₃ inside the C2C12 constraints."""
-        found = find_boundaries(
-            epsilon, force_N,
-            end_pct=float(st.session_state["pw_end"]),
-            bands_pct=piecewise_bands(),
-            span_pct=piecewise_span(),
-            spec_pct=piecewise_defaults()[:3],
-            settings=piecewise_model_settings(),
-            carry=piecewise_carry(),
-        )
-        if found.get("success"):
-            found["signature"] = piecewise_signature(epsilon, force_N)
-            st.session_state["pw_boundary_search"] = found
-        return found
+    def place(apply_now):
+        """Every route's boundaries, scored; the right one put in use."""
+        with st.spinner("Placing the boundaries: the power law, then fitting "
+                        "everything, inside the C2C12 constraints…"):
+            placements = compute_placements(model, epsilon, force_N)
+        st.session_state["pw_placements"] = placements
+        key, reason = select_placement(
+            placements, st.session_state.get("pw_method", "refined"), target)
+        if key is None:
+            st.warning("Could not place the boundaries inside the C2C12 "
+                       "constraints on this curve, so the defaults are used. "
+                       "A curve that stops before the nucleus is met has no "
+                       "ε₂ or ε₃ to find.", icon="⚠️")
+            return
+        st.session_state["pw_selected"] = {"key": key, "reason": reason}
+        best = placements["rows"][key]["best_pct"]
+        values = {k: round(float(v), 2) for k, v in zip(PW_BOUNDARY_KEYS, best)}
+        if apply_now:
+            # Before the inputs are drawn, so they can be written directly.
+            for k, v in values.items():
+                st.session_state[k] = v
+        else:
+            rerun_keeping_settings(values)
 
-    # A new curve has its boundaries found as soon as it is on the page.
-    # Done before the boundary inputs are drawn, so they can be written
-    # directly and the page is right on its first draw.
+    # A new curve has its boundaries placed as soon as it is on the page.
     data = st.session_state.get("data") or {}
     curve_key = repr((data.get("source"), int(np.size(epsilon)),
                       round(float(force_N[-1]), 15) if np.size(force_N) else 0.0))
     if st.session_state.get("_pw_auto_found") != curve_key:
         st.session_state["_pw_auto_found"] = curve_key
-        with st.spinner("Finding this curve's boundaries within the C2C12 "
-                        "constraints…"):
-            found = run_search()
-        if found.get("success"):
-            for key, value in zip(PW_BOUNDARY_KEYS, found["best_pct"]):
-                st.session_state[key] = round(float(value), 2)
-        else:
-            st.warning(
-                "Could not place the boundaries inside the C2C12 constraints "
-                f"on this curve ({found.get('error', 'no valid placement')}), "
-                "so the defaults are used. A curve that stops before the "
-                "nucleus is met has no ε₂ or ε₃ to find.",
-                icon="⚠️",
-            )
+        place(apply_now=True)
 
     st.markdown("#### 1 · Regime boundaries (% relative deformation)")
     prior = piecewise_prior()
     (l1, h1), (l2, h2), _b3 = piecewise_bands()
     s_lo, s_hi = piecewise_span()
     st.info(
-        "**C2C12 constraints the boundaries are found inside** "
+        "**C2C12 constraints every placement stays inside** "
         "(the app's C2C12 prior):\n"
         f"- **ε₁**, end of the contact artefact: {l1:g}–{h1:g} %.\n"
         "- **Membrane and cytoskeleton** carry load from ε₁ to the end of "
@@ -5578,6 +5970,26 @@ def piecewise_section(model, epsilon, force_N, rupture):
         "once met.",
         icon="🧬",
     )
+
+    # The route and the standard it has to meet, side by side.
+    m1, m2 = st.columns([3, 1])
+    with m1:
+        st.radio(
+            "How to place the boundaries", list(PW_METHODS),
+            format_func=lambda k: PW_METHODS[k] + (
+                " (recommended)" if k == "refined" else ""),
+            key="pw_method", horizontal=True, on_change=_pw_apply_selection,
+        )
+        st.caption(PW_METHOD_HELP[st.session_state.get("pw_method", "refined")])
+    with m2:
+        st.number_input(
+            "Fit must reach R² ≥", min_value=0.9, max_value=0.99999,
+            step=0.0005, format="%.4f", key="pw_target_r2",
+            on_change=_pw_apply_selection,
+            help="A placement whose fit falls short of this hands over to "
+            "one that reaches it, and the fit line says whether it is met.",
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.number_input(f"{EPS_NAMES[0]} · R2 starts (%)", 0.5, 99.0, step=0.5,
@@ -5591,23 +6003,23 @@ def piecewise_section(model, epsilon, force_N, rupture):
     with c4:
         st.number_input("Fit ends (%)", 1.0, 100.0, step=0.1, format="%.1f",
                         key="pw_end", help="The last point fitted. Not moved "
-                        "by the boundary search: it decides which points are "
-                        "fitted at all.")
+                        "when the boundaries are placed: it decides which "
+                        "points are fitted at all.")
 
     for note in constraint_notes(piecewise_boundaries()):
-        st.caption(f"⚠️ {note}. Set by hand; press **Find the boundaries** "
+        st.caption(f"⚠️ {note}. Set by hand; press **Place the boundaries** "
                    "to put them back inside the constraints.")
 
-    b1, b2, b3 = st.columns([1.3, 1, 1])
+    b1, b2, _b3 = st.columns([1.3, 1, 1])
     spec = piecewise_defaults()
     with b1:
-        find = st.button(
-            "🎯 Find the boundaries", type="primary", key="pw_find",
-            help="Places ε₁, ε₂ and ε₃ where the four-regime model, with your "
-            "equations, guesses, bounds and component ranges, is most likely "
-            "for this curve, inside the C2C12 constraints above. Done "
-            "automatically for every new curve; press it again after "
-            "changing the model.",
+        placing = st.button(
+            "▶ Place the boundaries", type="primary", key="pw_find",
+            help="Runs every route on this curve with the equations, "
+            "guesses, bounds and component ranges on the page, scores each "
+            "by its fit, and uses the chosen one (or the next that meets "
+            "the R² target). Done automatically for every new curve; press "
+            "it again after changing the model.",
             **STRETCH,
         )
     with b2:
@@ -5626,8 +6038,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 **{f"pw_use_{name}": True for name in PW_SWITCHABLE},
                 "_pw_editor_reset": True,
             })
-    with b3:
-        st.write("")
 
     with st.expander("Edit the C2C12 constraints", expanded=False):
         st.caption("Where the boundaries may go, in percent. Set both ends "
@@ -5651,24 +6061,20 @@ def piecewise_section(model, epsilon, force_N, rupture):
         if why:
             st.caption("From the app's C2C12 prior: " + why + ".")
 
-    if find:
-        with st.spinner("Profiling the likelihood over ε₁, ε₂ and ε₃…"):
-            found = run_search()
-        if found.get("success"):
-            # The most likely placement inside the constraints: every
-            # boundary it can take already respects them.
-            best = found["best_pct"]
-            rerun_keeping_settings({
-                "pw_b1": round(float(best[0]), 2),
-                "pw_b2": round(float(best[1]), 2),
-                "pw_b3": round(float(best[2]), 2),
-            })
-        else:
-            st.error(f"Could not place the boundaries: {found.get('error')}")
+    if placing:
+        place(apply_now=False)
 
     bounds = piecewise_boundaries()
-    found = current_search(epsilon, force_N)
-    piecewise_search_panel(found, bounds)
+    placements = current_placements(epsilon, force_N)
+    selected = st.session_state.get("pw_selected") or {}
+    found = None
+    if placements:
+        found = placements["searches"].get(selected.get("key"))
+        piecewise_placement_table(placements, bounds, target, selected)
+    elif st.session_state.get("pw_placements"):
+        st.caption("ℹ️ The model or the curve has changed since the "
+                   "boundaries were placed: press **▶ Place the boundaries** "
+                   "to place them for what is on the page now.")
 
     st.markdown("##### Components and where each one acts (%)")
     slots = piecewise_components_panel(bounds)
@@ -5693,21 +6099,37 @@ def piecewise_section(model, epsilon, force_N, rupture):
         return None, None, [], None
 
     used = result["boundaries_pct"]
-    source = boundary_source(used, found)
+    source = boundary_source(used, placements)
     chi = result.get("chi_squared_reduced", float("nan"))
     gaps = result.get("continuity_gaps_N") or {}
     worst_gap = max((abs(v) for v in gaps.values()), default=0.0)
     gap_disp, gap_unit = from_newtons(worst_gap, style.force_unit)
-    st.success(
-        f"**R² = {result['r_squared']:.5f}**"
+    meets = result["r_squared"] >= target
+    line = (
+        f"**R² = {result['r_squared']:.5f}** "
+        + (f"✅ meets the R² ≥ {target:g} target" if meets
+           else f"⚠️ below the R² ≥ {target:g} target")
         + (f" · χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
         + " · " + ", ".join(f"{n} = {v:.2f} %" for n, v in zip(EPS_NAMES, used[1:4]))
         + f" ({source}) · {result['n_points']} points from {used[0]:g} to "
         f"{result['epsilon_range'][1] * 100:.1f} % · continuity gap "
         f"{float(gap_disp):.1g} {gap_unit}"
-        + (" · membrane acting throughout"
-           if "K_shell" in (result.get("carry") or ()) else "")
     )
+    if meets:
+        st.success(line)
+    else:
+        fitted_regimes = [r for r in result["regimes"]
+                          if r["fitted"] and r["key"] != "R1"]
+        worst = min(fitted_regimes, key=lambda r: r["r_squared"]) \
+            if fitted_regimes else None
+        st.warning(
+            line + (f". The worst-fitting stretch is {worst['key']} "
+                    f"({worst['domain_pct'][0]:.1f}–{worst['domain_pct'][1]:.1f} %, "
+                    f"R² {worst['r_squared']:.4f})" if worst else "")
+            + ". Press **▶ Place the boundaries**, check that stretch's "
+            "component ranges, or look at the residuals under 🔍 The working.",
+            icon="⚠️",
+        )
 
     st.checkbox("Log force axis", key="pw_log_y")
     st.plotly_chart(
@@ -5876,6 +6298,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
         with working:
             piecewise_search_maths(found)
 
+    with st.expander("⚙️ Settings this fit used", expanded=False):
+        st.caption("Read from the fit itself, so every value here is one "
+                   "the fit on this page actually used.")
+        flat_table(piecewise_settings_used(result, geometry, target, source))
+
     for warning in result.get("warnings", []):
         st.warning(warning, icon="⚠️")
 
@@ -5910,7 +6337,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                       + [f"{result['r_squared']:.6f}"])
             st.code("\t".join(header) + "\n" + "\t".join(values), language=None)
 
-    fit = piecewise_as_fit(result, model, found=found)
+    fit = piecewise_as_fit(result, model, found=found, placements=placements)
     return fit, fitted, piecewise_stage_plan(result), result
 
 
@@ -7771,6 +8198,8 @@ def current_fit_settings():
             st.session_state.get("pw_membrane_throughout", True)),
         "piecewise_until": piecewise_until(),
         "piecewise_off": list(piecewise_off()),
+        "piecewise_method": st.session_state.get("pw_method", "refined"),
+        "piecewise_target_r2": float(st.session_state.get("pw_target_r2", 0.999)),
     }
 
 
@@ -9362,6 +9791,8 @@ with tab_analysis:
             pending.update({key: DEFAULTS[key] for key in PW_BOUNDARY_KEYS})
             pending["pw_until"] = {}
             st.session_state["pw_boundary_search"] = None
+            st.session_state["pw_placements"] = None
+            st.session_state["pw_selected"] = None
             # And its boundaries are then found inside the C2C12
             # constraints the first time the four-regime fit draws it.
             st.session_state["_pw_auto_found"] = None
@@ -12972,8 +13403,22 @@ with tab_results:
         if fit.get("piecewise"):
             # The same ε₁, ε₂, ε₃ and the same component curves, over the
             # same ranges, as the analysis tab, on this ε axis.
-            add_boundary_lines(
-                results_figure, fit["piecewise"]["boundaries_pct"], scale=0.01,
+            bounds_r = fit["piecewise"]["boundaries_pct"]
+            top_r = float(np.nanmax(results["epsilon"])) * 100.0
+            rows_r = add_boundary_lines(
+                results_figure, bounds_r, scale=0.01,
+                x_span=top_r * 1.05, x_max=top_r * 1.02,
+            )
+            # Title at the very top, the ε tags between it and the plot,
+            # and the legend under the axis instead of over the curve.
+            base_top = max(70, style.title_size * 3)
+            results_figure.update_layout(
+                title={"y": 0.99, "yref": "container", "yanchor": "top"},
+                margin={"t": base_top + TAG_ROW_PX * rows_r,
+                        "b": 90 + 22 * 3},
+                legend={"orientation": "h", "yanchor": "top", "y": -0.15,
+                        "xanchor": "left", "x": 0.0},
+                height=int(style.height) + TAG_ROW_PX * rows_r + 60,
             )
             pw_result = results.get("piecewise_result")
             if pw_result:
