@@ -75,7 +75,15 @@ def load(app, eps, force):
     }
 
 
+# The C2C12 page opens on the four-regime fit. Everything in this file
+# before it was written against the spring-network models, so unless a case
+# asks for the four regimes it is run on those.
+PIECEWISE_MODE = "4-regime piecewise (C2C12)"
+ADVANCED_MODE = "Spring-network models (advanced)"
+
+
 def start(**state):
+    state.setdefault("c2c12_fit_mode", ADVANCED_MODE)
     app = AppTest.from_file(APP, default_timeout=180)
     app.run()
     eps, force = synthetic()
@@ -218,6 +226,67 @@ def no_exception(app, name):
 
 
 # ---------------------------------------------------------------- cases ---
+
+def four_regime_curve(n=900, noise_N=0.2e-9):
+    """A curve built from the four-regime laws, with the spec's boundaries."""
+    x = np.linspace(0.0, 91.2, n)
+    k, c0 = 2e-10, 1e-10
+    ks, kc, kn, knc, kcore = 1e-13, 2e-11, 5e-12, 2e-10, 2e-9
+    f5 = k * 5 + c0
+    f40 = f5 + ks * 35 ** 3 + kc * 35 ** 1.5
+    f60 = f40 + kn * 20 ** 3 + knc * 20 ** 1.5
+    d = lambda a: np.clip(x - a, 0.0, None)  # noqa: E731
+    force = np.where(
+        x < 5, k * x + c0,
+        np.where(x < 40, f5 + ks * d(5) ** 3 + kc * d(5) ** 1.5,
+                 np.where(x < 60, f40 + kn * d(40) ** 3 + knc * d(40) ** 1.5,
+                          f60 + kcore * d(60) ** 1.5)))
+    rng = np.random.default_rng(1)
+    return x / 100.0, force + noise_N * rng.standard_normal(n)
+
+
+def case_c2c12_opens_on_the_four_regime_fit():
+    print("a C2C12 curve is fitted with the four regimes as soon as it loads")
+    app = AppTest.from_file(APP, default_timeout=300)
+    app.run()
+    eps, force = four_regime_curve()
+    load(app, eps, force)
+    app.run()
+    if not no_exception(app, "the four-regime page"):
+        return
+    check("the page opens on the four-regime fit",
+          state(app, "c2c12_fit_mode") == PIECEWISE_MODE,
+          str(state(app, "c2c12_fit_mode")))
+    fit = (state(app, "results") or {}).get("fit") or {}
+    check("it has fitted without anything being pressed",
+          fit.get("coupling") == "piecewise", str(fit.get("coupling")))
+    check("at the spec's boundaries",
+          [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3", "pw_end")]
+          == [5.0, 40.0, 60.0, 91.2],
+          str([state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3", "pw_end")]))
+    labels = [m.label for m in app.metric]
+    for symbol in ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core", "E_align"):
+        check(f"{symbol} is on the page", any(symbol in l for l in labels),
+              str(labels))
+    check("the fit follows the curve", fit.get("r_squared", 0) > 0.999,
+          str(fit.get("r_squared")))
+
+    app.number_input(key="pw_b2").set_value(35.0).run()
+    if no_exception(app, "moving a boundary"):
+        moved = state(app, "results")["fit"]["piecewise"]["boundaries_pct"]
+        check("moving a boundary refits at once", moved[2] == 35.0, str(moved))
+
+    app.button(key="pw_reset").click().run()
+    if no_exception(app, "putting the spec back"):
+        check("the reset puts the spec's boundaries back",
+              state(app, "pw_b2") == 40.0, str(state(app, "pw_b2")))
+
+    app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
+    if no_exception(app, "switching to the spring-network models"):
+        check("and the spring-network fit is one click away",
+              button_by_label(app, "Fit this cell") is not None,
+              str([b.label for b in app.button][:12]))
+
 
 def case_loads_clean():
     print("app loads with a curve, no exception")
@@ -607,6 +676,7 @@ def case_database_section_without_a_fit():
     print("the database section is reachable before any fit")
     app = AppTest.from_file(APP, default_timeout=180)
     app.run()
+    app.session_state["c2c12_fit_mode"] = ADVANCED_MODE
     eps, force = synthetic()
     load(app, eps, force)
     app.session_state["live_fit"] = False
@@ -4022,6 +4092,7 @@ def case_the_myoblast_nucleus_reaches_the_page():
 
     app = AppTest.from_file(APP, default_timeout=900)
     app.run()
+    app.session_state["c2c12_fit_mode"] = ADVANCED_MODE
     app.session_state["cell_name"] = "myo-nucleus"
     app.session_state["data"] = {
         "epsilon": eps, "force_N": force, "source": "myo.csv", "n_dropped": 0,
@@ -5992,6 +6063,7 @@ def case_a_fixed_cell_is_one_hertzian_solid():
 
     app = AppTest.from_file(APP, default_timeout=900)
     app.run()
+    app.session_state["c2c12_fit_mode"] = ADVANCED_MODE
     app.session_state["fixed_cell"] = True
     # Set directly rather than through the tick, so the tick's own callback
     # has not run: say what it would have said.
@@ -6393,6 +6465,7 @@ def case_the_plot_says_what_the_ranges_say():
     eps, force = synthetic(En_kPa=30.0)
     app = AppTest.from_file(APP, default_timeout=600)
     app.run()
+    app.session_state["c2c12_fit_mode"] = ADVANCED_MODE
     app.session_state["cell_name"] = "bands"
     app.session_state["show_components"] = True
     app.session_state["data"] = {
@@ -6465,6 +6538,7 @@ def case_the_video_is_not_a_plot_marking():
 
 if __name__ == "__main__":
     for case in (
+        case_c2c12_opens_on_the_four_regime_fit,
         case_loads_clean,
         case_legacy_record_refits,
         case_companion_file_guard,
