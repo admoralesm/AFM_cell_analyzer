@@ -318,6 +318,9 @@ def case_c2c12_opens_on_the_four_regime_fit():
     import app as app_module
     moduli_rows = [row for row in app_module.result_rows(fit)
                    if row[0].startswith("modulus_") and row[2] != "off"]
+    check("the results table has no where / how column",
+          not any("where / how" in str(m.value) for m in app.get("markdown")),
+          "the third column is still there")
     check("each modulus is quoted as value ± SE",
           moduli_rows and all("±" in row[2] for row in moduli_rows),
           str([row[2] for row in moduli_rows]))
@@ -612,8 +615,10 @@ def case_bare_plot():
           not any("data and fit only" in (box.label or "").lower()
                   for box in app.checkbox),
           str([box.label for box in app.checkbox][:10]))
-    check("element curves off by default",
-          app.session_state["show_components"] is False)
+    # The components that are ticked are the ones drawn: the bars on the
+    # control board and the curves on the plot are one list.
+    check("the ticked components are drawn by default",
+          app.session_state["show_components"] is True)
     check("and only the boundaries are on it until something is sent",
           [row["kind"] for row in (state(app, "plot_layers") or [])]
           == ["boundaries"], str(state(app, "plot_layers")))
