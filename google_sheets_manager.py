@@ -221,6 +221,12 @@ class GoogleSheetsManager:
         ("Ene", "Young's Modulus (Ene envelope, MPa)"),
         ("En", "Young's Modulus (En, kPa)"),
         ("En_range", "En range (ε)"),
+        # Only the four-regime C2C12 fit writes these: the cytoskeleton
+        # around the nucleus (regime 3), the apparent contact modulus
+        # (regime 1), and every coefficient and anchor as one JSON cell.
+        ("E_nc", "Young's Modulus (E_nc perinuclear cytoskeleton, kPa)"),
+        ("E_align", "Apparent contact modulus (E_align, kPa)"),
+        ("piecewise", "4-regime coefficients (JSON)"),
         ("membrane_areal", "Membrane Em·h (mN/m)"),
         ("model", "Model"),
         ("combination", "Combination"),
