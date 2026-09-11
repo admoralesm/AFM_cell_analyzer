@@ -125,6 +125,9 @@ HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "C2C12_BOUNDARIES_PCT",
     "C2C12_REGIMES",
     "Geometry",
+    "SEARCH_BANDS_PCT",
+    "component_curve",
+    "find_boundaries",
     "fit_piecewise",
     "piecewise_moduli",
     "predict_piecewise",
@@ -647,6 +650,17 @@ DEFAULTS = {
     # {name: {"p0": .., "lower": .., "upper": ..}}. Empty means the spec's.
     "pw_settings": {},
     "pw_log_y": False,
+    # The cell shell keeps stiffening after regime 2: K_shell*(x - ε₁)^3,
+    # with the K_shell regime 2 measured, is carried through regimes 3 and 4
+    # and they fit what is left on top of it.
+    "pw_membrane_throughout": True,
+    # Where the boundary search may put ε₁, ε₂ and ε₃, in percent: around
+    # the specification's 5 / 40 / 60.
+    "pw_band1_lo": 2.0, "pw_band1_hi": 10.0,
+    "pw_band2_lo": 30.0, "pw_band2_hi": 50.0,
+    "pw_band3_lo": 50.0, "pw_band3_hi": 70.0,
+    # The last boundary search, with the curve and settings it was run on.
+    "pw_boundary_search": None,
     # Guided by default: most people opening this want a number, not a
     # spring network. Everything is still one expander away.
     "ui_mode": "Guided · plain language",
@@ -805,7 +819,7 @@ NEW_CELL_CLEARS = (
     "_suggested_window", "_slope_profile",
     "video_path", "video_info", "video_track",
     "video_name", "video_link", "eps_percent_fix",
-    "video_saved_frame", "video_saved_frame_index",
+    "video_saved_frame", "video_saved_frame_index", "pw_boundary_search",
 )
 
 if st.session_state.pop("_start_new_cell", False):
@@ -3783,6 +3797,7 @@ NOT_A_SETTING = (
     "video_track", "video_saved_frame", "exploration", "composition_search",
     "arrangement_search", "component_search", "confinement_scan",
     "hypothesis_search", "boundary_search", "element_window_search",
+    "pw_boundary_search",
 )
 
 
@@ -4468,6 +4483,14 @@ ADVANCED_MODE = "Spring-network models (advanced)"
 FIT_MODES = (PIECEWISE_MODE, ADVANCED_MODE)
 PIECEWISE_CELL_TYPES = ("Myoblast (C2C12)",)
 PW_BOUNDARY_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end")
+PW_BAND_KEYS = (("pw_band1_lo", "pw_band1_hi"), ("pw_band2_lo", "pw_band2_hi"),
+                ("pw_band3_lo", "pw_band3_hi"))
+# The names the boundaries go by everywhere: on the inputs, on the curve,
+# in the results and in the sheet (ε₁ and ε₂ are its two boundary columns).
+EPS_NAMES = ("ε₁", "ε₂", "ε₃")
+EPS_ROLES = ("R2 starts: cell stretch + cytoskeleton",
+             "R3 starts: nuclear envelope reached",
+             "R4 starts: dense intranuclear packing")
 PW_COLORS = {"R1": "#7f8c8d", "R2": "#2ca02c", "R3": "#1f77b4", "R4": "#9467bd"}
 PW_BANDS = {"R1": "rgba(127,140,141,0.10)", "R2": "rgba(44,160,44,0.08)",
             "R3": "rgba(31,119,180,0.08)", "R4": "rgba(148,103,189,0.08)"}
@@ -4525,6 +4548,57 @@ def piecewise_boundaries():
     )
 
 
+def piecewise_carry():
+    """The coefficients carried past their own regime: the membrane, or none."""
+    return ("K_shell",) if st.session_state.get(
+        "pw_membrane_throughout", True) else ()
+
+
+def piecewise_bands():
+    """The three search bands, each (low, high) in percent, low <= high."""
+    return tuple(
+        tuple(sorted((float(st.session_state.get(lo, DEFAULTS[lo])),
+                      float(st.session_state.get(hi, DEFAULTS[hi])))))
+        for lo, hi in PW_BAND_KEYS
+    )
+
+
+def piecewise_signature(epsilon, force_N):
+    """What a boundary search depends on: the curve, the model and the end."""
+    data = st.session_state.get("data") or {}
+    return repr((
+        data.get("source"), int(np.size(epsilon)),
+        round(float(force_N[-1]), 15) if np.size(force_N) else 0.0,
+        sorted((k, sorted(v.items())) for k, v in piecewise_settings().items()),
+        piecewise_carry(),
+        round(float(st.session_state.get("pw_end", DEFAULTS["pw_end"])), 4),
+        piecewise_bands(),
+    ))
+
+
+def current_search(epsilon, force_N):
+    """The stored boundary search, if it belongs to this curve and model."""
+    found = st.session_state.get("pw_boundary_search")
+    if not (found and found.get("success")):
+        return None
+    if found.get("signature") != piecewise_signature(epsilon, force_N):
+        return None
+    return found
+
+
+def boundary_source(bounds, found=None):
+    """Where the boundaries in use came from, in a few words."""
+    inner = tuple(round(float(b), 2) for b in bounds[1:4])
+    spec = tuple(round(float(b), 2) for b in C2C12_BOUNDARIES_PCT[1:4])
+    if found and inner == tuple(round(float(b), 2) for b in found["best_pct"]):
+        return "found by the boundary search"
+    if inner == spec:
+        if found and found.get("strength") == "none":
+            return "the specification, kept by the boundary search"
+        return "the specification"
+    return "set by hand"
+
+
 def piecewise_settings():
     """The user's changes to initial guesses and bounds, cleaned."""
     stored = st.session_state.get("pw_settings") or {}
@@ -4579,6 +4653,7 @@ def run_piecewise_fit(model, epsilon, force_N):
         epsilon, force_N,
         boundaries_pct=piecewise_boundaries(),
         settings=piecewise_settings(),
+        carry=piecewise_carry(),
     )
     if result.get("success"):
         result["moduli"] = piecewise_moduli(result, piecewise_geometry(model))
@@ -4598,7 +4673,7 @@ def pressure_text(value, se=None):
     return f"{value:.3g} Pa"
 
 
-def piecewise_as_fit(result, model, probe_um=None, settings=None):
+def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None):
     """
     The four-regime result in the shape the rest of the page reads.
 
@@ -4627,7 +4702,10 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None):
 
     spans = {
         "alignment": (b[0] / 100, b[1] / 100),
-        "membrane": (b[1] / 100, b[2] / 100),
+        # The membrane acts to the end of the fit when it is carried.
+        "membrane": (b[1] / 100,
+                     result["epsilon_range"][1]
+                     if "K_shell" in (result.get("carry") or ()) else b[2] / 100),
         "interior": (b[1] / 100, b[2] / 100),
         "nucleus_shell": (b[2] / 100, b[3] / 100),
         "perinuclear": (b[2] / 100, b[3] / 100),
@@ -4671,10 +4749,11 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None):
         "warnings": list(result.get("warnings", [])),
         "R0": float(model.R0),
         "R_nucleus": float(model.R_nucleus),
-        # The two boundaries the sheet has columns for: where the nuclear
-        # regime starts and where the dense packing does.
-        "break_1": b[2] / 100.0,
-        "break_2": b[3] / 100.0,
+        # ε₁ and ε₂ are the sheet's two boundary columns; ε₃ rides along
+        # with the rest under "piecewise".
+        "break_1": b[1] / 100.0,
+        "break_2": b[2] / 100.0,
+        "break_3": b[3] / 100.0,
         "Km_kT": float("nan"),
         "piecewise": {
             "boundaries_pct": list(b),
@@ -4685,6 +4764,18 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None):
             "probe_diameter_um": float(
                 st.session_state.get("probe_diameter_um", 0.0)
                 if probe_um is None else probe_um
+            ),
+            "membrane_throughout": "K_shell" in (result.get("carry") or ()),
+            "boundary_source": boundary_source(b, found),
+            "boundary_search": (
+                {
+                    "best_pct": list(found["best_pct"]),
+                    "delta_bic": found["delta_bic"],
+                    "strength": found["strength"],
+                    "intervals": found["intervals"],
+                }
+                if found and boundary_source(b, found).startswith("found")
+                else None
             ),
             "settings": piecewise_settings() if settings is None else settings,
         },
@@ -4705,8 +4796,35 @@ def piecewise_stage_plan(result):
     ]
 
 
+def add_boundary_lines(fig, bounds, scale=1.0, end_label=True):
+    """
+    ε₁, ε₂, ε₃ (and the end of the fit) as labelled lines on a figure.
+
+    ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
+    0.01 for one in ε as a fraction. The labels carry the numbers, so the
+    curve says where its boundaries are without a legend to look up.
+    """
+    for name, value in zip(EPS_NAMES, bounds[1:4]):
+        fig.add_vline(
+            x=float(value) * scale, line_dash="dash", line_color="#333333",
+            line_width=1.5,
+            annotation_text=f"{name} = {float(value):.1f} %",
+            annotation_position="top right", annotation_font_size=13,
+            annotation_font_color="#111111",
+        )
+    if end_label:
+        fig.add_vline(
+            x=float(bounds[-1]) * scale, line_dash="dot", line_color="#888888",
+            line_width=1,
+            annotation_text=f"end = {float(bounds[-1]):.1f} %",
+            annotation_position="bottom left", annotation_font_size=11,
+            annotation_font_color="#555555",
+        )
+    return fig
+
+
 def piecewise_figure(epsilon, force_N, result, style, log_y=False):
-    """The data, the four fitted laws, the regimes and the anchors."""
+    """The data, the four fitted laws, the regimes, ε₁–ε₃ and the anchors."""
     x = np.asarray(epsilon, dtype=float) * 100.0
     y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
     scale = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
@@ -4717,8 +4835,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False):
         fig.add_vrect(
             x0=a, x1=z, fillcolor=PW_BANDS.get(regime["key"], "rgba(0,0,0,0.05)"),
             line_width=0, layer="below",
-            annotation_text=regime["key"], annotation_position="top left",
-            annotation_font_size=13,
+            annotation_text=regime["key"], annotation_position="bottom left",
+            annotation_font_size=12, annotation_font_color="#666666",
         )
     keep = (y > 0) if log_y else np.ones_like(y, dtype=bool)
     fig.add_trace(go.Scatter(
@@ -4733,6 +4851,19 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False):
             line={"color": PW_COLORS.get(key, "#000000"),
                   "width": max(2, int(style.line_width * 0.8))},
         ))
+    # The membrane's own force, from ε₁ to wherever it acts. With the
+    # membrane acting throughout that is the end of the fit, which is the
+    # thing this line is here to show.
+    shell = component_curve(result, "K_shell")
+    if shell is not None:
+        xs, fs = shell
+        throughout = "K_shell" in (result.get("carry") or ())
+        fig.add_trace(go.Scatter(
+            x=xs, y=fs * scale, mode="lines",
+            name=("Membrane (cell shell), acting throughout" if throughout
+                  else "Membrane (cell shell)"),
+            line={"color": "#d62728", "width": 2, "dash": "dash"},
+        ))
     anchor_x, anchor_y, anchor_text = [], [], []
     for name, value in result["anchors"].items():
         where = float(name.split("_")[1].replace("pct", ""))
@@ -4746,19 +4877,46 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False):
                     "line": {"color": "#000000", "width": 2}},
             text=anchor_text, hovertemplate="%{text}<extra></extra>",
         ))
-    for boundary in b[1:-1]:
-        fig.add_vline(x=boundary, line_dash="dot", line_color="#555555",
-                      line_width=1)
+    add_boundary_lines(fig, b)
     fig.update_layout(
         height=int(style.height), template="simple_white",
-        margin={"l": 70, "r": 20, "t": 30, "b": 60},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02,
+        margin={"l": 70, "r": 20, "t": 40, "b": 60},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06,
                 "xanchor": "left", "x": 0.0},
         xaxis_title="Relative deformation (%)",
         yaxis_title=f"Force ({unit})",
     )
     if log_y:
         fig.update_yaxes(type="log")
+    return fig
+
+
+def profile_figure(found, index):
+    """One boundary's profile likelihood: Δ(−2 ln L) across its band."""
+    key = ("eps1", "eps2", "eps3")[index]
+    grid, delta = found["profiles"][key]
+    grid = np.asarray(grid, dtype=float)
+    delta = np.array([np.nan if d is None else d for d in delta], dtype=float)
+    shown = np.clip(delta, 0.0, 30.0)
+    best = found["intervals"][key]["best"]
+    fig = go.Figure(go.Scatter(x=grid, y=shown, mode="lines",
+                               line={"color": "#1f77b4", "width": 2},
+                               name="Δ(−2 ln L)"))
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#2ca02c",
+                  annotation_text="68 %", annotation_position="top left")
+    fig.add_hline(y=3.84, line_dash="dot", line_color="#ff7f0e",
+                  annotation_text="95 %", annotation_position="top left")
+    fig.add_vline(x=best, line_color="#000000", line_width=1.5)
+    spec = found["spec_pct"][index]
+    fig.add_vline(x=spec, line_color="#888888", line_dash="dash", line_width=1,
+                  annotation_text="spec", annotation_position="bottom right")
+    fig.update_layout(
+        height=230, template="simple_white", showlegend=False,
+        margin={"l": 50, "r": 10, "t": 30, "b": 45},
+        title={"text": f"{EPS_NAMES[index]} = {best:.2f} %", "font": {"size": 14}},
+        xaxis_title=f"{EPS_NAMES[index]} (%)", yaxis_title="Δ(−2 ln L)",
+    )
+    fig.update_yaxes(range=[0, 30])
     return fig
 
 
@@ -4816,8 +4974,8 @@ def piecewise_parameter_editor():
                 problems.append(f"{name}: '{row[column]}' is not a number")
                 number = getattr(term, key)
             values[key] = number
-        if values["lower"] >= values["upper"]:
-            problems.append(f"{name}: the lower bound must be below the upper")
+        if values["lower"] > values["upper"]:
+            problems.append(f"{name}: the lower bound must not be above the upper")
             values["lower"], values["upper"] = term.lower, term.upper
         changed = {k: v for k, v in values.items() if v != getattr(term, k)}
         if changed:
@@ -4859,12 +5017,112 @@ def keep_unrendered_settings():
             pass
 
 
+def piecewise_equations_latex(bounds, carry):
+    """The four laws with the boundaries in use written into them."""
+    e1, e2, e3, end = (float(v) for v in bounds[1:5])
+    shell3 = (rf" + K_{{shell}}\left[(x-{e1:g})^3-({e2 - e1:g})^3\right]"
+              if "K_shell" in carry else "")
+    shell4 = (rf" + K_{{shell}}\left[(x-{e1:g})^3-({e3 - e1:g})^3\right]"
+              if "K_shell" in carry else "")
+    return [
+        rf"R_1\;(0 \le x < {e1:g}):\quad F_1 = k_{{align}}\,x + C_0",
+        rf"R_2\;({e1:g} \le x < {e2:g}):\quad F_2 = F_{{{e1:g}\%}} + "
+        rf"K_{{shell}}(x-{e1:g})^3 + K_{{cyto}}(x-{e1:g})^{{1.5}}",
+        rf"R_3\;({e2:g} \le x < {e3:g}):\quad F_3 = F_{{{e2:g}\%}} + "
+        rf"K_{{nucleus}}(x-{e2:g})^3 + K_{{nuc\,cyto}}(x-{e2:g})^{{1.5}}" + shell3,
+        rf"R_4\;({e3:g} \le x \le {end:g}):\quad F_4 = F_{{{e3:g}\%}} + "
+        rf"K_{{core}}(x-{e3:g})^{{1.5}}" + shell4,
+    ]
+
+
+def piecewise_search_panel(found, bounds):
+    """What the boundary search found, how sure it is, and the maths."""
+    if not found:
+        return
+    iv = found["intervals"]
+    in_use = boundary_source(bounds, found).startswith("found")
+    parts = []
+    for i, key in enumerate(("eps1", "eps2", "eps3")):
+        row = iv[key]
+        edge = " ⚠️ at the band edge" if row["at_band_edge"] else ""
+        parts.append(
+            f"**{EPS_NAMES[i]} = {row['best']:.2f} %** "
+            f"(68 %: {row['lo68']:.2f}–{row['hi68']:.2f}, "
+            f"95 %: {row['lo95']:.2f}–{row['hi95']:.2f}){edge}"
+        )
+    dbic = found["delta_bic"]
+    source = boundary_source(bounds, found)
+    kept = source.startswith("the specification, kept")
+    box = st.success if found["strength"] in ("strong", "positive", "only") \
+        else st.info
+    box(
+        "🎯 **Boundary search**, most likely placement: " + " · ".join(parts)
+        + (f" · ΔBIC = {dbic:.1f} against 5 / 40 / 60 %. " if np.isfinite(dbic) else ". ")
+        + found["verdict"]
+        + (" **In use.**" if in_use else
+           " **Kept 5 / 40 / 60 %.**" if kept else
+           " *The boundaries in use have been changed since.*")
+    )
+    if not in_use:
+        best = found["best_pct"]
+        if st.button(
+            "Use the most likely placement "
+            + " / ".join(f"{v:.2f}" for v in best) + " %",
+            key="pw_use_found",
+        ):
+            rerun_keeping_settings({
+                "pw_b1": round(float(best[0]), 2),
+                "pw_b2": round(float(best[1]), 2),
+                "pw_b3": round(float(best[2]), 2),
+            })
+    with st.expander("How the boundaries are found (maths and profiles)",
+                     expanded=False):
+        st.markdown(
+            "Once ε₁, ε₂, ε₃ are fixed, the continuous four-regime curve is "
+            "linear in all seven coefficients, because every anchor is itself "
+            "a sum of the coefficients upstream of it. So each trial placement "
+            "is one exact bounded least-squares problem, with your equations, "
+            "bounds and the membrane acting throughout if it is ticked:"
+        )
+        st.latex(r"\hat F(x) = X(x;\varepsilon_1,\varepsilon_2,\varepsilon_3)\,"
+                 r"\theta,\qquad \theta=(k_{align},C_0,K_{shell},K_{cyto},"
+                 r"K_{nucleus},K_{nuc\,cyto},K_{core})")
+        st.latex(r"S(\varepsilon_1,\varepsilon_2,\varepsilon_3)="
+                 r"\min_{\theta_{lo}\le\theta\le\theta_{hi}}"
+                 r"\sum_i\big[F_i-\hat F(x_i)\big]^2,\qquad"
+                 r"\hat\varepsilon=\arg\min S")
+        st.latex(r"\Delta(-2\ln L)(\varepsilon_j)=n\ln\frac{S}{S_{min}}"
+                 r"\;\le 1\ (68\,\%),\ \le 3.84\ (95\,\%)")
+        st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{spec}}{S_{min}}-3\ln n")
+        st.caption(
+            f"Searched ε₁ ∈ {found['bands_pct'][0][0]:g}–{found['bands_pct'][0][1]:g} %, "
+            f"ε₂ ∈ {found['bands_pct'][1][0]:g}–{found['bands_pct'][1][1]:g} %, "
+            f"ε₃ ∈ {found['bands_pct'][2][0]:g}–{found['bands_pct'][2][1]:g} % "
+            f"(coarse grid, then coordinate descent at 0.1 %), "
+            f"{found['n_evaluations']} placements, n = {found['n_points']} points "
+            f"up to {found['end_pct']:.1f} %. ΔBIC above 6 is strong evidence "
+            "for the found boundaries, 2 to 6 positive, below 0 none: the "
+            "3 ln n term is the price of letting the data choose three "
+            "numbers. The intervals assume independent noise; residuals that "
+            "run in long stretches make them narrower than they should be. "
+            "The coefficients and moduli are then fitted sequentially, "
+            "exactly as specified, at the boundaries in use."
+        )
+        cols = st.columns(3)
+        for i in range(3):
+            with cols[i]:
+                st.plotly_chart(profile_figure(found, i),
+                                key=f"pw_profile_{i}", **STRETCH)
+
+
 def piecewise_section(model, epsilon, force_N, rupture):
     """
     The whole four-regime step: boundaries, fit, curve, numbers.
 
     Returns (fit, fitted, stage_plan) for the database section below, with
-    ``fit`` None when there is nothing to show.
+    ``fit`` None when there is nothing to show. Everything on it is drawn
+    from one fit made in this run, at the boundaries on screen, so the
+    inputs, the lines on the curve and the results can never disagree.
     """
     if st.session_state.pop("_pw_editor_reset", False):
         st.session_state.pop("pw_param_editor", None)
@@ -4878,40 +5136,100 @@ def piecewise_section(model, epsilon, force_N, rupture):
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
     st.markdown("#### 1 · Regime boundaries (% relative deformation)")
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1.25])
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.number_input("R2 starts", 0.5, 99.0, step=0.5, format="%.1f",
-                        key="pw_b1", help="End of the contact/alignment zone.")
+        st.number_input(f"{EPS_NAMES[0]} · R2 starts (%)", 0.5, 99.0, step=0.5,
+                        format="%.2f", key="pw_b1", help=EPS_ROLES[0])
     with c2:
-        st.number_input("R3 starts", 1.0, 99.0, step=0.5, format="%.1f",
-                        key="pw_b2", help="Where the nuclear envelope is reached.")
+        st.number_input(f"{EPS_NAMES[1]} · R3 starts (%)", 1.0, 99.0, step=0.5,
+                        format="%.2f", key="pw_b2", help=EPS_ROLES[1])
     with c3:
-        st.number_input("R4 starts", 1.0, 99.5, step=0.5, format="%.1f",
-                        key="pw_b3", help="Where dense intranuclear packing starts.")
+        st.number_input(f"{EPS_NAMES[2]} · R4 starts (%)", 1.0, 99.5, step=0.5,
+                        format="%.2f", key="pw_b3", help=EPS_ROLES[2])
     with c4:
-        st.number_input("Fit ends", 1.0, 100.0, step=0.1, format="%.1f",
-                        key="pw_end", help="The last point fitted.")
-    with c5:
-        st.write("")
-        spec = tuple(DEFAULTS[k] for k in PW_BOUNDARY_KEYS)
-        if st.button("↺ 5 / 40 / 60 / 91.2 %", key="pw_reset",
-                     help="Put the boundaries, initial guesses and bounds "
-                     "back to the C2C12 specification.", **STRETCH):
+        st.number_input("Fit ends (%)", 1.0, 100.0, step=0.1, format="%.1f",
+                        key="pw_end", help="The last point fitted. Not moved "
+                        "by the boundary search: it decides which points are "
+                        "fitted at all.")
+
+    st.checkbox(
+        "🫧 Membrane acts throughout: K_shell·(x − ε₁)³ keeps stiffening "
+        "through R3 and R4",
+        key="pw_membrane_throughout",
+        help="On: the cell shell measured in R2 goes on carrying load to the "
+        "end of the fit, with the same K_shell, and R3 and R4 fit what is "
+        "left on top of it. Off: the specification as first written, where "
+        "the shell's force is held at the value it reached at ε₂.",
+    )
+
+    b1, b2, b3 = st.columns([1.3, 1, 1])
+    spec = tuple(DEFAULTS[k] for k in PW_BOUNDARY_KEYS)
+    with b1:
+        find = st.button(
+            "🎯 Find the best boundaries", type="primary", key="pw_find",
+            help="Moves ε₁, ε₂ and ε₃ to where the four-regime model, with "
+            "your equations, guesses, bounds and membrane setting, is most "
+            "likely, searching the bands around 5 / 40 / 60 %.",
+            **STRETCH,
+        )
+    with b2:
+        if st.button("↺ Back to 5 / 40 / 60 / 91.2 %", key="pw_reset",
+                     help="The specification's boundaries, initial guesses "
+                     "and bounds.", **STRETCH):
             rerun_keeping_settings({
                 **dict(zip(PW_BOUNDARY_KEYS, spec)),
                 "pw_settings": {},
                 "_pw_editor_reset": True,
             })
+    with b3:
+        st.write("")
+
+    with st.expander("Boundary search bands", expanded=False):
+        st.caption("Where the search may put each boundary, in percent. "
+                   "Set both ends to the same value to hold one fixed.")
+        for i, (lo_key, hi_key) in enumerate(PW_BAND_KEYS):
+            l, h = st.columns(2)
+            with l:
+                st.number_input(f"{EPS_NAMES[i]} from", 0.5, 99.0, step=0.5,
+                                format="%.1f", key=lo_key)
+            with h:
+                st.number_input(f"{EPS_NAMES[i]} to", 0.5, 99.0, step=0.5,
+                                format="%.1f", key=hi_key)
+
+    if find:
+        with st.spinner("Profiling the likelihood over ε₁, ε₂ and ε₃…"):
+            found = find_boundaries(
+                epsilon, force_N,
+                end_pct=float(st.session_state["pw_end"]),
+                bands_pct=piecewise_bands(),
+                settings=piecewise_settings(),
+                carry=piecewise_carry(),
+            )
+        if found.get("success"):
+            found["signature"] = piecewise_signature(epsilon, force_N)
+            st.session_state["pw_boundary_search"] = found
+            # The best boundaries are the ones the information criterion
+            # prefers: the most likely placement when the curve supports
+            # moving them (ΔBIC > 0), the specification when it does not.
+            best = (found["best_pct"] if found["strength"] != "none"
+                    else C2C12_BOUNDARIES_PCT[1:4])
+            rerun_keeping_settings({
+                "pw_b1": round(float(best[0]), 2),
+                "pw_b2": round(float(best[1]), 2),
+                "pw_b3": round(float(best[2]), 2),
+            })
+        else:
+            st.error(f"Could not place the boundaries: {found.get('error')}")
 
     bounds = piecewise_boundaries()
-    note = []
+    found = current_search(epsilon, force_N)
+    piecewise_search_panel(found, bounds)
+
     if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
         at = float(rupture["epsilon"]) * 100.0
         if bounds[0] < at < min(bounds[-1], top):
-            note.append(f"the force drops at {at:.1f} % (possible rupture); set "
-                        f"**Fit ends** to {at:.1f} to leave out what follows")
-    if note:
-        st.caption("ℹ️ " + "; ".join(note) + ".")
+            st.caption(f"ℹ️ The force drops at {at:.1f} % (possible rupture); "
+                       f"set **Fit ends** to {at:.1f} to leave out what follows.")
 
     with st.expander("Initial guesses and bounds", expanded=False):
         piecewise_parameter_editor()
@@ -4926,6 +5244,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.caption(f"⚠️ {warning}")
         return None, None, []
 
+    used = result["boundaries_pct"]
+    source = boundary_source(used, found)
     chi = result.get("chi_squared_reduced", float("nan"))
     gaps = result.get("continuity_gaps_N") or {}
     worst_gap = max((abs(v) for v in gaps.values()), default=0.0)
@@ -4933,9 +5253,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
     st.success(
         f"**R² = {result['r_squared']:.5f}**"
         + (f" · χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
-        + f" · {result['n_points']} points from {bounds[0]:g} to "
+        + " · " + ", ".join(f"{n} = {v:.2f} %" for n, v in zip(EPS_NAMES, used[1:4]))
+        + f" ({source}) · {result['n_points']} points from {used[0]:g} to "
         f"{result['epsilon_range'][1] * 100:.1f} % · continuity gap "
-        f"{float(gap_disp):.1g} {gap_unit} (exact by construction)"
+        f"{float(gap_disp):.1g} {gap_unit}"
+        + (" · membrane acting throughout"
+           if "K_shell" in (result.get("carry") or ()) else "")
     )
 
     st.checkbox("Log force axis", key="pw_log_y")
@@ -4952,7 +5275,26 @@ def piecewise_section(model, epsilon, force_N, rupture):
         )
 
     moduli = result.get("moduli") or {}
-    st.markdown("#### 3 · Young's moduli")
+    st.markdown("#### 3 · Fitting results")
+    # The boundaries first: every number below was fitted at these.
+    flat_table(
+        pd.DataFrame([
+            {"Boundary": n, "Value (%)": f"{v:.2f}", "Starts": role,
+             **({"Search 95 % interval": (
+                 f"{found['intervals'][k]['lo95']:.2f}–"
+                 f"{found['intervals'][k]['hi95']:.2f}")} if found else {})}
+            for n, v, role, k in zip(
+                EPS_NAMES, used[1:4], EPS_ROLES, ("eps1", "eps2", "eps3"))
+        ] + [{"Boundary": "end", "Value (%)": f"{used[4]:.2f}",
+              "Starts": "last point fitted",
+              **({"Search 95 % interval": "not searched"} if found else {})}]),
+        align_right=["Value (%)"],
+        caption=f"Boundaries in use: {source}.",
+    )
+    for line in piecewise_equations_latex(used, result.get("carry") or ()):
+        st.latex(line)
+
+    st.markdown("##### Young's moduli")
     order = ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core", "k_align")
     cols = st.columns(3)
     for i, name in enumerate(order):
@@ -4970,15 +5312,18 @@ def piecewise_section(model, epsilon, force_N, rupture):
     table = []
     for regime in result["regimes"]:
         a, z = regime["domain_pct"]
+        common = {
+            "Regime": regime["key"],
+            "Domain (%)": f"{a:.2f}–{z:.2f}",
+            "Points": regime["n_points"],
+            "R²": (f"{regime['r_squared']:.4f}"
+                   if np.isfinite(regime["r_squared"]) else "—"),
+        }
         for name, p in regime["params"].items():
             row = moduli.get(name, {})
             value, unit = p["value"], ("N" if name == "C0" else f"N/%^{p['power']:g}")
             table.append({
-                "Regime": regime["key"],
-                "Domain (%)": f"{a:g}–{z:g}",
-                "Points": regime["n_points"],
-                "R²": (f"{regime['r_squared']:.4f}"
-                       if np.isfinite(regime["r_squared"]) else "—"),
+                **common,
                 "Coefficient": name,
                 "Value ± SE": (
                     "—" if not np.isfinite(value) else
@@ -4990,6 +5335,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "E ± SE": (pressure_text(row["E_Pa"], row["E_se_Pa"])
                            if row else ""),
                 "Flag": "on bound" if p.get("at_bound") else "",
+            })
+        # Elements carried in from an earlier regime act here too, with the
+        # value they were measured at. Shown so the table adds up to the
+        # curve rather than leaving a term out of sight.
+        for name, c in (regime.get("carried") or {}).items():
+            if not regime["fitted"]:
+                continue
+            table.append({
+                **common,
+                "Coefficient": f"{name} (carried)",
+                "Value ± SE": f"{c['value']:.4g} N/%^{c['power']:g}",
+                "Initial": "—",
+                "Bounds": f"fixed from {c.get('from_regime', 'R2')}",
+                "Modulus": moduli.get(name, {}).get("symbol", ""),
+                "E ± SE": "same as above",
+                "Flag": f"acts from {c['onset_pct']:.2f} %",
             })
     flat_table(
         pd.DataFrame(table),
@@ -5035,6 +5396,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
             "prefactor_N_per_Pa": row["prefactor_N_per_Pa"],
             "probe_correction": row["probe_correction"],
             "at_bound": row["at_bound"],
+            "eps1_pct": used[1], "eps2_pct": used[2], "eps3_pct": used[3],
+            "end_pct": used[4],
+            "membrane_throughout": "K_shell" in (result.get("carry") or ()),
         }
         for name, row in moduli.items()
     ])
@@ -5047,13 +5411,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
         )
     with d2:
         with st.expander("📋 Copy as a row"):
-            header = ["cell"] + [f"{r['symbol']}_Pa" for r in moduli.values()] + ["R2"]
-            values = [st.session_state.get("cell_name") or ""] + [
-                f"{r['E_Pa']:.6g}" for r in moduli.values()
-            ] + [f"{result['r_squared']:.6f}"]
+            header = (["cell"] + list(EPS_NAMES)
+                      + [f"{r['symbol']}_Pa" for r in moduli.values()] + ["R2"])
+            values = ([st.session_state.get("cell_name") or ""]
+                      + [f"{v:.2f}" for v in used[1:4]]
+                      + [f"{r['E_Pa']:.6g}" for r in moduli.values()]
+                      + [f"{result['r_squared']:.6f}"])
             st.code("\t".join(header) + "\n" + "\t".join(values), language=None)
 
-    fit = piecewise_as_fit(result, model)
+    fit = piecewise_as_fit(result, model, found=found)
     return fit, fitted, piecewise_stage_plan(result)
 
 
@@ -6910,6 +7276,8 @@ def current_fit_settings():
         ),
         "piecewise_boundaries_pct": list(piecewise_boundaries()),
         "piecewise_settings": piecewise_settings(),
+        "piecewise_membrane_throughout": bool(
+            st.session_state.get("pw_membrane_throughout", True)),
     }
 
 
@@ -7165,9 +7533,15 @@ def send_cell_to_sheet(manager, fit, date_acquired):
 
     piecewise = fit.get("piecewise") or {}
     if piecewise:
-        combination = "4 regimes at " + " / ".join(
-            f"{b:g}" for b in piecewise.get("boundaries_pct", [])
-        ) + " %, C0-anchored"
+        edges = list(piecewise.get("boundaries_pct", []))
+        combination = (
+            "4 regimes, " + ", ".join(
+                f"{n} = {float(v):.2f} %" for n, v in zip(EPS_NAMES, edges[1:4]))
+            + (f", end {float(edges[4]):.1f} %" if len(edges) > 4 else "")
+            + f" ({piecewise.get('boundary_source', '')}), C0-anchored"
+            + (", membrane throughout" if piecewise.get("membrane_throughout")
+               else "")
+        )
 
     def span(term):
         """The stretch of deformation this modulus was actually measured on."""
@@ -7361,6 +7735,8 @@ def refit_stored_cell(store, cell_id, settings):
             boundaries_pct=merged.get("piecewise_boundaries_pct")
             or C2C12_BOUNDARIES_PCT,
             settings=merged.get("piecewise_settings") or {},
+            carry=(("K_shell",)
+                   if merged.get("piecewise_membrane_throughout", True) else ()),
         )
         if not result.get("success"):
             raise ArchiveError(f"{cell_id}: {result.get('error', 'fit failed')}")
@@ -8483,6 +8859,10 @@ with tab_analysis:
             # screen are always either a stated default or something that
             # was asked for.
             pending.update(default_boundaries(st.session_state["cell_type"]))
+            # The four-regime fit starts every curve from the specification
+            # too, and forgets the last curve's boundary search.
+            pending.update({key: DEFAULTS[key] for key in PW_BOUNDARY_KEYS})
+            st.session_state["pw_boundary_search"] = None
 
             # No search here. Loading a curve used to run the whole
             # comparison and apply its winner, so the boundaries on screen
@@ -12052,9 +12432,14 @@ with tab_results:
                 m7.metric("E_align (apparent)", f"{fit.get('E_align_kPa', 0.0):.3g} kPa")
                 bounds = fit["piecewise"]["boundaries_pct"]
                 st.caption(
-                    "4-regime piecewise fit, regimes at "
-                    + " / ".join(f"{b:g}" for b in bounds) + " % · "
+                    "4-regime piecewise fit · "
+                    + ", ".join(f"{n} = {v:.2f} %"
+                                for n, v in zip(EPS_NAMES, bounds[1:4]))
+                    + f", end {bounds[4]:.1f} % "
+                    f"({fit['piecewise'].get('boundary_source', '')}) · "
                     f"{fit['n_points']} points"
+                    + (" · membrane acting throughout"
+                       if fit["piecewise"].get("membrane_throughout") else "")
                 )
             else:
                 m1, m2, m3 = st.columns(3)
@@ -12067,20 +12452,22 @@ with tab_results:
                     f"bending constant Kₘ = {fit.get('Km_kT', float('nan')):.3g} k_BT"
                 )
 
-        st.plotly_chart(
-            force_curve_figure(
-                results["epsilon"],
-                results["force_N"],
-                style,
-                title=results["cell_name"] or "Force vs relative deformation",
-                fit_force_N=results["fitted_N"],
-                membrane_N=results["membrane_N"],
-                interior_N=results["interior_N"],
-                fit_window=tuple(fit["epsilon_range"]),
-            ),
-            **STRETCH,
-            key="results_tab_plot",
+        results_figure = force_curve_figure(
+            results["epsilon"],
+            results["force_N"],
+            style,
+            title=results["cell_name"] or "Force vs relative deformation",
+            fit_force_N=results["fitted_N"],
+            membrane_N=results["membrane_N"],
+            interior_N=results["interior_N"],
+            fit_window=tuple(fit["epsilon_range"]),
         )
+        if fit.get("piecewise"):
+            # The same ε₁, ε₂, ε₃ as the analysis tab, on this ε axis.
+            add_boundary_lines(
+                results_figure, fit["piecewise"]["boundaries_pct"], scale=0.01,
+            )
+        st.plotly_chart(results_figure, **STRETCH, key="results_tab_plot")
 
 
 # ========================================================== TAB 5: export ==
