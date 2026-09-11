@@ -271,9 +271,18 @@ def case_c2c12_opens_on_the_four_regime_fit():
     check("with its boundaries found inside the C2C12 constraints",
           1.0 <= e1 <= 5.0 and 44.0 <= e2 <= 62.0 and 15.0 <= e3 - e2 <= 35.0,
           str((e1, e2, e3)))
-    check("and saying so",
-          "constraints" in state(app, "results")["fit"]["piecewise"]["boundary_source"],
-          state(app, "results")["fit"]["piecewise"]["boundary_source"])
+    source = state(app, "results")["fit"]["piecewise"]["boundary_source"]
+    check("and saying which route placed them",
+          "Power law" in source or "Fit everything" in source, source)
+    check("with a fit that meets the R² ≥ 0.999 target",
+          state(app, "results")["fit"]["r_squared"] >= 0.999
+          and state(app, "pw_target_r2") == 0.999,
+          str(state(app, "results")["fit"]["r_squared"]))
+    placements = state(app, "pw_placements") or {}
+    check("and every route scored side by side",
+          {"refined", "power", "everything", "defaults"}
+          <= set((placements.get("rows") or {})),
+          str(list((placements.get("rows") or {}))))
     labels = [m.label for m in app.metric]
     for symbol in ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core", "E_align"):
         check(f"{symbol} is on the page", any(symbol in l for l in labels),
@@ -319,9 +328,9 @@ def case_c2c12_opens_on_the_four_regime_fit():
 
     app.button(key="pw_find").click().run()
     if no_exception(app, "finding the boundaries"):
-        found = state(app, "pw_boundary_search") or {}
-        check("the boundary search ran", found.get("success") is True,
-              str(found.get("error")))
+        placements = state(app, "pw_placements") or {}
+        check("the boundaries were placed again",
+              bool(placements.get("rows")), str(placements.get("errors")))
         used = [state(app, k) for k in ("pw_b1", "pw_b2", "pw_b3")]
         fitted = state(app, "results")["fit"]["piecewise"]
         check("and the fit on the page is at the boundaries it left",
@@ -329,8 +338,19 @@ def case_c2c12_opens_on_the_four_regime_fit():
               == [round(v, 2) for v in used],
               f"{fitted['boundaries_pct']} vs {used}")
         check("which says where they came from",
-              "constraints" in fitted["boundary_source"],
+              "Power law" in fitted["boundary_source"]
+              or "Fit everything" in fitted["boundary_source"],
               fitted["boundary_source"])
+
+    # Choosing the power law alone, which misses 0.999 on this curve, hands
+    # over to a route that reaches it and says why.
+    app.radio(key="pw_method").set_value("power").run()
+    if no_exception(app, "choosing the power law alone"):
+        chosen = state(app, "pw_selected") or {}
+        check("a route below the target hands over to one that meets it",
+              state(app, "results")["fit"]["r_squared"] >= 0.999
+              or "No placement reaches" in chosen.get("reason", ""),
+              chosen.get("reason", ""))
 
     app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
     if no_exception(app, "switching to the spring-network models"):
