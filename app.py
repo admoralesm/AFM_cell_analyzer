@@ -657,7 +657,7 @@ DEFAULTS = {
     "log_scale": False,
     # Off by default: the fit is one Lulevich curve, and the per-element
     # curves beside it invite reading three fits into a plot that has one.
-    "show_components": False,
+    "show_components": True,
     "bare_plot": False,
     "show_legend": True,
     # Separate from the bare switch: sometimes you want the markings but not
@@ -5582,7 +5582,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 continue
             a, u = ranges.get(name, (grid[0], grid[-1]))
             legend_names.append(
-                "⬛ C₀ offset (contact slope off)" if name in off
+                "⬛ C₀ baseline (contact slope off)" if name in off
                 else f"{label} · [{a:.1f}, {u:.1f}] %")
             fig.add_trace(go.Scatter(
                 x=grid, y=layer * scale, mode="lines", stackgroup="components",
@@ -5640,19 +5640,15 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         ))
 
     # The range track: the component rows, as bars on a panel of their own.
+    # One row per component that is on: the track and the ticked rows on
+    # the board are the same list, in the same order.
     ticks, labels = [], []
-    for row, (name, label, symbol, colour, _law) in enumerate(PW_COMPONENTS):
+    drawn_rows = [c for c in PW_COMPONENTS if c[0] not in off]
+    for row, (name, label, symbol, colour, _law) in enumerate(drawn_rows):
         a, u = ranges.get(name, (np.nan, np.nan))
         ticks.append(row)
         labels.append(symbol)
         if not np.isfinite(a):
-            continue
-        if name in off:
-            fig.add_trace(go.Scatter(
-                x=[a, u], y=[row, row], mode="lines", yaxis="y2",
-                line={"color": "#cccccc", "width": 3, "dash": "dot"},
-                showlegend=False, hovertemplate=f"{symbol}: off<extra></extra>",
-            ))
             continue
         fig.add_trace(go.Scatter(
             x=[a, u], y=[row, row], mode="lines", yaxis="y2",
@@ -6629,6 +6625,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.markdown("**Components θⱼ and the ranges [sⱼ, uⱼ] they act over**")
         value_slots = piecewise_components_panel(piecewise_boundaries(), None, None,
                                                  columns=2)
+        # What the board holds for each row, to compare with what the plot
+        # is drawing: the two lists must read the same, or say they differ.
+        board_off = set(piecewise_off())
+        board_ranges = piecewise_ranges(piecewise_boundaries())
 
         with st.expander("p₀ and bounds, constraints on ε, reset", expanded=False):
             piecewise_parameter_editor()
@@ -6726,9 +6726,19 @@ def piecewise_section(model, epsilon, force_N, rupture):
         with stepper_slot:
             pw_stepper(result, target, source, name, in_collection)
 
-        # What the fit made of each component, beside its row on the board.
+        # What the fit made of each component, beside its row on the board,
+        # and a mark on any row the plot is not drawing yet.
         if ok:
             shown = {row[0]: row[2] for row in result_rows(fit)}
+            applied_ranges = result.get("ranges") or {}
+
+            def _same(name):
+                if (name in board_off) != (name in off_now):
+                    return False
+                a1 = tuple(round(float(v), 2) for v in board_ranges.get(name, ()))
+                a2 = tuple(round(float(v), 2) for v in applied_ranges.get(name, ()))
+                return a1 == a2
+
             for key_, term in (("K_shell", "membrane"), ("K_cyto", "interior"),
                                ("K_nucleus", "nucleus_shell"),
                                ("K_core", "nucleus"), ("k_align", "alignment")):
@@ -6736,11 +6746,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 if slot is None:
                     continue
                 symbol = next((c[2] for c in PW_COMPONENTS if c[0] == key_), "")
+                waits = "" if _same(key_) else " ⏳ *not on the plot yet*"
                 if key_ in off_now:
-                    slot.caption(r"$\theta = 0$ (held)")
+                    slot.markdown(r"$\theta = 0$ (held, off the plot)" + waits)
                 else:
                     slot.markdown(
-                        f"**{symbol} = {shown.get(f'modulus_{term}', '—')}**")
+                        f"**{symbol} = {shown.get(f'modulus_{term}', '—')}**"
+                        + waits)
 
         fitted = None
         with graph_slot:
@@ -8402,8 +8414,8 @@ def fitting_results_rows(fit, style, send=True, compact=False):
         flat_table(
             pd.DataFrame([
                 {"": label, "value ± SE": quoted(value, error),
-                 "95 % interval": interval, "where / how": note}
-                for _key, label, value, error, interval, note in rows
+                 "95 % interval": interval}
+                for _key, label, value, error, interval, _note in rows
             ]),
             align_right=["value ± SE", "95 % interval"],
             caption="Each value is quoted as best fit ± one standard error, "
@@ -9362,6 +9374,32 @@ def optimisation_controls(model, lo, hi, terms):
     # for the whole experiment, not an analysis of this cell.
     set_default_boundaries_control()
     return slot
+
+
+def components_note(fit):
+    """What the plot is drawing, under the bars that say what to draw next."""
+    if not (fit and fit.get("success")):
+        st.caption("The plot shows nothing yet: press **▶ Fit & plot**.")
+        return
+    drawn = []
+    for term in ALL_TERMS:
+        if term not in (fit.get("terms") or ()):
+            continue
+        drawn.append(f"{plain_name(term).lower()} ({element_support(term, fit)})")
+    ticked = {t for t in terms_for(st.session_state.get("cell_type"))
+              if st.session_state.get(f"use_{t}")}
+    fitted = set(fit.get("terms") or ())
+    st.caption("**On the plot:** " + ("; ".join(drawn) if drawn else "nothing")
+               + ".")
+    if ticked != fitted:
+        missing = ", ".join(plain_name(t).lower() for t in sorted(ticked - fitted))
+        extra = ", ".join(plain_name(t).lower() for t in sorted(fitted - ticked))
+        st.caption(
+            "⚠️ The ticks and the plot differ: "
+            + (f"ticked but not drawn: {missing}. " if missing else "")
+            + (f"drawn but no longer ticked: {extra}. " if extra else "")
+            + "Press **▶ Fit & plot** to make the plot match the board."
+        )
 
 
 def boundaries_note(fit):
@@ -11744,36 +11782,17 @@ with tab_analysis:
                 if not chosen:
                     st.warning("Tick at least one material before fitting.")
 
-                # A range for each material, and the equation that follows from
-                # them. This is the whole of what the fit assumes, said where
-                # the choices are made rather than in a panel further down.
-                # Off the last fit where there is one, so the ranges show what
-                # was actually fitted rather than what the page was set to
-                # before the search moved it. A range showing the wrong place is
-                # worse than none: it is a claim about the model that is untrue.
-                _shown = st.session_state.get("_last_fit")
-                if _shown and _shown.get("success"):
-                    _e1 = float(_shown.get("break_1",
-                                           st.session_state["segment_break_1"]))
-                    _e2 = float(_shown.get("break_2",
-                                           st.session_state["segment_break_2"]))
-                    _mem = _shown.get(
-                        "membrane",
-                        MEMBRANE_CHOICES[st.session_state["membrane_after_break"]],
-                    )
-                    _cyto = _shown.get(
-                        "cyto_start",
-                        CYTO_CHOICES[st.session_state["cyto_starts_at"]],
-                    )
-                else:
-                    _e1 = float(st.session_state["segment_break_1"])
-                    _e2 = float(st.session_state["segment_break_2"])
-                    _mem = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
-                    _cyto = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
-                st.session_state["_bars_drawn_with"] = (
-                    round(_e1, 4), round(_e2, 4), _mem, _cyto,
-                    round(float(guided_hi), 4),
-                )
+                # A range for each material, and the equation that follows
+                # from them. The bars show what the **board** holds, not what
+                # was last fitted: a bar that snapped back to the fitted
+                # placement while a boundary was being changed was the board
+                # arguing with the person setting it. What is on the plot is
+                # said under the bars, and by the ⚠️ line at the head of the
+                # board when the two differ.
+                _e1 = float(st.session_state["segment_break_1"])
+                _e2 = float(st.session_state["segment_break_2"])
+                _mem = MEMBRANE_CHOICES[st.session_state["membrane_after_break"]]
+                _cyto = CYTO_CHOICES[st.session_state["cyto_starts_at"]]
                 # One row per component: whether it is in the model, and the
                 # stretch of the squash it acts on. The two belong together --
                 # ticking a component and then finding its range three headings
@@ -11781,6 +11800,7 @@ with tab_analysis:
                 component_controls(
                     here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
                 )
+                components_slot = st.container()
                 chosen = active_terms()
 
 
@@ -12838,25 +12858,9 @@ with tab_analysis:
                 fit["fit_id"] = fit_id(fit)
                 st.session_state["_last_fit"] = fit
                 st.session_state["_last_fit_signature"] = fit_signature
-                # The bars in "What to fit" were drawn earlier in this same pass,
-                # from the fit that existed then. If this one moved a boundary
-                # they are now showing the old placement, which is a claim about
-                # the model that is not true any more. One redraw fixes it, and
-                # the guard stops a fit that never settles from spinning.
-                _now = (
-                    round(float(fit.get("break_1", 0.0)), 4),
-                    round(float(fit.get("break_2", 0.0)), 4),
-                    fit.get("membrane"), fit.get("cyto_start"),
-                    round(float(fit.get("epsilon_range", (0, 1))[1]), 4),
-                )
-                if (
-                    not st.session_state.get("use_element_windows", False)
-                    and st.session_state.get("_bars_drawn_with") is not None
-                    and st.session_state["_bars_drawn_with"] != _now
-                    and st.session_state.get("_bars_redrawn_for") != _now
-                ):
-                    st.session_state["_bars_redrawn_for"] = _now
-                    st.rerun()
+                # No redraw of the bars here. They show what the control
+                # board holds, which is what the next fit will use; what
+                # this fit used is written under them by components_note.
             elif fit is None and st.session_state.get("_last_fit") is not None:
                 # Nothing asked for a fit on this run, so show the last good one
                 # rather than an empty page.
@@ -12880,6 +12884,8 @@ with tab_analysis:
                 if boundaries_slot is not None:
                     with boundaries_slot:
                         boundaries_note(fit)
+                with components_slot:
+                    components_note(fit)
                 with explainer_box:
                     fit_explainer(fit)
                 if board_status is not None:
