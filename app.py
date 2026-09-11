@@ -19,6 +19,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 # ------------------------------------------------------ companion imports ---
@@ -3636,7 +3637,7 @@ DEFAULT_BOUNDARIES_BY_TYPE = {
     # starts in the middle of that band rather than at a number with
     # nothing behind it. ε₁ is kept for the arrangements that use it; with
     # both outer elements carrying load throughout it does nothing.
-    "Myoblast (C2C12)": {"segment_break_1": 0.15, "segment_break_2": 0.55},
+    "Myoblast (C2C12)": {"segment_break_1": 0.15, "segment_break_2": 0.50},
     "Cardiomyocyte": {"segment_break_1": 0.15, "segment_break_2": 0.40},
 }
 
@@ -3651,15 +3652,36 @@ COMPONENT_PRIORS = {
     "Myoblast (C2C12)": {
         # Load-bearing from first contact to the end of the squash.
         "throughout": ("membrane", "interior"),
-        # Where the deep elements are first met.
-        "onset": {"nucleus": (0.44, 0.70), "nucleus_shell": (0.44, 0.70)},
+        # Where the deep elements are first met. The measured signature is a
+        # bump in the force at about half the squash: that is the probe
+        # reaching the nucleus, and it runs for roughly another quarter of
+        # the deformation after it starts. The onset is therefore near 0.50,
+        # and the band is that give or take, not a third of the curve.
+        "onset": {"nucleus": (0.44, 0.62), "nucleus_shell": (0.44, 0.62)},
+        # The feature itself, for drawing on the curve and for saying what
+        # the boundary is supposed to coincide with.
+        "bump": {"from": 0.50, "span": 0.25},
+        # Once met, a deep element keeps carrying to the end: nothing in a
+        # C2C12 stops taking load except the shell, and only if it is
+        # arranged to hold at ε₁.
+        "runs_to_the_end": ("interior", "nucleus", "nucleus_shell"),
         "why": (
-            "in a C2C12 the sarcolemma and the cytoskeleton carry load "
-            "throughout the compression, and the nucleus is met between "
-            "44 % and 70 % relative deformation"
+            "in a C2C12 the sarcolemma and the cytoskeleton carry load from "
+            "first contact, and the nucleus shows as a bump at about 50 % "
+            "relative deformation that runs on for another 25 %, so ε₂ sits "
+            "between 44 % and 62 %"
         ),
     },
 }
+
+
+def bump_window(cell_type=None):
+    """Where this cell type's deep element shows itself, if it is known."""
+    bump = component_prior(cell_type).get("bump")
+    if not bump:
+        return None
+    start = float(bump["from"])
+    return (start, start + float(bump.get("span", 0.0)))
 
 
 def component_prior(cell_type=None):
@@ -4252,7 +4274,7 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
             # the name alone leaves out what the tick actually does.
             law = (MATERIAL_LAWS.get(term) or {}).get("law")
             if law:
-                st.caption(law)
+                st.caption(f"{shape_mark(term)}  ·  {law}")
         with range_col:
             bar = f"{key}__bar"
             pair = st.session_state[key]
@@ -4400,6 +4422,80 @@ def fit_verdict():
         st.success(said)
 
 
+def share_of_force_plot(fit, model, style):
+    """
+    What the log curve's slope means, drawn: who is carrying the load, where.
+
+    The exponent plot says the curve changes its power law. This says why:
+    the share of the total force each element carries, against ε. A slope
+    leaving 3 and settling near 3/2 is the shell's share falling and the
+    cytoplasm's rising, and here that is the same picture as a line
+    crossing.
+    """
+    if not (fit and fit.get("success")):
+        return
+    terms = [t for t in ALL_TERMS if t in (fit.get("terms") or ())]
+    if not terms:
+        return
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    grid = np.linspace(max(lo, 1e-4), hi, 200)
+    try:
+        basis = model.composition_basis(
+            grid, float(fit.get("break_1", 0.15)),
+            float(fit.get("break_2", 0.40)),
+            fit.get("membrane", "freeze"), fit.get("cyto_start", "break"),
+            term_windows=fit.get("term_windows"),
+        )
+    except Exception:  # pragma: no cover - defensive
+        return
+    pieces = {}
+    for term in terms:
+        key = MODULUS_FIELDS[term][0]
+        raw = {"tension": "T0", "membrane": "Em", "cortex": "Ecx",
+               "interior": "Ei", "nucleus_shell": "Ene", "nucleus": "En"}[term]
+        column = np.asarray(basis.get(term), dtype=float)
+        if column.size != grid.size:
+            continue
+        pieces[term] = column * float(fit.get(raw, 0.0) or 0.0)
+    total = np.sum(list(pieces.values()), axis=0) if pieces else None
+    if total is None or not np.any(total > 0):
+        return
+
+    figure = go.Figure()
+    for term, force in pieces.items():
+        share = 100.0 * np.divide(force, np.maximum(total, 1e-30))
+        icon = SHAPE_MARKS.get(term, ("",))[0]
+        figure.add_trace(go.Scatter(
+            x=grid, y=share, mode="lines", stackgroup="one",
+            name=f"{icon} {plain_name(term).lower()}",
+            hovertemplate="ε = %{x:.3f}<br>%{y:.0f} % of the force"
+                          "<extra>" + plain_name(term).lower() + "</extra>",
+        ))
+    for value, name in ((fit.get("break_1"), "ε₁"),
+                        (fit.get("break_2"), "ε₂")):
+        if value is not None and lo < float(value) < hi:
+            figure.add_vline(
+                x=float(value), line=dict(color="#333333", width=1.5,
+                                          dash="dot"),
+                annotation_text=name, annotation_position="top",
+            )
+    figure.update_layout(
+        height=max(260, int(style.height * 0.5)),
+        margin=dict(l=60, r=20, t=40, b=50),
+        title="Who is carrying the force, and where",
+        yaxis=dict(title="share of the total force (%)", range=[0, 100]),
+        xaxis=dict(title="Relative deformation, ε"),
+        legend=dict(orientation="h", y=-0.25),
+    )
+    st.plotly_chart(figure, key="share_of_force", **STRETCH)
+    st.caption(
+        "Read the two together: the exponent above is the force-weighted "
+        "average of the element exponents, and this is the weighting. Where "
+        "one band fills the plot the measured slope is that element's own "
+        "power; where two bands share it, the slope sits between theirs."
+    )
+
+
 def stage_algebra(fit):
     """
     Each stretch of the squash, written as the sum of terms carrying it.
@@ -4538,26 +4634,24 @@ def send_to_plot(kind, label, payload):
     st.session_state["plot_layers"] = layers
 
 
-# Layers whose content is read live from the page every time the figure is
-# drawn, rather than frozen at the moment they were sent. The boundaries and
-# the fitted range are like that on purpose: a plot showing where ε₁ used to
-# be is worse than one not showing it at all.
-LIVE_LAYERS = ("boundaries", "range")
-
-
 def send_to_plot_button(kind, label, payload, key, help_text=None):
-    """A 📤 Send to plot button for one piece of the results."""
+    """
+    A 📤 Send to plot button for one piece of the results.
+
+    Every layer is live: what it draws is recomputed from the page each
+    time the figure is built, so the list under the figure is a history of
+    what was sent and never a set of stale numbers. Sending is therefore a
+    yes/no, and the button says which it currently is.
+    """
     on_plot = any(row["kind"] == kind for row in plot_layers())
-    if on_plot and kind in LIVE_LAYERS:
+    if on_plot:
         st.button("✅ On the plot", key=f"send_{key}", disabled=True,
                   help="It follows the numbers on this page, so it is "
                        "already up to date. Take it off under the figure.",
                   **STRETCH)
         return
-    if st.button(
-        ("🔄 Refresh on the plot" if on_plot else "📤 Send to plot"),
-        key=f"send_{key}", help=help_text, **STRETCH,
-    ):
+    if st.button("📤 Send to plot", key=f"send_{key}", help=help_text,
+                 **STRETCH):
         send_to_plot(kind, label, payload)
         rerun_keeping_settings()
 
@@ -4571,10 +4665,16 @@ def apply_plot_layers(figure, style):
     draws the measurement, this draws what somebody chose to say about it.
     """
     boxes = []
+    fit = st.session_state.get("_last_fit")
+    unit = getattr(style, "force_unit", "nN")
     for row in plot_layers():
-        kind, payload = row["kind"], row["payload"]
-        if kind in LIVE_LAYERS:
+        kind, payload = row["kind"], dict(row["payload"] or {})
+        if kind in ("boundaries", "range"):
             payload = live_payload(kind)
+        elif kind not in ("note",):
+            # A results box: rebuilt from the fit on the page, so a number
+            # on the figure is never a number the page has moved on from.
+            payload = {"text": row_text(payload.get("key", kind), fit, unit)}
         if kind == "boundaries":
             e1, e2 = payload.get("e1"), payload.get("e2")
             for value, name, colour in ((e1, "ε₁", "#2ca02c"),
@@ -4629,8 +4729,7 @@ def plot_layer_table():
         return
     for index, row in enumerate(layers):
         left, right = st.columns([5, 1])
-        label = (live_label(row["kind"]) if row["kind"] in LIVE_LAYERS
-                 else row["label"])
+        label = live_label_for(row)
         left.markdown(label)
         if right.button("✕", key=f"drop_layer_{index}",
                         help="Take this off the plot"):
@@ -4641,6 +4740,190 @@ def plot_layer_table():
     if st.button("Clear the plot", key="clear_plot_layers", **STRETCH):
         st.session_state["plot_layers"] = []
         rerun_keeping_settings()
+
+
+# What each element is, as a shape: a balloon is a thin shell around
+# something that does not compress, and its force rises as ε³; a spring is a
+# material squeezed between two plates, a Hertzian contact, rising as ε³ᐟ².
+# The mark is the same in the panel, the component list and the plot legend,
+# so "the spring" is one claim everywhere.
+SHAPE_MARKS = {
+    "tension": ("🪢", "taut network", "ε"),
+    "membrane": ("🎈", "balloon", "ε³"),
+    "cortex": ("🕸️", "spring", "ε³ᐟ²"),
+    "interior": ("🕸️", "spring", "ε³ᐟ²"),
+    "nucleus_shell": ("🎈", "balloon", "⟨ε−ε₂⟩³"),
+    "nucleus": ("🕸️", "spring", "⟨ε−ε₂⟩³ᐟ²"),
+}
+
+
+def shape_mark(term):
+    """The balloon-or-spring mark and law for one element, as one line."""
+    icon, kind, law = SHAPE_MARKS.get(term, ("", "", "ε"))
+    return f"{icon} {kind} · {law}"
+
+
+def share_of_load_maths():
+    """
+    How the elements share the load, as algebra rather than as adjectives.
+
+    Three ways of sharing, and they are different equations, not different
+    wordings: side by side adds forces at one deformation, stacked adds
+    deformations at one force, and segmented is side by side with each
+    element switched on at its own boundary. Written out, the choice is
+    obvious to anyone who has met a spring in series with another spring;
+    written as sentences it is three paragraphs that sound alike.
+    """
+    st.caption("Side by side — one ε, the forces add:")
+    st.latex(
+        r"F(\varepsilon) = \sum_k a_k E_k\, g_k(\varepsilon), \qquad "
+        r"\varepsilon_k = \varepsilon \;\;\forall k"
+    )
+    st.caption("Stacked — one F, the deformations add:")
+    st.latex(
+        r"\varepsilon(F) = \sum_k \varepsilon_k(F), \qquad "
+        r"F_k = F \;\;\forall k"
+    )
+    st.caption("Segmented — side by side, each with its own onset:")
+    st.latex(
+        r"F(\varepsilon) = \sum_k a_k E_k\, \bigl\langle \varepsilon - "
+        r"s_k \bigr\rangle^{p_k}\,(1-\varepsilon)^{-q}"
+    )
+    marks = [
+        f"- {plain_name(term)} — {shape_mark(term)}"
+        for term in terms_for(st.session_state.get("cell_type"))
+    ]
+    st.markdown(
+        "with p = 3 for a 🎈 balloon, a thin shell around something that "
+        "does not compress, and p = 3/2 for a 🕸️ spring, a material "
+        "squeezed between two plates. In this cell:\n\n" + "\n".join(marks)
+    )
+
+
+def result_rows(fit):
+    """
+    Every number the fit produced, one per row, with its uncertainty.
+
+    A row is (key, label, value string, ± string, interval string). The key
+    is what a "send to plot" button stores, so a row sent to the figure is
+    recomputed from the current fit every time it is drawn rather than
+    frozen at the moment somebody pressed it.
+    """
+    if not (fit and fit.get("success")):
+        return []
+    rows = []
+    here = terms_for(st.session_state.get("cell_type"))
+    fitted_terms = set(fit.get("terms") or ())
+    for term in ALL_TERMS:
+        if term not in here:
+            continue
+        key, unit_name, std_key = MODULUS_FIELDS[term]
+        label = f"{TERM_SYMBOLS.get(term, term)} {plain_name(term).lower()}"
+        if term not in fitted_terms:
+            rows.append((f"modulus_{term}", label, "not in this model",
+                         "—", "—", "not in this model"))
+            continue
+        try:
+            value = float(fit.get(key, 0.0))
+        except (TypeError, ValueError):
+            value = float("nan")
+        try:
+            error = float(fit.get(std_key, float("nan")))
+        except (TypeError, ValueError):
+            error = float("nan")
+        rows.append((
+            f"modulus_{term}",
+            label,
+            f"{value:.4g} {unit_name}",
+            (f"± {error:.3g} {unit_name}" if np.isfinite(error) else "—"),
+            (f"{max(value - 1.96 * error, 0.0):.4g} to "
+             f"{value + 1.96 * error:.4g} {unit_name}"
+             if np.isfinite(error) else "—"),
+            element_support(term, fit),
+        ))
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    rows.append((
+        "quality", "Goodness of fit",
+        f"R² = {float(fit.get('r_squared', float('nan'))):.5f}",
+        (f"χ²/dof = {float(chi):.3g}" if np.isfinite(chi) else "—"),
+        f"RMSE = {float(fit.get('rmse', float('nan'))):.4g} N",
+        f"{int(fit.get('n_points', 0))} points over ε {lo:.3f} to {hi:.3f}",
+    ))
+    if fit.get("break_1") is not None or fit.get("break_2") is not None:
+        rows.append((
+            "boundaries", "Boundaries",
+            (f"ε₁ = {float(fit['break_1']):.3f}"
+             if fit.get("break_1") is not None else "—"),
+            (f"ε₂ = {float(fit['break_2']):.3f}"
+             if fit.get("break_2") is not None else "—"),
+            (f"q = {float(fit.get('confinement', 0.0) or 0.0):g}"
+             if fit.get("confinement") else "—"),
+            "where the elements take over from one another",
+        ))
+    return rows
+
+
+def row_text(key, fit, unit="nN"):
+    """One results row as the text a plot box should carry."""
+    if key == "equation":
+        return equation_text(fit, unit)
+    for row in result_rows(fit):
+        if row[0] != key:
+            continue
+        pieces = [f"<b>{row[1]}</b>", row[2]]
+        if row[3] not in ("—", ""):
+            pieces.append(row[3])
+        if row[4] not in ("—", ""):
+            pieces.append(row[4])
+        return "<br>".join(pieces)
+    return ""
+
+
+def fitting_results_rows(fit, style):
+    """
+    The results, one per row, each with a way onto the figure.
+
+    Tiles put four numbers side by side and ran out of width at the fourth,
+    so the uncertainty went grey and small. A row has room for the value,
+    the ±, the interval and where it was measured, and room for the button
+    that puts it on the plot.
+    """
+    rows = result_rows(fit)
+    if not rows:
+        st.caption("Fit the curve and the results appear here.")
+        return
+    head = st.columns([1.5, 1.3, 1.2, 1.7, 1.6, 0.9])
+    for column, title in zip(
+        head,
+        ("", "value", "±", "95 % interval", "where / how", ""),
+    ):
+        column.markdown(
+            f"<span style='font-size:0.8em;opacity:0.7'>{title}</span>",
+            unsafe_allow_html=True,
+        )
+    for key, label, value, error, interval, note in rows:
+        c = st.columns([1.5, 1.3, 1.2, 1.7, 1.6, 0.9])
+        c[0].markdown(f"**{label}**")
+        c[1].markdown(value)
+        c[2].markdown(error)
+        c[3].markdown(interval)
+        c[4].markdown(
+            f"<span style='font-size:0.85em;opacity:0.8'>{note}</span>",
+            unsafe_allow_html=True,
+        )
+        with c[5]:
+            send_to_plot_button(
+                key, f"{label} · {value}", {"key": key}, key=f"row_{key}",
+                help_text="Writes this row in a box on the curve, and keeps "
+                          "it up to date as the fit changes.",
+            )
+    st.caption(
+        "The ± is one standard error from the covariance of the fit, "
+        "σ²(XᵀWX)⁻¹, and the interval is ±1.96σ around the value, cut at "
+        "zero because a modulus cannot be negative. Every row can go on the "
+        "figure, and stays current there."
+    )
 
 
 def moduli_text(fit):
@@ -4701,6 +4984,20 @@ def live_payload(kind):
         "lo": round(float(st.session_state.get("window_start", 0.0)), 4),
         "hi": round(float(st.session_state.get("window_end", 1.0)), 4),
     }
+
+
+def live_label_for(row):
+    """One row of the history table, read from the page as it stands."""
+    kind = row["kind"]
+    if kind in ("boundaries", "range"):
+        return live_label(kind)
+    fit = st.session_state.get("_last_fit")
+    if kind == "equation":
+        return "The fitted equation · " + (equation_text(fit) or "not fitted")
+    for key, label, value, _error, _interval, _note in result_rows(fit):
+        if key == (row["payload"] or {}).get("key", kind):
+            return f"{label} · {value}"
+    return row["label"]
 
 
 def live_label(kind):
@@ -7383,6 +7680,14 @@ with tab_analysis:
             # a change of range and must not count as one.
             pending = {"_fit_colour_range": None, "_fit_colour_step": 0}
             notes = []
+            # A new curve arrives with its boundaries drawn on it. They are
+            # the thing a person checks first against the shape of the
+            # curve, and a figure that has to be asked for them is one that
+            # gets looked at without them.
+            st.session_state["plot_layers"] = [
+                {"kind": "boundaries", "label": boundaries_label(),
+                 "payload": boundaries_payload()},
+            ]
 
             # A new curve arrives with its components ticked. They are a
             # property of the cell type, not of the last curve: a search
@@ -7598,6 +7903,12 @@ with tab_analysis:
                     fit_at_the_current_settings(
                         model, guided_lo, guided_hi, chosen,
                     )
+                send_to_plot_button(
+                    "quality", "R², χ²/dof and the range fitted",
+                    {"key": "quality"}, key="quality_beside_fit",
+                    help_text="Puts how well it fits, and over what, in a "
+                              "box on the curve, kept up to date.",
+                )
                 st.caption(
                     "Fits exactly the components ticked above, at the "
                     "boundaries and ranges shown. It does not move them: "
@@ -7667,6 +7978,7 @@ with tab_analysis:
         )
 
         if guided:
+            share_of_load_maths()
             st.radio(
                 "How the cell is modelled",
                 list(MODELS.keys()),
@@ -8882,77 +9194,8 @@ with tab_analysis:
                 # sentence about chi-squared that a person could read
                 # straight off the two numbers beside R². Three of those
                 # were duplicates and the fourth was noise.
-                r1, r2, r3 = st.columns([2.4, 1, 1])
-                with r1:
-                    st.markdown("#### Fitting results")
-                with r2:
-                    send_to_plot_button(
-                        "moduli", "The moduli, with their uncertainties",
-                        {"text": moduli_text(fit)}, key="moduli",
-                        help_text="Writes the moduli in a box on the curve.",
-                    )
-                with r3:
-                    send_to_plot_button(
-                        "quality", "R², χ²/dof and the range fitted",
-                        {"text": quality_text(fit)}, key="quality",
-                        help_text="Writes how well it fits, and over what, "
-                                  "in a box on the curve.",
-                    )
-
-            # All three moduli, always. A term that was not in the model reads
-            # 0 and says so, rather than disappearing: a blank column in a
-            # results table is ambiguous between "zero" and "not measured",
-            # and the two mean very different things when you pool cells.
-            fitted_terms = set(fit.get("terms") or active)
-            here = terms_for(st.session_state["cell_type"])
-            moduli_shown = [
-                (
-                    f"{TERM_SYMBOLS[term]} {plain_name(term).lower()}",
-                    fit.get(MODULUS_FIELDS[term][0], 0.0),
-                    MODULUS_FIELDS[term][1],
-                    term,
-                )
-                for term in ALL_TERMS if term in here
-            ]
-            # Two more columns for the two goodness-of-fit numbers.
-            metric_cols = st.columns(len(moduli_shown) + 2)
-            quality_slots = (len(moduli_shown), len(moduli_shown) + 1)
-            for slot, (label, value, unit, term) in enumerate(moduli_shown):
-                used = term in fitted_terms
-                std = fit.get(MODULUS_FIELDS[term][2], float("nan"))
-                # The uncertainty goes in the number, not under it. A
-                # modulus quoted alone is not a measurement, and it is the ±
-                # that decides whether two cells differ, so it is the same
-                # size as the thing it qualifies.
-                if not used:
-                    shown = f"0 {unit}"
-                elif np.isfinite(std) and value > 0:
-                    shown = f"{value:.3g} ± {std:.2g} {unit}"
-                else:
-                    shown = f"{value:.3g} {unit}"
-                if not used:
-                    note = "not in this model"
-                elif value <= 0:
-                    note = "came out at zero · " + element_support(term, fit)
-                else:
-                    note = element_support(term, fit)
-                metric_cols[slot].metric(
-                    label, shown, delta=note, delta_color="off",
-                )
-            metric_cols[quality_slots[0]].metric(
-                "R²", f"{fit['r_squared']:.4f}",
-                delta=f"adj {fit.get('adj_r_squared', float('nan')):.4f}"
-                if np.isfinite(fit.get("adj_r_squared", np.nan)) else None,
-                delta_color="off",
-            )
-            chi_red = fit.get("chi_squared_reduced", float("nan"))
-            metric_cols[quality_slots[1]].metric(
-                "χ²/dof",
-                f"{chi_red:.2f}" if np.isfinite(chi_red) else "n/a",
-                delta=f"χ² = {fit.get('chi_squared', float('nan')):.4g}"
-                if np.isfinite(fit.get("chi_squared", np.nan)) else None,
-                delta_color="off",
-            )
+                section("4 · Fitting results")
+                fitting_results_rows(fit, style)
 
             rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
             sigma_disp, sigma_unit = from_newtons(
@@ -9153,6 +9396,7 @@ with tab_analysis:
             # be small next to a modulus that is not determined at all. This
             # is the part that catches that.
             spread = fit.get("breakpoint_spread")
+            fitted_terms = set(fit.get("terms") or active)
             if spread and spread.get("success") and spread["n_accepted"] > 1:
                 loose_rows, spread_rows = [], []
                 for key, unit, term in (
@@ -9980,6 +10224,10 @@ with tab_explore:
 
         st.markdown("#### Where the curve changes its power law")
         where_the_power_law_changes(
+            st.session_state.get("_last_fit"), model_ex, style_ex,
+        )
+
+        share_of_force_plot(
             st.session_state.get("_last_fit"), model_ex, style_ex,
         )
 
