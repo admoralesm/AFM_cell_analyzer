@@ -323,6 +323,37 @@ def test_the_search_stays_inside_its_bands_and_can_hold_one_fixed():
     assert b3 == 62.0 and found["intervals"]["eps3"]["at_band_edge"]
 
 
+def test_the_search_respects_the_c2c12_prior():
+    # A curve built the way the C2C12 prior describes it: everything acting
+    # to the end, the nucleus met at 52 %, dense packing 24 % later. The
+    # search, held to contact under 5 %, the nucleus in 44-62 % and
+    # e3 - e2 in 15-35 %, finds it and never leaves those constraints.
+    carry_all = ("K_shell", "K_cyto", "K_nuc_cyto", "K_nucleus", "K_core")
+    x = np.linspace(0, 91.2, 1500)
+    rng = np.random.default_rng(2)
+    f = additive(x, TRUE, component_ranges((0, 4.0, 52.0, 76.0, 91.2),
+                                           carry=carry_all))
+    f = f + rng.normal(0, 0.5e-9, x.size)
+    found = find_boundaries(x / 100, f, bands_pct=((1, 5), (44, 62), (59, 89)),
+                            span_pct=(15, 35), spec_pct=(5, 50, 75),
+                            carry=carry_all)
+    b1, b2, b3 = found["best_pct"]
+    assert 1 <= b1 <= 5 and 44 <= b2 <= 62 and 15 <= b3 - b2 <= 35
+    assert abs(b2 - 52.0) < 0.6 and abs(b3 - 76.0) < 0.6, found["best_pct"]
+    iv = found["intervals"]["eps1"]
+    assert iv["lo95"] <= 4.0 <= iv["hi95"], iv
+    # A curve whose nucleus is met outside the band is placed at the edge,
+    # and says so.
+    f2 = additive(x, TRUE, component_ranges((0, 5.0, 38.0, 60.0, 91.2),
+                                            carry=carry_all))
+    found2 = find_boundaries(x / 100, f2, bands_pct=((1, 5), (44, 62), (59, 89)),
+                             span_pct=(15, 35), spec_pct=(5, 50, 75),
+                             carry=carry_all)
+    assert found2["best_pct"][1] >= 44.0
+    assert all(15 - 1e-9 <= found2["best_pct"][2] - found2["best_pct"][1] <= 35 + 1e-9
+               for _ in [0])
+
+
 def test_the_search_uses_the_page_settings():
     # A bound that forbids the nuclear envelope changes S, so it is used.
     eps, f = curve(noise=0.5e-9, n=1200)
