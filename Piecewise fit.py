@@ -73,6 +73,8 @@ __all__ = [
     "component_curve",
     "component_ranges",
     "find_boundaries",
+    "power_law_profile",
+    "boundaries_from_power_law",
     "joint_design",
     "joint_sse",
     "piecewise_moduli",
@@ -1165,6 +1167,124 @@ def find_boundaries(
         "span_pct": span,
         "carry": carry,
         "n_evaluations": len(cache),
+    }
+
+# ========================================================== the power law ==
+#
+# The other way to place the boundaries, and the one that does not use the
+# model at all: read the curve as a physicist does, on log-log axes. Each
+# element is a power law, so the local exponent
+#
+#     p(x) = d ln F / d ln x
+#
+# follows whichever laws are carrying load, and a boundary is where it
+# changes course. Measured straight off the data, it is evidence the fit
+# has to agree with rather than a restatement of it.
+
+def power_law_profile(epsilon, force_N, end_pct=C2C12_BOUNDARIES_PCT[-1],
+                      start_pct=0.5, n_log=300, window=21, step_pct=0.25):
+    """
+    The local exponent p = d ln F / d ln x along the curve.
+
+    ln F is binned on a grid uniform in ln x (medians, so a few bad points
+    cannot drag it), smoothed and differentiated with a Savitzky-Golay
+    filter, then put back on a grid uniform in x, ``step_pct`` apart, which
+    is where boundaries are placed. Points at or below zero force carry no
+    logarithm and are left out.
+
+    Returns {"x_pct", "exponent", "log_x", "log_F"} or {} when too little of
+    the curve is usable.
+    """
+    from scipy.signal import savgol_filter
+
+    x, f = _prepare(epsilon, force_N)
+    end = float(min(end_pct, x.max())) if x.size else float(end_pct)
+    keep = (x >= start_pct) & (x <= end) & (f > 0)
+    x, f = x[keep], f[keep]
+    if x.size < 20:
+        return {}
+    lx, lf = np.log(x), np.log(f)
+    edges = np.linspace(lx.min(), lx.max(), int(n_log) + 1)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    idx = np.clip(np.digitize(lx, edges) - 1, 0, n_log - 1)
+    med = np.full(n_log, np.nan)
+    for i in np.unique(idx):
+        med[i] = np.median(lf[idx == i])
+    ok = np.isfinite(med)
+    if ok.sum() < 12:
+        return {}
+    med = np.interp(centres, centres[ok], med[ok])
+    w = int(min(window, (len(med) // 2) * 2 - 1))
+    w = max(w, 5)
+    slope = savgol_filter(med, w, 2, deriv=1, delta=float(centres[1] - centres[0]))
+    grid = np.arange(np.ceil(x.min() / step_pct) * step_pct, end + 1e-9, step_pct)
+    p = np.interp(np.log(grid), centres, slope)
+    return {"x_pct": grid, "exponent": p, "log_x": centres, "log_F": med}
+
+
+def boundaries_from_power_law(profile, bands_pct=SEARCH_BANDS_PCT,
+                              span_pct=None):
+    """
+    ε₁, ε₂, ε₃ where the curve's log-log slope bends most sharply.
+
+    A new element starting at a boundary adds K (x - start)^p to the force.
+    For the 1.5-power elements that onset is a square-root kink in the
+    slope of F, so on log-log axes the exponent p(x) turns upward hardest
+    right there. Each boundary is placed at the strongest such turn, the
+    maximum of dp / d ln x, inside its C2C12 constraint: ε₂ in its band,
+    then ε₃ inside its band and ``span_pct`` after ε₂, and ε₁ in the
+    contact band.
+
+    This reads the curve without any model, so it is evidence rather than a
+    fit, and it is only as sharp as the smoothing lets it be: on test
+    curves it lands a few percent from the true boundary. Fitting
+    everything near it (``find_boundaries``) finishes the job.
+
+    Returns {"best_pct", "segments", "profile", "turn"} or
+    {"success": False, "error"}.
+    """
+    if not profile:
+        return {"success": False,
+                "error": "the log-log slope cannot be measured on this curve"}
+    x = np.asarray(profile["x_pct"], dtype=float)
+    p = np.asarray(profile["exponent"], dtype=float)
+    if x.size < 12:
+        return {"success": False, "error": "too little of the slope to read"}
+    turn = np.gradient(p, np.log(x))
+
+    def strongest(lo, hi):
+        inside = (x >= lo - 1e-9) & (x <= hi + 1e-9)
+        if not inside.any():
+            return None
+        return float(x[np.argmax(np.where(inside, turn, -np.inf))])
+
+    bands = [tuple(float(v) for v in b) for b in bands_pct]
+    b2 = strongest(*bands[1])
+    b1 = strongest(*bands[0])
+    if b2 is None or b1 is None:
+        return {"success": False,
+                "error": "the constraint bands are outside the measured slope"}
+    lo3, hi3 = bands[2]
+    if span_pct:
+        lo3 = max(lo3, b2 + float(span_pct[0]))
+        hi3 = min(hi3, b2 + float(span_pct[1]))
+    b3 = strongest(lo3, hi3) if hi3 >= lo3 else None
+    if b3 is None:
+        return {"success": False,
+                "error": "no room for ε₃ after ε₂ inside the constraints"}
+    cuts = [x[0], b1, b2, b3, x[-1]]
+    segments = []
+    for a, z in zip(cuts, cuts[1:]):
+        inside = (x >= a) & (x <= z)
+        segments.append({"from_pct": float(a), "to_pct": float(z),
+                         "mean_exponent": float(p[inside].mean())
+                         if inside.any() else float("nan")})
+    return {
+        "success": True,
+        "best_pct": (b1, b2, b3),
+        "segments": segments,
+        "profile": {"x_pct": x.tolist(), "exponent": p.tolist()},
+        "turn": turn.tolist(),
     }
 
 # ============================================================ the moduli ==
