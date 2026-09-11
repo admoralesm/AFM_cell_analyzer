@@ -19,6 +19,15 @@ its right-hand boundary, and that force is passed to the next regime as a
 fixed constant, never a free parameter. The whole curve is therefore
 continuous (C0) across [0, end] by construction, whatever the data do.
 
+By default the membrane acts throughout: the K_shell*(x - 5)^3 measured on
+R2 keeps rising, with that same K_shell, through R3 and R4, which fit what
+is left on top of it (``carry``; pass ``carry=()`` for the laws exactly as
+written above).
+
+The three inner boundaries (e1, e2, e3 = 5, 40, 60 %) can be placed by
+:func:`find_boundaries`, which profiles the likelihood of the same model
+over them and compares the result with the specification by BIC.
+
 Why this is easy to trust
 -------------------------
 Once the anchor is fixed every regime is LINEAR in its coefficients, so each
@@ -53,6 +62,10 @@ __all__ = [
     "fit_piecewise",
     "predict_piecewise",
     "regime_curves",
+    "component_curve",
+    "find_boundaries",
+    "joint_design",
+    "joint_sse",
     "piecewise_moduli",
     "probe_correction",
     "with_settings",
@@ -236,6 +249,23 @@ def _bounded_linear_fit(A, y, p0, lower, upper):
     lower = np.asarray(lower, dtype=float)
     upper = np.asarray(upper, dtype=float)
 
+    # A coefficient whose bounds meet is not fitted: it is held there, and
+    # the rest are fitted around it. Both solvers refuse an empty box.
+    fixed = np.isfinite(lower) & (lower == upper)
+    if fixed.any():
+        params = lower.copy()
+        at_bound = fixed.copy()
+        if (~fixed).any():
+            sub, engine, sub_bound = _bounded_linear_fit(
+                A[:, ~fixed], y - A[:, fixed] @ lower[fixed],
+                np.asarray(p0, dtype=float)[~fixed], lower[~fixed], upper[~fixed],
+            )
+            params[~fixed] = sub
+            at_bound[~fixed] = sub_bound
+        else:
+            engine = "held at its bounds"
+        return params, engine, at_bound
+
     col = np.linalg.norm(A, axis=0)
     col[~np.isfinite(col) | (col == 0)] = 1.0
     f_scale = float(np.max(np.abs(y))) if y.size and np.any(y) else 1.0
@@ -293,6 +323,7 @@ def fit_piecewise(
     regimes=C2C12_REGIMES,
     settings=None,
     min_points=None,
+    carry=("K_shell",),
 ):
     """
     Fit every regime in turn, each anchored to where the last one ended.
@@ -312,6 +343,19 @@ def fit_piecewise(
     min_points : int, optional
         Fewest points a regime may be fitted on. Defaults to its number of
         free parameters plus two.
+    carry : tuple of coefficient names
+        Elements that keep acting after the regime they were fitted in. The
+        default carries the cell shell (K_shell): once it has been measured
+        on regime 2 it goes on stiffening, K_shell*(x - e1)^3 with that same
+        K_shell, through regimes 3 and 4 as a known term, and each later
+        regime fits only what is left on top of it. Continuity is kept,
+        because the carried term is written relative to the regime's start:
+
+            F3(x) = F_40 + K_shell*[(x - e1)^3 - (e2 - e1)^3]
+                         + K_nucleus*(x - e2)^3 + K_nuc_cyto*(x - e2)^1.5
+
+        Pass ``()`` for the specification exactly as first written, where
+        the shell's force is held at the value it reached at e2.
 
     Returns
     -------
@@ -354,6 +398,8 @@ def fit_piecewise(
     coefficients = {}
     regime_out = []
     chain_broken = False
+    carry = tuple(carry or ())
+    carried = []   # [{"name", "power", "onset_pct", "value", "se"}]
 
     for i, regime in enumerate(regimes):
         a, b = bounds[i], bounds[i + 1]
@@ -375,6 +421,9 @@ def fit_piecewise(
             "anchor_in_N": None if regime.free_offset else anchor,
             "anchor_out_N": None,
             "params": {},
+            "carried": {} if regime.free_offset else {
+                c["name"]: dict(c) for c in carried
+            },
             "fitted": False,
             "engine": "",
         }
@@ -430,14 +479,17 @@ def fit_piecewise(
         else:
             dx = x - a
             design = np.column_stack([dx ** p for p in powers])
-            target = f - anchor
+            # What the carried elements add on top of the anchor here. Zero
+            # at the regime's start, so the anchor is still the force there.
+            known = _carried_force(carried, x, a)
+            target = f - anchor - known
             p0 = [t.p0 for t in regime.terms]
             lower = [t.lower for t in regime.terms]
             upper = [t.upper for t in regime.terms]
             params, engine, at_bound = _bounded_linear_fit(
                 design, target, p0, lower, upper,
             )
-            predicted = design @ params + anchor
+            predicted = design @ params + anchor + known
             cov = _covariance(design, f - predicted, ~at_bound)
             for j, t in enumerate(regime.terms):
                 entry["params"][t.name] = {
@@ -449,7 +501,12 @@ def fit_piecewise(
                     "at_bound": bool(at_bound[j]),
                 }
                 coefficients[t.name] = float(params[j])
-                if at_bound[j]:
+                if at_bound[j] and t.lower == t.upper:
+                    warnings.append(
+                        f"{t.name} in {regime.key} is held at {t.lower:.3g} "
+                        f"by its bounds, so it was not fitted."
+                    )
+                elif at_bound[j]:
                     where = "its lower bound" if np.isclose(
                         params[j], t.lower, atol=1e-300) else "its upper bound"
                     warnings.append(
@@ -460,7 +517,15 @@ def fit_piecewise(
             entry["engine"] = engine
             anchor = anchor + float(
                 sum(params[j] * (b - a) ** powers[j] for j in range(len(powers)))
-            )
+            ) + float(_carried_force(carried, np.array([b]), a)[0])
+            for j, t in enumerate(regime.terms):
+                if t.name in carry:
+                    carried.append({
+                        "name": t.name, "power": float(t.power),
+                        "onset_pct": float(a), "value": float(params[j]),
+                        "se": entry["params"][t.name]["se"],
+                        "from_regime": regime.key,
+                    })
 
         entry["anchor_out_N"] = float(anchor)
         entry.update(_statistics(f, predicted, n_free))
@@ -482,6 +547,7 @@ def fit_piecewise(
         "regimes": regime_out,
         "coefficients": coefficients,
         "anchors": anchors,
+        "carry": carry,
         "epsilon_range": (bounds[0] / 100.0, reach / 100.0),
         "warnings": warnings,
     }
@@ -520,6 +586,28 @@ def fit_piecewise(
     return result
 
 
+def _carried_force(carried, x, a):
+    """
+    Force the carried elements add inside a regime that starts at ``a``.
+
+    Each carried element keeps its own law from its own onset,
+    K*(x - onset)^p, and is written relative to the regime's start so it is
+    zero there and the regime's anchor stays the force at its start.
+    """
+    x = np.asarray(x, dtype=float)
+    out = np.zeros(x.shape)
+    for c in carried or ():
+        value = float(c["value"])
+        if not np.isfinite(value) or value == 0.0:
+            continue
+        onset, power = float(c["onset_pct"]), float(c["power"])
+        out = out + value * (
+            np.clip(x - onset, 0.0, None) ** power
+            - max(a - onset, 0.0) ** power
+        )
+    return out
+
+
 def _regime_force(regime, x):
     """One fitted regime's law evaluated at x (percent), NaN if not fitted."""
     x = np.asarray(x, dtype=float)
@@ -534,7 +622,32 @@ def _regime_force(regime, x):
     out = np.full(x.shape, float(regime["anchor_in_N"]))
     for p in params.values():
         out = out + p["value"] * dx ** p["power"]
-    return out
+    return out + _carried_force(list((regime.get("carried") or {}).values()), x, a)
+
+
+def component_curve(result, name, n=300):
+    """
+    One element's own force from its onset to the end of the fit.
+
+    For a carried element (the cell shell, by default) this is the whole
+    stretch it acts over; for any other it is its own regime. Returns
+    (x_pct, F_N), or None when the element was not fitted.
+    """
+    regimes = result.get("regimes") or []
+    home = next((r for r in regimes if name in r["params"]), None)
+    if home is None or not home["fitted"]:
+        return None
+    value = home["params"][name]["value"]
+    power = home["params"][name]["power"]
+    if not np.isfinite(value):
+        return None
+    onset = home["domain_pct"][0]
+    end = home["domain_pct"][1]
+    if name in (result.get("carry") or ()):
+        fitted = [r for r in regimes if r["fitted"]]
+        end = fitted[-1]["domain_pct"][1] if fitted else end
+    x = np.linspace(onset, end, n)
+    return x, value * (x - onset) ** power
 
 
 def predict_piecewise(epsilon, result):
@@ -583,6 +696,397 @@ def continuity_gaps(result):
         )
     return gaps
 
+
+
+# ======================================================= finding boundaries ==
+#
+# The boundaries are the three numbers the fit cannot find by itself: the
+# model is linear in its coefficients only once e1, e2 and e3 are fixed. So
+# they are found the way any nonlinear parameter of an otherwise linear
+# model is: by profiling the likelihood over them.
+#
+# The model family is the one on the page, the same four laws, the same
+# carried membrane, the same bounds, and continuous at every boundary. Its
+# force is LINEAR in all seven coefficients at once, because every anchor is
+# itself a linear combination of the coefficients upstream of it:
+#
+#     F_hat(x) = X(x; e1, e2, e3) . theta,
+#     theta = (k_align, C0, K_shell, K_cyto, K_nucleus, K_nuc_cyto, K_core)
+#
+# so for each trial placement the best continuous curve is one bounded
+# linear least-squares problem, solved exactly:
+#
+#     S(e1, e2, e3) = min_theta || F - X theta ||^2,   lower <= theta <= upper
+#     (e1, e2, e3)^ = argmin S    within bands around the specification
+#
+# Why jointly here when the fit itself is sequential: the sequential chain
+# is the specification's estimator, but its anchors inherit the noise of
+# the regimes upstream, so its S can be lowered by moving a boundary to
+# re-aim an anchor even when the boundaries are right. On curves generated
+# with the boundaries exactly at 5 / 40 / 60 % that alone reported strong
+# evidence for moving them. The joint S has no such lever: it is the
+# profile likelihood of the boundaries, and on those same curves it keeps
+# them (Delta BIC around -20). The coefficients shown are still the
+# sequential ones, fitted at the boundaries found here.
+#
+# With Gaussian noise, -2 ln L = n ln(S/n) + const, which gives a
+# profile-likelihood interval for each boundary (n ln(S/S_min) <= 1 for
+# 68 %, <= 3.84 for 95 %) and a Bayesian information criterion comparing
+# the found boundaries with the specification's, paying 3 ln n for the
+# three numbers the search was allowed to choose.
+
+def _coefficient_names(regimes):
+    names, lower, upper = [], [], []
+    for regime in regimes:
+        for term in regime.terms:
+            names.append(term.name)
+            lower.append(term.lower)
+            upper.append(term.upper)
+        if regime.free_offset:
+            names.append("C0")
+            lower.append(-np.inf)
+            upper.append(np.inf)
+    return names, np.array(lower, dtype=float), np.array(upper, dtype=float)
+
+
+def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
+    """
+    The design matrix of the continuous four-regime model: F_hat = X theta.
+
+    Row i holds what each coefficient contributes at x_i, including through
+    the anchors it feeds downstream and the carried elements. Returns
+    (X, covered, names, lower, upper); ``covered`` marks the points inside
+    [bounds[0], bounds[-1]].
+    """
+    x = np.asarray(x, dtype=float)
+    names, lower, upper = _coefficient_names(regimes)
+    col = {name: i for i, name in enumerate(names)}
+    X = np.zeros((x.size, len(names)))
+    covered = np.zeros(x.size, dtype=bool)
+    anchor = np.zeros(len(names))
+    carried = []
+    carry = tuple(carry or ())
+    for i, regime in enumerate(regimes):
+        a, b = bounds[i], bounds[i + 1]
+        last = i == len(regimes) - 1
+        mask = (x >= a) & ((x <= b) if last else (x < b))
+        covered |= mask
+        xm = x[mask]
+        if regime.free_offset:
+            term = regime.terms[0]
+            X[mask, col[term.name]] = xm ** term.power
+            X[mask, col["C0"]] = 1.0
+            anchor = np.zeros(len(names))
+            anchor[col[term.name]] = b ** term.power
+            anchor[col["C0"]] = 1.0
+            continue
+        rows = np.tile(anchor, (xm.size, 1))
+        after = anchor.copy()
+        for term in regime.terms:
+            rows[:, col[term.name]] += (xm - a) ** term.power
+            after[col[term.name]] += (b - a) ** term.power
+        for name, power, onset in carried:
+            rows[:, col[name]] += (np.clip(xm - onset, 0.0, None) ** power
+                                   - max(a - onset, 0.0) ** power)
+            after[col[name]] += (b - onset) ** power - max(a - onset, 0.0) ** power
+        for term in regime.terms:
+            if term.name in carry:
+                carried.append((term.name, float(term.power), float(a)))
+        X[mask] = rows
+        anchor = after
+    return X, covered, names, lower, upper
+
+
+def _bounded_lsq_exact(X, y, lower, upper):
+    """
+    min ||X theta - y||^2 with box bounds, exactly, and fast when it can be.
+
+    Unbounded coefficients (k_align, C0) are projected out; coefficients
+    bounded only below are shifted to a zero lower bound, and the rest is a
+    non-negative least-squares problem (Lawson-Hanson, exact). Finite upper
+    bounds fall back to ``lsq_linear``.
+    """
+    from scipy.optimize import nnls
+
+    fixed = np.isfinite(lower) & (lower == upper)
+    if fixed.any():
+        theta = lower.copy()
+        rest = y - X[:, fixed] @ lower[fixed]
+        if (~fixed).any():
+            sub, cost = _bounded_lsq_exact(X[:, ~fixed], rest,
+                                           lower[~fixed], upper[~fixed])
+            theta[~fixed] = sub
+            return theta, cost
+        return theta, float(rest @ rest)
+
+    col = np.linalg.norm(X, axis=0)
+    col[~np.isfinite(col) | (col == 0)] = 1.0
+    Xs = X / col
+    lo, hi = lower * col, upper * col
+    free = ~np.isfinite(lo) & ~np.isfinite(hi)
+    if np.any(np.isfinite(hi[~free])) or np.any(~np.isfinite(lo[~free])):
+        sol = lsq_linear(Xs, y, bounds=(lo, hi), method="trf", tol=1e-12)
+        r = Xs @ sol.x - y
+        return sol.x / col, float(r @ r)
+    U, B = Xs[:, free], Xs[:, ~free]
+    shift = lo[~free]
+    target = y - B @ shift
+    if U.shape[1]:
+        Q, _ = np.linalg.qr(U)
+        PB = B - Q @ (Q.T @ B)
+        Py = target - Q @ (Q.T @ target)
+    else:
+        PB, Py = B, target
+    q, _res = nnls(PB, Py, maxiter=50 * max(B.shape[1], 1))
+    theta = np.empty(X.shape[1])
+    theta[~free] = q + shift
+    if U.shape[1]:
+        theta[free] = np.linalg.lstsq(U, target - B @ q, rcond=None)[0]
+    r = Xs @ theta - y
+    return theta / col, float(r @ r)
+
+
+def _prepare(epsilon, force_N):
+    eps = np.asarray(epsilon, dtype=float).ravel()
+    force = np.asarray(force_N, dtype=float).ravel()
+    good = np.isfinite(eps) & np.isfinite(force)
+    order = np.argsort(eps[good], kind="stable")
+    return eps[good][order] * 100.0, force[good][order]
+
+
+def joint_sse(epsilon, force_N, boundaries_pct=C2C12_BOUNDARIES_PCT,
+              regimes=C2C12_REGIMES, settings=None, carry=("K_shell",)):
+    """
+    S at one placement: the residual sum of squares, in N^2, of the best
+    continuous four-regime curve with those boundaries.
+    """
+    x_all, f_all = _prepare(epsilon, force_N)
+    regimes = with_settings(regimes, settings)
+    X, covered, _n, lower, upper = joint_design(
+        x_all, [float(b) for b in boundaries_pct], regimes, carry)
+    return _bounded_lsq_exact(X[covered], f_all[covered], lower, upper)[1]
+
+
+def _grid(lo, hi, step):
+    lo, hi = float(lo), float(hi)
+    if hi <= lo or step <= 0:
+        return np.array([lo])
+    n = int(np.floor((hi - lo) / step + 1e-9))
+    return np.round(lo + step * np.arange(n + 1), 6)
+
+
+def _interval(grid, delta, best, level):
+    """The contiguous stretch around ``best`` where delta <= level."""
+    grid = np.asarray(grid)
+    delta = np.asarray(delta)
+    i0 = int(np.argmin(np.abs(grid - best)))
+    lo_i = hi_i = i0
+    while lo_i > 0 and delta[lo_i - 1] <= level:
+        lo_i -= 1
+    while hi_i < grid.size - 1 and delta[hi_i + 1] <= level:
+        hi_i += 1
+    return (float(grid[lo_i]), float(grid[hi_i]),
+            lo_i == 0, hi_i == grid.size - 1)
+
+
+SEARCH_BANDS_PCT = ((2.0, 10.0), (30.0, 50.0), (50.0, 70.0))
+
+
+def find_boundaries(
+    epsilon,
+    force_N,
+    end_pct=C2C12_BOUNDARIES_PCT[-1],
+    bands_pct=SEARCH_BANDS_PCT,
+    spec_pct=C2C12_BOUNDARIES_PCT[1:-1],
+    regimes=C2C12_REGIMES,
+    settings=None,
+    carry=("K_shell",),
+    coarse_step=(1.0, 2.0, 2.0),
+    fine_step=0.1,
+    profile_step=0.25,
+    min_width=2.0,
+):
+    """
+    The e1, e2, e3 that maximise the likelihood of the four-regime model.
+
+    Every trial uses the page's equations, bounds and carried elements. The
+    end of the fit is not searched: it decides which points are fitted, and
+    S only compares placements that fit the same points.
+
+    1. A coarse grid over the three bands (1 %, 2 %, 2 % by default).
+    2. Coordinate descent at ``fine_step`` from the three best grid points,
+       each boundary scanned in turn with the others held, until none moves.
+    3. A profile of each boundary across its band with the others at the
+       optimum: Delta(-2 ln L) = n ln(S / S_min), giving 68 % (<= 1) and
+       95 % (<= 3.84) intervals.
+    4. The specification scored the same way:
+       Delta BIC = n ln(S_spec / S_min) - 3 ln n.
+    """
+    x_all, f_all = _prepare(epsilon, force_N)
+    regimes = with_settings(regimes, settings)
+    carry = tuple(carry or ())
+    end = float(min(end_pct, x_all.max())) if x_all.size else float(end_pct)
+    keep = (x_all >= 0.0) & (x_all <= end)
+    x_fit, f_fit = x_all[keep], f_all[keep]
+    n = int(x_fit.size)
+    if n < 12:
+        return {"success": False, "error": "too few points to place boundaries"}
+    bands = [tuple(sorted(float(v) for v in band)) for band in bands_pct]
+    width = float(min_width)
+    needs = [len(r.terms) + (1 if r.free_offset else 0) + 2 for r in regimes]
+
+    def valid(b):
+        edges = (0.0,) + tuple(b) + (end,)
+        if any(e1 - e0 < width for e0, e1 in zip(edges, edges[1:])):
+            return False
+        for i, need in enumerate(needs):
+            last = i == len(needs) - 1
+            inside = (x_fit >= edges[i]) & (
+                (x_fit <= edges[i + 1]) if last else (x_fit < edges[i + 1]))
+            if int(inside.sum()) < need:
+                return False
+        return True
+
+    cache = {}
+
+    def S(b):
+        key = tuple(round(float(v), 6) for v in b)
+        if key not in cache:
+            if valid(key):
+                X, covered, _n, lower, upper = joint_design(
+                    x_fit, (0.0,) + key + (end,), regimes, carry)
+                cache[key] = _bounded_lsq_exact(
+                    X[covered], f_fit[covered], lower, upper)[1]
+            else:
+                cache[key] = float("inf")
+        return cache[key]
+
+    # 1 · coarse grid
+    grids = [_grid(lo, hi, step) for (lo, hi), step in zip(bands, coarse_step)]
+    scored = []
+    for b1 in grids[0]:
+        for b2 in grids[1]:
+            for b3 in grids[2]:
+                value = S((b1, b2, b3))
+                if np.isfinite(value):
+                    scored.append((value, (b1, b2, b3)))
+    if not scored:
+        return {"success": False,
+                "error": "no placement inside the bands leaves every regime "
+                         "enough points; widen the bands or check the curve"}
+    scored.sort(key=lambda item: item[0])
+
+    # 2 · coordinate descent from the best few
+    def descend(start):
+        b = [float(v) for v in start]
+        for _cycle in range(8):
+            moved = False
+            for i in range(3):
+                reach = 2.0 * coarse_step[i]
+                trial = _grid(max(bands[i][0], b[i] - reach),
+                              min(bands[i][1], b[i] + reach), fine_step)
+                values = [S(tuple(b[:i] + [v] + b[i + 1:])) for v in trial]
+                j = int(np.argmin(values))
+                if values[j] < S(tuple(b)) and trial[j] != b[i]:
+                    b[i] = float(trial[j])
+                    moved = True
+            if not moved:
+                break
+        return tuple(b)
+
+    best = min((descend(start) for _v, start in scored[:3]), key=S)
+
+    # 3 · profiles, which may also find a lower S the descent missed
+    def profiles(best):
+        out = {}
+        for i in range(3):
+            grid = _grid(bands[i][0], bands[i][1], profile_step)
+            values = np.array([S(tuple(best[:i]) + (v,) + tuple(best[i + 1:]))
+                               for v in grid])
+            out[i] = (grid, values)
+        return out
+
+    prof = profiles(best)
+    for _round in range(2):
+        lower_found = False
+        for i, (grid, values) in prof.items():
+            j = int(np.argmin(values))
+            if values[j] < S(best) * (1 - 1e-12):
+                best = descend(tuple(best[:i]) + (float(grid[j]),) + tuple(best[i + 1:]))
+                lower_found = True
+                break
+        if not lower_found:
+            break
+        prof = profiles(best)
+
+    s_min = S(best)
+    names = ("eps1", "eps2", "eps3")
+    intervals, curves = {}, {}
+    for i in range(3):
+        grid, values = prof[i]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            delta = n * np.log(values / s_min)
+        delta = np.where(np.isfinite(delta), np.maximum(delta, 0.0), np.inf)
+        lo68, hi68, open_lo, open_hi = _interval(grid, delta, best[i], 1.0)
+        lo95, hi95, _a, _b = _interval(grid, delta, best[i], 3.84)
+        intervals[names[i]] = {
+            "best": float(best[i]), "lo68": lo68, "hi68": hi68,
+            "lo95": lo95, "hi95": hi95,
+            "at_band_edge": bool(np.isclose(best[i], bands[i][0])
+                                 or np.isclose(best[i], bands[i][1])),
+            "open_low": bool(open_lo), "open_high": bool(open_hi),
+        }
+        curves[names[i]] = ([float(v) for v in grid],
+                            [float(v) if np.isfinite(v) else None for v in delta])
+
+    spec = tuple(float(v) for v in spec_pct)
+    s_spec = S(spec)
+    if np.isfinite(s_spec) and s_spec > 0:
+        delta_m2lnl = float(n * np.log(s_spec / s_min))
+        delta_bic = float(delta_m2lnl - 3.0 * np.log(n))
+    else:
+        delta_m2lnl = delta_bic = float("nan")
+
+    if not np.isfinite(delta_bic):
+        verdict = ("The specification's boundaries cannot be fitted on this "
+                   "curve, so the found ones are the only placement.")
+        strength = "only"
+    elif delta_bic > 6:
+        verdict = ("Strong evidence for the found boundaries: they fit "
+                   "better than the specification's by more than the cost "
+                   "of choosing three numbers.")
+        strength = "strong"
+    elif delta_bic > 2:
+        verdict = "Positive evidence for the found boundaries."
+        strength = "positive"
+    elif delta_bic > 0:
+        verdict = ("Weak evidence: the found boundaries fit a little better, "
+                   "hardly more than choosing them costs.")
+        strength = "weak"
+    else:
+        verdict = ("No evidence for moving them: the improvement is smaller "
+                   "than the cost of choosing three numbers, so the "
+                   "specification's boundaries describe this curve as well.")
+        strength = "none"
+
+    return {
+        "success": True,
+        "best_pct": tuple(float(v) for v in best),
+        "end_pct": end,
+        "sse_best": float(s_min),
+        "sse_spec": float(s_spec),
+        "spec_pct": spec,
+        "n_points": n,
+        "delta_m2lnL": delta_m2lnl,
+        "delta_bic": delta_bic,
+        "verdict": verdict,
+        "strength": strength,
+        "intervals": intervals,
+        "profiles": curves,
+        "bands_pct": tuple(bands),
+        "carry": carry,
+        "n_evaluations": len(cache),
+    }
 
 # ============================================================ the moduli ==
 
