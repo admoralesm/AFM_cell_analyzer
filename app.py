@@ -1288,6 +1288,16 @@ def _coefficient_latex(piece, fit, factor):
             + _sci_latex(value * relative, digits=2) + r")")
 
 
+def sharing_label(fit):
+    """How the components shared the load in this fit, as the page names it."""
+    if fit.get("coupling") == "piecewise":
+        return PW_SHARE
+    for label, key in MODEL_KEYS.items():
+        if key == fit.get("coupling"):
+            return label
+    return str(fit.get("model_label") or st.session_state.get("model_kind", ""))
+
+
 def fit_record(fit, unit="nN"):
     """
     Everything this fit measured, as one flat record of name → value.
@@ -1297,6 +1307,11 @@ def fit_record(fit, unit="nN"):
     will not average. Units live in the column names, values are plain
     floats, and the two rows are in the same order, so one paste is a row of
     a growing table.
+
+    One format whichever way the components shared the load: the columns
+    every fit has come first, in the same order, so rows from piecewise and
+    segmented fits stack into one table; what only one way measures comes
+    after them.
     """
     if not (fit and fit.get("success")):
         return {}
@@ -1309,12 +1324,14 @@ def fit_record(fit, unit="nN"):
         "Cell ID": st.session_state.get("cell_name", ""),
         "Cell type": st.session_state.get("cell_type", ""),
         "Experiment date": str(st.session_state.get("date_acquired", "")),
+        "Load sharing": sharing_label(fit),
         "Cell height (um)": st.session_state.get("cell_height_um", ""),
         "Spring constant (N/m)": st.session_state.get("spring_constant", ""),
         "eps min": round(lo, 4),
         "eps max": round(hi, 4),
         "eps1": round(float(edges["ε₁"]), 4) if "ε₁" in edges else "",
         "eps2": round(float(edges["ε₂"]), 4) if "ε₂" in edges else "",
+        "eps3": round(float(edges["ε₃"]), 4) if "ε₃" in edges else "",
         "q (confinement)": round(float(fit.get("confinement", 0.0) or 0.0), 4),
     }
     for term in ALL_TERMS:
@@ -1342,14 +1359,6 @@ def fit_record(fit, unit="nN"):
         else:
             record[f"{label} 95% low"] = ""
             record[f"{label} 95% high"] = ""
-    for piece in equation_pieces(fit):
-        label = f"coefficient {TERM_SYMBOLS.get(piece['term'], piece['term'])} ({unit_label})"
-        record[label] = piece["coefficient_N"] * factor
-        relative = _relative_error(piece, fit)
-        record[f"± {label}"] = (
-            piece["coefficient_N"] * factor * relative
-            if np.isfinite(relative) else ""
-        )
     record.update({
         "R2": float(fit.get("r_squared", float("nan"))),
         "adjusted R2": float(fit.get("adj_r_squared", float("nan"))),
@@ -1359,6 +1368,33 @@ def fit_record(fit, unit="nN"):
         "n points": int(fit.get("n_points", 0)),
         "free parameters": int(fit.get("n_params", 0)),
         "weighting": fit.get("weighting", "uniform"),
+    })
+    pw = fit.get("piecewise")
+    if pw:
+        # What only the regime-by-regime sharing measures.
+        for term, symbol, key, unit_name in EXTRA_PIECEWISE_ROWS:
+            label = f"{EXTRA_NAMES[term]} {symbol} ({unit_name})"
+            value = float(fit.get(key, float("nan")))
+            error = float(fit.get(f"{key}_std", float("nan")))
+            record[label] = value
+            record[f"± {label}"] = error
+        record["lamina work W_L (fJ)"] = float(fit.get("lamina_work_fJ", float("nan")))
+        record["lamina peak (%)"] = float(fit.get("lamina_peak_pct", float("nan")))
+        b = pw.get("boundaries_pct") or ()
+        for name, value in zip(("eps1 (%)", "eps2 (%)", "eps3 (%)", "x_end (%)"),
+                               list(b)[1:5]):
+            record[name] = round(float(value), 3)
+        record["eps route"] = pw.get("boundary_source", "")
+        record["membrane throughout"] = bool(pw.get("membrane_throughout"))
+        flat = pw.get("flat") or {}
+        for name in ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto",
+                     "K_core"):
+            if name in flat:
+                record[f"{name} (N/%^p)"] = float(flat[name])
+                record[f"± {name}"] = float(flat.get(f"{name}_se", float("nan")))
+        record["C0 (N)"] = float(flat.get("C0_N", float("nan")))
+        return record
+    record.update({
         "membrane past eps1": fit.get("membrane", ""),
         "cytoskeleton starts": fit.get("cyto_start", ""),
         "condition number": (
@@ -1371,6 +1407,14 @@ def fit_record(fit, unit="nN"):
             and np.isfinite(fit.get("worst_correlation", float("nan"))) else ""
         ),
     })
+    for piece in equation_pieces(fit):
+        label = f"coefficient {TERM_SYMBOLS.get(piece['term'], piece['term'])} ({unit_label})"
+        record[label] = piece["coefficient_N"] * factor
+        relative = _relative_error(piece, fit)
+        record[f"± {label}"] = (
+            piece["coefficient_N"] * factor * relative
+            if np.isfinite(relative) else ""
+        )
     return record
 
 
@@ -1515,16 +1559,33 @@ def element_support(term, fit):
     """
     if not (fit and fit.get("success")):
         return ""
-    if term not in (fit.get("terms") or ()):
+    spans = (fit.get("piecewise") or {}).get("spans") or {}
+    if term not in (fit.get("terms") or ()) and term not in spans:
         return "not in this model"
-    window = (fit.get("term_windows") or {}).get(term)
+    window = spans.get(term) or (fit.get("term_windows") or {}).get(term)
     lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
     if not window:
-        return f"from ε {lo:.3f}, stiffening to the end"
+        return f"from {eps_text(lo, fit)}, stiffening to the end"
     a, b = float(window[0]), float(window[1])
+    if term == "lamina":
+        return f"lump on [{eps_text(a, fit)}, {eps_text(b, fit)}]"
     if b >= hi - 1e-6:
-        return f"from ε {a:.3f}, stiffening to the end"
-    return f"from ε {a:.3f}, holding from {b:.3f}"
+        return f"from {eps_text(a, fit)}, stiffening to the end"
+    return f"from {eps_text(a, fit)}, holding from {eps_text(b, fit, bare=True)}"
+
+
+def eps_text(value, fit=None, bare=False):
+    """
+    A deformation written the way the page it is on writes it.
+
+    The four-regime page works in percent and the others in ε as a
+    fraction; the same value is written the same way on the inputs, on the
+    curve, in the results and in this sentence, so it reads as one number.
+    """
+    value = float(value)
+    if fit is not None and fit.get("coupling") == "piecewise":
+        return f"{100.0 * value:.1f} %"
+    return f"{value:.3f}" if bare else f"ε {value:.3f}"
 
 
 def copy_the_results(fit, unit="nN"):
@@ -4642,7 +4703,14 @@ def piecewise_on():
 
 
 def fit_mode_control():
-    """The one choice above the fit, drawn only where there is a choice."""
+    """
+    Which way the fit goes this run, and why the four-regime one is missing.
+
+    The choice itself is not made here any more: it is one of the ways the
+    components can share the load, chosen at the top of the parameter
+    block (load_sharing_control). This only decides which of the two
+    layouts draws it.
+    """
     if (PIECEWISE_PROBLEM and st.session_state.get("cell_type")
             in PIECEWISE_CELL_TYPES):
         piecewise_problem_note()
@@ -4650,18 +4718,94 @@ def fit_mode_control():
         return False
     if st.session_state.get("c2c12_fit_mode") not in FIT_MODES:
         st.session_state["c2c12_fit_mode"] = PIECEWISE_MODE
-    st.radio(
-        "Fitting model",
-        FIT_MODES,
-        key="c2c12_fit_mode",
-        horizontal=True,
-        help="The 4-regime model fits the whole curve in one press: contact, "
-        "cell stretch + cytoskeleton, nuclear envelope, dense nuclear "
-        "packing, each anchored to where the last one ended. The "
-        "spring-network models are the membrane / cytoskeleton / nucleus "
-        "fits with searchable boundaries.",
-    )
     return piecewise_on()
+
+
+# One spring network, several ways for its components to share the load.
+# Piecewise is one of them: the same membrane, cytoskeleton, nuclear
+# envelope and nucleus, taking over regime by regime, each regime starting
+# from the force the one before it ended on.
+PW_SHARE = "Piecewise (regime by regime, each anchored to the last)"
+SHARING_MATHS = {
+    PW_SHARE: r"F(x) = \hat F(\varepsilon_{k-1}) + \sum_{j \in k} \theta_j\,"
+              r"\phi_j(x) + C_k(x),\;\; x \in [\varepsilon_{k-1}, \varepsilon_k)",
+    "Segmented (each part takes over in turn)":
+        r"F(\varepsilon) = \sum_k a_k E_k \langle \varepsilon - s_k \rangle^{p_k}",
+    "Side by side (every element acts everywhere)":
+        r"F(\varepsilon) = \sum_k a_k E_k\,\varepsilon^{p_k}",
+    "Stacked (elements in line)":
+        r"\varepsilon(F) = \sum_k (F / a_k E_k)^{1/p_k}",
+}
+SHARING_HELP = {
+    PW_SHARE: "The same components, met in four regimes: contact, membrane "
+              "+ cytoskeleton from ε₁, nuclear envelope (+ lamina) from ε₂, "
+              "the inside of the nucleus from ε₃. Each regime is fitted from "
+              "the force the last one ended on (C⁰), and carried components "
+              "keep their fitted law.",
+}
+
+
+def sharing_options():
+    """Every way the components can share the load, for this cell."""
+    return ([PW_SHARE] if piecewise_offered() else []) + list(MODELS)
+
+
+def current_sharing():
+    """The way the page is sharing the load now."""
+    if piecewise_on():
+        return PW_SHARE
+    kind = st.session_state.get("model_kind")
+    return kind if kind in MODELS else next(iter(MODELS))
+
+
+def _load_sharing_changed():
+    """Switch the fit, carrying the boundaries over: they are the cell's."""
+    chosen = st.session_state.get("load_sharing")
+    was_piecewise = piecewise_on()
+    if chosen == PW_SHARE:
+        if not was_piecewise:
+            # ε₂, where the nucleus is reached, means the same in both. ε₁
+            # comes across only where it is a contact boundary here too.
+            (l1, h1), (l2, h2), _b3 = piecewise_bands()
+            e1 = 100.0 * float(st.session_state.get("segment_break_1", 0.05))
+            e2 = 100.0 * float(st.session_state.get("segment_break_2", 0.5))
+            if l2 <= e2 <= h2 and e2 < float(st.session_state.get("pw_b3", 75.0)):
+                st.session_state["pw_b2"] = round(e2, 2)
+            if l1 <= e1 <= h1:
+                st.session_state["pw_b1"] = round(e1, 2)
+        st.session_state["c2c12_fit_mode"] = PIECEWISE_MODE
+        return
+    if was_piecewise:
+        st.session_state["segment_break_1"] = round(
+            float(st.session_state.get("pw_b1", 5.0)) / 100.0, 4)
+        st.session_state["segment_break_2"] = round(
+            float(st.session_state.get("pw_b2", 50.0)) / 100.0, 4)
+    st.session_state["c2c12_fit_mode"] = ADVANCED_MODE
+    st.session_state["model_kind"] = chosen
+
+
+def load_sharing_control():
+    """
+    How the components share the load: the first parameter of the fit.
+
+    One model, one list of components, one set of boundaries; what changes
+    is how the components add up. Piecewise sits in the same list as side
+    by side, stacked and segmented, because that is all it is.
+    """
+    options = sharing_options()
+    st.session_state["load_sharing"] = current_sharing()
+    if st.session_state["load_sharing"] not in options:
+        st.session_state["load_sharing"] = options[0]
+    st.radio(
+        "How the components share the load", options, key="load_sharing",
+        on_change=_load_sharing_changed,
+        help="The same components and the same boundaries in every case; "
+        "this is only how their forces combine.",
+    )
+    chosen = st.session_state["load_sharing"]
+    if chosen in SHARING_MATHS:
+        st.latex(SHARING_MATHS[chosen])
+    st.caption(SHARING_HELP.get(chosen) or MODELS.get(chosen, ""))
 
 
 def piecewise_boundaries():
@@ -4677,12 +4821,13 @@ def piecewise_boundaries():
 # component cannot appear in one and not the others.
 PW_COMPONENTS = (
     # The square in each name is the colour of that component's line and bar
-    # on the plot.
+    # on the plot. The names and symbols are the spring network's own, for
+    # the four it shares with every other way of sharing the load.
     ("k_align", "⬛ Contact / alignment", "E_align", "#555555",
      r"$k_{align}\,x + C_0$"),
-    ("K_shell", "🟥 Membrane (cell shell)", "E_shell", "#d62728",
+    ("K_shell", "🟥 Membrane", "Eₘ", "#d62728",
      r"$K_{shell}\,[\min(x,u)-s]_+^{3}$"),
-    ("K_cyto", "🟧 Cytoskeleton", "E_cyto", "#ff7f0e",
+    ("K_cyto", "🟧 Cytoskeleton", "Ec", "#ff7f0e",
      r"$K_{cyto}\,[\min(x,u)-s]_+^{3/2}$"),
     ("K_nucleus", "🟦 Nuclear envelope", "E_ne", "#1f77b4",
      r"$K_{ne}\,[\min(x,u)-s]_+^{3}$"),
@@ -4690,9 +4835,32 @@ PW_COMPONENTS = (
      r"$K_{nc}\,[\min(x,u)-s]_+^{3/2}$"),
     ("A_lamina", "🟫 Nuclear lamina (lump)", "A_L", "#8c564b",
      r"$A_L\sin^2\!\big(\pi\,\frac{x-\varepsilon_2}{\varepsilon_3-\varepsilon_2}\big)$"),
-    ("K_core", "🟪 Nuclear interior (core)", "E_core", "#9467bd",
+    ("K_core", "🟪 Inside the nucleus", "Eₙ", "#9467bd",
      r"$K_{core}\,[\min(x,u)-s]_+^{3/2}$"),
 )
+# The engine names its moduli E_shell, E_cyto, E_core; the page writes them
+# with the spring network's symbols and in its units, so a modulus reads the
+# same in the results, on the bars, in the routes table and in the sheet.
+DISPLAY_SYMBOL = {"E_shell": "Eₘ", "E_cyto": "Ec", "E_ne": "E_ne",
+                  "E_nc": "E_nc", "E_core": "Eₙ", "E_align": "E_align",
+                  "A_L": "A_L"}
+DISPLAY_UNIT = {"E_shell": ("MPa", 1e6), "E_ne": ("MPa", 1e6),
+                "E_cyto": ("kPa", 1e3), "E_nc": ("kPa", 1e3),
+                "E_core": ("kPa", 1e3), "E_align": ("kPa", 1e3)}
+
+
+def modulus_display(symbol, value_pa, se_pa=None):
+    """A modulus as the results table writes it: 4 figures, its own unit."""
+    if value_pa is None or not np.isfinite(float(value_pa)):
+        return "—"
+    unit, scale = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
+    value_pa = float(value_pa) if abs(float(value_pa)) > 1e-6 else 0.0
+    text = f"{value_pa / scale:.4g}"
+    if se_pa is not None and np.isfinite(float(se_pa)):
+        text += f" ± {float(se_pa) / scale:.3g}"
+    return f"{text} {unit}"
+
+
 PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
 # Which boundary each component starts at: its regime's start. Moving a
 # component's start moves that boundary, and every component sharing it.
@@ -4971,65 +5139,6 @@ def piecewise_fit_id(result):
     })
 
 
-def piecewise_record(result, lamina, source, geometry, name, fid):
-    """
-    The four-regime fit as one flat row for a spreadsheet.
-
-    Every number comes from ``result``, the fit on the curve, in the order
-    the page shows it: the fit's fingerprint, the cell, ε, the quality, then
-    each modulus with its ±, its 95 % interval and its coefficient, then the
-    lamina. Moduli are all in kPa so a column can be averaged as it is.
-    """
-    b = result["boundaries_pct"]
-    record = {
-        "Fit ID": fid,
-        "Cell ID": name,
-        "Cell type": st.session_state.get("cell_type", ""),
-        "Experiment date": str(st.session_state.get("date_acquired", "")),
-        "Model": "4-regime piecewise",
-        "Cell height h0 (um)": round(geometry.cell_height * 1e6, 4),
-        "Cell radius R0 (um)": round(geometry.cell_radius * 1e6, 4),
-        "Nucleus radius Rn (um)": round(geometry.nucleus_radius * 1e6, 4),
-        "Probe radius Rp (um)": (round(geometry.probe_radius * 1e6, 4)
-                                 if geometry.probe_radius else ""),
-        "eps1 (%)": round(float(b[1]), 3),
-        "eps2 (%)": round(float(b[2]), 3),
-        "eps3 (%)": round(float(b[3]), 3),
-        "x_end (%)": round(float(b[4]), 3),
-        "eps route": source,
-        "R2": float(result.get("r_squared", float("nan"))),
-        "chi2 per dof": float(result.get("chi_squared_reduced", float("nan"))),
-        "RMSE (N)": float(result.get("rmse", float("nan"))),
-        "n points": int(result.get("n_points", 0)),
-    }
-    off = piecewise_off()
-    for key, _label, symbol, _colour, _law in PW_COMPONENTS:
-        row = (result.get("moduli") or {}).get(key)
-        if key == "A_lamina" or row is None:
-            continue
-        value = float(row.get("E_Pa", float("nan"))) / 1e3
-        error = float(row.get("E_se_Pa", float("nan"))) / 1e3
-        if key in off:
-            value, error = 0.0, float("nan")
-        label = f"{row['symbol']} (kPa)"
-        record[label] = value
-        record[f"± {label}"] = error
-        record[f"{label} 95% low"] = (max(value - 1.96 * error, 0.0)
-                                      if np.isfinite(error) else "")
-        record[f"{label} 95% high"] = (value + 1.96 * error
-                                       if np.isfinite(error) else "")
-        record[f"{key} (N/%^{row['power']:g})"] = float(row.get("K", float("nan")))
-        record[f"± {key}"] = float(row.get("K_se", float("nan")))
-    if lamina:
-        record["A_L lamina (nN)"] = float(lamina["A_N"]) * 1e9
-        record["± A_L (nN)"] = float(lamina.get("A_se_N", float("nan"))) * 1e9
-        record["W_L (fJ)"] = float(lamina.get("work_J", float("nan"))) * 1e15
-        record["lamina peak (%)"] = float(lamina["peak_pct"])
-    record["C0 (N)"] = float((result.get("coefficients") or {}).get("C0", float("nan")))
-    record["membrane throughout"] = "K_shell" in (result.get("carry") or ())
-    return record
-
-
 def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
                      off=None, placements=None):
     lamina = lamina_summary(result, piecewise_geometry(model, probe_um=probe_um))
@@ -5046,14 +5155,19 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
 
     def e(name):
         row = moduli.get(name) or {}
-        return float(row.get("E_Pa", float("nan"))), float(row.get("E_se_Pa", float("nan")))
+        value = float(row.get("E_Pa", float("nan")))
+        # A modulus held at its lower bound comes back as 1e-27 Pa, not 0;
+        # it is written as the 0 it is, the same everywhere it is shown.
+        if np.isfinite(value) and abs(value) < 1e-6:
+            value = 0.0
+        return value, float(row.get("E_se_Pa", float("nan")))
 
     shell, shell_se = e("K_shell")
     cyto, cyto_se = e("K_cyto")
     envelope, envelope_se = e("K_nucleus")
     peri, peri_se = e("K_nuc_cyto")
     core, core_se = e("K_core")
-    align, _align_se = e("k_align")
+    align, align_se = e("k_align")
     tension = float((moduli.get("k_align") or {}).get("tension_N_per_m", float("nan")))
 
     def finite(v):
@@ -5074,6 +5188,7 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
         "nucleus_shell": span("K_nucleus", (b[2], b[3])),
         "perinuclear": span("K_nuc_cyto", (b[2], b[3])),
         "nucleus": span("K_core", (b[3], b[4])),
+        "lamina": span("A_lamina", (b[2], b[3])),
     }
     flat = {}
     for name, row in moduli.items():
@@ -5103,9 +5218,12 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
         "Ene_MPa_std": finite(envelope_se) / 1e6,
         "En": finite(core), "En_kPa": finite(core) / 1e3,
         "En_kPa_std": finite(core_se) / 1e3,
-        "E_nc_kPa": finite(peri) / 1e3, "E_nc_kPa_std": finite(peri_se) / 1e3,
+        "E_nc_kPa": finite(peri) / 1e3, "E_nc_kPa_std": peri_se / 1e3,
         "E_align_kPa": finite(align) / 1e3,
+        "E_align_kPa_std": align_se / 1e3,
         "A_lamina_nN": finite((lamina or {}).get("A_N", float("nan"))) * 1e9,
+        "A_lamina_nN_std": float((lamina or {}).get("A_se_N", float("nan"))) * 1e9,
+        "load_sharing": PW_SHARE,
         "lamina_work_fJ": finite((lamina or {}).get("work_J", float("nan"))) * 1e15,
         "lamina_peak_pct": finite((lamina or {}).get("peak_pct", float("nan"))),
         "T_align_mN_m": finite(tension) * 1e3,
@@ -5117,6 +5235,8 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
         "noise_sigma": result.get("noise_sigma", float("nan")),
         "rmse": result["rmse"],
         "n_points": result["n_points"],
+        "n_params": int(sum(1 for v in (result.get("coefficients") or {}).values()
+                            if v is not None)),
         "epsilon_range": tuple(result["epsilon_range"]),
         "weighting": "uniform",
         "warnings": list(result.get("warnings", [])),
@@ -5629,7 +5749,7 @@ def piecewise_parameter_editor():
 
 def keep_unrendered_settings():
     """
-    Hold on to the spring-network settings while the four-regime fit is up.
+    Hold on to the settings of whichever sharing of the load is not shown.
 
     Streamlit drops a widget's value at the end of any run that does not
     draw it, and with the four-regime fit on screen none of the other
@@ -5699,6 +5819,7 @@ def piecewise_placement_table(placements, bounds, target, selected):
     rows = placements.get("rows") or {}
     inner = tuple(round(float(v), 2) for v in bounds[1:4])
     symbols = ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core")
+    heads = {s_: f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})" for s_ in symbols}
 
     def same(key):
         row = rows.get(key)
@@ -5719,7 +5840,7 @@ def piecewise_placement_table(placements, bounds, target, selected):
                 table.append({"Placement": PW_ROW_LABELS[key], "ε₁ (%)": "—",
                               "ε₂ (%)": "—", "ε₃ (%)": "—", "R²": "—",
                               f"≥ {target:g}": "could not place",
-                              **{s_: "" for s_ in symbols}, "In use": ""})
+                              **{heads[s_]: "" for s_ in symbols}, "In use": ""})
             continue
         r2 = row["r2"]
         in_use = key == in_use_key
@@ -5732,7 +5853,8 @@ def piecewise_placement_table(placements, bounds, target, selected):
             f"≥ {target:g}": ("✅" if np.isfinite(r2) and r2 >= target
                               else "⚠️ " + (f"{row['worst'][0]} {row['worst'][1]:.3f}"
                                             if row.get("worst") else "")),
-            **{s_: pressure_text(row["moduli"].get(s_)) for s_ in symbols},
+            **{heads[s_]: modulus_display(s_, row["moduli"].get(s_)).rsplit(" ", 1)[0]
+               for s_ in symbols},
             "In use": "◀ in use" if in_use else "",
         })
     st.markdown(r"**Routes** $r$: each row is $\hat F(x;\,\boldsymbol"
@@ -5740,7 +5862,7 @@ def piecewise_placement_table(placements, bounds, target, selected):
                 r"\varepsilon$, with the model on this page")
     flat_table(
         pd.DataFrame(table),
-        align_right=["ε₁ (%)", "ε₂ (%)", "ε₃ (%)", "R²"] + list(symbols),
+        align_right=["ε₁ (%)", "ε₂ (%)", "ε₃ (%)", "R²"] + list(heads.values()),
         caption="⚠️ names the regime with the lowest R²_k. Used: the chosen "
         "route if R² ≥ R²★, else the first of (power law → fit everything, "
         "fit everything, power law, defaults) that reaches it.",
@@ -5941,11 +6063,13 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None):
                 slots[name].caption(r"$\theta = 0$ (held)")
             elif name == "A_lamina" and lamina:
                 slots[name].markdown(
-                    f"**A_L = {lamina['A_N'] * 1e9:.3g} nN**"
+                    f"**A_L = {lamina['A_N'] * 1e9:.4g} nN**"
                     + ("" if lamina["present"] else " (no lump)"))
             elif row:
+                # Written exactly as the results table on the right writes it.
                 slots[name].markdown(
-                    f"**{row['symbol']} = {pressure_text(row['E_Pa'])}**"
+                    f"**{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
+                    f"{modulus_display(row['symbol'], row['E_Pa'])}**"
                     + (" ⚠️ on bound" if row.get("at_bound") else ""))
     st.caption(
         r"Row $j$: $F_j(x) = \theta_j\,\phi_j(x;\,s_j,u_j)$, acting on "
@@ -6352,8 +6476,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
     name = collection_name()
     collection = st.session_state.get("pw_collection") or {}
     in_collection = name in collection
-    fid = piecewise_fit_id(result) if ok else ""
     moduli = (result.get("moduli") or {}) if ok else {}
+    # The fit in the shape every results panel reads, made once here so the
+    # table, the copy block and the Results tab are all this one.
+    fit = (piecewise_as_fit(result, model, found=found, placements=placements)
+           if ok else None)
+    fid = fit["fit_id"] if fit else ""
 
     # ---- ① ② ③ ④, across the page ---------------------------------------
     pw_stepper(result, target, source, name, in_collection)
@@ -6367,6 +6495,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.markdown("### ⚙️ Fit parameters")
         st.caption("Everything the fit is given. The right-hand side is "
                    "drawn from the fit these values make.")
+        load_sharing_control()
         a1, a3 = st.columns(2)
         with a1:
             placing = st.button(
@@ -6395,7 +6524,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     "_pw_editor_reset": True,
                 })
 
-        st.markdown("#### 1 · Boundaries ε (%)")
+        st.markdown("#### 1 · Components θⱼ over [sⱼ, uⱼ]")
+        piecewise_components_panel(piecewise_boundaries(), moduli or None, lamina)
+        st.caption("The boundaries below are the starts of these rows: ε₁ "
+                   "where the membrane and cytoskeleton start, ε₂ the "
+                   "nuclear envelope, ε₃ the inside of the nucleus. The same "
+                   "ε₁, ε₂, ε₃ are the lines on the plot.")
+
+        st.markdown("#### 2 · Boundaries ε (%)")
         st.radio(
             "Route to ε", list(PW_METHODS),
             format_func=lambda k: PW_METHODS[k] + (
@@ -6458,9 +6594,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
             if prior.get("why"):
                 st.caption("Prior: " + prior["why"] + ".")
 
-        st.markdown("#### 2 · Components θⱼ over [sⱼ, uⱼ]")
-        piecewise_components_panel(piecewise_boundaries(), moduli or None, lamina)
-
         with st.expander("3 · p₀ and bounds [θ_lo, θ_hi]", expanded=False):
             piecewise_parameter_editor()
 
@@ -6511,38 +6644,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     + ". Try ▶ Place ε₁, ε₂, ε₃, or that regime's components.",
                     icon="⚠️")
 
-            # The answer: one card per element, in two rows.
-            cards = [(n, moduli.get(n)) for n in
-                     ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core",
-                      "k_align")]
-            row1, row2 = st.columns(4), st.columns(4)
-            slots = list(row1) + list(row2)
-            for col, (n, row) in zip(slots, cards):
-                if not row:
-                    continue
-                with col:
-                    st.metric(
-                        row["symbol"],
-                        "off" if n in piecewise_off() else pressure_text(row["E_Pa"]),
-                        help=f"{row['element']} · ${row['symbol']} = 100^{{{row['power']:g}}}"
-                        f"\\,{n}/A$, $A = $ {row['law']}",
-                    )
-            with slots[6]:
-                if lamina:
-                    st.metric(
-                        "A_L (lamina)",
-                        f"{lamina['A_N'] * 1e9:.3g} nN" if lamina["present"] else "0",
-                        help=r"$L(x) = A_L\sin^2(\pi\frac{x-\varepsilon_2}"
-                        r"{\varepsilon_3-\varepsilon_2})$ · peak at "
-                        f"{lamina['peak_pct']:.1f} %"
-                        + (f" · $W_L = {lamina.get('work_J', float('nan')) * 1e15:.3g}$ fJ"
-                           if lamina.get("work_J") is not None else ""),
-                    )
-            with slots[7]:
-                st.metric("R²", f"{result['r_squared']:.5f}",
-                          help=r"$R^2 = 1 - \sum (F_i-\hat F_i)^2 / "
-                          r"\sum (F_i-\bar F)^2$ over the whole fit.")
-
             log_y = bool(st.session_state.get("pw_log_y"))
             st.plotly_chart(
                 piecewise_figure(
@@ -6555,10 +6656,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
             )
             fitted = predict_piecewise(epsilon, result)
 
-            # The row to paste, from the same fit, and the store button.
-            record = piecewise_record(result, lamina, source, geometry, name, fid)
-            copy_block(record, key="pw_copy_record", file_stem=f"{name}_4regime",
-                       summary=f"fit {fid} · R² = {result['r_squared']:.5f}")
+            # The results in the same table, and the row to paste in the same
+            # format, as every other way of sharing the load: one fit, the
+            # one on the curve.
+            section("Fitting results")
+            fitting_results_rows(fit, style, send=False)
+            copy_the_results(fit, style.force_unit)
             adding = st.button(
                 ("↻ Update (ε, θ̂, E) in collection" if in_collection
                  else "➕ Store (ε, θ̂, E) in collection"),
@@ -6692,7 +6795,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
             file_name=f"{name}_4regime_coefficients.csv", mime="text/csv",
             key="pw_download",
         )
-    fit = piecewise_as_fit(result, model, found=found, placements=placements)
     return fit, fitted, piecewise_stage_plan(result), result
 
 
@@ -6724,7 +6826,8 @@ def piecewise_coefficient_table(result, moduli):
                 + f" {unit}",
                 "p₀": "—" if not np.isfinite(p["p0"]) else f"{p['p0']:.3g}",
                 "[θ_lo, θ_hi]": f"[{_pw_text(p['lower'])}, {_pw_text(p['upper'])}]",
-                "E ± SE": (f"{row['symbol']} = {pressure_text(row['E_Pa'], row['E_se_Pa'])}"
+                "E ± SE": (f"{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
+                           f"{modulus_display(row['symbol'], row['E_Pa'], row['E_se_Pa'])}"
                            if row else ""),
                 "flag": "at bound" if p.get("at_bound") else "",
             })
@@ -6805,7 +6908,8 @@ def collection_frame(collection):
             "ε₁ (%)": round(b[1], 2), "ε₂ (%)": round(b[2], 2),
             "ε₃ (%)": round(b[3], 2), "R²": round(rec["r2"], 5),
             "route": rec.get("route", ""),
-            **{f"{s_} (kPa)": round(rec["moduli"].get(s_, float("nan")) / 1e3, 4)
+            **{f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})":
+               round(rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1], 4)
                for s_ in COLLECTION_SYMBOLS},
             "A_L (nN)": round(rec.get("lamina_A_N", float("nan")) * 1e9, 4),
             "W_L (fJ)": round(rec.get("lamina_work_J", float("nan")) * 1e15, 4),
@@ -7103,8 +7207,10 @@ def all_cells_tab():
     st.plotly_chart(collection_eps_figure(cells), key="pw_cells_eps", **STRETCH)
 
     st.markdown(r"**Moduli per cell**: one point per cell, line = median")
-    quantities = [(s_, [rec["moduli"].get(s_, float("nan")) / 1e3 for rec in cells],
-                   "kPa") for s_ in COLLECTION_SYMBOLS]
+    quantities = [(DISPLAY_SYMBOL[s_],
+                   [rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1]
+                    for rec in cells],
+                   DISPLAY_UNIT[s_][0]) for s_ in COLLECTION_SYMBOLS]
     quantities.append(("A_L (lamina)", [rec.get("lamina_A_N", float("nan")) * 1e9
                                         for rec in cells], "nN"))
     for start in range(0, len(quantities), 4):
@@ -7441,6 +7547,12 @@ def fit_edges(fit):
     stage_rows), each named ε₁ or ε₂ where it is one, so a line on the plot
     and the start of a component curve are one number. (value, name).
     """
+    pw = (fit or {}).get("piecewise") if fit else None
+    if pw and pw.get("boundaries_pct"):
+        # Regime by regime, the boundaries are ε₁, ε₂, ε₃ and nothing else:
+        # the three lines on its curve.
+        b = pw["boundaries_pct"]
+        return [(float(v) / 100.0, name) for v, name in zip(b[1:4], EPS_NAMES)]
     rows = stage_rows(fit)
     if not rows:
         return []
@@ -7675,6 +7787,10 @@ def share_of_load_maths():
         r"F(\varepsilon) = \sum_k a_k E_k\, \bigl\langle \varepsilon - "
         r"s_k \bigr\rangle^{p_k}\,(1-\varepsilon)^{-q}"
     )
+    if piecewise_offered():
+        st.caption("Piecewise — the same terms, regime by regime, each regime "
+                   "starting from the force the one before it ended on:")
+        st.latex(SHARING_MATHS[PW_SHARE])
     marks = [
         f"- {plain_name(term)} — {shape_mark(term)}"
         for term in terms_for(st.session_state.get("cell_type"))
@@ -7727,6 +7843,25 @@ def result_rows(fit):
              if np.isfinite(error) else "—"),
             element_support(term, fit),
         ))
+    if fit.get("piecewise"):
+        # The components only the regime-by-regime sharing separates: the
+        # perinuclear cytoskeleton, the contact line and the lamina lump.
+        for term, symbol, key, unit_name in EXTRA_PIECEWISE_ROWS:
+            try:
+                value = float(fit.get(key, float("nan")))
+                error = float(fit.get(f"{key}_std", float("nan")))
+            except (TypeError, ValueError):
+                value = error = float("nan")
+            rows.append((
+                f"modulus_{term}",
+                f"{symbol} {EXTRA_NAMES[term].lower()}",
+                (f"{value:.4g} {unit_name}" if np.isfinite(value) else "—"),
+                (f"± {error:.3g} {unit_name}" if np.isfinite(error) else "—"),
+                (f"{max(value - 1.96 * error, 0.0):.4g} to "
+                 f"{value + 1.96 * error:.4g} {unit_name}"
+                 if np.isfinite(error) and np.isfinite(value) else "—"),
+                element_support(term, fit),
+            ))
     chi = fit.get("chi_squared_reduced", float("nan"))
     lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
     rows.append((
@@ -7734,21 +7869,39 @@ def result_rows(fit):
         f"R² = {float(fit.get('r_squared', float('nan'))):.5f}",
         (f"χ²/dof = {float(chi):.3g}" if np.isfinite(chi) else "—"),
         f"RMSE = {float(fit.get('rmse', float('nan'))):.4g} N",
-        f"{int(fit.get('n_points', 0))} points over ε {lo:.3f} to {hi:.3f}",
+        f"{int(fit.get('n_points', 0))} points over {eps_text(lo, fit)} to "
+        f"{eps_text(hi, fit, bare=True)}",
     ))
     # The boundaries this fit has: the lines on the curve and the ε columns
     # of the copied row, never a boundary the model does not use.
     edges = {name: value for value, name in fit_edges(fit)}
     if edges:
+        def said(name):
+            if name not in edges:
+                return "—"
+            return f"{name} = {eps_text(edges[name], fit, bare=True)}"
+        third = (said("ε₃") if "ε₃" in edges else
+                 (f"q = {float(fit.get('confinement', 0.0) or 0.0):g}"
+                  if fit.get("confinement") else "—"))
         rows.append((
-            "boundaries", "Boundaries",
-            (f"ε₁ = {float(edges['ε₁']):.3f}" if "ε₁" in edges else "—"),
-            (f"ε₂ = {float(edges['ε₂']):.3f}" if "ε₂" in edges else "—"),
-            (f"q = {float(fit.get('confinement', 0.0) or 0.0):g}"
-             if fit.get("confinement") else "—"),
+            "boundaries", "Boundaries", said("ε₁"), said("ε₂"), third,
             "where the elements take over from one another",
         ))
     return rows
+
+
+# The rows only the regime-by-regime sharing has, after the four it shares
+# with every other way: (support key, symbol, fit field, unit).
+EXTRA_PIECEWISE_ROWS = (
+    ("perinuclear", "E_nc", "E_nc_kPa", "kPa"),
+    ("alignment", "E_align", "E_align_kPa", "kPa"),
+    ("lamina", "A_L", "A_lamina_nN", "nN"),
+)
+EXTRA_NAMES = {
+    "perinuclear": "Perinuclear cytoskeleton",
+    "alignment": "Contact / alignment",
+    "lamina": "Nuclear lamina (lump)",
+}
 
 
 def row_text(key, fit, unit="nN"):
@@ -7767,7 +7920,7 @@ def row_text(key, fit, unit="nN"):
     return ""
 
 
-def fitting_results_rows(fit, style):
+def fitting_results_rows(fit, style, send=True):
     """
     The results, one per row, each with a way onto the figure.
 
@@ -7780,7 +7933,8 @@ def fitting_results_rows(fit, style):
     if not rows:
         st.caption("Fit the curve and the results appear here.")
         return
-    head = st.columns([1.5, 1.3, 1.2, 1.7, 1.6, 0.9])
+    widths = [1.5, 1.3, 1.2, 1.7, 1.6] + ([0.9] if send else [])
+    head = st.columns(widths)
     for column, title in zip(
         head,
         ("", "value", "±", "95 % interval", "where / how", ""),
@@ -7790,7 +7944,7 @@ def fitting_results_rows(fit, style):
             unsafe_allow_html=True,
         )
     for key, label, value, error, interval, note in rows:
-        c = st.columns([1.5, 1.3, 1.2, 1.7, 1.6, 0.9])
+        c = st.columns(widths)
         c[0].markdown(f"**{label}**")
         c[1].markdown(value)
         c[2].markdown(error)
@@ -7799,6 +7953,8 @@ def fitting_results_rows(fit, style):
             f"<span style='font-size:0.85em;opacity:0.8'>{note}</span>",
             unsafe_allow_html=True,
         )
+        if not send:
+            continue
         with c[5]:
             send_to_plot_button(
                 key, f"{label} · {value}", {"key": key}, key=f"row_{key}",
@@ -7807,9 +7963,12 @@ def fitting_results_rows(fit, style):
             )
     st.caption(
         "The ± is one standard error from the covariance of the fit, "
-        "σ²(XᵀWX)⁻¹, and the interval is ±1.96σ around the value, cut at "
-        "zero because a modulus cannot be negative. Every row can go on the "
-        "figure, and stays current there."
+        "σ²(XᵀWX)⁻¹"
+        + (" of the regime the element was fitted in" if not send else "")
+        + ", and the interval is ±1.96σ around the value, cut at "
+        "zero because a modulus cannot be negative."
+        + (" Every row can go on the figure, and stays current there."
+           if send else "")
     )
 
 
@@ -8550,9 +8709,10 @@ def optimisation_controls(model, lo, hi, terms):
     st.markdown("##### Boundaries")
     b1, b2 = st.columns([2.2, 1])
     with b1:
+        # Filled once the fit of this pass exists (boundaries_note), so it
+        # names the boundaries drawn on the plot, not the fit before.
+        slot = st.container()
         st.caption(
-            f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
-            f"ε₂ = {float(st.session_state['segment_break_2']):.3f}. "
             "They are read off the log curve on the **📈 Log curve and "
             "boundaries** tab, which is also where the placements tried and "
             "the algebra of each stretch live."
@@ -8567,6 +8727,36 @@ def optimisation_controls(model, lo, hi, terms):
     # What every curve of this type starts from stays here: it is a setting
     # for the whole experiment, not an analysis of this cell.
     set_default_boundaries_control()
+    return slot
+
+
+def boundaries_note(fit):
+    """The boundaries of the fit on the plot, and any the next fit will move."""
+    if not (fit and fit.get("success")):
+        st.markdown(
+            f"ε₁ = {float(st.session_state['segment_break_1']):.3f}, "
+            f"ε₂ = {float(st.session_state['segment_break_2']):.3f} "
+            "(not fitted yet)."
+        )
+        return
+    edges = fit_edges(fit)
+    shown = ", ".join(f"**{name} = {value:.3f}**" for value, name in edges)
+    st.markdown(
+        (f"On the plot: {shown}" if shown else "This model has no boundaries")
+        + (f" · `fit {fit['fit_id']}`" if fit.get("fit_id") else "")
+    )
+    used = {name for _v, name in edges}
+    notes = []
+    for key, name in (("segment_break_1", "ε₁"), ("segment_break_2", "ε₂")):
+        set_to = float(st.session_state.get(key, float("nan")))
+        was = fit.get("break_1" if name == "ε₁" else "break_2")
+        if name not in used:
+            notes.append(f"{name} = {set_to:.3f} is set but not used by these "
+                         "components")
+        elif was is not None and abs(set_to - float(was)) > 5e-4:
+            notes.append(f"{name} is set to {set_to:.3f}; refit to move the line")
+    if notes:
+        st.caption("; ".join(notes) + ".")
 
 
 def _term_symbol(term):
@@ -10055,12 +10245,6 @@ with st.sidebar:
         "Below here is presentation and plumbing, not physics."
     )
 
-    with st.expander("📈 Fitting", expanded=False):
-        hint(
-            "The model, the deformation ranges and the fitting options are all in "
-            "the main panel, under **Model** and **Deformation ranges**."
-        )
-
     with st.expander("🎨 Display"):
         st.selectbox(
             "Force unit",
@@ -10823,7 +11007,7 @@ with tab_analysis:
             # fit, on the right what the fit came to -- the verdict, the
             # curve, the results, the equation and the block to copy into a
             # spreadsheet -- all written from one fit, the one on the curve.
-            fit_block = results_area = verdict_slot = None
+            fit_block = results_area = verdict_slot = boundaries_slot = None
             if guided:
                 fit_left, fit_right = st.columns([1, 1.55], gap="large")
                 with fit_right:
@@ -10842,6 +11026,7 @@ with tab_analysis:
                     "Everything the fit θ̂ = argmin ‖F − X(ε₁, ε₂)θ‖² is given. "
                     "The right-hand side is drawn from the fit these made."
                 )
+                load_sharing_control()
 
             if guided:
                 names = components_for(st.session_state["cell_type"])
@@ -10948,7 +11133,8 @@ with tab_analysis:
                 # tab of their own. They were here, above the fit button, which
                 # put a panel of search results and a page of mathematics
                 # between choosing the components and seeing the curve.
-                optimisation_controls(model, guided_lo, guided_hi, chosen)
+                boundaries_slot = optimisation_controls(
+                    model, guided_lo, guided_hi, chosen)
 
                 # ------------------------------------------------- 2 · fit ---
                 st.markdown("#### 2 · Fit")
@@ -11043,14 +11229,14 @@ with tab_analysis:
             )
 
             if guided:
+                # The choice itself is the first control of the parameter
+                # block, "How the components share the load"; here is the
+                # algebra of each way.
                 share_of_load_maths()
-                st.radio(
-                    "How the cell is modelled",
-                    list(MODELS.keys()),
-                    key="model_kind",
-                    label_visibility="collapsed",
+                st.caption(
+                    "Chosen at the top of this block: **"
+                    + current_sharing() + "**."
                 )
-                st.caption(MODELS[st.session_state["model_kind"]])
             else:
                 element_col, model_col = st.columns([1, 1.5])
                 with model_col:
@@ -12063,6 +12249,9 @@ with tab_analysis:
                     fit["fit_id"] = fit_id(fit)
                 with verdict_slot:
                     fit_verdict(fit)
+                if boundaries_slot is not None:
+                    with boundaries_slot:
+                        boundaries_note(fit)
 
             if comparison and comparison.get("success"):
                 st.info(retell(comparison["verdict"]))
@@ -12281,7 +12470,7 @@ with tab_analysis:
                     # sentence about chi-squared that a person could read
                     # straight off the two numbers beside R². Three of those
                     # were duplicates and the fourth was noise.
-                    section("4 · Fitting results")
+                    section("Fitting results")
                     fitting_results_rows(fit, style)
 
                 rmse_disp, rmse_unit = from_newtons(fit["rmse"], style.force_unit)
@@ -14374,15 +14563,16 @@ with tab_results:
                 # Written exactly as on the analysis tab, in the same units,
                 # so the two tabs show one set of numbers.
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("E_shell", pressure_text(fit["Em"]))
-                m2.metric("E_cyto", pressure_text(fit["Ei"]))
-                m3.metric("E_ne", pressure_text(fit["Ene"]))
+                m1.metric("Eₘ", modulus_display("E_shell", fit["Em"]))
+                m2.metric("Ec", modulus_display("E_cyto", fit["Ei"]))
+                m3.metric("E_ne", modulus_display("E_ne", fit["Ene"]))
                 m4.metric("R²", f"{fit['r_squared']:.5f}")
                 m5, m6, m7, m8 = st.columns(4)
-                m5.metric("E_nc", pressure_text(fit.get("E_nc_kPa", 0.0) * 1e3))
-                m6.metric("E_core", pressure_text(fit["En"]))
-                m7.metric("E_align", pressure_text(fit.get("E_align_kPa", 0.0) * 1e3))
-                m8.metric("A_L (lamina)", f"{fit.get('A_lamina_nN', 0.0):.3g} nN")
+                m5.metric("E_nc", modulus_display("E_nc", fit.get("E_nc_kPa", 0.0) * 1e3))
+                m6.metric("Eₙ", modulus_display("E_core", fit["En"]))
+                m7.metric("E_align", modulus_display("E_align",
+                                                     fit.get("E_align_kPa", 0.0) * 1e3))
+                m8.metric("A_L (lamina)", f"{fit.get('A_lamina_nN', 0.0):.4g} nN")
                 if fit.get("fit_id"):
                     st.caption(f"fit {fit['fit_id']}, the same fit as on the "
                                "📊 Force curve analysis tab.")
@@ -14408,90 +14598,20 @@ with tab_results:
                     f"bending constant Kₘ = {fit.get('Km_kT', float('nan')):.3g} k_BT"
                 )
 
-        # The note in the corner is this fit's, not the page's last one.
-        if getattr(style, "range_note", None):
-            style = replace_style(style, range_note=fit_range_note(fit))
+        # A clean figure: the measured points and the fitted curve, nothing
+        # else. Everything that explains the fit is on the analysis tab.
+        clean_style = replace_style(
+            style, range_note=None, show_component_heights=False,
+            show_components=False, show_fit_window=False,
+        )
         results_figure = force_curve_figure(
             results["epsilon"],
             results["force_N"],
-            style,
+            clean_style,
             title=results["cell_name"] or "Force vs relative deformation",
             fit_force_N=results["fitted_N"],
-            membrane_N=results["membrane_N"],
-            interior_N=results["interior_N"],
-            fit_window=None,
         )
-        if fit.get("piecewise"):
-            # The same ε₁, ε₂, ε₃, the same contact artefact and the same
-            # components, over the same ranges, as the analysis tab, on
-            # this ε axis.
-            bounds_r = fit["piecewise"]["boundaries_pct"]
-            top_r = float(np.nanmax(results["epsilon"])) * 100.0
-            pw_result = results.get("piecewise_result")
-            off_r = results.get("piecewise_off") or ()
-            if pw_result and not style.log_scale:
-                results_figure.add_vrect(
-                    x0=0.0, x1=float(bounds_r[1]) / 100.0, layer="below",
-                    line_width=0, fillcolor=ARTEFACT_FILL)
-            rows_r = add_boundary_lines(
-                results_figure, bounds_r, scale=0.01,
-                x_span=top_r * 1.05, x_max=top_r * 1.02,
-                extra=[{"x": 0.0, "text": "contact artefact [0, ε₁)",
-                        "kind": "region"}],
-            )
-            if pw_result:
-                scale_f = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
-                stacked_r = (st.session_state.get("pw_view", "stacked") == "stacked"
-                             and component_force is not None
-                             and not style.log_scale)
-                grid = np.linspace(float(bounds_r[0]), float(bounds_r[-1]), 600)
-                marks = [v for pair in pw_result["ranges"].values() for v in pair]
-                grid = np.unique(np.concatenate(
-                    [grid, [v for v in marks + list(bounds_r)
-                            if bounds_r[0] <= v <= bounds_r[-1]]]))
-                for name, label, _symbol, colour, _law in PW_COMPONENTS:
-                    if name in off_r:
-                        continue
-                    a, u = pw_result["ranges"][name]
-                    if stacked_r:
-                        layer = component_force(pw_result, name, grid)
-                        if layer is None:
-                            continue
-                        results_figure.add_trace(go.Scatter(
-                            x=grid / 100.0, y=layer * scale_f, mode="lines",
-                            stackgroup="components",
-                            name=f"{label} · [{a:.1f}, {u:.1f}] %",
-                            line={"color": colour, "width": 0.8},
-                            fillcolor=_rgba(colour, 0.30),
-                        ))
-                        continue
-                    curve = component_curve(pw_result, name)
-                    if curve is None:
-                        continue
-                    results_figure.add_trace(go.Scatter(
-                        x=curve[0] / 100.0, y=curve[1] * scale_f, mode="lines",
-                        name=f"{label} · [{a:.1f}, {u:.1f}] %",
-                        line={"color": colour, "width": 2, "dash": "dash"},
-                    ))
-                # The layers under the points and the fitted line, not over.
-                traces = list(results_figure.data)
-                layers = [t for t in traces
-                          if isinstance(getattr(t, "stackgroup", None), str)]
-                if layers:
-                    try:
-                        ids = {id(t) for t in layers}
-                        results_figure.data = tuple(
-                            layers + [t for t in traces if id(t) not in ids])
-                    except Exception:  # pragma: no cover - older plotly
-                        pass
-            finish_legend_below(results_figure, style, rows_r)
-        else:
-            decorate_curve_figure(
-                results_figure, style, fit, results["epsilon"],
-                bands=(results.get("fit_windows") or ()
-                       if getattr(style, "show_fit_window", True) else ()),
-                boundaries=True, show_range=True,
-            )
+        finish_legend_below(results_figure, clean_style, 0)
         st.plotly_chart(results_figure, **STRETCH, key="results_tab_plot")
 
 
@@ -14605,6 +14725,7 @@ with tab_export:
 
 
 # ------------------------------------------------ settings kept offstage --
-# Last thing in the run, on purpose: see keep_unrendered_settings.
-if globals().get("piecewise_mode"):
-    keep_unrendered_settings()
+# Last thing in the run, on purpose: see keep_unrendered_settings. Every
+# run, whichever way the load is shared, so switching the sharing back finds
+# the other way's settings (its ε, its ranges) as they were left.
+keep_unrendered_settings()
