@@ -283,10 +283,16 @@ def case_c2c12_opens_on_the_four_regime_fit():
           {"refined", "power", "everything", "defaults"}
           <= set((placements.get("rows") or {})),
           str(list((placements.get("rows") or {}))))
-    labels = [m.label for m in app.metric]
-    for symbol in ("E_shell", "E_cyto", "E_ne", "E_nc", "E_core", "E_align"):
-        check(f"{symbol} is on the page", any(symbol in l for l in labels),
-              str(labels))
+    # One model: the piecewise results are written with the spring
+    # network's symbols, in the same table as every other way of sharing.
+    said = " ".join(str(m.value) for m in app.get("markdown"))
+    for symbol in ("Eₘ", "Ec", "E_ne", "E_nc", "Eₙ", "E_align", "A_L"):
+        check(f"{symbol} is in the results", f"**{symbol} " in said,
+              said[:300])
+    check("the way the load is shared is the first choice, piecewise first",
+          app.radio(key="load_sharing").value.startswith("Piecewise")
+          and list(app.radio(key="load_sharing").options)[0].startswith("Piecewise"),
+          str(app.radio(key="load_sharing").options))
     check("the fit follows the curve", fit.get("r_squared", 0) > 0.999,
           str(fit.get("r_squared")))
     # One fit on the right: the block to paste carries the fingerprint and
@@ -379,11 +385,19 @@ def case_c2c12_opens_on_the_four_regime_fit():
               "cell-A" in kept and len(kept["cell-A"]["bounds_pct"]) == 5,
               str(list(kept)))
 
-    app.radio(key="c2c12_fit_mode").set_value(ADVANCED_MODE).run()
-    if no_exception(app, "switching to the spring-network models"):
-        check("and the spring-network fit is one click away",
+    e2_before = state(app, "pw_b2")
+    app.radio(key="load_sharing").set_value(
+        "Segmented (each part takes over in turn)").run()
+    if no_exception(app, "switching to segmented sharing"):
+        check("and segmented sharing is one click away",
               button_by_label(app, "Fit θ̂: bounded least squares") is not None,
               str([b.label for b in app.button][:12]))
+        check("with the same ε₂, where the nucleus is reached",
+              abs(100.0 * state(app, "segment_break_2") - e2_before) < 1e-6,
+              f"{state(app, 'segment_break_2')} vs {e2_before}")
+        check("under the same one control",
+              state(app, "c2c12_fit_mode") == ADVANCED_MODE
+              and state(app, "model_kind").startswith("Segmented"))
 
 
 def case_loads_clean():
@@ -5178,7 +5192,7 @@ def case_the_controls_sit_above_the_curve():
           and "apply_plot_layers(figure, shown_style, fit)" in source)
     check("the equation is written after the results heading",
           source.index('st.markdown("##### The equation that was fitted")')
-          > source.index('section("4 · Fitting results")'))
+          > source.index('section("Fitting results")'))
     check("and the power-law picture has a tab of its own",
           'st.markdown("#### Where the curve changes its power law")'
           in source and '"📈 Log curve and boundaries"' in source)
