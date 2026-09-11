@@ -15,9 +15,11 @@ sys.path.insert(0, str(HERE))
 
 from piecewise_fit import (  # noqa: E402
     C2C12_BOUNDARIES_PCT,
+    boundaries_from_power_law,
     component_curve,
     component_ranges,
     find_boundaries,
+    power_law_profile,
     joint_sse,
     Geometry,
     fit_piecewise,
@@ -352,6 +354,41 @@ def test_the_search_respects_the_c2c12_prior():
     assert found2["best_pct"][1] >= 44.0
     assert all(15 - 1e-9 <= found2["best_pct"][2] - found2["best_pct"][1] <= 35 + 1e-9
                for _ in [0])
+
+
+def test_the_power_law_reads_the_exponents_off_the_curve():
+    # A pure power law has a flat exponent equal to its power.
+    x = np.linspace(0.5, 91.2, 1500)
+    for power in (1.5, 3.0):
+        prof = power_law_profile(x / 100, 1e-9 * x ** power)
+        mid = (prof["x_pct"] > 5) & (prof["x_pct"] < 85)
+        assert np.allclose(prof["exponent"][mid], power, atol=0.05), power
+
+
+def test_the_power_law_places_the_boundaries_roughly_and_fitting_finishes():
+    carry_all = ("K_shell", "K_cyto", "K_nuc_cyto", "K_nucleus", "K_core")
+    bands, span = ((1, 5), (44, 62), (59, 89)), (15, 35)
+    x = np.linspace(0, 91.2, 1500)
+    rng = np.random.default_rng(2)
+    true = (5.0, 58.0, 80.0)
+    f = additive(x, TRUE, component_ranges((0,) + true + (91.2,), carry=carry_all))
+    f = f + rng.normal(0, 0.5e-9, x.size)
+    rough = boundaries_from_power_law(power_law_profile(x / 100, f), bands, span)
+    assert rough["success"]
+    b1, b2, b3 = rough["best_pct"]
+    # Inside the constraints, and within reach of the truth...
+    assert 1 <= b1 <= 5 and 44 <= b2 <= 62 and 15 <= b3 - b2 <= 35
+    assert abs(b2 - true[1]) < 12 and abs(b3 - true[2]) < 15
+    # ...and fitting everything near them lands on it.
+    near = tuple((max(c[0], p - 15), min(c[1], p + 15))
+                 for c, p in zip(bands, rough["best_pct"]))
+    fine = find_boundaries(x / 100, f, bands_pct=near, span_pct=span,
+                           spec_pct=rough["best_pct"], carry=carry_all)
+    assert abs(fine["best_pct"][1] - true[1]) < 0.6
+    assert abs(fine["best_pct"][2] - true[2]) < 0.6
+    r = fit_piecewise(x / 100, f, boundaries_pct=(0,) + fine["best_pct"] + (91.2,),
+                      carry=carry_all)
+    assert r["r_squared"] >= 0.999
 
 
 def test_the_search_uses_the_page_settings():
