@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -117,10 +118,59 @@ if not HAS_WINDOW_SEARCH:
 # The four-regime, C0-anchored C2C12 fit. Optional in the same way: without
 # piecewise_fit.py the C2C12 page falls back to the other models rather than
 # refusing to start.
-try:
-    _piecewise_module = importlib.import_module("piecewise_fit")
-except Exception:  # pragma: no cover - only on a half-updated deploy
-    _piecewise_module = None
+PIECEWISE_PROBLEM = ""
+
+
+def _load_piecewise():
+    """Import piecewise_fit, or a copy saved under a near-miss name.
+
+    Files added through the GitHub web page or a download folder often
+    arrive as "Piecewise fit.py" or "piecewise_fit (1).py", which Python
+    cannot import by name. Such a copy is loaded from its path instead, and
+    the reason is kept so the page can say exactly what to rename.
+    """
+    global PIECEWISE_PROBLEM
+    try:
+        return importlib.import_module("piecewise_fit")
+    except ModuleNotFoundError:
+        pass
+    except Exception as exc:  # pragma: no cover - a broken copy
+        PIECEWISE_PROBLEM = f"piecewise_fit.py failed to import: {exc}"
+        return None
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        names = sorted(os.listdir(here))
+    except OSError:
+        names = []
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        key = re.sub(r"[^a-z]", "", stem.lower())
+        if ext.lower() != ".py" or not key.startswith("piecewisefit"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "piecewise_fit", os.path.join(here, name))
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["piecewise_fit"] = module
+            spec.loader.exec_module(module)
+        except Exception as exc:  # pragma: no cover - a broken copy
+            sys.modules.pop("piecewise_fit", None)
+            PIECEWISE_PROBLEM = f"'{name}' failed to import: {exc}"
+            return None
+        PIECEWISE_PROBLEM = (
+            f"The engine is saved as '{name}'. It was loaded anyway, but "
+            "rename it to piecewise_fit.py so every tool can import it.")
+        return module
+    PIECEWISE_PROBLEM = ("piecewise_fit.py was not found in the folder "
+                         "that holds app.py.")
+    return None
+
+
+_piecewise_module = _load_piecewise()
+# Newer than the rest: without it the plot draws each component on its own
+# rather than stacked, and nothing else changes.
+component_force = getattr(_piecewise_module, "component_force", None)
 HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "C2C12_BOUNDARIES_PCT",
     "C2C12_REGIMES",
@@ -138,6 +188,28 @@ HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "probe_correction",
     "regime_curves",
 ), required=False)
+
+if _piecewise_module is not None and not HAS_PIECEWISE:
+    _stale = [name for name in (
+        "C2C12_BOUNDARIES_PCT", "C2C12_REGIMES", "Geometry",
+        "SEARCH_BANDS_PCT", "component_curve", "component_ranges",
+        "lamina_summary", "find_boundaries", "boundaries_from_power_law",
+        "power_law_profile", "fit_piecewise", "piecewise_moduli",
+        "predict_piecewise", "probe_correction", "regime_curves",
+    ) if not hasattr(_piecewise_module, name)]
+    PIECEWISE_PROBLEM = (
+        (PIECEWISE_PROBLEM + " ") if PIECEWISE_PROBLEM.startswith("The engine")
+        else "") + (
+        "piecewise_fit.py is older than app.py; it lacks "
+        + ", ".join(_stale) + ". Replace it with the version shipped "
+        "with this app.py.")
+
+
+def piecewise_problem_note():
+    """Say why the 4-regime fit is unavailable (or loaded from a stray name)."""
+    if PIECEWISE_PROBLEM:
+        (st.warning if HAS_PIECEWISE else st.error)(
+            "4-regime engine: " + PIECEWISE_PROBLEM)
 
 if MISSING_PIECES:
     st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
@@ -657,6 +729,7 @@ DEFAULTS = {
     # {name: {"p0": .., "lower": .., "upper": ..}}. Empty means the spec's.
     "pw_settings": {},
     "pw_log_y": False,
+    "pw_view": "stacked",
     # The cell shell keeps stiffening after regime 2: K_shell*(x - ε₁)^3,
     # with the K_shell regime 2 measured, is carried through regimes 3 and 4
     # and they fit what is left on top of it.
@@ -1229,7 +1302,10 @@ def fit_record(fit, unit="nN"):
         return {}
     factor, unit_label = FORCE_UNITS.get(unit, (1e9, "nN"))
     lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    # The boundaries this fit actually has: the lines on the curve.
+    edges = {name: value for value, name in fit_edges(fit)}
     record = {
+        "Fit ID": fit.get("fit_id") or fit_id(fit),
         "Cell ID": st.session_state.get("cell_name", ""),
         "Cell type": st.session_state.get("cell_type", ""),
         "Experiment date": str(st.session_state.get("date_acquired", "")),
@@ -1237,10 +1313,8 @@ def fit_record(fit, unit="nN"):
         "Spring constant (N/m)": st.session_state.get("spring_constant", ""),
         "eps min": round(lo, 4),
         "eps max": round(hi, 4),
-        "eps1": (round(float(fit["break_1"]), 4)
-                 if fit.get("break_1") is not None else ""),
-        "eps2": (round(float(fit["break_2"]), 4)
-                 if fit.get("break_2") is not None else ""),
+        "eps1": round(float(edges["ε₁"]), 4) if "ε₁" in edges else "",
+        "eps2": round(float(edges["ε₂"]), 4) if "ε₂" in edges else "",
         "q (confinement)": round(float(fit.get("confinement", 0.0) or 0.0), 4),
     }
     for term in ALL_TERMS:
@@ -1357,15 +1431,8 @@ def fitted_equation(fit, unit="nN", heading=True):
         )
         + bracket_close
     )
-    e1 = fit.get("break_1")
-    e2 = fit.get("break_2")
-    boundaries = []
-    if any(p["term"] in ("tension", "membrane", "interior") for p in pieces) \
-            and e1 is not None:
-        boundaries.append(f"ε₁ = {float(e1):.3f}")
-    if any(p["term"] in ("nucleus", "nucleus_shell") for p in pieces) \
-            and e2 is not None:
-        boundaries.append(f"ε₂ = {float(e2):.3f}")
+    # The same boundaries as the lines on the curve and the results rows.
+    boundaries = [f"{name} = {value:.3f}" for value, name in fit_edges(fit)]
     lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
     st.caption(
         "⟨x⟩ is x where x is positive and zero before that, so each term "
@@ -1473,8 +1540,16 @@ def copy_the_results(fit, unit="nN"):
     record = fit_record(fit, unit)
     if not record:
         return
-    with st.expander("📋 Copy these results into a spreadsheet",
-                     expanded=False):
+    copy_block(record, key="download_fit_record",
+               file_stem=st.session_state.get("cell_name", "cell") or "cell",
+               summary=(f"fit {record['Fit ID']} · R² = "
+                        f"{float(fit.get('r_squared', float('nan'))):.5f}"))
+
+
+def copy_block(record, key, file_stem, summary=""):
+    """The record as two tab-separated lines to paste, and as a CSV."""
+    with st.expander("📋 Copy these results into a spreadsheet"
+                     + (f" · {summary}" if summary else ""), expanded=False):
         st.code(_tsv(record), language="text")
         st.caption(
             "Tab separated, headers on the first line. Copy both lines, "
@@ -1487,12 +1562,9 @@ def copy_the_results(fit, unit="nN"):
         st.download_button(
             "⬇️ Or download it as a CSV",
             data=_csv(record),
-            file_name=(
-                f"{st.session_state.get('cell_name', 'cell') or 'cell'}"
-                "_fit.csv"
-            ),
+            file_name=f"{file_stem}_fit.csv",
             mime="text/csv",
-            key="download_fit_record",
+            key=key,
             **STRETCH,
         )
 
@@ -2602,19 +2674,23 @@ def view_token():
     ))
 
 
-def fit_range_note():
+def fit_range_note(fit=None):
     """
     The line printed in the corner of the curve: what was fitted, and how well.
 
     Read off the fit when there is one, because that is the range the
     numbers actually came from, and off the chosen range before that, so
-    the plot says what is about to be fitted rather than nothing.
+    the plot says what is about to be fitted rather than nothing. Pass the
+    fit being drawn, so the note and the curve are the same fit.
     """
-    fit = st.session_state.get("_last_fit")
+    if fit is None:
+        fit = st.session_state.get("_last_fit")
     epsilon = (st.session_state.get("data") or {}).get("epsilon")
     if fit and fit.get("success"):
         lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
         bits = [f"fitted ε = {lo:.3f} to {hi:.3f}"]
+        if fit.get("fit_id"):
+            bits.insert(0, f"fit {fit['fit_id']}")
         points = fit.get("n_points")
         if points:
             bits.append(f"{int(points)} points")
@@ -2637,6 +2713,15 @@ def fit_range_note():
         if epsilon is not None and np.size(epsilon) else 0
     )
     return f"range to fit: ε = {lo:.3f} to {hi:.3f}  ·  {inside} points"
+
+
+def replace_style(style, **changes):
+    """A copy of a PlotStyle with some fields changed."""
+    import dataclasses
+    try:
+        return dataclasses.replace(style, **changes)
+    except TypeError:  # pragma: no cover - a PlotStyle without the field
+        return style
 
 
 def current_style(force_N=None) -> PlotStyle:
@@ -4473,23 +4558,22 @@ def fit_at_the_current_settings(model, lo, hi, terms):
     rerun_keeping_settings()
 
 
-def fit_verdict():
+def fit_verdict(fit=None):
     """What the fit on screen came to, at the settings it was given."""
-    fit = st.session_state.get("_last_fit")
+    if fit is None:
+        fit = st.session_state.get("_last_fit")
     if not (fit and fit.get("success")):
         st.caption(
-            "Press it and the answer appears here, with the fitted curve "
-            "below."
+            "Press **Fit θ̂** on the left and the answer appears here, with "
+            "the fitted curve below."
         )
         return
     chi = fit.get("chi_squared_reduced", float("nan"))
-    where = []
-    if fit.get("break_1") is not None:
-        where.append(f"ε₁ = {float(fit['break_1']):.3f}")
-    if fit.get("break_2") is not None:
-        where.append(f"ε₂ = {float(fit['break_2']):.3f}")
+    # The boundaries this fit has, which are the lines on the curve below.
+    where = [f"{name} = {value:.3f}" for value, name in fit_edges(fit)]
     said = (
-        f"**R² = {fit.get('r_squared', float('nan')):.5f}**"
+        (f"`fit {fit['fit_id']}` · " if fit.get("fit_id") else "")
+        + f"**R² = {fit.get('r_squared', float('nan')):.5f}**"
         + (f", χ²/dof = {chi:.3g}" if np.isfinite(chi) else "")
         + " at " + (", ".join(where) if where else "the range shown")
         + f", over ε {float(fit['epsilon_range'][0]):.3f} to "
@@ -4559,6 +4643,9 @@ def piecewise_on():
 
 def fit_mode_control():
     """The one choice above the fit, drawn only where there is a choice."""
+    if (PIECEWISE_PROBLEM and st.session_state.get("cell_type")
+            in PIECEWISE_CELL_TYPES):
+        piecewise_problem_note()
     if not piecewise_offered():
         return False
     if st.session_state.get("c2c12_fit_mode") not in FIT_MODES:
@@ -4859,6 +4946,9 @@ def pressure_text(value, se=None):
     """A modulus in the unit that reads best: Pa, kPa or MPa."""
     if value is None or not np.isfinite(value):
         return "—"
+    if abs(value) < 1e-6:
+        # A coefficient held at its lower bound, not a tiny measurement.
+        return "0 Pa"
     for factor, unit in ((1e6, "MPa"), (1e3, "kPa"), (1.0, "Pa")):
         if abs(value) >= factor or unit == "Pa":
             text = f"{value / factor:.3g} {unit}"
@@ -4866,6 +4956,78 @@ def pressure_text(value, se=None):
                 text = f"{value / factor:.3g} ± {se / factor:.2g} {unit}"
             return text
     return f"{value:.3g} Pa"
+
+
+def piecewise_fit_id(result):
+    """The fingerprint of a four-regime fit: its ε and its coefficients."""
+    if not (result and result.get("success")):
+        return ""
+    return fit_id({
+        "success": True, "coupling": "piecewise",
+        "boundaries_pct": [round(float(v), 6) for v in result["boundaries_pct"]],
+        "coefficients": {k: float(v) for k, v in
+                         sorted((result.get("coefficients") or {}).items())},
+        "r_squared": float(result.get("r_squared", float("nan"))),
+    })
+
+
+def piecewise_record(result, lamina, source, geometry, name, fid):
+    """
+    The four-regime fit as one flat row for a spreadsheet.
+
+    Every number comes from ``result``, the fit on the curve, in the order
+    the page shows it: the fit's fingerprint, the cell, ε, the quality, then
+    each modulus with its ±, its 95 % interval and its coefficient, then the
+    lamina. Moduli are all in kPa so a column can be averaged as it is.
+    """
+    b = result["boundaries_pct"]
+    record = {
+        "Fit ID": fid,
+        "Cell ID": name,
+        "Cell type": st.session_state.get("cell_type", ""),
+        "Experiment date": str(st.session_state.get("date_acquired", "")),
+        "Model": "4-regime piecewise",
+        "Cell height h0 (um)": round(geometry.cell_height * 1e6, 4),
+        "Cell radius R0 (um)": round(geometry.cell_radius * 1e6, 4),
+        "Nucleus radius Rn (um)": round(geometry.nucleus_radius * 1e6, 4),
+        "Probe radius Rp (um)": (round(geometry.probe_radius * 1e6, 4)
+                                 if geometry.probe_radius else ""),
+        "eps1 (%)": round(float(b[1]), 3),
+        "eps2 (%)": round(float(b[2]), 3),
+        "eps3 (%)": round(float(b[3]), 3),
+        "x_end (%)": round(float(b[4]), 3),
+        "eps route": source,
+        "R2": float(result.get("r_squared", float("nan"))),
+        "chi2 per dof": float(result.get("chi_squared_reduced", float("nan"))),
+        "RMSE (N)": float(result.get("rmse", float("nan"))),
+        "n points": int(result.get("n_points", 0)),
+    }
+    off = piecewise_off()
+    for key, _label, symbol, _colour, _law in PW_COMPONENTS:
+        row = (result.get("moduli") or {}).get(key)
+        if key == "A_lamina" or row is None:
+            continue
+        value = float(row.get("E_Pa", float("nan"))) / 1e3
+        error = float(row.get("E_se_Pa", float("nan"))) / 1e3
+        if key in off:
+            value, error = 0.0, float("nan")
+        label = f"{row['symbol']} (kPa)"
+        record[label] = value
+        record[f"± {label}"] = error
+        record[f"{label} 95% low"] = (max(value - 1.96 * error, 0.0)
+                                      if np.isfinite(error) else "")
+        record[f"{label} 95% high"] = (value + 1.96 * error
+                                       if np.isfinite(error) else "")
+        record[f"{key} (N/%^{row['power']:g})"] = float(row.get("K", float("nan")))
+        record[f"± {key}"] = float(row.get("K_se", float("nan")))
+    if lamina:
+        record["A_L lamina (nN)"] = float(lamina["A_N"]) * 1e9
+        record["± A_L (nN)"] = float(lamina.get("A_se_N", float("nan"))) * 1e9
+        record["W_L (fJ)"] = float(lamina.get("work_J", float("nan"))) * 1e15
+        record["lamina peak (%)"] = float(lamina["peak_pct"])
+    record["C0 (N)"] = float((result.get("coefficients") or {}).get("C0", float("nan")))
+    record["membrane throughout"] = "K_shell" in (result.get("carry") or ())
+    return record
 
 
 def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
@@ -4929,6 +5091,7 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
 
     fit = {
         "success": True,
+        "fit_id": piecewise_fit_id(result),
         "coupling": "piecewise",
         "model_label": PIECEWISE_MODE,
         "terms": ("membrane", "interior", "nucleus_shell", "nucleus"),
@@ -5025,7 +5188,7 @@ def piecewise_stage_plan(result):
 TAG_CHAR_PX = 8.0
 TAG_PAD_PX = 14.0
 TAG_ROW_PX = 24
-ASSUMED_PLOT_PX = 700.0
+ASSUMED_PLOT_PX = 560.0
 
 
 def tag_levels(positions, texts, x_span, plot_px=ASSUMED_PLOT_PX, x_max=None):
@@ -5060,72 +5223,141 @@ def tag_levels(positions, texts, x_span, plot_px=ASSUMED_PLOT_PX, x_max=None):
     return placed, max(len(ends), 1)
 
 
-def add_boundary_lines(fig, bounds, scale=1.0, end_label=True, x_span=None,
-                       x_max=None):
-    """
-    ε₁, ε₂, ε₃ (and the end of the fit) as lines with tags above the plot.
+# How each kind of tagged line looks: (line colour, width, dash, tag
+# border, tag font size, tag text colour). A "region" tag names a shaded
+# stretch and has no line of its own.
+TAG_STYLES = {
+    "boundary": ("#222222", 1.5, "dash", "#222222", 13, "#111111"),
+    "end": ("#888888", 1.0, "dot", "#aaaaaa", 11, "#555555"),
+    "artefact": ("#8c6d31", 1.5, "solid", "#8c6d31", 12, "#6b4f1d"),
+    "rupture": ("#ff7f0e", 2.0, "dashdot", "#ff7f0e", 12, "#b35900"),
+    "region": (None, 0, None, "#8c6d31", 12, "#6b4f1d"),
+}
+ARTEFACT_FILL = "rgba(140,109,49,0.13)"
+ARTEFACT_PCT = 5.0
 
-    Each line runs the whole height of the plot and on up into the top
-    margin to its tag, so the tag never sits on the data, the fitted
-    curves, the legend or another line. Tags that would touch go on
-    separate rows, and one that would run off the right edge turns to the
-    left of its line. Returns the number of rows, so the caller can make
-    the top margin tall enough.
 
-    ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
-    0.01 for one in ε as a fraction. ``x_span`` and ``x_max`` are the x
-    axis's width and right edge, in percent.
+def add_tag_lines(fig, items, x_span, x_max, plot_px=None):
     """
-    lines = [(f"{name} = {float(v):.1f} %", float(v), False, name)
-             for name, v in zip(EPS_NAMES, bounds[1:4])]
-    if end_label:
-        lines.append((f"end = {float(bounds[-1]):.1f} %", float(bounds[-1]),
-                      True, "end"))
-    span = float(x_span) if x_span else max(float(bounds[-1]) - float(bounds[0]), 1.0) * 1.05
-    placed, n_rows = tag_levels([v for _t, v, _e, _n in lines],
-                                [t for t, _v, _e, _n in lines], span,
-                                x_max=x_max if x_max is not None else span)
-    for (text, value, is_end, name), (row, side) in zip(lines, placed):
-        x = value * scale
-        fig.add_shape(
-            type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
-            line={"color": "#888888" if is_end else "#222222",
-                  "width": 1 if is_end else 1.5,
-                  "dash": "dot" if is_end else "dash"},
-            layer="below",
-        )
-        # The line carries on above the plot, in pixels, up to its own tag,
-        # so a tag on a higher row is still plainly attached to its line.
-        fig.add_shape(
-            type="line", xref="x", yref="paper", ysizemode="pixel",
-            yanchor=1.0, x0=x, x1=x, y0=0, y1=4 + TAG_ROW_PX * row + 10,
-            line={"color": "#888888" if is_end else "#222222", "width": 1},
-        )
+    Vertical lines with their tags above the plot, none overlapping.
+
+    ``items`` are dicts with ``x`` (figure units), ``text``, ``kind`` (a
+    TAG_STYLES key) and optionally ``bold`` (the part of the text to set in
+    bold). Each line runs the height of the plot and on up into the top
+    margin to its own tag, so no tag sits on the data, a curve, the legend
+    or another line; tags that would touch go on separate rows, and one
+    that would run off the right edge turns to the left of its line.
+    Returns the number of tag rows, for the top margin.
+    """
+    items = [dict(item) for item in items
+             if item.get("x") is not None and np.isfinite(float(item["x"]))]
+    if not items:
+        return 0
+    placed, n_rows = tag_levels([float(i["x"]) for i in items],
+                                [i["text"] for i in items], x_span,
+                                plot_px=plot_px or ASSUMED_PLOT_PX,
+                                x_max=x_max)
+    for item, (row, side) in zip(items, placed):
+        colour, width, dash, border, size, ink = TAG_STYLES.get(
+            item.get("kind", "boundary"), TAG_STYLES["boundary"])
+        x = float(item["x"])
+        if colour is not None:
+            fig.add_shape(
+                type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
+                line={"color": colour, "width": width, "dash": dash},
+                layer="below",
+            )
+            # The line carries on above the plot, in pixels, up to its own
+            # tag, so a tag on a higher row is still plainly its line's.
+            fig.add_shape(
+                type="line", xref="x", yref="paper", ysizemode="pixel",
+                yanchor=1.0, x0=x, x1=x, y0=0, y1=4 + TAG_ROW_PX * row + 10,
+                line={"color": colour, "width": 1},
+            )
+        text = item["text"]
+        bold = item.get("bold")
+        if bold and bold in text:
+            text = text.replace(bold, f"<b>{bold}</b>", 1)
         fig.add_annotation(
-            x=x, y=1.0, xref="x", yref="paper", showarrow=False,
-            text=(text if is_end else text.replace(name, f"<b>{name}</b>", 1)),
+            x=x, y=1.0, xref="x", yref="paper", showarrow=False, text=text,
             xanchor=side, yanchor="bottom", xshift=3 if side == "left" else -3,
             yshift=4 + TAG_ROW_PX * row,
-            font={"size": 13 if not is_end else 11,
-                  "color": "#555555" if is_end else "#111111"},
-            bgcolor="rgba(255,255,255,0.95)",
-            bordercolor="#222222" if not is_end else "#aaaaaa",
+            font={"size": size, "color": ink},
+            bgcolor="rgba(255,255,255,0.95)", bordercolor=border,
             borderwidth=1, borderpad=2,
         )
     return n_rows
 
 
-def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
+def boundary_tag_items(bounds, scale=1.0, end_label=True):
+    """ε₁, ε₂, ε₃ (and the end of the fit) as tag items, in figure units."""
+    items = [{"x": float(v) * scale, "text": f"{name} = {float(v):.1f} %",
+              "bold": name, "kind": "boundary"}
+             for name, v in zip(EPS_NAMES, bounds[1:4])]
+    if end_label:
+        items.append({"x": float(bounds[-1]) * scale,
+                      "text": f"end = {float(bounds[-1]):.1f} %", "kind": "end"})
+    return items
+
+
+def add_boundary_lines(fig, bounds, scale=1.0, end_label=True, x_span=None,
+                       x_max=None, extra=()):
+    """
+    ε₁, ε₂, ε₃ (and the end of the fit) as lines with tags above the plot,
+    plus any ``extra`` tag items (the contact artefact, a rupture). Returns
+    the number of tag rows, so the caller can make the top margin fit.
+
+    ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
+    0.01 for one in ε as a fraction. ``x_span`` and ``x_max`` are the x
+    axis's width and right edge, in percent.
+    """
+    span = (float(x_span) if x_span
+            else max(float(bounds[-1]) - float(bounds[0]), 1.0) * 1.05)
+    return add_tag_lines(
+        fig, boundary_tag_items(bounds, scale, end_label) + list(extra),
+        span * scale, (x_max if x_max is not None else span) * scale,
+    )
+
+
+def legend_rows(labels, plot_px=None):
+    """How many rows a horizontal legend of these labels needs."""
+    width = float(plot_px or ASSUMED_PLOT_PX)
+    rows, used = 1, 0.0
+    for label in labels:
+        need = 7.0 * len(str(label)) + 44.0
+        if used and used + need > width:
+            rows, used = rows + 1, 0.0
+        used += need
+    return rows
+
+
+PW_VIEWS = {
+    "stacked": "stacked: the layers add up to F̂",
+    "own": "each from zero, over its own [s, u]",
+}
+
+
+def _rgba(hex_colour, alpha):
+    """#rrggbb as an rgba() string."""
+    h = hex_colour.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
+                     view="stacked", note=None):
     """
     The data, the fitted curve, and every component over its own range.
 
-    The top panel is the curve: the data, the total fit in black, and each
-    component's own force as a dashed line in its colour, drawn from where
-    it starts to where it stops adding load. The bottom panel is the same
-    ranges as bars, one row per component in the order of the controls
-    above, with a dotted tail where a component holds what it reached. Both
-    are drawn from the fit's own ranges, which are the ones the controls
-    show, so what is on the plot and what is on the bars is one thing.
+    The top panel is the curve: the data, the total fit in black and the
+    components. Stacked, each component is a layer that starts at its own
+    boundary, thickens while it takes load, keeps its thickness once it
+    holds, and the layers add up to the black curve exactly; each from
+    zero, it is a dashed line from where it starts. The bottom panel is the
+    same ranges as bars. Everything is drawn from the fit's own boundaries
+    and ranges, the ones the controls show and the results report. The
+    first stretch, to ε₁, is shaded as the contact artefact: the probe
+    settling onto the cell, fitted by the contact line and nothing else.
     """
     x = np.asarray(epsilon, dtype=float) * 100.0
     y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
@@ -5134,18 +5366,45 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
     b = result["boundaries_pct"]
     end = float(b[-1])
     ranges = result.get("ranges") or {}
+    stacked = view == "stacked" and not log_y and component_force is not None
     for regime in result["regimes"]:
         a, z = regime["domain_pct"]
         # The regime's name inside its band, at the top left and nudged off
         # the boundary line; the curve rises to the right, so that corner is
         # the one the data leave empty.
         fig.add_vrect(
-            x0=a, x1=z, fillcolor=PW_BANDS.get(regime["key"], "rgba(0,0,0,0.05)"),
+            x0=a, x1=z,
+            fillcolor=(ARTEFACT_FILL if regime["key"] == "R1"
+                       else PW_BANDS.get(regime["key"], "rgba(0,0,0,0.05)")),
             line_width=0, layer="below",
             annotation_text=regime["key"], annotation_position="top left",
             annotation_font_size=12, annotation_font_color="#666666",
-            annotation_xshift=6, annotation_yshift=-4,
+            annotation_xshift=4, annotation_yshift=-4,
         )
+    legend_names = []
+    if stacked:
+        # One grid for every layer, with every boundary and every [s, u] on
+        # it, so each layer's corner is drawn exactly where it is.
+        grid = np.linspace(float(b[0]), end, 700)
+        marks = [v for pair in ranges.values() for v in pair] + list(b)
+        grid = np.unique(np.concatenate(
+            [grid, [v for v in marks if b[0] <= v <= end]]))
+        for name, label, symbol, colour, _law in PW_COMPONENTS:
+            if name in off:
+                continue
+            layer = component_force(result, name, grid)
+            if layer is None:
+                continue
+            a, u = ranges.get(name, (grid[0], grid[-1]))
+            legend_names.append(f"{label} · [{a:.1f}, {u:.1f}] %")
+            fig.add_trace(go.Scatter(
+                x=grid, y=layer * scale, mode="lines", stackgroup="components",
+                name=legend_names[-1],
+                line={"color": colour, "width": 0.8},
+                fillcolor=_rgba(colour, 0.30),
+                hovertemplate=f"{symbol}<br>x = %{{x:.1f}} %<br>F_j = %{{y:.4g}} "
+                              f"{unit}<extra></extra>",
+            ))
     keep = (y > 0) if log_y else np.ones_like(y, dtype=bool)
     fig.add_trace(go.Scatter(
         x=x[keep], y=y[keep], mode="markers", name="Experimental data",
@@ -5157,26 +5416,28 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
         xs = np.concatenate([p[1] for p in pieces])
         fs = np.concatenate([p[2] for p in pieces])
         fig.add_trace(go.Scatter(
-            x=xs, y=fs * scale, mode="lines", name="Fitted curve",
+            x=xs, y=fs * scale, mode="lines",
+            name="Fitted curve F̂" + (" = Σ layers" if stacked else ""),
             line={"color": style.fit_color or "#000000",
                   "width": max(2, int(style.line_width * 0.8))},
         ))
-    # Each component's own force, over its own range.
-    for name, label, symbol, colour, _law in PW_COMPONENTS:
-        if name in off:
-            continue
-        curve = component_curve(result, name)
-        if curve is None:
-            continue
-        cx, cf = curve
-        a, u = ranges.get(name, (cx[0], cx[-1]))
-        fig.add_trace(go.Scatter(
-            x=cx, y=cf * scale, mode="lines",
-            name=f"{label} · {a:.1f}–{u:.1f} %",
-            line={"color": colour, "width": 2, "dash": "dash"},
-            hovertemplate=f"{symbol}<br>x = %{{x:.1f}} %<br>F = %{{y:.4g}} {unit}"
-                          "<extra></extra>",
-        ))
+    if not stacked:
+        # Each component's own force, over its own range.
+        for name, label, symbol, colour, _law in PW_COMPONENTS:
+            if name in off:
+                continue
+            curve = component_curve(result, name)
+            if curve is None:
+                continue
+            cx, cf = curve
+            a, u = ranges.get(name, (cx[0], cx[-1]))
+            legend_names.append(f"{label} · [{a:.1f}, {u:.1f}] %")
+            fig.add_trace(go.Scatter(
+                x=cx, y=cf * scale, mode="lines", name=legend_names[-1],
+                line={"color": colour, "width": 2, "dash": "dash"},
+                hovertemplate=f"{symbol}<br>x = %{{x:.1f}} %<br>F = %{{y:.4g}} {unit}"
+                              "<extra></extra>",
+            ))
     anchor_x, anchor_y, anchor_text = [], [], []
     for name, value in result["anchors"].items():
         where = float(name.split("_")[1].replace("pct", ""))
@@ -5185,8 +5446,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
         anchor_text.append(f"{name.replace('pct', '%')} = {value * scale:.4g} {unit}")
     if anchor_x:
         fig.add_trace(go.Scatter(
-            x=anchor_x, y=anchor_y, mode="markers", name="C0 anchors",
-            marker={"symbol": "diamond", "size": 12, "color": "#ffffff",
+            x=anchor_x, y=anchor_y, mode="markers", name="C⁰ anchors",
+            marker={"symbol": "diamond", "size": 11, "color": "#ffffff",
                     "line": {"color": "#000000", "width": 2}},
             text=anchor_text, hovertemplate="%{text}<extra></extra>",
         ))
@@ -5211,7 +5472,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
             line={"color": colour, "width": 10}, showlegend=False,
             hovertemplate=f"{label}: {a:.1f}–{u:.1f} %<extra></extra>",
         ))
-        if u < end - 1e-6 and name != "k_align":
+        if u < end - 1e-6 and name not in ("k_align", "A_lamina"):
             fig.add_trace(go.Scatter(
                 x=[u, end], y=[row, row], mode="lines", yaxis="y2",
                 line={"color": colour, "width": 2, "dash": "dot"},
@@ -5220,24 +5481,40 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
             ))
     x_lo = min(0.0, float(np.nanmin(x)) if x.size else 0.0) - 1.0
     x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
-    tag_rows = add_boundary_lines(fig, b, x_span=x_hi - x_lo, x_max=x_hi)
-    n_legend = 3 + sum(1 for c in PW_COMPONENTS if c[0] not in off)
+    # The contact artefact is named once, above the plot, over its band.
+    artefact = [{"x": float(b[0]), "text": "contact artefact [0, ε₁)",
+                 "kind": "region"}]
+    tag_rows = add_boundary_lines(fig, b, x_span=x_hi - x_lo, x_max=x_hi,
+                                  extra=artefact)
+    if note:
+        # Which fit this is, top left, under the regime names: the corner
+        # the rising curve and its layers leave empty.
+        fig.add_annotation(
+            text=str(note), xref="paper", yref="paper", x=0.01, y=1.0,
+            xanchor="left", yanchor="top", yshift=-24, showarrow=False,
+            font={"size": 11, "color": "#444444"},
+            bgcolor="rgba(255,255,255,0.88)", bordercolor="#999999",
+            borderwidth=1, borderpad=3,
+        )
+    n_rows = legend_rows(legend_names + ["Experimental data", "Fitted curve F̂",
+                                         "C⁰ anchors"])
     fig.update_layout(
-        height=int(style.height * 1.3) + TAG_ROW_PX * tag_rows,
+        height=int(style.height * 1.3) + TAG_ROW_PX * tag_rows + 22 * n_rows,
         template="simple_white",
-        # Top: room for the ε tags, one row each. Bottom: the x axis, then
+        # Top: room for the tags, one row each. Bottom: the x axis, then
         # the legend under it, so nothing is drawn over the data.
         margin={"l": 80, "r": 20, "t": 16 + TAG_ROW_PX * tag_rows,
-                "b": 90 + 22 * ((n_legend + 2) // 3)},
-        legend={"orientation": "h", "yanchor": "top", "y": -0.14,
-                "xanchor": "left", "x": 0.0, "font": {"size": 12}},
-        xaxis={"title": "Relative deformation (%)", "anchor": "y2",
+                "b": 78 + 24 * n_rows},
+        legend={"orientation": "h", "yref": "container", "yanchor": "bottom",
+                "y": 0.005, "xanchor": "left", "x": 0.0, "font": {"size": 12},
+                "traceorder": "normal"},
+        xaxis={"title": "Relative deformation x (%)", "anchor": "y2",
                "range": [x_lo, x_hi]},
         yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0]},
         yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
                 "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
                 "showgrid": False, "zeroline": False,
-                "title": {"text": "acts over", "font": {"size": 12}}},
+                "title": {"text": "[s, u]", "font": {"size": 12}}},
     )
     if log_y:
         # Only the force axis; the range track stays linear.
@@ -5622,7 +5899,10 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None):
     for name, label, symbol, colour, law in PW_COMPONENTS:
         start, until = ranges[name]
         on = name == "k_align" or st.session_state.get(f"pw_use_{name}", True)
-        c_name, c_bar, c_out = st.columns([1.35, 2.3, 1.05])
+        # Laid out for the narrow parameter column: the name and what the
+        # fit made of it on one line, the range bar under them at full width.
+        c_name, c_out = st.columns([1.7, 1])
+        c_bar = st.container()
         with c_name:
             if name == "k_align":
                 st.markdown(f"**{label}**")
@@ -6011,13 +6291,16 @@ def pw_stepper(result, target, source, name, in_collection):
 
 def piecewise_section(model, epsilon, force_N, rupture):
     """
-    The four-regime step, laid out answer first.
+    The four-regime step: parameters on the left, the fit on the right.
 
-    Top: where this cell is in the four steps, the actions, the moduli and
-    the curve. Below, in tabs, everything that decided them: the ε, the
-    components, the parameters, the model in equations, the settings and
-    the working. Everything is drawn from one fit made in this run from the
-    values on the page, so no two places can disagree.
+    Left, one block with every parameter of the fit: the route to ε and
+    its target, ε itself, the constraints, the components and their
+    ranges, p₀ and bounds, and how the plot draws them. Right, what the fit
+    came to: the verdict, the moduli, the curve, the block to copy into a
+    spreadsheet and the working. The fit is made once, in this run, from
+    the values on the left, and everything on the right is written from
+    that one fit, so no two numbers on the right can disagree; its
+    fingerprint is printed in each place to show it.
 
     Returns (fit, fitted, stage_plan, result) for the sections below.
     """
@@ -6055,7 +6338,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.session_state["_pw_auto_found"] = curve_key
         place(apply_now=True)
 
-    # The fit, from the values already on the page.
+    # The fit, from the values already on the page: the one fit everything
+    # below is written from.
     result = run_piecewise_fit(model, epsilon, force_N)
     style = current_style(force_N)
     placements = current_placements(epsilon, force_N)
@@ -6068,166 +6352,72 @@ def piecewise_section(model, epsilon, force_N, rupture):
     name = collection_name()
     collection = st.session_state.get("pw_collection") or {}
     in_collection = name in collection
+    fid = piecewise_fit_id(result) if ok else ""
+    moduli = (result.get("moduli") or {}) if ok else {}
 
-    # ---- ① ② ③ ④ and the three actions ---------------------------------
+    # ---- ① ② ③ ④, across the page ---------------------------------------
     pw_stepper(result, target, source, name, in_collection)
-    a1, a2, a3 = st.columns([1.2, 1.2, 1])
-    with a1:
-        placing = st.button(
-            "▶ Place ε₁, ε₂, ε₃ (route, R² ≥ R²★)", type="primary", key="pw_find",
-            help="Runs every route on this curve with the model on the page "
-            "and uses the chosen one, or the next with R² ≥ the target.",
-            **STRETCH,
-        )
-    with a2:
-        adding = st.button(
-            ("↻ Update (ε, θ̂, E) in collection" if in_collection
-             else "➕ Store (ε, θ̂, E) in collection"),
-            key="pw_add", disabled=not ok, **STRETCH,
-            help="Keeps this cell (its curve, its own ε, its moduli) for the "
-            "📚 All cells tab. Named after the cell name in section 1, or "
-            "the file.",
-        )
-    with a3:
-        spec = piecewise_defaults()
-        if st.button("↺ Reset ε, [s, u], p₀, bounds", key="pw_reset",
-                     help="ε = " + " / ".join(f"{v:g}" for v in spec) + " %, "
-                     "and the specification's component ranges, p₀ and bounds.",
-                     **STRETCH):
-            rerun_keeping_settings({
-                **dict(zip(PW_BOUNDARY_KEYS, spec)),
-                "pw_settings": {},
-                "pw_until": {},
-                "pw_membrane_throughout": True,
-                **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
-                **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
-                **{f"pw_use_{n}": True for n in PW_SWITCHABLE},
-                "_pw_editor_reset": True,
-            })
-    if placing:
-        place(apply_now=False)
-    if adding and ok:
-        collection = dict(collection)
-        collection[name] = collection_record(
-            name, data.get("source", ""), st.session_state["cell_height_um"],
-            epsilon, force_N, result, geometry,
-            PW_ROW_LABELS.get(selected.get("key"), source),
-        )
-        st.session_state["pw_collection"] = collection
-        rerun_keeping_settings()
 
-    fitted = None
-    if not ok:
-        st.error(f"The fit is not defined here: {result.get('error', '')}. "
-                 "Adjust ε in the first tab below.")
-    else:
-        used = result["boundaries_pct"]
-        chi = result.get("chi_squared_reduced", float("nan"))
-        meets = result["r_squared"] >= target
-        line = (
-            rf"$R^2 = {result['r_squared']:.5f}\;"
-            + (r"\ge" if meets else "<") + rf"\;R^2_\star = {target:g}$"
-            + (rf" · $\chi^2_\nu = {chi:.3g}$" if np.isfinite(chi) else "")
-            + rf" · $n = {result['n_points']}$"
-            + rf" · $(\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
-            rf"({used[1]:.2f},\,{used[2]:.2f},\,{used[3]:.2f})\,\%$"
-            + f" · {source}"
-        )
-        if meets:
-            st.success(line)
-        else:
-            regimes = [r for r in result["regimes"] if r["fitted"] and r["key"] != "R1"]
-            worst = min(regimes, key=lambda r: r["r_squared"]) if regimes else None
-            st.warning(
-                line + (rf" · worst $R_{{{worst['key'][1]}}}$: "
-                        rf"$R^2 = {worst['r_squared']:.4f}$ on "
-                        rf"$[{worst['domain_pct'][0]:.1f},\,{worst['domain_pct'][1]:.1f}]\,\%$"
-                        if worst else "")
-                + ". Try ▶ Place ε₁, ε₂, ε₃, or that regime's components.", icon="⚠️")
+    left, right = st.columns([1, 1.55], gap="large")
 
-        # The answer: one card per element.
-        moduli = result.get("moduli") or {}
-        cards = [(n, moduli.get(n)) for n in
-                 ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core", "k_align")]
-        cols = st.columns(7)
-        for col, (n, row) in zip(cols, cards):
-            if not row:
-                continue
-            with col:
-                st.metric(
-                    row["symbol"],
-                    "off" if n in piecewise_off() else pressure_text(row["E_Pa"]),
-                    help=f"{row['element']} · ${row['symbol']} = 100^{{{row['power']:g}}}"
-                    f"\\,{n}/A$, $A = $ {row['law']}",
-                )
-        with cols[6]:
-            if lamina:
-                st.metric(
-                    "A_L (lamina)",
-                    f"{lamina['A_N'] * 1e9:.3g} nN" if lamina["present"] else "0",
-                    help=r"$L(x) = A_L\sin^2(\pi\frac{x-\varepsilon_2}"
-                    r"{\varepsilon_3-\varepsilon_2})$ · peak at "
-                    f"{lamina['peak_pct']:.1f} %"
-                    + (f" · $W_L = {lamina.get('work_J', float('nan')) * 1e15:.3g}$ fJ"
-                       if lamina.get("work_J") is not None else ""),
-                )
-
-        st.checkbox("log F axis", key="pw_log_y")
-        st.plotly_chart(
-            piecewise_figure(epsilon, force_N, result, style,
-                             log_y=bool(st.session_state.get("pw_log_y")),
-                             off=piecewise_off()),
-            key="pw_curve", **STRETCH,
-        )
-        fitted = predict_piecewise(epsilon, result)
-
-    # ---- everything that decided it ------------------------------------
-    t_eps, t_comp, t_par, t_model, t_set, t_work = st.tabs([
-        "ε · boundaries & routes", "Components", "p₀ & bounds",
-        "Model F(x)", "Settings used", "🔍 Working",
-    ])
-
-    with t_eps:
-        prior = piecewise_prior()
-        (l1, h1), (l2, h2), _b3 = piecewise_bands()
-        s_lo, s_hi = piecewise_span()
-        st.markdown("**Constraints** (the app's C2C12 prior), in %:")
-        st.latex(rf"{l1:g} \le \varepsilon_1 \le {h1:g},\qquad "
-                 rf"{l2:g} \le \varepsilon_2 \le {h2:g},\qquad "
-                 rf"{s_lo:g} \le \varepsilon_3 - \varepsilon_2 \le {s_hi:g},"
-                 rf"\qquad \varepsilon_3 < x_{{end}}")
-        st.latex(r"\operatorname{supp}K_{shell} = \operatorname{supp}K_{cyto} "
-                 r"= [\varepsilon_1, x_{end}],\quad \operatorname{supp}K_{ne} = "
-                 r"\operatorname{supp}K_{nc} = [\varepsilon_2, x_{end}],\quad "
-                 r"\operatorname{supp}A_L = [\varepsilon_2, \varepsilon_3],\quad "
-                 r"\operatorname{supp}K_{core} = [\varepsilon_3, x_{end}]")
-        m1, m2 = st.columns([3, 1])
-        with m1:
-            st.radio(
-                "Route to ε", list(PW_METHODS),
-                format_func=lambda k: PW_METHODS[k] + (
-                    " (recommended)" if k == "refined" else ""),
-                key="pw_method", horizontal=True, on_change=_pw_apply_selection,
+    # ================================================ left: the parameters
+    with left:
+        block = st.container(border=True)
+    with block:
+        st.markdown("### ⚙️ Fit parameters")
+        st.caption("Everything the fit is given. The right-hand side is "
+                   "drawn from the fit these values make.")
+        a1, a3 = st.columns(2)
+        with a1:
+            placing = st.button(
+                "▶ Place ε₁, ε₂, ε₃ (route, R² ≥ R²★)", type="primary",
+                key="pw_find",
+                help="Runs every route on this curve with the model on the "
+                "page and uses the chosen one, or the next with R² ≥ the "
+                "target.",
+                **STRETCH,
             )
-            st.caption(PW_METHOD_HELP[st.session_state.get("pw_method", "refined")])
-        with m2:
-            st.number_input(
-                "R²★ (target)", min_value=0.9, max_value=0.99999,
-                step=0.0005, format="%.4f", key="pw_target_r2",
-                on_change=_pw_apply_selection,
-                help=r"The route used is the first with $R^2 \ge R^2_\star$.",
-            )
-        c1, c2, c3, c4 = st.columns(4)
+        with a3:
+            spec = piecewise_defaults()
+            if st.button("↺ Reset ε, [s, u], p₀, bounds", key="pw_reset",
+                         help="ε = " + " / ".join(f"{v:g}" for v in spec) + " %, "
+                         "and the specification's component ranges, p₀ and "
+                         "bounds.",
+                         **STRETCH):
+                rerun_keeping_settings({
+                    **dict(zip(PW_BOUNDARY_KEYS, spec)),
+                    "pw_settings": {},
+                    "pw_until": {},
+                    "pw_membrane_throughout": True,
+                    **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
+                    **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
+                    **{f"pw_use_{n}": True for n in PW_SWITCHABLE},
+                    "_pw_editor_reset": True,
+                })
+
+        st.markdown("#### 1 · Boundaries ε (%)")
+        st.radio(
+            "Route to ε", list(PW_METHODS),
+            format_func=lambda k: PW_METHODS[k] + (
+                " (recommended)" if k == "refined" else ""),
+            key="pw_method", on_change=_pw_apply_selection,
+        )
+        st.caption(PW_METHOD_HELP[st.session_state.get("pw_method", "refined")])
+        st.number_input(
+            "R²★ (target)", min_value=0.9, max_value=0.99999,
+            step=0.0005, format="%.4f", key="pw_target_r2",
+            on_change=_pw_apply_selection,
+            help=r"The route used is the first with $R^2 \ge R^2_\star$.",
+        )
+        c1, c2 = st.columns(2)
         with c1:
             st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
                             key="pw_b1", help=EPS_ROLES[0])
+            st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
+                            key="pw_b3", help=EPS_ROLES[2])
         with c2:
             st.number_input("ε₂ (%)", 1.0, 99.0, step=0.5, format="%.2f",
                             key="pw_b2", help=EPS_ROLES[1])
-        with c3:
-            st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
-                            key="pw_b3", help=EPS_ROLES[2])
-        with c4:
             st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
                             key="pw_end", help="Last point fitted; not moved "
                             "by the routes.")
@@ -6238,13 +6428,18 @@ def piecewise_section(model, epsilon, force_N, rupture):
             if 0.0 < at < min(float(st.session_state["pw_end"]), top):
                 st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
                            rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
-        if placements:
-            piecewise_placement_table(placements, piecewise_boundaries(),
-                                      target, selected)
-        elif st.session_state.get("pw_placements"):
+        if not placements and st.session_state.get("pw_placements"):
             st.caption("ℹ️ The model changed since ε was placed: press "
                        "**▶ Place ε₁, ε₂, ε₃**.")
-        with st.expander("Edit the constraints", expanded=False):
+        with st.expander("Constraints on ε (the app's C2C12 prior)",
+                         expanded=False):
+            prior = piecewise_prior()
+            (l1, h1), (l2, h2), _b3 = piecewise_bands()
+            s_lo, s_hi = piecewise_span()
+            st.latex(rf"{l1:g} \le \varepsilon_1 \le {h1:g},\;\; "
+                     rf"{l2:g} \le \varepsilon_2 \le {h2:g}")
+            st.latex(rf"{s_lo:g} \le \varepsilon_3 - \varepsilon_2 \le {s_hi:g},"
+                     rf"\;\; \varepsilon_3 < x_{{end}}")
             for i, (lo_key, hi_key) in enumerate(PW_BAND_KEYS):
                 l, h = st.columns(2)
                 with l:
@@ -6263,90 +6458,213 @@ def piecewise_section(model, epsilon, force_N, rupture):
             if prior.get("why"):
                 st.caption("Prior: " + prior["why"] + ".")
 
-    with t_comp:
-        piecewise_components_panel(piecewise_boundaries(),
-                                   result.get("moduli") if ok else None, lamina)
+        st.markdown("#### 2 · Components θⱼ over [sⱼ, uⱼ]")
+        piecewise_components_panel(piecewise_boundaries(), moduli or None, lamina)
 
-    with t_par:
-        piecewise_parameter_editor()
+        with st.expander("3 · p₀ and bounds [θ_lo, θ_hi]", expanded=False):
+            piecewise_parameter_editor()
 
-    with t_model:
-        if ok:
+        st.markdown("#### 4 · Plot")
+        st.radio("Components on the plot", list(PW_VIEWS),
+                 format_func=PW_VIEWS.get, key="pw_view",
+                 help="Stacked, the layers add up to the fitted curve and each "
+                 "starts at its own boundary; each from zero, every "
+                 "component is its own dashed line.")
+        st.checkbox("log F axis (components drawn each from zero)",
+                    key="pw_log_y")
+
+    if placing:
+        place(apply_now=False)
+
+    # ================================================== right: the fit
+    fitted = None
+    with right:
+        if not ok:
+            st.error(f"The fit is not defined here: {result.get('error', '')}. "
+                     "Adjust ε on the left.")
+        else:
             used = result["boundaries_pct"]
-            st.markdown("**Model**")
-            for line in piecewise_equations_latex(used, result.get("ranges") or {},
-                                                  piecewise_off()):
-                st.latex(line)
-            st.markdown("**Estimator** (sequential, $k = 1\\ldots4$, "
-                        "$\\varepsilon_0 = 0$, $\\varepsilon_4 = x_{end}$)")
-            st.latex(r"\hat\theta_k = \arg\min_{\theta_{lo}\le\theta\le\theta_{hi}}"
-                     r"\sum_{x_i \in [\varepsilon_{k-1},\varepsilon_k)}\Big[F_i - "
-                     r"\hat F(\varepsilon_{k-1}) - C_k(x_i) - \sum_{j \in k}\theta_j"
-                     r"\phi_j(x_i)\Big]^2")
-            st.latex(r"\hat F_k(\varepsilon_{k-1}) = \hat F_{k-1}(\varepsilon_{k-1})"
-                     r"\quad(C^0),\qquad C_k = \text{elements carried in from } "
-                     r"j < k \text{ with their } \hat\theta_j")
-            st.markdown("**Moduli** ($p_j$ = exponent, $A_j$ = prefactor)")
-            st.latex(r"E_j = \frac{100^{p_j}\,K_j}{A_j},\quad A_{shell} = "
-                     r"\frac{2\pi h_m R_0}{1-\nu_m},\quad A_{ne} = \frac{2\pi h_{ne}"
-                     r" R_n}{1-\nu_n},\quad A_{H}(R) = \frac{\sqrt2\,R^2}{3(1-\nu^2)}"
-                     r"\,c(R)")
-            st.latex(r"c(R) = \left[\frac{2R^{-1/3}}{R_*^{-1/3}+R^{-1/3}}\right]^{3/2},"
-                     r"\;R_* = \frac{R R_p}{R+R_p},\qquad T_{align} = "
-                     r"\frac{100\,k_{align}}{2\pi R_0^2/h_0},\;E_{align} = "
-                     r"\frac{T_{align}}{h_{coat}}")
-            st.latex(r"W_L = \int L\,d\delta = A_L\,\frac{\varepsilon_3-"
-                     r"\varepsilon_2}{2}\,\frac{h_0}{100},\qquad R^2 = 1 - "
-                     r"\frac{\sum (F_i-\hat F_i)^2}{\sum (F_i-\bar F)^2}")
-            piecewise_coefficient_table(result, result.get("moduli") or {})
+            chi = result.get("chi_squared_reduced", float("nan"))
+            meets = result["r_squared"] >= target
+            line = (
+                f"`fit {fid}` · "
+                + rf"$R^2 = {result['r_squared']:.5f}\;"
+                + (r"\ge" if meets else "<") + rf"\;R^2_\star = {target:g}$"
+                + (rf" · $\chi^2_\nu = {chi:.3g}$" if np.isfinite(chi) else "")
+                + rf" · $n = {result['n_points']}$"
+                + rf" · $(\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
+                rf"({used[1]:.2f},\,{used[2]:.2f},\,{used[3]:.2f})\,\%$"
+                + f" · {source}"
+            )
+            if meets:
+                st.success(line)
+            else:
+                regimes = [r for r in result["regimes"]
+                           if r["fitted"] and r["key"] != "R1"]
+                worst = min(regimes, key=lambda r: r["r_squared"]) if regimes else None
+                st.warning(
+                    line + (rf" · worst $R_{{{worst['key'][1]}}}$: "
+                            rf"$R^2 = {worst['r_squared']:.4f}$ on "
+                            rf"$[{worst['domain_pct'][0]:.1f},\,"
+                            rf"{worst['domain_pct'][1]:.1f}]\,\%$"
+                            if worst else "")
+                    + ". Try ▶ Place ε₁, ε₂, ε₃, or that regime's components.",
+                    icon="⚠️")
 
-    with t_set:
-        if ok:
-            flat_table(piecewise_settings_used(result, geometry, target, source))
+            # The answer: one card per element, in two rows.
+            cards = [(n, moduli.get(n)) for n in
+                     ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core",
+                      "k_align")]
+            row1, row2 = st.columns(4), st.columns(4)
+            slots = list(row1) + list(row2)
+            for col, (n, row) in zip(slots, cards):
+                if not row:
+                    continue
+                with col:
+                    st.metric(
+                        row["symbol"],
+                        "off" if n in piecewise_off() else pressure_text(row["E_Pa"]),
+                        help=f"{row['element']} · ${row['symbol']} = 100^{{{row['power']:g}}}"
+                        f"\\,{n}/A$, $A = $ {row['law']}",
+                    )
+            with slots[6]:
+                if lamina:
+                    st.metric(
+                        "A_L (lamina)",
+                        f"{lamina['A_N'] * 1e9:.3g} nN" if lamina["present"] else "0",
+                        help=r"$L(x) = A_L\sin^2(\pi\frac{x-\varepsilon_2}"
+                        r"{\varepsilon_3-\varepsilon_2})$ · peak at "
+                        f"{lamina['peak_pct']:.1f} %"
+                        + (f" · $W_L = {lamina.get('work_J', float('nan')) * 1e15:.3g}$ fJ"
+                           if lamina.get("work_J") is not None else ""),
+                    )
+            with slots[7]:
+                st.metric("R²", f"{result['r_squared']:.5f}",
+                          help=r"$R^2 = 1 - \sum (F_i-\hat F_i)^2 / "
+                          r"\sum (F_i-\bar F)^2$ over the whole fit.")
 
-    with t_work:
-        if ok:
-            st.markdown("**Residuals** $r_i = F_i - \\hat F(x_i)$")
+            log_y = bool(st.session_state.get("pw_log_y"))
             st.plotly_chart(
-                piecewise_residual_figure(epsilon, force_N, fitted, style),
-                key="pw_residuals", **STRETCH,
+                piecewise_figure(
+                    epsilon, force_N, result, style, log_y=log_y,
+                    off=piecewise_off(),
+                    view=st.session_state.get("pw_view", "stacked"),
+                    note=f"fit {fid} · R² = {result['r_squared']:.5f}",
+                ),
+                key="pw_curve", **STRETCH,
             )
-            anchors_disp = " · ".join(
-                f"$F({name.split('_')[1].replace('pct', '')}\\%) = "
-                f"{float(from_newtons(value, style.force_unit)[0]):.4g}$ "
-                f"{from_newtons(value, style.force_unit)[1]}"
-                for name, value in result["anchors"].items()
+            fitted = predict_piecewise(epsilon, result)
+
+            # The row to paste, from the same fit, and the store button.
+            record = piecewise_record(result, lamina, source, geometry, name, fid)
+            copy_block(record, key="pw_copy_record", file_stem=f"{name}_4regime",
+                       summary=f"fit {fid} · R² = {result['r_squared']:.5f}")
+            adding = st.button(
+                ("↻ Update (ε, θ̂, E) in collection" if in_collection
+                 else "➕ Store (ε, θ̂, E) in collection"),
+                key="pw_add", disabled=not ok, **STRETCH,
+                help="Keeps this cell (its curve, its own ε, its moduli) for "
+                "the 📚 All cells tab. Named after the cell name in section "
+                "1, or the file.",
             )
-            gap = max((abs(v) for v in (result.get("continuity_gaps_N") or {}).values()),
-                      default=0.0)
-            st.markdown("**Anchors** (C⁰): " + anchors_disp
-                        + rf" · $\max|\Delta F| = {gap:.1g}$ N")
-            c_cell = probe_correction(geometry.cell_radius, geometry.probe_radius)
-            c_nuc = probe_correction(geometry.nucleus_radius, geometry.probe_radius)
-            st.markdown(
-                rf"**Geometry**: $h_0 = {geometry.cell_height * 1e6:.2f}$ µm, "
-                rf"$R_0 = {geometry.cell_radius * 1e6:.2f}$ µm, "
-                rf"$R_n = {geometry.nucleus_radius * 1e6:.2f}$ µm, "
-                + (rf"$R_p = {geometry.probe_radius * 1e6:.1f}$ µm, "
-                   rf"$c(R_0) = {c_cell:.3f}$, $c(R_n) = {c_nuc:.3f}$, "
-                   if geometry.probe_radius else r"$R_p = \infty$ (flat), ")
-                + rf"$h_m = {geometry.membrane_thickness * 1e9:.1f}$ nm, "
-                rf"$h_{{ne}} = {geometry.envelope_thickness * 1e9:.0f}$ nm, "
-                rf"$\nu = ({geometry.nu_membrane:.2f}, {geometry.nu_interior:.2f}, "
-                rf"{geometry.nu_nucleus:.2f})$"
-            )
-            st.markdown("**Solver**: " + " · ".join(
-                f"{r['key']}: {r['engine'] or '—'}, $n = {r['n_points']}$"
-                for r in result["regimes"]))
-            if found:
-                piecewise_search_maths(found)
-            for warning in result.get("warnings", []):
-                st.caption(f"⚠️ {warning}")
+            if adding:
+                collection = dict(collection)
+                collection[name] = collection_record(
+                    name, data.get("source", ""), st.session_state["cell_height_um"],
+                    epsilon, force_N, result, geometry,
+                    PW_ROW_LABELS.get(selected.get("key"), source),
+                )
+                st.session_state["pw_collection"] = collection
+                rerun_keeping_settings()
+
+        # ---- what decided it, from the same fit ------------------------
+        t_routes, t_coef, t_model, t_set, t_work = st.tabs([
+            "ε routes compared", "θ̂ by regime", "Model F(x)",
+            "Settings used", "🔍 Working",
+        ])
+        with t_routes:
+            if placements:
+                piecewise_placement_table(placements, piecewise_boundaries(),
+                                          target, selected)
+            else:
+                st.caption("Press **▶ Place ε₁, ε₂, ε₃** on the left to compare "
+                           "the routes on this curve.")
+        with t_coef:
+            if ok:
+                piecewise_coefficient_table(result, moduli)
+        with t_model:
+            if ok:
+                used = result["boundaries_pct"]
+                st.markdown("**Model**")
+                for line in piecewise_equations_latex(used, result.get("ranges") or {},
+                                                      piecewise_off()):
+                    st.latex(line)
+                st.markdown("**Estimator** (sequential, $k = 1\\ldots4$, "
+                            "$\\varepsilon_0 = 0$, $\\varepsilon_4 = x_{end}$)")
+                st.latex(r"\hat\theta_k = \arg\min_{\theta_{lo}\le\theta\le\theta_{hi}}"
+                         r"\sum_{x_i \in [\varepsilon_{k-1},\varepsilon_k)}\Big[F_i - "
+                         r"\hat F(\varepsilon_{k-1}) - C_k(x_i) - \sum_{j \in k}\theta_j"
+                         r"\phi_j(x_i)\Big]^2")
+                st.latex(r"\hat F_k(\varepsilon_{k-1}) = \hat F_{k-1}(\varepsilon_{k-1})"
+                         r"\quad(C^0),\qquad C_k = \text{elements carried in from } "
+                         r"j < k \text{ with their } \hat\theta_j")
+                st.markdown("**Moduli** ($p_j$ = exponent, $A_j$ = prefactor)")
+                st.latex(r"E_j = \frac{100^{p_j}\,K_j}{A_j},\quad A_{shell} = "
+                         r"\frac{2\pi h_m R_0}{1-\nu_m},\quad A_{ne} = \frac{2\pi h_{ne}"
+                         r" R_n}{1-\nu_n},\quad A_{H}(R) = \frac{\sqrt2\,R^2}{3(1-\nu^2)}"
+                         r"\,c(R)")
+                st.latex(r"c(R) = \left[\frac{2R^{-1/3}}{R_*^{-1/3}+R^{-1/3}}\right]^{3/2},"
+                         r"\;R_* = \frac{R R_p}{R+R_p},\qquad T_{align} = "
+                         r"\frac{100\,k_{align}}{2\pi R_0^2/h_0},\;E_{align} = "
+                         r"\frac{T_{align}}{h_{coat}}")
+                st.latex(r"W_L = \int L\,d\delta = A_L\,\frac{\varepsilon_3-"
+                         r"\varepsilon_2}{2}\,\frac{h_0}{100},\qquad R^2 = 1 - "
+                         r"\frac{\sum (F_i-\hat F_i)^2}{\sum (F_i-\bar F)^2}")
+        with t_set:
+            if ok:
+                flat_table(piecewise_settings_used(result, geometry, target, source))
+        with t_work:
+            if ok:
+                st.markdown("**Residuals** $r_i = F_i - \\hat F(x_i)$")
+                st.plotly_chart(
+                    piecewise_residual_figure(epsilon, force_N, fitted, style),
+                    key="pw_residuals", **STRETCH,
+                )
+                anchors_disp = " · ".join(
+                    f"$F({name.split('_')[1].replace('pct', '')}\\%) = "
+                    f"{float(from_newtons(value, style.force_unit)[0]):.4g}$ "
+                    f"{from_newtons(value, style.force_unit)[1]}"
+                    for name, value in result["anchors"].items()
+                )
+                gap = max((abs(v) for v in (result.get("continuity_gaps_N") or {}).values()),
+                          default=0.0)
+                st.markdown("**Anchors** (C⁰): " + anchors_disp
+                            + rf" · $\max|\Delta F| = {gap:.1g}$ N")
+                c_cell = probe_correction(geometry.cell_radius, geometry.probe_radius)
+                c_nuc = probe_correction(geometry.nucleus_radius, geometry.probe_radius)
+                st.markdown(
+                    rf"**Geometry**: $h_0 = {geometry.cell_height * 1e6:.2f}$ µm, "
+                    rf"$R_0 = {geometry.cell_radius * 1e6:.2f}$ µm, "
+                    rf"$R_n = {geometry.nucleus_radius * 1e6:.2f}$ µm, "
+                    + (rf"$R_p = {geometry.probe_radius * 1e6:.1f}$ µm, "
+                       rf"$c(R_0) = {c_cell:.3f}$, $c(R_n) = {c_nuc:.3f}$, "
+                       if geometry.probe_radius else r"$R_p = \infty$ (flat), ")
+                    + rf"$h_m = {geometry.membrane_thickness * 1e9:.1f}$ nm, "
+                    rf"$h_{{ne}} = {geometry.envelope_thickness * 1e9:.0f}$ nm, "
+                    rf"$\nu = ({geometry.nu_membrane:.2f}, {geometry.nu_interior:.2f}, "
+                    rf"{geometry.nu_nucleus:.2f})$"
+                )
+                st.markdown("**Solver**: " + " · ".join(
+                    f"{r['key']}: {r['engine'] or '—'}, $n = {r['n_points']}$"
+                    for r in result["regimes"]))
+                if found:
+                    piecewise_search_maths(found)
+                for warning in result.get("warnings", []):
+                    st.caption(f"⚠️ {warning}")
 
     if not ok:
         return None, None, [], None
 
-    moduli = result.get("moduli") or {}
     used = result["boundaries_pct"]
     export = pd.DataFrame([
         {
@@ -6367,11 +6685,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
         "eps1_pct": used[1], "eps2_pct": used[2], "eps3_pct": used[3],
         "end_pct": used[4],
     }] if lamina else []))
-    st.download_button(
-        "📥 This cell's coefficients and moduli (CSV)",
-        data=export.to_csv(index=False),
-        file_name=f"{name}_4regime.csv", mime="text/csv", key="pw_download",
-    )
+    with right:
+        st.download_button(
+            "📥 This cell's coefficients and moduli, one row each (CSV)",
+            data=export.to_csv(index=False),
+            file_name=f"{name}_4regime_coefficients.csv", mime="text/csv",
+            key="pw_download",
+        )
     fit = piecewise_as_fit(result, model, found=found, placements=placements)
     return fit, fitted, piecewise_stage_plan(result), result
 
@@ -7095,63 +7415,190 @@ def send_to_plot_button(kind, label, payload, key, help_text=None):
         rerun_keeping_settings()
 
 
-def apply_plot_layers(figure, style):
+def fit_id(fit):
+    """
+    A short fingerprint of one fit, the same wherever that fit is shown.
+
+    Printed on the curve, above the results and in the block copied into a
+    spreadsheet, so three places that should be showing one fit can be seen
+    to be: if the fingerprints match, the numbers are the same numbers.
+    """
+    import hashlib
+    if not (fit and fit.get("success")):
+        return ""
+    keys = ("coupling", "break_1", "break_2", "epsilon_range", "r_squared",
+            "Em", "Ei", "En", "T0", "Ene", "Ecx", "confinement", "terms",
+            "term_windows", "boundaries_pct", "coefficients")
+    text = repr([(k, fit.get(k)) for k in keys])
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:6]
+
+
+def fit_edges(fit):
+    """
+    Every place where an element of the fit starts or stops taking load.
+
+    The same edges as the bands behind the curve (both come from
+    stage_rows), each named ε₁ or ε₂ where it is one, so a line on the plot
+    and the start of a component curve are one number. (value, name).
+    """
+    rows = stage_rows(fit)
+    if not rows:
+        return []
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    edges = sorted({round(float(a), 6) for a, _b, _r, _h in rows}
+                   | {round(float(b), 6) for _a, b, _r, _h in rows})
+    named = []
+    for value in edges:
+        if not (lo + 1e-6 < value < hi - 1e-6):
+            continue
+        name = "ε"
+        for key, label in (("break_1", "ε₁"), ("break_2", "ε₂")):
+            if fit.get(key) is not None and abs(float(fit[key]) - value) < 5e-4:
+                name = label
+        named.append((value, name))
+    return named
+
+
+def decorate_curve_figure(figure, style, fit=None, epsilon=None, bands=(),
+                          rupture_eps=None, boundaries=True, show_range=False,
+                          extra_tags=(), artefact=True):
+    """
+    Everything drawn on the curve besides the data and the fit, placed so
+    that nothing sits on anything else.
+
+    Lines (the end of the contact artefact, the boundaries, the end of the
+    fitted range, a rupture) are tagged above the plot on as many rows as
+    they need. The bands behind the curve are named in the legend, and the
+    legend is under the plot, so neither is written over the data. Every
+    line comes from ``fit``, the fit the figure is drawing, never from the
+    page's controls, so a line cannot mark a boundary the curve was not
+    fitted with.
+    """
+    log_mode = bool(getattr(style, "log_scale", False))
+    eps = np.asarray(epsilon if epsilon is not None else [], dtype=float)
+    eps = eps[np.isfinite(eps)]
+    x_lo = float(style.x_range[0]) if style.x_range else (
+        min(0.0, float(eps.min())) if eps.size else 0.0)
+    x_hi = float(style.x_range[1]) if style.x_range else (
+        float(eps.max()) if eps.size else 1.0)
+    span = max(x_hi - x_lo, 1e-6) * (1.0 if style.x_range else 1.04)
+    x_max = x_hi + (0.0 if style.x_range else 0.02 * span)
+    tags = []
+    legend_extra = []
+    ok = bool(fit and fit.get("success"))
+    lo = hi = None
+    if ok:
+        lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    if not log_mode:
+        for band in bands or ():
+            a, b = (float(v) for v in band["range"])
+            colour = band.get("color", "#2ca02c")
+            figure.add_vrect(x0=a, x1=b, fillcolor=colour,
+                             opacity=band.get("opacity", 0.12),
+                             layer="below", line_width=0)
+            name = f"▮ {band.get('label', 'stretch')} · ε {a:.3f}–{b:.3f}"
+            legend_extra.append(name)
+            figure.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers", name=name,
+                marker={"symbol": "square", "size": 13, "color": colour,
+                        "opacity": 0.45},
+                hoverinfo="skip",
+            ))
+        if show_range and ok:
+            figure.add_vrect(x0=lo, x1=hi, layer="below", line_width=0,
+                             fillcolor="#7f7f7f", opacity=0.07)
+            name = f"▮ fitted range · ε {lo:.3f}–{hi:.3f}"
+            legend_extra.append(name)
+            figure.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers", name=name,
+                marker={"symbol": "square", "size": 13, "color": "#7f7f7f",
+                        "opacity": 0.35},
+                hoverinfo="skip",
+            ))
+        # The first few percent are the probe settling onto the cell: drawn
+        # as a stretch of its own, and fitted all the same.
+        edge = ARTEFACT_PCT / 100.0
+        if artefact and x_hi > edge:
+            figure.add_vrect(x0=max(x_lo, 0.0), x1=edge, layer="below",
+                             line_width=0, fillcolor=ARTEFACT_FILL)
+            tags.append({"x": edge, "text": f"contact artefact ≤ {edge:.2f}",
+                         "kind": "artefact"})
+        if ok and boundaries:
+            for value, name in fit_edges(fit):
+                tags.append({"x": value, "text": f"{name} = {value:.3f}",
+                             "bold": name, "kind": "boundary"})
+        if ok and hi is not None and eps.size and hi < float(eps.max()) - 1e-3:
+            tags.append({"x": hi, "text": f"ε_max = {hi:.3f}", "kind": "end"})
+        if rupture_eps is not None and getattr(style, "show_rupture_marker", True):
+            tags.append({"x": float(rupture_eps),
+                         "text": f"rupture {float(rupture_eps):.3f}",
+                         "kind": "rupture"})
+        tags.extend(extra_tags or ())
+    rows = add_tag_lines(figure, tags, span, x_max) if tags else 0
+    finish_legend_below(figure, style, rows, legend_extra)
+    return rows
+
+
+def finish_legend_below(figure, style, tag_rows=0, labels=()):
+    """Title at the top, tags under it, the legend under the axis."""
+    base_top = max(70, int(style.title_size * 3))
+    bottom = 50 + int(2.4 * style.axis_title_size)
+    names = [getattr(t, "name", None) for t in getattr(figure, "data", ())]
+    names = [n for n in names if isinstance(n, str) and n] or list(labels)
+    rows = legend_rows(names) if getattr(style, "show_legend", True) else 0
+    figure.update_layout(
+        title={"y": 0.99, "yref": "container", "yanchor": "top"},
+        margin={"t": base_top + TAG_ROW_PX * tag_rows,
+                "b": bottom + 26 * rows + 8},
+        legend={"orientation": "h", "yref": "container", "y": 0.005,
+                "yanchor": "bottom", "xanchor": "left", "x": 0.0,
+                "bgcolor": "rgba(255,255,255,0)", "borderwidth": 0},
+        height=int(style.height) + TAG_ROW_PX * tag_rows + 26 * rows,
+    )
+
+
+def apply_plot_layers(figure, style, fit=None):
     """
     Draw whatever has been sent to the plot onto the figure.
 
     Done here rather than inside the figure builder because a layer is a
     decision made on the page, not a property of the curve: the builder
     draws the measurement, this draws what somebody chose to say about it.
+    Every box is written from ``fit``, the fit the figure is drawing, so a
+    number on the curve is the number in the results beside it.
     """
     boxes = []
-    fit = st.session_state.get("_last_fit")
+    if fit is None:
+        fit = st.session_state.get("_last_fit")
     unit = getattr(style, "force_unit", "nN")
     for row in plot_layers():
         kind, payload = row["kind"], dict(row["payload"] or {})
         if kind in ("boundaries", "range"):
-            payload = live_payload(kind)
-        elif kind not in ("note",):
+            # Drawn by decorate_curve_figure, from the same fit.
+            continue
+        if kind not in ("note",):
             # A results box: rebuilt from the fit on the page, so a number
             # on the figure is never a number the page has moved on from.
             payload = {"text": row_text(payload.get("key", kind), fit, unit)}
-        if kind == "boundaries":
-            e1, e2 = payload.get("e1"), payload.get("e2")
-            for value, name, colour in ((e1, "ε₁", "#2ca02c"),
-                                        (e2, "ε₂", "#e377c2")):
-                if value is None:
-                    continue
-                figure.add_vline(
-                    x=float(value), line=dict(color=colour, width=2, dash="dot"),
-                    annotation_text=f"{name} = {float(value):.3f}",
-                    annotation_position="top",
-                    annotation_font_size=max(10, style.tick_size - 6),
-                    annotation_font_color=colour,
-                )
-        elif kind == "range":
-            lo, hi = payload.get("lo"), payload.get("hi")
-            if lo is not None and hi is not None and float(hi) > float(lo):
-                figure.add_vrect(
-                    x0=float(lo), x1=float(hi), layer="below", line_width=0,
-                    fillcolor="#7f7f7f", opacity=0.08,
-                    annotation_text=f"fitted ε {float(lo):.3f}–{float(hi):.3f}",
-                    annotation_position="bottom left",
-                    annotation_font_size=max(10, style.tick_size - 7),
-                )
-        else:
-            text = str(payload.get("text", "")).strip()
-            if text:
-                boxes.append(text)
-    # Text boxes stack down the left, inside the axes, so a narrow screen
-    # cannot clip them off.
+        text = str(payload.get("text", "")).strip()
+        if text:
+            boxes.append(text)
+    # Text boxes stack down the left, inside the axes, where a rising curve
+    # leaves the plot empty; the legend is under the axis, out of their way.
     for index, text in enumerate(boxes):
         figure.add_annotation(
             xref="paper", yref="paper", x=0.02, y=0.98 - 0.16 * index,
             xanchor="left", yanchor="top", text=text, showarrow=False,
             align="left", font=dict(size=max(10, style.tick_size - 7)),
-            bgcolor="rgba(255,255,255,0.86)", bordercolor="#8c8c8c",
+            bgcolor="rgba(255,255,255,0.9)", bordercolor="#8c8c8c",
             borderwidth=1, borderpad=4,
         )
     return figure
+
+
+def layer_on(kind):
+    """Whether a live layer of this kind is on the plot."""
+    return any(row["kind"] == kind for row in plot_layers())
 
 
 def plot_layer_table():
@@ -7289,13 +7736,14 @@ def result_rows(fit):
         f"RMSE = {float(fit.get('rmse', float('nan'))):.4g} N",
         f"{int(fit.get('n_points', 0))} points over ε {lo:.3f} to {hi:.3f}",
     ))
-    if fit.get("break_1") is not None or fit.get("break_2") is not None:
+    # The boundaries this fit has: the lines on the curve and the ε columns
+    # of the copied row, never a boundary the model does not use.
+    edges = {name: value for value, name in fit_edges(fit)}
+    if edges:
         rows.append((
             "boundaries", "Boundaries",
-            (f"ε₁ = {float(fit['break_1']):.3f}"
-             if fit.get("break_1") is not None else "—"),
-            (f"ε₂ = {float(fit['break_2']):.3f}"
-             if fit.get("break_2") is not None else "—"),
+            (f"ε₁ = {float(edges['ε₁']):.3f}" if "ε₁" in edges else "—"),
+            (f"ε₂ = {float(edges['ε₂']):.3f}" if "ε₂" in edges else "—"),
             (f"q = {float(fit.get('confinement', 0.0) or 0.0):g}"
              if fit.get("confinement") else "—"),
             "where the elements take over from one another",
@@ -7441,6 +7889,16 @@ def live_label_for(row):
 
 def live_label(kind):
     """How a live layer reads in the list of what is on the plot."""
+    fit = st.session_state.get("_last_fit")
+    if fit and fit.get("success"):
+        # What the plot is drawing, which is the fit, not the controls.
+        if kind == "boundaries":
+            edges = fit_edges(fit)
+            return ("Boundaries · " + (", ".join(f"{n} = {v:.3f}" for v, n in edges)
+                                       or "none in this model")
+                    + " · from the fit shown")
+        lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+        return f"Fitted range · ε {lo:.3f} to {hi:.3f} · from the fit shown"
     payload = live_payload(kind)
     if kind == "boundaries":
         return (f"Boundaries · ε₁ = {payload['e1']:.3f}, "
@@ -10361,6 +10819,30 @@ with tab_analysis:
             # against rather than being spelled out of two hundred branches.
             guided = True
 
+            # Two columns: on the left one block with every parameter of the
+            # fit, on the right what the fit came to -- the verdict, the
+            # curve, the results, the equation and the block to copy into a
+            # spreadsheet -- all written from one fit, the one on the curve.
+            fit_block = results_area = verdict_slot = None
+            if guided:
+                fit_left, fit_right = st.columns([1, 1.55], gap="large")
+                with fit_right:
+                    verdict_slot = st.container()
+                    curve_slot = st.container()
+                    results_area = st.container()
+                    video_slot = st.container()
+                    diagnostics_box = st.expander(
+                        "🔍 The working, in detail", expanded=False
+                    )
+                with fit_left:
+                    fit_block = st.container(border=True)
+                fit_block.__enter__()
+                st.markdown("### ⚙️ Fit parameters")
+                st.caption(
+                    "Everything the fit θ̂ = argmin ‖F − X(ε₁, ε₂)θ‖² is given. "
+                    "The right-hand side is drawn from the fit these made."
+                )
+
             if guided:
                 names = components_for(st.session_state["cell_type"])
                 here = terms_for(st.session_state["cell_type"])
@@ -10454,10 +10936,8 @@ with tab_analysis:
                 )
                 chosen = active_terms()
 
-                # The curve goes directly under the ranges that shape it. Every
-                # bar above moves something drawn below, and a control whose
-                # effect is two screens away is a control used blind.
-                curve_slot = st.container()
+                # The curve is in the right-hand column, beside the ranges
+                # that shape it, so every bar here moves something in view.
 
                 # No element search. Which components are in the model is a
                 # decision about the cell, and the boxes above are where it is
@@ -10472,7 +10952,9 @@ with tab_analysis:
 
                 # ------------------------------------------------- 2 · fit ---
                 st.markdown("#### 2 · Fit")
-                fit_col, verdict_col = st.columns([1, 2.4])
+                # The verdict is written beside the curve, once the fit of
+                # this pass exists: drawn here it read the fit before.
+                fit_col = st.container()
                 with fit_col:
                     if st.button(
                         "🔬 Fit θ̂: bounded least squares at ε₁, ε₂", type="primary",
@@ -10498,8 +10980,6 @@ with tab_analysis:
                         "boundaries and ranges shown. It does not move them: "
                         "that is what the optimisation buttons are for."
                     )
-                with verdict_col:
-                    fit_verdict()
 
                 # No picture picker and no table of pictures compared. The
                 # search says in one line which picture the curve supports, and
@@ -10514,7 +10994,7 @@ with tab_analysis:
             # created, not where the code that fills them runs.
             if not guided:
                 curve_slot = st.container()
-            video_slot = st.container()
+                video_slot = st.container()
 
             # Everything the fit decided for you, under the curve rather than
             # between the button and it. In guided mode all of it lives behind
@@ -10539,9 +11019,6 @@ with tab_analysis:
                 settings_box = st.expander(
                     "⚙️ Fit assumptions: coupling, composition at ε₁, "
                     "windows, weighting", expanded=False
-                )
-                diagnostics_box = st.expander(
-                    "🔍 The working, in detail", expanded=False
                 )
                 settings_box.__enter__()
                 st.caption(
@@ -11514,6 +11991,11 @@ with tab_analysis:
             close_panel(fit_panel)
             if settings_box is not None:
                 settings_box.__exit__(None, None, None)
+            if fit_block is not None:
+                # The parameters end here; everything from now on is what
+                # the fit came to, in the right-hand column.
+                fit_block.__exit__(None, None, None)
+                results_area.__enter__()
 
             # The video and database section below runs whether or not there is a
             # fit, so the names it reads have to exist either way.
@@ -11539,6 +12021,7 @@ with tab_analysis:
                         )
                     except Exception:
                         fit["breakpoint_spread"] = None
+                fit["fit_id"] = fit_id(fit)
                 st.session_state["_last_fit"] = fit
                 st.session_state["_last_fit_signature"] = fit_signature
                 # The bars in "What to fit" were drawn earlier in this same pass,
@@ -11573,6 +12056,13 @@ with tab_analysis:
                         "was made, so press **Fit θ̂ (current settings)** to bring it up to date, "
                         "or switch on live refitting in Advanced fitting options."
                     )
+
+            if verdict_slot is not None:
+                # Written now, from the fit the rest of this column shows.
+                if fit is not None and fit.get("success") and not fit.get("fit_id"):
+                    fit["fit_id"] = fit_id(fit)
+                with verdict_slot:
+                    fit_verdict(fit)
 
             if comparison and comparison.get("success"):
                 st.info(retell(comparison["verdict"]))
@@ -12186,10 +12676,16 @@ with tab_analysis:
                 with plot_col:
                     # Built once and reused for the save button. Building it twice
                     # doubled the work on every rerun for two identical figures.
+                    # The corner note is written from the fit being drawn, not
+                    # from the page's memory of the last one.
+                    shown_style = style
+                    if getattr(style, "range_note", None):
+                        shown_style = replace_style(
+                            style, range_note=fit_range_note(fit))
                     figure = force_curve_figure(
                         epsilon,
                         force_N,
-                        style,
+                        shown_style,
                         **figure_kwargs(
                             force_curve_figure,
                             title=st.session_state["cell_name"]
@@ -12203,16 +12699,27 @@ with tab_analysis:
                             deep_label=plain_name("nucleus").lower(),
                             cortex_label=plain_name("cortex").lower(),
                             interior_label=plain_name("interior").lower(),
-                            fit_window=windows_for_plot,
-                            rupture_epsilon=rupture.get("epsilon")
-                            if rupture.get("method") == "force-drop"
-                            else None,
+                            # Bands, boundaries and the rupture are drawn by
+                            # decorate_curve_figure below, from this fit.
+                            fit_window=None,
+                            rupture_epsilon=None,
                             highlight=highlight
                             if (video_ready or show_schematic) else None,
                             highlight_window=highlight_window,
                         ),
                     )
-                    figure = apply_plot_layers(figure, style)
+                    decorate_curve_figure(
+                        figure, shown_style, fit, epsilon,
+                        bands=(windows_for_plot
+                               if getattr(shown_style, "show_fit_window", True)
+                               else ()),
+                        rupture_eps=(rupture.get("epsilon")
+                                     if rupture.get("method") == "force-drop"
+                                     else None),
+                        boundaries=layer_on("boundaries"),
+                        show_range=layer_on("range"),
+                    )
+                    figure = apply_plot_layers(figure, shown_style, fit)
                     st.plotly_chart(
                         figure,
                         key="main_fit_plot",
@@ -12221,12 +12728,13 @@ with tab_analysis:
                     )
                     apply_plot_drag("main_fit_plot", eps_lo_data, eps_hi_data)
 
-                    o1, o2 = st.columns([2, 1])
-                    with o1:
+                    # One row of nesting at most: this sits in a column
+                    # already, and the layer list has columns of its own.
+                    with st.expander("🎛️ On the plot · plot options · save",
+                                     expanded=False):
                         plot_layer_table()
-                        with st.expander("🎛️ Plot options", expanded=False):
-                            plot_option_controls()
-                    with o2:
+                        st.markdown("**Plot options**")
+                        plot_option_controls()
                         save_plot_controls(figure, fit, date_acquired)
 
                 panel_index = 0
@@ -12553,6 +13061,9 @@ with tab_analysis:
                 # boundaries in the sentence under the results heading, and the
                 # coefficients in the equation.
 
+            if results_area is not None:
+                results_area.__exit__(None, None, None)
+
         section(
             "4 · Video and database" if piecewise_mode
             else "7 · Video and database" if segmented
@@ -12774,7 +13285,7 @@ with tab_cells:
     if HAS_PIECEWISE:
         all_cells_tab()
     else:
-        st.info("Needs piecewise_fit.py next to app.py.")
+        piecewise_problem_note()
 
 
 # =============================================== TAB 2: balloon and spring ==
@@ -13860,16 +14371,21 @@ with tab_results:
             if fit.get("coupling") == "piecewise":
                 # The four-regime fit has six moduli, not two, and no
                 # bending constant.
+                # Written exactly as on the analysis tab, in the same units,
+                # so the two tabs show one set of numbers.
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("E_shell", f"{fit['Em_MPa']:.3g} MPa")
-                m2.metric("E_cyto", f"{fit['Ei_kPa']:.3g} kPa")
-                m3.metric("E_ne", f"{fit['Ene_MPa']:.3g} MPa")
-                m4.metric("R²", f"{fit['r_squared']:.4f}")
+                m1.metric("E_shell", pressure_text(fit["Em"]))
+                m2.metric("E_cyto", pressure_text(fit["Ei"]))
+                m3.metric("E_ne", pressure_text(fit["Ene"]))
+                m4.metric("R²", f"{fit['r_squared']:.5f}")
                 m5, m6, m7, m8 = st.columns(4)
-                m5.metric("E_nc", f"{fit.get('E_nc_kPa', 0.0):.3g} kPa")
-                m6.metric("E_core", f"{fit['En_kPa']:.3g} kPa")
-                m7.metric("E_align (apparent)", f"{fit.get('E_align_kPa', 0.0):.3g} kPa")
+                m5.metric("E_nc", pressure_text(fit.get("E_nc_kPa", 0.0) * 1e3))
+                m6.metric("E_core", pressure_text(fit["En"]))
+                m7.metric("E_align", pressure_text(fit.get("E_align_kPa", 0.0) * 1e3))
                 m8.metric("A_L (lamina)", f"{fit.get('A_lamina_nN', 0.0):.3g} nN")
+                if fit.get("fit_id"):
+                    st.caption(f"fit {fit['fit_id']}, the same fit as on the "
+                               "📊 Force curve analysis tab.")
                 bounds = fit["piecewise"]["boundaries_pct"]
                 st.caption(
                     "4-regime piecewise fit · "
@@ -13892,6 +14408,9 @@ with tab_results:
                     f"bending constant Kₘ = {fit.get('Km_kT', float('nan')):.3g} k_BT"
                 )
 
+        # The note in the corner is this fit's, not the page's last one.
+        if getattr(style, "range_note", None):
+            style = replace_style(style, range_note=fit_range_note(fit))
         results_figure = force_curve_figure(
             results["epsilon"],
             results["force_N"],
@@ -13900,43 +14419,79 @@ with tab_results:
             fit_force_N=results["fitted_N"],
             membrane_N=results["membrane_N"],
             interior_N=results["interior_N"],
-            fit_window=tuple(fit["epsilon_range"]),
+            fit_window=None,
         )
         if fit.get("piecewise"):
-            # The same ε₁, ε₂, ε₃ and the same component curves, over the
-            # same ranges, as the analysis tab, on this ε axis.
+            # The same ε₁, ε₂, ε₃, the same contact artefact and the same
+            # components, over the same ranges, as the analysis tab, on
+            # this ε axis.
             bounds_r = fit["piecewise"]["boundaries_pct"]
             top_r = float(np.nanmax(results["epsilon"])) * 100.0
+            pw_result = results.get("piecewise_result")
+            off_r = results.get("piecewise_off") or ()
+            if pw_result and not style.log_scale:
+                results_figure.add_vrect(
+                    x0=0.0, x1=float(bounds_r[1]) / 100.0, layer="below",
+                    line_width=0, fillcolor=ARTEFACT_FILL)
             rows_r = add_boundary_lines(
                 results_figure, bounds_r, scale=0.01,
                 x_span=top_r * 1.05, x_max=top_r * 1.02,
+                extra=[{"x": 0.0, "text": "contact artefact [0, ε₁)",
+                        "kind": "region"}],
             )
-            # Title at the very top, the ε tags between it and the plot,
-            # and the legend under the axis instead of over the curve.
-            base_top = max(70, style.title_size * 3)
-            results_figure.update_layout(
-                title={"y": 0.99, "yref": "container", "yanchor": "top"},
-                margin={"t": base_top + TAG_ROW_PX * rows_r,
-                        "b": 90 + 22 * 3},
-                legend={"orientation": "h", "yanchor": "top", "y": -0.15,
-                        "xanchor": "left", "x": 0.0},
-                height=int(style.height) + TAG_ROW_PX * rows_r + 60,
-            )
-            pw_result = results.get("piecewise_result")
             if pw_result:
                 scale_f = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
+                stacked_r = (st.session_state.get("pw_view", "stacked") == "stacked"
+                             and component_force is not None
+                             and not style.log_scale)
+                grid = np.linspace(float(bounds_r[0]), float(bounds_r[-1]), 600)
+                marks = [v for pair in pw_result["ranges"].values() for v in pair]
+                grid = np.unique(np.concatenate(
+                    [grid, [v for v in marks + list(bounds_r)
+                            if bounds_r[0] <= v <= bounds_r[-1]]]))
                 for name, label, _symbol, colour, _law in PW_COMPONENTS:
-                    if name in (results.get("piecewise_off") or ()):
+                    if name in off_r:
+                        continue
+                    a, u = pw_result["ranges"][name]
+                    if stacked_r:
+                        layer = component_force(pw_result, name, grid)
+                        if layer is None:
+                            continue
+                        results_figure.add_trace(go.Scatter(
+                            x=grid / 100.0, y=layer * scale_f, mode="lines",
+                            stackgroup="components",
+                            name=f"{label} · [{a:.1f}, {u:.1f}] %",
+                            line={"color": colour, "width": 0.8},
+                            fillcolor=_rgba(colour, 0.30),
+                        ))
                         continue
                     curve = component_curve(pw_result, name)
                     if curve is None:
                         continue
-                    a, u = pw_result["ranges"][name]
                     results_figure.add_trace(go.Scatter(
                         x=curve[0] / 100.0, y=curve[1] * scale_f, mode="lines",
-                        name=f"{label} · {a:.1f}–{u:.1f} %",
+                        name=f"{label} · [{a:.1f}, {u:.1f}] %",
                         line={"color": colour, "width": 2, "dash": "dash"},
                     ))
+                # The layers under the points and the fitted line, not over.
+                traces = list(results_figure.data)
+                layers = [t for t in traces
+                          if isinstance(getattr(t, "stackgroup", None), str)]
+                if layers:
+                    try:
+                        ids = {id(t) for t in layers}
+                        results_figure.data = tuple(
+                            layers + [t for t in traces if id(t) not in ids])
+                    except Exception:  # pragma: no cover - older plotly
+                        pass
+            finish_legend_below(results_figure, style, rows_r)
+        else:
+            decorate_curve_figure(
+                results_figure, style, fit, results["epsilon"],
+                bands=(results.get("fit_windows") or ()
+                       if getattr(style, "show_fit_window", True) else ()),
+                boundaries=True, show_range=True,
+            )
         st.plotly_chart(results_figure, **STRETCH, key="results_tab_plot")
 
 
