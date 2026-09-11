@@ -5339,46 +5339,51 @@ def piecewise_search_panel(found, bounds):
                 "pw_b2": round(float(best[1]), 2),
                 "pw_b3": round(float(best[2]), 2),
             })
-    with st.expander("How the boundaries are found (maths and profiles)",
-                     expanded=False):
-        st.markdown(
-            "Once ε₁, ε₂, ε₃ are fixed, the continuous four-regime curve is "
-            "linear in all seven coefficients, because every anchor is itself "
-            "a sum of the coefficients upstream of it. So each trial placement "
-            "is one exact bounded least-squares problem, with your equations, "
-            "bounds and the membrane acting throughout if it is ticked:"
-        )
-        st.latex(r"\hat F(x) = X(x;\varepsilon_1,\varepsilon_2,\varepsilon_3)\,"
-                 r"\theta,\qquad \theta=(k_{align},C_0,K_{shell},K_{cyto},"
-                 r"K_{nucleus},K_{nuc\,cyto},K_{core})")
-        st.latex(r"S(\varepsilon_1,\varepsilon_2,\varepsilon_3)="
-                 r"\min_{\theta_{lo}\le\theta\le\theta_{hi}}"
-                 r"\sum_i\big[F_i-\hat F(x_i)\big]^2,\qquad"
-                 r"\hat\varepsilon=\arg\min S")
-        st.latex(r"\Delta(-2\ln L)(\varepsilon_j)=n\ln\frac{S}{S_{min}}"
-                 r"\;\le 1\ (68\,\%),\ \le 3.84\ (95\,\%)")
-        st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{spec}}{S_{min}}-3\ln n")
-        span = found.get("span_pct")
-        st.caption(
-            f"Searched ε₁ ∈ {found['bands_pct'][0][0]:g}–{found['bands_pct'][0][1]:g} %, "
-            f"ε₂ ∈ {found['bands_pct'][1][0]:g}–{found['bands_pct'][1][1]:g} %"
-            + (f", ε₃ − ε₂ ∈ {span[0]:g}–{span[1]:g} %" if span else
-               f", ε₃ ∈ {found['bands_pct'][2][0]:g}–{found['bands_pct'][2][1]:g} %")
-            + " (coarse grid, then coordinate descent at 0.1 %), "
-            f"{found['n_evaluations']} placements, n = {found['n_points']} points "
-            f"up to {found['end_pct']:.1f} %. ΔBIC above 6 is strong evidence "
-            "that the curve itself places the boundaries there rather than "
-            "at the defaults, 2 to 6 positive, below 0 none: the 3 ln n term "
-            "is the price of letting the data choose three numbers. The intervals assume independent noise; residuals that "
-            "run in long stretches make them narrower than they should be. "
-            "The coefficients and moduli are then fitted sequentially, "
-            "exactly as specified, at the boundaries in use."
-        )
-        cols = st.columns(3)
-        for i in range(3):
-            with cols[i]:
-                st.plotly_chart(profile_figure(found, i),
-                                key=f"pw_profile_{i}", **STRETCH)
+    st.caption("How they were found, with the likelihood profiles, is under "
+               "**🔍 The working, in detail**, below the fit.")
+
+
+def piecewise_search_maths(found):
+    """How the boundaries were found: the maths and the three profiles."""
+    st.markdown("**🎯 How the boundaries were found**")
+    st.markdown(
+        "Once ε₁, ε₂, ε₃ are fixed, the continuous four-regime curve is "
+        "linear in all seven coefficients, because every anchor is itself "
+        "a sum of the coefficients upstream of it. So each trial placement "
+        "is one exact bounded least-squares problem, with your equations, "
+        "bounds and the membrane acting throughout if it is ticked:"
+    )
+    st.latex(r"\hat F(x) = X(x;\varepsilon_1,\varepsilon_2,\varepsilon_3)\,"
+             r"\theta,\qquad \theta=(k_{align},C_0,K_{shell},K_{cyto},"
+             r"K_{nucleus},K_{nuc\,cyto},K_{core})")
+    st.latex(r"S(\varepsilon_1,\varepsilon_2,\varepsilon_3)="
+             r"\min_{\theta_{lo}\le\theta\le\theta_{hi}}"
+             r"\sum_i\big[F_i-\hat F(x_i)\big]^2,\qquad"
+             r"\hat\varepsilon=\arg\min S")
+    st.latex(r"\Delta(-2\ln L)(\varepsilon_j)=n\ln\frac{S}{S_{min}}"
+             r"\;\le 1\ (68\,\%),\ \le 3.84\ (95\,\%)")
+    st.latex(r"\Delta\mathrm{BIC}=n\ln\frac{S_{default}}{S_{min}}-3\ln n")
+    span = found.get("span_pct")
+    st.caption(
+        f"Searched ε₁ ∈ {found['bands_pct'][0][0]:g}–{found['bands_pct'][0][1]:g} %, "
+        f"ε₂ ∈ {found['bands_pct'][1][0]:g}–{found['bands_pct'][1][1]:g} %"
+        + (f", ε₃ − ε₂ ∈ {span[0]:g}–{span[1]:g} %" if span else
+           f", ε₃ ∈ {found['bands_pct'][2][0]:g}–{found['bands_pct'][2][1]:g} %")
+        + " (coarse grid, then coordinate descent at 0.1 %), "
+        f"{found['n_evaluations']} placements, n = {found['n_points']} points "
+        f"up to {found['end_pct']:.1f} %. ΔBIC above 6 is strong evidence "
+        "that the curve itself places the boundaries there rather than "
+        "at the defaults, 2 to 6 positive, below 0 none: the 3 ln n term "
+        "is the price of letting the data choose three numbers. The intervals assume independent noise; residuals that "
+        "run in long stretches make them narrower than they should be. "
+        "The coefficients and moduli are then fitted sequentially, "
+        "exactly as specified, at the boundaries in use."
+    )
+    cols = st.columns(3)
+    for i in range(3):
+        with cols[i]:
+            st.plotly_chart(profile_figure(found, i),
+                            key=f"pw_profile_{i}", **STRETCH)
 
 
 def _pw_range_moved(name):
@@ -5712,7 +5717,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
         key="pw_curve", **STRETCH,
     )
     fitted = predict_piecewise(epsilon, result)
-    with st.expander("Residuals", expanded=False):
+    # The working, right under the fit: how it came out, not settings. It
+    # is filled as the page goes on (residuals now; anchors, geometry and
+    # the boundary search once the results are drawn).
+    working = st.expander("🔍 The working, in detail", expanded=False)
+    with working:
+        st.markdown("**📉 Residuals, data minus fit**")
         st.plotly_chart(
             piecewise_residual_figure(epsilon, force_N, fitted, style),
             key="pw_residuals", **STRETCH,
@@ -5828,7 +5838,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         align_right=["Points", "R²", "Value ± SE", "Initial", "E ± SE"],
         caption="Coefficients are in newtons per percent to the power of the "
         "law; the modulus is E = K·100^p / A with A the element's analytical "
-        "prefactor (see the geometry below). C0 is regime 1's intercept.",
+        "prefactor (see the geometry under 🔍 The working, in detail). C0 is regime 1's intercept.",
     )
 
     anchors_disp = " · ".join(
@@ -5837,12 +5847,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
         f"{from_newtons(value, style.force_unit)[1]}"
         for name, value in result["anchors"].items()
     )
-    st.caption(f"**Anchors passed forward:** {anchors_disp}")
-
     geometry = piecewise_geometry(model)
     c_cell = probe_correction(geometry.cell_radius, geometry.probe_radius)
     c_nuc = probe_correction(geometry.nucleus_radius, geometry.probe_radius)
-    st.caption(
+    working.markdown("**⚓ Anchors passed forward** (C0 continuity)")
+    working.caption(anchors_disp + " · largest gap at a boundary "
+                    + f"{max((abs(v) for v in (result.get('continuity_gaps_N') or {}).values()), default=0.0):.1g} N")
+    working.markdown("**📐 Geometry used for the moduli**")
+    working.caption(
         f"**Geometry used:** h₀ = {geometry.cell_height * 1e6:.2f} µm · "
         f"R₀ = {geometry.cell_radius * 1e6:.2f} µm · "
         f"Rₙ = {geometry.nucleus_radius * 1e6:.2f} µm · "
@@ -5855,6 +5867,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
         f"{geometry.nu_nucleus:.2f}. Height, radii and thicknesses are set in "
         "section 1 and under **Cell geometry** in the sidebar."
     )
+    working.markdown("**⚙️ Solver, regime by regime**")
+    working.caption(" · ".join(
+        f"{r['key']}: {r['engine'] or 'not fitted'}, {r['n_points']} points"
+        for r in result["regimes"]
+    ))
+    if found:
+        with working:
+            piecewise_search_maths(found)
 
     for warning in result.get("warnings", []):
         st.warning(warning, icon="⚠️")
@@ -9591,10 +9611,11 @@ with tab_analysis:
                 # does not draw is a control whose value it forgets, and these
                 # hold the weighting, the boundaries and the arrangement. Out of
                 # the page's way, still one click from anywhere on it.
-                # A second sidebar panel, staked out now and filled once the fit
-                # exists. The working belongs somewhere: off the page, but not
-                # nowhere, or a curve that fits badly has nothing to look at.
-                diagnostics_box = st.sidebar.expander(
+                # The working belongs with the fit, not with the settings: it
+                # is how this fit came out, not something to set. So it sits
+                # on the page right under the Fit step, collapsed, staked out
+                # now and filled once the fit exists.
+                diagnostics_box = st.expander(
                     "🔍 The working, in detail", expanded=False
                 )
                 settings_box = st.sidebar.expander(
