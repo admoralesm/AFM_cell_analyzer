@@ -71,7 +71,9 @@ __all__ = [
     "predict_piecewise",
     "regime_curves",
     "component_curve",
+    "component_force",
     "component_ranges",
+    "lamina_summary",
     "find_boundaries",
     "power_law_profile",
     "boundaries_from_power_law",
@@ -102,6 +104,29 @@ class Term:
     # its own regime (or the end of the fit for a carried element). Past it
     # the element holds the force it reached, so the curve has no step.
     until: float = float("nan")
+    # "power": K (x - start)^power, rising and then holding.
+    # "lump":  A sin^2(pi (x - start) / (end - start)) inside its regime and
+    #          zero outside: a transient bump that rises and falls back,
+    #          zero with zero slope at both ends of the regime.
+    shape: str = "power"
+
+
+LUMP = "lump"
+
+
+def _basis(shape, power, x, start, until):
+    """
+    One element's shape at x (percent), per unit coefficient.
+
+    power: [min(x, until) - start]_+ ^ power
+    lump:  sin^2(pi (x - start) / (until - start)) on [start, until], else 0
+    """
+    x = np.asarray(x, dtype=float)
+    if shape == LUMP:
+        width = max(float(until) - float(start), 1e-9)
+        inside = (x >= start) & (x <= until)
+        return np.where(inside, np.sin(np.pi * (x - start) / width) ** 2, 0.0)
+    return np.clip(np.minimum(x, until) - start, 0.0, None) ** power
 
 
 @dataclass(frozen=True)
@@ -153,8 +178,14 @@ C2C12_REGIMES = (
                  label="nuclear envelope stretch"),
             Term("K_nuc_cyto", 1.5, p0=1.0e-8, element="perinuclear_cytoskeleton",
                  label="perinuclear cytoskeleton compression"),
+            # The little lump at about 50 %: the nuclear lamina taking load
+            # and giving way again. A bump confined to the regime, so it
+            # leaves both anchors exactly where they were.
+            Term("A_lamina", 0.0, p0=1.0e-9, element="nuclear_lamina",
+                 label="nuclear lamina lump", shape=LUMP),
         ),
-        equation="F₃(x) = K_nucleus·(x−40)³ + K_nuc_cyto·(x−40)^1.5 + F_40%",
+        equation="F₃(x) = K_nucleus·(x−40)³ + K_nuc_cyto·(x−40)^1.5 "
+                 "+ A_lamina·sin²(π(x−40)/20) + F_40%",
     ),
     Regime(
         key="R4",
@@ -348,7 +379,8 @@ def _resolve_ranges(regimes, bounds, carry=()):
     for i, regime in enumerate(regimes):
         a, b = float(bounds[i]), float(bounds[i + 1])
         for term in regime.terms:
-            if regime.free_offset:
+            if regime.free_offset or term.shape == LUMP:
+                # A lump lives and dies inside its own regime.
                 out[term.name] = (a, b)
                 continue
             u = term.until
@@ -538,8 +570,8 @@ def fit_piecewise(
             # end, and holds what it reached after that.
             untils = np.array([ranges[t.name][1] for t in regime.terms])
             design = np.column_stack([
-                (np.minimum(x, untils[j]) - a) ** powers[j]
-                for j in range(len(powers))
+                _basis(t.shape, t.power, x, a, untils[j])
+                for j, t in enumerate(regime.terms)
             ])
             # What the carried elements add on top of the anchor here. Zero
             # at the regime's start, so the anchor is still the force there.
@@ -562,8 +594,13 @@ def fit_piecewise(
                     "upper": float(t.upper), "power": float(t.power),
                     "at_bound": bool(at_bound[j]),
                     "start": float(a), "until": float(untils[j]),
+                    "shape": t.shape,
                 }
                 coefficients[t.name] = float(params[j])
+                if t.shape == LUMP and not (t.lower == t.upper):
+                    # A lump at zero is an answer ("no lamina lump on this
+                    # curve"), not a coefficient the data pushed on.
+                    continue
                 if at_bound[j] and t.lower == t.upper:
                     warnings.append(
                         f"{t.name} in {regime.key} is held at {t.lower:.3g} "
@@ -581,11 +618,12 @@ def fit_piecewise(
                     )
             entry["engine"] = engine
             anchor = anchor + float(
-                sum(params[j] * (min(b, untils[j]) - a) ** powers[j]
-                    for j in range(len(powers)))
+                sum(params[j] * float(_basis(t.shape, t.power, np.array([b]),
+                                             a, untils[j])[0])
+                    for j, t in enumerate(regime.terms) if t.shape != LUMP)
             ) + float(_carried_force(carried, np.array([b]), a)[0])
             for j, t in enumerate(regime.terms):
-                if untils[j] > b + 1e-9:
+                if t.shape != LUMP and untils[j] > b + 1e-9:
                     carried.append({
                         "name": t.name, "power": float(t.power),
                         "onset_pct": float(a), "until_pct": float(untils[j]),
@@ -690,7 +728,8 @@ def _regime_force(regime, x):
     out = np.full(x.shape, float(regime["anchor_in_N"]))
     for p in params.values():
         until = float(p.get("until", np.inf))
-        out = out + p["value"] * np.clip(np.minimum(x, until) - a, 0.0, None) ** p["power"]
+        out = out + p["value"] * _basis(p.get("shape", "power"), p["power"],
+                                        x, a, until)
     return out + _carried_force(list((regime.get("carried") or {}).values()), x, a)
 
 
@@ -715,7 +754,39 @@ def component_curve(result, name, n=300):
     x = np.linspace(start, until, n)
     if home["anchor_in_N"] is None:
         return x, p["value"] * x + home["params"]["C0"]["value"]
-    return x, p["value"] * (x - start) ** p["power"]
+    return x, p["value"] * _basis(p.get("shape", "power"), p["power"], x,
+                                  start, until)
+
+
+def component_force(result, name, x_pct):
+    """
+    One element's force at any x (percent), in newtons, for stacking.
+
+    Zero before the element starts, K times its shape up to its own
+    ``until`` and the force it reached after that (the lump returns to
+    zero), NaN outside the fitted domain. The contact term is
+    C0 + k_align min(x, until). Summed over every element this is the
+    fitted curve exactly, so the layers of a stacked plot end on it.
+    None when the element was not fitted.
+    """
+    regimes = result.get("regimes") or []
+    home = next((r for r in regimes if name in r["params"]), None)
+    if home is None or not home["fitted"]:
+        return None
+    p = home["params"][name]
+    if not np.isfinite(p["value"]):
+        return None
+    x = np.asarray(x_pct, dtype=float)
+    start = float(p.get("start", home["domain_pct"][0]))
+    until = float(p.get("until", home["domain_pct"][1]))
+    if home["anchor_in_N"] is None:
+        out = p["value"] * np.minimum(x, until) + home["params"]["C0"]["value"]
+    else:
+        out = p["value"] * _basis(p.get("shape", "power"), p["power"], x,
+                                  start, until)
+    lo = float(regimes[0]["domain_pct"][0])
+    hi = float(regimes[-1]["domain_pct"][1])
+    return np.where((x >= lo) & (x <= hi), out, np.nan)
 
 
 def predict_piecewise(epsilon, result):
@@ -853,8 +924,9 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
         after = anchor.copy()
         for term in regime.terms:
             u = ranges[term.name][1]
-            rows[:, col[term.name]] += (np.minimum(xm, u) - a) ** term.power
-            after[col[term.name]] += (min(b, u) - a) ** term.power
+            rows[:, col[term.name]] += _basis(term.shape, term.power, xm, a, u)
+            if term.shape != LUMP:
+                after[col[term.name]] += (min(b, u) - a) ** term.power
         for name, power, onset, u in carried:
             base = max(min(a, u) - onset, 0.0) ** power
             rows[:, col[name]] += (np.clip(np.minimum(xm, u) - onset, 0.0, None)
@@ -862,7 +934,7 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
             after[col[name]] += max(min(b, u) - onset, 0.0) ** power - base
         for term in regime.terms:
             u = ranges[term.name][1]
-            if u > b + 1e-9:
+            if term.shape != LUMP and u > b + 1e-9:
                 carried.append((term.name, float(term.power), float(a), float(u)))
         X[mask] = rows
         anchor = after
@@ -1402,6 +1474,40 @@ MODULUS_SYMBOLS = {
 }
 
 
+def lamina_summary(result, geometry: Geometry | None = None, name="A_lamina"):
+    """
+    The nuclear lamina lump, in numbers.
+
+    L(x) = A_L sin^2(pi (x - e2) / (e3 - e2)),  e2 <= x <= e3
+
+    Its height A_L (N), where it peaks, x_L = (e2 + e3) / 2, how wide it is,
+    w = e3 - e2, and the work it takes up,
+
+        W_L = integral L d(delta) = A_L (w / 2) (h0 / 100)   [J],
+
+    since delta = x h0 / 100. A_L at zero means no lump on this curve.
+    """
+    for regime in result.get("regimes") or []:
+        p = regime["params"].get(name)
+        if p is None:
+            continue
+        a, b = float(p.get("start", regime["domain_pct"][0])), float(
+            p.get("until", regime["domain_pct"][1]))
+        amp = float(p["value"])
+        out = {
+            "A_N": amp, "A_se_N": float(p["se"]),
+            "peak_pct": 0.5 * (a + b), "width_pct": b - a,
+            "from_pct": a, "to_pct": b,
+            "fitted": bool(regime["fitted"]) and np.isfinite(amp),
+            "present": bool(np.isfinite(amp) and amp > 0
+                            and not p.get("at_bound")),
+        }
+        if geometry is not None and np.isfinite(amp):
+            out["work_J"] = amp * 0.5 * (b - a) * geometry.cell_height / 100.0
+        return out
+    return None
+
+
 def piecewise_moduli(result, geometry: Geometry, regimes=C2C12_REGIMES):
     """
     Young's moduli (Pa) from the fitted coefficients.
@@ -1422,6 +1528,8 @@ def piecewise_moduli(result, geometry: Geometry, regimes=C2C12_REGIMES):
         for term in spec.terms:
             p = regime["params"].get(term.name)
             if p is None:
+                continue
+            if term.shape == LUMP or term.element not in pref:
                 continue
             element = pref[term.element]
             factor = 100.0 ** term.power
