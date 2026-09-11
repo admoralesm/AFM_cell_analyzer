@@ -127,6 +127,7 @@ HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "Geometry",
     "SEARCH_BANDS_PCT",
     "component_curve",
+    "component_ranges",
     "find_boundaries",
     "fit_piecewise",
     "piecewise_moduli",
@@ -654,6 +655,16 @@ DEFAULTS = {
     # with the K_shell regime 2 measured, is carried through regimes 3 and 4
     # and they fit what is left on top of it.
     "pw_membrane_throughout": True,
+    # Where each component stops adding load when it is set by hand, in
+    # percent, {name: until}. Absent means its regime's end (the fit's end
+    # for the membrane acting throughout), so it follows the boundaries.
+    "pw_until": {},
+    # Each component in the model or not. Off holds its coefficient at 0.
+    "pw_use_K_shell": True,
+    "pw_use_K_cyto": True,
+    "pw_use_K_nucleus": True,
+    "pw_use_K_nuc_cyto": True,
+    "pw_use_K_core": True,
     # Where the boundary search may put ε₁, ε₂ and ε₃, in percent: around
     # the specification's 5 / 40 / 60.
     "pw_band1_lo": 2.0, "pw_band1_hi": 10.0,
@@ -4548,6 +4559,77 @@ def piecewise_boundaries():
     )
 
 
+# The components of the four-regime model, in the order the plates meet
+# them: (coefficient, name, modulus, colour, law). The same list builds the
+# range rows, the curves on the plot and the range track under it, so a
+# component cannot appear in one and not the others.
+PW_COMPONENTS = (
+    # The square in each name is the colour of that component's line and bar
+    # on the plot.
+    ("k_align", "⬛ Contact / alignment", "E_align", "#555555",
+     "linear: k_align·x + C₀ (contact artefact)"),
+    ("K_shell", "🟥 Membrane (cell shell)", "E_shell", "#d62728",
+     "ε³: K_shell·(x − start)³"),
+    ("K_cyto", "🟧 Cytoskeleton", "E_cyto", "#ff7f0e",
+     "ε^1.5: K_cyto·(x − start)^1.5"),
+    ("K_nucleus", "🟦 Nuclear envelope", "E_ne", "#1f77b4",
+     "ε³: K_nucleus·(x − start)³"),
+    ("K_nuc_cyto", "🟩 Perinuclear cytoskeleton", "E_nc", "#2ca02c",
+     "ε^1.5: K_nuc_cyto·(x − start)^1.5"),
+    ("K_core", "🟪 Nuclear interior (core)", "E_core", "#9467bd",
+     "ε^1.5: K_core·(x − start)^1.5"),
+)
+PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
+# Which boundary each component starts at: its regime's start. Moving a
+# component's start moves that boundary, and every component sharing it.
+PW_START_INDEX = {"K_shell": 1, "K_cyto": 1, "K_nucleus": 2,
+                  "K_nuc_cyto": 2, "K_core": 3}
+PW_SWITCHABLE = tuple(PW_START_INDEX)
+
+
+def effective_piecewise_settings(settings=None, untils=None, off=()):
+    """
+    Guesses and bounds, plus each component's own end and on/off state.
+
+    Pure, so a stored cell can be refitted from its record exactly as the
+    page fitted it.
+    """
+    out = {k: dict(v) for k, v in (settings or {}).items() if isinstance(v, dict)}
+    for name, until in (untils or {}).items():
+        if until is not None:
+            out.setdefault(name, {})["until"] = float(until)
+    for name in off or ():
+        out.setdefault(name, {}).update({"lower": 0.0, "upper": 0.0})
+    return out
+
+
+def piecewise_off():
+    """The components switched off on the page."""
+    return tuple(name for name in PW_SWITCHABLE
+                 if not st.session_state.get(f"pw_use_{name}", True))
+
+
+def piecewise_until():
+    """The component ends set by hand, cleaned."""
+    stored = st.session_state.get("pw_until") or {}
+    return {k: float(v) for k, v in stored.items()
+            if k in PW_SWITCHABLE and v is not None}
+
+
+def piecewise_model_settings():
+    """What the fit, the search and the plot all use."""
+    return effective_piecewise_settings(
+        piecewise_settings(), piecewise_until(), piecewise_off())
+
+
+def piecewise_ranges(bounds=None):
+    """{coefficient: (start, until)} in percent, as the fit will use them."""
+    return component_ranges(
+        bounds or piecewise_boundaries(),
+        settings=piecewise_model_settings(), carry=piecewise_carry(),
+    )
+
+
 def piecewise_carry():
     """The coefficients carried past their own regime: the membrane, or none."""
     return ("K_shell",) if st.session_state.get(
@@ -4569,7 +4651,7 @@ def piecewise_signature(epsilon, force_N):
     return repr((
         data.get("source"), int(np.size(epsilon)),
         round(float(force_N[-1]), 15) if np.size(force_N) else 0.0,
-        sorted((k, sorted(v.items())) for k, v in piecewise_settings().items()),
+        sorted((k, sorted(v.items())) for k, v in piecewise_model_settings().items()),
         piecewise_carry(),
         round(float(st.session_state.get("pw_end", DEFAULTS["pw_end"])), 4),
         piecewise_bands(),
@@ -4652,7 +4734,7 @@ def run_piecewise_fit(model, epsilon, force_N):
     result = fit_piecewise(
         epsilon, force_N,
         boundaries_pct=piecewise_boundaries(),
-        settings=piecewise_settings(),
+        settings=piecewise_model_settings(),
         carry=piecewise_carry(),
     )
     if result.get("success"):
@@ -4673,7 +4755,8 @@ def pressure_text(value, se=None):
     return f"{value:.3g} Pa"
 
 
-def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None):
+def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
+                     off=None):
     """
     The four-regime result in the shape the rest of the page reads.
 
@@ -4700,16 +4783,21 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None):
     def finite(v):
         return float(v) if np.isfinite(v) else 0.0
 
+    # Where each modulus was measured: the component's own range, the one
+    # on its bar and on the plot.
+    ranges = result.get("ranges") or {}
+
+    def span(name, fallback):
+        a, u = ranges.get(name, fallback)
+        return (float(a) / 100, min(float(u), result["epsilon_range"][1] * 100) / 100)
+
     spans = {
-        "alignment": (b[0] / 100, b[1] / 100),
-        # The membrane acts to the end of the fit when it is carried.
-        "membrane": (b[1] / 100,
-                     result["epsilon_range"][1]
-                     if "K_shell" in (result.get("carry") or ()) else b[2] / 100),
-        "interior": (b[1] / 100, b[2] / 100),
-        "nucleus_shell": (b[2] / 100, b[3] / 100),
-        "perinuclear": (b[2] / 100, b[3] / 100),
-        "nucleus": (b[3] / 100, result["epsilon_range"][1]),
+        "alignment": span("k_align", (b[0], b[1])),
+        "membrane": span("K_shell", (b[1], b[2])),
+        "interior": span("K_cyto", (b[1], b[2])),
+        "nucleus_shell": span("K_nucleus", (b[2], b[3])),
+        "perinuclear": span("K_nuc_cyto", (b[2], b[3])),
+        "nucleus": span("K_core", (b[3], b[4])),
     }
     flat = {}
     for name, row in moduli.items():
@@ -4766,6 +4854,8 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None):
                 if probe_um is None else probe_um
             ),
             "membrane_throughout": "K_shell" in (result.get("carry") or ()),
+            "component_ranges_pct": {k: list(v) for k, v in ranges.items()},
+            "components_off": list(piecewise_off() if off is None else off),
             "boundary_source": boundary_source(b, found),
             "boundary_search": (
                 {
@@ -4801,35 +4891,51 @@ def add_boundary_lines(fig, bounds, scale=1.0, end_label=True):
     ε₁, ε₂, ε₃ (and the end of the fit) as labelled lines on a figure.
 
     ``scale`` turns percent into the figure's x unit: 1 for a percent axis,
-    0.01 for one in ε as a fraction. The labels carry the numbers, so the
-    curve says where its boundaries are without a legend to look up.
+    0.01 for one in ε as a fraction. Drawn against the whole figure's
+    height, so on the four-regime plot each line runs through the curve and
+    the component ranges under it alike.
     """
-    for name, value in zip(EPS_NAMES, bounds[1:4]):
-        fig.add_vline(
-            x=float(value) * scale, line_dash="dash", line_color="#333333",
-            line_width=1.5,
-            annotation_text=f"{name} = {float(value):.1f} %",
-            annotation_position="top right", annotation_font_size=13,
-            annotation_font_color="#111111",
-        )
+    lines = list(zip(EPS_NAMES, bounds[1:4]))
     if end_label:
-        fig.add_vline(
-            x=float(bounds[-1]) * scale, line_dash="dot", line_color="#888888",
-            line_width=1,
-            annotation_text=f"end = {float(bounds[-1]):.1f} %",
-            annotation_position="bottom left", annotation_font_size=11,
-            annotation_font_color="#555555",
+        lines.append(("end", bounds[-1]))
+    for name, value in lines:
+        x = float(value) * scale
+        is_end = name == "end"
+        fig.add_shape(
+            type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
+            line={"color": "#888888" if is_end else "#333333",
+                  "width": 1 if is_end else 1.5,
+                  "dash": "dot" if is_end else "dash"},
+            layer="above",
+        )
+        fig.add_annotation(
+            x=x, y=1.0, xref="x", yref="paper", showarrow=False,
+            text=f"{name} = {float(value):.1f} %", xanchor="left",
+            yanchor="bottom", font={"size": 12 if not is_end else 11,
+                                    "color": "#555555" if is_end else "#111111"},
         )
     return fig
 
 
-def piecewise_figure(epsilon, force_N, result, style, log_y=False):
-    """The data, the four fitted laws, the regimes, ε₁–ε₃ and the anchors."""
+def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=()):
+    """
+    The data, the fitted curve, and every component over its own range.
+
+    The top panel is the curve: the data, the total fit in black, and each
+    component's own force as a dashed line in its colour, drawn from where
+    it starts to where it stops adding load. The bottom panel is the same
+    ranges as bars, one row per component in the order of the controls
+    above, with a dotted tail where a component holds what it reached. Both
+    are drawn from the fit's own ranges, which are the ones the controls
+    show, so what is on the plot and what is on the bars is one thing.
+    """
     x = np.asarray(epsilon, dtype=float) * 100.0
     y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
     scale = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
     fig = go.Figure()
     b = result["boundaries_pct"]
+    end = float(b[-1])
+    ranges = result.get("ranges") or {}
     for regime in result["regimes"]:
         a, z = regime["domain_pct"]
         fig.add_vrect(
@@ -4843,26 +4949,31 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False):
         x=x[keep], y=y[keep], mode="markers", name="Experimental data",
         marker={"color": style.data_color, "size": max(3, int(style.marker_size * 0.55))},
     ))
-    for key, xs, fs in regime_curves(result):
-        regime = next(r for r in result["regimes"] if r["key"] == key)
+    # The whole fitted curve, every regime, one line.
+    pieces = regime_curves(result)
+    if pieces:
+        xs = np.concatenate([p[1] for p in pieces])
+        fs = np.concatenate([p[2] for p in pieces])
         fig.add_trace(go.Scatter(
-            x=xs, y=fs * scale, mode="lines",
-            name=f"{key} · {regime['title']}",
-            line={"color": PW_COLORS.get(key, "#000000"),
+            x=xs, y=fs * scale, mode="lines", name="Fitted curve",
+            line={"color": style.fit_color or "#000000",
                   "width": max(2, int(style.line_width * 0.8))},
         ))
-    # The membrane's own force, from ε₁ to wherever it acts. With the
-    # membrane acting throughout that is the end of the fit, which is the
-    # thing this line is here to show.
-    shell = component_curve(result, "K_shell")
-    if shell is not None:
-        xs, fs = shell
-        throughout = "K_shell" in (result.get("carry") or ())
+    # Each component's own force, over its own range.
+    for name, label, symbol, colour, _law in PW_COMPONENTS:
+        if name in off:
+            continue
+        curve = component_curve(result, name)
+        if curve is None:
+            continue
+        cx, cf = curve
+        a, u = ranges.get(name, (cx[0], cx[-1]))
         fig.add_trace(go.Scatter(
-            x=xs, y=fs * scale, mode="lines",
-            name=("Membrane (cell shell), acting throughout" if throughout
-                  else "Membrane (cell shell)"),
-            line={"color": "#d62728", "width": 2, "dash": "dash"},
+            x=cx, y=cf * scale, mode="lines",
+            name=f"{label} · {a:.1f}–{u:.1f} %",
+            line={"color": colour, "width": 2, "dash": "dash"},
+            hovertemplate=f"{symbol}<br>x = %{{x:.1f}} %<br>F = %{{y:.4g}} {unit}"
+                          "<extra></extra>",
         ))
     anchor_x, anchor_y, anchor_text = [], [], []
     for name, value in result["anchors"].items():
@@ -4877,17 +4988,50 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False):
                     "line": {"color": "#000000", "width": 2}},
             text=anchor_text, hovertemplate="%{text}<extra></extra>",
         ))
+
+    # The range track: the component rows, as bars on a panel of their own.
+    ticks, labels = [], []
+    for row, (name, label, symbol, colour, _law) in enumerate(PW_COMPONENTS):
+        a, u = ranges.get(name, (np.nan, np.nan))
+        ticks.append(row)
+        labels.append(symbol)
+        if not np.isfinite(a):
+            continue
+        if name in off:
+            fig.add_trace(go.Scatter(
+                x=[a, u], y=[row, row], mode="lines", yaxis="y2",
+                line={"color": "#cccccc", "width": 3, "dash": "dot"},
+                showlegend=False, hovertemplate=f"{symbol}: off<extra></extra>",
+            ))
+            continue
+        fig.add_trace(go.Scatter(
+            x=[a, u], y=[row, row], mode="lines", yaxis="y2",
+            line={"color": colour, "width": 10}, showlegend=False,
+            hovertemplate=f"{label}: {a:.1f}–{u:.1f} %<extra></extra>",
+        ))
+        if u < end - 1e-6 and name != "k_align":
+            fig.add_trace(go.Scatter(
+                x=[u, end], y=[row, row], mode="lines", yaxis="y2",
+                line={"color": colour, "width": 2, "dash": "dot"},
+                showlegend=False,
+                hovertemplate=f"{symbol} holds what it reached<extra></extra>",
+            ))
     add_boundary_lines(fig, b)
     fig.update_layout(
-        height=int(style.height), template="simple_white",
-        margin={"l": 70, "r": 20, "t": 40, "b": 60},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06,
+        height=int(style.height * 1.3), template="simple_white",
+        margin={"l": 80, "r": 20, "t": 40, "b": 60},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.04,
                 "xanchor": "left", "x": 0.0},
-        xaxis_title="Relative deformation (%)",
-        yaxis_title=f"Force ({unit})",
+        xaxis={"title": "Relative deformation (%)", "anchor": "y2"},
+        yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0]},
+        yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
+                "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
+                "showgrid": False, "zeroline": False,
+                "title": {"text": "acts over", "font": {"size": 12}}},
     )
     if log_y:
-        fig.update_yaxes(type="log")
+        # Only the force axis; the range track stays linear.
+        fig.update_layout(yaxis={"type": "log"})
     return fig
 
 
@@ -5017,21 +5161,34 @@ def keep_unrendered_settings():
             pass
 
 
-def piecewise_equations_latex(bounds, carry):
-    """The four laws with the boundaries in use written into them."""
-    e1, e2, e3, end = (float(v) for v in bounds[1:5])
-    shell3 = (rf" + K_{{shell}}\left[(x-{e1:g})^3-({e2 - e1:g})^3\right]"
-              if "K_shell" in carry else "")
-    shell4 = (rf" + K_{{shell}}\left[(x-{e1:g})^3-({e3 - e1:g})^3\right]"
-              if "K_shell" in carry else "")
+PW_TEX = {"K_shell": r"K_{shell}", "K_cyto": r"K_{cyto}",
+          "K_nucleus": r"K_{nucleus}", "K_nuc_cyto": r"K_{nuc\,cyto}",
+          "K_core": r"K_{core}"}
+
+
+def piecewise_equations_latex(bounds, ranges, off=()):
+    """
+    The fitted model with every component's range written into it.
+
+    Written as the sum it is: past the contact zone each component adds
+    K (x - start)^p from its own start to its own end and holds after, so
+    the equation carries exactly the numbers on the range bars.
+    """
+    e1, end = float(bounds[1]), float(bounds[4])
+    terms = []
+    for name, _label, _symbol, _colour, _law in PW_COMPONENTS:
+        if name == "k_align" or name in off or name not in ranges:
+            continue
+        a, u = ranges[name]
+        power = {"K_shell": "3", "K_nucleus": "3"}.get(name, "1.5")
+        terms.append(
+            rf"{PW_TEX[name]}\,\big[\min(x,{u:.4g})-{a:.4g}\big]_+^{{{power}}}"
+        )
+    body = r" \\ &+ ".join(terms) if terms else "0"
     return [
-        rf"R_1\;(0 \le x < {e1:g}):\quad F_1 = k_{{align}}\,x + C_0",
-        rf"R_2\;({e1:g} \le x < {e2:g}):\quad F_2 = F_{{{e1:g}\%}} + "
-        rf"K_{{shell}}(x-{e1:g})^3 + K_{{cyto}}(x-{e1:g})^{{1.5}}",
-        rf"R_3\;({e2:g} \le x < {e3:g}):\quad F_3 = F_{{{e2:g}\%}} + "
-        rf"K_{{nucleus}}(x-{e2:g})^3 + K_{{nuc\,cyto}}(x-{e2:g})^{{1.5}}" + shell3,
-        rf"R_4\;({e3:g} \le x \le {end:g}):\quad F_4 = F_{{{e3:g}\%}} + "
-        rf"K_{{core}}(x-{e3:g})^{{1.5}}" + shell4,
+        rf"F(x) = k_{{align}}\,x + C_0, \qquad 0 \le x < {e1:.4g}",
+        r"\begin{aligned} F(x) = F_{" + f"{e1:.4g}" + r"\%} &+ " + body
+        + r" \end{aligned}" + rf"\qquad {e1:.4g} \le x \le {end:.4g}",
     ]
 
 
@@ -5115,6 +5272,115 @@ def piecewise_search_panel(found, bounds):
                                 key=f"pw_profile_{i}", **STRETCH)
 
 
+def _pw_range_moved(name):
+    """
+    A component's range bar was moved: write it back to the model.
+
+    The start is its regime's boundary, so moving it moves ε₁, ε₂ or ε₃,
+    and with it every component that starts there. The end is the
+    component's own: at its regime's end it follows the boundaries, and
+    anywhere else it is kept as set. Runs as the slider's callback, before
+    the page is redrawn, so the boundary inputs, the other bars, the fit
+    and the plot all come back from the same numbers.
+    """
+    got = st.session_state.get(f"pw_range_{name}")
+    if not got:
+        return
+    lo, hi = sorted(float(v) for v in got)
+    b = list(piecewise_boundaries())
+    end = b[4]
+    if name == "k_align":
+        # Contact runs from 0 to ε₁, so only its far end means anything.
+        st.session_state["pw_b1"] = round(float(np.clip(hi, 0.5, b[2] - 1.0)), 2)
+        return
+    i = PW_START_INDEX[name]
+    start = float(np.clip(lo, b[i - 1] + (0.5 if i == 1 else 1.0), b[i + 1] - 1.0))
+    st.session_state[PW_BOUNDARY_KEYS[i - 1]] = round(start, 2)
+    b[i] = start
+    regime_end = b[i + 1]
+    untils = dict(st.session_state.get("pw_until") or {})
+    hi = float(np.clip(hi, start + 0.1, end))
+    if name == "K_shell":
+        # The membrane reaching the end of the fit is what "acts
+        # throughout" means, so the tick and the bar are one setting.
+        throughout = hi >= end - 0.05
+        st.session_state["pw_membrane_throughout"] = throughout
+        if throughout or abs(hi - regime_end) < 0.05:
+            untils.pop(name, None)
+        else:
+            untils[name] = round(hi, 2)
+    elif abs(hi - regime_end) < 0.05:
+        untils.pop(name, None)
+    else:
+        untils[name] = round(hi, 2)
+    st.session_state["pw_until"] = untils
+
+
+def _pw_throughout_changed():
+    """The tick decides the membrane's end, so a hand-set one is dropped."""
+    untils = dict(st.session_state.get("pw_until") or {})
+    untils.pop("K_shell", None)
+    st.session_state["pw_until"] = untils
+
+
+def piecewise_components_panel(bounds):
+    """
+    One row per component: in or out, where it acts, and what it came to.
+
+    Returns {coefficient: placeholder} for the fitted modulus, filled in
+    once the fit has run, so each row ends with its own number.
+    """
+    ranges = piecewise_ranges(bounds)
+    end = float(bounds[4])
+    slots = {}
+    for name, label, symbol, colour, law in PW_COMPONENTS:
+        start, until = ranges[name]
+        on = name == "k_align" or st.session_state.get(f"pw_use_{name}", True)
+        c_name, c_bar, c_out = st.columns([1.35, 2.3, 1.05])
+        with c_name:
+            if name == "k_align":
+                st.markdown(f"**{label}**")
+            else:
+                st.checkbox(f"{label}", key=f"pw_use_{name}",
+                            help="Off holds this component at zero, and it "
+                            "leaves the plot and the fit.")
+            st.caption(law)
+        with c_bar:
+            key = f"pw_range_{name}"
+            # Set from the model every run, before the bar is drawn, so the
+            # bar always shows the range the fit is about to use.
+            shown_start = float(min(max(start, 0.0), end))
+            shown_until = float(min(max(until, shown_start), end))
+            st.session_state[key] = (round(shown_start, 2), round(shown_until, 2))
+            st.slider(
+                f"{label} acts over (%)", min_value=0.0, max_value=float(end),
+                step=0.1, key=key, on_change=_pw_range_moved, args=(name,),
+                disabled=not on, label_visibility="collapsed",
+                help="Left end: where it starts carrying load, which is its "
+                "regime's boundary, so it moves that boundary. Right end: "
+                "where it stops adding load; past it the component holds "
+                "the force it reached.",
+            )
+            if name == "K_shell":
+                st.checkbox(
+                    "acts throughout (to the end of the fit)",
+                    key="pw_membrane_throughout",
+                    on_change=_pw_throughout_changed, disabled=not on,
+                )
+        with c_out:
+            st.caption(f"{start:.1f}–{until:.1f} %" if on else "off")
+            slots[name] = st.empty()
+    st.caption(
+        "Each bar is where that component carries load, and the plot below "
+        "draws each one over exactly that range, in the same colour, with "
+        "the same bars under the curve. Components that start together "
+        "share a boundary: moving one start moves ε₁, ε₂ or ε₃ for all of "
+        "them. The right end is each component's own; past it the force it "
+        "reached is held, so the curve never steps."
+    )
+    return slots
+
+
 def piecewise_section(model, epsilon, force_N, rupture):
     """
     The whole four-regime step: boundaries, fit, curve, numbers.
@@ -5152,16 +5418,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         "by the boundary search: it decides which points are "
                         "fitted at all.")
 
-    st.checkbox(
-        "🫧 Membrane acts throughout: K_shell·(x − ε₁)³ keeps stiffening "
-        "through R3 and R4",
-        key="pw_membrane_throughout",
-        help="On: the cell shell measured in R2 goes on carrying load to the "
-        "end of the fit, with the same K_shell, and R3 and R4 fit what is "
-        "left on top of it. Off: the specification as first written, where "
-        "the shell's force is held at the value it reached at ε₂.",
-    )
-
     b1, b2, b3 = st.columns([1.3, 1, 1])
     spec = tuple(DEFAULTS[k] for k in PW_BOUNDARY_KEYS)
     with b1:
@@ -5174,11 +5430,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
         )
     with b2:
         if st.button("↺ Back to 5 / 40 / 60 / 91.2 %", key="pw_reset",
-                     help="The specification's boundaries, initial guesses "
-                     "and bounds.", **STRETCH):
+                     help="The specification's boundaries, component "
+                     "ranges, initial guesses and bounds.", **STRETCH):
             rerun_keeping_settings({
                 **dict(zip(PW_BOUNDARY_KEYS, spec)),
                 "pw_settings": {},
+                "pw_until": {},
+                "pw_membrane_throughout": True,
+                **{f"pw_use_{name}": True for name in PW_SWITCHABLE},
                 "_pw_editor_reset": True,
             })
     with b3:
@@ -5202,7 +5461,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 epsilon, force_N,
                 end_pct=float(st.session_state["pw_end"]),
                 bands_pct=piecewise_bands(),
-                settings=piecewise_settings(),
+                settings=piecewise_model_settings(),
                 carry=piecewise_carry(),
             )
         if found.get("success"):
@@ -5225,6 +5484,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
     found = current_search(epsilon, force_N)
     piecewise_search_panel(found, bounds)
 
+    st.markdown("##### Components and where each one acts (%)")
+    slots = piecewise_components_panel(bounds)
+
     if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
         at = float(rupture["epsilon"]) * 100.0
         if bounds[0] < at < min(bounds[-1], top):
@@ -5242,7 +5504,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.error(f"Could not fit: {result.get('error', 'unknown error')}")
         for warning in result.get("warnings", []):
             st.caption(f"⚠️ {warning}")
-        return None, None, []
+        return None, None, [], None
 
     used = result["boundaries_pct"]
     source = boundary_source(used, found)
@@ -5264,7 +5526,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
     st.checkbox("Log force axis", key="pw_log_y")
     st.plotly_chart(
         piecewise_figure(epsilon, force_N, result, style,
-                         log_y=bool(st.session_state.get("pw_log_y"))),
+                         log_y=bool(st.session_state.get("pw_log_y")),
+                         off=piecewise_off()),
         key="pw_curve", **STRETCH,
     )
     fitted = predict_piecewise(epsilon, result)
@@ -5275,6 +5538,18 @@ def piecewise_section(model, epsilon, force_N, rupture):
         )
 
     moduli = result.get("moduli") or {}
+    # Each component row above ends with what that component came to.
+    for name, slot in slots.items():
+        row = moduli.get(name)
+        if not row:
+            continue
+        if name != "k_align" and name in piecewise_off():
+            slot.caption("held at 0")
+            continue
+        slot.markdown(
+            f"**{row['symbol']} = {pressure_text(row['E_Pa'])}**"
+            + (" ⚠️ on bound" if row.get("at_bound") else "")
+        )
     st.markdown("#### 3 · Fitting results")
     # The boundaries first: every number below was fitted at these.
     flat_table(
@@ -5291,8 +5566,16 @@ def piecewise_section(model, epsilon, force_N, rupture):
         align_right=["Value (%)"],
         caption=f"Boundaries in use: {source}.",
     )
-    for line in piecewise_equations_latex(used, result.get("carry") or ()):
+    for line in piecewise_equations_latex(used, result.get("ranges") or {},
+                                          piecewise_off()):
         st.latex(line)
+    st.caption(
+        "[·]₊ is zero before a component starts, and min(x, end) holds it "
+        "at the force it reached once its range is over. The numbers are the "
+        "ones on the component bars. The coefficients are fitted regime by "
+        "regime from R1 to R4, each regime anchored at the force the one "
+        "before it ended on."
+    )
 
     st.markdown("##### Young's moduli")
     order = ("K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto", "K_core", "k_align")
@@ -5322,9 +5605,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
         for name, p in regime["params"].items():
             row = moduli.get(name, {})
             value, unit = p["value"], ("N" if name == "C0" else f"N/%^{p['power']:g}")
+            acts = ("—" if name == "C0" or "start" not in p
+                    else f"{p['start']:.1f}–{p['until']:.1f}")
+            if name in piecewise_off():
+                acts = "off"
             table.append({
                 **common,
                 "Coefficient": name,
+                "Acts over (%)": acts,
                 "Value ± SE": (
                     "—" if not np.isfinite(value) else
                     f"{value:.4g}" + (f" ± {p['se']:.2g}" if np.isfinite(p["se"]) else "")
@@ -5345,12 +5633,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
             table.append({
                 **common,
                 "Coefficient": f"{name} (carried)",
+                "Acts over (%)": (f"{c['onset_pct']:.1f}–"
+                                  f"{c.get('until_pct', a):.1f}"),
                 "Value ± SE": f"{c['value']:.4g} N/%^{c['power']:g}",
                 "Initial": "—",
                 "Bounds": f"fixed from {c.get('from_regime', 'R2')}",
                 "Modulus": moduli.get(name, {}).get("symbol", ""),
                 "E ± SE": "same as above",
-                "Flag": f"acts from {c['onset_pct']:.2f} %",
+                "Flag": "carried in",
             })
     flat_table(
         pd.DataFrame(table),
@@ -5420,7 +5710,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.code("\t".join(header) + "\n" + "\t".join(values), language=None)
 
     fit = piecewise_as_fit(result, model, found=found)
-    return fit, fitted, piecewise_stage_plan(result)
+    return fit, fitted, piecewise_stage_plan(result), result
 
 
 def share_of_force_plot(fit, model, style):
@@ -7278,6 +7568,8 @@ def current_fit_settings():
         "piecewise_settings": piecewise_settings(),
         "piecewise_membrane_throughout": bool(
             st.session_state.get("pw_membrane_throughout", True)),
+        "piecewise_until": piecewise_until(),
+        "piecewise_off": list(piecewise_off()),
     }
 
 
@@ -7734,7 +8026,11 @@ def refit_stored_cell(store, cell_id, settings):
             model.epsilon, model.force,
             boundaries_pct=merged.get("piecewise_boundaries_pct")
             or C2C12_BOUNDARIES_PCT,
-            settings=merged.get("piecewise_settings") or {},
+            settings=effective_piecewise_settings(
+                merged.get("piecewise_settings") or {},
+                merged.get("piecewise_until") or {},
+                merged.get("piecewise_off") or (),
+            ),
             carry=(("K_shell",)
                    if merged.get("piecewise_membrane_throughout", True) else ()),
         )
@@ -7746,7 +8042,8 @@ def refit_stored_cell(store, cell_id, settings):
                                coat_nm=merged.get("protein_coat_nm", 200.0)),
         )
         fit = piecewise_as_fit(result, model, probe_um=probe_um,
-                               settings=merged.get("piecewise_settings") or {})
+                               settings=merged.get("piecewise_settings") or {},
+                               off=merged.get("piecewise_off") or ())
         record.update({
             "coupling": "piecewise",
             "Em_MPa": float(fit["Em_MPa"]),
@@ -8862,6 +9159,7 @@ with tab_analysis:
             # The four-regime fit starts every curve from the specification
             # too, and forgets the last curve's boundary search.
             pending.update({key: DEFAULTS[key] for key in PW_BOUNDARY_KEYS})
+            pending["pw_until"] = {}
             st.session_state["pw_boundary_search"] = None
 
             # No search here. Loading a curve used to run the whole
@@ -8901,7 +9199,7 @@ with tab_analysis:
             # The four-regime fit is the whole of this step. Nothing below
             # it in the spring-network flow applies, so none of it is drawn.
             segmented = False
-            fit, fitted, stage_plan = piecewise_section(
+            fit, fitted, stage_plan, pw_result = piecewise_section(
                 model, epsilon, force_N, rupture,
             )
             # Not written to _last_fit: that is the spring-network flow's
@@ -8923,6 +9221,10 @@ with tab_analysis:
                     "nucleus_N": None,
                     "fit": fit,
                     "fit_windows": [],
+                    # The four-regime result itself, so the Results tab can
+                    # draw the same component curves as the analysis tab.
+                    "piecewise_result": pw_result,
+                    "piecewise_off": piecewise_off(),
                     "source": data["source"],
                     "timestamp": datetime.now(),
                 }
@@ -12463,10 +12765,26 @@ with tab_results:
             fit_window=tuple(fit["epsilon_range"]),
         )
         if fit.get("piecewise"):
-            # The same ε₁, ε₂, ε₃ as the analysis tab, on this ε axis.
+            # The same ε₁, ε₂, ε₃ and the same component curves, over the
+            # same ranges, as the analysis tab, on this ε axis.
             add_boundary_lines(
                 results_figure, fit["piecewise"]["boundaries_pct"], scale=0.01,
             )
+            pw_result = results.get("piecewise_result")
+            if pw_result:
+                scale_f = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
+                for name, label, _symbol, colour, _law in PW_COMPONENTS:
+                    if name in (results.get("piecewise_off") or ()):
+                        continue
+                    curve = component_curve(pw_result, name)
+                    if curve is None:
+                        continue
+                    a, u = pw_result["ranges"][name]
+                    results_figure.add_trace(go.Scatter(
+                        x=curve[0] / 100.0, y=curve[1] * scale_f, mode="lines",
+                        name=f"{label} · {a:.1f}–{u:.1f} %",
+                        line={"color": colour, "width": 2, "dash": "dash"},
+                    ))
         st.plotly_chart(results_figure, **STRETCH, key="results_tab_plot")
 
 
