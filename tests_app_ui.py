@@ -313,6 +313,20 @@ def case_c2c12_opens_on_the_four_regime_fit():
         check("there is a block to paste", False, str(blocks)[:200])
     check("the components are stacked on the plot by default",
           state(app, "pw_view") == "stacked", str(state(app, "pw_view")))
+    # Every modulus is quoted with its ± beside it, and the working is
+    # written out for an undergraduate with this cell's numbers.
+    import app as app_module
+    moduli_rows = [row for row in app_module.result_rows(fit)
+                   if row[0].startswith("modulus_") and row[2] != "off"]
+    check("each modulus is quoted as value ± SE",
+          moduli_rows and all("±" in row[2] for row in moduli_rows),
+          str([row[2] for row in moduli_rows]))
+    said_all = " ".join(str(m.value) for m in app.get("markdown"))
+    for step in ("1 · What was measured", "5 · Least squares",
+                 "6 · The ± : how sure is each number?",
+                 "7 · From stiffness to Young's modulus"):
+        check(f"the maths summary has “{step}”", step in said_all,
+              said_all[:200])
 
     # One button: a change waits on the control board until ▶ Fit & plot.
     fit_plot = lambda: app.button(key="pw_fit_plot").click().run()  # noqa: E731
