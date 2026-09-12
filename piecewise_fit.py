@@ -82,6 +82,12 @@ __all__ = [
     "WEIGHTINGS",
     "confinement_factor",
     "small_strain_reading",
+    "information_criteria",
+    "akaike_weights",
+    "residual_diagnostics",
+    "LACK_OF_FIT_PCT",
+    "coefficient_significance",
+    "model_conditioning",
     "power_law_window",
     "SMALL_STRAIN_LAWS",
     "confinement_from_profile",
@@ -821,9 +827,28 @@ def fit_piecewise(
         "r_squared": stats["r_squared"],
         "rmse": stats["rmse"],
         "relative_rmse": stats["relative_rmse"],
+        "ss_res": stats["ss_res"],
         "n_points": stats["n_points"],
         "n_params": int(n_params),
     })
+    # Parsimony, carried on the fit itself so that anything comparing two
+    # fits is comparing the same numbers the page shows.
+    # A coefficient pinned by lower == upper (a component switched off) is
+    # not a parameter the curve paid for, so it is not counted against the
+    # model. Without this every candidate in a screen would look the same
+    # size and AIC would have nothing to say.
+    n_free = 0
+    for r in fitted_regimes:
+        for p in (r.get("params") or {}).values():
+            lo, hi = p.get("lower", -np.inf), p.get("upper", np.inf)
+            if np.isfinite(lo) and np.isfinite(hi) and lo == hi:
+                continue
+            n_free += 1
+    result["n_free_params"] = int(n_free)
+    result.update(information_criteria(stats["n_points"], stats["ss_res"],
+                                       n_free))
+    result["residuals"] = residual_diagnostics(
+        f_all[covered][ok], predicted[ok], x=x_all[covered][ok])
     try:  # the chi-squared the rest of the app reports, when available
         from lulevich_model import fit_statistics
 
@@ -1083,6 +1108,275 @@ def small_strain_reading(epsilon, force_N, geometry, window_pct=20.0,
         "offset_N": float(params[-1]) if free_offset else 0.0,
         "moduli": moduli,
     }
+
+
+# ================================================== method validation ==
+#
+# A fit with a high R2 is not a result. R2 rises whenever a parameter is
+# added, it is nearly 1 for anything monotonic over four decades of force,
+# and it says nothing at all about whether the parameters mean what they
+# are called. The things that do say something are the ones any analytical
+# method is validated on, and they are all computable from one fit:
+#
+#   SELECTIVITY   Is each component distinguishable from the others, or are
+#                 two of them describing the same feature? Collinearity:
+#                 the variance inflation factor of each coefficient and the
+#                 condition number of the whole design.
+#   DETECTION     Is each coefficient distinguishable from zero? t = θ/SE
+#                 with its p-value and its confidence interval. A component
+#                 whose interval covers zero has not been measured, however
+#                 good the R2 of the fit that contains it.
+#   PARSIMONY     Does adding it earn its parameter? AIC, AICc and BIC,
+#                 which penalise parameters, and the Akaike weight, which
+#                 turns a set of candidate models into the probability that
+#                 each is the best of the set.
+#   FIT QUALITY   Are the residuals structureless, or does the model miss
+#                 the shape of the curve in a systematic way? The runs test
+#                 and the Durbin-Watson statistic, which see a wandering
+#                 residual that R2 cannot.
+#
+# Each function below returns plain numbers with plain names, so the page
+# can put them in a table and a person can put them in a methods section.
+
+
+def information_criteria(n_points, ss_res, n_params):
+    """
+    AIC, AICc and BIC for a least-squares fit with Gaussian errors.
+
+    AIC = n ln(SSE/n) + 2k, and the small-sample correction AICc adds
+    2k(k+1)/(n-k-1), which matters whenever n is not much bigger than k.
+    BIC swaps the 2k for k ln n and so prefers smaller models as the curve
+    gets longer. Only differences between models fitted to the SAME points
+    mean anything, which is why the screen holds the boundaries fixed.
+    """
+    n, k = int(n_points), int(n_params)
+    ss = float(ss_res)
+    if n <= 0 or k < 0 or not np.isfinite(ss) or ss <= 0:
+        return {"aic": float("nan"), "aicc": float("nan"),
+                "bic": float("nan"), "log_likelihood": float("nan")}
+    # Up to a constant that is the same for every model on the same data.
+    log_likelihood = -0.5 * n * (np.log(2.0 * np.pi * ss / n) + 1.0)
+    aic = n * np.log(ss / n) + 2.0 * k
+    penalty = (2.0 * k * (k + 1.0) / (n - k - 1.0)) if n - k - 1 > 0 else np.inf
+    return {"aic": float(aic), "aicc": float(aic + penalty),
+            "bic": float(n * np.log(ss / n) + k * np.log(n)),
+            "log_likelihood": float(log_likelihood)}
+
+
+def akaike_weights(scores):
+    """
+    Candidate models ranked: ΔAIC and the weight of each, summing to one.
+
+    The weight is the usual exp(-Δ/2) normalised over the set, read as the
+    probability that this candidate is the best of the ones tried. A
+    difference of less than about 2 is no difference: those candidates fit
+    the curve equally well and something other than the curve has to choose
+    between them.
+    """
+    values = np.asarray([float(s) for s in scores], dtype=float)
+    good = np.isfinite(values)
+    delta = np.full(values.shape, float("inf"))
+    weight = np.zeros(values.shape)
+    if not good.any():
+        return delta, weight
+    delta[good] = values[good] - values[good].min()
+    raw = np.exp(-0.5 * delta[good])
+    total = float(raw.sum())
+    if total > 0:
+        weight[good] = raw / total
+    return delta, weight
+
+
+LACK_OF_FIT_PCT = 2.0
+
+
+def residual_diagnostics(y, predicted, x=None, window_fraction=0.05):
+    """
+    Whether what is left over looks like noise or like a missed feature.
+
+    Two different questions, and on a curve of several thousand points only
+    the second one is worth acting on:
+
+    IS THERE ANY STRUCTURE AT ALL?  runs_z, the runs test on the signs of
+        the residuals, and durbin_watson / lag1 behind it. On a densely
+        sampled force curve these ALWAYS say yes, because the noise itself
+        is correlated from point to point and n is in the thousands. A
+        significant runs test here is not news.
+    HOW BIG IS IT?  bias_pct: the residual smoothed over ``window_fraction``
+        of the curve, at its worst, as a percentage of the force there.
+        This is the one that matters -- it says the model is systematically
+        below or above the data by so much over such a stretch, which is a
+        statement about the cell rather than about the sample size -- and
+        ``structured`` is set from it, at LACK_OF_FIT_PCT.
+    """
+    y = np.asarray(y, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    keep = np.isfinite(y) & np.isfinite(predicted)
+    residual = y[keep] - predicted[keep]
+    n = int(residual.size)
+    out = {"runs": 0, "runs_expected": float("nan"), "runs_z": float("nan"),
+           "durbin_watson": float("nan"), "lag1": float("nan"),
+           "n_points": n, "structured": None,
+           "bias_pct": float("nan"), "bias_at_pct": float("nan"),
+           "bias_window_pct": float(window_fraction) * 100.0}
+    if n < 8:
+        return out
+    # The systematic part: the residual averaged over a window, compared
+    # with the force over the same window. Only where there is force to
+    # speak of -- a picnewton of bias on a picnewton of force is not a
+    # lack of fit, it is the contact point.
+    width = max(int(round(n * float(window_fraction))), 5)
+    if width < n:
+        kernel = np.ones(width) / width
+        smooth_residual = np.convolve(residual, kernel, mode="valid")
+        smooth_force = np.convolve(np.abs(y[keep]), kernel, mode="valid")
+        floor = float(np.max(np.abs(y[keep]))) * 0.1
+        loud = smooth_force >= floor
+        if loud.any():
+            share = np.abs(smooth_residual[loud]) / smooth_force[loud]
+            where = int(np.argmax(share))
+            out["bias_pct"] = float(100.0 * share[where])
+            out["structured"] = bool(out["bias_pct"] > LACK_OF_FIT_PCT)
+            if x is not None:
+                grid = np.asarray(x, dtype=float)[keep]
+                centres = np.convolve(grid, kernel, mode="valid")[loud]
+                out["bias_at_pct"] = float(centres[where])
+    signs = np.sign(residual)
+    signs[signs == 0] = 1.0
+    positives = float(np.sum(signs > 0))
+    negatives = float(n) - positives
+    runs = int(1 + np.sum(signs[1:] != signs[:-1]))
+    out["runs"] = runs
+    if positives > 0 and negatives > 0:
+        expected = 2.0 * positives * negatives / n + 1.0
+        variance = (2.0 * positives * negatives
+                    * (2.0 * positives * negatives - n)
+                    / (n * n * (n - 1.0)))
+        out["runs_expected"] = float(expected)
+        if variance > 0:
+            out["runs_z"] = float((runs - expected) / np.sqrt(variance))
+    diff = np.diff(residual)
+    denominator = float(np.sum(residual ** 2))
+    if denominator > 0:
+        out["durbin_watson"] = float(np.sum(diff ** 2) / denominator)
+        out["lag1"] = float(np.sum(residual[1:] * residual[:-1]) / denominator)
+    out["signs_random"] = (None if not np.isfinite(out["runs_z"])
+                           else bool(abs(out["runs_z"]) <= 2.0))
+    return out
+
+
+def coefficient_significance(result, confidence=0.95):
+    """
+    Is each coefficient distinguishable from zero, and by how much.
+
+    For every fitted coefficient: its value, its standard error, t = θ/SE,
+    the two-sided p-value, the confidence interval, and a verdict in words.
+    A coefficient whose interval covers zero has not been measured on this
+    curve -- it is not that the component is absent, it is that the curve
+    cannot see it -- and one sitting on a bound was never free to be
+    measured at all.
+    """
+    try:
+        from scipy import stats
+    except Exception:  # pragma: no cover - scipy is a hard dependency anyway
+        stats = None
+    rows = {}
+    for regime in result.get("regimes") or ():
+        if not regime.get("fitted"):
+            continue
+        n = int(regime.get("n_points", 0))
+        k = len(regime.get("params") or {})
+        dof = max(n - k, 1)
+        for name, p in (regime.get("params") or {}).items():
+            value = float(p.get("value", float("nan")))
+            se = float(p.get("se", float("nan")))
+            t = value / se if (np.isfinite(se) and se > 0) else float("nan")
+            if stats is not None and np.isfinite(t):
+                p_value = float(2.0 * stats.t.sf(abs(t), dof))
+                critical = float(stats.t.ppf(0.5 + confidence / 2.0, dof))
+            else:  # pragma: no cover
+                p_value, critical = float("nan"), 1.96
+            half = critical * se if np.isfinite(se) else float("nan")
+            if p.get("at_bound"):
+                verdict = "held at a bound — never free to be measured"
+            elif not np.isfinite(t):
+                verdict = "no standard error — not identifiable here"
+            elif abs(value) <= 0 or (np.isfinite(half) and abs(value) <= half):
+                verdict = "not distinguishable from zero on this curve"
+            elif abs(t) >= 10:
+                verdict = "well determined"
+            else:
+                verdict = "determined"
+            rows[name] = {
+                "regime": regime.get("key", ""),
+                "value": value, "se": se, "t": t, "p_value": p_value,
+                "lo": value - half, "hi": value + half,
+                "dof": int(dof), "confidence": float(confidence),
+                "at_bound": bool(p.get("at_bound")),
+                "detected": bool(np.isfinite(t) and np.isfinite(half)
+                                 and abs(value) > half
+                                 and not p.get("at_bound")),
+                "verdict": verdict,
+            }
+    return rows
+
+
+def model_conditioning(epsilon, force_N, boundaries_pct=C2C12_BOUNDARIES_PCT,
+                       regimes=C2C12_REGIMES, settings=None,
+                       carry=("K_shell",), squeeze=0.0):
+    """
+    Are the components telling themselves apart, or describing one feature?
+
+    Builds the whole-curve design matrix the boundary search uses and
+    reports, for each coefficient, its variance inflation factor -- how
+    much wider its confidence interval is than it would be if that column
+    were orthogonal to the others -- and, for the design as a whole, the
+    condition number of its correlation matrix.
+
+    VIF above 10 is the usual line: past it, two components are describing
+    the same part of the curve and the split between them is arbitrary,
+    which is exactly the failure that makes one of them come back at zero
+    and the other far too stiff.
+    """
+    x_all, _f_all = _prepare(epsilon, force_N)
+    regimes = with_settings(regimes, settings)
+    X, covered, names, _lower, _upper = joint_design(
+        x_all, [float(b) for b in boundaries_pct], regimes, carry, squeeze)
+    A = X[covered]
+    keep = [i for i, name in enumerate(names) if name != "C0"]
+    out = {"vif": {}, "condition_number": float("nan"),
+           "names": [names[i] for i in keep]}
+    if A.shape[0] < 3 or len(keep) < 1:
+        return out
+    columns = A[:, keep]
+    spread = columns.std(axis=0)
+    live = spread > 0
+    if live.sum() < 1:
+        return out
+    centred = (columns[:, live] - columns[:, live].mean(axis=0)) / spread[live]
+    correlation = centred.T @ centred / max(centred.shape[0] - 1, 1)
+    try:
+        singular = np.linalg.svd(correlation, compute_uv=False)
+        if singular.min() > 0:
+            out["condition_number"] = float(np.sqrt(singular.max()
+                                                    / singular.min()))
+    except np.linalg.LinAlgError:  # pragma: no cover
+        pass
+    live_names = [names[i] for i, ok in zip(keep, live) if ok]
+    for j, name in enumerate(live_names):
+        others = [c for c in range(centred.shape[1]) if c != j]
+        if not others:
+            out["vif"][name] = 1.0
+            continue
+        target = centred[:, j]
+        basis = centred[:, others]
+        coefficients, *_ = np.linalg.lstsq(basis, target, rcond=None)
+        residual = target - basis @ coefficients
+        total = float(np.sum((target - target.mean()) ** 2))
+        r2 = 1.0 - float(np.sum(residual ** 2)) / total if total > 0 else 0.0
+        out["vif"][name] = (float(1.0 / (1.0 - r2)) if r2 < 1 - 1e-12
+                            else float("inf"))
+    return out
 
 
 def _carried_force(carried, x, a):
