@@ -779,9 +779,6 @@ DEFAULTS = {
     "log_guide_p2": 1.5,
     "log_guide_anchor_pct": 30.0,
     "log_guide_span": 0.4,
-    # Which number the combination search keeps the best of.
-    "pw_combo_criterion": "adj_r2",
-    "legacy_combo_criterion": "adj_r2",
     # The cells fitted so far this session, each with its own boundaries,
     # moduli and curve, for the All cells tab.
     "pw_collection": {},
@@ -796,6 +793,9 @@ DEFAULTS = {
     "pw_boundary_search": None,
     # How the boundaries are placed, and the R² every fit has to reach.
     "pw_method": "refined",
+    # Whether ▶ Fit & plot places the boundaries from the curve or fits at
+    # the numbers on the board exactly as they are.
+    "pw_eps_way": "found",
     "pw_target_r2": 0.999,
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
@@ -4697,31 +4697,25 @@ def fit_at_the_current_settings(model, lo, hi, terms):
     rerun_keeping_settings({"_fit_from_curve": True})
 
 
-def legacy_combination_search(model, lo, hi, here, criterion):
+def legacy_contributions(model, lo, hi, terms):
     """
-    Fit every combination of this cell type's components, once each.
+    Refit without each ticked component, at the same boundaries and range.
 
-    Nothing else moves: the boundaries, the ranges, the weighting and the
-    confinement are the ones on the board, so the only difference between
-    the rows is which components are in the model. Each fit is one linear
-    solve, which is why trying all of them is affordable.
+    The spring-network answer to the same question the regime-by-regime
+    fit answers: what is this component worth on this curve? Each fit is
+    one linear solve, so asking it of every component is cheap.
     """
-    if not hasattr(model, "fit_composition") or not here:
-        return None
-    pool = [term for term in ALL_TERMS if term in here][:6]
-    if not pool:
+    if not hasattr(model, "fit_composition") or not terms:
         return None
     e1 = float(st.session_state["segment_break_1"])
     e2 = float(st.session_state["segment_break_2"])
     membrane = MEMBRANE_CHOICES.get(
         st.session_state["membrane_after_break"], "freeze")
     cyto = CYTO_CHOICES.get(st.session_state["cyto_starts_at"], "break")
-    rows = []
-    for mask in range(1, 1 << len(pool)):
-        on = tuple(term for index, term in enumerate(pool)
-                   if mask >> index & 1)
+
+    def _fit(on):
         try:
-            fit = model.fit_composition(
+            return model.fit_composition(
                 lo, hi, e1=e1, e2=e2, membrane=membrane, cyto_start=cyto,
                 use_membrane="membrane" in on,
                 use_interior="interior" in on,
@@ -4735,66 +4729,23 @@ def legacy_combination_search(model, lo, hi, here, criterion):
                                 term_windows=element_windows(on, lo, hi)),
             )
         except Exception as exc:  # pragma: no cover - defensive
-            fit = {"success": False, "error": str(exc)}
-        ok = bool(fit.get("success"))
-        rows.append({
-            "on": on,
-            "label": " + ".join(plain_name(t).lower() for t in on),
-            "ok": ok,
-            "r2": float(fit.get("r_squared", float("nan"))) if ok else float("nan"),
-            "adj_r2": criterion_value(fit, "adj_r2") if ok else float("nan"),
-            "bic": -criterion_value(fit, "bic") if ok else float("nan"),
-            "n_params": int(fit.get("n_params") or len(on)) if ok else 0,
-            "score": criterion_value(fit, criterion) if ok else float("-inf"),
-            "error": "" if ok else str(fit.get("error", "did not fit")),
-        })
-    scored = [row for row in rows if np.isfinite(row["score"])]
-    # Ties go to the model with fewer components: on this curve they are the
-    # same fit, and the smaller one is the one that can be believed.
-    best = (max(scored, key=lambda r: (round(r["score"], 9), -len(r["on"])))
-            if scored else None)
-    return {"criterion": criterion, "rows": rows, "best": best,
-            "eps": (e1, e2), "range": (float(lo), float(hi))}
+            return {"success": False, "error": str(exc)}
 
-
-def legacy_combination_table(found):
-    """The combinations tried on this page, best first."""
-    if not found:
-        st.caption(
-            "Press **🔎 Find the best combination** on the control board: "
-            "every combination of this cell type's components is fitted at "
-            "the boundaries on the board and compared here."
-        )
-        return
-    criterion = found.get("criterion", "adj_r2")
-    best = found.get("best") or {}
-    rows = sorted(found["rows"],
-                  key=lambda r: (-r["score"] if np.isfinite(r["score"])
-                                 else float("inf")))
-    flat_table(
-        pd.DataFrame([
-            {
-                "combination": row["label"],
-                "kept": "★" if row["on"] == best.get("on") else "",
-                "R²": f"{row['r2']:.5f}" if np.isfinite(row["r2"]) else "—",
-                "adjusted R²": (f"{row['adj_r2']:.5f}"
-                                if np.isfinite(row["adj_r2"]) else "—"),
-                "BIC": f"{row['bic']:.1f}" if np.isfinite(row["bic"]) else "—",
-                "coefficients m": row["n_params"],
-                "": row["error"],
-            }
-            for row in rows
-        ]),
-        align_right=["R²", "adjusted R²", "BIC", "coefficients m"],
-    )
-    e1, e2 = found.get("eps", (float("nan"), float("nan")))
-    st.caption(
-        f"Judged by **{PW_CRITERIA.get(criterion, criterion)}**, every row "
-        f"fitted at ε₁ = {e1:.3f}, ε₂ = {e2:.3f} over the range on the "
-        "board. Only which components are in the model differs between the "
-        "rows."
-    )
-    st.caption(PW_CRITERION_HELP.get(criterion, ""))
+    on = tuple(terms)
+    full = _fit(on)
+    if not full.get("success"):
+        return None
+    base = float(full.get("r_squared", float("nan")))
+    names = components_for(st.session_state.get("cell_type"))
+    rows = []
+    for term in [t for t in ALL_TERMS if t in on]:
+        without = _fit(tuple(t for t in on if t != term))
+        r2 = (float(without.get("r_squared", float("nan")))
+              if without.get("success") else float("nan"))
+        rows.append({"label": names[term][0],
+                     "symbol": TERM_SYMBOLS.get(term, term), "in": True,
+                     "r2_without": r2, "drop": base - r2})
+    return {"base": base, "rows": rows, "eps": (e1, e2)}
 
 
 def fit_verdict(fit=None):
@@ -5444,7 +5395,15 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
         "fit_id": piecewise_fit_id(result),
         "coupling": "piecewise",
         "model_label": PIECEWISE_MODE,
-        "terms": ("membrane", "interior", "nucleus_shell", "nucleus"),
+        # The components this fit is made of: the ticked ones and no
+        # others, so a component held at zero is absent from the results,
+        # the strip and the copied row rather than reported as 0 ± 0.
+        "terms": tuple(
+            term for name, term in (("K_shell", "membrane"),
+                                    ("K_cyto", "interior"),
+                                    ("K_nucleus", "nucleus_shell"),
+                                    ("K_core", "nucleus"))
+            if name not in (piecewise_off() if off is None else off)),
         "Em": finite(shell), "Em_MPa": finite(shell) / 1e6,
         "Em_MPa_std": finite(shell_se) / 1e6,
         "Ei": finite(cyto), "Ei_kPa": finite(cyto) / 1e3,
@@ -6380,8 +6339,19 @@ PW_METHODS = {
     "power": "ε_PL = argmax dp/d ln x,   p = d ln F/d ln x",
     "everything": "ε̂ = argmin S(ε),  ε ∈ B",
     "defaults": "ε = ε_prior  (the C2C12 constraints' middle)",
-    "typed": "ε = as typed below, and nothing moves",
 }
+# Step 2 asks one question -- are the boundaries found or kept? -- and the
+# route that finds them is a detail of the first answer, under Advanced.
+PW_EPS_WAYS = {
+    "found": "🎯 Found from this curve",
+    "typed": "✍️ Kept exactly as I typed them",
+}
+
+
+def _pw_eps_way_changed():
+    """Callback: found or typed. Found re-chooses at once, typed moves nothing."""
+    if st.session_state.get("pw_eps_way") == "found":
+        _pw_apply_selection()
 # The same routes written as names, for the table, the reasons and the
 # spreadsheet, where an expression would read as noise.
 PW_ROW_LABELS = {
@@ -6389,7 +6359,6 @@ PW_ROW_LABELS = {
     "power": "📈 Power law only",
     "everything": "🎯 Fit everything only",
     "defaults": "C2C12 defaults",
-    "typed": "✍️ As typed",
 }
 PW_METHOD_HELP = {
     "refined": r"$\hat{\boldsymbol\varepsilon} = \arg\min_{\boldsymbol\varepsilon"
@@ -6405,61 +6374,22 @@ PW_METHOD_HELP = {
                   r"$\;S = \min_{\theta_{lo}\le\theta\le\theta_{hi}} "
                   r"\lVert F - X(\boldsymbol\varepsilon)\theta\rVert^2$.",
     "defaults": r"$\boldsymbol\varepsilon$ = the C2C12 prior's defaults.",
-    "typed": r"$\boldsymbol\varepsilon$ exactly as typed in the boxes: "
-             r"▶ Fit & plot fits there and moves nothing.",
 }
 # When the chosen route misses the R² target, the others are tried in this
 # order and the first that reaches it is used.
 PW_FALLBACK = ("refined", "everything", "power", "defaults")
 
 
-# ------------------------------------------------ which components at all --
+# ------------------------------------ what each component is worth here --
 #
-# Ticking components by hand answers "does this one help?" one press at a
-# time. The search answers it for every combination at once: it fits each
-# of them at the boundaries on the board and keeps the best by a number
-# that is named on the button, so the answer is a table rather than an
-# opinion. The first combination is the four main components, which is
-# what the page opens on.
-
-# Which number to keep the best of. Each is written so that bigger is
-# better, so the search is one argmax.
-PW_CRITERIA = {
-    "adj_r2": "adjusted R²",
-    "r2": "R²",
-    "bic": "BIC (fewest components that still fit)",
-}
-PW_CRITERION_HELP = {
-    "adj_r2": r"$\bar R^2 = 1 - (1-R^2)\dfrac{n-1}{n-m-1}$: closeness of fit "
-              r"with the number of coefficients $m$ charged for. The usual "
-              r"choice.",
-    "r2": r"$R^2 = 1 - \dfrac{\sum (F_i - \hat F_i)^2}{\sum (F_i-\bar F)^2}$: "
-          r"closeness alone. It never falls when a component is added, so it "
-          r"tends to pick the biggest model.",
-    "bic": r"$\mathrm{BIC} = n\ln(S/n) + m\ln n$, kept smallest: the harshest "
-           r"charge per coefficient, so it picks the smallest model the curve "
-           r"actually needs.",
-}
-# Membrane and cytoskeleton carry the first stretch of the squash, so
-# every combination has them; the two nuclear components are what the
-# search is about. All four come first: that is the model the page opens
-# on, and ties go to it.
-PW_COMBINATIONS = (
-    ("K_shell", "K_cyto", "K_nucleus", "K_core"),
-    ("K_shell", "K_cyto", "K_nucleus"),
-    ("K_shell", "K_cyto", "K_core"),
-    ("K_shell", "K_cyto"),
-)
-
-
-def combination_label(on):
-    """A combination of components, written with the names on the board."""
-    names = [label for name, label, *_ in PW_COMPONENTS if name in on]
-    return " + ".join(names) if names else "nothing"
+# Nothing on this page ticks a component for you. What the page can do is
+# say what each ticked one is worth on this curve: refit without it and
+# report how much worse the fit gets. That is the insight a person needs
+# to decide the model, and the decision stays theirs.
 
 
 def criterion_value(result, criterion):
-    """The chosen number, written so that bigger is always better."""
+    """A goodness number written so that bigger is always better."""
     n = int(result.get("n_points") or 0)
     m = int(result.get("n_params") or 0)
     r2 = float(result.get("r_squared", float("nan")))
@@ -6476,85 +6406,88 @@ def criterion_value(result, criterion):
         rmse = float(result.get("rmse", float("nan")))
         if not (n > 0 and np.isfinite(rmse) and rmse > 0):
             return float("-inf")
-        # -BIC, so the best is still the largest.
         return -(n * np.log(rmse ** 2) + m * np.log(n))
     return r2
 
 
-def pw_combination_search(epsilon, force_N, criterion):
-    """
-    Fit every combination of components at the boundaries on the board.
+def contribution_verdict(drop):
+    """How much worse the fit is without this component, in words."""
+    if not np.isfinite(drop):
+        return "the fit does not stand without it"
+    if drop >= 1e-3:
+        return "carries the fit here"
+    if drop >= 1e-5:
+        return "helps a little"
+    return "adds nothing measurable — the curve does not need it"
 
-    Nothing is placed and nothing else is changed: ε, the ranges, p₀ and
-    the bounds are the ones on the board, so the only difference between
-    the rows is which components are in the model. Returns the rows in the
-    order they were tried, each with its score, and the winner first in
-    ``best``.
+
+def piecewise_contributions(epsilon, force_N, off_now):
+    """
+    Refit without each ticked component, at the same boundaries.
+
+    Only which components are in the model changes between the rows, so
+    the drop in R² is what that one component is worth on this curve.
     """
     bounds = piecewise_boundaries()
-    settings, untils, carry = (piecewise_settings(), piecewise_until(),
-                               piecewise_carry())
-    rows = []
-    for on in PW_COMBINATIONS:
-        off = tuple(n for n in PW_SWITCHABLE if n not in on)
-        result = fit_piecewise(
+    settings, untils = piecewise_settings(), piecewise_until()
+    carry = piecewise_carry()
+
+    def _fit(off):
+        return fit_piecewise(
             epsilon, force_N, boundaries_pct=bounds, regimes=PW_REGIMES,
-            settings=effective_piecewise_settings(settings, untils, off),
-            carry=carry,
-        )
-        ok = bool(result.get("success"))
-        rows.append({
-            "on": tuple(on), "off": off, "label": combination_label(on),
-            "ok": ok,
-            "r2": float(result.get("r_squared", float("nan"))) if ok else float("nan"),
-            "adj_r2": (criterion_value(result, "adj_r2") if ok else float("nan")),
-            "bic": (-criterion_value(result, "bic") if ok else float("nan")),
-            "n_params": int(result.get("n_params") or 0) if ok else 0,
-            "score": criterion_value(result, criterion) if ok else float("-inf"),
-            "error": "" if ok else result.get("error", "the fit is not defined here"),
-        })
-    scored = [r for r in rows if np.isfinite(r["score"])]
-    best = max(scored, key=lambda r: r["score"]) if scored else None
-    return {"criterion": criterion, "rows": rows, "best": best,
+            settings=effective_piecewise_settings(settings, untils, tuple(off)),
+            carry=carry)
+
+    full = _fit(off_now)
+    if not full.get("success"):
+        return None
+    base = float(full.get("r_squared", float("nan")))
+    rows = []
+    for name, label, symbol, _colour, _law in PW_COMPONENTS:
+        if name in off_now:
+            rows.append({"label": label, "symbol": symbol, "in": False})
+            continue
+        without = _fit(tuple(off_now) + (name,))
+        r2 = (float(without.get("r_squared", float("nan")))
+              if without.get("success") else float("nan"))
+        rows.append({"label": label, "symbol": symbol, "in": True,
+                     "r2_without": r2, "drop": base - r2})
+    return {"base": base, "rows": rows,
             "boundaries_pct": tuple(float(v) for v in bounds)}
 
 
-def combination_search_table(found):
-    """The combinations the search tried, best first, with what decided it."""
+def contributions_table(found, heading_note=""):
+    """What each component is worth, as a table with a verdict per row."""
     if not found:
-        st.caption(
-            "Press **🔎 Find the best combination** on the board and every "
-            "combination of components is fitted at the boundaries on the "
-            "board, then compared here."
-        )
+        st.caption("Press **▶ Fit & plot** and this says what each ticked "
+                   "component is worth on this curve.")
         return
-    criterion = found.get("criterion", "adj_r2")
-    best = found.get("best") or {}
-    rows = sorted(found["rows"],
-                  key=lambda r: (-r["score"] if np.isfinite(r["score"])
-                                 else float("inf")))
-    frame = pd.DataFrame([
+    base = found["base"]
+    st.markdown(f"With every ticked component in, **R² = {base:.5f}**. Each "
+                "row is the same fit with that one component held at zero, "
+                "at the same boundaries.")
+    flat_table(pd.DataFrame([
         {
-            "combination": row["label"],
-            "kept": "★" if row["on"] == best.get("on") else "",
-            "R²": f"{row['r2']:.5f}" if np.isfinite(row["r2"]) else "—",
-            "adjusted R²": (f"{row['adj_r2']:.5f}"
-                            if np.isfinite(row["adj_r2"]) else "—"),
-            "BIC": f"{row['bic']:.1f}" if np.isfinite(row["bic"]) else "—",
-            "coefficients m": row["n_params"],
-            "": row["error"],
+            "component": row["label"],
+            "in the model": "✓" if row["in"] else "—",
+            "R² without it": (f"{row['r2_without']:.5f}"
+                              if row["in"] and np.isfinite(row["r2_without"])
+                              else "—"),
+            "R² it accounts for": (f"{row['drop']:.5f}" if row["in"]
+                                   and np.isfinite(row["drop"]) else "—"),
+            "what that means": (contribution_verdict(row["drop"]) if row["in"]
+                                else "unticked, so not in this fit"),
         }
-        for row in rows
-    ])
-    flat_table(frame, align_right=["R²", "adjusted R²", "BIC", "coefficients m"])
+        for row in found["rows"]
+    ]), align_right=["R² without it", "R² it accounts for"])
     b = found.get("boundaries_pct") or ()
     st.caption(
-        f"Judged by **{PW_CRITERIA.get(criterion, criterion)}**"
-        + (f", every row fitted at ε = ({b[1]:.2f}, {b[2]:.2f}, {b[3]:.2f}) %, "
-           f"x_end = {b[4]:.1f} %" if len(b) >= 5 else "")
-        + ". Only which components are in the model differs between the rows."
+        (f"All rows fitted at ε = ({b[1]:.2f}, {b[2]:.2f}, {b[3]:.2f}) %, "
+         f"x_end = {b[4]:.1f} %. " if len(b) >= 5 else "")
+        + "Nothing here changes the ticks: a component leaves the model "
+        "when you untick it in step 1 and not before."
+        + (f" {heading_note}" if heading_note else "")
     )
-    st.caption(PW_CRITERION_HELP.get(criterion, ""))
 
 
 def _pw_score(placement, epsilon, force_N, model):
@@ -6633,6 +6566,11 @@ def select_placement(placements, method, target):
     used and the reason says so.
     """
     rows = placements.get("rows") or {}
+    # "typed" used to be one of the routes; it is now the other answer to
+    # step 2, so a session that still holds it asks for the recommended
+    # route rather than for a KeyError.
+    if method not in PW_METHODS:
+        method = "refined"
 
     def r2(key):
         value = (rows.get(key) or {}).get("r2", float("nan"))
@@ -6660,7 +6598,7 @@ def select_placement(placements, method, target):
 def _pw_apply_selection():
     """Callback: the route or the target changed, so re-choose and apply."""
     placements = st.session_state.get("pw_placements")
-    if not placements or st.session_state.get("pw_method") == "typed":
+    if not placements or st.session_state.get("pw_eps_way") == "typed":
         return
     key, reason = select_placement(
         placements, st.session_state.get("pw_method", "refined"),
@@ -6846,34 +6784,49 @@ def collection_record(name, source, height_um, epsilon, force_N, result,
     }
 
 
-def pw_stepper(result, target, source, name, in_collection):
+def component_results_strip(fit, extra=""):
     """
-    Where this cell is in the four steps, at a glance.
+    What the cell is made of, across the top of the page.
 
-    ① the curve · ② its own ε · ③ R² against the target · ④ in the
-    collection. A person new to the app reads left to right and sees which
-    one is not done.
+    One card per component: its modulus as best fit ± one standard error,
+    and the 95 % interval under it. This is the answer the page exists to
+    give, so it is the first thing on it, before the curve; how good the
+    fit is and where its boundaries fell are one line under the cards.
     """
-    data = st.session_state.get("data") or {}
-    ok = bool(result.get("success"))
-    r2 = float(result.get("r_squared", float("nan"))) if ok else float("nan")
-    relation = r"\ge" if ok and r2 >= target else "<"
-    steps = [
-        ("①", "Curve", True,
-         f"$n = {int(result.get('n_points', 0))}$" if ok else "loaded"),
-        ("②", "ε for this cell", ok and source != "set by hand",
-         source if ok else "—"),
-        ("③", "Fit quality", ok and np.isfinite(r2) and r2 >= target,
-         rf"$R^2 = {r2:.5f} {relation} {target:g}$" if ok else "no fit"),
-        ("④", "Collection", in_collection,
-         f"“{name}” is in the collection" if in_collection
-         else "not added yet"),
-    ]
-    cols = st.columns(4)
-    for col, (num, title, done, detail) in zip(cols, steps):
-        with col:
-            st.markdown(f"**{num} {title}** {'✅' if done else '⬜'}")
-            st.caption(detail)
+    if not (fit and fit.get("success")):
+        st.info("Tick the components the cell is made of below, then press "
+                "**▶ Fit & plot**. Their moduli appear here, each with its "
+                "uncertainty.")
+        return
+    # Only the components this fit is made of: an unticked one is not a
+    # measurement of zero, it is absent, and the strip says what the cell
+    # was found to be made of.
+    rows = [row for row in result_rows(fit)
+            if row[0].startswith("modulus_") and row[2] != "not in this model"]
+    if not rows:
+        st.warning("No component is ticked, so there is nothing to report. "
+                   "Tick at least one below and press ▶ Fit & plot.")
+        return
+    for card, (_key, label, value, _se, interval, support) in zip(
+            st.columns(len(rows)), rows):
+        with card:
+            with st.container(border=True):
+                st.caption(label)
+                st.markdown(f"### {value}")
+                st.caption(f"95 % interval: {interval}")
+                st.caption(support)
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    where = " · ".join(f"{name} = {value:.3f}" for value, name in fit_edges(fit))
+    st.caption(
+        "Each value is the best fit ± one standard error, "
+        r"SE = √diag[σ̂²(XᵀX)⁻¹]; the interval is ± 1.96 SE. · "
+        + (f"`fit {fit['fit_id']}` · " if fit.get("fit_id") else "")
+        + f"R² = {float(fit.get('r_squared', float('nan'))):.5f}"
+        + (f" · χ²/dof = {float(chi):.3g}" if np.isfinite(chi) else "")
+        + f" · {int(fit.get('n_points', 0))} points"
+        + (f" · {where}" if where else "")
+        + (f" · {extra}" if extra else "")
+    )
 
 
 def piecewise_section(model, epsilon, force_N, rupture):
@@ -6899,6 +6852,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
     # ticked, and on arrival that is all four components.
     for _name in PW_SWITCHABLE:
         st.session_state.setdefault(f"pw_use_{_name}", True)
+    # A session left over from when "as typed" was one of the routes.
+    if st.session_state.get("pw_method") not in PW_METHODS:
+        st.session_state["pw_method"] = "refined"
+        st.session_state["pw_eps_way"] = "typed"
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
     data = st.session_state.get("data") or {}
@@ -6917,10 +6874,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
         """
         method = ("refined" if arriving
                   else st.session_state.get("pw_method", "refined"))
-        if method == "typed":
+        if not arriving and st.session_state.get("pw_eps_way") == "typed":
             return
         if arriving:
             st.session_state["pw_method"] = "refined"
+            st.session_state["pw_eps_way"] = "found"
         placements = current_placements(epsilon, force_N)
         if placements is None:
             with st.spinner("Placing ε₁, ε₂, ε₃ for this cell…"):
@@ -6964,73 +6922,45 @@ def piecewise_section(model, epsilon, force_N, rupture):
     # range shown, so they are read before the rest of the parameters.
     board = st.container(border=True)
     with board:
-        head1, head2, head3 = st.columns([1, 1, 1.6])
-        with head1:
-            pressed = st.button(
-                "▶ Fit & plot", type="primary", key="pw_fit_plot",
-                help="Places ε by the route chosen below (unless it is to be "
-                "used as typed), fits every regime, and redraws the graph "
-                "and the results.",
-                **STRETCH,
-            )
-        with head2:
-            refreshed = st.button(
-                "🔄 Refresh graph", key="pw_refresh",
-                help="Redraws the graph and the results at exactly what the "
-                "board holds now. Moves no boundary and chooses nothing: "
-                "the same fit the board describes, drawn again.",
-                **STRETCH,
-            )
-        with head3:
-            st.selectbox(
-                "judged by", list(PW_CRITERIA), format_func=PW_CRITERIA.get,
-                key="pw_combo_criterion", label_visibility="collapsed",
-                help="Which number the search below keeps the best of.",
-            )
-            criterion = st.session_state.get("pw_combo_criterion", "adj_r2")
-            searched = st.button(
-                f"🔎 Find the best combination based on "
-                f"{PW_CRITERIA[criterion]}",
-                key="pw_find_combo",
-                help="Fits all "
-                f"{len(PW_COMBINATIONS)} combinations of the components at "
-                "the boundaries on the board, keeps the best by this "
-                "number, ticks it here and redraws. The combinations are "
-                "compared in the table under 'Component combinations'.",
-                **STRETCH,
-            )
+        # The board is read top to bottom and it is four steps: what the
+        # cell is made of, where its parts take over, the one button, and
+        # everything else out of the way behind Advanced. Nothing on it
+        # ticks or unticks a component: the ticks are the person's, and
+        # every fit is made of exactly what they have ticked.
+        st.markdown("#### 🎛️ Fitting")
         status_slot = st.empty()
-        st.markdown("#### 🎛️ Fitting options")
-        st.markdown("**1 · Components θⱼ and the ranges [sⱼ, uⱼ] they act "
-                    "over** — what is ticked is what is fitted and drawn")
+
+        st.markdown("**Step 1 · What the cell is made of**")
+        share_col, model_col = st.columns([1.2, 1], gap="medium")
+        with share_col:
+            load_sharing_control()
+        with model_col:
+            st.latex(r"\hat F_k(x) = \hat F_{k-1}(\varepsilon_{k-1}) + "
+                     r"\sum_{j\,\in\,k}\theta_j\,\phi_j(x)")
         value_slots = piecewise_components_panel(
             piecewise_boundaries(), None, None, columns=2)
         components_note_slot = st.empty()
-        st.markdown("**2 · The model, its boundaries, and what is drawn**")
         # What the board holds for each row, to compare with what the plot
         # is drawing: the two lists must read the same, or say they differ.
         board_off = set(piecewise_off())
         board_ranges = piecewise_ranges(piecewise_boundaries())
-        # Each tile is headed by the expression it sets, not by a phrase:
-        # what the model is, where its boundaries come from, and what the
-        # plot draws of it.
-        t1, t2, t3 = st.columns([1.05, 1.25, 0.9], gap="medium")
-        with t1:
-            st.latex(r"\hat F_k(x) = \hat F_{k-1}(\varepsilon_{k-1}) + "
-                     r"\sum_{j\,\in\,k}\theta_j\,\phi_j(x)")
-            st.caption("how the components share the load")
-            load_sharing_control()
-        with t2:
-            st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
-                     r"\le x_{end}")
-            st.caption("where the boundaries come from, and what they are")
+
+        st.markdown("**Step 2 · Where its parts take over**")
+        st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
+                 r"\le x_{end}")
+        how_col, eps_col = st.columns([1, 1.6], gap="medium")
+        with how_col:
             st.radio(
-                "ε on ▶ Fit & plot", list(PW_METHODS),
-                format_func=lambda k: PW_METHODS[k] + (
-                    "  ★" if k == "refined" else ""),
-                key="pw_method", on_change=_pw_apply_selection,
+                "on ▶ Fit & plot", list(PW_EPS_WAYS),
+                format_func=PW_EPS_WAYS.get, key="pw_eps_way",
+                on_change=_pw_eps_way_changed,
+                help="Found from the curve: the boundaries are placed by the "
+                     "route under Advanced, and the numbers beside this are "
+                     "overwritten with what it found. Kept as typed: the fit "
+                     "happens exactly at the numbers beside this and nothing "
+                     "moves.",
             )
-            st.caption(PW_METHOD_HELP[st.session_state.get("pw_method", "refined")])
+        with eps_col:
             c1, c2 = st.columns(2)
             with c1:
                 st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
@@ -7043,32 +6973,64 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
                                 key="pw_end", help="Last point fitted; not moved "
                                 "by the routes.")
-            st.number_input(
-                "R²★  (the fit must reach it)", min_value=0.9, max_value=0.99999,
-                step=0.0005, format="%.4f", key="pw_target_r2",
-                on_change=_pw_apply_selection,
-                help=r"A route below R²★ hands over to the next that reaches it.",
-            )
-            for note in constraint_notes(piecewise_boundaries()):
-                st.caption(f"⚠️ {note}.")
-            if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
-                at = float(rupture["epsilon"]) * 100.0
-                if 0.0 < at < min(float(st.session_state["pw_end"]), top):
-                    st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
-                               rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
-        with t3:
-            st.latex(r"\hat F = \textstyle\sum_j F_j")
-            st.caption("what the plot draws of it")
-            st.radio("Components on the plot", list(PW_VIEWS),
-                     format_func=PW_VIEWS.get, key="pw_view",
-                     help="Stacked, the layers add up to the fitted curve and "
-                     "each starts at its own boundary; each from zero, every "
-                     "component is its own dashed line. Applies at once.")
-            st.checkbox("log F axis", key="pw_log_y",
-                        help="Applies at once; components are then drawn "
-                        "each from zero.")
+        for note in constraint_notes(piecewise_boundaries()):
+            st.caption(f"⚠️ {note}.")
+        if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
+            at = float(rupture["epsilon"]) * 100.0
+            if 0.0 < at < min(float(st.session_state["pw_end"]), top):
+                st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
+                           rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
 
-        with st.expander("p₀ and bounds, constraints on ε, reset", expanded=False):
+        st.markdown("**Step 3 · Fit**")
+        go1, go2 = st.columns([1, 1])
+        with go1:
+            pressed = st.button(
+                "▶ Fit & plot", type="primary", key="pw_fit_plot",
+                help="Fits the components ticked in step 1, at the "
+                "boundaries step 2 gives, and redraws everything on this "
+                "page from that one fit.",
+                **STRETCH,
+            )
+        with go2:
+            refreshed = st.button(
+                "🔄 Refresh graph", key="pw_refresh",
+                help="Redraws the graph and the results at exactly what the "
+                "board holds now. Moves no boundary and chooses nothing.",
+                **STRETCH,
+            )
+
+        with st.expander("⚙️ Advanced · the route to ε, R²★, p₀ and bounds, "
+                         "the plot, reset", expanded=False):
+            a1, a2 = st.columns([1.3, 1], gap="medium")
+            with a1:
+                st.markdown("**The route that finds ε**")
+                st.radio(
+                    "route", list(PW_METHODS),
+                    format_func=lambda k: PW_METHODS[k] + (
+                        "  ★" if k == "refined" else ""),
+                    key="pw_method", on_change=_pw_apply_selection,
+                    label_visibility="collapsed",
+                )
+                st.caption(PW_METHOD_HELP[
+                    st.session_state.get("pw_method", "refined")])
+                st.number_input(
+                    "R²★  (the fit must reach it)", min_value=0.9,
+                    max_value=0.99999, step=0.0005, format="%.4f",
+                    key="pw_target_r2", on_change=_pw_apply_selection,
+                    help=r"A route below R²★ hands over to the next that "
+                         r"reaches it.",
+                )
+            with a2:
+                st.markdown("**What the plot draws**")
+                st.radio("Components on the plot", list(PW_VIEWS),
+                         format_func=PW_VIEWS.get, key="pw_view",
+                         help="Stacked, the layers add up to the fitted curve "
+                         "and each starts at its own boundary; each from "
+                         "zero, every component is its own dashed line. "
+                         "Applies at once.")
+                st.checkbox("log F axis", key="pw_log_y",
+                            help="Applies at once; components are then drawn "
+                            "each from zero.")
             piecewise_parameter_editor()
             prior = piecewise_prior()
             (l1, h1), (l2, h2), _b3 = piecewise_bands()
@@ -7098,14 +7060,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
                            key="pw_reset_board",
                            help="ε = " + " / ".join(f"{v:g}" for v in spec)
                            + " %, the specification's ranges, p₀ and bounds, "
-                           "the four main components on and the contact line "
-                           "off. Applied with ▶ Fit & plot."):
+                           "and every component ticked. Applied with "
+                           "▶ Fit & plot."):
                 rerun_keeping_settings({
                     **dict(zip(PW_BOUNDARY_KEYS, spec)),
                     "pw_settings": {},
                     "pw_until": {},
                     "pw_membrane_throughout": True,
-                    "pw_method": "typed",
+                    "pw_method": "refined",
+                    "pw_eps_way": "typed",
                     **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
                     **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
                     **{f"pw_use_{n}": DEFAULTS[f"pw_use_{n}"]
@@ -7114,23 +7077,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     "_pw_editor_reset": True,
                 })
 
-    # 🔎 Find the best combination: every combination fitted where the board
-    # says, the best by the chosen number ticked on the board and applied.
-    if searched:
-        with st.spinner(f"Fitting {len(PW_COMBINATIONS)} combinations of the "
-                        "components at these boundaries…"):
-            found_combo = pw_combination_search(epsilon, force_N, criterion)
-        st.session_state["pw_combo_search"] = found_combo
-        best = found_combo.get("best")
-        if best is None:
-            st.error("No combination of components fits this curve at these "
-                     "boundaries. Move ε, or press ▶ Fit & plot to place it.")
-        else:
-            rerun_keeping_settings({
-                **{f"pw_use_{n}": (n in best["on"]) for n in PW_SWITCHABLE},
-                "_pw_apply": True,
-            })
-
     # 🔄 Refresh graph: draw the board as it stands, moving nothing.
     if refreshed:
         apply_board()
@@ -7138,7 +7084,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
 
     # ▶ Fit & plot: place ε if the route says so, then apply the board.
     if pressed:
-        if st.session_state.get("pw_method", "refined") == "typed":
+        if st.session_state.get("pw_eps_way") == "typed":
             apply_board()
             applied = st.session_state["pw_applied"]["values"]
         else:
@@ -7186,7 +7132,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
         off_now = piecewise_off()
 
         with stepper_slot:
-            pw_stepper(result, target, source, name, in_collection)
+            component_results_strip(
+                fit, extra=(source if ok else "")
+                + (f" · “{name}” is in the collection" if in_collection else ""))
 
         # What the fit made of each component, beside its row on the board,
         # and a mark on any row the plot is not drawing yet.
@@ -7303,12 +7251,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
             fit_explainer(fit, result if ok else None)
 
         # ---- what decided it, from the same fit ------------------------
-        t_routes, t_combo, t_coef, t_model, t_set, t_work = st.tabs([
-            "ε routes compared", "Component combinations", "θ̂ by regime",
-            "Model F(x)", "Settings used", "🔍 Working",
+        t_worth, t_routes, t_coef, t_model, t_set, t_work = st.tabs([
+            "🔬 What each component is worth", "ε routes compared",
+            "θ̂ by regime", "Model F(x)", "Settings used", "🔍 Working",
         ])
-        with t_combo:
-            combination_search_table(st.session_state.get("pw_combo_search"))
+        with t_worth:
+            # Measured once per fit: four more linear solves, and only when
+            # the fit on the page has changed.
+            if ok:
+                if (st.session_state.get("_pw_loo") or {}).get("fit_id") != fid:
+                    st.session_state["_pw_loo"] = {
+                        "fit_id": fid,
+                        "found": piecewise_contributions(epsilon, force_N,
+                                                         off_now),
+                    }
+                contributions_table(
+                    (st.session_state.get("_pw_loo") or {}).get("found"))
         with t_routes:
             if placements:
                 piecewise_placement_table(placements, piecewise_boundaries(),
@@ -12299,10 +12257,11 @@ with tab_analysis:
             # board until it is pressed.
             fit_block = results_area = verdict_slot = boundaries_slot = None
             board_status = None
-            fit_pressed = refresh_pressed = combo_pressed = False
-            legacy_criterion = st.session_state.get("legacy_combo_criterion",
-                                                    "adj_r2")
+            fit_pressed = refresh_pressed = False
             if guided:
+                # The same strip of component moduli the regime-by-regime
+                # page opens with, above the curve and full width.
+                strip_slot = st.container()
                 plot_col, res_col = st.columns([1.75, 1], gap="large")
                 with plot_col:
                     verdict_slot = st.container()
@@ -12319,7 +12278,7 @@ with tab_analysis:
                     "🔍 The working, in detail", expanded=False
                 )
                 fit_block.__enter__()
-                head1, head2, head3 = st.columns([1, 1, 1.6])
+                head1, head2 = st.columns([1, 1])
                 with head1:
                     fit_pressed = st.button(
                         "▶ Fit & plot", type="primary", key="guided_fit",
@@ -12336,27 +12295,6 @@ with tab_analysis:
                         help="Redraws the graph and the results at exactly "
                         "what the board holds now. Moves no boundary and "
                         "chooses nothing.",
-                        **STRETCH,
-                    )
-                with head3:
-                    st.selectbox(
-                        "judged by", list(PW_CRITERIA),
-                        format_func=PW_CRITERIA.get,
-                        key="legacy_combo_criterion",
-                        label_visibility="collapsed",
-                        help="Which number the search below keeps the best of.",
-                    )
-                    legacy_criterion = st.session_state.get(
-                        "legacy_combo_criterion", "adj_r2")
-                    combo_pressed = st.button(
-                        "🔎 Find the best combination based on "
-                        + PW_CRITERIA[legacy_criterion],
-                        key="guided_find_combo",
-                        help="Fits every combination of this cell type's "
-                        "components at the boundaries on the board, keeps "
-                        "the best by this number, ticks it here and "
-                        "redraws. The combinations are compared under "
-                        "**Component combinations** below the curve.",
                         **STRETCH,
                     )
                 board_status = st.empty()
@@ -12458,25 +12396,19 @@ with tab_analysis:
                 chosen = active_terms()
 
 
-            # 🔎 Find the best combination, now that the range is known:
-            # every combination fitted where the board says, the winner
-            # ticked on the board and fitted again as the page's fit.
-            if guided and combo_pressed:
-                with st.spinner("Fitting every combination of the components "
-                                "at these boundaries…"):
-                    found_combo = legacy_combination_search(
-                        model, guided_lo, guided_hi, here, legacy_criterion)
-                if not found_combo or not found_combo.get("best"):
-                    st.error("No combination of the components fits this "
-                             "curve at these boundaries.")
-                else:
-                    st.session_state["legacy_combo_search"] = found_combo
-                    best = found_combo["best"]
-                    rerun_keeping_settings({
-                        **{f"use_{term}": (term in best["on"])
-                           for term in here},
-                        "_fit_from_curve": True,
-                    })
+            # What each ticked component is worth on this curve, measured
+            # once per fit and shown under the plot. It never changes a
+            # tick: the model is the person's to choose.
+            if guided and chosen:
+                stamp = repr((sorted(chosen), round(guided_lo, 6),
+                              round(guided_hi, 6),
+                              round(float(st.session_state["segment_break_1"]), 6),
+                              round(float(st.session_state["segment_break_2"]), 6)))
+                if (st.session_state.get("_legacy_loo") or {}).get("stamp") != stamp:
+                    found_loo = legacy_contributions(model, guided_lo,
+                                                     guided_hi, chosen)
+                    st.session_state["_legacy_loo"] = {"stamp": stamp,
+                                                       "found": found_loo}
 
             # 🔄 Refresh graph: fit at what the board holds, moving nothing.
             if guided and refresh_pressed and chosen:
@@ -13557,6 +13489,8 @@ with tab_analysis:
                 # Written now, from the fit the rest of this column shows.
                 if fit is not None and fit.get("success") and not fit.get("fit_id"):
                     fit["fit_id"] = fit_id(fit)
+                with strip_slot:
+                    component_results_strip(fit)
                 with verdict_slot:
                     fit_verdict(fit)
                 if boundaries_slot is not None:
@@ -14249,10 +14183,10 @@ with tab_analysis:
                         plot_option_controls()
                         save_plot_controls(figure, fit, date_acquired)
 
-                    with st.expander("🔎 Component combinations compared",
-                                     expanded=False):
-                        legacy_combination_table(
-                            st.session_state.get("legacy_combo_search"))
+                    with st.expander("🔬 What each component is worth on "
+                                     "this curve", expanded=False):
+                        contributions_table(
+                            (st.session_state.get("_legacy_loo") or {}).get("found"))
 
                 panel_index = 0
                 if show_schematic and panel_index < len(panel_cols):
