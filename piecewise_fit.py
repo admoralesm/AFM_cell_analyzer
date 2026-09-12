@@ -82,6 +82,11 @@ __all__ = [
     "WEIGHTINGS",
     "confinement_factor",
     "small_strain_reading",
+    "early_regime_search",
+    "early_fit",
+    "bending_prefactor",
+    "bending_crossover",
+    "EARLY_WINDOWS_PCT",
     "information_criteria",
     "akaike_weights",
     "residual_diagnostics",
@@ -1036,6 +1041,280 @@ def power_law_window(epsilon, force_N, start_pct=5.0, anchor_pct=15.0,
     return {"window_pct": window, "exponent": level,
             "exponent_at_end": float(end[-1]) if end.size else float("nan"),
             "spread": float(np.std(p[inside])) if inside.sum() else float("nan")}
+
+
+# =============================================== the early regime, every way ==
+#
+# Over the first third of a squash there is more than one defensible way to
+# put the components together, and which one is chosen changes the moduli
+# by more than the fit's own error bars do. So none of them is assumed:
+# they are all fitted and ranked.
+#
+# THE LAWS. Each is a force per unit modulus, from the same prefactors the
+# rest of the module uses:
+#
+#   stretch   E*A_m*e^3      the cell shell stretching (Lulevich)
+#   hertz     E*A_i*e^1.5    the interior/cytoskeleton, Hertzian contact
+#   bending   E*A_b*e        the shell BENDING, linear in the deflection
+#
+# THE BENDING TERM. A thin shell resists a deflection d in two ways: by
+# bending, with rigidity D = E h^3/(12(1-nu^2)), and by stretching, with
+# modulus E h. The ratio of the two goes as (h/d)^2, so bending matters
+# while the deflection is of order the shell thickness and is negligible
+# once d >> h. That is the condition for dropping it, and it is a
+# STATEMENT ABOUT THICKNESS, not a universal deformation: with h = 4 nm
+# (a bilayer) d = h happens within the first hundredth of a per cent and
+# bending never matters; with h = 200-500 nm (an actin cortex) d = h is
+# at a few per cent of the squash, which is inside the stretch anyone
+# reads a small-deformation modulus over. :func:`bending_crossover` gives
+# the number for whatever thickness is meant, so the assumption is checked
+# on the curve at hand rather than inherited.
+#
+# THE ARRANGEMENTS. With the laws fixed, what is left is which acts from
+# first contact and which joins later, and when:
+#
+#   parallel          both from contact, the usual reading
+#   stretch first     shell from 0, interior joins at b
+#   hertz first       interior from 0, shell joins at b
+#
+# with b scanned across the window, and the whole thing repeated over
+# several windows (20, 25, 30, 35 %). AICc ranks arrangements WITHIN a
+# window, where they are fitted to the same points; across windows it
+# would be meaningless, so the windows are reported side by side instead.
+
+EARLY_POWERS = {"stretch": 3.0, "hertz": 1.5, "bending": 1.0}
+EARLY_ELEMENT = {"stretch": "membrane", "hertz": "cytoskeleton",
+                 "bending": "membrane"}
+EARLY_WINDOWS_PCT = (20.0, 25.0, 30.0, 35.0)
+
+
+# What thickness the bending term is meant to be about. A lipid bilayer is
+# ~4 nm and an actin cortex ~100-500 nm, and since the bending prefactor
+# goes as h^2 that is a factor of 10^3 to 10^4 between them. It is set
+# explicitly rather than inherited, because the answer to "can bending be
+# dropped" is entirely a statement about which of the two is meant.
+CORTEX_THICKNESS_M = 200e-9
+
+
+def bending_prefactor(geometry: "Geometry", thickness=None):
+    """
+    Newtons per pascal for the shell's BENDING resistance, at e = 1.
+
+    Reissner's small-deflection result for a thin spherical shell,
+    F = 4 E h^2 d / (sqrt(3(1-nu^2)) R), written per unit deformation
+    e = d / h0 so it sits beside the other prefactors:
+
+        A_bend = 4 h^2 h0 / (sqrt(3 (1 - nu^2)) R)
+
+    It goes as the SQUARE of the thickness, which is why the answer depends
+    so completely on whether h is a bilayer or a cortex.
+    """
+    h = float(thickness if thickness else CORTEX_THICKNESS_M)
+    nu = float(geometry.nu_membrane)
+    return (4.0 * h * h * float(geometry.cell_height)
+            / (np.sqrt(3.0 * max(1.0 - nu * nu, 1e-9))
+               * float(geometry.cell_radius)))
+
+
+def bending_crossover(geometry: "Geometry", thickness=None):
+    """
+    Where the bending term stops mattering, for this cell and this thickness.
+
+    Returns {"thickness_m", "crossover_pct", "ratio_at"}: the deformation at
+    which the deflection equals the shell thickness (d = h, below which
+    bending is of the same order as stretching), and a function of x giving
+    the bending-to-stretching ratio (h/d)^2 there.
+    """
+    h = float(thickness if thickness else CORTEX_THICKNESS_M)
+    h0 = float(geometry.cell_height)
+    crossover = 100.0 * h / h0 if h0 > 0 else float("nan")
+
+    def ratio_at(x_pct):
+        d = np.clip(np.asarray(x_pct, dtype=float) / 100.0 * h0, 1e-18, None)
+        return (h / d) ** 2
+
+    return {"thickness_m": h, "crossover_pct": float(crossover),
+            "ratio_at": ratio_at}
+
+
+def early_fit(epsilon, force_N, geometry, window_pct, plan, squeeze=0.0,
+              weighting="absolute", thickness=None, bending="off"):
+    """
+    One arrangement of the early regime, fitted.
+
+    ``plan`` is a tuple of (law, onset_pct): each law acts from its own
+    onset, with the prefactor of that law's element, and a free constant
+    carries the contact offset. Linear in the moduli, non-negative, one
+    bounded solve.
+
+    ``bending``: "off" drops the shell's bending term, "tied" keeps it with
+    the SAME modulus and thickness as the stretching term (Lulevich's own
+    arrangement, and no extra parameter, so the two can be compared
+    honestly), "free" gives it a modulus of its own, which fits better and
+    means less.
+
+    Returns a row with the moduli, the onset factor on each of them (how
+    much a law measured from an onset overstates a modulus converted as if
+    it started at zero), and the usual statistics.
+    """
+    x, f = _prepare(epsilon, force_N)
+    window = float(window_pct)
+    keep = (x >= 0.0) & (x <= window) & np.isfinite(f)
+    e, y = x[keep] / 100.0, f[keep]
+    if e.size < len(plan) + 3:
+        return None
+    pref = _prefactors(geometry)
+    columns, names = [], []
+    tied = bool(bending == "tied")
+    for law, onset in plan:
+        if law == "bending" and tied:
+            continue          # folded into the stretch column below
+        power = EARLY_POWERS[law]
+        if law == "bending":
+            A = bending_prefactor(geometry, thickness)
+        else:
+            A = pref[EARLY_ELEMENT[law]]["A"]
+        shifted = np.clip(e - float(onset) / 100.0, 0.0, None)
+        column = A * shifted ** power
+        if law == "stretch" and tied:
+            # Lulevich's point, kept as physics rather than as a free
+            # parameter: the shell bends AND stretches with the SAME
+            # modulus and the same thickness, so keeping the bending term
+            # costs nothing and dropping it is a claim about size, not a
+            # change of model. F_shell = E (A_m e^3 + A_b e).
+            column = column + bending_prefactor(geometry, thickness) * shifted
+        if squeeze:
+            column = column * confinement_factor(e * 100.0, squeeze)
+        columns.append(column)
+        names.append((law, float(onset), power, A))
+    columns.append(np.ones_like(e))
+    design = np.column_stack(columns)
+    lower = [0.0] * len(plan) + [-np.inf]
+    upper = [np.inf] * design.shape[1]
+    p0 = [1.0e3] * len(plan) + [float(np.mean(y[:10]))]
+    w = _weights(y, weighting)
+    params, engine, at_bound = _bounded_linear_fit(
+        design * w[:, None], y * w, p0, lower, upper)
+    predicted = design @ params
+    cov = _covariance(design * w[:, None], (y - predicted) * w, ~at_bound)
+    stats = _statistics(y, predicted, len(params))
+    moduli = {}
+    for j, (law, onset, power, A) in enumerate(names):
+        se = float(np.sqrt(cov[j, j])) if (np.isfinite(cov[j, j])
+                                           and cov[j, j] >= 0) else float("nan")
+        # (e / (e - s))^p at the middle of the stretch this law acts on:
+        # the factor by which a law measured from an onset overstates a
+        # modulus that is converted as if it had started at contact.
+        mid = 0.5 * (onset + window) / 100.0
+        span = max(mid - onset / 100.0, 1e-9)
+        moduli[law] = {
+            "law": law, "power": float(power), "onset_pct": float(onset),
+            "element": EARLY_ELEMENT[law], "prefactor": float(A),
+            # When the bending term is tied, this law's column is
+            # A e^p + A_bend e, so a curve drawn from it needs both.
+            "tied_bending_A": (float(bending_prefactor(geometry, thickness))
+                               if (law == "stretch" and tied) else 0.0),
+            "E_Pa": float(params[j]), "E_se_Pa": se,
+            "E_lo_Pa": float(params[j]) - 1.96 * se,
+            "E_hi_Pa": float(params[j]) + 1.96 * se,
+            "onset_factor": float((mid / span) ** power),
+            "at_bound": bool(at_bound[j]),
+        }
+    return {
+        "window_pct": window, "bending": bending,
+        "bending_thickness_m": float(thickness if thickness
+                                     else CORTEX_THICKNESS_M),
+        "plan": tuple((l, float(o)) for l, o in plan),
+        "n_points": int(e.size), "engine": engine,
+        "r_squared": stats["r_squared"], "ss_res": stats["ss_res"],
+        "relative_rmse": stats["relative_rmse"],
+        "offset_N": float(params[-1]), "moduli": moduli,
+        "squeeze": float(squeeze or 0.0), "weighting": weighting,
+        "residuals": residual_diagnostics(y, predicted, x=x[keep]),
+        **information_criteria(int(e.size), stats["ss_res"], len(params)),
+    }
+
+
+def early_regime_search(epsilon, force_N, geometry,
+                        windows_pct=EARLY_WINDOWS_PCT, onset_step=2.0,
+                        laws=("stretch", "hertz"), bending=("off", "tied"),
+                        squeeze=0.0, weighting="absolute", thickness=None):
+    """
+    Every arrangement of the early regime, over every window, ranked.
+
+    For each window: both laws from contact; then each of them from contact
+    with the other joining at b, for b across the window. Each arrangement
+    is fitted once per entry in ``bending`` -- "off" and "tied" by default
+    -- so whether the shell's bending term can be dropped is settled by
+    fitting the same data both ways rather than by assertion. Tied costs no
+    extra parameter, so the AICc comparison between them is clean.
+
+    ΔAICc and Akaike weights are computed WITHIN each window, because only
+    there are the candidates fitted to the same points. Returns
+    {"windows": [...], "best", "rows"}.
+    """
+    first, second = laws[0], laws[1]
+    out_windows = []
+    for window in windows_pct:
+        plans = [((first, 0.0), (second, 0.0))]
+        grid = np.arange(onset_step, max(window - onset_step, onset_step),
+                         onset_step)
+        for onset in grid:
+            plans.append(((first, 0.0), (second, float(onset))))
+            plans.append(((second, 0.0), (first, float(onset))))
+        rows = []
+        for plan in plans:
+            for how in bending:
+                full = (plan + (("bending", 0.0),)) if how == "free" else plan
+                row = early_fit(epsilon, force_N, geometry, window, full,
+                                squeeze=squeeze, weighting=weighting,
+                                thickness=thickness, bending=how)
+                if row is None:
+                    continue
+                row["label"] = " · ".join(
+                    (f"{l} from contact" if o <= 0 else f"{l} joins at {o:g} %")
+                    for l, o in plan)
+                row["shape"] = ("both from contact"
+                                if all(o <= 0 for _l, o in plan)
+                                else f"{plan[0][0]} first")
+                row["bending_note"] = {
+                    "off": "bending dropped",
+                    "tied": "bending kept, same E and h as the stretch",
+                    "free": "bending with a modulus of its own",
+                }.get(how, how)
+                rows.append(row)
+        if not rows:
+            continue
+        delta, weight = akaike_weights([r["aicc"] for r in rows])
+        for row, d, w in zip(rows, delta, weight):
+            row["delta"] = float(d)
+            row["weight"] = float(w)
+        rows.sort(key=lambda r: (round(r["delta"] / 2.0), r["delta"]))
+        out_windows.append({"window_pct": float(window), "rows": rows,
+                            "best": rows[0], "n_tried": len(rows)})
+    if not out_windows:
+        return None
+    # Across windows AICc cannot be compared, so the one reported as best
+    # is the widest window whose best arrangement still describes the curve
+    # (no systematic lack of fit), which is the most information taken from
+    # the cell without leaving the stretch the laws are meant for.
+    good = [w for w in out_windows
+            if not (w["best"]["residuals"] or {}).get("structured")]
+
+    def bias_of(w):
+        value = (w["best"]["residuals"] or {}).get("bias_pct", float("nan"))
+        return float(value) if np.isfinite(value) else float("inf")
+
+    # R2 only ever grows with the window, so it cannot choose one. The
+    # widest window that still has no systematic lack of fit takes the most
+    # from the cell without leaving the stretch the laws are meant for; if
+    # none is clean, the one that misses the curve least is reported and
+    # the page says none of them was clean.
+    chosen = (max(good, key=lambda w: w["window_pct"]) if good
+              else min(out_windows, key=bias_of))
+    return {"windows": out_windows, "best": chosen["best"],
+            "chosen_window_pct": chosen["window_pct"],
+            "clean": bool(good), "n_fits": sum(w["n_tried"] for w in out_windows)}
 
 
 def small_strain_reading(epsilon, force_N, geometry, window_pct=20.0,
