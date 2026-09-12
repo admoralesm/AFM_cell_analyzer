@@ -6761,6 +6761,14 @@ def piecewise_placement_table(placements, bounds, target, selected):
         "route if R² ≥ R²★, else the first of (power law → fit everything, "
         "fit everything, power law, defaults) that reaches it.",
     )
+    step = int((placements or {}).get("every_nth", 1) or 1)
+    if step > 1:
+        st.caption(
+            f"Scored on every {step}ᵗʰ point: where a boundary lies does not "
+            "need every point of a long curve to decide, and the fit the "
+            "page shows is always the whole curve. These R² are for choosing "
+            "between the rows, not the number reported above the graph."
+        )
     reason = (selected or {}).get("reason")
     if reason:
         st.caption("**In use:** " + reason)
@@ -7054,6 +7062,24 @@ def _pw_score(placement, epsilon, force_N, model):
     }
 
 
+# A boundary search fits the whole model once per placement on a grid, so
+# its cost is the number of points times the size of that grid. Where a
+# boundary is does not need every point of a 6000-point curve to be
+# decided -- a few hundred per stretch settles it to far better than the
+# 0.5 % the boundaries are read to -- so the search runs on an evenly
+# thinned copy. The fit the page shows is always the whole curve.
+SEARCH_POINTS = 1800
+
+
+def thinned_for_search(epsilon, force_N):
+    """An evenly thinned copy of the curve, for placing boundaries on."""
+    n = int(np.size(epsilon))
+    if n <= SEARCH_POINTS:
+        return epsilon, force_N, 1
+    step = int(np.ceil(n / SEARCH_POINTS))
+    return np.asarray(epsilon)[::step], np.asarray(force_N)[::step], step
+
+
 def compute_placements(model, epsilon, force_N):
     """
     Every route's boundaries for this curve, each scored by its own fit.
@@ -7061,12 +7087,14 @@ def compute_placements(model, epsilon, force_N):
     Returns {"signature", "rows": {key: score}, "power": ..., "searches":
     {key: find_boundaries result}}.
     """
+    signature = piecewise_signature(epsilon, force_N)
+    epsilon, force_N, step = thinned_for_search(epsilon, force_N)
     bands, span = piecewise_bands(), piecewise_span()
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
     common = dict(end_pct=end, span_pct=span, regimes=pw_regimes(),
                   settings=piecewise_model_settings(), carry=piecewise_carry())
-    out = {"signature": piecewise_signature(epsilon, force_N), "rows": {},
-           "searches": {}, "errors": {}}
+    out = {"signature": signature, "rows": {}, "searches": {}, "errors": {},
+           "every_nth": step}
     # 1 · the power law, read straight off the curve
     power = boundaries_from_power_law(
         power_law_profile(epsilon, force_N, end_pct=end), bands, span)
@@ -7495,28 +7523,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.session_state["pw_reach_note"] = None
         st.session_state["pw_method"] = "refined"
         st.session_state["pw_eps_way"] = "found"
-        target_now = float(st.session_state.get("pw_target_r2", 0.999))
-        with st.spinner("Placing ε₁, ε₂, ε₃ and fitting this cell…"):
-            arrived = reach_the_target(model, epsilon, force_N, target_now)
-        if arrived:
-            st.session_state["pw_placements"] = arrived.get("placements")
-            st.session_state["pw_selected"] = {
-                "key": arrived["route"],
-                "reason": f"On arrival: {arrived['said']}, "
-                          f"R² = {arrived['r2']:.5f}.",
-            }
-            for key, value in zip(PW_BOUNDARY_KEYS, arrived["best_pct"]):
-                st.session_state[key] = round(float(value), 2)
-            st.session_state["pw_membrane_throughout"] = bool(
-                arrived.get("throughout", True))
-            if arrived.get("widened"):
-                # Found outside the prior, so it has to be kept as typed:
-                # placing ε again inside the prior would lose it.
-                st.session_state["pw_eps_way"] = "typed"
-                st.session_state["pw_reach_note"] = reach_note(arrived,
-                                                               target_now)
-        else:
-            place_now(arriving=True)
+        # One placement search, the same one this page has always done on
+        # arrival: every route scored inside the C2C12 prior and the first
+        # that reaches R²★ taken. Opening the prior out is the 🎯 button's
+        # job, because it is several more searches and a person should be
+        # the one who asks for them.
+        place_now(arriving=True)
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
