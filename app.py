@@ -797,6 +797,10 @@ DEFAULTS = {
     "pw_boundary_search": None,
     # The order the four components are met in, first to last.
     "component_order": ["membrane", "interior", "nucleus_shell", "nucleus"],
+    # Which of the three ways the four components are fitted with, and the
+    # mixture the third of them last found.
+    "pw_style": "carried",
+    "pw_best_carry": None,
     # How the probe met the cell, recorded with it and written into the
     # spreadsheet row.
     "compression_type": "Head-on",
@@ -4938,6 +4942,7 @@ PW_TERM_OF = {
 # otherwise.
 PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_until", "pw_membrane_throughout", "pw_target_r2",
+                   "pw_style", "pw_best_carry",
                    "pw_use_K_shell", "pw_use_K_cyto",
                    "pw_use_K_nucleus", "pw_use_K_core")
 _PW_SOURCE = [None]
@@ -5168,18 +5173,32 @@ def pw_start_index():
 
 def sharing_options():
     """
-    The two ways of fitting the four components, and there are only two.
+    The three ways of fitting the four components, and there are three.
 
-    Both fit the same four components over the same four stretches, one
-    unknown at a time. They differ in one thing: whether a component that
-    has been fitted goes on carrying load into the stretches after it.
+    All three fit the same four components over the same four stretches,
+    one unknown at a time, with the same boundaries. They differ in one
+    thing: how far each component goes on carrying load after the stretch
+    it was fitted on. A cell type the four regimes are not written for has
+    the spring network instead.
     """
-    return ([PW_SHARE] if piecewise_offered() else []) + [OWN_STRETCH]
+    if piecewise_offered():
+        return [PW_STYLES[key] for key in PW_STYLES]
+    return [OWN_STRETCH]
+
+
+def style_of_label(label):
+    """The style key behind one of the three labels."""
+    for key, said in PW_STYLES.items():
+        if said == label:
+            return key
+    return None
 
 
 def current_sharing():
     """The way the page is fitting now."""
-    return PW_SHARE if piecewise_on() else OWN_STRETCH
+    if piecewise_on():
+        return PW_STYLES[piecewise_style()]
+    return OWN_STRETCH
 
 
 def own_stretch_boundaries():
@@ -5205,7 +5224,14 @@ def _load_sharing_changed():
     """Switch the fit, carrying the boundaries over: they are the cell's."""
     chosen = st.session_state.get("load_sharing")
     was_piecewise = piecewise_on()
-    if chosen == PW_SHARE:
+    style = style_of_label(chosen)
+    if style:
+        st.session_state["pw_style"] = style
+        # The mixture is searched again for the curve on the page, and the
+        # fit that follows is made of what it finds.
+        st.session_state["pw_best_carry"] = None
+        st.session_state["_pw_restyle"] = True
+    if style:
         if not was_piecewise:
             # ε₂, where the nucleus is reached, means the same in both. ε₁
             # comes across only where it is a contact boundary here too.
@@ -5255,17 +5281,26 @@ def load_sharing_control():
     # ways of adding the same forces up are scanned, not read, and the one
     # sentence that matters is the one under whichever is chosen.
     st.selectbox(
-        "How the components share the load", options, key="load_sharing",
-        format_func=lambda name: SHARING_SHORT.get(name, name),
+        "How the cell is fitted", options, key="load_sharing",
+        format_func=lambda name: (
+            PW_STYLE_SHORT.get(style_of_label(name))
+            or SHARING_SHORT.get(name, name)),
         on_change=_load_sharing_changed,
-        help="The same components, the same ticks and the same boundaries "
-        "in every case; this is only how their forces combine. Changing it "
-        "keeps every component you have ticked.",
+        help="The same four components, the same ticks, the same "
+        "boundaries and the same one-unknown-at-a-time solve in all three. "
+        "The only difference is how far each component goes on carrying "
+        "load after the stretch it was fitted on.",
     )
     chosen = st.session_state["load_sharing"]
-    if chosen in SHARING_MATHS:
-        st.latex(SHARING_MATHS[chosen])
-    st.caption(SHARING_HELP.get(chosen) or MODELS.get(chosen, ""))
+    style = style_of_label(chosen)
+    if style:
+        st.latex(r"\phi_j(x) = \big[\min(x,\,u_j) - s_j\big]_+^{\,p_j}")
+        st.latex(PW_STYLE_MATHS[style])
+        st.caption(PW_STYLE_HELP[style])
+    else:
+        if chosen in SHARING_MATHS:
+            st.latex(SHARING_MATHS[chosen])
+        st.caption(SHARING_HELP.get(chosen) or MODELS.get(chosen, ""))
     st.caption("Your ticks in the table below stay as they are when you "
                "change this.")
 
@@ -5448,6 +5483,142 @@ def piecewise_defaults():
 _PW_CARRY_OVERRIDE = [None]
 
 
+# =========================================================== the three ways ==
+#
+# Three ways of fitting the same four components over the same four
+# stretches, one unknown at a time. They differ in one thing only: how far
+# each component goes on carrying load after the stretch it was fitted on.
+# Write the fit as
+#
+#     F(x) = sum_j theta_j * phi_j(x; s_j, u_j),
+#     phi_j(x) = [ min(x, u_j) - s_j ]_+ ^ p_j
+#
+# with s_j the boundary the component joins at and u_j where it stops
+# taking on more load (past u_j it holds the force it had reached, so the
+# curve never steps). s_j is the same in all three. Only u_j changes:
+#
+#   ① all carried on   u_j = x_end for every j
+#   ② one at a time    u_j = s_{j+1}, its own stretch and no further
+#   ③ best mixture     u_j in {s_{j+1}, x_end}, chosen for the best R²
+#
+# so ① and ② are the two ends of ③, and ③ is a search over the 2^4 = 16
+# ways of choosing between them.
+
+PW_STYLES = {
+    "carried": "Piecewise · every component carried on to the end",
+    "handoff": "Piecewise · one at a time, each on its own stretch",
+    "best": "Piecewise · the mixture of the two that fits best",
+}
+PW_STYLE_SHORT = {
+    "carried": "① Carried on to the end  ·  each joins and stays",
+    "handoff": "② One at a time  ·  each on its own stretch, then held",
+    "best": "③ Best mixture  ·  each way tried, the best R² kept",
+}
+PW_STYLE_MATHS = {
+    "carried": r"u_j = x_{end}\;\;\forall j: \quad \hat F(x) = \sum_j "
+               r"\hat\theta_j\,\big[x - s_j\big]_+^{\,p_j}",
+    "handoff": r"u_j = s_{j+1}: \quad \hat F(x) = \sum_j \hat\theta_j\,"
+               r"\big[\min(x,\,s_{j+1}) - s_j\big]_+^{\,p_j}",
+    "best": r"\hat u = \arg\max_{u_j \,\in\, \{s_{j+1},\, x_{end}\}} "
+            r"R^2\big(\hat F(\,\cdot\,; u)\big) \quad (2^4 = 16 \text{ ways})",
+}
+PW_STYLE_HELP = {
+    "carried":
+        "**Each joins and then stays.** The membrane carries load from "
+        "first contact to the end of the squash. The cytoskeleton joins at "
+        "ε₁ and also carries to the end; the nuclear envelope joins at ε₂ "
+        "and carries to the end; the inside of the nucleus joins at ε₃ and "
+        "carries to the end. Each one is fitted on the stretch where it "
+        "joins, with everything found before it **held at the value "
+        "already found** and still adding its force, so every stretch has "
+        "one unknown in it.",
+    "handoff":
+        "**One at a time, handed on.** The membrane is fitted on 0 to ε₁ "
+        "and stops taking on more load there: its modulus becomes a fixed "
+        "constant, and the force it had reached is carried forward as a "
+        "constant while the cytoskeleton is fitted on ε₁ to ε₂. Then that "
+        "one is fixed in turn for the nuclear envelope on ε₂ to ε₃, and "
+        "that one for the inside of the nucleus from ε₃ on. One element "
+        "fitted at a time, each on its own stretch, the boundaries "
+        "optimised as always.",
+    "best":
+        "**The mixture that fits best.** Every component is tried both "
+        "ways — carrying on to the end, or stopping at the next boundary "
+        "and holding — and the combination with the highest R² is kept. "
+        "Sixteen ways in all; the one chosen is written out under the "
+        "results, component by component, so it is never a mystery which "
+        "mixture the numbers came from.",
+}
+
+
+def piecewise_style():
+    """Which of the three ways the page is fitting with."""
+    style = _pw_get("pw_style", DEFAULTS.get("pw_style", "carried"))
+    return style if style in PW_STYLES else "carried"
+
+
+def carry_subsets():
+    """Every way of choosing, per component, carried on or handed over."""
+    names = [ORDER_COEFFICIENT[term] for term in component_order()]
+    for mask in range(1 << len(names)):
+        yield tuple(name for index, name in enumerate(names)
+                    if mask >> index & 1)
+
+
+def best_mixture(epsilon, force_N):
+    """
+    Try every component both ways and keep the combination that fits best.
+
+    Sixteen fits of four coefficients: the same boundaries, the same
+    components, the same one-unknown-at-a-time solve, and the only thing
+    that changes is which components go on carrying load past their own
+    stretch. Returns {"carry", "r2", "rows"}.
+    """
+    bounds = piecewise_boundaries()
+    settings = effective_piecewise_settings(
+        piecewise_settings(), piecewise_until(), piecewise_off())
+    rows = []
+    best = None
+    for carry in carry_subsets():
+        result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                               regimes=pw_regimes(), settings=settings,
+                               carry=carry)
+        r2 = (float(result.get("r_squared", float("nan")))
+              if result.get("success") else float("nan"))
+        zeros = sum(1 for name, value in (result.get("coefficients") or {}).items()
+                    if name not in ("C0",) and value is not None
+                    and np.isfinite(value) and abs(float(value)) < 1e-30)
+        rows.append({"carry": carry, "r2": r2, "unmeasured": zeros})
+        if not np.isfinite(r2):
+            continue
+        # Ties and near-ties go to the combination that measures every
+        # component: a mixture that fits a hair closer by silencing one of
+        # them has not learnt anything about the cell.
+        key = (-zeros, round(r2, 9), len(carry))
+        if best is None or key > best["key"]:
+            best = {"key": key, "carry": carry, "r2": r2, "unmeasured": zeros}
+    if best is None:
+        return None
+    return {"carry": best["carry"], "r2": best["r2"],
+            "unmeasured": best["unmeasured"], "rows": rows}
+
+
+def mixture_note(carry):
+    """Which components are carried on and which hand over, in words."""
+    names = components_for(st.session_state.get("cell_type"))
+    carried, handed = [], []
+    for term in component_order():
+        (carried if ORDER_COEFFICIENT[term] in carry else handed).append(
+            names[term][0])
+    parts = []
+    if carried:
+        parts.append("carried on to the end: " + ", ".join(carried))
+    if handed:
+        parts.append("stops at the next boundary and holds: "
+                     + ", ".join(handed))
+    return " · ".join(parts)
+
+
 def piecewise_carry():
     """
     The components that keep acting to the end of the fit.
@@ -5455,18 +5626,25 @@ def piecewise_carry():
     The prior's: membrane and cytoskeleton from first contact, the nucleus
     once met. The membrane's tick takes it out of that list.
     """
-    # Carried forward means exactly that: a component that has been
-    # fitted goes on carrying load through every stretch after it, with
-    # the modulus already found for it. So every component carries, and
-    # the membrane's own tick is the one exception, because a membrane
-    # that holds what it reached at ε₁ is a thing people fit on purpose.
+    # Which components carry on past their own stretch IS the choice
+    # between the three ways of fitting, so it is read from that choice
+    # and nowhere else.
     order = component_order()
-    carry = tuple(ORDER_COEFFICIENT[t] for t in order)
+    style = piecewise_style()
+    if style == "handoff":
+        carry = ()
+    elif style == "best":
+        kept = tuple(_pw_get("pw_best_carry", None) or ())
+        carry = tuple(ORDER_COEFFICIENT[t] for t in order
+                      if ORDER_COEFFICIENT[t] in kept)
+    else:
+        carry = tuple(ORDER_COEFFICIENT[t] for t in order)
     throughout = (_PW_CARRY_OVERRIDE[0] if _PW_CARRY_OVERRIDE[0] is not None
                   else _pw_get("pw_membrane_throughout", True))
-    if not throughout and order:
-        # The first component holds what it reached at its own boundary
-        # instead of carrying its law on.
+    if style == "carried" and not throughout and order:
+        # The first component holding what it reached at its own boundary,
+        # which is what the target search tries when nothing else reaches
+        # it, and what the tick beside that component says.
         first = ORDER_COEFFICIENT[order[0]]
         carry = tuple(c for c in carry if c != first)
     return carry
@@ -6636,10 +6814,19 @@ def carried_forward_summary(bounds=None, target=0.999):
     st.markdown("#### 1 · The model")
     st.markdown(
         "The cell is met one component at a time. Each starts at its own "
-        "boundary and, once it is carrying load, goes on carrying it: past "
-        "its own stretch it keeps the law already found for it. So on the "
-        "stretch from ε_{k−1} to ε_k the force is everything found so far, "
-        "plus the one new component:"
+        "boundary s_j and stops taking on more load at u_j, holding the "
+        "force it had reached after that, so the curve never steps:"
+    )
+    st.latex(r"\phi_j(x) = \big[\min(x,\,u_j) - s_j\big]_+^{\,p_j}, "
+             r"\qquad s_j \in \{0, \varepsilon_1, \varepsilon_2, "
+             r"\varepsilon_3\}")
+    st.markdown(
+        "The three ways of fitting differ in u_j and in nothing else: "
+        "**① carried on**, u_j = x_end for every component; **② one at a "
+        "time**, u_j = the next boundary; **③ best mixture**, each "
+        "component tried both ways and the best R² kept. On the stretch "
+        "from ε_{k−1} to ε_k the force is everything found so far, plus "
+        "the one new component:"
     )
     st.latex(
         r"\hat F(x) \;=\; \underbrace{\hat F(\varepsilon_{k-1})}"
@@ -7559,12 +7746,29 @@ def piecewise_section(model, epsilon, force_N, rupture):
         for k, v in zip(PW_BOUNDARY_KEYS, placements["rows"][key]["best_pct"]):
             st.session_state[k] = round(float(v), 2)
 
+    def settle_mixture():
+        """Which components carry on, when that is a thing to be found."""
+        if piecewise_style() != "best":
+            st.session_state["pw_best_carry"] = None
+            st.session_state["pw_mixture"] = None
+            return
+        with st.spinner("Trying every component both ways…"):
+            found_mix = best_mixture(epsilon, force_N)
+        st.session_state["pw_mixture"] = found_mix
+        st.session_state["pw_best_carry"] = (list(found_mix["carry"])
+                                             if found_mix else [])
+
     def apply_board():
         st.session_state["pw_applied"] = {"curve": curve_key,
                                           "values": pw_board_values()}
 
     # A new curve: its own ε, fitted at once. A press of ▶ that placed ε
     # comes back here with the new ε already on the board, to be applied.
+    # A change of the way the cell is fitted settles its mixture and is
+    # applied at once: it is a change of model, not a change of setting.
+    if st.session_state.pop("_pw_restyle", False):
+        settle_mixture()
+        st.session_state["_pw_apply"] = True
     applied_state = st.session_state.get("pw_applied") or {}
     if st.session_state.pop("_pw_apply", False):
         apply_board()
@@ -7583,6 +7787,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # describes costs the one placement search this page has always
         # done; only a curve it does not costs more, and that is exactly
         # the curve nobody wants to place by hand.
+        settle_mixture()
         target_now = float(st.session_state.get("pw_target_r2", 0.999))
         with st.spinner(f"Fitting this cell: placing ε₁, ε₂, ε₃ and moving "
                         f"them until R² ≥ {target_now:g}…"):
@@ -7771,6 +7976,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # A new fit of its own: whatever the last target search had to say
         # was about the boundaries it found, not about these.
         st.session_state["pw_reach_note"] = None
+        settle_mixture()
         if st.session_state.get("pw_eps_way") == "typed":
             apply_board()
             applied = st.session_state["pw_applied"]["values"]
@@ -7801,6 +8007,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
         said_reach = st.session_state.get("pw_reach_note")
         if said_reach:
             st.caption(said_reach)
+        if piecewise_style() == "best":
+            found_mix = st.session_state.get("pw_mixture")
+            if found_mix:
+                st.caption(
+                    "**The mixture kept:** " + mixture_note(found_mix["carry"])
+                    + f" · best of {len(found_mix['rows'])} ways, "
+                    f"R² = {found_mix['r2']:.5f}.")
 
     # ============================ the applied fit: graph, results, working
     with pw_applied_values(applied):
