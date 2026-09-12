@@ -5528,7 +5528,7 @@ PW_SWITCHABLE = tuple(PW_START_INDEX)
 # fitted with, [0, ε₁), where the probe is settling onto the cell. It is
 # drawn as the bottom layer of the stack so the layers still add up to the
 # fitted curve, and it is named as what it is.
-PW_BASELINE = ("k_align", "⬛ Baseline C₀ over [0, ε₁)", "C₀", "#9a9a9a",
+PW_BASELINE = ("C0", "⬛ Baseline C₀ · where the curve starts", "C₀", "#9a9a9a",
                r"$C_0$")
 
 
