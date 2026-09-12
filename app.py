@@ -850,6 +850,10 @@ DEFAULTS = {
     "pw_small_strain": True,
     "pw_small_way": "found",
     "pw_small_window": 20.0,
+    # Whether that second reading is drawn on the main graph as well as
+    # reported under it. On by default: seeing the two fits on one pair of
+    # axes is the point of having both.
+    "pw_small_on_plot": True,
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
     "pw_selected": None,
@@ -6593,6 +6597,61 @@ def small_strain_window(epsilon, force_N):
     return found
 
 
+def small_strain_now(model, epsilon, force_N):
+    """
+    The small-deformation reading as the page currently has it, or None.
+
+    One place, so the panel under the graph and the line ON the graph are
+    the same fit and cannot drift apart. Returns the engine's reading with
+    the window it used added to it.
+    """
+    if (small_strain_reading is None or model is None
+            or not st.session_state.get("pw_small_strain", True)):
+        return None
+    window = float(st.session_state.get("pw_small_window", 20.0))
+    if st.session_state.get("pw_small_way", "found") != "typed":
+        found = small_strain_window(epsilon, force_N)
+        if found:
+            window = float(found.get("window_pct", window))
+        reading_window = found
+    else:
+        reading_window = small_strain_window(epsilon, force_N)
+    try:
+        reading = small_strain_reading(
+            epsilon, force_N, piecewise_geometry(model), window_pct=window,
+            squeeze=piecewise_squeeze(), weighting=piecewise_weighting())
+    except Exception:  # pragma: no cover - a curve it cannot read
+        return None
+    if not reading.get("success"):
+        return None
+    reading["window_pct"] = window
+    reading["profile"] = reading_window or {}
+    return reading
+
+
+def small_strain_curve(reading, x_pct):
+    """
+    The small-deformation reading evaluated anywhere: (total, {element: F}).
+
+    F(e) = C0 + sum_j E_j A_j e^p_j (1-e)^-q, every law from first contact.
+    Drawn past its own window as well as inside it, because where it starts
+    to leave the data is the most informative thing about it.
+    """
+    if not reading:
+        return None, {}
+    e = np.clip(np.asarray(x_pct, dtype=float), 0.0, None) / 100.0
+    q = float(reading.get("squeeze") or 0.0)
+    room = (np.clip(1.0 - e, 0.02, None) ** (-q)) if q else 1.0
+    total = np.full(e.shape, float(reading.get("offset_N", 0.0)))
+    parts = {}
+    for element, row in (reading.get("moduli") or {}).items():
+        piece = (float(row["E_Pa"]) * float(row["A"])
+                 * e ** float(row["power"]) * room)
+        parts[element] = piece
+        total = total + piece
+    return total, parts
+
+
 def small_strain_panel(model, epsilon, force_N, whole_curve=None):
     """The same cell read again over its small-deformation stretch."""
     if small_strain_reading is None:
@@ -6663,6 +6722,12 @@ def small_strain_panel(model, epsilon, force_N, whole_curve=None):
                     f"{row['E_hi_Pa'] / scale:.4g} {unit} · law "
                     f"$\\varepsilon^{{{row['power']:g}}}$ from first contact"
                 )
+                if row.get("at_bound") or float(row["E_Pa"]) <= 0:
+                    st.caption(
+                        "⚠️ measured as zero here. Over a stretch this "
+                        "short the ε³ and ε^1.5 shapes are hard to tell "
+                        "apart, so the fit can put everything in one of "
+                        "them. The other law's number carries both.")
                 verdict = modulus_in_range(symbol, row["E_Pa"], cell_type)
                 if verdict is not None:
                     window_lit = (literature_for(cell_type).get("moduli")
@@ -7523,8 +7588,15 @@ def _rgba(hex_colour, alpha):
     return f"rgba({r},{g},{b},{alpha})"
 
 
+# The small-deformation reading gets its own colour on the plot: it is not
+# one of the four components and it is not the whole-curve fit, it is a
+# second, independent reading of the same cell over a stretch of its own.
+SMALL_COLOUR = "#0b8f6a"
+SMALL_FILL = "rgba(11, 143, 106, 0.07)"
+
+
 def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
-                     view="stacked", note=None):
+                     view="stacked", note=None, small=None):
     """
     The data, the fitted curve, and every component over its own range.
 
@@ -7537,6 +7609,14 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     and ranges, the ones the controls show and the results report. The
     first stretch, to ε₁, is shaded as the contact artefact: the probe
     settling onto the cell, fitted by the contact line and nothing else.
+
+    ``small`` is the small-deformation reading, drawn on the same axes when
+    it is switched on: its window shaded, its curve solid inside that
+    window and dotted past it (where it leaves the data is the most
+    informative thing about it), each of its laws as a thin dotted line,
+    and a row of its own in the range track. It is a SECOND reading of the
+    same cell over a stretch of its own, not part of the fit above, so it
+    never enters the stack and never changes the black curve.
     """
     x = np.asarray(epsilon, dtype=float) * 100.0
     y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
@@ -7635,6 +7715,62 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
             text=anchor_text, hovertemplate="%{text}<extra></extra>",
         ))
 
+    # ---- the small-deformation reading, on the same axes -------------
+    #
+    # Drawn last so it sits over the stack, and never inside it: it is a
+    # different fit of the same data, over a stretch of its own, and the
+    # whole point of putting it here is to SEE the two side by side --
+    # where they agree, where the small-deformation one leaves the data,
+    # and how short the stretch it was read over really is.
+    small_window = None
+    if small and small.get("success"):
+        small_window = float(small.get("window_pct", 20.0))
+        fig.add_vrect(
+            x0=0.0, x1=small_window, fillcolor=SMALL_FILL, line_width=0,
+            layer="below",
+            annotation_text=f"read at small deformation · 0–{small_window:.1f} %",
+            annotation_position="bottom left", annotation_font_size=11,
+            annotation_font_color=SMALL_COLOUR, annotation_xshift=4,
+        )
+        inside = np.linspace(0.0, small_window, 220)
+        beyond = np.linspace(small_window, end, 220)
+        total_in, parts_in = small_strain_curve(small, inside)
+        total_out, _parts_out = small_strain_curve(small, beyond)
+        laws = ", ".join(
+            f"{DISPLAY_SYMBOL.get({'membrane': 'E_shell', 'cytoskeleton': 'E_cyto'}.get(k, k), k)}"
+            f" ε^{row['power']:g}"
+            for k, row in (small.get("moduli") or {}).items())
+        legend_names.append(f"Small-deformation reading · [0, {small_window:.1f}] %")
+        fig.add_trace(go.Scatter(
+            x=inside, y=total_in * scale, mode="lines",
+            name=legend_names[-1],
+            line={"color": SMALL_COLOUR, "width": 2.6},
+            hovertemplate=("small-deformation fit<br>x = %{x:.1f} %<br>"
+                           f"F = %{{y:.4g}} {unit}<br>{laws}<extra></extra>"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=beyond, y=total_out * scale, mode="lines", showlegend=False,
+            line={"color": SMALL_COLOUR, "width": 1.4, "dash": "dot"},
+            hovertemplate=("the same reading extrapolated past its window"
+                           "<br>x = %{x:.1f} %<br>"
+                           f"F = %{{y:.4g}} {unit}<extra></extra>"),
+        ))
+        for element, piece in parts_in.items():
+            row = (small.get("moduli") or {}).get(element) or {}
+            symbol = {"membrane": "E_shell",
+                      "cytoskeleton": "E_cyto"}.get(element, element)
+            unit_e, scale_e = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
+            fig.add_trace(go.Scatter(
+                x=inside, y=piece * scale, mode="lines", showlegend=False,
+                line={"color": SMALL_COLOUR, "width": 1.0, "dash": "dash"},
+                hovertemplate=(
+                    f"{DISPLAY_SYMBOL.get(symbol, symbol)} "
+                    f"= {float(row.get('E_Pa', 0.0)) / scale_e:.4g} {unit_e}"
+                    f" · ε^{row.get('power', 1.5):g} from first contact"
+                    "<br>x = %{x:.1f} %<br>"
+                    f"F = %{{y:.4g}} {unit}<extra></extra>"),
+            ))
+
     # The range track: the component rows, as bars on a panel of their own.
     # One row per component that is on: the track and the ticked rows on
     # the board are the same list, in the same order.
@@ -7658,6 +7794,24 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 showlegend=False,
                 hovertemplate=f"{symbol} holds what it reached<extra></extra>",
             ))
+    if small_window is not None:
+        # Its own row at the bottom of the track, so how short the stretch
+        # is can be read against the components' bars above it.
+        row = len(ticks)
+        ticks.append(row)
+        labels.append("0–ε_PL")
+        fig.add_trace(go.Scatter(
+            x=[0.0, small_window], y=[row, row], mode="lines", yaxis="y2",
+            line={"color": SMALL_COLOUR, "width": 10}, showlegend=False,
+            hovertemplate=(f"read at small deformation: 0.0–{small_window:.1f} %"
+                           "<extra></extra>"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=[small_window, end], y=[row, row], mode="lines", yaxis="y2",
+            line={"color": SMALL_COLOUR, "width": 2, "dash": "dot"},
+            showlegend=False,
+            hovertemplate="not read here<extra></extra>",
+        ))
     x_lo = min(0.0, float(np.nanmin(x)) if x.size else 0.0) - 1.0
     x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
     # The contact artefact is named once, above the plot, over its band.
@@ -7702,7 +7856,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
 
 
 def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
-                         fit_id_text="", n_points=None):
+                         fit_id_text="", n_points=None, small=None):
     """
     What is on the graph above, in one line, written from the same fit.
 
@@ -7740,6 +7894,26 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
     if left_out:
         parts.append("switched off, so neither fitted nor drawn: "
                      + ", ".join(left_out))
+    if small and small.get("success"):
+        window = float(small.get("window_pct", 20.0))
+        said = []
+        for element, row in (small.get("moduli") or {}).items():
+            symbol = {"membrane": "E_shell",
+                      "cytoskeleton": "E_cyto"}.get(element, element)
+            unit, scale_e = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
+            said.append(f"{DISPLAY_SYMBOL.get(symbol, symbol)} = "
+                        f"{float(row['E_Pa']) / scale_e:.4g} {unit} "
+                        f"(ε^{row['power']:g})")
+        parts.append(
+            f"in green, the **second reading at small deformation**: the "
+            f"same laws acting from first contact over [0, {window:.1f}] % "
+            f"only, shaded and barred at the bottom of the track, solid "
+            f"inside its window and dotted past it to show where it leaves "
+            f"the data. Its own numbers, "
+            + " and ".join(said)
+            + f", R² = {float(small.get('r_squared', float('nan'))):.5f} on "
+            f"{int(small.get('n_points', 0)):,} points. It is a different "
+            "fit of the same curve and it changes nothing above")
     q = float(result.get("squeeze") or 0.0)
     if q:
         parts.append(f"every law multiplied by the squash factor "
@@ -9671,12 +9845,19 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         "widening the C2C12 constraints only as far as it "
                         "has to.", icon="⚠️")
                 log_y = bool(st.session_state.get("pw_log_y"))
+                # The second reading, on the same axes. Computed before the
+                # figure so the line on the plot and the numbers in the
+                # panel below come from one fit.
+                small_on = bool(st.session_state.get("pw_small_on_plot", True))
+                small = (small_strain_now(model, epsilon, force_N)
+                         if small_on else None)
                 st.plotly_chart(
                     piecewise_figure(
                         epsilon, force_N, result, style, log_y=log_y,
                         off=off_now,
                         view=st.session_state.get("pw_view", "stacked"),
                         note=f"fit {fid} · R² = {result['r_squared']:.5f}",
+                        small=small,
                     ),
                     key="pw_curve", **STRETCH,
                 )
@@ -9685,16 +9866,25 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     result, off=off_now,
                     view=st.session_state.get("pw_view", "stacked"),
                     log_y=log_y, fit_id_text=fid,
-                    n_points=int(np.size(epsilon)),
+                    n_points=int(np.size(epsilon)), small=small,
                 )
                 # How the plot draws it, under the plot, where it is being
-                # looked at. Both apply at once; neither changes the fit.
-                v1, v2 = st.columns([2.4, 1])
+                # looked at. All three apply at once; none changes the fit.
+                v1, v2, v3 = st.columns([2.1, 1.5, 0.9])
                 with v1:
                     st.radio("Components on the plot", list(PW_VIEWS),
                              format_func=PW_VIEWS.get, key="pw_view",
                              horizontal=True, label_visibility="collapsed")
                 with v2:
+                    st.checkbox("small-deformation reading",
+                                key="pw_small_on_plot",
+                                help="Draws the second reading on the same "
+                                     "axes: its window shaded, its curve "
+                                     "solid inside it and dotted past it, "
+                                     "and each of its laws dashed. It is a "
+                                     "different fit of the same data and it "
+                                     "changes nothing about the black curve.")
+                with v3:
                     st.checkbox("log F axis", key="pw_log_y")
                 fitted = predict_piecewise(epsilon, result)
 
