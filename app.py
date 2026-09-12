@@ -6355,6 +6355,106 @@ def piecewise_equations_latex(bounds, ranges, off=()):
     ]
 
 
+def _tex_number(value, digits=4):
+    """A number in LaTeX, in scientific form when it needs to be."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return r"\text{—}"
+    if not np.isfinite(value):
+        return r"\text{—}"
+    if value == 0:
+        return "0"
+    text = f"{value:.{digits}g}"
+    if "e" in text:
+        mantissa, exponent = text.split("e")
+        return rf"{mantissa}\times 10^{{{int(exponent)}}}"
+    return text
+
+
+def piecewise_answer(result, fit):
+    """
+    The answer, as mathematics: the fitted function, stretch by stretch.
+
+    The strip at the top says what each component came to. This says what
+    the whole curve came to: F̂ written out with the numbers in it, one
+    line per stretch, each starting from the force the one before it ended
+    on, and the moduli those coefficients turn into. It is the thing to
+    copy into a report.
+    """
+    if not (result and result.get("success")):
+        return
+    names = components_for(st.session_state.get("cell_type"))
+    moduli = result.get("moduli") or {}
+    ranges = result.get("ranges") or {}
+    bounds = result["boundaries_pct"]
+    off = set(result.get("components_off") or piecewise_off())
+
+    st.markdown("**The answer, written out**")
+    st.caption("x is the relative deformation in per cent, F̂ in newtons; "
+               "⟨·⟩ is zero before its boundary.")
+    for index, regime in enumerate(result.get("regimes") or []):
+        a, b = regime["domain_pct"]
+        fitted_here = [name for name in regime["params"]
+                       if name not in ("C0", "k_align") and name not in off]
+        pieces = []
+        if index == 0:
+            offset = (regime["params"].get("C0") or {}).get("value")
+            if offset is not None and np.isfinite(offset) and abs(offset) > 0:
+                pieces.append(_tex_number(offset, 3))
+        else:
+            pieces.append(rf"\hat F({a:.4g}\%)")
+        for name in fitted_here:
+            row = regime["params"][name]
+            power = row.get("power", 1.0)
+            power_tex = {3.0: "3", 1.5: "3/2"}.get(float(power),
+                                                   f"{float(power):g}")
+            pieces.append(
+                rf"{_tex_number(row.get('value'), 4)}\,"
+                rf"\big\langle x - {a:.4g} \big\rangle^{{{power_tex}}}"
+            )
+        # What the stretches before it are still adding here.
+        carried = [name for name in (regime.get("carried") or {})
+                   if name not in off]
+        if carried:
+            pieces.append(
+                r"\underbrace{\textstyle\sum_{j<k} \hat\theta_j\,\phi_j(x)}"
+                r"_{\text{" + f"{len(carried)} carried on" + r"}}")
+        body = " + ".join(pieces) if pieces else "0"
+        last_one = index >= len(result["regimes"]) - 1
+        relation = r"\le" if last_one else "<"
+        st.latex(rf"\hat F(x) = {body}, \qquad {a:.4g}\,\% \le x "
+                 + relation + rf" {b:.4g}\,\%")
+
+    lines = []
+    for term, coefficient in ORDER_COEFFICIENT.items():
+        row = moduli.get(coefficient)
+        if not row or coefficient in off:
+            continue
+        unit, scale = DISPLAY_UNIT.get(row["symbol"], ("kPa", 1e3))
+        value = float(row["E_Pa"]) / scale
+        error = float(row.get("E_se_Pa", float("nan"))) / scale
+        start, until = ranges.get(coefficient, (float("nan"), float("nan")))
+        lines.append(
+            rf"{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
+            rf"{_tex_number(value, 4)}"
+            + (rf" \pm {_tex_number(error, 3)}" if np.isfinite(error) else "")
+            + rf"\;\text{{{unit}}} \quad \text{{({names[term][0].split(' ', 1)[-1]}, "
+            rf"{start:.1f}–{until:.1f}\%)}}")
+    if lines:
+        st.latex(r"\begin{aligned}" + r" \\ ".join(
+            line.replace(" = ", " &= ", 1) for line in lines) + r"\end{aligned}")
+    r2 = float(result.get("r_squared", float("nan")))
+    chi = float(result.get("chi_squared_reduced", float("nan")))
+    st.latex(
+        rf"R^2 = {r2:.5f}"
+        + (rf", \qquad \chi^2_\nu = {chi:.3g}" if np.isfinite(chi) else "")
+        + rf", \qquad n = {int(result.get('n_points', 0))}"
+        + rf", \qquad (\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
+        rf"({bounds[1]:.2f},\,{bounds[2]:.2f},\,{bounds[3]:.2f})\,\%"
+    )
+
+
 def _band_keys():
     """Every session key that holds a constraint on ε."""
     return [key for pair in PW_BAND_KEYS for key in pair] + list(PW_SPAN_KEYS)
@@ -6435,6 +6535,8 @@ def reach_the_target(model, epsilon, force_N, target):
                                 "said": said + held,
                                 "best_pct": tuple(row["best_pct"]),
                                 "route": key, "throughout": throughout,
+                                "widened": (factor != 1.0
+                                            or throughout != was_throughout),
                                 "bands": {k: st.session_state.get(k)
                                           for k in _band_keys()},
                                 "placements": placements}
@@ -7385,8 +7487,36 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_apply", False):
         apply_board()
     elif applied_state.get("curve") != curve_key:
+        # A C2C12 arrives fitted the way a C2C12 is fitted: carried
+        # forward, all four components, and boundaries already taken as far
+        # as the target. The search starts inside the prior, so a curve the
+        # prior describes costs one placement search, exactly as before;
+        # only a curve it does not costs more, and then it says so.
         st.session_state["pw_reach_note"] = None
-        place_now(arriving=True)
+        st.session_state["pw_method"] = "refined"
+        st.session_state["pw_eps_way"] = "found"
+        target_now = float(st.session_state.get("pw_target_r2", 0.999))
+        with st.spinner("Placing ε₁, ε₂, ε₃ and fitting this cell…"):
+            arrived = reach_the_target(model, epsilon, force_N, target_now)
+        if arrived:
+            st.session_state["pw_placements"] = arrived.get("placements")
+            st.session_state["pw_selected"] = {
+                "key": arrived["route"],
+                "reason": f"On arrival: {arrived['said']}, "
+                          f"R² = {arrived['r2']:.5f}.",
+            }
+            for key, value in zip(PW_BOUNDARY_KEYS, arrived["best_pct"]):
+                st.session_state[key] = round(float(value), 2)
+            st.session_state["pw_membrane_throughout"] = bool(
+                arrived.get("throughout", True))
+            if arrived.get("widened"):
+                # Found outside the prior, so it has to be kept as typed:
+                # placing ε again inside the prior would lose it.
+                st.session_state["pw_eps_way"] = "typed"
+                st.session_state["pw_reach_note"] = reach_note(arrived,
+                                                               target_now)
+        else:
+            place_now(arriving=True)
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -7705,6 +7835,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
             if ok:
                 section("Fitting results")
                 fitting_results_rows(fit, style, send=False, compact=True)
+                with st.expander("🧮 The answer, written out as mathematics",
+                                 expanded=False):
+                    piecewise_answer(result, fit)
                 copy_the_results(fit, style.force_unit)
                 adding = st.button(
                     ("↻ Update (ε, θ̂, E) in collection" if in_collection
