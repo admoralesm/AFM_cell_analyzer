@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 import numpy as np
@@ -6495,6 +6496,10 @@ def _widen_the_bands(factor):
 
 # How far the search is allowed to open the constraints out, in order, and
 # what each step is called when the page says what it had to do.
+# How long a curve may spend placing its own boundaries as it loads. The
+# button has no budget: a person who pressed it is waiting on purpose.
+ARRIVAL_BUDGET_S = 12.0
+ARRIVAL_SEARCH_POINTS = 700
 REACH_STEPS = (
     (1.0, "inside the C2C12 prior"),
     (2.0, "with the prior's bands opened out twice as wide"),
@@ -6502,7 +6507,8 @@ REACH_STEPS = (
 )
 
 
-def reach_the_target(model, epsilon, force_N, target):
+def reach_the_target(model, epsilon, force_N, target, budget_seconds=None,
+                     interleave=False, search_points=None):
     """
     Open the constraints on ε out, a step at a time, until R² ≥ target.
 
@@ -6515,47 +6521,73 @@ def reach_the_target(model, epsilon, force_N, target):
     found outside the prior is a result about this cell that the prior did
     not expect.
 
+    ``budget_seconds`` stops it early and keeps the best it has: a curve
+    loading should not wait a minute for a search that is not going to
+    reach the target anyway, and the button has no such hurry.
+
     Returns {"reached", "best_pct", "r2", "said", "bands", "step"} or None.
     """
+    started = time.monotonic()
     kept = {key: st.session_state.get(key) for key in _band_keys()}
+    _SEARCH_POINTS_OVERRIDE[0] = search_points
     was_throughout = bool(st.session_state.get("pw_membrane_throughout", True))
+    # Which order to try things in. Left alone, every placement is tried
+    # with the first component acting throughout before the model is
+    # changed at all. Interleaved, both models are tried at each step: it
+    # gets to a usable answer in two searches rather than four, which is
+    # what a curve that is still loading needs.
+    plan = ([(factor, said, throughout)
+             for factor, said in REACH_STEPS
+             for throughout in (was_throughout, False)] if interleave else
+            [(factor, said, throughout)
+             for throughout in (was_throughout, False)
+             for factor, said in REACH_STEPS])
     best = None
     try:
-        for factor, said in REACH_STEPS:
+        # Two passes, not two tries at each step. The first component acting
+        # throughout is the model this page is set up with, so every
+        # placement is tried that way first, all the way out; only when none
+        # of them reaches the target is the first component asked to hold
+        # what it reached instead. A law carried on and extrapolated can
+        # cover the whole of the next stretch and leave nothing for the
+        # component that joins there, so holding it is often the difference
+        # between three components measured and four -- but it is a change
+        # to the model, and a change to the model is the last resort.
+        for factor, said, throughout in plan:
+            _PW_CARRY_OVERRIDE[0] = throughout
+            held = ("" if throughout else
+                    ", with the first component holding what it reached "
+                    "rather than carrying on")
+            st.session_state.update(kept)
             if factor != 1.0:
                 st.session_state.update(_widen_the_bands(factor))
-            # Two models at each step: the first component carried on as it
-            # is, and the first component holding what it reached at its own
-            # boundary. A law carried on and extrapolated can cover the whole
-            # of the next stretch and leave nothing for the component that
-            # joins there, and letting it hold instead is often the whole
-            # difference between three components measured and four.
-            for throughout in (was_throughout, False):
-                _PW_CARRY_OVERRIDE[0] = throughout
-                st.session_state["pw_placements"] = None
-                placements = compute_placements(model, epsilon, force_N)
-                rows = placements.get("rows") or {}
-                held = ("" if throughout else
-                        ", with the first component holding what it reached "
-                        "rather than carrying on")
-                for key, row in rows.items():
-                    r2 = float(row.get("r2", float("nan")))
-                    if not np.isfinite(r2):
-                        continue
-                    if best is None or r2 > best["r2"]:
-                        best = {"reached": r2 >= target, "r2": r2,
-                                "said": said + held,
-                                "best_pct": tuple(row["best_pct"]),
-                                "route": key, "throughout": throughout,
-                                "widened": (factor != 1.0
-                                            or throughout != was_throughout),
-                                "bands": {k: st.session_state.get(k)
-                                          for k in _band_keys()},
-                                "placements": placements}
-                if best and best["reached"]:
-                    return best
+            st.session_state["pw_placements"] = None
+            placements = compute_placements(model, epsilon, force_N)
+            rows = placements.get("rows") or {}
+            for key, row in rows.items():
+                r2 = float(row.get("r2", float("nan")))
+                if not np.isfinite(r2):
+                    continue
+                if best is None or r2 > best["r2"]:
+                    best = {"reached": r2 >= target, "r2": r2,
+                            "said": said + held,
+                            "best_pct": tuple(row["best_pct"]),
+                            "route": key, "throughout": throughout,
+                            "widened": (factor != 1.0
+                                        or throughout != was_throughout),
+                            "bands": {k: st.session_state.get(k)
+                                      for k in _band_keys()},
+                            "placements": placements}
+            if best and best["reached"]:
+                return best
+            if (budget_seconds is not None
+                    and time.monotonic() - started > budget_seconds):
+                if best:
+                    best["stopped_early"] = True
+                return best
     finally:
         _PW_CARRY_OVERRIDE[0] = None
+        _SEARCH_POINTS_OVERRIDE[0] = None
         # The board goes back to the constraints it had; the boundaries the
         # search found are written to it instead, as typed numbers.
         st.session_state.update(kept)
@@ -6570,11 +6602,17 @@ def reach_note(found, target):
     where = ", ".join(f"ε{sub} = {value:.2f} %" for sub, value
                       in zip("₁₂₃", found["best_pct"]))
     if found["reached"]:
-        return (f"✅ **R² = {found['r2']:.6f} ≥ {target:g}**, found "
+        return (f"✅ **R² ≈ {found['r2']:.6f} ≥ {target:g}**, found "
                 f"{found['said']}, at {where}. The boundaries are on the "
                 "board as typed numbers, so this fit stays until you "
                 "change them.")
-    return (f"⚠️ **The best this curve gives is R² = {found['r2']:.6f}**, "
+    if found.get("stopped_early"):
+        return (f"⏱️ **The best found so far is R² ≈ {found['r2']:.6f}**, "
+                f"below {target:g}, at {where}. The search stopped there so "
+                "the page would not keep you waiting. Press **🎯 Reach R² ≥ "
+                f"{target:g}** and it will carry on from the prior, opening "
+                "it out as far as it needs to.")
+    return (f"⚠️ **The best this curve gives is R² ≈ {found['r2']:.6f}**, "
             f"below {target:g}, even {REACH_STEPS[-1][1]}. It is at {where}. "
             "A curve that will not reach the target usually has something "
             "the model does not describe in it: a rupture, a bad contact, "
@@ -7081,14 +7119,18 @@ def _pw_score(placement, epsilon, force_N, model):
 # 0.5 % the boundaries are read to -- so the search runs on an evenly
 # thinned copy. The fit the page shows is always the whole curve.
 SEARCH_POINTS = 1800
+# Thinned harder while a curve is loading, where the whole point is not to
+# keep anybody waiting; put back to None as soon as that search is done.
+_SEARCH_POINTS_OVERRIDE = [None]
 
 
 def thinned_for_search(epsilon, force_N):
     """An evenly thinned copy of the curve, for placing boundaries on."""
+    most = int(_SEARCH_POINTS_OVERRIDE[0] or SEARCH_POINTS)
     n = int(np.size(epsilon))
-    if n <= SEARCH_POINTS:
+    if n <= most:
         return epsilon, force_N, 1
-    step = int(np.ceil(n / SEARCH_POINTS))
+    step = int(np.ceil(n / most))
     return np.asarray(epsilon)[::step], np.asarray(force_N)[::step], step
 
 
@@ -7535,12 +7577,39 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.session_state["pw_reach_note"] = None
         st.session_state["pw_method"] = "refined"
         st.session_state["pw_eps_way"] = "found"
-        # One placement search, the same one this page has always done on
-        # arrival: every route scored inside the C2C12 prior and the first
-        # that reaches R²★ taken. Opening the prior out is the 🎯 button's
-        # job, because it is several more searches and a person should be
-        # the one who asks for them.
-        place_now(arriving=True)
+        # A curve arrives fitted, with its four components and with its
+        # boundaries moved until the whole curve reaches the target. The
+        # search starts inside the C2C12 prior, so a curve the prior
+        # describes costs the one placement search this page has always
+        # done; only a curve it does not costs more, and that is exactly
+        # the curve nobody wants to place by hand.
+        target_now = float(st.session_state.get("pw_target_r2", 0.999))
+        with st.spinner(f"Fitting this cell: placing ε₁, ε₂, ε₃ and moving "
+                        f"them until R² ≥ {target_now:g}…"):
+            arrived = reach_the_target(
+                model, epsilon, force_N, target_now,
+                budget_seconds=ARRIVAL_BUDGET_S, interleave=True,
+                search_points=ARRIVAL_SEARCH_POINTS)
+        if arrived:
+            st.session_state["pw_placements"] = arrived.get("placements")
+            st.session_state["pw_selected"] = {
+                "key": arrived["route"],
+                "reason": f"On arrival: {arrived['said']}, "
+                          f"R² = {arrived['r2']:.5f}.",
+            }
+            for key, value in zip(PW_BOUNDARY_KEYS, arrived["best_pct"]):
+                st.session_state[key] = round(float(value), 2)
+            st.session_state["pw_membrane_throughout"] = bool(
+                arrived.get("throughout", True))
+            if arrived.get("widened"):
+                # Found outside the prior, or with the model changed, so it
+                # is kept as typed: placing ε again inside the prior would
+                # throw it away.
+                st.session_state["pw_eps_way"] = "typed"
+                st.session_state["pw_reach_note"] = reach_note(arrived,
+                                                               target_now)
+        else:
+            place_now(arriving=True)
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -12766,6 +12835,10 @@ with tab_analysis:
                     pending[f"pw_use_{name}"] = bool(
                         DEFAULTS.get(f"pw_use_{name}", True))
                 pending["component_order"] = list(COMPONENT_ORDER_DEFAULT)
+                # And with the component met first acting throughout, which
+                # is the model this page is set up with. The fit gives it up
+                # only if nothing else reaches the target, and says so.
+                pending["pw_membrane_throughout"] = True
                 st.session_state["component_search"] = None
 
             window = (
