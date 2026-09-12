@@ -379,7 +379,7 @@ def _resolve_ranges(regimes, bounds, carry=()):
     for i, regime in enumerate(regimes):
         a, b = float(bounds[i]), float(bounds[i + 1])
         for term in regime.terms:
-            if regime.free_offset or term.shape == LUMP:
+            if term.shape == LUMP:
                 # A lump lives and dies inside its own regime.
                 out[term.name] = (a, b)
                 continue
@@ -540,47 +540,63 @@ def fit_piecewise(
             continue
 
         if regime.free_offset:
-            # R1: an ordinary straight-line least-squares fit. Its starting
-            # values are reported for the record; a straight line has one
-            # answer and needs none.
-            k0 = (f[-1] - f[0]) / (x[-1] - x[0]) if x[-1] > x[0] else 0.0
+            # The first regime has no earlier one to be anchored to, so it
+            # carries a free intercept C0 of its own. Everything else about
+            # it is the fit every other regime gets: its terms' own laws,
+            # measured from the regime's start, with their own bounds. It
+            # used to be a bare straight line because the first regime was
+            # always the contact slope; it is now whichever element the
+            # model puts first, which can be a cube law like any other.
             c0 = float(np.mean(f_all[:10]))
-            term0 = regime.terms[0]
-            held = bool(np.isfinite(term0.lower) and term0.lower == term0.upper)
-            if held:
-                # The contact slope switched off (or pinned): held at its
-                # bound, and only the offset C0 is fitted, F = k x + C0.
-                slope = float(term0.lower)
-                offset = float(np.mean(f - slope * x))
-                predicted = slope * x + offset
-                resid = f - predicted
-                se_c0 = (float(np.std(resid, ddof=1) / np.sqrt(resid.size))
-                         if resid.size > 1 else float("nan"))
-                se_k = 0.0
-            else:
-                design = np.column_stack([x ** p for p in powers] + [np.ones_like(x)])
-                sol, *_ = np.linalg.lstsq(design, f, rcond=None)
-                predicted = design @ sol
-                cov = _covariance(design, f - predicted, np.ones(design.shape[1], bool))
-                slope, offset = float(sol[0]), float(sol[1])
-                se_k = float(np.sqrt(max(cov[0, 0], 0.0)))
-                se_c0 = float(np.sqrt(max(cov[1, 1], 0.0)))
-            entry["params"][names[0]] = {
-                "value": slope, "se": se_k,
-                "p0": float(k0), "lower": term0.lower if held else -np.inf,
-                "upper": term0.upper if held else np.inf,
-                "power": 1.0, "at_bound": held,
-                "start": float(a), "until": float(b),
-            }
+            untils = np.array([ranges[t.name][1] for t in regime.terms])
+            columns = [_basis(t.shape, t.power, x, a, untils[j])
+                       for j, t in enumerate(regime.terms)]
+            design = np.column_stack(columns + [np.ones_like(x)])
+            p0 = [float(t.p0) if np.isfinite(t.p0) else 0.0
+                  for t in regime.terms] + [c0]
+            lower = [t.lower for t in regime.terms] + [-np.inf]
+            upper = [t.upper for t in regime.terms] + [np.inf]
+            params, engine, at_bound = _bounded_linear_fit(
+                design, f, p0, lower, upper,
+            )
+            predicted = design @ params
+            cov = _covariance(design, f - predicted, ~at_bound)
+            for j, t in enumerate(regime.terms):
+                entry["params"][t.name] = {
+                    "value": float(params[j]),
+                    "se": float(np.sqrt(cov[j, j])) if np.isfinite(cov[j, j])
+                    and cov[j, j] >= 0 else float("nan"),
+                    "p0": float(t.p0) if np.isfinite(t.p0) else float("nan"),
+                    "lower": float(t.lower), "upper": float(t.upper),
+                    "power": float(t.power), "at_bound": bool(at_bound[j]),
+                    "start": float(a), "until": float(untils[j]),
+                    "shape": t.shape,
+                }
+                coefficients[t.name] = float(params[j])
+            offset = float(params[-1])
             entry["params"]["C0"] = {
-                "value": offset, "se": se_c0,
+                "value": offset,
+                "se": float(np.sqrt(cov[-1, -1]))
+                if np.isfinite(cov[-1, -1]) and cov[-1, -1] >= 0
+                else float("nan"),
                 "p0": c0, "lower": -np.inf, "upper": np.inf, "power": 0.0,
                 "at_bound": False,
             }
-            coefficients[names[0]] = slope
             coefficients["C0"] = offset
-            entry["engine"] = "linear least squares"
-            anchor = slope * b + offset
+            entry["engine"] = engine
+            anchor = offset + float(sum(
+                params[j] * float(_basis(t.shape, t.power, np.array([b]),
+                                         a, untils[j])[0])
+                for j, t in enumerate(regime.terms) if t.shape != LUMP))
+            for j, t in enumerate(regime.terms):
+                if t.shape != LUMP and untils[j] > b + 1e-9:
+                    carried.append({
+                        "name": t.name, "power": float(t.power),
+                        "onset_pct": float(a), "until_pct": float(untils[j]),
+                        "value": float(params[j]),
+                        "se": entry["params"][t.name]["se"],
+                        "from_regime": regime.key,
+                    })
         else:
             # Each element's law runs from the regime's start to its own
             # end, and holds what it reached after that.
