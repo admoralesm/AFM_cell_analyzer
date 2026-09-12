@@ -797,6 +797,9 @@ DEFAULTS = {
     "pw_boundary_search": None,
     # The order the four components are met in, first to last.
     "component_order": ["membrane", "interior", "nucleus_shell", "nucleus"],
+    # How the probe met the cell, recorded with it and written into the
+    # spreadsheet row.
+    "compression_type": "Head-on",
     # How the boundaries are placed, and the R² every fit has to reach.
     "pw_method": "refined",
     # Whether ▶ Fit & plot places the boundaries from the curve or fits at
@@ -1347,6 +1350,91 @@ def sharing_label(fit):
     return str(fit.get("model_label") or st.session_state.get("model_kind", ""))
 
 
+COMPRESSION_TYPES = ("Head-on", "Off-centre", "Edge-on", "Not recorded")
+
+# The lab's own table, column for column. This is the row that gets pasted
+# into the shared sheet, so its headers, its order and the way each number
+# is written are fixed here and nowhere else. Values are written the way
+# the sheet writes them, "3.608 MPa ± 0.026", because that is the column a
+# person reads; every number as a plain float, for averaging, is the other
+# block in the same panel.
+LAB_SHEET_COLUMNS = (
+    "Experiment Date", "Cell ID", "Cell Height, h (μm)",
+    "Spring Constant, K (N/m)", "Compression Type",
+    "Boundaries (ε1 and ε2)", "Young's Modulus, Em (MPa)",
+    "Young's Modulus, Ec (kPa)", "Young's Modulus, Ene (MPa)",
+    "Young's Modulus, En (kPa)", "En range (ε)", "Fit Quality (R²)",
+    "Chi squared",
+)
+LAB_SHEET_MODULI = (("Young's Modulus, Em (MPa)", "Em_MPa", "MPa"),
+                    ("Young's Modulus, Ec (kPa)", "Ei_kPa", "kPa"),
+                    ("Young's Modulus, Ene (MPa)", "Ene_MPa", "MPa"),
+                    ("Young's Modulus, En (kPa)", "En_kPa", "kPa"))
+
+
+def _sheet_date(value):
+    """The date the way the sheet writes it: M/D/YYYY."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = [int(p) for p in text.split("-")]
+        if len(parts) == 3:
+            return f"{parts[1]}/{parts[2]}/{parts[0]}"
+    except ValueError:
+        pass
+    return text
+
+
+def lab_sheet_row(fit):
+    """
+    This fit as one row of the lab's table, written as the table writes it.
+
+    Thirteen columns, always the same thirteen and always in this order, so
+    a row pasted under the last one lines up without anybody checking. A
+    modulus the fit does not have is an empty cell, not a zero.
+    """
+    if not (fit and fit.get("success")):
+        return {}
+    edges = {name: value for value, name in fit_edges(fit)}
+    lo, hi = (float(v) for v in fit.get("epsilon_range", (0.0, 1.0)))
+    chi = fit.get("chi_squared_reduced", float("nan"))
+    row = {
+        "Experiment Date": _sheet_date(st.session_state.get("date_acquired")),
+        "Cell ID": st.session_state.get("cell_name", ""),
+        "Cell Height, h (μm)": st.session_state.get("cell_height_um", ""),
+        "Spring Constant, K (N/m)": st.session_state.get("spring_constant", ""),
+        "Compression Type": st.session_state.get("compression_type", ""),
+        "Boundaries (ε1 and ε2)": ", ".join(
+            f"{name} = {value:.3f}" for value, name in fit_edges(fit)) or "—",
+    }
+    for column, key, unit_name in LAB_SHEET_MODULI:
+        value = fit.get(key)
+        error = fit.get(f"{key}_std")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if not np.isfinite(value):
+            row[column] = ""
+            continue
+        text = f"{value:.4g} {unit_name}"
+        try:
+            error = float(error)
+        except (TypeError, ValueError):
+            error = float("nan")
+        if np.isfinite(error):
+            text += f" ± {error:.2g}"
+        row[column] = text
+    row["En range (ε)"] = f"{lo:.3f} to {hi:.3f}"
+    row["Fit Quality (R²)"] = round(
+        float(fit.get("r_squared", float("nan"))), 5)
+    row["Chi squared"] = (f"χ²/dof = {float(chi):.3g}"
+                          if np.isfinite(chi) else "")
+    # Never reordered and never short: the sheet's columns are the contract.
+    return {column: row.get(column, "") for column in LAB_SHEET_COLUMNS}
+
+
 def fit_record(fit, unit="nN"):
     """
     Everything this fit measured, as one flat record of name → value.
@@ -1650,13 +1738,34 @@ def copy_the_results(fit, unit="nN"):
     copy_block(record, key="download_fit_record",
                file_stem=st.session_state.get("cell_name", "cell") or "cell",
                summary=(f"fit {record['Fit ID']} · R² = "
-                        f"{float(fit.get('r_squared', float('nan'))):.5f}"))
+                        f"{float(fit.get('r_squared', float('nan'))):.5f}"),
+               lab=lab_sheet_row(fit))
 
 
-def copy_block(record, key, file_stem, summary=""):
-    """The record as two tab-separated lines to paste, and as a CSV."""
+def copy_block(record, key, file_stem, summary="", lab=None):
+    """The lab's row to paste, the whole record under it, and both as CSV."""
     with st.expander("📋 Copy these results into a spreadsheet"
                      + (f" · {summary}" if summary else ""), expanded=False):
+        if lab:
+            st.markdown("**The lab table** — paste straight into the sheet")
+            st.code(_tsv(lab), language="text")
+            st.caption(
+                "The thirteen columns of the shared sheet, in its order and "
+                "written the way it writes them. Copy both lines, click the "
+                "first empty cell of the sheet and paste: the headers land "
+                "on the header row and the values under them. Pasting only "
+                "the second line adds a row to a sheet that already has its "
+                "headers."
+            )
+            st.download_button(
+                "⬇️ The lab row as a CSV",
+                data=_csv(lab),
+                file_name=f"{file_stem}_row.csv",
+                mime="text/csv",
+                key=f"{key}_lab",
+                **STRETCH,
+            )
+            st.markdown("**Every number this fit produced**")
         st.code(_tsv(record), language="text")
         st.caption(
             "Tab separated, headers on the first line. Copy both lines, "
@@ -8207,12 +8316,19 @@ def fit_edges(fit):
     for value in edges:
         if not (lo + 1e-6 < value < hi - 1e-6):
             continue
-        name = "ε"
+        name = None
         for key, label in (("break_1", "ε₁"), ("break_2", "ε₂")):
             if fit.get(key) is not None and abs(float(fit[key]) - value) < 5e-4:
                 name = label
-        named.append((value, name))
-    return named
+        named.append([value, name])
+    # Anything else the components start at is the next ε in the sequence,
+    # named rather than left as a bare "ε": with one component to a stretch
+    # there is a third and a fourth boundary and they have names.
+    spare = [n for n in EPS_NAMES if n not in {row[1] for row in named}]
+    for row in named:
+        if row[1] is None:
+            row[1] = spare.pop(0) if spare else "ε"
+    return [(value, name) for value, name in named]
 
 
 def decorate_curve_figure(figure, style, fit=None, epsilon=None, bands=(),
@@ -12007,6 +12123,14 @@ with tab_analysis:
             "compare with cells squashed at the same one.",
         )
     with c8:
+        st.selectbox(
+            "Compression type", COMPRESSION_TYPES, key="compression_type",
+            help="How the probe met the cell. Recorded with the cell and "
+            "written into the spreadsheet row: a head-on squash and one off "
+            "to the side are not the same measurement.",
+        )
+    c9, _c10 = st.columns([1, 3])
+    with c9:
         st.text_input("Operator", placeholder="initials", key="operator")
     st.text_input("Notes", placeholder="passage, treatment, anything worth keeping",
                   key="cell_notes")
