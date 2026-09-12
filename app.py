@@ -196,8 +196,7 @@ early_regime_search = getattr(_piecewise_module, "early_regime_search", None)
 bending_crossover = getattr(_piecewise_module, "bending_crossover", None)
 EARLY_WINDOWS_PCT = getattr(_piecewise_module, "EARLY_WINDOWS_PCT",
                             (20.0, 25.0, 30.0, 35.0))
-CORTEX_THICKNESS_M = float(getattr(_piecewise_module, "CORTEX_THICKNESS_M",
-                                   200e-9))
+bending_constant = getattr(_piecewise_module, "bending_constant", None)
 LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
 HAS_VALIDATION = all(f is not None for f in (
     information_criteria, akaike_weights, residual_diagnostics,
@@ -864,7 +863,10 @@ DEFAULTS = {
     "pw_early_windows": [20.0, 25.0, 30.0, 35.0],
     "pw_early_step": 2.0,
     "pw_early_bending": "compare",
-    "pw_early_cortex_nm": 200.0,
+    # The membrane thickness the bending term is read with. 4 nm is the
+    # bilayer Lulevich uses; the term goes as h^2, so this is the setting
+    # that decides whether it can be dropped.
+    "pw_early_h_nm": 4.0,
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
     "pw_selected": None,
@@ -5000,7 +5002,7 @@ PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_style", "pw_best_carry",
                    "pw_weighting", "pw_squeeze", "pw_squeeze_way",
                    "pw_small_strain", "pw_early_on", "pw_early_step",
-                   "pw_early_bending", "pw_early_cortex_nm",
+                   "pw_early_bending", "pw_early_h_nm",
                    "pw_use_K_shell", "pw_use_K_cyto",
                    "pw_use_K_nucleus", "pw_use_K_core")
 _PW_SOURCE = [None]
@@ -5629,6 +5631,11 @@ LITERATURE = {
             # symbol: (low, high, in Pa, what it is)
             "E_cyto": (10.0e3, 15.0e3,
                        "the cytoskeleton of a C2C12, 10–15 kPa"),
+            # Lulevich et al., Langmuir 2006: ten living-cell compression
+            # profiles fitted with their eq 3 over the early regime.
+            "E_shell": (10.0e6, 35.0e6,
+                        "the membrane of a living cell, 10–35 MPa "
+                        "(Lulevich 2006)"),
         },
         "bump_pct": 50.0,
         "bump_is": "the nuclear envelope and the lamina under it",
@@ -6651,7 +6658,10 @@ def small_strain_curve(reading, x_pct):
         piece = prefactor * shifted ** float(row["power"])
         tied = float(row.get("tied_bending_A", 0.0))
         if tied:
-            piece = piece + tied * shifted
+            # Lulevich eq 1: the same membrane, the same modulus, bending
+            # as e^(1/2) beside its own stretching as e^3.
+            piece = piece + tied * shifted ** float(
+                row.get("tied_bending_power", 0.5))
         piece = float(row["E_Pa"]) * piece * room
         parts[name] = piece
         total = total + piece
@@ -6791,16 +6801,52 @@ def small_strain_figure(epsilon, force_N, reading, style, past=1.4):
     return fig
 
 
-EARLY_LAW_NAME = {"stretch": "🟥 Shell stretching (ε³)",
-                  "hertz": "🟧 Cytoskeleton, Hertz (ε^1.5)",
-                  "bending": "⬜ Shell bending (ε)"}
+# ========================================================= early deformation ==
+#
+# Lulevich, Zink, Chen, Liu & Liu, Langmuir 2006, 22, 8151-8155, which is
+# where this whole model comes from. Over the first third of a squash a
+# living cell is a balloon of incompressible fluid, and there are exactly
+# TWO components in it:
+#
+#   the MEMBRANE, which both stretches and bends (their eq 1)
+#
+#       F_m = 2*pi*E_m/(1-nu_m) * h*R0 * e^3   +   pi*E_m/(2*sqrt2) * h^2 * e^(1/2)
+#             \______ stretching ______/            \______ bending ______/
+#
+#   the CYTOSKELETON / cell interior, Hertzian (their eq 6)
+#
+#       F_i = sqrt2 * E_i / (3(1-nu_i^2)) * R0^2 * e^(3/2)
+#
+# and their eq 2 says when the bending half may be dropped:
+#
+#       F_bending / F_stretching  ~  (h/R0) * e^(-5/2)
+#
+# which DIVERGES as e -> 0. So bending is never negligible near contact; it
+# is negligible above a deformation, and the paper drops it over e = 0.1 to
+# 0.3 because with h = 4 nm and R0 = 5 um the ratio is under 0.05 there.
+# With the numerical factor kept, (1-nu)/(4 sqrt2) * (h/R0) * e^(-5/2), the
+# two terms are equal at about 2 % and bending is under a twentieth of
+# stretching by about 7 %. A reading that starts at first contact therefore
+# cannot inherit the approximation: it is fitted both ways here.
+#
+# The paper's own results, for comparison: E_m = 10 to 35 MPa for living
+# cell membranes, K_m = 17 to 52 kT, and E_i = 4 to 7.5 kPa for the cell
+# interior of dead cells fitted with eq 6 below 30 % deformation, which it
+# calls "in good agreement with the cytoskeleton or cell nuclei (1-10 kPa)".
+
+EARLY_LAW_NAME = {"stretch": "🟥 Membrane", "hertz": "🟧 Cytoskeleton",
+                  "bending": "⬜ Membrane bending"}
+EARLY_LAW_LAW = {"stretch": r"$2\pi\frac{E_m}{1-\nu_m}hR_0\,\varepsilon^{3}$",
+                 "hertz": r"$\frac{\sqrt{2}E_i}{3(1-\nu_i^2)}R_0^2\,"
+                          r"\varepsilon^{3/2}$",
+                 "bending": r"$\frac{\pi E_m}{2\sqrt{2}}h^2\,"
+                            r"\varepsilon^{1/2}$"}
 EARLY_LAW_SYMBOL = {"stretch": "E_shell", "hertz": "E_cyto",
-                    "bending": "E_bend"}
+                    "bending": "E_shell"}
 EARLY_BENDING_WAYS = {
-    "compare": "Both, and compare — drop it, and keep it tied to the shell",
-    "off": "Dropped — stretching only",
-    "tied": "Kept, tied — same E and h as the stretching term",
-    "free": "Kept, free — a modulus of its own (fits better, means less)",
+    "compare": "Both, and compare — Lulevich eq 1 against eq 3",
+    "off": "Dropped — stretching only (their eq 3)",
+    "tied": "Kept — stretching + bending, one modulus (their eq 1)",
 }
 
 
@@ -6815,9 +6861,17 @@ def early_signature(epsilon, force_N):
                      (st.session_state.get("pw_early_windows") or ()))),
         round(float(st.session_state.get("pw_early_step", 2.0)), 3),
         st.session_state.get("pw_early_bending", "compare"),
-        round(float(st.session_state.get("pw_early_cortex_nm", 200.0)), 3),
+        round(float(st.session_state.get("pw_early_h_nm", 4.0)), 4),
         piecewise_weighting(), round(piecewise_squeeze(), 3),
     ))
+
+
+def early_thickness_m():
+    """The membrane thickness the early regime is read with, in metres."""
+    try:
+        return max(float(st.session_state.get("pw_early_h_nm", 4.0)), 0.1) * 1e-9
+    except (TypeError, ValueError):
+        return 4e-9
 
 
 def early_search_now(model, epsilon, force_N):
@@ -6833,14 +6887,13 @@ def early_search_now(model, epsilon, force_N):
                             or EARLY_WINDOWS_PCT)))
     how = st.session_state.get("pw_early_bending", "compare")
     bending = ("off", "tied") if how == "compare" else (how,)
-    thickness = float(st.session_state.get("pw_early_cortex_nm", 200.0)) * 1e-9
     try:
         found = early_regime_search(
             epsilon, force_N, piecewise_geometry(model),
             windows_pct=windows,
             onset_step=float(st.session_state.get("pw_early_step", 2.0)),
             bending=bending, squeeze=piecewise_squeeze(),
-            weighting=piecewise_weighting(), thickness=thickness)
+            weighting=piecewise_weighting(), thickness=early_thickness_m())
     except Exception:  # pragma: no cover - a curve it cannot read
         return None
     if not found:
@@ -6856,218 +6909,257 @@ def early_row_label(row, short=False):
     for law, onset in row.get("plan", ()):
         name = EARLY_LAW_NAME.get(law, law)
         if short:
-            name = name.split(" ", 1)[-1].split(",")[0].split(" (")[0]
+            name = name.split(" ", 1)[-1]
         parts.append(f"{name} from contact" if onset <= 0
                      else f"{name} joins at {onset:g} %")
     return " → ".join(parts)
 
 
-def bending_verdict(search, geometry, thickness_m):
-    """Whether the shell's bending term can be dropped, on this curve."""
-    if bending_crossover is None or not search:
-        return ""
-    crossing = bending_crossover(geometry, thickness_m)
-    at = crossing["crossover_pct"]
-    window = float(search.get("chosen_window_pct", 20.0))
-    said = [
-        f"With a shell **{thickness_m * 1e9:.0f} nm** thick, the plates have "
-        f"moved by one thickness at **x = {at:.2f} %** of the squash. Bending "
-        "resistance and stretching resistance are of the same order there, "
-        "and their ratio falls as (h/δ)², so by "
-        f"x = 5 % it is {crossing['ratio_at'](5.0):.1%} of the stretching "
-        f"term and by x = {window:.0f} % it is "
-        f"{crossing['ratio_at'](window):.2%}."
-    ]
-    # What the curve says, rather than what the scaling says.
-    pairs = {}
-    for w in search.get("windows", ()):
-        for row in w["rows"]:
-            pairs.setdefault((w["window_pct"], row["plan"]), {})[
-                row["bending"]] = row
-    both = [p for p in pairs.values() if "off" in p and "tied" in p]
-    if both:
-        better = sum(1 for p in both
-                     if p["off"]["aicc"] <= p["tied"]["aicc"])
-        gap = np.median([p["tied"]["aicc"] - p["off"]["aicc"] for p in both])
-        said.append(
-            f"Fitted both ways, the same arrangement on the same points: "
-            f"dropping it is better in **{better} of {len(both)}** of them, "
-            f"by a median ΔAICc of {gap:.0f}. Keeping it costs no parameter "
-            "(it shares the stretching term's modulus), so that difference "
-            "is the data speaking and not a penalty."
-            if better >= len(both) / 2 else
-            f"Fitted both ways on the same points, KEEPING it is better in "
-            f"{len(both) - better} of {len(both)} arrangements "
-            f"(median ΔAICc {abs(gap):.0f}). On this curve the bending term "
-            "is not droppable.")
-    return " ".join(said)
+def early_components_row(best, geometry, whole_curve=None):
+    """The two components of the early regime, side by side."""
+    cell_type = st.session_state.get("cell_type")
+    laws = [(law, row) for law, row in (best.get("moduli") or {}).items()]
+    columns = st.columns(max(len(laws), 1))
+    for column, (law, row) in zip(columns, laws):
+        symbol = EARLY_LAW_SYMBOL.get(law, law)
+        unit, scale = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
+        with column:
+            st.markdown(f"**{EARLY_LAW_NAME.get(law, law)}** · "
+                        + EARLY_LAW_LAW.get(law, ""))
+            st.metric(DISPLAY_SYMBOL.get(symbol, symbol),
+                      modulus_display(symbol, row["E_Pa"], row["E_se_Pa"]))
+            st.caption(
+                f"95 %: {row['E_lo_Pa'] / scale:.4g} to "
+                f"{row['E_hi_Pa'] / scale:.4g} {unit} · acts from "
+                + ("first contact" if row["onset_pct"] <= 0
+                   else f"{row['onset_pct']:.0f} %")
+                + (", with its bending term"
+                   if row.get("tied_bending_A") else ""))
+            if law == "stretch" and bending_constant is not None:
+                k = bending_constant(row["E_Pa"], geometry, early_thickness_m())
+                inside = 17.0 <= k["K_kT"] <= 52.0
+                st.caption(
+                    ("✅ " if inside else "⚠️ ")
+                    + f"bending constant K_m = {k['K_kT']:.0f} kT "
+                    + ("inside" if inside else "outside")
+                    + " the 17–52 kT Lulevich reports for living cell "
+                      "membranes (their eq 4, at h = "
+                    + f"{early_thickness_m() * 1e9:.0f} nm)")
+            if row["at_bound"] or float(row["E_Pa"]) <= 0:
+                st.caption("⚠️ measured as zero here: over this stretch the "
+                           "two shapes are close enough that the fit can put "
+                           "everything in the other one.")
+            factor = float(row.get("onset_factor", 1.0))
+            if factor > 1.5:
+                st.caption(
+                    f"⚠️ this law starts at {row['onset_pct']:.0f} %, not at "
+                    f"contact, so reading it as a modulus of the whole "
+                    f"deformation overstates it by about **{factor:.0f}×**.")
+            verdict = modulus_in_range(symbol, row["E_Pa"], cell_type)
+            if verdict is not None:
+                lit = (literature_for(cell_type).get("moduli")
+                       or {}).get(symbol)
+                st.caption(("✅ inside" if verdict else "⚠️ outside")
+                           + f" the {lit[0] / scale:g}–{lit[1] / scale:g} "
+                           f"{unit} reported for this cell type")
+            was = (whole_curve or {}).get(symbol)
+            if was is not None and np.isfinite(float(was)) and row["E_Pa"]:
+                times = float(was) / float(row["E_Pa"])
+                if np.isfinite(times) and times > 0:
+                    st.caption(f"The whole-curve fit puts it at "
+                               f"{modulus_display(symbol, was)} — "
+                               f"{times:.3g}× this one.")
 
 
-def small_strain_panel(model, epsilon, force_N, whole_curve=None):
+def early_equations(best, geometry, window):
+    """Lulevich's equations, with this cell's numbers in them."""
+    h = early_thickness_m()
+    R0 = float(geometry.cell_radius)
+    nu_m, nu_i = float(geometry.nu_membrane), float(geometry.nu_interior)
+    st.markdown("**The equations** — Lulevich et al., *Langmuir* **2006**, "
+                "22, 8151–8155")
+    st.caption("Two components over the early regime, and nothing else: a "
+               "membrane that stretches and bends, and the cell interior "
+               "answering Hertz.")
+    st.latex(r"\textbf{(1)}\quad F_m \;=\; \underbrace{2\pi\frac{E_m}"
+             r"{1-\nu_m}\,h R_0\,\varepsilon^{3}}_{\text{stretching}}"
+             r"\;+\;\underbrace{\frac{\pi E_m}{2\sqrt{2}}\,h^{2}\,"
+             r"\varepsilon^{1/2}}_{\text{bending}}")
+    st.latex(r"\textbf{(6)}\quad F_i \;=\; \frac{\sqrt{2}\,E_i}"
+             r"{3\,(1-\nu_i^{2})}\,R_0^{2}\,\varepsilon^{3/2}")
+    crossing = (bending_crossover(geometry, h)
+                if bending_crossover is not None else {})
+    st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}} \;=\; "
+             r"\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
+             r"\varepsilon^{-5/2}")
+    if crossing:
+        st.caption(
+            f"For this cell — h = {h * 1e9:.0f} nm, R₀ = {R0 * 1e6:.2f} µm, "
+            f"ν_m = {nu_m:g} — the two terms are **equal at "
+            f"x = {crossing['equal_pct']:.2f} %**, and bending falls below a "
+            f"twentieth of stretching at **x = "
+            f"{crossing['negligible_pct']:.2f} %**. At 10 % it is "
+            f"{crossing['ratio_at'](10.0):.3f} of the stretching term; at "
+            f"{window:.0f} % it is {crossing['ratio_at'](window):.4f}. The "
+            "paper drops it over ε = 0.1–0.3 for exactly this reason (their "
+            "eq 3), but the ratio diverges as ε → 0, so a reading that "
+            "starts at first contact cannot simply inherit that."
+        )
+    st.latex(r"\textbf{(4)}\quad K_m \;=\; \frac{E_m h^{3}}"
+             r"{12\,(1-\nu_m^{2})}")
+    # And the fit as it was actually made.
+    pieces = [r"C_0"]
+    for law, row in (best.get("moduli") or {}).items():
+        s = float(row.get("onset_pct", 0.0)) / 100.0
+        shift = (r"\varepsilon" if s <= 0
+                 else rf"\langle\varepsilon - {s:.2f}\rangle")
+        body = rf"A_{{{law[0]}}}\,{shift}^{{{row['power']:g}}}"
+        if row.get("tied_bending_A"):
+            body += rf" + A_b\,{shift}^{{1/2}}"
+        pieces.append(rf"E_{{{law[0]}}}\big[{body}\big]")
+    st.latex(r"\hat F(\varepsilon) = " + r" + ".join(pieces)
+             + (r"\,(1-\varepsilon)^{-q}" if piecewise_squeeze() else "")
+             + rf",\qquad 0 \le \varepsilon \le {window / 100.0:.2f}")
+    st.caption(
+        "A law acting from first contact has its coefficient **equal** to "
+        "E·A and converts with nothing to undo. One that joins at s does "
+        "not, and the factor is shown beside it above: that is the single "
+        "biggest reason a modulus read off a late-starting component comes "
+        "out too large."
+    )
+
+
+def early_deformation_section(model, epsilon, force_N, whole_curve=None):
     """
-    The same cell read again over its early regime, every way round.
+    Early deformation: the two components, the graph and the equations.
 
-    The literature's modulus for a cytoskeleton is a small-deformation
-    number, and reading one off a whole-cell squash means deciding three
-    things that the fit above simply assumes: how far out to read, which
-    law acts from first contact, and whether the shell's bending term
-    belongs in it. None of them is assumed here. Every arrangement is
+    A reading of its own, independent of the four-regime fit above and
+    changing nothing about it. Over the early regime Lulevich's model has
+    exactly two components, so exactly two are fitted here; what is NOT
+    assumed is how far out to read, which of them acts from first contact,
+    and whether the membrane's bending term belongs. Every arrangement is
     fitted over every window and ranked, and the bending question is
     settled by fitting the same points with it and without.
     """
-    if small_strain_reading is None:
+    if early_regime_search is None:
         return
     box = st.container(border=True)
     with box:
-        st.markdown("#### 📏 The same cell, read over its early regime")
+        st.markdown("### 🔬 Early deformation")
         st.caption(
-            "A second reading, independent of the fit above and changing "
-            "nothing about it. Every law acts from first contact or joins "
-            "at a boundary of its own; both ways round are tried, over "
-            "each window, and ranked by AICc within the window where they "
-            "are fitted to the same points."
+            "Lulevich et al., *Langmuir* 2006: over the first third of a "
+            "squash a living cell is a balloon of incompressible fluid with "
+            "**two components** — a membrane that stretches (ε³) and bends "
+            "(ε^½), and the cell interior answering Hertz (ε^1.5). This "
+            "section fits those two and nothing else, and it is where the "
+            "number that compares with a paper is read."
         )
-        on = st.checkbox("Read it", key="pw_small_strain")
+        on = st.checkbox("Read the early regime", key="pw_small_strain")
         if not on:
             return
 
-        c1, c2, c3 = st.columns([1.5, 1, 1.5], gap="medium")
+        c1, c2, c3, c4 = st.columns([1.5, 0.9, 1.5, 0.9], gap="medium")
         with c1:
-            st.multiselect("Windows to try (%)", [15.0, 20.0, 25.0, 30.0, 35.0,
-                                                  40.0],
+            st.multiselect("Windows to try (%)",
+                           [15.0, 20.0, 25.0, 30.0, 35.0, 40.0],
                            key="pw_early_windows",
-                           help="Each window is a separate ranking: AICc only "
+                           help="Each window is its own ranking: AICc only "
                                 "compares fits of the same points.")
         with c2:
             st.number_input("joining step (%)", 1.0, 5.0, step=0.5,
                             format="%.1f", key="pw_early_step",
-                            help="How finely the point where the second law "
-                                 "joins is scanned across the window.")
+                            help="How finely the point where the second "
+                                 "component joins is scanned.")
         with c3:
-            st.selectbox("The shell's bending term",
+            st.selectbox("The membrane's bending term (their eq 1 vs eq 3)",
                          list(EARLY_BENDING_WAYS),
                          format_func=EARLY_BENDING_WAYS.get,
                          key="pw_early_bending")
-            st.number_input("shell thickness for bending (nm)", 2.0, 1000.0,
-                            step=10.0, format="%.0f", key="pw_early_cortex_nm",
-                            help="Bending resistance goes as h², so whether "
-                                 "it can be dropped is entirely a statement "
-                                 "about which shell is meant: ~4 nm for a "
-                                 "bilayer, 100–500 nm for an actin cortex.")
+        with c4:
+            st.number_input("h (nm)", 0.5, 1000.0, step=1.0, format="%.1f",
+                            key="pw_early_h_nm",
+                            help="Membrane thickness. 4 nm is the bilayer "
+                                 "Lulevich uses; a cortex is 100–500 nm. "
+                                 "The bending term goes as h², so this is "
+                                 "what decides whether it can be dropped.")
 
         search = early_search_now(model, epsilon, force_N)
         if not search:
             st.warning("The early regime could not be fitted on this curve.",
                        icon="⚠️")
             return
-        best = search["best"]
+        best = dict(search["best"])
         window = float(search["chosen_window_pct"])
+        best["window_pct"] = window
+        geometry = piecewise_geometry(model)
 
         st.markdown(
             f"**{early_row_label(best)}**, over **0 to {window:.0f} %**, is "
-            f"the best-supported arrangement of the early regime "
-            f"(R² = {best['r_squared']:.5f}, Akaike weight "
-            f"{best['weight']:.0%} of the {len(search['windows'][0]['rows'])} "
-            f"tried at that window, {best['bending_note']})."
+            f"the best-supported arrangement (R² = {best['r_squared']:.5f}, "
+            f"Akaike weight {best['weight']:.0%} within that window, "
+            f"{best['bending_note']})."
             + ("" if search.get("clean") else
                " ⚠️ No window was free of systematic lack of fit, so the one "
                "that misses the curve least is reported.")
         )
 
-        # ---- one row per window, the ladder of how far to read ----------
-        table = []
-        for w in search["windows"]:
-            row = w["best"]
-            bias = float((row["residuals"] or {}).get("bias_pct", float("nan")))
-            table.append({
-                "Window": f"0–{w['window_pct']:.0f} %",
-                "Best arrangement": early_row_label(row, short=True),
-                "Bending": row["bending"],
-                "n": row["n_points"],
-                "R²": round(row["r_squared"], 6),
-                "Lack of fit": ("—" if not np.isfinite(bias)
-                                else f"{bias:.2f} %"),
-                **{f"{EARLY_LAW_SYMBOL.get(law, law)}":
-                   modulus_display(EARLY_LAW_SYMBOL.get(law, law),
-                                   value["E_Pa"], value["E_se_Pa"])
-                   for law, value in row["moduli"].items()},
-                "Chosen": "✅" if w["window_pct"] == window else "",
-            })
-        st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
-        st.caption(
-            "R² always grows with the window, so it cannot choose one. The "
-            "window chosen is the widest that still has **no systematic "
-            "lack of fit**: the most taken from the cell without leaving "
-            "the stretch these laws are meant for. "
-            f"{search.get('n_fits', 0)} fits in all."
-        )
+        st.markdown("**The two components**")
+        early_components_row(best, geometry, whole_curve)
 
-        # ---- the winner's numbers ---------------------------------------
-        cell_type = st.session_state.get("cell_type")
-        columns = st.columns(max(len(best["moduli"]), 1))
-        for column, (law, row) in zip(columns, best["moduli"].items()):
-            symbol = EARLY_LAW_SYMBOL.get(law, law)
-            unit, scale = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
-            with column:
-                st.metric(EARLY_LAW_NAME.get(law, law),
-                          modulus_display(symbol, row["E_Pa"], row["E_se_Pa"]))
-                st.caption(
-                    f"95 %: {row['E_lo_Pa'] / scale:.4g} to "
-                    f"{row['E_hi_Pa'] / scale:.4g} {unit} · acts from "
-                    + (f"first contact" if row["onset_pct"] <= 0
-                       else f"{row['onset_pct']:.0f} %"))
-                if row["at_bound"] or float(row["E_Pa"]) <= 0:
-                    st.caption("⚠️ measured as zero here: over this stretch "
-                               "the two shapes are close enough that the fit "
-                               "can put everything in the other one.")
-                factor = float(row.get("onset_factor", 1.0))
-                if factor > 1.5:
-                    st.caption(
-                        f"⚠️ this law starts at {row['onset_pct']:.0f} %, not "
-                        f"at contact, so reading it as a modulus of the whole "
-                        f"deformation overstates it by about **{factor:.0f}×**. "
-                        "Only a law acting from first contact converts "
-                        "cleanly.")
-                verdict = modulus_in_range(symbol, row["E_Pa"], cell_type)
-                if verdict is not None:
-                    lit = (literature_for(cell_type).get("moduli")
-                           or {}).get(symbol)
-                    st.caption(("✅ inside" if verdict else "⚠️ outside")
-                               + f" the {lit[0] / scale:g}–{lit[1] / scale:g} "
-                               f"{unit} reported for this cell type")
-                was = (whole_curve or {}).get(symbol)
-                if was is not None and np.isfinite(float(was)) and row["E_Pa"]:
-                    times = float(was) / float(row["E_Pa"])
-                    if np.isfinite(times) and times > 0:
-                        st.caption(f"The whole-curve fit puts it at "
-                                   f"{modulus_display(symbol, was)} — "
-                                   f"{times:.3g}× this one.")
-
-        # ---- the plot of this reading, zoomed to where it was fitted ----
-        best = dict(best)
-        best["window_pct"] = window
+        st.markdown("**The graph**")
         st.plotly_chart(
             small_strain_figure(epsilon, force_N, best, current_style(force_N)),
             key="pw_small_curve", **STRETCH,
         )
         st.caption(
-            "**On this graph:** the data over the first "
+            "The data over the first "
             f"{min(window * 1.4, 100.0):.0f} % only, the arrangement above in "
             f"green over the [0, {window:.0f}] % it was fitted on, and each "
-            "law dashed in its own colour from the point it joins. Past the "
-            "shaded stretch the same fit is carried on dotted: it was not "
-            "fitted there, and how quickly it leaves the data is how far a "
-            "small-deformation description of this cell reaches. The strip "
-            "underneath is how far off it is, as a percentage of the force "
-            "at that point."
+            "component dashed in its own colour from the point it joins. "
+            "Past the shaded stretch the same fit is carried on dotted: it "
+            "was not fitted there, and how quickly it leaves the data is how "
+            "far a small-deformation description of this cell reaches. The "
+            "strip underneath is how far off it is, as a percentage of the "
+            "force at that point."
         )
 
-        # ---- every arrangement at the chosen window ---------------------
-        chosen = next((w for w in search["windows"]
-                       if w["window_pct"] == window), None)
-        if chosen:
-            with st.expander(f"All {chosen['n_tried']} arrangements over "
-                             f"0–{window:.0f} %, ranked", expanded=False):
+        early_equations(best, geometry, window)
+
+        with st.expander("How far to read, and every arrangement tried",
+                         expanded=False):
+            table = []
+            for w in search["windows"]:
+                row = w["best"]
+                bias = float((row["residuals"] or {}).get("bias_pct",
+                                                          float("nan")))
+                table.append({
+                    "Window": f"0–{w['window_pct']:.0f} %",
+                    "Best arrangement": early_row_label(row, short=True),
+                    "Bending": row["bending"],
+                    "n": row["n_points"],
+                    "R²": round(row["r_squared"], 6),
+                    "Lack of fit": ("—" if not np.isfinite(bias)
+                                    else f"{bias:.2f} %"),
+                    **{DISPLAY_SYMBOL.get(EARLY_LAW_SYMBOL.get(law, law),
+                                          law):
+                       modulus_display(EARLY_LAW_SYMBOL.get(law, law),
+                                       value["E_Pa"])
+                       for law, value in row["moduli"].items()},
+                    "Chosen": "✅" if w["window_pct"] == window else "",
+                })
+            st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
+            st.caption(
+                "R² always grows with the window, so it cannot choose one. "
+                "The window chosen is the widest that still has **no "
+                "systematic lack of fit**: the most taken from the cell "
+                "without leaving the stretch these laws are meant for. "
+                f"{search.get('n_fits', 0)} fits in all."
+            )
+            chosen = next((w for w in search["windows"]
+                           if w["window_pct"] == window), None)
+            if chosen:
+                st.markdown(f"**All {chosen['n_tried']} arrangements over "
+                            f"0–{window:.0f} %**")
                 rows = []
                 for rank, row in enumerate(chosen["rows"], start=1):
                     rows.append({
@@ -7078,8 +7170,10 @@ def small_strain_panel(model, epsilon, force_N, whole_curve=None):
                         "ΔAICc": ("—" if not np.isfinite(row["delta"])
                                   else round(row["delta"], 2)),
                         "Weight": f"{row['weight']:.1%}",
-                        **{EARLY_LAW_SYMBOL.get(law, law):
-                           f"{value['E_Pa'] / DISPLAY_UNIT.get(EARLY_LAW_SYMBOL.get(law, law), ('kPa', 1e3))[1]:.4g}"
+                        **{DISPLAY_SYMBOL.get(
+                            EARLY_LAW_SYMBOL.get(law, law), law):
+                           modulus_display(EARLY_LAW_SYMBOL.get(law, law),
+                                           value["E_Pa"])
                            for law, value in row["moduli"].items()},
                         "Evidence": ("best" if rank == 1 else
                                      "tied with the best"
@@ -7089,41 +7183,54 @@ def small_strain_panel(model, epsilon, force_N, whole_curve=None):
                     })
                 st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
 
-        # ---- the bending question, answered on this curve ----------------
-        st.markdown("**Can the shell's bending term be dropped?**")
-        st.caption(bending_verdict(
-            search, piecewise_geometry(model),
-            float(st.session_state.get("pw_early_cortex_nm", 200.0)) * 1e-9))
-        st.latex(
-            r"\frac{\text{bending}}{\text{stretching}} \;\sim\; "
-            r"\Big(\frac{h}{\delta}\Big)^{2}, \qquad \delta = "
-            r"\varepsilon\,h_0"
+        st.markdown("**Can the membrane's bending term be dropped?**")
+        st.caption(bending_verdict(search, geometry))
+
+
+def bending_verdict(search, geometry):
+    """Whether the membrane's bending term can be dropped, on this curve."""
+    if bending_crossover is None or not search:
+        return ""
+    h = early_thickness_m()
+    crossing = bending_crossover(geometry, h)
+    window = float(search.get("chosen_window_pct", 20.0))
+    said = [
+        f"**What the equation says.** With h = {h * 1e9:.0f} nm and "
+        f"R₀ = {float(geometry.cell_radius) * 1e6:.2f} µm, bending and "
+        f"stretching are equal at x = {crossing['equal_pct']:.2f} % and "
+        f"bending is under a twentieth of stretching by "
+        f"x = {crossing['negligible_pct']:.2f} %. Lulevich drops it over "
+        "ε = 0.1–0.3 on the same grounds. But their eq 2 diverges as "
+        "ε → 0, so over a window that starts at first contact the term is "
+        "not small everywhere, and dropping it is an approximation being "
+        "made at the one end where it does not hold."
+    ]
+    pairs = {}
+    for w in search.get("windows", ()):
+        for row in w["rows"]:
+            pairs.setdefault((w["window_pct"], row["plan"]), {})[
+                row["bending"]] = row
+    both = [p for p in pairs.values() if "off" in p and "tied" in p]
+    if both:
+        better = sum(1 for p in both if p["off"]["aicc"] <= p["tied"]["aicc"])
+        gap = float(np.median([p["tied"]["aicc"] - p["off"]["aicc"]
+                               for p in both]))
+        said.append(
+            "**What this curve says.** Fitted both ways on the same points, "
+            "with the bending term sharing the stretching term's modulus so "
+            "it costs no parameter: "
+            + (f"dropping it is better in **{better} of {len(both)}** "
+               f"arrangements, by a median ΔAICc of {abs(gap):.0f}. On this "
+               "curve eq 3 is enough."
+               if better >= len(both) / 2 else
+               f"**keeping** it is better in {len(both) - better} of "
+               f"{len(both)} arrangements, by a median ΔAICc of "
+               f"{abs(gap):.0f}. On this curve eq 1 earns its second term.")
         )
-        st.caption(
-            "A thin shell resists a deflection δ by bending, with rigidity "
-            "D = E·h³/12(1−ν²), and by stretching, with modulus E·h. Their "
-            "ratio falls as (h/δ)², so the bending term is droppable once "
-            "the plates have moved by more than a few shell thicknesses — "
-            "which is a statement about **h**, not a universal deformation. "
-            "Both ways are fitted above so the claim is checked on this "
-            "curve rather than inherited."
-        )
-        st.latex(
-            r"F(\varepsilon) \;=\; C_0 \;+\; \sum_j E_j\,\Big[A_j\,"
-            r"\langle \varepsilon - s_j\rangle^{\,p_j}"
-            + (r" + A_{b}\,\langle \varepsilon - s_j\rangle" 
-               if best.get("bending") == "tied" else "")
-            + r"\Big]"
-            + (r"(1-\varepsilon)^{-q}" if piecewise_squeeze() else "")
-            + rf",\qquad 0 \le \varepsilon \le {window / 100.0:.2f}"
-        )
-        st.caption(
-            "A law acting from first contact (s = 0) has its coefficient "
-            "**equal** to E·A and converts with nothing to undo. One that "
-            "joins at s does not, and the factor is shown beside it above: "
-            "that is the single biggest reason a modulus read off a "
-            "late-starting component comes out too large."
-        )
+    else:
+        said.append("Set the bending term to **Both, and compare** above to "
+                    "have this curve answer it.")
+    return "\n\n".join(said)
 
 
 def screen_signature(epsilon, force_N):
@@ -10151,7 +10258,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
             validation_panel(result, epsilon, force_N, model)
 
         # ---- the same cell, read where the literature reads it ---------
-        small_strain_panel(
+        early_deformation_section(
             model, epsilon, force_N,
             whole_curve={row["symbol"]: row["E_Pa"]
                          for row in (moduli or {}).values()
