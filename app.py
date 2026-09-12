@@ -811,7 +811,12 @@ DEFAULTS = {
     # What each element does either side of the first boundary. These are the
     # two choices the physics leaves open, and the combination search below
     # settles them from the data when you ask it to.
-    "membrane_after_break": "holds what it reached",
+    # The order the cell is met in: the membrane from first contact and
+    # still stiffening after ε₁, the cytoskeleton joining it at ε₁, the
+    # nuclear envelope at ε₂ and the inside of the nucleus after that. Each
+    # component then has an onset of its own, which is what lets the fit
+    # tell them apart instead of putting one of them at zero.
+    "membrane_after_break": "keeps stiffening",
     "cyto_starts_at": "at ε₁",
     "highlight_segment": "(none)",
     "composition_search": None,
@@ -3731,13 +3736,23 @@ def has_deep_term(cell_type=None):
 # membrane is deforming on its own. Starting the cytoskeleton at zero is what
 # reproduces a 1.7 rather than a 3.
 DEFAULT_COMPOSITION_BY_TYPE = {
-    # Both outer elements of a C2C12 carry load from first contact and keep
-    # carrying it, which is what "present throughout" means as an
-    # arrangement: the shell goes on stiffening rather than holding at ε₁,
-    # and the cytoskeleton is loaded from zero rather than waiting for it.
+    # A C2C12 is met in this order: the membrane from first contact, the
+    # cytoskeleton joining it at ε₁ and both carrying load together from
+    # there, the nuclear envelope at ε₂, and what the envelope contains
+    # after that. The membrane goes on stiffening rather than holding at
+    # ε₁, so past ε₁ it is a mixture of the two.
+    #
+    # The cytoskeleton starts AT ε₁ and not at zero, and that is not a
+    # detail of taste. Loaded from zero its 3/2 law and the membrane's
+    # cube law run over the same stretch of curve, their basis functions
+    # correlate at about 0.98, and a fit that cannot tell two shapes apart
+    # gives all of the force to one of them and returns exactly zero for
+    # the other. A component that comes back as 0 has not been removed by
+    # the page: it has been made unmeasurable by where it was told to
+    # start. A separate onset is what makes it measurable.
     "Myoblast (C2C12)": {
         "membrane_after_break": "keeps stiffening",
-        "cyto_starts_at": "from the very start",
+        "cyto_starts_at": "at ε₁",
     },
     "Cardiomyocyte": {
         "membrane_after_break": "starts stretching at ε₁",
@@ -6860,7 +6875,20 @@ def component_results_strip(fit, extra=""):
             with st.container(border=True):
                 st.caption(label)
                 st.markdown(f"### {value}")
-                st.caption(f"95 % interval: {interval}")
+                # A component the fit put at exactly zero was not dropped by
+                # the page: it is ticked, it was fitted, and the fit could
+                # not tell its shape from another one's over this stretch.
+                # Saying so is the difference between a bug and a reading.
+                if str(value).split(" ")[0] in ("0", "0.0", "-0"):
+                    st.caption(
+                        "⚠️ **the fit put nothing here.** It is ticked and it "
+                        "was fitted; over this stretch its shape could not be "
+                        "told from another component's, so the fit gave that "
+                        "force to the other one. Start it at a boundary of "
+                        "its own, or widen the fitted range, and see 🔬 "
+                        "**What each component is worth**.")
+                else:
+                    st.caption(f"95 % interval: {interval}")
                 st.caption(support)
     chi = fit.get("chi_squared_reduced", float("nan"))
     where = " · ".join(f"{name} = {value:.3f}" for value, name in fit_edges(fit))
@@ -14528,10 +14556,14 @@ with tab_analysis:
                 # cell did, and only then the equation and the working. Putting
                 # the maths under the plot, as it was, meant scrolling past it
                 # to reach the numbers it was the working for.
-                e1_col, e2_col = st.columns([2.6, 1])
-                with e1_col:
-                    st.markdown("##### The equation that was fitted")
-                with e2_col:
+                # The equation, its coefficients and their uncertainties used
+                # to be written out here, in the narrow results column, where
+                # it was the longest thing on the page and the numbers it
+                # repeats are already in the strip at the top. It lives
+                # behind one line now, with the button that writes it on the
+                # curve.
+                with st.expander("🧮 The equation that was fitted, with every "
+                                 "coefficient", expanded=False):
                     send_to_plot_button(
                         "equation", "The fitted equation",
                         {"text": equation_text(fit, style.force_unit)},
@@ -14539,17 +14571,12 @@ with tab_analysis:
                         help_text="Writes the equation with this cell's numbers "
                                   "in a box on the curve.",
                     )
-                fitted_equation(fit, unit=style.force_unit, heading=False)
-
-                # The picture of the exponent is not here: it is the whole of
-                # the Log curve and boundaries tab, with the placements tried
-                # and the algebra of each stretch beside it. Drawing it twice
-                # was two panels to keep in step.
-                st.caption(
-                    "The measured exponent, the boundaries drawn on it and the "
-                    "algebra of each stretch are on the **📈 Log curve and "
-                    "boundaries** tab."
-                )
+                    fitted_equation(fit, unit=style.force_unit, heading=False)
+                    st.caption(
+                        "The measured exponent, the boundaries drawn on it and "
+                        "the algebra of each stretch are on the **📈 Log curve "
+                        "and boundaries** tab."
+                    )
 
                 # No "how this fit was calculated" panel. What it said is now
                 # said where it is needed: the criterion sits under the search
