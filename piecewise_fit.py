@@ -1404,20 +1404,35 @@ def _carried_force(carried, x, a):
 
 
 def _regime_force(regime, x):
-    """One fitted regime's law evaluated at x (percent), NaN if not fitted."""
+    """
+    One fitted regime's law evaluated at x (percent), NaN if not fitted.
+
+    Every regime is drawn the same way: start from the force it was handed
+    (its anchor, or its own free intercept C0 when it is the first one),
+    then add each of its terms' own laws and whatever the carried elements
+    are still adding. The first regime used to be a special case drawn as a
+    straight line theta*x + C0, because it used to BE a straight line -- the
+    contact slope. It is a component like any other now, with a power law of
+    its own, and drawing it as a straight line made its contribution look
+    flat at zero over the whole first stretch and put a step in the fitted
+    curve at e1 where the real anchor picked up.
+    """
     x = np.asarray(x, dtype=float)
     if not regime["fitted"]:
         return np.full(x.shape, np.nan)
     a = regime["domain_pct"][0]
     params = regime["params"]
-    if regime["anchor_in_N"] is None:
-        name = next(k for k in params if k != "C0")
-        return params[name]["value"] * x + params["C0"]["value"]
-    out = np.full(x.shape, float(regime["anchor_in_N"]))
-    for p in params.values():
+    anchor = regime["anchor_in_N"]
+    if anchor is None:
+        anchor = float((params.get("C0") or {}).get("value", 0.0) or 0.0)
+    out = np.full(x.shape, float(anchor))
+    for name, p in params.items():
+        if name == "C0":
+            continue
         until = float(p.get("until", np.inf))
         out = out + p["value"] * _basis(p.get("shape", "power"), p["power"],
-                                        x, a, until, p.get("squeeze", 0.0))
+                                        x, float(p.get("start", a)), until,
+                                        p.get("squeeze", 0.0))
     return out + _carried_force(list((regime.get("carried") or {}).values()), x, a)
 
 
@@ -1427,8 +1442,10 @@ def component_curve(result, name, n=300):
 
     From its start to its own ``until``, the same range the fit gave it, so
     the line on the plot and the range on the page are one number. None
-    when the element was not fitted. The contact term is its straight line
-    including C0; every other element is measured from its own start.
+    when the element was not fitted. Every element is its own law measured
+    from its own start, the first one included: C0 is the baseline the
+    curve starts from, not part of any component, and it is drawn as its
+    own layer.
     """
     regimes = result.get("regimes") or []
     home = next((r for r in regimes if name in r["params"]), None)
@@ -1440,8 +1457,6 @@ def component_curve(result, name, n=300):
     start = float(p.get("start", home["domain_pct"][0]))
     until = float(p.get("until", home["domain_pct"][1]))
     x = np.linspace(start, until, n)
-    if home["anchor_in_N"] is None:
-        return x, p["value"] * x + home["params"]["C0"]["value"]
     return x, p["value"] * _basis(p.get("shape", "power"), p["power"], x,
                                   start, until, p.get("squeeze", 0.0))
 
@@ -1452,10 +1467,13 @@ def component_force(result, name, x_pct):
 
     Zero before the element starts, K times its shape up to its own
     ``until`` and the force it reached after that (the lump returns to
-    zero), NaN outside the fitted domain. The contact term is
-    C0 + k_align min(x, until). Summed over every element this is the
-    fitted curve exactly, so the layers of a stacked plot end on it.
-    None when the element was not fitted.
+    zero), NaN outside the fitted domain.
+
+    ``name="C0"`` gives the baseline layer: the force the curve starts
+    from, flat across the whole domain, which belongs to no component.
+    Summed over every element AND C0 this is the fitted curve exactly, so
+    the layers of a stacked plot end on it. None when the element was not
+    fitted.
     """
     regimes = result.get("regimes") or []
     home = next((r for r in regimes if name in r["params"]), None)
@@ -1467,8 +1485,10 @@ def component_force(result, name, x_pct):
     x = np.asarray(x_pct, dtype=float)
     start = float(p.get("start", home["domain_pct"][0]))
     until = float(p.get("until", home["domain_pct"][1]))
-    if home["anchor_in_N"] is None:
-        out = p["value"] * np.minimum(x, until) + home["params"]["C0"]["value"]
+    if name == "C0":
+        # The baseline is flat: it is where the curve starts, not something
+        # that grows with the squash.
+        out = np.full(x.shape, float(p["value"]))
     else:
         out = p["value"] * _basis(p.get("shape", "power"), p["power"], x,
                                   start, until, p.get("squeeze", 0.0))
