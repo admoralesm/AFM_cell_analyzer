@@ -772,6 +772,13 @@ DEFAULTS = {
     "pw_use_K_cyto": True,
     "pw_use_K_nucleus": True,
     "pw_use_K_core": True,
+    # The straight lines on the log-log plot: their exponents, the point of
+    # the data they pivot on and how far they run.
+    "log_guides": True,
+    "log_guide_p1": 3.0,
+    "log_guide_p2": 1.5,
+    "log_guide_anchor_pct": 30.0,
+    "log_guide_span": 0.4,
     # Which number the combination search keeps the best of.
     "pw_combo_criterion": "adj_r2",
     "legacy_combo_criterion": "adj_r2",
@@ -5638,8 +5645,8 @@ def legend_rows(labels, plot_px=None):
 
 
 PW_VIEWS = {
-    "stacked": "stacked: the layers add up to F̂",
-    "own": "each from zero, over its own [s, u]",
+    "stacked": "Σⱼ Fⱼ(x) = F̂(x)   · stacked layers",
+    "own": "Fⱼ(x) on [sⱼ, uⱼ]   · each from zero",
 }
 
 
@@ -6335,12 +6342,24 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
 # first tell the second where to look. Each is scored by the fit it gives
 # and the Young's moduli that come out, side by side, so which one to
 # believe is a table, not a leap of faith.
+# On the board a route is written as what it does to ε, not as a name: the
+# label is the expression that is minimised or read off, so the choice is
+# made on the maths rather than on four words that all sound alike.
 PW_METHODS = {
+    "refined": "ε̂ = argmin S(ε),  ε ∈ B ∩ [ε_PL ± 15 %]",
+    "power": "ε_PL = argmax dp/d ln x,   p = d ln F/d ln x",
+    "everything": "ε̂ = argmin S(ε),  ε ∈ B",
+    "defaults": "ε = ε_prior  (the C2C12 constraints' middle)",
+    "typed": "ε = as typed below, and nothing moves",
+}
+# The same routes written as names, for the table, the reasons and the
+# spreadsheet, where an expression would read as noise.
+PW_ROW_LABELS = {
     "refined": "📈→🎯 Power law, then fit everything",
     "power": "📈 Power law only",
     "everything": "🎯 Fit everything only",
     "defaults": "C2C12 defaults",
-    "typed": "✍️ As typed below",
+    "typed": "✍️ As typed",
 }
 PW_METHOD_HELP = {
     "refined": r"$\hat{\boldsymbol\varepsilon} = \arg\min_{\boldsymbol\varepsilon"
@@ -6359,7 +6378,6 @@ PW_METHOD_HELP = {
     "typed": r"$\boldsymbol\varepsilon$ exactly as typed in the boxes: "
              r"▶ Fit & plot fits there and moves nothing.",
 }
-PW_ROW_LABELS = dict(PW_METHODS)
 # When the chosen route misses the R² target, the others are tried in this
 # order and the first that reaches it is used.
 PW_FALLBACK = ("refined", "everything", "power", "defaults")
@@ -6662,15 +6680,31 @@ def power_law_figure(power, bounds):
                 showlegend=False,
                 hovertemplate=f"mean exponent {seg['mean_exponent']:.2f}<extra></extra>",
             ))
+    # The exponents the model's laws have, so the reading can be held
+    # against them: a stretch sitting on p = 3 is a shell stretching, one
+    # on 3/2 a Hertzian contact, one on 1 a network already under tension.
+    p_lo = float(np.nanmin(p)) if p.size else 0.0
+    p_hi = float(np.nanmax(p)) if p.size else 3.0
+    for level, colour, said in ((3.0, "#2ca02c", "p = 3 · shell"),
+                                (1.5, "#9467bd", "p = 3/2 · Hertz"),
+                                (1.0, "#8c564b", "p = 1 · tension")):
+        fig.add_hline(y=level, line_width=1, line_dash="dot",
+                      line_color=colour, annotation_text=said,
+                      annotation_position="right",
+                      annotation_font_size=11, annotation_font_color=colour)
+        p_lo, p_hi = min(p_lo, level), max(p_hi, level)
     levels = add_boundary_lines(fig, (0.0,) + tuple(power["best_pct"]) + (bounds[-1],),
                                 end_label=False,
                                 x_span=float(x.max() - x.min()) if x.size else None,
                                 x_max=float(x.max()) if x.size else None)
+    pad = 0.12 * max(p_hi - p_lo, 1.0)
     fig.update_layout(
         height=300, template="simple_white", showlegend=False,
-        margin={"l": 60, "r": 20, "t": 30 + 24 * levels, "b": 50},
+        # Room on the right for the p = 3, 3/2 and 1 tags, and a y range
+        # that holds every one of those lines as well as the reading.
+        margin={"l": 60, "r": 96, "t": 30 + 24 * levels, "b": 50},
         xaxis_title="Relative deformation (%)",
-        yaxis_title="local exponent p",
+        yaxis={"title": "local exponent p", "range": [p_lo - pad, p_hi + pad]},
     )
     return fig
 
@@ -6830,6 +6864,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
     """
     if st.session_state.pop("_pw_editor_reset", False):
         st.session_state.pop("pw_param_editor", None)
+    # The page draws a fit the moment a curve is loaded, so the ticks have
+    # to be on before that fit is made: what is on the graph is what is
+    # ticked, and on arrival that is all four components.
+    for _name in PW_SWITCHABLE:
+        st.session_state.setdefault(f"pw_use_{_name}", True)
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
     data = st.session_state.get("data") or {}
@@ -6947,16 +6986,23 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # is drawing: the two lists must read the same, or say they differ.
         board_off = set(piecewise_off())
         board_ranges = piecewise_ranges(piecewise_boundaries())
+        # Each tile is headed by the expression it sets, not by a phrase:
+        # what the model is, where its boundaries come from, and what the
+        # plot draws of it.
         t1, t2, t3 = st.columns([1.05, 1.25, 0.9], gap="medium")
         with t1:
-            st.markdown("**How the components share the load**")
+            st.latex(r"\hat F_k(x) = \hat F_{k-1}(\varepsilon_{k-1}) + "
+                     r"\sum_{j\,\in\,k}\theta_j\,\phi_j(x)")
+            st.caption("how the components share the load")
             load_sharing_control()
         with t2:
-            st.markdown("**Boundaries ε (%)**")
+            st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
+                     r"\le x_{end}")
+            st.caption("where the boundaries come from, and what they are")
             st.radio(
                 "ε on ▶ Fit & plot", list(PW_METHODS),
                 format_func=lambda k: PW_METHODS[k] + (
-                    " (recommended)" if k == "refined" else ""),
+                    "  ★" if k == "refined" else ""),
                 key="pw_method", on_change=_pw_apply_selection,
             )
             st.caption(PW_METHOD_HELP[st.session_state.get("pw_method", "refined")])
@@ -6973,7 +7019,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                                 key="pw_end", help="Last point fitted; not moved "
                                 "by the routes.")
             st.number_input(
-                "R²★ (target)", min_value=0.9, max_value=0.99999,
+                "R²★  (the fit must reach it)", min_value=0.9, max_value=0.99999,
                 step=0.0005, format="%.4f", key="pw_target_r2",
                 on_change=_pw_apply_selection,
                 help=r"A route below R²★ hands over to the next that reaches it.",
@@ -6986,7 +7032,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
                                rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
         with t3:
-            st.markdown("**Plot**")
+            st.latex(r"\hat F = \textstyle\sum_j F_j")
+            st.caption("what the plot draws of it")
             st.radio("Components on the plot", list(PW_VIEWS),
                      format_func=PW_VIEWS.get, key="pw_view",
                      help="Stacked, the layers add up to the fitted curve and "
@@ -9117,7 +9164,73 @@ def shown_fit():
     return st.session_state.get("_last_fit")
 
 
-def log_log_figure(epsilon, force_N, fitted_N, fit, style):
+# The straight lines drawn on the log-log plot to hold the curve against.
+# Each is F = F(ε_a)·(ε/ε_a)^p: one exponent, pivoting on one point of the
+# data, so turning the exponent rotates the line about that point and the
+# eye can match it to a stretch of the curve.
+LOG_GUIDES = (("log_guide_p1", "#2ca02c"), ("log_guide_p2", "#9467bd"))
+GUIDE_NAMES = {3.0: "a stretching shell", 1.5: "a Hertzian contact",
+               1.0: "a network under tension"}
+
+
+def guide_line_name(power):
+    """What a line of this slope would mean, when it means something."""
+    for value, said in GUIDE_NAMES.items():
+        if abs(power - value) < 1e-9:
+            return said
+    return ""
+
+
+def log_guide_settings():
+    """The guide lines as the page has them set."""
+    return {
+        "on": bool(st.session_state.get("log_guides", True)),
+        "powers": [float(st.session_state.get(key, default))
+                   for key, default in zip([k for k, _c in LOG_GUIDES],
+                                           (3.0, 1.5))],
+        "anchor_pct": float(st.session_state.get("log_guide_anchor_pct", 30.0)),
+        "span": float(st.session_state.get("log_guide_span", 0.4)),
+    }
+
+
+def log_guide_controls():
+    """
+    Turn the straight lines, and say where they pivot.
+
+    The exponent is the only thing a straight line on log-log axes has, so
+    it is the only thing to set: p is typed, the line turns about the point
+    of the data at ε_a, and its tag on the plot reads the p it is at.
+    """
+    st.checkbox("Draw straight guide lines on the plot", key="log_guides",
+                help="Each is F = F(ε_a)·(ε/ε_a)^p, a straight line of slope "
+                     "p through the data at ε_a.")
+    st.latex(r"\log F = \log F(\varepsilon_a) + p\,"
+             r"\big[\log\varepsilon - \log\varepsilon_a\big]")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.number_input("p₁", min_value=0.1, max_value=6.0, step=0.05,
+                        format="%.2f", key="log_guide_p1",
+                        help="Exponent of the first line. 3 is a stretching "
+                             "shell.")
+    with c2:
+        st.number_input("p₂", min_value=0.1, max_value=6.0, step=0.05,
+                        format="%.2f", key="log_guide_p2",
+                        help="Exponent of the second line. 3/2 is a Hertzian "
+                             "contact, 1 a network already under tension.")
+    with c3:
+        st.slider("ε_a (%)", min_value=0.5, max_value=99.0, step=0.5,
+                  key="log_guide_anchor_pct",
+                  help="Where the lines touch the data. Both turn about this "
+                       "point, so slide it along the curve and turn p until a "
+                       "line lies on the stretch you are reading.")
+    with c4:
+        st.slider("half-length (decades)", min_value=0.2, max_value=2.0,
+                  step=0.1, format="%.1f", key="log_guide_span",
+                  help="How far each line runs either side of ε_a, in decades "
+                       "of ε. The plot always shows the whole of both lines.")
+
+
+def log_log_figure(epsilon, force_N, fitted_N, fit, style, guides=None):
     """
     The curve itself on log-log axes: the data, the fit, the boundaries.
 
@@ -9125,6 +9238,11 @@ def log_log_figure(epsilon, force_N, fitted_N, fit, style):
     stretch that runs straight is one law carrying the load and a bend is a
     boundary. The boundaries are drawn as lines of the plot's own, in data
     coordinates, so they sit where they belong on a log axis.
+
+    The straight guide lines pivot on one point of the data, ε_a, and each
+    carries its exponent as a tag at its end. The force axis is set to hold
+    the data **and** the whole of every guide line, so a line turned steep
+    is not cut off at the top of the plot.
     """
     x = np.asarray(epsilon, dtype=float)
     y, unit = from_newtons(np.asarray(force_N, dtype=float), style.force_unit)
@@ -9143,6 +9261,9 @@ def log_log_figure(epsilon, force_N, fitted_N, fit, style):
         ))
     if keep.any():
         y_lo, y_hi = float(np.min(y[keep])), float(np.max(y[keep]))
+        x_lo, x_hi = float(np.min(x[keep])), float(np.max(x[keep]))
+        # Everything drawn, so the axis can be set to hold all of it.
+        shown_lo, shown_hi = y_lo, y_hi
         for value, name in (fit_edges(fit) if fit else []):
             if value <= 0:
                 continue
@@ -9152,23 +9273,45 @@ def log_log_figure(epsilon, force_N, fitted_N, fit, style):
                 line={"color": "#222222", "width": 1.5, "dash": "dash"},
                 hoverinfo="skip",
             ))
-        # Slope 3 and slope 3/2 through the middle of the data, to hold the
-        # curve against by eye.
-        xm = float(np.median(x[keep]))
-        ym = float(np.median(y[keep]))
-        xs = np.array([float(np.min(x[keep])), float(np.max(x[keep]))])
-        for power, colour, label in ((3.0, "#2ca02c", "slope 3 (shell)"),
-                                     (1.5, "#9467bd", "slope 3/2 (Hertz)")):
+        settings = guides if guides is not None else log_guide_settings()
+        if settings.get("on", True):
+            # The pivot: a point of the data itself, so the lines are held
+            # against the curve rather than floating beside it.
+            order = np.argsort(x[keep])
+            xs_data, ys_data = x[keep][order], y[keep][order]
+            x_a = float(np.clip(settings["anchor_pct"] / 100.0, x_lo, x_hi))
+            y_a = float(np.interp(x_a, xs_data, ys_data))
+            span = float(settings["span"])
+            ends = np.array([x_a * 10.0 ** -span, x_a * 10.0 ** span])
+            for power, (_key, colour) in zip(settings["powers"], LOG_GUIDES):
+                line_y = y_a * (ends / x_a) ** power
+                shown_lo = min(shown_lo, float(np.min(line_y)))
+                shown_hi = max(shown_hi, float(np.max(line_y)))
+                said = guide_line_name(power)
+                fig.add_trace(go.Scatter(
+                    x=ends, y=line_y, mode="lines+text",
+                    name=f"slope p = {power:g}" + (f" ({said})" if said else ""),
+                    text=["", f"p = {power:g}"], textposition="top left",
+                    textfont={"color": colour, "size": 12},
+                    line={"color": colour, "width": 1.5, "dash": "dot"},
+                    hoverinfo="skip",
+                ))
             fig.add_trace(go.Scatter(
-                x=xs, y=ym * (xs / xm) ** power, mode="lines", name=label,
-                line={"color": colour, "width": 1, "dash": "dot"},
-                hoverinfo="skip",
+                x=[x_a], y=[y_a], mode="markers",
+                name=f"pivot ε_a = {100.0 * x_a:.1f} %",
+                marker={"symbol": "circle-open", "size": 12, "color": "#000000",
+                        "line": {"width": 2}},
+                hovertemplate=f"the lines turn about ε = {100.0 * x_a:.1f} %"
+                              "<extra></extra>",
             ))
-            fig.update_yaxes(range=[np.log10(max(y_lo, 1e-30)) - 0.2,
-                                    np.log10(y_hi) + 0.2])
+            # Room for the tags at the ends of the lines.
+            shown_hi *= 1.6
+            shown_lo /= 1.6
+        fig.update_yaxes(range=[np.log10(max(shown_lo, 1e-30)) - 0.1,
+                                np.log10(max(shown_hi, 1e-29)) + 0.1])
     fig.update_layout(
         height=460, template="simple_white",
-        margin={"l": 70, "r": 20, "t": 30, "b": 90},
+        margin={"l": 70, "r": 20, "t": 30, "b": 110},
         legend={"orientation": "h", "yref": "container", "y": 0.005,
                 "yanchor": "bottom", "x": 0.0, "xanchor": "left"},
         xaxis={"title": "Relative deformation ε (log)", "type": "log"},
@@ -12198,7 +12341,9 @@ with tab_analysis:
                 st.markdown("#### 🎛️ Fitting options")
                 tile1, tile2, tile3 = st.columns([1.05, 1.25, 0.9], gap="medium")
                 with tile1:
-                    st.markdown("**How the components share the load**")
+                    st.latex(r"F(\varepsilon) = \sum_k a_k E_k\,"
+                             r"g_k(\varepsilon)")
+                    st.caption("how the components share the load")
                     load_sharing_control()
 
             if guided:
@@ -12208,7 +12353,9 @@ with tab_analysis:
                 # The range first: it decides which points exist at all, and
                 # every component below is placed inside it.
                 with tile2:
-                    st.markdown("**Relative deformation range**")
+                    st.latex(r"\varepsilon \in [\varepsilon_{min},\,"
+                             r"\varepsilon_{max}]")
+                    st.caption("which points are fitted at all")
                     guided_lo, guided_hi = epsilon_range_control(
                         "window_start", "window_end", 0.0, eps_hi_data, step,
                         label="Fitted range, ε",
@@ -12239,7 +12386,9 @@ with tab_analysis:
 
                 chosen = active_terms()
                 with tile3:
-                    st.markdown("**Boundaries ε₁, ε₂**")
+                    st.latex(r"0 \le \varepsilon_1 < \varepsilon_2 \le "
+                             r"\varepsilon_{max}")
+                    st.caption("where the components take over")
                     st.radio(
                         "ε₁, ε₂ on ▶ Fit & plot", list(LEGACY_EPS_MODES),
                         format_func=LEGACY_EPS_MODES.get, key="legacy_eps_mode",
@@ -14708,11 +14857,12 @@ with tab_explore:
             key="log_log_curve", **STRETCH,
         )
         st.caption(
-            "ln F against ln ε: a law F ∝ εᵖ is a straight line of slope p, "
+            "log F against log ε: a law F ∝ εᵖ is a straight line of slope p, "
             "so a straight stretch is one law and a bend is a boundary. The "
-            "dotted lines have slope 3 (a stretching shell) and 3/2 (a "
-            "Hertzian contact); the dashed ones are the fit's boundaries."
+            "dashed lines are the fit's boundaries; the dotted ones are the "
+            "guide lines below, each tagged with the p it is set to."
         )
+        log_guide_controls()
 
         st.markdown("#### Where the curve changes its power law")
         where_the_power_law_changes(fit_ex, model_ex, style_ex)
