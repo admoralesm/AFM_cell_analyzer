@@ -736,12 +736,11 @@ DEFAULTS = {
     "onset_mode": "Scan for best",
     "_scanned_onset": None,
     # fitting
-    # The page opens on the segmented fit: the four components taking over
-    # in turn, all four ticked, each over the stretch its boundaries give
-    # it. The four-regime piecewise fit is the same four components with
-    # each regime anchored to the one before, and it is one line away in
-    # "How the components share the load".
-    "c2c12_fit_mode": "Spring-network models (advanced)",
+    # The page opens on the carried-forward fit: one component to a
+    # stretch, each modulus found in turn and then held while the next is
+    # found. Fitting each component only inside its own stretch is the
+    # other way, one line away in "How the components share the load".
+    "c2c12_fit_mode": "4-regime piecewise (C2C12)",
     # Where regimes 2, 3 and 4 start and where the fit ends, in PERCENT
     # relative deformation. Regime 1 always starts at 0 %. These are the
     # C2C12 prior's (see piecewise_prior): contact under 5 %, the nucleus
@@ -6328,6 +6327,139 @@ def piecewise_equations_latex(bounds, ranges, off=()):
     ]
 
 
+def carried_forward_summary(bounds=None, target=0.999):
+    """
+    The whole method on one page: the model, the fit, and where ε comes from.
+
+    Written to be read once and understood, in the order a person meets it:
+    what is being fitted, how the moduli come out one at a time, and how the
+    three boundaries are found before any of that happens.
+    """
+    names = components_for(st.session_state.get("cell_type"))
+    order = component_order()
+    b = list(bounds or piecewise_boundaries())
+    edges = (", ".join(f"ε{sub} = {b[i + 1]:.2f} %"
+                       for i, sub in enumerate("₁₂₃")) if len(b) >= 4 else "")
+
+    st.markdown("#### 1 · The model")
+    st.markdown(
+        "The cell is met one component at a time. Each starts at its own "
+        "boundary and, once it is carrying load, goes on carrying it: past "
+        "its own stretch it keeps the law already found for it. So on the "
+        "stretch from ε_{k−1} to ε_k the force is everything found so far, "
+        "plus the one new component:"
+    )
+    st.latex(
+        r"\hat F(x) \;=\; \underbrace{\hat F(\varepsilon_{k-1})}"
+        r"_{\text{where the last stretch ended}} \;+\; "
+        r"\underbrace{C_k(x)}_{\text{the ones already fitted, carried on}}"
+        r" \;+\; \underbrace{\theta_k\,\phi_k(x)}_{\text{the new one}}"
+    )
+    st.markdown(
+        "with one shape per component — a shell being stretched goes as the "
+        "cube of how far it is squashed, something squeezed between two "
+        "plates as the three-halves power:"
+    )
+    st.latex(
+        r"\phi_k(x) = \big[\,x - \varepsilon_{k-1}\,\big]_+^{\,p_k}, \qquad "
+        r"p = 3 \;\;\text{(a shell)}, \qquad p = 3/2 \;\;"
+        r"\text{(a Hertzian contact)}"
+    )
+    lines = []
+    for index, term in enumerate(order):
+        power = "3" if ORDER_COEFFICIENT[term] in ("K_shell", "K_nucleus") \
+            else "3/2"
+        start = "first contact" if index == 0 else f"ε{'₁₂₃'[index - 1]}"
+        lines.append(f"{index + 1}. **{names[term][0]}** from {start}, "
+                     f"as the power {power}")
+    st.markdown("In this cell, in the order you have them met:\n\n"
+                + "\n".join(lines))
+
+    st.markdown("#### 2 · The fit: one unknown at a time")
+    st.markdown(
+        "Because everything found earlier is **held**, each stretch has "
+        "exactly one unknown left, and the force depends on it in a straight "
+        "line. That makes it an ordinary least squares with one coefficient: "
+        "it has one answer, and no starting guess can change it."
+    )
+    st.latex(
+        r"\hat\theta_k \;=\; \arg\min_{\theta \,\ge\, 0} "
+        r"\sum_{x_i \in [\varepsilon_{k-1},\,\varepsilon_k)} "
+        r"\Big[\, F_i - \hat F(\varepsilon_{k-1}) - C_k(x_i) - "
+        r"\theta\,\phi_k(x_i) \,\Big]^{2}"
+    )
+    st.markdown(
+        "The stretch starts from the force the one before it ended on, so "
+        "the fitted curve has no step in it. The modulus is that coefficient "
+        "divided by a prefactor fixed by the cell's geometry before any "
+        "fitting, and its uncertainty comes out of the same least squares:"
+    )
+    st.latex(
+        r"E_k = \frac{100^{\,p_k}\,\hat\theta_k}{A_k}, \qquad "
+        r"\mathrm{SE} = \sqrt{\operatorname{diag}\!\big[\hat\sigma^{2}"
+        r"(X^{\top}X)^{-1}\big]}, \qquad 95\,\%:\; \hat E \pm 1.96\,"
+        r"\mathrm{SE}"
+    )
+
+    st.markdown("#### 3 · Where the boundaries come from")
+    st.markdown(
+        "All of that needs ε₁, ε₂ and ε₃ first, and they are read off this "
+        "curve rather than assumed. Two things are tried, and the one that "
+        "fits better is kept."
+    )
+    st.markdown(
+        "**Step one — what the curve's own slope says.** A single power law "
+        "F = a·xᵖ is a straight line on log–log axes, and its slope *is* the "
+        "power:"
+    )
+    st.latex(r"p(x) \;=\; \frac{d\ln F}{d\ln x}")
+    st.markdown(
+        "A new component joining in bends that slope, so the places where it "
+        "bends fastest are where the boundaries are. This needs no model at "
+        "all, and it is usually right to within a few per cent:"
+    )
+    st.latex(r"\varepsilon^{PL}_j \;=\; \arg\max_{x \,\in\, B_j}\;"
+             r"\left|\frac{dp}{d\ln x}\right|")
+    st.markdown(
+        "**Step two — which placement actually fits best.** Every placement "
+        "near that reading is fitted in full, all four stretches with one "
+        "unknown each, and the one that leaves the least error behind is "
+        "kept:"
+    )
+    st.latex(
+        r"\hat{\boldsymbol\varepsilon} \;=\; \arg\min_{\boldsymbol\varepsilon"
+        r"\,\in\, B \,\cap\, [\boldsymbol\varepsilon^{PL} \pm 15\,\%]} "
+        r"S(\boldsymbol\varepsilon), \qquad S = \sum_i \big(F_i - \hat F_i"
+        r"\big)^{2}"
+    )
+    prior = piecewise_prior()
+    (l1, h1), (l2, h2), _b3 = piecewise_bands()
+    s_lo, s_hi = piecewise_span()
+    st.markdown("**Step three — inside what this cell type allows.** B is "
+                "the C2C12 prior, and no route may leave it:")
+    st.latex(rf"{l1:g}\,\% \le \varepsilon_1 \le {h1:g}\,\%, \qquad "
+             rf"{l2:g}\,\% \le \varepsilon_2 \le {h2:g}\,\%, \qquad "
+             rf"{s_lo:g}\,\% \le \varepsilon_3 - \varepsilon_2 \le "
+             rf"{s_hi:g}\,\%")
+    if prior.get("why"):
+        st.caption("Why those bands: " + prior["why"] + ".")
+    st.markdown(
+        "**Step four — and it has to work.** A placement is only kept if the "
+        f"whole curve comes back at R² ≥ {target:g}. If it does not, the "
+        "other routes in the table above are tried in turn and the first "
+        "that reaches it is used — which is what the last line of that table "
+        "is telling you."
+        + (f" On this cell they came out at **{edges}**." if edges else "")
+    )
+    st.caption(
+        "Every regime is linear in its one coefficient once its anchor is "
+        "fixed, so the fit has one best answer inside its bounds. A "
+        "coefficient that settles exactly on a bound is flagged in the "
+        "results: it means the curve could not tell that component's shape "
+        "from another's over its stretch, not that it was removed."
+    )
+
+
 def piecewise_placement_table(placements, bounds, target, selected):
     """
     Every route's boundaries, its fit and its Young's moduli, side by side.
@@ -6743,17 +6875,40 @@ def select_placement(placements, method, target):
         value = (rows.get(key) or {}).get("r2", float("nan"))
         return value if np.isfinite(value) else -np.inf
 
+    def unmeasured(key):
+        """How many components this placement leaves at exactly zero."""
+        moduli = (rows.get(key) or {}).get("moduli") or {}
+        return sum(1 for value in moduli.values()
+                   if not np.isfinite(value) or abs(float(value)) < 1e-12)
+
+    # Every placement that reaches the target, best first: fewest components
+    # left unmeasured, then highest R². A boundary that puts one component
+    # on top of another leaves that one at zero, and a placement that
+    # measures all four is a better answer than one that measures three and
+    # fits a hair closer.
+    reached = sorted((k for k in rows if r2(k) >= target),
+                     key=lambda k: (unmeasured(k), -r2(k)))
     if method in rows and r2(method) >= target:
-        return method, (f"{PW_ROW_LABELS[method]} reaches R² = {r2(method):.5f} "
-                        f"≥ {target:g}.")
-    for key in PW_FALLBACK:
-        if key in rows and r2(key) >= target:
-            said = (f"{PW_ROW_LABELS[method]} reached R² = {r2(method):.5f}, "
-                    f"below the {target:g} target"
-                    if method in rows else
-                    f"{PW_ROW_LABELS[method]} could not place the boundaries")
-            return key, (f"{said}, so {PW_ROW_LABELS[key]} is used "
-                         f"(R² = {r2(key):.5f}).")
+        if not reached or unmeasured(method) <= unmeasured(reached[0]):
+            return method, (f"{PW_ROW_LABELS[method]} reaches R² = "
+                            f"{r2(method):.5f} ≥ {target:g}.")
+        key = reached[0]
+        return key, (
+            f"{PW_ROW_LABELS[method]} reaches R² = {r2(method):.5f} but "
+            f"leaves {unmeasured(method)} component"
+            + ("s" if unmeasured(method) != 1 else "")
+            + f" at zero, so {PW_ROW_LABELS[key]} is used: it also reaches "
+              f"the target (R² = {r2(key):.5f}) and measures "
+            + ("every component." if not unmeasured(key)
+               else f"{unmeasured(key)} fewer at zero."))
+    if reached:
+        key = reached[0]
+        said = (f"{PW_ROW_LABELS[method]} reached R² = {r2(method):.5f}, "
+                f"below the {target:g} target"
+                if method in rows else
+                f"{PW_ROW_LABELS[method]} could not place the boundaries")
+        return key, (f"{said}, so {PW_ROW_LABELS[key]} is used "
+                     f"(R² = {r2(key):.5f}).")
     if not rows:
         return None, "No placement could be fitted."
     key = max(rows, key=r2)
@@ -6992,9 +7147,12 @@ def component_results_strip(fit, extra=""):
                         "lower bound: over this stretch its shape could not "
                         "be told from another component's, so that force "
                         "went to the other one. Only your tick takes a "
-                        "component out of the model. Give it a boundary of "
-                        "its own, or widen the fitted range, and it becomes "
-                        "measurable again.")
+                        "component out of the model. Move the boundary it "
+                        "starts at, change the order the components are met "
+                        "in, or untick **acts throughout** on the component "
+                        "before it — a law carried on and extrapolated can "
+                        "cover the whole of the next stretch and leave "
+                        "nothing for the component that joins there.")
                 else:
                     st.caption(f"95 % interval: {interval}")
                 st.caption(support)
@@ -7184,83 +7342,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 **STRETCH,
             )
 
-        with st.expander("⚙️ Advanced · the route to ε, R²★, p₀ and bounds, "
-                         "the plot, reset", expanded=False):
-            a1, a2 = st.columns([1.3, 1], gap="medium")
-            with a1:
-                st.markdown("**The route that finds ε**")
-                st.radio(
-                    "route", list(PW_METHODS),
-                    format_func=lambda k: PW_METHODS[k] + (
-                        "  ★" if k == "refined" else ""),
-                    key="pw_method", on_change=_pw_apply_selection,
-                    label_visibility="collapsed",
-                )
-                st.caption(PW_METHOD_HELP[
-                    st.session_state.get("pw_method", "refined")])
-                st.number_input(
-                    "R²★  (the fit must reach it)", min_value=0.9,
-                    max_value=0.99999, step=0.0005, format="%.4f",
-                    key="pw_target_r2", on_change=_pw_apply_selection,
-                    help=r"A route below R²★ hands over to the next that "
-                         r"reaches it.",
-                )
-            with a2:
-                st.markdown("**What the plot draws**")
-                st.radio("Components on the plot", list(PW_VIEWS),
-                         format_func=PW_VIEWS.get, key="pw_view",
-                         help="Stacked, the layers add up to the fitted curve "
-                         "and each starts at its own boundary; each from "
-                         "zero, every component is its own dashed line. "
-                         "Applies at once.")
-                st.checkbox("log F axis", key="pw_log_y",
-                            help="Applies at once; components are then drawn "
-                            "each from zero.")
-            piecewise_parameter_editor()
-            prior = piecewise_prior()
-            (l1, h1), (l2, h2), _b3 = piecewise_bands()
-            s_lo, s_hi = piecewise_span()
-            st.markdown("**Constraints on ε** (the app's C2C12 prior), in %")
-            st.latex(rf"{l1:g} \le \varepsilon_1 \le {h1:g},\;\; "
-                     rf"{l2:g} \le \varepsilon_2 \le {h2:g},\;\; "
-                     rf"{s_lo:g} \le \varepsilon_3 - \varepsilon_2 \le {s_hi:g}")
-            cons = st.columns(6)
-            for i, (lo_key, hi_key) in enumerate(PW_BAND_KEYS):
-                with cons[2 * i]:
-                    st.number_input(f"{EPS_NAMES[i]} ≥", 0.5, 99.0, step=0.5,
-                                    format="%.1f", key=lo_key)
-                with cons[2 * i + 1]:
-                    st.number_input(f"{EPS_NAMES[i]} ≤", 0.5, 99.0, step=0.5,
-                                    format="%.1f", key=hi_key)
-            with cons[4]:
-                st.number_input("ε₃ − ε₂ ≥", 1.0, 90.0, step=0.5,
-                                format="%.1f", key=PW_SPAN_KEYS[0])
-            with cons[5]:
-                st.number_input("ε₃ − ε₂ ≤", 1.0, 90.0, step=0.5,
-                                format="%.1f", key=PW_SPAN_KEYS[1])
-            if prior.get("why"):
-                st.caption("Prior: " + prior["why"] + ".")
-            spec = piecewise_defaults()
-            if st.checkbox("↺ Put the board back to the C2C12 defaults",
-                           key="pw_reset_board",
-                           help="ε = " + " / ".join(f"{v:g}" for v in spec)
-                           + " %, the specification's ranges, p₀ and bounds, "
-                           "and every component ticked. Applied with "
-                           "▶ Fit & plot."):
-                rerun_keeping_settings({
-                    **dict(zip(PW_BOUNDARY_KEYS, spec)),
-                    "pw_settings": {},
-                    "pw_until": {},
-                    "pw_membrane_throughout": True,
-                    "pw_method": "refined",
-                    "pw_eps_way": "typed",
-                    **{key: DEFAULTS[key] for pair in PW_BAND_KEYS for key in pair},
-                    **{key: DEFAULTS[key] for key in PW_SPAN_KEYS},
-                    **{f"pw_use_{n}": DEFAULTS[f"pw_use_{n}"]
-                       for n in PW_SWITCHABLE},
-                    "pw_reset_board": False,
-                    "_pw_editor_reset": True,
-                })
+        # The board holds what is decided here and nothing else. The route
+        # that finds ε is chosen by the fit itself -- every route is scored
+        # and the first that reaches R²★ is used -- and the table under the
+        # graph says which, with a button to take any other. The guesses,
+        # the bounds and the constraints on ε are the C2C12 prior's and are
+        # written out under that table rather than sitting here as boxes
+        # nobody sets.
 
     # 🔄 Refresh graph: draw the board as it stands, moving nothing.
     if refreshed:
@@ -7404,6 +7492,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     log_y=log_y, fit_id_text=fid,
                     n_points=int(np.size(epsilon)),
                 )
+                # How the plot draws it, under the plot, where it is being
+                # looked at. Both apply at once; neither changes the fit.
+                v1, v2 = st.columns([2.4, 1])
+                with v1:
+                    st.radio("Components on the plot", list(PW_VIEWS),
+                             format_func=PW_VIEWS.get, key="pw_view",
+                             horizontal=True, label_visibility="collapsed")
+                with v2:
+                    st.checkbox("log F axis", key="pw_log_y")
                 fitted = predict_piecewise(epsilon, result)
 
         with results_slot:
@@ -7445,8 +7542,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 piecewise_placement_table(placements, piecewise_boundaries(),
                                           target, selected)
             else:
-                st.caption("Choose a route to ε on the board and press "
-                           "**▶ Fit & plot** to compare the routes on this curve.")
+                st.caption("Press **▶ Fit & plot** to place ε on this curve "
+                           "and compare the routes.")
+            st.divider()
+            carried_forward_summary(piecewise_boundaries(), target)
         with t_coef:
             if ok:
                 piecewise_coefficient_table(result, moduli)
