@@ -86,6 +86,7 @@ __all__ = [
     "early_fit",
     "bending_prefactor",
     "bending_crossover",
+    "bending_constant",
     "EARLY_WINDOWS_PCT",
     "information_criteria",
     "akaike_weights",
@@ -1082,7 +1083,10 @@ def power_law_window(epsilon, force_N, start_pct=5.0, anchor_pct=15.0,
 # window, where they are fitted to the same points; across windows it
 # would be meaningless, so the windows are reported side by side instead.
 
-EARLY_POWERS = {"stretch": 3.0, "hertz": 1.5, "bending": 1.0}
+# Lulevich eq 1: the membrane stretches as e^3 and bends as e^(1/2), and
+# the cell interior answers Hertz at e^(3/2). Three laws, two components:
+# stretching and bending are the SAME membrane with the same modulus.
+EARLY_POWERS = {"stretch": 3.0, "hertz": 1.5, "bending": 0.5}
 EARLY_ELEMENT = {"stretch": "membrane", "hertz": "cytoskeleton",
                  "bending": "membrane"}
 EARLY_WINDOWS_PCT = (20.0, 25.0, 30.0, 35.0)
@@ -1098,43 +1102,71 @@ CORTEX_THICKNESS_M = 200e-9
 
 def bending_prefactor(geometry: "Geometry", thickness=None):
     """
-    Newtons per pascal for the shell's BENDING resistance, at e = 1.
+    Newtons per pascal for the membrane's BENDING term, at e = 1.
 
-    Reissner's small-deflection result for a thin spherical shell,
-    F = 4 E h^2 d / (sqrt(3(1-nu^2)) R), written per unit deformation
-    e = d / h0 so it sits beside the other prefactors:
+    Lulevich et al., Langmuir 2006, eq 5: the bending deformation of the
+    spherical membrane, localised at the contact,
 
-        A_bend = 4 h^2 h0 / (sqrt(3 (1 - nu^2)) R)
+        F_bending = pi E_m h^2 e^(1/2) / (2 sqrt 2)
 
-    It goes as the SQUARE of the thickness, which is why the answer depends
-    so completely on whether h is a bilayer or a cortex.
+    so A_bend = pi h^2 / (2 sqrt 2). It carries no radius: unlike the
+    stretching term it does not know how big the cell is, which is why the
+    ratio between them depends on h/R0. The power is ONE HALF, so this term
+    dominates as e -> 0 and dies away as the squash goes on -- the opposite
+    of the e^3 stretching beside it.
     """
-    h = float(thickness if thickness else CORTEX_THICKNESS_M)
+    h = float(thickness if thickness else geometry.membrane_thickness)
+    return float(np.pi * h * h / (2.0 * np.sqrt(2.0)))
+
+
+def bending_constant(E_pa, geometry: "Geometry", thickness=None):
+    """
+    The membrane bending constant K_m, in joules and in kT at 300 K.
+
+    Lulevich eq 4: K_m = E_m h^3 / (12 (1 - nu_m^2)). The paper reports
+    17 to 52 kT for living cell membranes, which is the number to compare a
+    fitted E_m against -- it is far more sensitive to h than E_m is.
+    """
+    h = float(thickness if thickness else geometry.membrane_thickness)
     nu = float(geometry.nu_membrane)
-    return (4.0 * h * h * float(geometry.cell_height)
-            / (np.sqrt(3.0 * max(1.0 - nu * nu, 1e-9))
-               * float(geometry.cell_radius)))
+    joules = float(E_pa) * h ** 3 / (12.0 * max(1.0 - nu * nu, 1e-9))
+    return {"K_J": joules, "K_kT": joules / (1.380649e-23 * 300.0),
+            "thickness_m": h}
 
 
-def bending_crossover(geometry: "Geometry", thickness=None):
+def bending_crossover(geometry: "Geometry", thickness=None, negligible=0.05):
     """
-    Where the bending term stops mattering, for this cell and this thickness.
+    Where the bending term stops mattering, from Lulevich eq 2.
 
-    Returns {"thickness_m", "crossover_pct", "ratio_at"}: the deformation at
-    which the deflection equals the shell thickness (d = h, below which
-    bending is of the same order as stretching), and a function of x giving
-    the bending-to-stretching ratio (h/d)^2 there.
+        F_bending / F_stretching = (1 - nu_m) / (4 sqrt 2) * (h / R0) * e^(-5/2)
+
+    (the paper writes this as ~ (h/R) e^(-5/2), dropping the numerical
+    factor). It DIVERGES as e -> 0 and falls away steeply, so the question
+    is never "is bending negligible" but "above what deformation". Returns
+    the deformation where the two terms are equal, the one where bending
+    falls below ``negligible`` of stretching, and the ratio at any x.
+
+    With the paper's own numbers, h = 4 nm and R0 = 5 um, that is about
+    2 % and 7 %: which is why eq 3, stretching alone, is used there over
+    e = 0.1 to 0.3, and why a reading that starts at first contact cannot
+    simply inherit that.
     """
-    h = float(thickness if thickness else CORTEX_THICKNESS_M)
-    h0 = float(geometry.cell_height)
-    crossover = 100.0 * h / h0 if h0 > 0 else float("nan")
+    h = float(thickness if thickness else geometry.membrane_thickness)
+    R0 = float(geometry.cell_radius)
+    nu = float(geometry.nu_membrane)
+    factor = (1.0 - nu) / (4.0 * np.sqrt(2.0)) * (h / R0) if R0 > 0 else np.inf
 
     def ratio_at(x_pct):
-        d = np.clip(np.asarray(x_pct, dtype=float) / 100.0 * h0, 1e-18, None)
-        return (h / d) ** 2
+        e = np.clip(np.asarray(x_pct, dtype=float) / 100.0, 1e-9, None)
+        return factor * e ** (-2.5)
 
-    return {"thickness_m": h, "crossover_pct": float(crossover),
-            "ratio_at": ratio_at}
+    def where(level):
+        return 100.0 * float((factor / float(level)) ** 0.4) if factor > 0 \
+            else float("nan")
+
+    return {"thickness_m": h, "radius_m": R0, "factor": float(factor),
+            "equal_pct": where(1.0), "negligible_pct": where(negligible),
+            "negligible": float(negligible), "ratio_at": ratio_at}
 
 
 def early_fit(epsilon, force_N, geometry, window_pct, plan, squeeze=0.0,
@@ -1182,7 +1214,8 @@ def early_fit(epsilon, force_N, geometry, window_pct, plan, squeeze=0.0,
             # modulus and the same thickness, so keeping the bending term
             # costs nothing and dropping it is a claim about size, not a
             # change of model. F_shell = E (A_m e^3 + A_b e).
-            column = column + bending_prefactor(geometry, thickness) * shifted
+            column = column + (bending_prefactor(geometry, thickness)
+                               * shifted ** EARLY_POWERS["bending"])
         if squeeze:
             column = column * confinement_factor(e * 100.0, squeeze)
         columns.append(column)
@@ -1211,9 +1244,10 @@ def early_fit(epsilon, force_N, geometry, window_pct, plan, squeeze=0.0,
             "law": law, "power": float(power), "onset_pct": float(onset),
             "element": EARLY_ELEMENT[law], "prefactor": float(A),
             # When the bending term is tied, this law's column is
-            # A e^p + A_bend e, so a curve drawn from it needs both.
+            # A e^3 + A_bend e^(1/2), so a curve drawn from it needs both.
             "tied_bending_A": (float(bending_prefactor(geometry, thickness))
                                if (law == "stretch" and tied) else 0.0),
+            "tied_bending_power": float(EARLY_POWERS["bending"]),
             "E_Pa": float(params[j]), "E_se_Pa": se,
             "E_lo_Pa": float(params[j]) - 1.96 * se,
             "E_hi_Pa": float(params[j]) + 1.96 * se,
