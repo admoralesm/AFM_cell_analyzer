@@ -172,6 +172,16 @@ _piecewise_module = _load_piecewise()
 # Newer than the rest: without it the plot draws each component on its own
 # rather than stacked, and nothing else changes.
 component_force = getattr(_piecewise_module, "component_force", None)
+# Newer still: how the curve is read rather than what it is made of -- what
+# the fit is asked to get right, the squash's own stiffening, and the
+# small-deformation reading kept beside the whole-curve one. Each is
+# optional, so an older engine loses that control and nothing else.
+small_strain_reading = getattr(_piecewise_module, "small_strain_reading", None)
+power_law_window = getattr(_piecewise_module, "power_law_window", None)
+confinement_from_profile = getattr(
+    _piecewise_module, "confinement_from_profile", None)
+best_confinement = getattr(_piecewise_module, "best_confinement", None)
+ENGINE_WEIGHTINGS = getattr(_piecewise_module, "WEIGHTINGS", {}) or {}
 HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "C2C12_BOUNDARIES_PCT",
     "C2C12_REGIMES",
@@ -811,6 +821,24 @@ DEFAULTS = {
     # the numbers on the board exactly as they are.
     "pw_eps_way": "found",
     "pw_target_r2": 0.999,
+    # What the fit is asked to get right. A whole-cell squash spans three
+    # or four decades of force, so plain least squares in newtons is very
+    # nearly a fit to the last decade alone, and the components that only
+    # act early are left with the crumbs. "relative" asks for the same
+    # per-cent accuracy everywhere instead.
+    "pw_weighting": "absolute",
+    # The squash's own stiffening, (1 - x/100)^-q: a cell pressed flat has
+    # nowhere to put its volume, so everything in it stiffens together.
+    # "off" is the plain powers; "found" reads q off this curve.
+    "pw_squeeze_way": "off",
+    "pw_squeeze": 0.0,
+    "pw_squeeze_note": None,
+    # The small-deformation reading, kept beside the whole-curve fit: the
+    # same laws acting from first contact over the stretch where the curve
+    # is still one power law. This is the number the literature reports.
+    "pw_small_strain": True,
+    "pw_small_way": "found",
+    "pw_small_window": 20.0,
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
     "pw_selected": None,
@@ -4944,6 +4972,8 @@ PW_TERM_OF = {
 PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_until", "pw_membrane_throughout", "pw_target_r2",
                    "pw_style", "pw_best_carry",
+                   "pw_weighting", "pw_squeeze", "pw_squeeze_way",
+                   "pw_small_strain", "pw_small_way", "pw_small_window",
                    "pw_use_K_shell", "pw_use_K_cyto",
                    "pw_use_K_nucleus", "pw_use_K_core")
 _PW_SOURCE = [None]
@@ -5515,6 +5545,7 @@ def literature_note(fit, cell_type=None):
     if not known or not (fit and fit.get("success")):
         return ""
     said = []
+    over_by = False
     for symbol, window in (known.get("moduli") or {}).items():
         field = {"E_cyto": "Ei_kPa", "E_shell": "Em_MPa",
                  "E_ne": "Ene_MPa", "E_core": "En_kPa"}.get(symbol)
@@ -5531,6 +5562,10 @@ def literature_note(fit, cell_type=None):
             f"{unit}, " + ("inside" if inside else "outside")
             + f" the {window[0] / divisor:g}–{window[1] / divisor:g} {unit} "
             f"{window[2].split(',')[0]}")
+        if not inside and value > window[1]:
+            # Not a failure of the fit: the two numbers are measurements of
+            # different things, and the page has the other one.
+            over_by = True
     bump = known.get("bump_pct")
     edges = {name: value for value, name in fit_edges(fit)}
     if bump is not None and "ε₂" in edges:
@@ -5543,6 +5578,11 @@ def literature_note(fit, cell_type=None):
                     "is met")
     if not said:
         return ""
+    if over_by:
+        said.append(
+            "a whole-curve number is not the number a paper quotes — see "
+            "**📏 The same cell, read at small deformation** below, which "
+            "reads the same curve the way the literature reads it")
     return ("**Against what is reported for this cell type:** "
             + " · ".join(said))
 
@@ -5697,7 +5737,7 @@ def best_mixture(epsilon, force_N, model=None):
     for carry in carry_subsets():
         result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
                                regimes=pw_regimes(), settings=settings,
-                               carry=carry)
+                               carry=carry, **fit_extras())
         r2 = (float(result.get("r_squared", float("nan")))
               if result.get("success") else float("nan"))
         zeros = sum(1 for name, value in (result.get("coefficients") or {}).items()
@@ -5900,6 +5940,348 @@ def piecewise_geometry(model, probe_um=None, coat_nm=None):
     )
 
 
+# ====================================== how the curve is read, not what it is ==
+#
+# Two settings that change nothing about the model and everything about the
+# answer it gives, which is exactly why they are said out loud rather than
+# left as defaults nobody sees.
+#
+# WEIGHTING. The force on one of these curves runs from a few hundred
+# piconewtons at 5 % to tens of nanonewtons at 90 %: three or four decades.
+# Least squares minimises the squared error in newtons, so a single point
+# at the end of the squash weighs as much as ten thousand points at the
+# start, and a component that only acts early is fitted to whatever is left
+# over rather than to its own part of the curve. That is the usual reason a
+# component comes back as exactly zero while the one beside it comes back
+# ten times too stiff. Asking instead for the same PER CENT accuracy
+# everywhere gives every decade of the curve an equal say.
+#
+# CONFINEMENT. A cell squashed flat between two surfaces has nowhere to put
+# the volume it is losing, so everything inside it stiffens together as the
+# gap closes, over and above each element's own law. One number, q, covers
+# it: every term is multiplied by (1 - x/100)^-q, which is 1 at first
+# contact and climbs as the cell runs out of room. The curve says what q
+# is: on log-log paper the local slope of a plain power law is flat, and
+# with confinement it rises exactly like q x/(100 - x).
+
+PW_WEIGHTINGS = {
+    "absolute": "⚖️ Newtons · plain least squares",
+    "relative": "📐 Per cent · every decade counts the same",
+    "sqrt": "🤝 In between · √F",
+}
+PW_WEIGHTING_HELP = {
+    "absolute": "The error in newtons is minimised. The last decade of the "
+                "squash carries almost all of the weight, because that is "
+                "where almost all of the force is.",
+    "relative": "The error as a fraction of the force there is minimised, "
+                "so 5 % of the force at 10 % deformation counts for as much "
+                "as 5 % of the force at 90 %. This is what lets a component "
+                "that only acts early be measured at all.",
+    "sqrt": "Halfway between the two, the weighting counting noise would "
+            "ask for.",
+}
+PW_SQUEEZE_WAYS = {
+    "off": "Off · the plain powers",
+    "found": "🎯 Found from this curve",
+    "typed": "✍️ Kept as I typed it",
+}
+WEIGHTINGS_USED = {
+    "absolute": "newtons: every point counts the same (ordinary least "
+                "squares), so the last decade of force decides almost "
+                "everything",
+    "relative": "per cent: each point weighted by 1/F, so every decade of "
+                "force counts the same and a component acting only early "
+                "can still be measured",
+    "sqrt": "√F: halfway between newtons and per cent",
+}
+
+
+def piecewise_weighting():
+    """What the fit is asked to get right: newtons, per cent, or between."""
+    value = _pw_get("pw_weighting", DEFAULTS.get("pw_weighting", "absolute"))
+    return value if value in PW_WEIGHTINGS else "absolute"
+
+
+def piecewise_squeeze():
+    """The confinement exponent q the next fit will use, 0 when it is off."""
+    if _pw_get("pw_squeeze_way", DEFAULTS.get("pw_squeeze_way")) == "off":
+        return 0.0
+    try:
+        return float(max(0.0, min(3.0, float(_pw_get("pw_squeeze", 0.0)))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fit_extras():
+    """The read-the-curve settings this engine understands, as keywords."""
+    extras = {}
+    try:
+        import inspect
+        accepts = set(inspect.signature(fit_piecewise).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - builtins only
+        return extras
+    if "squeeze" in accepts:
+        extras["squeeze"] = piecewise_squeeze()
+    if "weighting" in accepts:
+        extras["weighting"] = piecewise_weighting()
+    return extras
+
+
+def curve_confinement(epsilon, force_N):
+    """
+    q read straight off this curve, cached: the rise of the log-log slope.
+
+    A plain power law is a straight line on log-log paper, so its local
+    slope p = d ln F / d ln x is flat. With the confinement factor the same
+    slope is p0 + q x/(100 - x), so fitting a straight line to the measured
+    slope against x/(100 - x) gives q as its gradient. Returns the engine's
+    dict, or {} when the curve is too short to say.
+    """
+    if confinement_from_profile is None or power_law_profile is None:
+        return {}
+    signature = piecewise_signature(epsilon, force_N)
+    cached = st.session_state.get("_pw_squeeze_cache") or {}
+    if cached.get("signature") == signature:
+        return cached.get("found") or {}
+    thin_eps, thin_force, _step = thinned_for_search(epsilon, force_N)
+    try:
+        found = confinement_from_profile(
+            power_law_profile(thin_eps, thin_force), from_pct=5.0) or {}
+    except Exception:  # pragma: no cover - a curve the profile cannot read
+        found = {}
+    st.session_state["_pw_squeeze_cache"] = {"signature": signature,
+                                             "found": found}
+    return found
+
+
+def read_curve_control(epsilon, force_N):
+    """
+    Step 2½: what the fit is asked to get right, and the squash's own stiffening.
+
+    Neither of these changes the model. They change which part of the curve
+    the model is fitted to, and on a curve that spans four decades of force
+    that is the difference between a cytoskeleton of 12 kPa and one of
+    300 kPa. So they are on the board, in words, with what the curve itself
+    says about each.
+    """
+    weigh_col, squeeze_col = st.columns([1.15, 1], gap="medium")
+    with weigh_col:
+        st.radio(
+            "What the fit is asked to get right",
+            list(PW_WEIGHTINGS), format_func=PW_WEIGHTINGS.get,
+            key="pw_weighting",
+            help="A whole-cell squash runs from a few hundred piconewtons "
+                 "at 5 % to tens of nanonewtons at 90 %. In newtons, the "
+                 "last decade of the curve decides almost everything and a "
+                 "component that only acts early can come back as exactly "
+                 "zero. In per cent, every decade counts the same.",
+        )
+        st.caption(PW_WEIGHTING_HELP.get(piecewise_weighting(), ""))
+    with squeeze_col:
+        st.radio(
+            "The squash's own stiffening  $(1-x/100)^{-q}$",
+            list(PW_SQUEEZE_WAYS), format_func=PW_SQUEEZE_WAYS.get,
+            key="pw_squeeze_way",
+            help="A cell pressed flat has nowhere to put the volume it is "
+                 "losing, so everything in it stiffens together as the gap "
+                 "closes. q is that effect, one number for the whole cell, "
+                 "and it leaves every modulus meaning what it meant: the "
+                 "factor is 1 at first contact.",
+        )
+        way = st.session_state.get("pw_squeeze_way", "off")
+        found = curve_confinement(epsilon, force_N) if way != "off" else {}
+        if way == "typed":
+            st.number_input("q", 0.0, 3.0, step=0.05, format="%.2f",
+                            key="pw_squeeze",
+                            help="0 is the plain powers. Around 0.5 to 1 is "
+                                 "what a flat-plate squash of a cell "
+                                 "usually shows.")
+        elif way == "found":
+            if found:
+                # Written to the board, not to a widget: in this mode there
+                # is no q box to disagree with.
+                st.session_state["pw_squeeze"] = round(
+                    float(found.get("squeeze", 0.0)), 2)
+                st.metric("q read off this curve",
+                          f"{float(found.get('squeeze', 0.0)):.2f}")
+            else:
+                st.session_state["pw_squeeze"] = 0.0
+                st.caption("This curve is too short to read q from; the fit "
+                           "uses q = 0.")
+        if found:
+            st.caption(
+                rf"Its log-log slope is $p \approx {found.get('p0', 0.0):.2f}$ "
+                rf"near contact and rises as $q\,x/(100-x)$ "
+                rf"($R^2 = {found.get('r_squared', 0.0):.2f}$ on that line). "
+                "A flat slope would mean q = 0 and the plain powers.")
+
+
+# ========================================== the reading at small deformation ==
+#
+# Why this sits beside the whole-curve fit rather than replacing it.
+#
+# A modulus quoted in the literature for a cytoskeleton -- the 10 to 15 kPa
+# a C2C12 is reported at -- is a SMALL-DEFORMATION number. It is measured
+# where the cell is still behaving like the material the law describes, and
+# it is fitted to the part of the curve where that law is what the curve is
+# doing. The whole-curve fit here is a different measurement: it runs to
+# 90 % relative deformation, where the force is a thousand times larger and
+# the cell is a flattened pancake with its nucleus in contact. Both are
+# real; they are not the same quantity, and the second one is not the one
+# the literature is quoting.
+#
+# Two things make the whole-curve number bigger, and they compound:
+#
+#   1. What is minimised. Least squares in newtons is, to within a rounding
+#      error, a fit to the last decade of force. The early part of the
+#      curve -- the only part where a soft component is visible -- barely
+#      enters the sum at all.
+#   2. Where each component's law starts. In the sequential model a
+#      component measured from an onset s is converted into a modulus with
+#      the prefactor of a law measured from zero, which overstates it by
+#      (100/(100-s))^p: at s = 40 % and p = 3/2 that alone is 2.2x.
+#
+# So the same curve is read a second way here: every law acting from first
+# contact, in parallel, over the stretch where the curve is still a single
+# power law (which the curve itself says, by the flat part of its log-log
+# slope). One bounded solve, no onsets to undo, and the coefficients
+# convert straight into moduli. That number is the one to put beside the
+# literature; the whole-curve number is the one to put beside another
+# whole-curve squash.
+
+
+def small_strain_window(epsilon, force_N):
+    """Where the curve stops being one power law, cached, in per cent."""
+    if power_law_window is None or power_law_profile is None:
+        return {}
+    signature = piecewise_signature(epsilon, force_N)
+    cached = st.session_state.get("_pw_window_cache") or {}
+    if cached.get("signature") == signature:
+        return cached.get("found") or {}
+    thin_eps, thin_force, _step = thinned_for_search(epsilon, force_N)
+    try:
+        found = power_law_window(
+            thin_eps, thin_force,
+            profile=power_law_profile(thin_eps, thin_force)) or {}
+    except Exception:  # pragma: no cover - a curve the profile cannot read
+        found = {}
+    st.session_state["_pw_window_cache"] = {"signature": signature,
+                                            "found": found}
+    return found
+
+
+def small_strain_panel(model, epsilon, force_N, whole_curve=None):
+    """The same cell read again over its small-deformation stretch."""
+    if small_strain_reading is None:
+        return
+    box = st.container(border=True)
+    with box:
+        st.markdown("#### 📏 The same cell, read at small deformation")
+        st.caption(
+            "The literature's modulus for a cytoskeleton is a "
+            "small-deformation number. This reads it that way: every law "
+            "acting **from first contact and in parallel**, over the "
+            "stretch where this curve is still a single power law. It "
+            "changes nothing about the fit above — it is a second reading "
+            "of the same cell, for the number that compares with a paper."
+        )
+        on = st.checkbox("Read it", key="pw_small_strain")
+        if not on:
+            return
+        found = small_strain_window(epsilon, force_N)
+        way_col, win_col = st.columns([1.3, 1], gap="medium")
+        with way_col:
+            st.radio("How far to read", ["found", "typed"],
+                     format_func={"found": "🎯 As far as this curve stays "
+                                           "one power law",
+                                  "typed": "✍️ As far as I say"}.get,
+                     key="pw_small_way", horizontal=True)
+        window = float(st.session_state.get("pw_small_window", 20.0))
+        with win_col:
+            if st.session_state.get("pw_small_way") == "typed":
+                st.number_input("read to (%)", 5.0, 60.0, step=1.0,
+                                format="%.1f", key="pw_small_window")
+                window = float(st.session_state["pw_small_window"])
+            elif found:
+                window = float(found.get("window_pct", 20.0))
+                st.session_state["pw_small_window"] = round(window, 1)
+                st.metric("straight to", f"{window:.1f} %")
+            else:
+                st.caption("The log-log slope could not be read; 20 % used.")
+                window = 20.0
+        if found:
+            st.caption(
+                rf"Its log-log slope is $p \approx {found.get('exponent', 0):.2f}$ "
+                rf"over that stretch and $\approx "
+                rf"{found.get('exponent_at_end', float('nan')):.2f}$ where it "
+                "leaves it. A cell shell alone would be 3, a Hertzian "
+                "interior 1.5."
+            )
+        reading = small_strain_reading(
+            epsilon, force_N, piecewise_geometry(model), window_pct=window,
+            squeeze=piecewise_squeeze(), weighting=piecewise_weighting())
+        if not reading.get("success"):
+            st.warning(reading.get("error", "could not be read"), icon="⚠️")
+            return
+        cell_type = st.session_state.get("cell_type")
+        symbols = {"membrane": "E_shell", "cytoskeleton": "E_cyto"}
+        whole = (whole_curve or {})
+        columns = st.columns(max(len(reading["moduli"]), 1))
+        for column, (element, row) in zip(columns, reading["moduli"].items()):
+            symbol = symbols.get(element, element)
+            with column:
+                st.metric(
+                    f"{DISPLAY_SYMBOL.get(symbol, symbol)} · {row['name']}",
+                    modulus_display(symbol, row["E_Pa"], row["E_se_Pa"]),
+                )
+                unit, scale = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
+                st.caption(
+                    f"95 %: {row['E_lo_Pa'] / scale:.4g} to "
+                    f"{row['E_hi_Pa'] / scale:.4g} {unit} · law "
+                    f"$\\varepsilon^{{{row['power']:g}}}$ from first contact"
+                )
+                verdict = modulus_in_range(symbol, row["E_Pa"], cell_type)
+                if verdict is not None:
+                    window_lit = (literature_for(cell_type).get("moduli")
+                                  or {}).get(symbol)
+                    st.caption(("✅ inside" if verdict else "⚠️ outside")
+                               + f" the {window_lit[0] / scale:g}–"
+                               f"{window_lit[1] / scale:g} {unit} reported "
+                               "for this cell type")
+                was = whole.get(symbol)
+                if was is not None and np.isfinite(float(was)) and row["E_Pa"]:
+                    times = float(was) / float(row["E_Pa"])
+                    if np.isfinite(times) and times > 0:
+                        st.caption(
+                            f"The whole-curve fit puts it at "
+                            f"{modulus_display(symbol, was)} — "
+                            f"{times:.3g}× this one."
+                        )
+        st.caption(
+            f"R² = {reading['r_squared']:.5f} over {reading['n_points']:,} "
+            f"points below {window:.1f} %"
+            + (f", {100.0 * reading['relative_rmse']:.1f} % typical error"
+               if np.isfinite(reading.get("relative_rmse", float("nan")))
+               else "")
+            + (f" · with the squash factor q = {piecewise_squeeze():.2f}"
+               if piecewise_squeeze() else "")
+            + "."
+        )
+        st.latex(
+            r"F(\varepsilon) \;=\; C_0 \;+\; \sum_j E_j\,A_j\,"
+            r"\varepsilon^{\,p_j}"
+            + (r"\,(1-\varepsilon)^{-q}" if piecewise_squeeze() else "")
+            + rf",\qquad 0 \le \varepsilon \le {window / 100.0:.3f}"
+        )
+        st.caption(
+            "Each law is measured from zero, so its coefficient **is** "
+            "E·A and converts with no onset to undo. That is the second "
+            "reason the two readings differ: in the fit above, a component "
+            "starting at ε₁ is converted with the prefactor of a law "
+            "starting at 0, which overstates it by (100/(100−ε₁))^p."
+        )
+
+
 def run_piecewise_fit(model, epsilon, force_N):
     """Fit and convert, at the page's boundaries and settings."""
     result = fit_piecewise(
@@ -5908,6 +6290,7 @@ def run_piecewise_fit(model, epsilon, force_N):
         regimes=pw_regimes(),
         settings=piecewise_model_settings(),
         carry=piecewise_carry(),
+        **fit_extras(),
     )
     if result.get("success"):
         result["moduli"] = piecewise_moduli(result, piecewise_geometry(model),
@@ -6494,6 +6877,15 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
     if left_out:
         parts.append("switched off, so neither fitted nor drawn: "
                      + ", ".join(left_out))
+    q = float(result.get("squeeze") or 0.0)
+    if q:
+        parts.append(f"every law multiplied by the squash factor "
+                     f"(1 − x/100)^−q with q = {q:.2f}")
+    if result.get("weighting", "absolute") != "absolute":
+        parts.append("fitted for the same **per cent** accuracy at every "
+                     "force, not the same accuracy in newtons"
+                     if result.get("weighting") == "relative"
+                     else "fitted with √F weighting")
     if len(b) >= 5:
         parts.append(
             f"boundaries ε₁ = {b[1]:.2f} %, ε₂ = {b[2]:.2f} %, "
@@ -6746,6 +7138,21 @@ def piecewise_answer(result, fit):
         relation = r"\le" if last_one else "<"
         st.latex(rf"\hat F(x) = {body}, \qquad {a:.4g}\,\% \le x "
                  + relation + rf" {b:.4g}\,\%")
+
+    q = float(result.get("squeeze") or 0.0)
+    if q:
+        st.latex(rf"\text{{each }}\;\big\langle x - s\big\rangle^{{p}}\;"
+                 rf"\text{{above is multiplied by}}\;\Big(1 - "
+                 rf"\tfrac{{x}}{{100}}\Big)^{{-{q:.2f}}}")
+        st.caption("The squash's own stiffening: one factor for the whole "
+                   "cell, equal to 1 at first contact, so every modulus "
+                   "below still means what it meant.")
+    if result.get("weighting", "absolute") != "absolute":
+        st.caption("Fitted for the same **per cent** accuracy at every force "
+                   "rather than the same accuracy in newtons, so the early "
+                   "part of the curve has as much say as the end of it."
+                   if result.get("weighting") == "relative"
+                   else "Fitted with √F weighting.")
 
     lines = []
     for term, coefficient in ORDER_COEFFICIENT.items():
@@ -7443,7 +7850,7 @@ def _pw_score(placement, epsilon, force_N, model):
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
                            regimes=pw_regimes(),
                            settings=piecewise_model_settings(),
-                           carry=piecewise_carry())
+                           carry=piecewise_carry(), **fit_extras())
     if not result.get("success"):
         return {"best_pct": tuple(placement), "r2": float("nan"),
                 "moduli": {}, "error": result.get("error", "")}
@@ -7494,6 +7901,14 @@ def compute_placements(model, epsilon, force_N):
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
     common = dict(end_pct=end, span_pct=span, regimes=pw_regimes(),
                   settings=piecewise_model_settings(), carry=piecewise_carry())
+    # The search compares placements of the same model, so it has to be the
+    # same model the fit will use -- including the squash's own stiffening.
+    try:
+        import inspect
+        if "squeeze" in set(inspect.signature(find_boundaries).parameters):
+            common["squeeze"] = piecewise_squeeze()
+    except (TypeError, ValueError):  # pragma: no cover
+        pass
     out = {"signature": signature, "rows": {}, "searches": {}, "errors": {},
            "every_nth": step}
     # 1 · the power law, read straight off the curve
@@ -7730,8 +8145,15 @@ def piecewise_settings_used(result, geometry, target, source):
     rows += [
         ("C₀ over [0, ε₁)", "the constant the first stretch is fitted with, "
          "by least squares and with no bounds", "fixed"),
-        ("Weighting", "uniform: every point counts the same (ordinary least "
-                      "squares)", "fixed"),
+        ("Weighting", WEIGHTINGS_USED.get(
+            result.get("weighting", "absolute"),
+            "uniform: every point counts the same (ordinary least squares)"),
+         "How the curve is read"),
+        ("Squash factor (1 − x/100)^−q",
+         (f"q = {float(result.get('squeeze') or 0.0):.2f} "
+          f"({PW_SQUEEZE_WAYS.get(st.session_state.get('pw_squeeze_way', 'off'), '')})")
+         if float(result.get("squeeze") or 0.0) else
+         "off: the plain powers, q = 0", "How the curve is read"),
         ("Solver", " · ".join(f"{r['key']}: {r['engine'] or 'not fitted'}"
                               for r in result["regimes"]), "fixed"),
         ("Cell height h₀", f"{geometry.cell_height * 1e6:.2f} µm", "1 · Cell information"),
@@ -8102,6 +8524,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
                            rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
 
+        st.markdown("**Step 2½ · How the curve is read**")
+        read_curve_control(epsilon, force_N)
+
         st.markdown("**Step 3 · Fit**")
         nothing_ticked = len(piecewise_off()) >= len(PW_SWITCHABLE) + 1
         go1, go2, go3 = st.columns([1.1, 1.3, 1])
@@ -8377,6 +8802,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     st.session_state["pw_collection"] = collection
                     rerun_keeping_settings()
 
+        # ---- the same cell, read where the literature reads it ---------
+        small_strain_panel(
+            model, epsilon, force_N,
+            whole_curve={row["symbol"]: row["E_Pa"]
+                         for row in (moduli or {}).values()
+                         if isinstance(row, dict) and "symbol" in row},
+        )
+
         # ---- how it is done, for an undergraduate, with these numbers --
         with st.expander("📘 How the fit is done — the maths, step by step",
                          expanded=False):
@@ -8594,7 +9027,7 @@ def fit_cell_from_file(name, epsilon, force_N, height_um):
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
                            regimes=pw_regimes(),
                            settings=piecewise_model_settings(),
-                           carry=piecewise_carry())
+                           carry=piecewise_carry(), **fit_extras())
     if not result.get("success"):
         return None, result.get("error", "fit failed")
     record = collection_record(name, name, height_um, epsilon, force_N, result,
