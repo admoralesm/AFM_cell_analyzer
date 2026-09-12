@@ -4714,57 +4714,6 @@ def fit_at_the_current_settings(model, lo, hi, terms):
     rerun_keeping_settings({"_fit_from_curve": True})
 
 
-def legacy_contributions(model, lo, hi, terms):
-    """
-    Refit without each ticked component, at the same boundaries and range.
-
-    The spring-network answer to the same question the regime-by-regime
-    fit answers: what is this component worth on this curve? Each fit is
-    one linear solve, so asking it of every component is cheap.
-    """
-    if not hasattr(model, "fit_composition") or not terms:
-        return None
-    e1 = float(st.session_state["segment_break_1"])
-    e2 = float(st.session_state["segment_break_2"])
-    membrane = MEMBRANE_CHOICES.get(
-        st.session_state["membrane_after_break"], "freeze")
-    cyto = CYTO_CHOICES.get(st.session_state["cyto_starts_at"], "break")
-
-    def _fit(on):
-        try:
-            return model.fit_composition(
-                lo, hi, e1=e1, e2=e2, membrane=membrane, cyto_start=cyto,
-                use_membrane="membrane" in on,
-                use_interior="interior" in on,
-                use_nucleus="nucleus" in on,
-                use_tension="tension" in on,
-                use_nucleus_shell="nucleus_shell" in on,
-                use_cortex="cortex" in on,
-                weighting=st.session_state["weighting"],
-                fit_offset=st.session_state["fit_offset"],
-                **figure_kwargs(model.fit_composition,
-                                term_windows=element_windows(on, lo, hi)),
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            return {"success": False, "error": str(exc)}
-
-    on = tuple(terms)
-    full = _fit(on)
-    if not full.get("success"):
-        return None
-    base = float(full.get("r_squared", float("nan")))
-    names = components_for(st.session_state.get("cell_type"))
-    rows = []
-    for term in [t for t in ALL_TERMS if t in on]:
-        without = _fit(tuple(t for t in on if t != term))
-        r2 = (float(without.get("r_squared", float("nan")))
-              if without.get("success") else float("nan"))
-        rows.append({"label": names[term][0],
-                     "symbol": TERM_SYMBOLS.get(term, term), "in": True,
-                     "r2_without": r2, "drop": base - r2})
-    return {"base": base, "rows": rows, "eps": (e1, e2)}
-
-
 def fit_verdict(fit=None):
     """What the fit on screen came to, at the settings it was given."""
     if fit is None:
@@ -6442,116 +6391,6 @@ PW_METHOD_HELP = {
 PW_FALLBACK = ("refined", "everything", "power", "defaults")
 
 
-# ------------------------------------ what each component is worth here --
-#
-# Nothing on this page ticks a component for you. What the page can do is
-# say what each ticked one is worth on this curve: refit without it and
-# report how much worse the fit gets. That is the insight a person needs
-# to decide the model, and the decision stays theirs.
-
-
-def criterion_value(result, criterion):
-    """A goodness number written so that bigger is always better."""
-    n = int(result.get("n_points") or 0)
-    m = int(result.get("n_params") or 0)
-    r2 = float(result.get("r_squared", float("nan")))
-    if criterion == "r2":
-        return r2
-    if criterion == "adj_r2":
-        adj = result.get("adj_r_squared")
-        if adj is not None and np.isfinite(adj):
-            return float(adj)
-        if n - m - 1 <= 0:
-            return float("-inf")
-        return 1.0 - (1.0 - r2) * (n - 1) / (n - m - 1)
-    if criterion == "bic":
-        rmse = float(result.get("rmse", float("nan")))
-        if not (n > 0 and np.isfinite(rmse) and rmse > 0):
-            return float("-inf")
-        return -(n * np.log(rmse ** 2) + m * np.log(n))
-    return r2
-
-
-def contribution_verdict(drop):
-    """How much worse the fit is without this component, in words."""
-    if not np.isfinite(drop):
-        return "the fit does not stand without it"
-    if drop >= 1e-3:
-        return "carries the fit here"
-    if drop >= 1e-5:
-        return "helps a little"
-    return "adds nothing measurable — the curve does not need it"
-
-
-def piecewise_contributions(epsilon, force_N, off_now):
-    """
-    Refit without each ticked component, at the same boundaries.
-
-    Only which components are in the model changes between the rows, so
-    the drop in R² is what that one component is worth on this curve.
-    """
-    bounds = piecewise_boundaries()
-    settings, untils = piecewise_settings(), piecewise_until()
-    carry = piecewise_carry()
-
-    def _fit(off):
-        return fit_piecewise(
-            epsilon, force_N, boundaries_pct=bounds, regimes=PW_REGIMES,
-            settings=effective_piecewise_settings(settings, untils, tuple(off)),
-            carry=carry)
-
-    full = _fit(off_now)
-    if not full.get("success"):
-        return None
-    base = float(full.get("r_squared", float("nan")))
-    rows = []
-    for name, label, symbol, _colour, _law in PW_COMPONENTS:
-        if name in off_now:
-            rows.append({"label": label, "symbol": symbol, "in": False})
-            continue
-        without = _fit(tuple(off_now) + (name,))
-        r2 = (float(without.get("r_squared", float("nan")))
-              if without.get("success") else float("nan"))
-        rows.append({"label": label, "symbol": symbol, "in": True,
-                     "r2_without": r2, "drop": base - r2})
-    return {"base": base, "rows": rows,
-            "boundaries_pct": tuple(float(v) for v in bounds)}
-
-
-def contributions_table(found, heading_note=""):
-    """What each component is worth, as a table with a verdict per row."""
-    if not found:
-        st.caption("Press **▶ Fit & plot** and this says what each ticked "
-                   "component is worth on this curve.")
-        return
-    base = found["base"]
-    st.markdown(f"With every ticked component in, **R² = {base:.5f}**. Each "
-                "row is the same fit with that one component held at zero, "
-                "at the same boundaries.")
-    flat_table(pd.DataFrame([
-        {
-            "component": row["label"],
-            "in the model": "✓" if row["in"] else "—",
-            "R² without it": (f"{row['r2_without']:.5f}"
-                              if row["in"] and np.isfinite(row["r2_without"])
-                              else "—"),
-            "R² it accounts for": (f"{row['drop']:.5f}" if row["in"]
-                                   and np.isfinite(row["drop"]) else "—"),
-            "what that means": (contribution_verdict(row["drop"]) if row["in"]
-                                else "unticked, so not in this fit"),
-        }
-        for row in found["rows"]
-    ]), align_right=["R² without it", "R² it accounts for"])
-    b = found.get("boundaries_pct") or ()
-    st.caption(
-        (f"All rows fitted at ε = ({b[1]:.2f}, {b[2]:.2f}, {b[3]:.2f}) %, "
-         f"x_end = {b[4]:.1f} %. " if len(b) >= 5 else "")
-        + "Nothing here changes the ticks: a component leaves the model "
-        "when you untick it in step 1 and not before."
-        + (f" {heading_note}" if heading_note else "")
-    )
-
-
 def _pw_score(placement, epsilon, force_N, model):
     """Fit at one placement; its R², worst regime and moduli."""
     bounds = (0.0,) + tuple(float(v) for v in placement) + (
@@ -6881,12 +6720,15 @@ def component_results_strip(fit, extra=""):
                 # Saying so is the difference between a bug and a reading.
                 if str(value).split(" ")[0] in ("0", "0.0", "-0"):
                     st.caption(
-                        "⚠️ **the fit put nothing here.** It is ticked and it "
-                        "was fitted; over this stretch its shape could not be "
-                        "told from another component's, so the fit gave that "
-                        "force to the other one. Start it at a boundary of "
-                        "its own, or widen the fitted range, and see 🔬 "
-                        "**What each component is worth**.")
+                        "⚠️ **measured as zero here — it has not been "
+                        "removed.** It is ticked, it is in the model, it was "
+                        "fitted, and the least squares came back at its "
+                        "lower bound: over this stretch its shape could not "
+                        "be told from another component's, so that force "
+                        "went to the other one. Only your tick takes a "
+                        "component out of the model. Give it a boundary of "
+                        "its own, or widen the fitted range, and it becomes "
+                        "measurable again.")
                 else:
                     st.caption(f"95 % interval: {interval}")
                 st.caption(support)
@@ -7326,22 +7168,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
             fit_explainer(fit, result if ok else None)
 
         # ---- what decided it, from the same fit ------------------------
-        t_worth, t_routes, t_coef, t_model, t_set, t_work = st.tabs([
-            "🔬 What each component is worth", "ε routes compared",
-            "θ̂ by regime", "Model F(x)", "Settings used", "🔍 Working",
+        t_routes, t_coef, t_model, t_set, t_work = st.tabs([
+            "ε routes compared", "θ̂ by regime", "Model F(x)",
+            "Settings used", "🔍 Working",
         ])
-        with t_worth:
-            # Measured once per fit: four more linear solves, and only when
-            # the fit on the page has changed.
-            if ok:
-                if (st.session_state.get("_pw_loo") or {}).get("fit_id") != fid:
-                    st.session_state["_pw_loo"] = {
-                        "fit_id": fid,
-                        "found": piecewise_contributions(epsilon, force_N,
-                                                         off_now),
-                    }
-                contributions_table(
-                    (st.session_state.get("_pw_loo") or {}).get("found"))
         with t_routes:
             if placements:
                 piecewise_placement_table(placements, piecewise_boundaries(),
@@ -12478,20 +12308,6 @@ with tab_analysis:
                     )
 
 
-            # What each ticked component is worth on this curve, measured
-            # once per fit and shown under the plot. It never changes a
-            # tick: the model is the person's to choose.
-            if guided and chosen:
-                stamp = repr((sorted(chosen), round(guided_lo, 6),
-                              round(guided_hi, 6),
-                              round(float(st.session_state["segment_break_1"]), 6),
-                              round(float(st.session_state["segment_break_2"]), 6)))
-                if (st.session_state.get("_legacy_loo") or {}).get("stamp") != stamp:
-                    found_loo = legacy_contributions(model, guided_lo,
-                                                     guided_hi, chosen)
-                    st.session_state["_legacy_loo"] = {"stamp": stamp,
-                                                       "found": found_loo}
-
             # 🔄 Refresh graph: fit at what the board holds, moving nothing.
             if guided and refresh_pressed and chosen:
                 rerun_keeping_settings({"_fit_from_curve": True})
@@ -14265,10 +14081,6 @@ with tab_analysis:
                         plot_option_controls()
                         save_plot_controls(figure, fit, date_acquired)
 
-                    with st.expander("🔬 What each component is worth on "
-                                     "this curve", expanded=False):
-                        contributions_table(
-                            (st.session_state.get("_legacy_loo") or {}).get("found"))
 
                 panel_index = 0
                 if show_schematic and panel_index < len(panel_cols):
