@@ -788,11 +788,15 @@ DEFAULTS = {
     # ε₁ (end of the contact artefact) under 5 %, ε₂ (nucleus met) in the
     # prior's 44 to 62 %, and ε₃ - ε₂ (how long the nuclear bump lasts)
     # 25 % give or take 10. Set from piecewise_prior; editable on the page.
-    "pw_band1_lo": 1.0, "pw_band1_hi": 5.0,
+    # ε₁ is where the second component joins, not the end of a contact
+    # artefact, so it is allowed anywhere in the first third of the squash.
+    "pw_band1_lo": 1.0, "pw_band1_hi": 35.0,
     "pw_band2_lo": 44.0, "pw_band2_hi": 62.0,
     "pw_span_lo": 15.0, "pw_span_hi": 35.0,
     # The last boundary search, with the curve and settings it was run on.
     "pw_boundary_search": None,
+    # The order the four components are met in, first to last.
+    "component_order": ["membrane", "interior", "nucleus_shell", "nucleus"],
     # How the boundaries are placed, and the R² every fit has to reach.
     "pw_method": "refined",
     # Whether ▶ Fit & plot places the boundaries from the curve or fits at
@@ -4936,6 +4940,96 @@ def _carry_the_ticks(to_piecewise):
         st.session_state[target] = bool(st.session_state.get(source, True))
 
 
+# Which component is met first, second, third and fourth. It is a choice,
+# not a property of the model: the same four elements can be met in any
+# order, and both ways of fitting take the order from here. The default is
+# the C2C12's own: the membrane at contact, the cytoskeleton next, then the
+# nuclear envelope, then what it contains.
+COMPONENT_ORDER_DEFAULT = ("membrane", "interior", "nucleus_shell", "nucleus")
+# The name each component goes by on either side: the spring network's term
+# and the four-regime engine's coefficient.
+ORDER_COEFFICIENT = {"membrane": "K_shell", "interior": "K_cyto",
+                     "nucleus_shell": "K_nucleus", "nucleus": "K_core"}
+ONSET_NAMES = ("at contact, ε = 0", "at ε₁", "at ε₂", "at ε₃")
+
+
+def component_order():
+    """The four components in the order they are met, validated."""
+    got = st.session_state.get("component_order") or []
+    order = [t for t in got if t in COMPONENT_ORDER_DEFAULT]
+    if len(set(order)) != len(COMPONENT_ORDER_DEFAULT):
+        return COMPONENT_ORDER_DEFAULT
+    return tuple(dict.fromkeys(order))
+
+
+def component_order_control():
+    """
+    Pick which component is met first, second, third and fourth.
+
+    One row per position, because that is the question: what starts at
+    contact, what joins at ε₁, what joins at ε₂, what joins at ε₃. Both
+    ways of fitting read it, so the order is the model and not a property
+    of one of them.
+    """
+    names = components_for(st.session_state.get("cell_type"))
+    order = list(component_order())
+    picked = []
+    cols = st.columns(len(order))
+    for index, (col, term) in enumerate(zip(cols, order)):
+        with col:
+            choice = st.selectbox(
+                f"{index + 1}ᵉ · starts {ONSET_NAMES[index]}",
+                list(COMPONENT_ORDER_DEFAULT),
+                index=list(COMPONENT_ORDER_DEFAULT).index(term),
+                format_func=lambda t: names[t][0],
+                key=f"component_order_{index}",
+            )
+            picked.append(choice)
+    if len(set(picked)) == len(picked):
+        if tuple(picked) != tuple(order):
+            st.session_state["component_order"] = list(picked)
+            rerun_keeping_settings()
+    else:
+        st.caption("⚠️ Two positions name the same component, so the order "
+                   "below is still **"
+                   + " → ".join(names[t][0] for t in order)
+                   + "**. Give each position a component of its own.")
+    st.caption("Met in this order: "
+               + " → ".join(f"{names[t][0]} {ONSET_NAMES[i]}"
+                            for i, t in enumerate(component_order())))
+
+
+def pw_regimes():
+    """
+    The four regimes, built from the order the components are met in.
+
+    The engine is handed one regime per component: the first from contact
+    with a free intercept, then one at each boundary. Nothing is met in
+    pairs unless the order says so, because every position holds exactly
+    one component.
+    """
+    if not PW_REGIMES:
+        return ()
+    terms = {t.name: t for regime in PW_REGIMES for t in regime.terms}
+    out = []
+    for index, (regime, term) in enumerate(zip(PW_REGIMES, component_order())):
+        name = ORDER_COEFFICIENT[term]
+        if name not in terms:
+            return PW_REGIMES
+        out.append(_dataclasses.replace(
+            regime, terms=(terms[name],), free_offset=(index == 0),
+            title=PW_COMPONENT_TITLES.get(name, regime.title),
+            equation="",
+        ))
+    return tuple(out)
+
+
+def pw_start_index():
+    """Which boundary each coefficient starts at, in the chosen order."""
+    return {ORDER_COEFFICIENT[term]: index
+            for index, term in enumerate(component_order())}
+
+
 def sharing_options():
     """
     The two ways of fitting the four components, and there are only two.
@@ -4965,10 +5059,10 @@ def own_stretch_boundaries():
 
 
 def own_stretch_windows():
-    """One stretch each: [0,ε₁], [ε₁,ε₂], [ε₂,ε₃], [ε₃,end]."""
-    lo, e1, e2, e3, end = own_stretch_boundaries()
-    return {"membrane": (lo, e1), "interior": (e1, e2),
-            "nucleus_shell": (e2, e3), "nucleus": (e3, end)}
+    """One stretch each, in the order the components are met."""
+    edges = own_stretch_boundaries()
+    return {term: (edges[index], edges[index + 1])
+            for index, term in enumerate(component_order())}
 
 
 def _load_sharing_changed():
@@ -5091,9 +5185,14 @@ def modulus_display(symbol, value_pa, se_pa=None):
 
 
 PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
+# What a regime is called when it is that component's own stretch.
+PW_COMPONENT_TITLES = {c[0]: c[1].split(" ", 1)[1] for c in PW_COMPONENTS}
 # Which boundary each component starts at: its regime's start. Moving a
 # component's start moves that boundary, and every component sharing it.
-PW_START_INDEX = {"K_shell": 1, "K_cyto": 1, "K_nucleus": 2, "K_core": 3}
+# The fallback order, used before the page has one of its own. Which
+# boundary a component actually starts at is pw_start_index(), read from
+# the order the components are met in.
+PW_START_INDEX = {"K_shell": 0, "K_cyto": 1, "K_nucleus": 2, "K_core": 3}
 # Any of the four can be switched off; all four are on by default.
 PW_SWITCHABLE = tuple(PW_START_INDEX)
 # Not a component and not on the board: the constant the first stretch is
@@ -5149,7 +5248,7 @@ def piecewise_model_settings():
 def piecewise_ranges(bounds=None):
     """{coefficient: (start, until)} in percent, as the fit will use them."""
     return component_ranges(
-        bounds or piecewise_boundaries(), regimes=PW_REGIMES,
+        bounds or piecewise_boundaries(), regimes=pw_regimes(),
         settings=piecewise_model_settings(), carry=piecewise_carry(),
     )
 
@@ -5213,7 +5312,12 @@ def piecewise_carry():
     The prior's: membrane and cytoskeleton from first contact, the nucleus
     once met. The membrane's tick takes it out of that list.
     """
-    carry = piecewise_prior()["carry"]
+    # Carried forward means exactly that: a component that has been
+    # fitted goes on carrying load through every stretch after it, with
+    # the modulus already found for it. So every component carries, and
+    # the membrane's own tick is the one exception, because a membrane
+    # that holds what it reached at ε₁ is a thing people fit on purpose.
+    carry = tuple(ORDER_COEFFICIENT[t] for t in component_order())
     if not _pw_get("pw_membrane_throughout", True):
         carry = tuple(c for c in carry if c != "K_shell")
     return carry
@@ -5344,13 +5448,13 @@ def run_piecewise_fit(model, epsilon, force_N):
     result = fit_piecewise(
         epsilon, force_N,
         boundaries_pct=piecewise_boundaries(),
-        regimes=PW_REGIMES,
+        regimes=pw_regimes(),
         settings=piecewise_model_settings(),
         carry=piecewise_carry(),
     )
     if result.get("success"):
         result["moduli"] = piecewise_moduli(result, piecewise_geometry(model),
-                                            regimes=PW_REGIMES)
+                                            regimes=pw_regimes())
     return result
 
 
@@ -6272,12 +6376,18 @@ def _pw_range_moved(name):
     lo, hi = sorted(float(v) for v in got)
     b = list(piecewise_boundaries())
     end = b[4]
-    if name == "k_align":  # not on the board any more
+    if name == "k_align":  # not a component of this model
         return
-    i = PW_START_INDEX[name]
-    start = float(np.clip(lo, b[i - 1] + (0.5 if i == 1 else 1.0), b[i + 1] - 1.0))
-    st.session_state[PW_BOUNDARY_KEYS[i - 1]] = round(start, 2)
-    b[i] = start
+    i = pw_start_index().get(name, PW_START_INDEX.get(name, 1))
+    if i == 0:
+        # The component met first starts at contact; there is no boundary
+        # of its own to move, only where the next one joins.
+        start = 0.0
+    else:
+        start = float(np.clip(lo, b[i - 1] + (0.5 if i == 1 else 1.0),
+                              b[i + 1] - 1.0))
+        st.session_state[PW_BOUNDARY_KEYS[i - 1]] = round(start, 2)
+        b[i] = start
     if name == "A_lamina":
         # The lump spans the nuclear regime, so its far end is ε₃.
         st.session_state["pw_b3"] = round(float(np.clip(hi, start + 1.0, end - 1.0)), 2)
@@ -6443,14 +6553,14 @@ def _pw_score(placement, epsilon, force_N, model):
     bounds = (0.0,) + tuple(float(v) for v in placement) + (
         float(st.session_state.get("pw_end", DEFAULTS["pw_end"])),)
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
-                           regimes=PW_REGIMES,
+                           regimes=pw_regimes(),
                            settings=piecewise_model_settings(),
                            carry=piecewise_carry())
     if not result.get("success"):
         return {"best_pct": tuple(placement), "r2": float("nan"),
                 "moduli": {}, "error": result.get("error", "")}
     moduli = piecewise_moduli(result, piecewise_geometry(model),
-                              regimes=PW_REGIMES)
+                              regimes=pw_regimes())
     fitted = [r for r in result["regimes"] if r["fitted"] and r["key"] != "R1"]
     worst = min(fitted, key=lambda r: r["r_squared"]) if fitted else None
     return {
@@ -6470,7 +6580,7 @@ def compute_placements(model, epsilon, force_N):
     """
     bands, span = piecewise_bands(), piecewise_span()
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
-    common = dict(end_pct=end, span_pct=span, regimes=PW_REGIMES,
+    common = dict(end_pct=end, span_pct=span, regimes=pw_regimes(),
                   settings=piecewise_model_settings(), carry=piecewise_carry())
     out = {"signature": piecewise_signature(epsilon, force_N), "rows": {},
            "searches": {}, "errors": {}}
@@ -6711,7 +6821,7 @@ def collection_name():
 def collection_record(name, source, height_um, epsilon, force_N, result,
                       geometry, route=""):
     """One cell as the collection keeps it: its curve, its ε, its numbers."""
-    moduli = piecewise_moduli(result, geometry, regimes=PW_REGIMES)
+    moduli = piecewise_moduli(result, geometry, regimes=pw_regimes())
     lamina = lamina_summary(result, geometry) or {}
     return {
         "name": name, "source": source, "height_um": float(height_um),
@@ -6900,7 +7010,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
             load_sharing_control()
         with model_col:
             st.latex(r"\hat F_k(x) = \hat F_{k-1}(\varepsilon_{k-1}) + "
-                     r"\sum_{j\,\in\,k}\theta_j\,\phi_j(x)")
+                     r"\theta_k\,\phi_k(x)")
+        st.markdown("**The order they are met in**")
+        component_order_control()
         value_slots = piecewise_components_panel(
             piecewise_boundaries(), None, None, columns=2)
         components_note_slot = st.empty()
@@ -7398,7 +7510,7 @@ def refit_collection_cell(record, height_um=None):
     eps, force = record["epsilon"], record["force_N"]
     model = build_model(eps, force, height_um=height)
     result = fit_piecewise(eps, force, boundaries_pct=record["bounds_pct"],
-                           regimes=PW_REGIMES,
+                           regimes=pw_regimes(),
                            settings=record.get("settings") or {},
                            carry=tuple(record.get("carry") or ()))
     if not result.get("success"):
@@ -7422,7 +7534,7 @@ def fit_cell_from_file(name, epsilon, force_N, height_um):
     bounds = (0.0,) + tuple(placement) + (
         float(st.session_state.get("pw_end", DEFAULTS["pw_end"])),)
     result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
-                           regimes=PW_REGIMES,
+                           regimes=pw_regimes(),
                            settings=piecewise_model_settings(),
                            carry=piecewise_carry())
     if not result.get("success"):
@@ -10975,7 +11087,7 @@ def refit_stored_cell(store, cell_id, settings):
             model.epsilon, model.force,
             boundaries_pct=merged.get("piecewise_boundaries_pct")
             or C2C12_BOUNDARIES_PCT,
-            regimes=PW_REGIMES,
+            regimes=pw_regimes(),
             settings=effective_piecewise_settings(
                 merged.get("piecewise_settings") or {},
                 merged.get("piecewise_until") or {},
@@ -10990,7 +11102,7 @@ def refit_stored_cell(store, cell_id, settings):
             result,
             piecewise_geometry(model, probe_um=probe_um,
                                coat_nm=merged.get("protein_coat_nm", 200.0)),
-            regimes=PW_REGIMES,
+            regimes=pw_regimes(),
         )
         fit = piecewise_as_fit(result, model, probe_um=probe_um,
                                settings=merged.get("piecewise_settings") or {},
@@ -12234,6 +12346,8 @@ with tab_analysis:
                 with model_col:
                     st.latex(r"F(\varepsilon) = \sum_k a_k E_k\,"
                              r"g_k(\varepsilon)")
+                st.markdown("**The order they are met in**")
+                component_order_control()
                 # The components are the rest of step 1: they are what the
                 # plot draws, one tick per curve and one bar per range.
                 # Filled after the tiles, because the range the bars live
