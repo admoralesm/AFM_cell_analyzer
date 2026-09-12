@@ -182,6 +182,16 @@ confinement_from_profile = getattr(
     _piecewise_module, "confinement_from_profile", None)
 best_confinement = getattr(_piecewise_module, "best_confinement", None)
 ENGINE_WEIGHTINGS = getattr(_piecewise_module, "WEIGHTINGS", {}) or {}
+# Method validation: the numbers a fit has to be judged on rather than R².
+information_criteria = getattr(_piecewise_module, "information_criteria", None)
+akaike_weights = getattr(_piecewise_module, "akaike_weights", None)
+residual_diagnostics = getattr(_piecewise_module, "residual_diagnostics", None)
+coefficient_significance = getattr(
+    _piecewise_module, "coefficient_significance", None)
+model_conditioning = getattr(_piecewise_module, "model_conditioning", None)
+HAS_VALIDATION = all(f is not None for f in (
+    information_criteria, akaike_weights, residual_diagnostics,
+    coefficient_significance, model_conditioning))
 HAS_PIECEWISE = _pull(_piecewise_module, "piecewise_fit.py", (
     "C2C12_BOUNDARIES_PCT",
     "C2C12_REGIMES",
@@ -5337,11 +5347,102 @@ def load_sharing_control():
                "change this.")
 
 
+# The boundaries have to increase, and a fit that refuses to run because
+# they do not is a dead end: the person is looking at a page with no graph
+# on it and a sentence about ordering. So they are repaired instead --
+# put back in order, spread by at least PW_MIN_GAP, and given an x_end past
+# the last of them -- and what was repaired is said out loud on the board.
+# Nothing here is a silent correction: every repair appears as a caption.
+PW_MIN_GAP = 0.5
+
+
+def data_top_pct(default=None):
+    """How far this curve actually goes, in per cent."""
+    try:
+        top = float(st.session_state.get("_pw_data_top") or 0.0)
+    except (TypeError, ValueError):
+        top = 0.0
+    if top > 1.0:
+        return top
+    return float(default if default is not None else DEFAULTS["pw_end"])
+
+
+def repair_boundaries(values, top=None):
+    """
+    (bounds, what was repaired): boundaries that always define a fit.
+
+    Takes the four numbers on the board and returns (0, ε₁, ε₂, ε₃, x_end)
+    guaranteed to increase, with a note for each thing that had to be
+    changed. A missing or impossible number is replaced, never refused.
+    """
+    ceiling = float(min(max(float(top if top else data_top_pct()), 2.0), 100.0))
+    said = []
+
+    def number(value, fallback):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        return value if np.isfinite(value) else float(fallback)
+
+    e1, e2, e3, end = (number(v, DEFAULTS[k])
+                       for v, k in zip(values, PW_BOUNDARY_KEYS))
+    inner = sorted((e1, e2, e3))
+    if [round(v, 4) for v in inner] != [round(v, 4) for v in (e1, e2, e3)]:
+        said.append(
+            f"ε₁, ε₂, ε₃ were {e1:g}, {e2:g}, {e3:g} %, which do not "
+            f"increase; they were put in order as {inner[0]:g}, "
+            f"{inner[1]:g}, {inner[2]:g} %")
+    was_end = end
+    if end <= inner[-1] + PW_MIN_GAP or end <= 0.0:
+        end = round(min(ceiling, 100.0), 1)
+        if end <= inner[-1] + PW_MIN_GAP:
+            end = round(inner[-1] + PW_MIN_GAP, 2)
+        said.append(
+            f"x_end was {was_end:g} %, not past ε₃ = {inner[-1]:g} %, so "
+            f"there was no last stretch to fit; the fit runs to {end:g} % "
+            "instead")
+    # Spread them: each at least PW_MIN_GAP above the one before, then, if
+    # that pushed the last past x_end, compressed back down from the top.
+    floor = PW_MIN_GAP
+    spread = []
+    for value in inner:
+        value = max(value, floor)
+        spread.append(value)
+        floor = value + PW_MIN_GAP
+    if spread[-1] > end - PW_MIN_GAP:
+        ceiling_here = end - PW_MIN_GAP
+        for i in range(2, -1, -1):
+            spread[i] = min(spread[i], ceiling_here)
+            ceiling_here = spread[i] - PW_MIN_GAP
+        spread = [max(v, PW_MIN_GAP * (i + 1))
+                  for i, v in enumerate(spread)]
+    if ([round(v, 4) for v in spread] != [round(v, 4) for v in inner]
+            and not said):
+        said.append("ε₁, ε₂, ε₃ were moved apart so that every stretch has "
+                    "points in it")
+    elif [round(v, 4) for v in spread] != [round(v, 4) for v in inner]:
+        said.append(f"and moved apart to {spread[0]:.2f}, {spread[1]:.2f}, "
+                    f"{spread[2]:.2f} % so that every stretch has points")
+    return (0.0, spread[0], spread[1], spread[2], float(end)), said
+
+
 def piecewise_boundaries():
-    """(0, b1, b2, b3, end) in percent, as the page has them."""
-    return (0.0,) + tuple(
-        float(_pw_get(key, DEFAULTS[key])) for key in PW_BOUNDARY_KEYS
-    )
+    """
+    (0, ε₁, ε₂, ε₃, x_end) in percent, always defining a fit.
+
+    Whatever the board holds, what comes back increases. See
+    :func:`repair_boundaries`; :func:`boundary_repairs` is the same call
+    kept for its notes, which the board prints.
+    """
+    return repair_boundaries(
+        [_pw_get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS])[0]
+
+
+def boundary_repairs():
+    """What had to be repaired to make the board's boundaries a fit."""
+    return repair_boundaries(
+        [_pw_get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS])[1]
 
 
 # The components of the four-regime model, in the order the plates meet
@@ -5771,6 +5872,127 @@ def best_mixture(epsilon, force_N, model=None):
     return {"carry": best["carry"], "r2": best["r2"],
             "unmeasured": best["unmeasured"],
             "inside": best.get("inside", 0), "rows": rows}
+
+
+# ============================================================ the screen ==
+#
+# "Which components are in this cell?" is a model-selection question, and
+# the way to answer it is the way any analytical method answers one: fit
+# every candidate to the SAME points, score each on a criterion that
+# charges for parameters, and report the whole ranking rather than the
+# winner alone.
+#
+#   * Sixteen candidates: every subset of the four components (the empty
+#     one is the baseline C0 alone, which is worth seeing -- if it is not
+#     far behind, this curve has nothing in it).
+#   * The same boundaries, the same weighting, the same confinement, the
+#     same points. Only which components are free changes, so AIC
+#     differences between candidates mean what they are supposed to.
+#   * Scored on AICc, with the corresponding Akaike weight: the
+#     probability, over the set tried, that this candidate is the best one.
+#     ΔAICc under 2 is a tie, and a tie is reported as a tie rather than
+#     resolved by the fourth decimal place of R2.
+#   * Each candidate also carries how many of its components were actually
+#     DETECTED -- coefficient distinguishable from zero -- because a
+#     candidate that wins by including a component it cannot see has not
+#     learnt anything, and the screen says so instead of hiding it.
+
+PW_SCREEN_TIE = 2.0
+
+
+def screen_components(model, epsilon, force_N, subsets=None, budget=None):
+    """
+    Fit every subset of the components at the board's boundaries and rank them.
+
+    Returns {"rows": [...], "best", "boundaries_pct", "n_points"} where each
+    row is {"on", "label", "n_free", "r2", "aicc", "bic", "delta", "weight",
+    "detected", "unmeasured", "moduli"}. The row order is the ranking.
+    """
+    bounds = piecewise_boundaries()
+    every = [name for name, *_rest in PW_COMPONENTS]
+    if subsets is None:
+        subsets = []
+        for mask in range(1 << len(every)):
+            subsets.append(tuple(name for i, name in enumerate(every)
+                                 if mask >> i & 1))
+    geometry = piecewise_geometry(model) if model is not None else None
+    names = components_for(st.session_state.get("cell_type"))
+    label_of = {coefficient: names[term][0]
+                for term, coefficient in ORDER_COEFFICIENT.items()
+                if term in names}
+    rows = []
+    for on in subsets:
+        off = ("k_align",) + tuple(n for n in every if n not in on)
+        settings = effective_piecewise_settings(
+            piecewise_settings(), piecewise_until(), off)
+        result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                               regimes=pw_regimes(), settings=settings,
+                               carry=tuple(n for n in piecewise_carry()
+                                           if n in on),
+                               **fit_extras())
+        if not result.get("success"):
+            continue
+        significance = (coefficient_significance(result)
+                        if coefficient_significance is not None else {})
+        detected = [n for n in on
+                    if (significance.get(n) or {}).get("detected")]
+        moduli = {}
+        if geometry is not None:
+            try:
+                moduli = {row["symbol"]: row["E_Pa"] for row in
+                          piecewise_moduli(result, geometry,
+                                           regimes=pw_regimes()).values()
+                          if isinstance(row, dict) and "symbol" in row}
+            except Exception:  # pragma: no cover - conversion is optional
+                moduli = {}
+        rows.append({
+            "on": tuple(on),
+            "label": (" + ".join(label_of.get(n, n) for n in on)
+                      if on else "baseline C₀ only"),
+            "n_free": int(result.get("n_free_params", 0)),
+            "r2": float(result.get("r_squared", float("nan"))),
+            "aicc": float(result.get("aicc", float("nan"))),
+            "bic": float(result.get("bic", float("nan"))),
+            "detected": tuple(detected),
+            "unmeasured": tuple(n for n in on if n not in detected),
+            "residuals": result.get("residuals") or {},
+            "moduli": moduli,
+        })
+    if not rows:
+        return None
+    delta, weight = akaike_weights([r["aicc"] for r in rows])
+    for row, d, w in zip(rows, delta, weight):
+        row["delta"] = float(d)
+        row["weight"] = float(w)
+    # Ranked by AICc; ties (ΔAICc < 2, which is no evidence either way)
+    # broken towards the candidate with fewer unmeasured components and
+    # then fewer parameters, which is what a person would do by hand.
+    rows.sort(key=lambda r: (round(r["delta"] / PW_SCREEN_TIE),
+                             len(r["unmeasured"]), r["n_free"], r["delta"]))
+    return {"rows": rows, "best": rows[0], "boundaries_pct": bounds,
+            "n_points": int(np.size(epsilon))}
+
+
+def screen_verdict(screen):
+    """The screen's conclusion, in a sentence a person can quote."""
+    if not screen or not screen.get("rows"):
+        return ""
+    best = screen["best"]
+    ties = [r for r in screen["rows"]
+            if r is not best and r["delta"] < PW_SCREEN_TIE]
+    said = (f"**{best['label']}** is the best-supported combination "
+            f"(ΔAICc = 0, Akaike weight {best['weight']:.0%}, "
+            f"R² = {best['r2']:.5f}, {best['n_free']} free parameters)")
+    if best["unmeasured"]:
+        said += (", though "
+                 + str(len(best["unmeasured"]))
+                 + " of its components could not be told from zero")
+    if ties:
+        said += (f". {len(ties)} other combination"
+                 + ("s are" if len(ties) > 1 else " is")
+                 + " within ΔAICc < 2 of it, which is no evidence either "
+                 "way: this curve cannot separate them")
+    return said + "."
 
 
 def mixture_note(carry):
@@ -6280,6 +6502,352 @@ def small_strain_panel(model, epsilon, force_N, whole_curve=None):
             "starting at ε₁ is converted with the prefactor of a law "
             "starting at 0, which overstates it by (100/(100−ε₁))^p."
         )
+
+
+def screen_signature(epsilon, force_N):
+    """What a screen depends on: change any of it and the screen is stale."""
+    return repr((
+        piecewise_signature(epsilon, force_N),
+        tuple(round(float(v), 3) for v in piecewise_boundaries()),
+        piecewise_style(), tuple(sorted(piecewise_carry())),
+        piecewise_weighting(), round(piecewise_squeeze(), 3),
+        tuple(sorted(component_order())),
+    ))
+
+
+def component_screen_panel(model, epsilon, force_N):
+    """
+    Step E: fit every combination of the components and rank them properly.
+
+    One press, sixteen fits, one table. The point of it is that it answers
+    the question the ticks only pretend to answer -- which components does
+    this curve actually contain evidence for -- and it answers it the way a
+    method is validated: same points, same boundaries, a criterion that
+    charges for parameters, and the whole ranking rather than the winner.
+    """
+    if not HAS_VALIDATION:
+        return
+    signature = screen_signature(epsilon, force_N)
+    stored = st.session_state.get("pw_screen") or {}
+    fresh = stored.get("signature") == signature
+    run_col, view_col = st.columns([1.1, 1.6])
+    with run_col:
+        pressed = st.button(
+            "🔬 Screen every combination", key="pw_screen_go", **STRETCH,
+            help="Fits all sixteen subsets of the four components at the "
+                 "boundaries on the board, on the same points and with the "
+                 "same weighting, and ranks them by AICc. Nothing is "
+                 "changed by it: it reports, and you decide.",
+        )
+    with view_col:
+        if stored and not fresh:
+            st.caption("⚠️ The screen below was run on different settings. "
+                       "Press 🔬 again to bring it up to date.")
+        elif not stored:
+            st.caption("Not screened yet. The ticks above are a hypothesis; "
+                       "this is the test of it.")
+    if pressed:
+        with st.spinner("Fitting sixteen combinations…"):
+            thin_eps, thin_force, step = thinned_for_search(epsilon, force_N)
+            screen = screen_components(model, thin_eps, thin_force)
+        if screen:
+            screen["signature"] = signature
+            screen["every_nth"] = step
+            st.session_state["pw_screen"] = screen
+            stored, fresh = screen, True
+        else:
+            st.warning("No combination could be fitted at these boundaries.",
+                       icon="⚠️")
+    if not stored or not stored.get("rows"):
+        return
+
+    st.markdown(screen_verdict(stored))
+    best = stored["best"]
+    names = components_for(st.session_state.get("cell_type"))
+    label_of = {coefficient: names[term][0]
+                for term, coefficient in ORDER_COEFFICIENT.items()
+                if term in names}
+    table = []
+    for rank, row in enumerate(stored["rows"], start=1):
+        table.append({
+            "#": rank,
+            "Combination": row["label"],
+            "k": row["n_free"],
+            "R²": round(row["r2"], 6),
+            "AICc": round(row["aicc"], 1),
+            "ΔAICc": ("—" if not np.isfinite(row["delta"])
+                      else round(row["delta"], 2)),
+            "Akaike weight": f"{row['weight']:.1%}",
+            "Detected": f"{len(row['detected'])}/{len(row['on'])}"
+            if row["on"] else "—",
+            "Lack of fit": (
+                "—" if not np.isfinite(
+                    float((row["residuals"] or {}).get("bias_pct", float("nan"))))
+                else f"{float(row['residuals']['bias_pct']):.1f} %"),
+            "Evidence": ("best" if rank == 1 else
+                         "tied with the best" if row["delta"] < PW_SCREEN_TIE
+                         else "weaker" if row["delta"] < 10 else "ruled out"),
+        })
+    st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
+    st.caption(
+        "**k** free parameters · **ΔAICc** how much worse than the best "
+        f"(under {PW_SCREEN_TIE:g} is a tie, over 10 is ruled out) · "
+        "**Akaike weight** the probability this is the best of the sixteen "
+        "· **Detected** how many of its components have a coefficient "
+        "distinguishable from zero · **Lack of fit** the worst systematic "
+        "deviation left over, as a percentage of the force there."
+        + (f" Screened on every {stored.get('every_nth', 1)}th point."
+           if stored.get("every_nth", 1) > 1 else "")
+    )
+    on_now = tuple(n for n, *_r in PW_COMPONENTS if n not in piecewise_off())
+    if tuple(best["on"]) == on_now:
+        st.success("The ticks above already are the best-supported "
+                   "combination.", icon="✅")
+    elif st.button(f"✔️ Adopt “{best['label']}”", key="pw_screen_adopt",
+                   help="Ticks exactly the components of the winning "
+                        "combination and refits."):
+        rerun_keeping_settings({
+            **{f"pw_use_{name}": (name in best["on"])
+               for name, *_r in PW_COMPONENTS},
+            "_pw_apply": True,
+        })
+
+
+def method_statement(result, screen=None):
+    """
+    The fit as it would be written in a methods section, from the fit itself.
+
+    Nothing in it is typed: the boundaries, the weighting, the criterion,
+    the components detected and the lack of fit all come off the result, so
+    a paragraph pasted into a paper cannot describe a fit that was not run.
+    """
+    if not (result and result.get("success")):
+        return ""
+    b = result.get("boundaries_pct") or ()
+    names = components_for(st.session_state.get("cell_type"))
+    label_of = {coefficient: names[term][0].split(" ", 1)[-1]
+                for term, coefficient in ORDER_COEFFICIENT.items()
+                if term in names}
+    off = set(piecewise_off())
+    on = [label_of.get(name, name) for name, *_r in PW_COMPONENTS
+          if name not in off]
+    significance = (coefficient_significance(result)
+                    if coefficient_significance is not None else {})
+    detected = [label_of.get(name, name) for name, *_r in PW_COMPONENTS
+                if name not in off
+                and (significance.get(name) or {}).get("detected")]
+    diagnostics = result.get("residuals") or {}
+    weighting = {"absolute": "unweighted least squares",
+                 "relative": "least squares weighted by 1/F, so that every "
+                             "decade of force carries equal weight",
+                 "sqrt": "least squares weighted by 1/√F"}.get(
+        result.get("weighting", "absolute"), "least squares")
+    q = float(result.get("squeeze") or 0.0)
+    lines = [
+        f"Force–deformation curves were fitted with a sequential, "
+        f"C0-anchored piecewise model of {len(on)} components "
+        f"({', '.join(on)}), each contributing "
+        f"θ·[min(x,u)−s]^p over its own domain"
+        + (f" and every term multiplied by a confinement factor "
+           f"(1−x/100)^−q with q = {q:.2f}" if q else "")
+        + ".",
+        f"Domains were bounded at ε₁ = {b[1]:.2f} %, ε₂ = {b[2]:.2f} %, "
+        f"ε₃ = {b[3]:.2f} % relative deformation and the fit was taken to "
+        f"x_end = {b[4]:.1f} %; each regime was anchored to the force "
+        f"reached at its left-hand boundary, so the fitted curve is "
+        f"continuous by construction.",
+        f"Coefficients were estimated by bounded {weighting} "
+        f"(n = {int(result.get('n_points', 0)):,} points, "
+        f"k = {int(result.get('n_free_params', 0))} free parameters), "
+        f"giving R² = {float(result.get('r_squared', float('nan'))):.5f} "
+        f"and AICc = {float(result.get('aicc', float('nan'))):.0f}.",
+    ]
+    if np.isfinite(diagnostics.get("bias_pct", float("nan"))):
+        lines.append(
+            f"The worst systematic deviation of the fit, taken as the "
+            f"residual smoothed over "
+            f"{diagnostics.get('bias_window_pct', 5):.0f} % of the curve, "
+            f"was {float(diagnostics['bias_pct']):.2f} % of the local force"
+            + (f" near x = {float(diagnostics['bias_at_pct']):.0f} %."
+               if np.isfinite(diagnostics.get("bias_at_pct", float("nan")))
+               else "."))
+    if on:
+        lines.append(
+            f"Of the {len(on)} components fitted, {len(detected)} had "
+            f"coefficients distinguishable from zero at the 95 % level"
+            + (f" ({', '.join(detected)})." if detected else "."))
+    if screen and screen.get("rows"):
+        best = screen["best"]
+        plain = " + ".join(
+            part.split(" ", 1)[-1] if " " in part else part
+            for part in str(best["label"]).split(" + "))
+        lines.append(
+            f"All {len(screen['rows'])} subsets of the components were "
+            f"fitted to the same points at the same boundaries and ranked "
+            f"by AICc; the best-supported combination was "
+            f"{plain} (Akaike weight {best['weight']:.0%}).")
+    return " ".join(lines)
+
+
+def validation_panel(result, epsilon, force_N, model=None):
+    """
+    Step F: what the fit is worth, in the terms a method is validated in.
+
+    Selectivity, detection, parsimony and residual structure, each with the
+    number, the usual line, and what it means for this fit in words.
+    """
+    if not (HAS_VALIDATION and result and result.get("success")):
+        return
+    box = st.container(border=True)
+    with box:
+        st.markdown("#### 🧪 Method validation")
+        st.caption(
+            "R² is not a result: it rises with every parameter added and is "
+            "close to 1 for anything that goes up over four decades of "
+            "force. These are the numbers the fit has to survive instead."
+        )
+        tabs = st.tabs(["Detection", "Selectivity", "Parsimony", "Residuals"])
+        names = components_for(st.session_state.get("cell_type"))
+        label_of = {coefficient: names[term][0]
+                    for term, coefficient in ORDER_COEFFICIENT.items()
+                    if term in names}
+        moduli = result.get("moduli") or {}
+        off = set(piecewise_off())
+
+        with tabs[0]:
+            st.caption("Is each coefficient distinguishable from zero? "
+                       "t = θ̂/SE, and the interval that goes with it. A "
+                       "component whose interval covers zero has not been "
+                       "measured on this curve — which is a result, not a "
+                       "failure.")
+            rows = []
+            for name, row in coefficient_significance(result).items():
+                if name in ("k_align",) or name in off:
+                    continue
+                modulus = moduli.get(name) or {}
+                symbol = modulus.get("symbol", name)
+                rows.append({
+                    "Component": label_of.get(name, name),
+                    "θ̂": f"{row['value']:.4g}",
+                    "SE": f"{row['se']:.3g}" if np.isfinite(row["se"]) else "—",
+                    "t": f"{row['t']:.3g}" if np.isfinite(row["t"]) else "—",
+                    "p": ("< 0.001" if row["p_value"] < 1e-3
+                          else f"{row['p_value']:.3f}"
+                          if np.isfinite(row["p_value"]) else "—"),
+                    "Modulus": modulus_display(symbol, modulus.get("E_Pa"),
+                                               modulus.get("E_se_Pa")),
+                    "Verdict": ("✅ " if row["detected"] else "⚠️ ")
+                    + row["verdict"],
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+
+        with tabs[1]:
+            st.caption(
+                "Are the components telling themselves apart? The variance "
+                "inflation factor says how much wider a coefficient's "
+                "interval is because the other components are describing "
+                "some of the same curve. Above 10, two of them are fitting "
+                "one feature and the split between them is arbitrary — "
+                "which is how one comes back at zero and its neighbour ten "
+                "times too stiff."
+            )
+            conditioning = model_conditioning(
+                epsilon, force_N, boundaries_pct=result["boundaries_pct"],
+                regimes=pw_regimes(), settings=piecewise_model_settings(),
+                carry=piecewise_carry(), squeeze=piecewise_squeeze())
+            rows = []
+            for name, value in (conditioning.get("vif") or {}).items():
+                if name in ("k_align", "C0") or name in off:
+                    continue
+                rows.append({
+                    "Component": label_of.get(name, name),
+                    "VIF": ("∞" if not np.isfinite(value)
+                            else f"{value:.1f}"),
+                    "Reading": ("🟢 independent" if value < 5 else
+                                "🟡 overlapping" if value < 10 else
+                                "🔴 not separable from the others"),
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+            kappa = conditioning.get("condition_number", float("nan"))
+            if np.isfinite(kappa):
+                st.metric("Condition number of the design", f"{kappa:.1f}")
+                st.caption("Under 30 is comfortable; over 100 means the "
+                           "components are nearly the same function of x "
+                           "over the stretches they are fitted on.")
+
+        with tabs[2]:
+            st.caption("Does the model earn its parameters? AIC and BIC "
+                       "charge for each one; only differences between fits "
+                       "of the same points mean anything, which is what the "
+                       "screen in step E compares.")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("free parameters k",
+                      f"{int(result.get('n_free_params', 0))}")
+            c2.metric("AICc", f"{float(result.get('aicc', float('nan'))):.1f}")
+            c3.metric("BIC", f"{float(result.get('bic', float('nan'))):.1f}")
+            c4.metric("points n", f"{int(result.get('n_points', 0)):,}")
+            screen = st.session_state.get("pw_screen") or {}
+            if screen.get("rows"):
+                st.caption("From the last screen: " + screen_verdict(screen))
+            st.markdown("**The method, in a paragraph**")
+            st.caption("For a methods section. Everything in it is read "
+                       "from this fit, not typed.")
+            st.code(method_statement(result, screen), language=None)
+
+        with tabs[3]:
+            st.caption(
+                "Is what is left over noise, or a feature the model missed? "
+                "Random residuals change sign about as often as a coin "
+                "would; a model with the shape wrong leaves long runs of "
+                "one sign. The runs test sees that where R² cannot."
+            )
+            diagnostics = result.get("residuals") or {}
+            bias = float(diagnostics.get("bias_pct", float("nan")))
+            at = float(diagnostics.get("bias_at_pct", float("nan")))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("worst systematic bias",
+                      f"{bias:.2f} %" if np.isfinite(bias) else "—",
+                      help="The residual smoothed over "
+                           f"{diagnostics.get('bias_window_pct', 5):.0f} % of "
+                           "the curve, at its worst, as a percentage of the "
+                           "force there. This is the number to act on.")
+            c2.metric("where", f"{at:.1f} %" if np.isfinite(at) else "—")
+            c3.metric("residual RMS",
+                      f"{float(result.get('rmse', float('nan'))):.3g} N")
+            if diagnostics.get("structured") is True:
+                st.warning(
+                    f"The model is systematically off by up to {bias:.1f} % "
+                    + (f"around x = {at:.1f} %" if np.isfinite(at) else "")
+                    + ". Something in the shape of this curve is not in the "
+                    "model: a boundary in the wrong place, a component not "
+                    "ticked in **A**, or a law that is not the right law "
+                    "over that stretch. Step **E** will say whether another "
+                    "combination does better.", icon="⚠️")
+            elif diagnostics.get("structured") is False:
+                st.success(
+                    f"No systematic lack of fit: the smoothed residual never "
+                    f"exceeds {bias:.2f} % of the force, which is inside the "
+                    "noise of the measurement.", icon="✅")
+            z = float(diagnostics.get("runs_z", float("nan")))
+            dw = float(diagnostics.get("durbin_watson", float("nan")))
+            st.caption(
+                "Runs-test z = "
+                + (f"{z:.1f}" if np.isfinite(z) else "—")
+                + ", Durbin–Watson = "
+                + (f"{dw:.3f}" if np.isfinite(dw) else "—")
+                + ". On a curve of "
+                + f"{int(diagnostics.get('n_points', 0)):,} points these "
+                "almost always say the residuals are not random, because "
+                "the noise itself is correlated from point to point — which "
+                "is why the bias above, not the p-value, is what the "
+                "verdict is taken from."
+            )
+            relative = float(result.get("relative_rmse", float("nan")))
+            if np.isfinite(relative):
+                st.caption(f"Typical error over the top decade of force: "
+                           f"{100.0 * relative:.1f} %.")
 
 
 def run_piecewise_fit(model, epsilon, force_N):
@@ -8309,6 +8877,24 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.session_state["pw_eps_way"] = "typed"
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
+    st.session_state["_pw_data_top"] = top
+    # Put the board's own numbers right before any of their boxes is drawn,
+    # so the person never sees a fit refused for boundaries that do not
+    # increase. Writing a widget key is allowed here and only here: this
+    # runs before the widgets are created in this run. What was changed is
+    # kept and printed on the board itself.
+    _fixed, _repaired = repair_boundaries(
+        [st.session_state.get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS],
+        top=top)
+    for _key, _value in zip(PW_BOUNDARY_KEYS, _fixed[1:]):
+        try:
+            _same = abs(float(st.session_state.get(_key, DEFAULTS[_key]))
+                        - float(_value)) < 1e-6
+        except (TypeError, ValueError):
+            _same = False
+        if not _same:
+            st.session_state[_key] = round(float(_value), 2)
+    st.session_state["_pw_boundary_repairs"] = _repaired
     data = st.session_state.get("data") or {}
     curve_key = repr((data.get("source"), int(np.size(epsilon)),
                       round(float(force_N[-1]), 15) if np.size(force_N) else 0.0))
@@ -8469,10 +9055,20 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # everything else out of the way behind Advanced. Nothing on it
         # ticks or unticks a component: the ticks are the person's, and
         # every fit is made of exactly what they have ticked.
-        st.markdown("#### 🎛️ Fitting")
+        st.markdown("#### 🎛️ Fitting — the method, step by step")
+        st.caption(
+            "Read top to bottom it is a method: **A** what is in the "
+            "specimen, **B** over what domains, **C** under what regression "
+            "conditions, **D** run it, **E** test the hypothesis in A "
+            "against the curve, and **F**, under the results, what the "
+            "answer is worth."
+        )
         status_slot = st.empty()
 
-        st.markdown("**Step 1 · What the cell is made of**")
+        st.markdown("**A · Analyte — what the cell is made of**")
+        st.caption("The components ticked here are a hypothesis about this "
+                   "cell. Exactly what is ticked is fitted, drawn and "
+                   "reported; step E tests whether the curve supports it.")
         share_col, model_col = st.columns([1.2, 1], gap="medium")
         with share_col:
             load_sharing_control()
@@ -8489,7 +9085,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
         board_off = set(piecewise_off())
         board_ranges = piecewise_ranges(piecewise_boundaries())
 
-        st.markdown("**Step 2 · Where its parts take over**")
+        st.markdown("**B · Domains — where each part takes over**")
+        st.caption("The stretch of deformation each component is fitted "
+                   "on. Found from the curve, or held exactly where you "
+                   "put them.")
         st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
                  r"\le x_{end}")
         st.radio(
@@ -8516,6 +9115,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
                             key="pw_end", help="Last point fitted; not moved "
                             "by the routes.")
+        for note in (st.session_state.get("_pw_boundary_repairs") or ()):
+            st.caption(f"🔧 Repaired: {note}.")
         for note in constraint_notes(piecewise_boundaries()):
             st.caption(f"⚠️ {note}.")
         if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
@@ -8524,10 +9125,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
                            rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
 
-        st.markdown("**Step 2½ · How the curve is read**")
+        st.markdown("**C · Regression conditions — how the curve is read**")
+        st.caption("Neither of these changes the model. They change which "
+                   "part of the curve the model is fitted to, and over four "
+                   "decades of force that decides the answer.")
         read_curve_control(epsilon, force_N)
 
-        st.markdown("**Step 3 · Fit**")
+        st.markdown("**D · Run**")
         nothing_ticked = len(piecewise_off()) >= len(PW_SWITCHABLE) + 1
         go1, go2, go3 = st.columns([1.1, 1.3, 1])
         with go1:
@@ -8559,7 +9163,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 **STRETCH,
             )
         if nothing_ticked:
-            st.warning("Tick at least one component in step 1 before "
+            st.warning("Tick at least one component in **A** before "
                        "fitting.", icon="⚠️")
         else:
             st.caption(
@@ -8568,6 +9172,26 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "target, widening the prior only as far as it has to. "
                 "**🔄 Refresh graph** just draws the board again."
             )
+
+        st.markdown("**E · Screen — which components the curve supports**")
+        st.caption(
+            "Every combination of the four, fitted to the same points at "
+            "the same boundaries, ranked by AICc. This is the test of the "
+            "hypothesis in **A**: it charges for parameters, so a component "
+            "that only flatters R² loses, and it reports the whole ranking "
+            "including the ties, because a tie is the honest answer when "
+            "the curve cannot separate two combinations."
+        )
+        st.caption(
+            "One caveat, stated rather than hidden: every candidate is "
+            "fitted at the boundaries on the board, which were placed for "
+            "the combination ticked in **A**. That is what makes the AICc "
+            "differences comparable — same points, same domains — but it "
+            "does favour the combination the boundaries were chosen for. "
+            "To screen without that lean, set the boundaries by hand in "
+            "**B** first."
+        )
+        component_screen_panel(model, epsilon, force_N)
 
         # The board holds what is decided here and nothing else. The route
         # that finds ε is chosen by the fit itself -- every route is scored
@@ -8801,6 +9425,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     )
                     st.session_state["pw_collection"] = collection
                     rerun_keeping_settings()
+
+        # ---- F · what the answer is worth ------------------------------
+        if ok:
+            validation_panel(result, epsilon, force_N, model)
 
         # ---- the same cell, read where the literature reads it ---------
         small_strain_panel(
