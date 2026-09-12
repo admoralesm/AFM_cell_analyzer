@@ -313,15 +313,19 @@ def force_curve_figure(
                     ))
 
         if style.show_components:
+            # The colours are the app's component colours, the same four
+            # squares that name the components on the control board and the
+            # same layers the regime-by-regime plot draws, so a component is
+            # one colour wherever it appears.
             for comp, label, dash, color in (
-                (membrane_N, "· membrane contribution", "dash", "#2ca02c"),
+                (membrane_N, "· membrane contribution", "dash", "#d62728"),
                 (cortex_N, f"· {cortex_label} contribution", "dot", "#17becf"),
                 (interior_N, f"· {interior_label} contribution", "dot",
-                 "#9467bd"),
+                 "#ff7f0e"),
                 (nucleus_shell_N, "· nuclear envelope contribution",
-                 "longdash", "#6c3483"),
+                 "longdash", "#1f77b4"),
                 (nucleus_N, f"· {deep_label} contribution", "dashdot",
-                 "#e377c2"),
+                 "#9467bd"),
             ):
                 if comp is None or not np.any(np.asarray(comp)):
                     continue
