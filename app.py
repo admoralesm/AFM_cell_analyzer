@@ -4666,6 +4666,16 @@ COMPONENT_TABLE_HEAD = ("tick · component · symbol · law · the range it acts
 
 def component_row_table(rows, columns=2):
     """Draw the components table and return {key: slot} for the values."""
+    # A tick box with no value in session state comes up empty, whatever
+    # the app meant it to be, and an empty box beside a component the fit
+    # has just measured is the page lying about its own model. So every
+    # row's state is written before its box is drawn: a component this
+    # page fits by default arrives ticked, on the first run and on every
+    # run after a reset that cleared it.
+    for row in rows:
+        if row["tick_key"] not in st.session_state:
+            st.session_state[row["tick_key"]] = bool(
+                row.get("default_on", True))
     st.caption(COMPONENT_TABLE_HEAD)
     grid = st.columns(columns, gap="medium") if columns > 1 else None
     slots = {}
@@ -4745,6 +4755,8 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
         law = (MATERIAL_LAWS.get(term) or {}).get("law") or shape_mark(term)
         rows.append({
             "key": term, "tick_key": f"use_{term}", "label": names[term][0],
+            "default_on": bool(DEFAULT_TERMS_BY_TYPE.get(
+                st.session_state.get("cell_type"), {}).get(term, True)),
             "symbol": TERM_SYMBOLS.get(term, term),
             "law": f"{shape_mark(term)}  ·  {law}",
             "help": names[term][1],
@@ -12746,6 +12758,14 @@ with tab_analysis:
                     pending[f"use_{term}"] = bool(
                         wanted.get(term, False) and term in here_now
                     )
+                # The same, for the four the carried-forward fit is made
+                # of. The curve is fitted with all four the moment it
+                # loads, so all four arrive ticked: a box that says
+                # otherwise is the page disagreeing with its own fit.
+                for name in PW_SWITCHABLE:
+                    pending[f"pw_use_{name}"] = bool(
+                        DEFAULTS.get(f"pw_use_{name}", True))
+                pending["component_order"] = list(COMPONENT_ORDER_DEFAULT)
                 st.session_state["component_search"] = None
 
             window = (
