@@ -736,10 +736,12 @@ DEFAULTS = {
     "onset_mode": "Scan for best",
     "_scanned_onset": None,
     # fitting
-    # A C2C12 curve is fitted with the four-regime piecewise model by
-    # default: fixed regimes, one anchored fit, nothing to set before the
-    # answer appears. The spring-network models are the other choice.
-    "c2c12_fit_mode": "4-regime piecewise (C2C12)",
+    # The page opens on the segmented fit: the four components taking over
+    # in turn, all four ticked, each over the stretch its boundaries give
+    # it. The four-regime piecewise fit is the same four components with
+    # each regime anchored to the one before, and it is one line away in
+    # "How the components share the load".
+    "c2c12_fit_mode": "Spring-network models (advanced)",
     # Where regimes 2, 3 and 4 start and where the fit ends, in PERCENT
     # relative deformation. Regime 1 always starts at 0 %. These are the
     # C2C12 prior's (see piecewise_prior): contact under 5 %, the nucleus
@@ -4872,7 +4874,8 @@ def piecewise_on():
     """Whether the curve on the page is being fitted with the four regimes."""
     return (
         piecewise_offered()
-        and st.session_state.get("c2c12_fit_mode", PIECEWISE_MODE) == PIECEWISE_MODE
+        and st.session_state.get("c2c12_fit_mode",
+                                 DEFAULTS["c2c12_fit_mode"]) == PIECEWISE_MODE
     )
 
 
@@ -4891,7 +4894,7 @@ def fit_mode_control():
     if not piecewise_offered():
         return False
     if st.session_state.get("c2c12_fit_mode") not in FIT_MODES:
-        st.session_state["c2c12_fit_mode"] = PIECEWISE_MODE
+        st.session_state["c2c12_fit_mode"] = DEFAULTS["c2c12_fit_mode"]
     return piecewise_on()
 
 
@@ -12322,39 +12325,25 @@ with tab_analysis:
                     "🔍 The working, in detail", expanded=False
                 )
                 fit_block.__enter__()
-                head1, head2 = st.columns([1, 1])
-                with head1:
-                    fit_pressed = st.button(
-                        "▶ Fit & plot", type="primary", key="guided_fit",
-                        disabled=not active_terms(),
-                        help="Places ε₁, ε₂ if the board says so, fits the "
-                        "components ticked below at their ranges, and redraws "
-                        "the graph and the results.",
-                        **STRETCH,
-                    )
-                with head2:
-                    refresh_pressed = st.button(
-                        "🔄 Refresh graph", key="guided_refresh",
-                        disabled=not active_terms(),
-                        help="Redraws the graph and the results at exactly "
-                        "what the board holds now. Moves no boundary and "
-                        "chooses nothing.",
-                        **STRETCH,
-                    )
+                # The same board, in the same three steps, as the
+                # regime-by-regime fit: what the cell is made of, where its
+                # parts take over, then the one button.
+                st.markdown("#### 🎛️ Fitting")
                 board_status = st.empty()
-                st.markdown("#### 🎛️ Fitting options")
-                # The components are the first part of the options: they
-                # are what the plot draws, one tick per curve and one bar
-                # per range. Filled after the tiles, because the range the
-                # bars live inside is set there, but drawn here.
-                components_area = st.container()
-                st.markdown("**2 · The model, its boundaries and its range**")
-                tile1, tile2, tile3 = st.columns([1.05, 1.25, 0.9], gap="medium")
-                with tile1:
+                st.markdown("**Step 1 · What the cell is made of**")
+                share_col, model_col = st.columns([1.2, 1], gap="medium")
+                with share_col:
+                    load_sharing_control()
+                with model_col:
                     st.latex(r"F(\varepsilon) = \sum_k a_k E_k\,"
                              r"g_k(\varepsilon)")
-                    st.caption("how the components share the load")
-                    load_sharing_control()
+                # The components are the rest of step 1: they are what the
+                # plot draws, one tick per curve and one bar per range.
+                # Filled after the tiles, because the range the bars live
+                # inside is set there, but drawn here.
+                components_area = st.container()
+                st.markdown("**Step 2 · Where its parts take over**")
+                tile2, tile3 = st.columns([1.25, 1], gap="medium")
 
             if guided:
                 names = components_for(st.session_state["cell_type"])
@@ -12411,7 +12400,7 @@ with tab_analysis:
                         model, guided_lo, guided_hi, chosen)
 
                 components_area.__enter__()
-                st.markdown("**1 · Components and the ranges they act over** "
+                st.markdown("Components and the ranges they act over "
                             "— what is ticked is what is fitted and drawn")
                 chosen = active_terms()
                 if not chosen:
@@ -12438,6 +12427,27 @@ with tab_analysis:
                 components_slot = st.container()
                 components_area.__exit__(None, None, None)
                 chosen = active_terms()
+
+                st.markdown("**Step 3 · Fit**")
+                go1, go2 = st.columns([1, 1])
+                with go1:
+                    fit_pressed = st.button(
+                        "▶ Fit & plot", type="primary", key="guided_fit",
+                        disabled=not chosen,
+                        help="Fits the components ticked in step 1, at the "
+                        "boundaries step 2 gives, and redraws the graph and "
+                        "the results.",
+                        **STRETCH,
+                    )
+                with go2:
+                    refresh_pressed = st.button(
+                        "🔄 Refresh graph", key="guided_refresh",
+                        disabled=not chosen,
+                        help="Redraws the graph and the results at exactly "
+                        "what the board holds now. Moves no boundary and "
+                        "chooses nothing.",
+                        **STRETCH,
+                    )
 
 
             # What each ticked component is worth on this curve, measured
