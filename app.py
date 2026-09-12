@@ -801,6 +801,7 @@ DEFAULTS = {
     # mixture the third of them last found.
     "pw_style": "carried",
     "pw_best_carry": None,
+    "pw_style_note": None,
     # How the probe met the cell, recorded with it and written into the
     # spreadsheet row.
     "compression_type": "Head-on",
@@ -5227,6 +5228,7 @@ def _load_sharing_changed():
     style = style_of_label(chosen)
     if style:
         st.session_state["pw_style"] = style
+        st.session_state["pw_style_note"] = None
         # The mixture is searched again for the curve on the page, and the
         # fit that follows is made of what it finds.
         st.session_state["pw_best_carry"] = None
@@ -5434,6 +5436,117 @@ PW_ELEMENT_OF = {
 }
 
 
+# ================================================ what the literature says ==
+#
+# Two things are known about a C2C12 before this curve is fitted, and both
+# are about the answer rather than about the procedure:
+#
+#   * its cytoskeleton is reported at 10 to 15 kPa;
+#   * at about 50 % relative deformation the curve bumps, and that bump is
+#     the nuclear envelope and the lamina under it being met.
+#
+# They are used where a prior belongs -- in choosing between fits that the
+# data cannot tell apart -- and nowhere else. No coefficient is clamped, no
+# modulus is nudged: every number reported is still the plain least-squares
+# estimate with its own standard error, and the page says which of them
+# landed where the literature says they should.
+LITERATURE = {
+    "Myoblast (C2C12)": {
+        "moduli": {
+            # symbol: (low, high, in Pa, what it is)
+            "E_cyto": (10.0e3, 15.0e3,
+                       "the cytoskeleton of a C2C12, 10–15 kPa"),
+        },
+        "bump_pct": 50.0,
+        "bump_is": "the nuclear envelope and the lamina under it",
+        "source": "what is reported for C2C12 myoblasts",
+    },
+}
+
+
+def literature_for(cell_type=None):
+    """What is known about this cell type before the curve is fitted."""
+    if cell_type is None:
+        cell_type = st.session_state.get("cell_type")
+    return LITERATURE.get(cell_type) or {}
+
+
+def modulus_in_range(symbol, value_pa, cell_type=None):
+    """
+    True / False / None: inside the reported range, outside, or not known.
+
+    None is not a failure, it is the honest answer where the literature has
+    nothing to say about that component.
+    """
+    window = (literature_for(cell_type).get("moduli") or {}).get(symbol)
+    if not window or value_pa is None or not np.isfinite(float(value_pa)):
+        return None
+    return bool(window[0] <= float(value_pa) <= window[1])
+
+
+def literature_fit_score(moduli, eps2_pct, cell_type=None):
+    """
+    How well one candidate fit agrees with what is known, for ranking.
+
+    Returns (how many moduli land where they should, how far the bump is
+    from where it is expected). Bigger first, then smaller: a candidate
+    that puts the cytoskeleton at 12 kPa and the bump at 49 % is preferred
+    to one that puts them at 5 900 kPa and 62 %, when the curve itself
+    cannot tell them apart.
+    """
+    known = literature_for(cell_type)
+    inside = 0
+    for symbol, window in (known.get("moduli") or {}).items():
+        value = (moduli or {}).get(symbol)
+        if value is None or not np.isfinite(float(value)):
+            continue
+        if window[0] <= float(value) <= window[1]:
+            inside += 1
+    bump = known.get("bump_pct")
+    away = (abs(float(eps2_pct) - float(bump))
+            if bump is not None and eps2_pct is not None
+            and np.isfinite(float(eps2_pct)) else 0.0)
+    return inside, away
+
+
+def literature_note(fit, cell_type=None):
+    """One line: which of the reported numbers this fit agrees with."""
+    known = literature_for(cell_type)
+    if not known or not (fit and fit.get("success")):
+        return ""
+    said = []
+    for symbol, window in (known.get("moduli") or {}).items():
+        field = {"E_cyto": "Ei_kPa", "E_shell": "Em_MPa",
+                 "E_ne": "Ene_MPa", "E_core": "En_kPa"}.get(symbol)
+        scale = 1e3 if (field or "").endswith("kPa") else 1e6
+        try:
+            value = float(fit.get(field)) * scale
+        except (TypeError, ValueError):
+            continue
+        unit, divisor = (("kPa", 1e3) if window[1] < 1e6 else ("MPa", 1e6))
+        inside = window[0] <= value <= window[1]
+        said.append(
+            ("✅ " if inside else "⚠️ ")
+            + f"{DISPLAY_SYMBOL.get(symbol, symbol)} = {value / divisor:.4g} "
+            f"{unit}, " + ("inside" if inside else "outside")
+            + f" the {window[0] / divisor:g}–{window[1] / divisor:g} {unit} "
+            f"{window[2].split(',')[0]}")
+    bump = known.get("bump_pct")
+    edges = {name: value for value, name in fit_edges(fit)}
+    if bump is not None and "ε₂" in edges:
+        at = 100.0 * float(edges["ε₂"])
+        close = abs(at - bump) <= 10.0
+        said.append(("✅ " if close else "⚠️ ")
+                    + f"the bump at ε₂ = {at:.1f} %, "
+                    + ("near" if close else "away from")
+                    + f" the {bump:g} % where {known.get('bump_is', 'it')} "
+                    "is met")
+    if not said:
+        return ""
+    return ("**Against what is reported for this cell type:** "
+            + " · ".join(said))
+
+
 def piecewise_prior(cell_type=None):
     """
     The C2C12 constraints the boundaries are found inside, in percent.
@@ -5565,7 +5678,7 @@ def carry_subsets():
                     if mask >> index & 1)
 
 
-def best_mixture(epsilon, force_N):
+def best_mixture(epsilon, force_N, model=None):
     """
     Try every component both ways and keep the combination that fits best.
 
@@ -5577,6 +5690,8 @@ def best_mixture(epsilon, force_N):
     bounds = piecewise_boundaries()
     settings = effective_piecewise_settings(
         piecewise_settings(), piecewise_until(), piecewise_off())
+    geometry = piecewise_geometry(model) if model is not None else None
+    eps2 = float(bounds[2]) if len(bounds) > 2 else None
     rows = []
     best = None
     for carry in carry_subsets():
@@ -5588,19 +5703,34 @@ def best_mixture(epsilon, force_N):
         zeros = sum(1 for name, value in (result.get("coefficients") or {}).items()
                     if name not in ("C0",) and value is not None
                     and np.isfinite(value) and abs(float(value)) < 1e-30)
-        rows.append({"carry": carry, "r2": r2, "unmeasured": zeros})
+        inside = 0
+        if geometry is not None and result.get("success"):
+            try:
+                moduli = piecewise_moduli(result, geometry,
+                                          regimes=pw_regimes())
+                inside, _away = literature_fit_score(
+                    {row["symbol"]: row["E_Pa"] for row in moduli.values()},
+                    eps2)
+            except Exception:  # pragma: no cover - defensive
+                inside = 0
+        rows.append({"carry": carry, "r2": r2, "unmeasured": zeros,
+                     "inside": inside})
         if not np.isfinite(r2):
             continue
         # Ties and near-ties go to the combination that measures every
-        # component: a mixture that fits a hair closer by silencing one of
-        # them has not learnt anything about the cell.
-        key = (-zeros, round(r2, 9), len(carry))
+        # component and agrees with what is reported for this cell type: a
+        # mixture that fits a hair closer by silencing one of them, or by
+        # putting the cytoskeleton two orders of magnitude out, has not
+        # learnt anything about the cell.
+        key = (-zeros, inside, round(r2, 9), len(carry))
         if best is None or key > best["key"]:
-            best = {"key": key, "carry": carry, "r2": r2, "unmeasured": zeros}
+            best = {"key": key, "carry": carry, "r2": r2, "unmeasured": zeros,
+                    "inside": inside}
     if best is None:
         return None
     return {"carry": best["carry"], "r2": best["r2"],
-            "unmeasured": best["unmeasured"], "rows": rows}
+            "unmeasured": best["unmeasured"],
+            "inside": best.get("inside", 0), "rows": rows}
 
 
 def mixture_note(carry):
@@ -6922,6 +7052,36 @@ def carried_forward_summary(bounds=None, target=0.999):
              rf"{s_hi:g}\,\%")
     if prior.get("why"):
         st.caption("Why those bands: " + prior["why"] + ".")
+    known = literature_for()
+    if known:
+        windows = known.get("moduli") or {}
+        st.markdown("**Step three and a half — what is already known about "
+                    "this cell type.** Two things are known before this "
+                    "curve is fitted, and both are about the answer rather "
+                    "than the procedure:")
+        lines = []
+        for symbol, window in windows.items():
+            unit, divisor = (("kPa", 1e3) if window[1] < 1e6 else ("MPa", 1e6))
+            lines.append(
+                rf"{window[0] / divisor:g}\,	ext{{{unit}}} \le "
+                rf"{DISPLAY_SYMBOL.get(symbol, symbol)} \le "
+                rf"{window[1] / divisor:g}\,	ext{{{unit}}}")
+        if known.get("bump_pct") is not None:
+            lines.append(rf"arepsilon_2 pprox {known['bump_pct']:g}\,\%")
+        if lines:
+            st.latex(r",\qquad ".join(lines))
+        st.markdown(
+            "The second is a bump in the curve at about "
+            f"{known.get('bump_pct', 50):g} %, which is "
+            f"{known.get('bump_is', 'the next component')} being met. "
+            "Neither is imposed: no coefficient is clamped and no modulus "
+            "is nudged, so every number reported is still the plain least "
+            "squares estimate with its own standard error. They are used "
+            "only where a prior belongs — to choose between placements the "
+            "curve itself cannot tell apart, after the fewest-unmeasured "
+            "rule and before the closest-fit one — and the results say "
+            "which of them the answer agreed with."
+        )
     st.markdown(
         "**Step four — and it has to work.** A placement is only kept if the "
         f"whole curve comes back at R² ≥ {target:g}. If it does not, the "
@@ -7392,13 +7552,27 @@ def select_placement(placements, method, target):
         return sum(1 for value in moduli.values()
                    if not np.isfinite(value) or abs(float(value)) < 1e-12)
 
+    def agrees(key):
+        """How well this placement agrees with what is reported."""
+        row = rows.get(key) or {}
+        best_pct = row.get("best_pct") or ()
+        eps2 = best_pct[1] if len(best_pct) > 1 else None
+        inside, away = literature_fit_score(row.get("moduli"), eps2)
+        return inside, -away
+
     # Every placement that reaches the target, best first: fewest components
     # left unmeasured, then highest R². A boundary that puts one component
     # on top of another leaves that one at zero, and a placement that
     # measures all four is a better answer than one that measures three and
     # fits a hair closer.
+    # Every placement that reaches the target, best first: fewest
+    # components left unmeasured, then the one that agrees with what is
+    # reported for this cell type, then the closest fit. The curve decides
+    # what is possible; the literature only chooses between placements the
+    # curve cannot tell apart.
     reached = sorted((k for k in rows if r2(k) >= target),
-                     key=lambda k: (unmeasured(k), -r2(k)))
+                     key=lambda k: (unmeasured(k), [-v for v in agrees(k)],
+                                    -r2(k)))
     if method in rows and r2(method) >= target:
         if not reached or unmeasured(method) <= unmeasured(reached[0]):
             return method, (f"{PW_ROW_LABELS[method]} reaches R² = "
@@ -7667,6 +7841,9 @@ def component_results_strip(fit, extra=""):
                 else:
                     st.caption(f"95 % interval: {interval}")
                 st.caption(support)
+    said_lit = literature_note(fit)
+    if said_lit:
+        st.caption(said_lit)
     chi = fit.get("chi_squared_reduced", float("nan"))
     where = " · ".join(f"{name} = {value:.3f}" for value, name in fit_edges(fit))
     st.caption(
@@ -7753,7 +7930,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.session_state["pw_mixture"] = None
             return
         with st.spinner("Trying every component both ways…"):
-            found_mix = best_mixture(epsilon, force_N)
+            found_mix = best_mixture(epsilon, force_N, model)
         st.session_state["pw_mixture"] = found_mix
         st.session_state["pw_best_carry"] = (list(found_mix["carry"])
                                              if found_mix else [])
@@ -7815,6 +7992,39 @@ def piecewise_section(model, epsilon, force_N, rupture):
                                                                target_now)
         else:
             place_now(arriving=True)
+        # The boundaries are settled; now check the answer they give
+        # against what is known about this cell type. Every component
+        # carried on to the end is the model the page is set up with, but
+        # a carried cube law can cover the whole of the next stretch and
+        # leave the component that joins there at zero, or two orders of
+        # magnitude from where the literature puts it. When that happens,
+        # the mixture that measures every component and agrees with what
+        # is reported is used instead, and the page says so.
+        st.session_state["pw_style_note"] = None
+        if piecewise_style() == "carried" and literature_for():
+            found_mix = best_mixture(epsilon, force_N, model)
+            everything = tuple(ORDER_COEFFICIENT[t] for t in component_order())
+            as_set = next((row for row in (found_mix or {}).get("rows", [])
+                           if set(row["carry"]) == set(everything)), None)
+            if found_mix and as_set and (
+                    (found_mix["unmeasured"], found_mix["inside"])
+                    != (as_set["unmeasured"], as_set["inside"])
+                    and (found_mix["unmeasured"] < as_set["unmeasured"]
+                         or found_mix["inside"] > as_set["inside"])):
+                st.session_state["pw_style"] = "best"
+                st.session_state["pw_best_carry"] = list(found_mix["carry"])
+                st.session_state["pw_mixture"] = found_mix
+                st.session_state["pw_style_note"] = (
+                    "ℹ️ Every component carried on to the end left "
+                    + (f"{as_set['unmeasured']} of them unmeasured"
+                       if as_set["unmeasured"] else
+                       "the moduli away from what is reported for this cell "
+                       "type")
+                    + ", so **③ the best mixture** was used instead: "
+                    + mixture_note(found_mix["carry"])
+                    + f" (R² = {found_mix['r2']:.5f}). Choose "
+                    "**① Carried on to the end** above to see it the other "
+                    "way.")
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -8007,6 +8217,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
         said_reach = st.session_state.get("pw_reach_note")
         if said_reach:
             st.caption(said_reach)
+        said_style = st.session_state.get("pw_style_note")
+        if said_style:
+            st.caption(said_style)
         if piecewise_style() == "best":
             found_mix = st.session_state.get("pw_mixture")
             if found_mix:
