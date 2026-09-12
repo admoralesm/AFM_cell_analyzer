@@ -3263,15 +3263,19 @@ COMPONENT_SETS = {
     # what it contains resists being squeezed. Modelling the whole nucleus as
     # one Hertzian lump said it was jelly with no skin, which is the one
     # thing a nucleus is known not to be.
+    # The names, the squares and the symbols are the same four whichever
+    # way the load is shared: one components table for the whole app, so a
+    # person switching from the regime-by-regime fit to side by side finds
+    # the components they already had rather than four new ones.
     "Myoblast (C2C12)": {
-        "membrane": ("🫧 Membrane", "the skin around the cell"),
-        "interior": ("🕸️ Cytoskeleton", "the scaffolding filling the cell"),
+        "membrane": ("🟥 Membrane", "the skin around the cell"),
+        "interior": ("🟧 Cytoskeleton", "the scaffolding filling the cell"),
         "nucleus_shell": (
-            "🔵 Nuclear envelope",
+            "🟦 Nuclear envelope",
             "the skin around the nucleus, stretched as it is squashed",
         ),
         "nucleus": (
-            "🟣 Inside the nucleus",
+            "🟪 Inside the nucleus",
             "what the envelope contains, squeezed like everything else",
         ),
     },
@@ -4488,6 +4492,54 @@ def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
     return (lo, hi)
 
 
+# ------------------------------------------------ the components table --
+#
+# One table, one row shape, whichever way the load is shared. A row is a
+# small bordered card so that four of them side by side read as four
+# things rather than as one block of text:
+#
+#   ☑ 🟥 Membrane · Eₘ
+#   K_shell [min(x,u) − s]³
+#   [=========== the range it acts over ===========]
+#   [s, u] = [2.0, 91.2] %                 Eₘ = 0.42 MPa
+#
+# Every way of sharing the load builds its rows and hands them here, so a
+# person switching from one to another finds the same four components laid
+# out the same way, not a new interface.
+
+COMPONENT_TABLE_HEAD = ("tick · component · symbol · law · the range it acts "
+                        "over · what the fit made of it")
+
+
+def component_row_table(rows, columns=2):
+    """Draw the components table and return {key: slot} for the values."""
+    st.caption(COMPONENT_TABLE_HEAD)
+    grid = st.columns(columns, gap="medium") if columns > 1 else None
+    slots = {}
+    for index, row in enumerate(rows):
+        cell = grid[index % columns] if grid else st.container()
+        with cell:
+            card = st.container(border=True)
+            with card:
+                on = bool(st.session_state.get(
+                    row["tick_key"], row.get("default_on", True)))
+                st.checkbox(f"{row['label']}  ·  {row['symbol']}",
+                            key=row["tick_key"], help=row.get("help"))
+                st.caption(row["law"])
+                slider = row.get("slider")
+                if slider:
+                    st.slider(**dict(slider, disabled=slider.get(
+                        "disabled", not on)))
+                foot_l, foot_r = st.columns([1.25, 1])
+                with foot_l:
+                    st.caption(row.get("range_text", "") if on else "off")
+                with foot_r:
+                    slots[row["key"]] = st.empty()
+                for extra in row.get("extras", ()):
+                    extra(on)
+    return slots
+
+
 def component_controls(terms, names, lo, hi, step, e1, e2,
                        membrane="freeze", cyto_start="break"):
     """
@@ -4498,19 +4550,16 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
     squash and not the rest; splitting those across two parts of the page
     made a person hold one in their head while setting the other.
 
-    The ranges follow the fit until somebody takes them over. That is the
-    honest default: epsilon 1 and epsilon 2 are found from the curve, and a
-    range that did not move with them would be describing a model that is
-    no longer the one being fitted.
+    The rows are drawn by the same table the regime-by-regime fit uses, so
+    the components look and behave the same whichever way the load is
+    shared. The ranges follow the fit until somebody takes them over. That
+    is the honest default: epsilon 1 and epsilon 2 are found from the
+    curve, and a range that did not move with them would be describing a
+    model that is no longer the one being fitted.
     """
     if not terms:
         return None
-    # Every range is editable, always, and every one is used by the fit.
-    # There is no switch: a range that follows the boundaries and a range
-    # set by hand are the same number, and the fit is identical while
-    # nothing has been moved, so a tick to choose between them was a
-    # question with no consequence.
-    own = True
+    rows = []
     for term in terms:
         key = element_window_key(term)
         automatic = default_element_window(term, lo, hi, e1, e2, membrane,
@@ -4526,75 +4575,68 @@ def component_controls(terms, names, lo, hi, step, e1, e2,
         # a law is measured from contact, and clamping it up to the range
         # start is what turned a curve with a bad contact into a fit with
         # no membrane in it at all.
-        floor = 0.0
-        tick_col, range_col = st.columns([1.25, 2])
-        with tick_col:
-            st.checkbox(
-                f"{names[term][0]} · {TERM_SYMBOLS.get(term, term)}",
-                key=f"use_{term}", help=names[term][1],
-            )
-            # The law it stands for, beside the box that switches it on. A
-            # component is a term in an equation, and the exponent is the
-            # thing that makes it a different term from its neighbour, so
-            # the name alone leaves out what the tick actually does.
-            law = (MATERIAL_LAWS.get(term) or {}).get("law")
-            if law:
-                st.caption(f"{shape_mark(term)}  ·  {law}")
-        with range_col:
-            bar = f"{key}__bar"
-            pair = st.session_state[key]
-            a = float(np.clip(pair[0], floor, hi - step))
-            b = float(np.clip(pair[1], a + step, hi))
-            st.session_state[bar] = (a, b)
+        bar = f"{key}__bar"
+        pair = st.session_state[key]
+        a = float(np.clip(pair[0], 0.0, hi - step))
+        b = float(np.clip(pair[1], a + step, hi))
+        st.session_state[bar] = (a, b)
 
-            def _store(term=term, key=key, bar=bar):
-                got = st.session_state.get(bar)
-                if got:
-                    st.session_state[key] = (
-                        round(float(got[0]), 4), round(float(got[1]), 4)
-                    )
-                    st.session_state[f"_window_touched_{term}"] = True
+        def _store(term=term, key=key, bar=bar):
+            got = st.session_state.get(bar)
+            if got:
+                st.session_state[key] = (
+                    round(float(got[0]), 4), round(float(got[1]), 4)
+                )
+                st.session_state[f"_window_touched_{term}"] = True
 
-            st.slider(
-                f"acts over ε · {plain_name(term)}",
-                min_value=float(floor), max_value=float(hi), step=float(step),
-                key=bar, on_change=_store,
-                disabled=not st.session_state.get(f"use_{term}"),
-                label_visibility="collapsed",
-                help="Where this component starts carrying load and where "
-                     "it stops taking more. Past the far end it holds what "
-                     "it reached rather than vanishing, so the curve has no "
-                     "step in it.",
-            )
-    if True:
-        automatic = {
-            term: default_element_window(term, lo, hi, e1, e2, membrane,
-                                         cyto_start)
-            for term in terms
-        }
-        drifted = [
-            term for term in terms
-            if st.session_state.get(f"use_{term}")
-            and st.session_state.get(f"_window_touched_{term}")
-            and st.session_state.get(element_window_key(term)) != automatic[term]
-        ]
-        if drifted:
-            st.caption(
-                "Moved by hand, so the boundaries no longer place "
-                + ", ".join(plain_name(t) for t in drifted)
-                + (" is" if len(drifted) == 1 else " are")
-                + " away from where the fit would put "
-                + ("it." if len(drifted) == 1 else "them.")
-            )
-            if st.button("↺ Reset windows to ε₁, ε₂",
-                         key="reset_element_windows", **STRETCH):
-                for term in terms:
-                    st.session_state.pop(f"_window_touched_{term}", None)
-                rerun_keeping_settings({
-                    element_window_key(term): window
-                    for term, window in automatic.items()
-                })
-    if not drifted:
+        law = (MATERIAL_LAWS.get(term) or {}).get("law") or shape_mark(term)
+        rows.append({
+            "key": term, "tick_key": f"use_{term}", "label": names[term][0],
+            "symbol": TERM_SYMBOLS.get(term, term),
+            "law": f"{shape_mark(term)}  ·  {law}",
+            "help": names[term][1],
+            "range_text": f"acts over ε = {a:.3f} to {b:.3f}",
+            "slider": {
+                "label": f"acts over ε · {plain_name(term)}",
+                "min_value": 0.0, "max_value": float(hi), "step": float(step),
+                "key": bar, "on_change": _store,
+                "label_visibility": "collapsed",
+                "help": "Where this component starts carrying load and where "
+                        "it stops taking more. Past the far end it holds what "
+                        "it reached rather than vanishing, so the curve has "
+                        "no step in it.",
+            },
+        })
+    component_row_table(rows, columns=2)
+
+    automatic = {
+        term: default_element_window(term, lo, hi, e1, e2, membrane,
+                                     cyto_start)
+        for term in terms
+    }
+    drifted = [
+        term for term in terms
+        if st.session_state.get(f"use_{term}")
+        and st.session_state.get(f"_window_touched_{term}")
+        and st.session_state.get(element_window_key(term)) != automatic[term]
+    ]
+    if drifted:
+        st.caption(
+            "Moved by hand, so the boundaries no longer place "
+            + ", ".join(plain_name(t) for t in drifted)
+            + (" is" if len(drifted) == 1 else " are")
+            + " away from where the fit would put "
+            + ("it." if len(drifted) == 1 else "them.")
+        )
+        if st.button("↺ Reset windows to ε₁, ε₂",
+                     key="reset_element_windows", **STRETCH):
+            for term in terms:
+                st.session_state.pop(f"_window_touched_{term}", None)
+            rerun_keeping_settings({
+                element_window_key(term): window
+                for term, window in automatic.items()
+            })
+    else:
         st.caption(
             "A range is where a component takes on load: it starts at the "
             "near edge and stops taking **more** at the far edge, holding "
@@ -6254,82 +6296,70 @@ def _pw_throughout_changed():
     st.session_state["pw_until"] = untils
 
 
-def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
+def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=2):
     """
-    One row per component: in or out, its law, where it acts, its value.
+    The components table for the regime-by-regime fit.
 
-    Each row: the tick, the law in symbols, the range [s, u] as a two-ended
-    bar, and what the fit made of it (E, or A_L for the lamina lump).
+    Builds one row per component and hands them to the table every way of
+    sharing the load uses: the tick, the symbol, the law, the range [s, u]
+    as a two-ended bar, and what the fit made of it.
     """
     ranges = piecewise_ranges(bounds)
     end = float(bounds[4])
-    slots = {}
-    # On the control board the rows sit side by side, ``columns`` to a line.
-    grid = st.columns(columns) if columns > 1 else None
-    for index, (name, label, symbol, colour, law) in enumerate(PW_COMPONENTS):
+    rows = []
+    for name, label, symbol, _colour, law in PW_COMPONENTS:
         start, until = ranges[name]
-        cell = grid[index % columns] if grid else st.container()
-        cell.__enter__()
-        on = st.session_state.get(f"pw_use_{name}",
-                                  DEFAULTS.get(f"pw_use_{name}", True))
-        # Laid out for the narrow parameter column: the name and what the
-        # fit made of it on one line, the range bar under them at full width.
-        c_name, c_out = st.columns([1.7, 1])
-        c_bar = st.container()
-        with c_name:
-            st.checkbox(
-                f"{label}", key=f"pw_use_{name}",
-                help="One of the four components, on by default. Ticked, it "
-                     "is fitted and drawn; unticked, it is held at zero and "
-                     "leaves both the fit and the plot. Everything on the "
-                     "graph has a tick here.")
-            st.caption(law)
-        with c_bar:
-            key = f"pw_range_{name}"
-            # Set from the model every run, before the bar is drawn, so the
-            # bar always shows the range the fit is about to use.
-            shown_start = float(min(max(start, 0.0), end))
-            shown_until = float(min(max(until, shown_start), end))
-            st.session_state[key] = (round(shown_start, 2), round(shown_until, 2))
-            st.slider(
-                f"{label} acts over (%)", min_value=0.0, max_value=float(end),
-                step=0.1, key=key, on_change=_pw_range_moved, args=(name,),
-                disabled=not on,
-                label_visibility="collapsed",
-                help="Left end: where it starts carrying load, which is its "
-                "regime's boundary, so it moves that boundary. Right end: "
-                "where it stops adding load; past it the component holds "
-                "the force it reached.",
-            )
-            if name == "K_shell":
-                st.checkbox(
-                    "acts throughout (to the end of the fit)",
-                    key="pw_membrane_throughout",
-                    on_change=_pw_throughout_changed, disabled=not on,
-                )
-        with c_out:
-            st.caption(rf"$[s,u] = [{start:.1f},\,{until:.1f}]\,\%$" if on else "off")
-            slots[name] = st.empty()
-            row = (moduli or {}).get(name)
-            if not on:
-                slots[name].caption(r"$\theta = 0$ (held)")
-            elif name == "A_lamina" and lamina:
-                slots[name].markdown(
-                    f"**A_L = {lamina['A_N'] * 1e9:.4g} nN**"
-                    + ("" if lamina["present"] else " (no lump)"))
-            elif row:
-                # Written exactly as the results table on the right writes it.
-                slots[name].markdown(
-                    f"**{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
-                    f"{modulus_display(row['symbol'], row['E_Pa'])}**"
-                    + (" ⚠️ on bound" if row.get("at_bound") else ""))
-        cell.__exit__(None, None, None)
+        key = f"pw_range_{name}"
+        # Set from the model every run, before the bar is drawn, so the
+        # bar always shows the range the fit is about to use.
+        shown_start = float(min(max(start, 0.0), end))
+        shown_until = float(min(max(until, shown_start), end))
+        st.session_state[key] = (round(shown_start, 2), round(shown_until, 2))
+        extras = ()
+        if name == "K_shell":
+            def _throughout(on):
+                st.checkbox("acts throughout (to the end of the fit)",
+                            key="pw_membrane_throughout",
+                            on_change=_pw_throughout_changed, disabled=not on)
+            extras = (_throughout,)
+        rows.append({
+            "key": name, "tick_key": f"pw_use_{name}", "label": label,
+            "symbol": symbol, "law": law,
+            "default_on": DEFAULTS.get(f"pw_use_{name}", True),
+            "help": "One of the four components, on by default. Ticked, it "
+                    "is fitted and drawn; unticked, it is held at zero and "
+                    "leaves both the fit and the plot. Everything on the "
+                    "graph has a tick here.",
+            "range_text": rf"$[s,u] = [{start:.1f},\,{until:.1f}]\,\%$",
+            "extras": extras,
+            "slider": {
+                "label": f"{label} acts over (%)", "min_value": 0.0,
+                "max_value": float(end), "step": 0.1, "key": key,
+                "on_change": _pw_range_moved, "args": (name,),
+                "label_visibility": "collapsed",
+                "help": "Left end: where it starts carrying load, which is "
+                        "its regime's boundary, so it moves that boundary. "
+                        "Right end: where it stops adding load; past it the "
+                        "component holds the force it reached.",
+            },
+        })
+    slots = component_row_table(rows, columns=columns)
+    for name, _label, _symbol, _colour, _law in PW_COMPONENTS:
+        row = (moduli or {}).get(name)
+        if not st.session_state.get(f"pw_use_{name}", True):
+            slots[name].caption(r"$\theta = 0$ (held)")
+        elif row:
+            # Written exactly as the results table on the right writes it.
+            slots[name].markdown(
+                f"**{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
+                f"{modulus_display(row['symbol'], row['E_Pa'])}**"
+                + (" ⚠️ on bound" if row.get("at_bound") else ""))
     st.caption(
         r"Row $j$: $F_j(x) = \theta_j\,\phi_j(x;\,s_j,u_j)$, acting on "
         r"$[s_j, u_j]$ and held at $F_j(u_j)$ for $x > u_j$. "
         r"$s_j \in \{\varepsilon_1, \varepsilon_2, \varepsilon_3\}$ is shared "
         r"by the rows that start there; $u_j$ is the row's own. "
-        "The dashed curve and the bar of the same colour on the plot are this "
+        "The layer and the bar of the same colour on the plot are this "
         "row. A ticked row is fitted and drawn; an unticked row is in "
         "neither, so the ticks and the graph always say the same thing."
     )
@@ -6928,13 +6958,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
     with results_col:
         results_slot = st.container()
 
-    # The components sit directly under the plot, because they are the
-    # plot: one tick per curve drawn, one bar per range shown. They are
-    # not buried in the board with the rest of the parameters, which is
-    # where a person looks last and this is what they look at first.
-    components_box = st.container(border=True)
-
     # ================================================= the control board
+    # Directly under the plot, and the components are the first thing in
+    # it: they are the plot, one tick per curve drawn and one bar per
+    # range shown, so they are read before the rest of the parameters.
     board = st.container(border=True)
     with board:
         head1, head2, head3 = st.columns([1, 1, 1.6])
@@ -6974,14 +7001,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
             )
         status_slot = st.empty()
         st.markdown("#### 🎛️ Fitting options")
-        # Drawn into the box under the plot, staked out above; written
-        # here so the board is still read in one pass, top to bottom.
-        with components_box:
-            st.markdown("**Components θⱼ and the ranges [sⱼ, uⱼ] they act "
-                        "over** — what is ticked is what is fitted and drawn")
-            value_slots = piecewise_components_panel(
-                piecewise_boundaries(), None, None, columns=2)
-            components_note_slot = st.empty()
+        st.markdown("**1 · Components θⱼ and the ranges [sⱼ, uⱼ] they act "
+                    "over** — what is ticked is what is fitted and drawn")
+        value_slots = piecewise_components_panel(
+            piecewise_boundaries(), None, None, columns=2)
+        components_note_slot = st.empty()
+        st.markdown("**2 · The model, its boundaries, and what is drawn**")
         # What the board holds for each row, to compare with what the plot
         # is drawing: the two lists must read the same, or say they differ.
         board_off = set(piecewise_off())
@@ -12285,9 +12310,6 @@ with tab_analysis:
                     video_slot = st.container()
                 with res_col:
                     results_area = st.container()
-                # The components go directly under the plot: they are what
-                # the plot draws, one tick per curve and one bar per range.
-                components_box = st.container(border=True)
                 fit_block = st.container(border=True)
                 explainer_box = st.expander(
                     "📘 How the fit is done — the maths, step by step",
@@ -12339,6 +12361,12 @@ with tab_analysis:
                     )
                 board_status = st.empty()
                 st.markdown("#### 🎛️ Fitting options")
+                # The components are the first part of the options: they
+                # are what the plot draws, one tick per curve and one bar
+                # per range. Filled after the tiles, because the range the
+                # bars live inside is set there, but drawn here.
+                components_area = st.container()
+                st.markdown("**2 · The model, its boundaries and its range**")
                 tile1, tile2, tile3 = st.columns([1.05, 1.25, 0.9], gap="medium")
                 with tile1:
                     st.latex(r"F(\varepsilon) = \sum_k a_k E_k\,"
@@ -12400,9 +12428,9 @@ with tab_analysis:
                     boundaries_slot = optimisation_controls(
                         model, guided_lo, guided_hi, chosen)
 
-                components_box.__enter__()
-                st.markdown("**Components and the ranges they act over** — "
-                            "what is ticked is what is fitted and drawn")
+                components_area.__enter__()
+                st.markdown("**1 · Components and the ranges they act over** "
+                            "— what is ticked is what is fitted and drawn")
                 chosen = active_terms()
                 if not chosen:
                     st.warning("Tick at least one material before fitting.")
@@ -12426,7 +12454,7 @@ with tab_analysis:
                     here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
                 )
                 components_slot = st.container()
-                components_box.__exit__(None, None, None)
+                components_area.__exit__(None, None, None)
                 chosen = active_terms()
 
 
