@@ -79,6 +79,14 @@ __all__ = [
     "boundaries_from_power_law",
     "joint_design",
     "joint_sse",
+    "WEIGHTINGS",
+    "confinement_factor",
+    "small_strain_reading",
+    "power_law_window",
+    "SMALL_STRAIN_LAWS",
+    "confinement_from_profile",
+    "scan_confinement",
+    "best_confinement",
     "piecewise_moduli",
     "probe_correction",
     "with_settings",
@@ -113,20 +121,53 @@ class Term:
 
 LUMP = "lump"
 
+# How little room is allowed to be left before the confinement factor is
+# held: (1 - x/100)^-q would run away at x = 100 %, and no curve is fitted
+# that far in anyway.
+MIN_ROOM = 0.02
 
-def _basis(shape, power, x, start, until):
+
+def confinement_factor(x_pct, squeeze):
+    """
+    (1 - x/100)^-q: how much harder the squash itself makes the cell.
+
+    A cell squashed between two flat surfaces has nowhere to put the volume
+    it is losing, so every element in it stiffens as the gap closes, on top
+    of its own law. ``squeeze`` (q) is that effect and nothing else: it is
+    one number for the whole cell, it is 1 at first contact, and it leaves
+    the small-deformation limit of every term untouched, so the moduli read
+    off the coefficients still mean what they meant before.
+
+    q = 0 gives the plain powers this model started with.
+    """
+    q = float(squeeze or 0.0)
+    if q == 0.0:
+        return np.ones_like(np.asarray(x_pct, dtype=float))
+    room = np.clip(1.0 - np.asarray(x_pct, dtype=float) / 100.0, MIN_ROOM, None)
+    return room ** (-q)
+
+
+def _basis(shape, power, x, start, until, squeeze=0.0):
     """
     One element's shape at x (percent), per unit coefficient.
 
-    power: [min(x, until) - start]_+ ^ power
+    power: [min(x, until) - start]_+ ^ power * (1 - min(x, until)/100)^-q
     lump:  sin^2(pi (x - start) / (until - start)) on [start, until], else 0
+
+    The confinement factor is evaluated at min(x, until) like the power
+    itself, so an element that has stopped taking on more load holds the
+    force it reached instead of being carried up by the squash.
     """
     x = np.asarray(x, dtype=float)
     if shape == LUMP:
         width = max(float(until) - float(start), 1e-9)
         inside = (x >= start) & (x <= until)
         return np.where(inside, np.sin(np.pi * (x - start) / width) ** 2, 0.0)
-    return np.clip(np.minimum(x, until) - start, 0.0, None) ** power
+    held = np.minimum(x, until)
+    out = np.clip(held - start, 0.0, None) ** power
+    if squeeze:
+        out = out * confinement_factor(held, squeeze)
+    return out
 
 
 @dataclass(frozen=True)
@@ -255,12 +296,56 @@ def _statistics(y, predicted, n_params):
     residual = y - predicted
     ss_res = float(np.sum(residual ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
+    # How far off the fit is as a fraction of the force there, over the top
+    # decade of the stretch. Below that there is no force to be a fraction
+    # of: a piconewton of residual on a piconewton of force is a hundred
+    # per cent and says nothing about the fit.
+    size = np.abs(y)
+    loud = size >= 0.1 * float(np.max(size)) if np.max(size) > 0 else size > 0
+    relative = (float(np.sqrt(np.mean((residual[loud] / size[loud]) ** 2)))
+                if loud.any() else float("nan"))
     return {
         "r_squared": 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
         "rmse": float(np.sqrt(ss_res / n)),
+        "relative_rmse": relative,
         "ss_res": ss_res,
         "n_points": n,
     }
+
+
+# =========================================================== what is minimised ==
+#
+# The force over one of these curves spans three or four decades: a few
+# hundred piconewtons at 5 % and tens of nanonewtons at 90 %. Plain least
+# squares minimises the squared error in newtons, so one point at the end
+# of the squash counts for as much as ten thousand points at the start,
+# and the elements that only act early are fitted to whatever is left over
+# rather than to their own part of the curve. Weighting is the knob for
+# that, and it is the honest one: it does not change the model, only which
+# part of the curve the model is asked to get right.
+#
+#   absolute   w = 1          newtons; the tail decides
+#   relative   w = 1/F        per cent; every decade counts the same
+#   sqrt       w = 1/sqrt(F)  halfway between the two (counting-noise-like)
+
+WEIGHTINGS = {
+    "absolute": "Newtons — every point counts the same (plain least squares)",
+    "relative": "Per cent — every decade of force counts the same",
+    "sqrt": "In between — √F, halfway between newtons and per cent",
+}
+
+
+def _weights(f, weighting):
+    """The weight on each point, normalised to a mean of one."""
+    f = np.asarray(f, dtype=float)
+    if weighting in (None, "", "absolute") or f.size == 0:
+        return np.ones(f.shape)
+    size = np.abs(f)
+    floor = float(np.max(size)) * 1e-3 if np.max(size) > 0 else 1.0
+    size = np.clip(size, floor, None)
+    w = 1.0 / size if weighting == "relative" else 1.0 / np.sqrt(size)
+    mean = float(np.mean(w))
+    return w / mean if mean > 0 else np.ones(f.shape)
 
 
 def _covariance(A, residual, free):
@@ -272,9 +357,19 @@ def _covariance(A, residual, free):
     if idx.size == 0 or dof <= 0:
         return cov
     J = A[:, idx]
+    # The columns of a cell-squash design matrix differ by ten or more
+    # orders of magnitude (a column of ones beside a column of e^3 times a
+    # prefactor of 1e-11), and a pseudo-inverse of the raw normal matrix
+    # throws the small directions away as if they were noise, which reports
+    # a standard error of zero on a coefficient that is in fact barely
+    # determined. Scaling each column to unit norm first makes the inverse
+    # about the shape of the problem rather than about its units.
+    scale = np.linalg.norm(J, axis=0)
+    scale[~np.isfinite(scale) | (scale == 0)] = 1.0
+    Js = J / scale
     s2 = float(np.sum(residual ** 2)) / dof
     try:
-        sub = s2 * np.linalg.pinv(J.T @ J)
+        sub = s2 * np.linalg.pinv(Js.T @ Js, rcond=1e-12) / np.outer(scale, scale)
     except np.linalg.LinAlgError:  # pragma: no cover - pinv rarely fails
         return cov
     cov[np.ix_(idx, idx)] = sub
@@ -411,6 +506,8 @@ def fit_piecewise(
     settings=None,
     min_points=None,
     carry=("K_shell",),
+    squeeze=0.0,
+    weighting="absolute",
 ):
     """
     Fit every regime in turn, each anchored to where the last one ended.
@@ -443,6 +540,17 @@ def fit_piecewise(
 
         Pass ``()`` for the specification exactly as first written, where
         the shell's force is held at the value it reached at e2.
+    squeeze : float
+        The confinement exponent q of :func:`confinement_factor`. Every
+        element's law is multiplied by (1 - x/100)^-q, one number for the
+        whole cell, describing the stiffening that comes from squashing a
+        cell of fixed volume between two flat surfaces rather than from any
+        one component. Zero is the plain model.
+    weighting : {"absolute", "relative", "sqrt"}
+        What is minimised: the error in newtons (the default, in which the
+        last decade of the curve decides everything), the error as a
+        fraction of the force there, or halfway between. See
+        :data:`WEIGHTINGS`.
 
     Returns
     -------
@@ -486,6 +594,8 @@ def fit_piecewise(
     regime_out = []
     chain_broken = False
     carry = tuple(carry or ())
+    squeeze = float(squeeze or 0.0)
+    weighting = weighting if weighting in WEIGHTINGS else "absolute"
     ranges = _resolve_ranges(regimes, bounds, carry)
     carried = []   # [{"name", "power", "onset_pct", "until_pct", "value"}]
 
@@ -549,18 +659,20 @@ def fit_piecewise(
             # model puts first, which can be a cube law like any other.
             c0 = float(np.mean(f_all[:10]))
             untils = np.array([ranges[t.name][1] for t in regime.terms])
-            columns = [_basis(t.shape, t.power, x, a, untils[j])
+            columns = [_basis(t.shape, t.power, x, a, untils[j], squeeze)
                        for j, t in enumerate(regime.terms)]
             design = np.column_stack(columns + [np.ones_like(x)])
             p0 = [float(t.p0) if np.isfinite(t.p0) else 0.0
                   for t in regime.terms] + [c0]
             lower = [t.lower for t in regime.terms] + [-np.inf]
             upper = [t.upper for t in regime.terms] + [np.inf]
+            w = _weights(f, weighting)
             params, engine, at_bound = _bounded_linear_fit(
-                design, f, p0, lower, upper,
+                design * w[:, None], f * w, p0, lower, upper,
             )
             predicted = design @ params
-            cov = _covariance(design, f - predicted, ~at_bound)
+            cov = _covariance(design * w[:, None], (f - predicted) * w,
+                              ~at_bound)
             for j, t in enumerate(regime.terms):
                 entry["params"][t.name] = {
                     "value": float(params[j]),
@@ -570,7 +682,7 @@ def fit_piecewise(
                     "lower": float(t.lower), "upper": float(t.upper),
                     "power": float(t.power), "at_bound": bool(at_bound[j]),
                     "start": float(a), "until": float(untils[j]),
-                    "shape": t.shape,
+                    "shape": t.shape, "squeeze": squeeze,
                 }
                 coefficients[t.name] = float(params[j])
             offset = float(params[-1])
@@ -586,7 +698,7 @@ def fit_piecewise(
             entry["engine"] = engine
             anchor = offset + float(sum(
                 params[j] * float(_basis(t.shape, t.power, np.array([b]),
-                                         a, untils[j])[0])
+                                         a, untils[j], squeeze)[0])
                 for j, t in enumerate(regime.terms) if t.shape != LUMP))
             for j, t in enumerate(regime.terms):
                 if t.shape != LUMP and untils[j] > b + 1e-9:
@@ -595,6 +707,7 @@ def fit_piecewise(
                         "onset_pct": float(a), "until_pct": float(untils[j]),
                         "value": float(params[j]),
                         "se": entry["params"][t.name]["se"],
+                        "squeeze": squeeze,
                         "from_regime": regime.key,
                     })
         else:
@@ -602,7 +715,7 @@ def fit_piecewise(
             # end, and holds what it reached after that.
             untils = np.array([ranges[t.name][1] for t in regime.terms])
             design = np.column_stack([
-                _basis(t.shape, t.power, x, a, untils[j])
+                _basis(t.shape, t.power, x, a, untils[j], squeeze)
                 for j, t in enumerate(regime.terms)
             ])
             # What the carried elements add on top of the anchor here. Zero
@@ -612,11 +725,13 @@ def fit_piecewise(
             p0 = [t.p0 for t in regime.terms]
             lower = [t.lower for t in regime.terms]
             upper = [t.upper for t in regime.terms]
+            w = _weights(f, weighting)
             params, engine, at_bound = _bounded_linear_fit(
-                design, target, p0, lower, upper,
+                design * w[:, None], target * w, p0, lower, upper,
             )
             predicted = design @ params + anchor + known
-            cov = _covariance(design, f - predicted, ~at_bound)
+            cov = _covariance(design * w[:, None], (f - predicted) * w,
+                              ~at_bound)
             for j, t in enumerate(regime.terms):
                 entry["params"][t.name] = {
                     "value": float(params[j]),
@@ -626,7 +741,7 @@ def fit_piecewise(
                     "upper": float(t.upper), "power": float(t.power),
                     "at_bound": bool(at_bound[j]),
                     "start": float(a), "until": float(untils[j]),
-                    "shape": t.shape,
+                    "shape": t.shape, "squeeze": squeeze,
                 }
                 coefficients[t.name] = float(params[j])
                 if t.shape == LUMP and not (t.lower == t.upper):
@@ -651,7 +766,7 @@ def fit_piecewise(
             entry["engine"] = engine
             anchor = anchor + float(
                 sum(params[j] * float(_basis(t.shape, t.power, np.array([b]),
-                                             a, untils[j])[0])
+                                             a, untils[j], squeeze)[0])
                     for j, t in enumerate(regime.terms) if t.shape != LUMP)
             ) + float(_carried_force(carried, np.array([b]), a)[0])
             for j, t in enumerate(regime.terms):
@@ -661,6 +776,7 @@ def fit_piecewise(
                         "onset_pct": float(a), "until_pct": float(untils[j]),
                         "value": float(params[j]),
                         "se": entry["params"][t.name]["se"],
+                        "squeeze": squeeze,
                         "from_regime": regime.key,
                     })
 
@@ -685,6 +801,8 @@ def fit_piecewise(
         "coefficients": coefficients,
         "anchors": anchors,
         "carry": carry,
+        "squeeze": squeeze,
+        "weighting": weighting,
         "ranges": {k: (float(v[0]), float(v[1])) for k, v in ranges.items()},
         "epsilon_range": (bounds[0] / 100.0, reach / 100.0),
         "warnings": warnings,
@@ -702,6 +820,7 @@ def fit_piecewise(
     result.update({
         "r_squared": stats["r_squared"],
         "rmse": stats["rmse"],
+        "relative_rmse": stats["relative_rmse"],
         "n_points": stats["n_points"],
         "n_params": int(n_params),
     })
@@ -724,6 +843,248 @@ def fit_piecewise(
     return result
 
 
+# ============================================== how hard the squash itself is ==
+#
+# A power law K dx^p has a local exponent of exactly p: on log-log paper it
+# is a straight line of slope p. Multiplied by the confinement factor the
+# local exponent becomes
+#
+#     d ln F / d ln x = p + q * x / (100 - x)
+#
+# which is p near contact and climbs as the gap closes. That is the whole
+# diagnosis in one line: measure the slope of the curve on log-log paper,
+# see whether it stays flat (q = 0, the plain model is right) or rises the
+# way x/(100 - x) does (q > 0, the cell is running out of room), and read q
+# off the rise. Nothing is assumed; the curve is asked.
+
+CONFINEMENT_MAX = 3.0
+
+
+def confinement_from_profile(profile, from_pct=5.0, to_pct=None):
+    """
+    Read q off the measured local exponent: p(x) = p0 + q x/(100 - x).
+
+    ``profile`` is what :func:`power_law_profile` returns. Fitting that
+    straight line in the variable x/(100 - x) gives both the exponent the
+    curve starts with (p0, the intercept) and how fast it steepens (q, the
+    slope). Returns {"squeeze", "p0", "r_squared", "n"} or {} when the
+    profile is too short to say anything.
+    """
+    x = np.asarray((profile or {}).get("x_pct", ()), dtype=float)
+    p = np.asarray((profile or {}).get("exponent", ()), dtype=float)
+    if x.size < 8 or x.size != p.size:
+        return {}
+    top = float(to_pct) if to_pct else float(x.max())
+    keep = (x >= float(from_pct)) & (x <= top) & np.isfinite(p) & (x < 99.0)
+    if keep.sum() < 8:
+        return {}
+    u = x[keep] / (100.0 - x[keep])
+    y = p[keep]
+    slope, intercept = np.polyfit(u, y, 1)
+    predicted = slope * u + intercept
+    spread = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - float(np.sum((y - predicted) ** 2)) / spread if spread > 0 else 0.0
+    return {"squeeze": float(np.clip(slope, 0.0, CONFINEMENT_MAX)),
+            "p0": float(intercept), "r_squared": float(r2), "n": int(keep.sum())}
+
+
+def scan_confinement(epsilon, force_N, grid=None, **kwargs):
+    """
+    Fit the same model at each q and report how well each one did.
+
+    Everything else is held: the same components, the same boundaries, the
+    same bounds, the same one-unknown-at-a-time solve. Only the confinement
+    changes, so the comparison is fair and the best q is the one the curve
+    itself prefers. Returns a list of {"squeeze", "r_squared", "result"}
+    in the order of the grid.
+    """
+    if grid is None:
+        grid = np.round(np.arange(0.0, 2.01, 0.1), 3)
+    rows = []
+    for q in grid:
+        result = fit_piecewise(epsilon, force_N, squeeze=float(q), **kwargs)
+        r2 = (float(result.get("r_squared", float("nan")))
+              if result.get("success") else float("nan"))
+        rows.append({"squeeze": float(q), "r_squared": r2, "result": result})
+    return rows
+
+
+def best_confinement(epsilon, force_N, coarse=0.1, fine=0.01,
+                     limit=CONFINEMENT_MAX, prefer=None, **kwargs):
+    """
+    The confinement the curve prefers: coarse sweep, then a fine one round it.
+
+    ``prefer`` is an optional callable ``(q, result) -> comparable`` used to
+    break the choice when two values of q fit the curve equally well (the
+    page uses it to prefer a fit whose moduli land where the literature
+    says they should). Returns {"squeeze", "r_squared", "result", "rows"}
+    or None if nothing fitted.
+    """
+    def look(grid):
+        return [row for row in scan_confinement(epsilon, force_N, grid, **kwargs)
+                if np.isfinite(row["r_squared"])]
+
+    def pick(rows):
+        if not rows:
+            return None
+        if prefer is None:
+            return max(rows, key=lambda r: (round(r["r_squared"], 9),
+                                            -r["squeeze"]))
+        return max(rows, key=lambda r: (prefer(r["squeeze"], r["result"]),
+                                        round(r["r_squared"], 9), -r["squeeze"]))
+
+    rows = look(np.round(np.arange(0.0, float(limit) + 1e-9, float(coarse)), 3))
+    best = pick(rows)
+    if best is None:
+        return None
+    if fine and fine < coarse:
+        lo = max(0.0, best["squeeze"] - coarse)
+        hi = min(float(limit), best["squeeze"] + coarse)
+        near = look(np.round(np.arange(lo, hi + 1e-9, float(fine)), 4))
+        rows = rows + near
+        best = pick(rows + [best]) or best
+    return {"squeeze": best["squeeze"], "r_squared": best["r_squared"],
+            "result": best["result"],
+            "rows": [{"squeeze": r["squeeze"], "r_squared": r["r_squared"]}
+                     for r in sorted(rows, key=lambda r: r["squeeze"])]}
+
+
+# ========================================== the reading at small deformation ==
+#
+# A whole-cell squash runs from a few hundred piconewtons at 5 % to tens of
+# nanonewtons at 90 %: three or four decades. Plain least squares over all
+# of it is, to within a rounding error, a fit to the last decade, and the
+# elements that only act early are left with whatever the tail did not
+# want. That is why an element can come back as exactly zero, and why the
+# one that survives comes back far too stiff.
+#
+# The literature number for a cytoskeleton is a SMALL-DEFORMATION modulus:
+# it is read where the cell is still behaving like the material the law
+# describes. So it is read here the same way -- both laws from first
+# contact, over the stretch where the curve is still a straight line on
+# log-log paper -- and reported next to the whole-curve fit rather than
+# instead of it. They are two different measurements of the same cell and
+# they are allowed to differ; what is not allowed is calling the whole-curve
+# number the literature's number.
+
+SMALL_STRAIN_LAWS = (("membrane", 3.0), ("cytoskeleton", 1.5))
+
+
+def power_law_window(epsilon, force_N, start_pct=5.0, anchor_pct=15.0,
+                     max_pct=45.0, tolerance=0.5, profile=None):
+    """
+    How far the curve is still one power law: the flat part of the log-log slope.
+
+    The exponent is read over an anchor band just past the contact region
+    (``start_pct`` to ``anchor_pct``, where the curve is clean and still
+    straight on log-log paper), and the window is walked outwards from
+    there while the exponent stays within ``tolerance`` of that level. Where
+    it stops is where the curve begins to steepen, and that is the honest
+    end of a small-deformation reading: past it any single power law fitted
+    through the data is measuring the steepening, not the material.
+
+    Returns {"window_pct", "exponent", "spread", "exponent_at_end"} or {}.
+    """
+    profile = (profile if profile is not None
+               else power_law_profile(epsilon, force_N))
+    x = np.asarray((profile or {}).get("x_pct", ()), dtype=float)
+    p = np.asarray((profile or {}).get("exponent", ()), dtype=float)
+    if x.size < 8:
+        return {}
+    band = (x >= start_pct) & (x <= anchor_pct) & np.isfinite(p)
+    if band.sum() < 3:
+        band = np.isfinite(p) & (x <= max_pct)
+        if band.sum() < 3:
+            return {}
+    level = float(np.median(p[band]))
+    window = float(min(anchor_pct, x[band].max()))
+    for value, exponent in zip(x, p):
+        if value <= window:
+            continue
+        if value > max_pct or not np.isfinite(exponent):
+            break
+        if abs(exponent - level) > tolerance:
+            break
+        window = float(value)
+    inside = (x >= start_pct) & (x <= window) & np.isfinite(p)
+    end = p[x <= window]
+    return {"window_pct": window, "exponent": level,
+            "exponent_at_end": float(end[-1]) if end.size else float("nan"),
+            "spread": float(np.std(p[inside])) if inside.sum() else float("nan")}
+
+
+def small_strain_reading(epsilon, force_N, geometry, window_pct=20.0,
+                         laws=SMALL_STRAIN_LAWS, squeeze=0.0,
+                         weighting="absolute", free_offset=True):
+    """
+    The moduli read off the first ``window_pct`` of the squash.
+
+    Every law acts from first contact and in parallel, which is what the
+    elements of a cell actually do, rather than one after another with an
+    onset each: F(e) = C0 + sum_j E_j A_j e^p_j, e the deformation as a
+    fraction. Linear in the coefficients, non-negative, one bounded solve.
+    Because each law is measured from zero, its coefficient converts
+    straight into a modulus with the same prefactor the rest of the module
+    uses and nothing has to be undone.
+
+    Returns {"success", "window_pct", "n_points", "r_squared",
+    "relative_rmse", "offset_N", "moduli": {element: {...}}}.
+    """
+    x, f = _prepare(epsilon, force_N)
+    window = float(window_pct)
+    keep = (x >= 0.0) & (x <= window) & np.isfinite(f)
+    e, y = x[keep] / 100.0, f[keep]
+    need = len(laws) + (2 if free_offset else 1)
+    if e.size < need:
+        return {"success": False,
+                "error": f"only {int(e.size)} points below {window:g} %"}
+    A = _prefactors(geometry)
+    room = confinement_factor(e * 100.0, squeeze)
+    columns = [(e ** float(power)) * room * A[element]["A"]
+               for element, power in laws]
+    if free_offset:
+        columns.append(np.ones_like(e))
+    design = np.column_stack(columns)
+    lower = [0.0] * len(laws) + ([-np.inf] if free_offset else [])
+    upper = [np.inf] * len(design.T)
+    p0 = [1.0e3] * len(laws) + ([float(np.mean(y[:10]))] if free_offset else [])
+    w = _weights(y, weighting)
+    params, engine, at_bound = _bounded_linear_fit(
+        design * w[:, None], y * w, p0, lower, upper)
+    predicted = design @ params
+    cov = _covariance(design * w[:, None], (y - predicted) * w, ~at_bound)
+    stats = _statistics(y, predicted, len(params))
+    moduli = {}
+    for j, (element, power) in enumerate(laws):
+        se = float(np.sqrt(cov[j, j])) if (np.isfinite(cov[j, j])
+                                           and cov[j, j] >= 0) else float("nan")
+        moduli[element] = {
+            "element": element,
+            "name": ELEMENT_NAMES.get(element, element),
+            "power": float(power),
+            "E_Pa": float(params[j]),
+            "E_se_Pa": se,
+            "E_lo_Pa": float(params[j]) - 1.96 * se,
+            "E_hi_Pa": float(params[j]) + 1.96 * se,
+            "A": float(A[element]["A"]),
+            "law": A[element]["law"],
+            "at_bound": bool(at_bound[j]),
+        }
+    return {
+        "success": True,
+        "window_pct": window,
+        "squeeze": float(squeeze or 0.0),
+        "weighting": weighting,
+        "engine": engine,
+        "n_points": int(e.size),
+        "r_squared": stats["r_squared"],
+        "relative_rmse": stats["relative_rmse"],
+        "rmse": stats["rmse"],
+        "offset_N": float(params[-1]) if free_offset else 0.0,
+        "moduli": moduli,
+    }
+
+
 def _carried_force(carried, x, a):
     """
     Force the carried elements add inside a regime that starts at ``a``.
@@ -740,9 +1101,10 @@ def _carried_force(carried, x, a):
             continue
         onset, power = float(c["onset_pct"]), float(c["power"])
         until = float(c.get("until_pct", np.inf))
+        q = float(c.get("squeeze", 0.0) or 0.0)
         out = out + value * (
-            np.clip(np.minimum(x, until) - onset, 0.0, None) ** power
-            - max(min(a, until) - onset, 0.0) ** power
+            _basis("power", power, x, onset, until, q)
+            - float(_basis("power", power, np.array([a]), onset, until, q)[0])
         )
     return out
 
@@ -761,7 +1123,7 @@ def _regime_force(regime, x):
     for p in params.values():
         until = float(p.get("until", np.inf))
         out = out + p["value"] * _basis(p.get("shape", "power"), p["power"],
-                                        x, a, until)
+                                        x, a, until, p.get("squeeze", 0.0))
     return out + _carried_force(list((regime.get("carried") or {}).values()), x, a)
 
 
@@ -787,7 +1149,7 @@ def component_curve(result, name, n=300):
     if home["anchor_in_N"] is None:
         return x, p["value"] * x + home["params"]["C0"]["value"]
     return x, p["value"] * _basis(p.get("shape", "power"), p["power"], x,
-                                  start, until)
+                                  start, until, p.get("squeeze", 0.0))
 
 
 def component_force(result, name, x_pct):
@@ -815,7 +1177,7 @@ def component_force(result, name, x_pct):
         out = p["value"] * np.minimum(x, until) + home["params"]["C0"]["value"]
     else:
         out = p["value"] * _basis(p.get("shape", "power"), p["power"], x,
-                                  start, until)
+                                  start, until, p.get("squeeze", 0.0))
     lo = float(regimes[0]["domain_pct"][0])
     hi = float(regimes[-1]["domain_pct"][1])
     return np.where((x >= lo) & (x <= hi), out, np.nan)
@@ -920,7 +1282,8 @@ def _coefficient_names(regimes):
     return names, np.array(lower, dtype=float), np.array(upper, dtype=float)
 
 
-def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
+def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",),
+                 squeeze=0.0):
     """
     The design matrix of the continuous four-regime model: F_hat = X theta.
 
@@ -937,7 +1300,14 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
     anchor = np.zeros(len(names))
     carried = []
     carry = tuple(carry or ())
+    squeeze = float(squeeze or 0.0)
     ranges = _resolve_ranges(regimes, bounds, carry)
+
+    def at(term_shape, power, value, start, until):
+        """One basis function at a single x, as a plain float."""
+        return float(_basis(term_shape, power, np.array([float(value)]),
+                            start, until, squeeze)[0])
+
     for i, regime in enumerate(regimes):
         a, b = bounds[i], bounds[i + 1]
         last = i == len(regimes) - 1
@@ -945,25 +1315,34 @@ def joint_design(x, bounds, regimes=C2C12_REGIMES, carry=("K_shell",)):
         covered |= mask
         xm = x[mask]
         if regime.free_offset:
-            term = regime.terms[0]
-            X[mask, col[term.name]] = xm ** term.power
-            X[mask, col["C0"]] = 1.0
             anchor = np.zeros(len(names))
-            anchor[col[term.name]] = b ** term.power
+            for term in regime.terms:
+                u = ranges[term.name][1]
+                X[mask, col[term.name]] = _basis(term.shape, term.power, xm,
+                                                 a, u, squeeze)
+                if term.shape != LUMP:
+                    anchor[col[term.name]] = at(term.shape, term.power, b, a, u)
+            X[mask, col["C0"]] = 1.0
             anchor[col["C0"]] = 1.0
+            for term in regime.terms:
+                u = ranges[term.name][1]
+                if term.shape != LUMP and u > b + 1e-9:
+                    carried.append((term.name, float(term.power), float(a),
+                                    float(u)))
             continue
         rows = np.tile(anchor, (xm.size, 1))
         after = anchor.copy()
         for term in regime.terms:
             u = ranges[term.name][1]
-            rows[:, col[term.name]] += _basis(term.shape, term.power, xm, a, u)
+            rows[:, col[term.name]] += _basis(term.shape, term.power, xm, a, u,
+                                              squeeze)
             if term.shape != LUMP:
-                after[col[term.name]] += (min(b, u) - a) ** term.power
+                after[col[term.name]] += at(term.shape, term.power, b, a, u)
         for name, power, onset, u in carried:
-            base = max(min(a, u) - onset, 0.0) ** power
-            rows[:, col[name]] += (np.clip(np.minimum(xm, u) - onset, 0.0, None)
-                                   ** power - base)
-            after[col[name]] += max(min(b, u) - onset, 0.0) ** power - base
+            base = at("power", power, a, onset, u)
+            rows[:, col[name]] += (_basis("power", power, xm, onset, u, squeeze)
+                                   - base)
+            after[col[name]] += at("power", power, b, onset, u) - base
         for term in regime.terms:
             u = ranges[term.name][1]
             if term.shape != LUMP and u > b + 1e-9:
@@ -1031,7 +1410,8 @@ def _prepare(epsilon, force_N):
 
 
 def joint_sse(epsilon, force_N, boundaries_pct=C2C12_BOUNDARIES_PCT,
-              regimes=C2C12_REGIMES, settings=None, carry=("K_shell",)):
+              regimes=C2C12_REGIMES, settings=None, carry=("K_shell",),
+              squeeze=0.0):
     """
     S at one placement: the residual sum of squares, in N^2, of the best
     continuous four-regime curve with those boundaries.
@@ -1039,7 +1419,7 @@ def joint_sse(epsilon, force_N, boundaries_pct=C2C12_BOUNDARIES_PCT,
     x_all, f_all = _prepare(epsilon, force_N)
     regimes = with_settings(regimes, settings)
     X, covered, _n, lower, upper = joint_design(
-        x_all, [float(b) for b in boundaries_pct], regimes, carry)
+        x_all, [float(b) for b in boundaries_pct], regimes, carry, squeeze)
     return _bounded_lsq_exact(X[covered], f_all[covered], lower, upper)[1]
 
 
@@ -1082,6 +1462,7 @@ def find_boundaries(
     profile_step=0.25,
     min_width=2.0,
     span_pct=None,
+    squeeze=0.0,
 ):
     """
     The e1, e2, e3 that maximise the likelihood of the four-regime model.
@@ -1138,7 +1519,7 @@ def find_boundaries(
         if key not in cache:
             if valid(key):
                 X, covered, _n, lower, upper = joint_design(
-                    x_fit, (0.0,) + key + (end,), regimes, carry)
+                    x_fit, (0.0,) + key + (end,), regimes, carry, squeeze)
                 cache[key] = _bounded_lsq_exact(
                     X[covered], f_fit[covered], lower, upper)[1]
             else:
