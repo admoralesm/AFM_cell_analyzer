@@ -808,6 +808,8 @@ DEFAULTS = {
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
     "pw_selected": None,
+    # What the last "reach the target" search had to do, in one line.
+    "pw_reach_note": None,
     # Guided by default: most people opening this want a number, not a
     # spring network. Everything is still one expander away.
     "ui_mode": "Guided · plain language",
@@ -5413,6 +5415,13 @@ def piecewise_defaults():
     return tuple(piecewise_prior()["defaults"]) + (DEFAULTS["pw_end"],)
 
 
+# While the target search is running it tries the first component both
+# carried on and holding what it reached. It cannot write the tick's own
+# session key -- the widget already exists this run -- so it says so here
+# instead, and puts it back when it is done.
+_PW_CARRY_OVERRIDE = [None]
+
+
 def piecewise_carry():
     """
     The components that keep acting to the end of the fit.
@@ -5425,9 +5434,15 @@ def piecewise_carry():
     # the modulus already found for it. So every component carries, and
     # the membrane's own tick is the one exception, because a membrane
     # that holds what it reached at ε₁ is a thing people fit on purpose.
-    carry = tuple(ORDER_COEFFICIENT[t] for t in component_order())
-    if not _pw_get("pw_membrane_throughout", True):
-        carry = tuple(c for c in carry if c != "K_shell")
+    order = component_order()
+    carry = tuple(ORDER_COEFFICIENT[t] for t in order)
+    throughout = (_PW_CARRY_OVERRIDE[0] if _PW_CARRY_OVERRIDE[0] is not None
+                  else _pw_get("pw_membrane_throughout", True))
+    if not throughout and order:
+        # The first component holds what it reached at its own boundary
+        # instead of carrying its law on.
+        first = ORDER_COEFFICIENT[order[0]]
+        carry = tuple(c for c in carry if c != first)
     return carry
 
 
@@ -6325,6 +6340,118 @@ def piecewise_equations_latex(bounds, ranges, off=()):
         r"\begin{aligned} F(x) = F_{" + f"{e1:.4g}" + r"\%} &+ " + body
         + r" \end{aligned}" + rf"\qquad {e1:.4g} \le x \le {end:.4g}",
     ]
+
+
+def _band_keys():
+    """Every session key that holds a constraint on ε."""
+    return [key for pair in PW_BAND_KEYS for key in pair] + list(PW_SPAN_KEYS)
+
+
+def _widen_the_bands(factor):
+    """
+    Open the constraints on ε out about their own middle, by ``factor``.
+
+    Each band keeps its centre and grows: the prior is still the place the
+    search starts from, it is just allowed to look further out. Returns the
+    values written, so they can be reported and put back.
+    """
+    (l1, h1), (l2, h2), _b3 = piecewise_bands()
+    s_lo, s_hi = piecewise_span()
+    out = {}
+    for (lo_key, hi_key), (lo, hi) in zip(PW_BAND_KEYS, ((l1, h1), (l2, h2))):
+        middle, half = (lo + hi) / 2.0, (hi - lo) / 2.0 * factor
+        out[lo_key] = round(float(max(0.5, middle - half)), 2)
+        out[hi_key] = round(float(min(99.0, middle + half)), 2)
+    middle, half = (s_lo + s_hi) / 2.0, (s_hi - s_lo) / 2.0 * factor
+    out[PW_SPAN_KEYS[0]] = round(float(max(1.0, middle - half)), 2)
+    out[PW_SPAN_KEYS[1]] = round(float(min(90.0, middle + half)), 2)
+    return out
+
+
+# How far the search is allowed to open the constraints out, in order, and
+# what each step is called when the page says what it had to do.
+REACH_STEPS = (
+    (1.0, "inside the C2C12 prior"),
+    (2.0, "with the prior's bands opened out twice as wide"),
+    (4.0, "with the prior's bands opened out four times"),
+)
+
+
+def reach_the_target(model, epsilon, force_N, target):
+    """
+    Open the constraints on ε out, a step at a time, until R² ≥ target.
+
+    The prior is where the search starts, not where it has to end: a cell
+    whose nucleus is met at 70 % is a real cell, and a fit that cannot
+    reach it inside a band written for the average one is a fit refusing to
+    describe the cell in front of it. So each step widens the bands about
+    their own middle, searches again, and stops at the first placement that
+    reaches the target. What it had to open out is reported, because a fit
+    found outside the prior is a result about this cell that the prior did
+    not expect.
+
+    Returns {"reached", "best_pct", "r2", "said", "bands", "step"} or None.
+    """
+    kept = {key: st.session_state.get(key) for key in _band_keys()}
+    was_throughout = bool(st.session_state.get("pw_membrane_throughout", True))
+    best = None
+    try:
+        for factor, said in REACH_STEPS:
+            if factor != 1.0:
+                st.session_state.update(_widen_the_bands(factor))
+            # Two models at each step: the first component carried on as it
+            # is, and the first component holding what it reached at its own
+            # boundary. A law carried on and extrapolated can cover the whole
+            # of the next stretch and leave nothing for the component that
+            # joins there, and letting it hold instead is often the whole
+            # difference between three components measured and four.
+            for throughout in (was_throughout, False):
+                _PW_CARRY_OVERRIDE[0] = throughout
+                st.session_state["pw_placements"] = None
+                placements = compute_placements(model, epsilon, force_N)
+                rows = placements.get("rows") or {}
+                held = ("" if throughout else
+                        ", with the first component holding what it reached "
+                        "rather than carrying on")
+                for key, row in rows.items():
+                    r2 = float(row.get("r2", float("nan")))
+                    if not np.isfinite(r2):
+                        continue
+                    if best is None or r2 > best["r2"]:
+                        best = {"reached": r2 >= target, "r2": r2,
+                                "said": said + held,
+                                "best_pct": tuple(row["best_pct"]),
+                                "route": key, "throughout": throughout,
+                                "bands": {k: st.session_state.get(k)
+                                          for k in _band_keys()},
+                                "placements": placements}
+                if best and best["reached"]:
+                    return best
+    finally:
+        _PW_CARRY_OVERRIDE[0] = None
+        # The board goes back to the constraints it had; the boundaries the
+        # search found are written to it instead, as typed numbers.
+        st.session_state.update(kept)
+    return best
+
+
+def reach_note(found, target):
+    """What the search had to do, in one line."""
+    if not found:
+        return ("The search could not fit this curve at any placement. "
+                "Check the fitted range and the components ticked.")
+    where = ", ".join(f"ε{sub} = {value:.2f} %" for sub, value
+                      in zip("₁₂₃", found["best_pct"]))
+    if found["reached"]:
+        return (f"✅ **R² = {found['r2']:.6f} ≥ {target:g}**, found "
+                f"{found['said']}, at {where}. The boundaries are on the "
+                "board as typed numbers, so this fit stays until you "
+                "change them.")
+    return (f"⚠️ **The best this curve gives is R² = {found['r2']:.6f}**, "
+            f"below {target:g}, even {REACH_STEPS[-1][1]}. It is at {where}. "
+            "A curve that will not reach the target usually has something "
+            "the model does not describe in it: a rupture, a bad contact, "
+            "or a component that is not ticked.")
 
 
 def carried_forward_summary(bounds=None, target=0.999):
@@ -7245,6 +7372,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_apply", False):
         apply_board()
     elif applied_state.get("curve") != curve_key:
+        st.session_state["pw_reach_note"] = None
         place_now(arriving=True)
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
@@ -7291,31 +7419,30 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.markdown("**Step 2 · Where its parts take over**")
         st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
                  r"\le x_{end}")
-        how_col, eps_col = st.columns([1, 1.6], gap="medium")
-        with how_col:
-            st.radio(
-                "on ▶ Fit & plot", list(PW_EPS_WAYS),
-                format_func=PW_EPS_WAYS.get, key="pw_eps_way",
-                on_change=_pw_eps_way_changed,
-                help="Found from the curve: the boundaries are placed by the "
-                     "route under Advanced, and the numbers beside this are "
-                     "overwritten with what it found. Kept as typed: the fit "
-                     "happens exactly at the numbers beside this and nothing "
-                     "moves.",
-            )
-        with eps_col:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
-                                key="pw_b1", help=EPS_ROLES[0])
-                st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
-                                key="pw_b3", help=EPS_ROLES[2])
-            with c2:
-                st.number_input("ε₂ (%)", 1.0, 99.0, step=0.5, format="%.2f",
-                                key="pw_b2", help=EPS_ROLES[1])
-                st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
-                                key="pw_end", help="Last point fitted; not moved "
-                                "by the routes.")
+        st.radio(
+            "on ▶ Fit & plot", list(PW_EPS_WAYS),
+            format_func=PW_EPS_WAYS.get, key="pw_eps_way",
+            on_change=_pw_eps_way_changed, horizontal=True,
+            label_visibility="collapsed",
+            help="Found from this curve: ▶ Fit & plot places the boundaries "
+                 "and overwrites the numbers below with what it found. Kept "
+                 "as typed: the fit happens exactly at the numbers below and "
+                 "nothing moves.",
+        )
+        e1c, e2c, e3c, endc = st.columns(4)
+        with e1c:
+            st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
+                            key="pw_b1", help=EPS_ROLES[0])
+        with e2c:
+            st.number_input("ε₂ (%)", 1.0, 99.0, step=0.5, format="%.2f",
+                            key="pw_b2", help=EPS_ROLES[1])
+        with e3c:
+            st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
+                            key="pw_b3", help=EPS_ROLES[2])
+        with endc:
+            st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
+                            key="pw_end", help="Last point fitted; not moved "
+                            "by the routes.")
         for note in constraint_notes(piecewise_boundaries()):
             st.caption(f"⚠️ {note}.")
         if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
@@ -7325,21 +7452,45 @@ def piecewise_section(model, epsilon, force_N, rupture):
                            rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
 
         st.markdown("**Step 3 · Fit**")
-        go1, go2 = st.columns([1, 1])
+        nothing_ticked = len(piecewise_off()) >= len(PW_SWITCHABLE) + 1
+        go1, go2, go3 = st.columns([1.1, 1.3, 1])
         with go1:
             pressed = st.button(
                 "▶ Fit & plot", type="primary", key="pw_fit_plot",
+                disabled=nothing_ticked,
                 help="Fits the components ticked in step 1, at the "
                 "boundaries step 2 gives, and redraws everything on this "
                 "page from that one fit.",
                 **STRETCH,
             )
         with go2:
+            reaching = st.button(
+                f"🎯 Reach R² ≥ {float(_pw_get('pw_target_r2', 0.999)):g}",
+                key="pw_reach", disabled=nothing_ticked,
+                help="Searches for boundaries that bring the whole curve to "
+                "the target, opening the C2C12 constraints out a step at a "
+                "time until it gets there, and says what it had to open. "
+                "The boundaries it finds are written on the board as typed "
+                "numbers.",
+                **STRETCH,
+            )
+        with go3:
             refreshed = st.button(
                 "🔄 Refresh graph", key="pw_refresh",
+                disabled=nothing_ticked,
                 help="Redraws the graph and the results at exactly what the "
                 "board holds now. Moves no boundary and chooses nothing.",
                 **STRETCH,
+            )
+        if nothing_ticked:
+            st.warning("Tick at least one component in step 1 before "
+                       "fitting.", icon="⚠️")
+        else:
+            st.caption(
+                "**▶ Fit & plot** uses the board as it stands. "
+                "**🎯 Reach R²** goes looking for boundaries that meet the "
+                "target, widening the prior only as far as it has to. "
+                "**🔄 Refresh graph** just draws the board again."
             )
 
         # The board holds what is decided here and nothing else. The route
@@ -7350,6 +7501,30 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # written out under that table rather than sitting here as boxes
         # nobody sets.
 
+    # 🎯 Reach R²: open the constraints out a step at a time until the
+    # whole curve meets the target, and say what had to be opened.
+    if reaching:
+        with st.spinner("Looking for boundaries that reach the target…"):
+            found_reach = reach_the_target(model, epsilon, force_N,
+                                           float(_pw_get("pw_target_r2", 0.999)))
+        st.session_state["pw_reach_note"] = reach_note(
+            found_reach, float(_pw_get("pw_target_r2", 0.999)))
+        if found_reach:
+            st.session_state["pw_placements"] = found_reach.get("placements")
+            st.session_state["pw_selected"] = {
+                "key": found_reach["route"],
+                "reason": f"🎯 Reach R²: {found_reach['said']}, "
+                          f"R² = {found_reach['r2']:.5f}.",
+            }
+            rerun_keeping_settings({
+                **{key: round(float(value), 2) for key, value in
+                   zip(PW_BOUNDARY_KEYS, found_reach["best_pct"])},
+                "pw_membrane_throughout": bool(
+                    found_reach.get("throughout", True)),
+                "pw_eps_way": "typed",
+                "_pw_apply": True,
+            })
+
     # 🔄 Refresh graph: draw the board as it stands, moving nothing.
     if refreshed:
         apply_board()
@@ -7357,6 +7532,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
 
     # ▶ Fit & plot: place ε if the route says so, then apply the board.
     if pressed:
+        # A new fit of its own: whatever the last target search had to say
+        # was about the boundaries it found, not about these.
+        st.session_state["pw_reach_note"] = None
         if st.session_state.get("pw_eps_way") == "typed":
             apply_board()
             applied = st.session_state["pw_applied"]["values"]
@@ -7377,11 +7555,16 @@ def piecewise_section(model, epsilon, force_N, rupture):
             rerun_keeping_settings({**values, "_pw_apply": True})
 
     waiting = pw_board_values() != applied
-    status_slot.markdown(
-        "⚠️ **The board has changes the plot does not show yet.** Press "
-        "▶ Fit & plot to apply them." if waiting else
-        "✓ The graph and the results show the settings on this board."
-    )
+    with status_slot.container():
+        if waiting:
+            st.warning("The board has changes the plot does not show yet. "
+                       "Press **▶ Fit & plot** to apply them.", icon="⚠️")
+        else:
+            st.success("The graph and the results show the settings on this "
+                       "board.", icon="✅")
+        said_reach = st.session_state.get("pw_reach_note")
+        if said_reach:
+            st.caption(said_reach)
 
     # ============================ the applied fit: graph, results, working
     with pw_applied_values(applied):
@@ -7473,8 +7656,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         line + (rf" · worst $R_{{{worst['key'][1]}}}$: "
                                 rf"$R^2 = {worst['r_squared']:.4f}$"
                                 if worst else "")
-                        + ". Try another route to ε, or that regime's components, "
-                        "then ▶ Fit & plot.", icon="⚠️")
+                        + f". Press **🎯 Reach R² ≥ {target:g}** on the board "
+                        "and it will look for boundaries that meet it, "
+                        "widening the C2C12 constraints only as far as it "
+                        "has to.", icon="⚠️")
                 log_y = bool(st.session_state.get("pw_log_y"))
                 st.plotly_chart(
                     piecewise_figure(
