@@ -975,7 +975,10 @@ NEW_CELL_CLEARS = (
     "video_path", "video_info", "video_track",
     "video_name", "video_link", "eps_percent_fix",
     "video_saved_frame", "video_saved_frame_index", "pw_boundary_search",
-    "_pw_auto_found", "pw_placements", "pw_selected",
+    "_pw_auto_found", "pw_placements", "pw_selected", "pw_reach_note",
+    # The way of fitting is a property of the cell type, not of the cell
+    # before this one: a C2C12 starts on the carried-forward fit.
+    "c2c12_fit_mode",
 )
 
 if st.session_state.pop("_start_new_cell", False):
@@ -4217,6 +4220,16 @@ def apply_cell_type(name):
     composition.update(DEFAULT_COMPOSITION_BY_TYPE.get(name, {}))
     for key, value in composition.items():
         st.session_state[key] = value
+    # Which way this cell type is fitted. A C2C12 is fitted carried
+    # forward -- one component to a stretch, each modulus found in turn and
+    # then held -- and that is where it starts, whatever the cell before it
+    # was fitted with. A cell type the four regimes are not written for has
+    # only the other way, so it gets that.
+    st.session_state["c2c12_fit_mode"] = (
+        PIECEWISE_MODE if (HAS_PIECEWISE and name in PIECEWISE_CELL_TYPES)
+        else ADVANCED_MODE
+    )
+    st.session_state["pw_reach_note"] = None
     # The boundaries and everything measured for the previous cell type.
     st.session_state["segment_break_1"] = DEFAULTS["segment_break_1"]
     st.session_state["segment_break_2"] = DEFAULTS["segment_break_2"]
