@@ -4911,12 +4911,47 @@ SHARING_MATHS = {
         r"\varepsilon(F) = \sum_k (F / a_k E_k)^{1/p_k}",
 }
 SHARING_HELP = {
-    PW_SHARE: "The same four components, met in four regimes: contact (can "
-              "be switched off), membrane + cytoskeleton from ε₁, nuclear "
-              "envelope from ε₂, the inside of the nucleus from ε₃. Each "
-              "regime is fitted from the force the last one ended on (C⁰), "
-              "and carried components keep their fitted law.",
+    PW_SHARE: "The same components, met in four regimes: membrane and "
+              "cytoskeleton from ε₁, the nuclear envelope from ε₂, the "
+              "inside of the nucleus from ε₃. Each regime is fitted from "
+              "the force the last one ended on (C⁰), and components carried "
+              "in keep the law already found for them.",
 }
+# The list is read while deciding, so every entry is one short line: the
+# shape of the sum, not a sentence about it. The sentence is written under
+# the chosen one, where it is actually read.
+SHARING_SHORT = {
+    PW_SHARE: "Regime by regime  ·  each anchored to the last",
+    "Segmented (each part takes over in turn)":
+        "Segmented  ·  each part takes over in turn",
+    "Side by side (every element acts everywhere)":
+        "Side by side  ·  same squash, forces add",
+    "Stacked (elements in line)":
+        "Stacked  ·  same force, squashes add",
+    "Side by side, then stacked":
+        "Side by side → stacked  ·  at a crossover",
+    "Stacked, then side by side":
+        "Stacked → side by side  ·  at a crossover",
+    "Compare these and rank them":
+        "Compare them  ·  fit all and rank by AICc",
+    "Cardiomyocyte (Morales Maldonado)":
+        "Cardiomyocyte shell  ·  provisional",
+}
+# The four the app measures, under the name each way of sharing gives them,
+# so a tick survives a change of model: nothing about which components the
+# cell has depends on how their forces are added up.
+SHARED_TICKS = (("pw_use_K_shell", "use_membrane"),
+                ("pw_use_K_cyto", "use_interior"),
+                ("pw_use_K_nucleus", "use_nucleus_shell"),
+                ("pw_use_K_core", "use_nucleus"))
+
+
+def _carry_the_ticks(to_piecewise):
+    """Carry which components are ticked across a change of sharing."""
+    for pw_key, legacy_key in SHARED_TICKS:
+        source, target = ((legacy_key, pw_key) if to_piecewise
+                          else (pw_key, legacy_key))
+        st.session_state[target] = bool(st.session_state.get(source, True))
 
 
 def sharing_options():
@@ -4947,6 +4982,7 @@ def _load_sharing_changed():
                 st.session_state["pw_b2"] = round(e2, 2)
             if l1 <= e1 <= h1:
                 st.session_state["pw_b1"] = round(e1, 2)
+            _carry_the_ticks(to_piecewise=True)
         st.session_state["c2c12_fit_mode"] = PIECEWISE_MODE
         return
     if was_piecewise:
@@ -4954,6 +4990,7 @@ def _load_sharing_changed():
             float(st.session_state.get("pw_b1", 5.0)) / 100.0, 4)
         st.session_state["segment_break_2"] = round(
             float(st.session_state.get("pw_b2", 50.0)) / 100.0, 4)
+        _carry_the_ticks(to_piecewise=False)
     st.session_state["c2c12_fit_mode"] = ADVANCED_MODE
     st.session_state["model_kind"] = chosen
 
@@ -4970,16 +5007,23 @@ def load_sharing_control():
     st.session_state["load_sharing"] = current_sharing()
     if st.session_state["load_sharing"] not in options:
         st.session_state["load_sharing"] = options[0]
-    st.radio(
+    # A list one line per entry rather than a column of paragraphs: seven
+    # ways of adding the same forces up are scanned, not read, and the one
+    # sentence that matters is the one under whichever is chosen.
+    st.selectbox(
         "How the components share the load", options, key="load_sharing",
+        format_func=lambda name: SHARING_SHORT.get(name, name),
         on_change=_load_sharing_changed,
-        help="The same components and the same boundaries in every case; "
-        "this is only how their forces combine.",
+        help="The same components, the same ticks and the same boundaries "
+        "in every case; this is only how their forces combine. Changing it "
+        "keeps every component you have ticked.",
     )
     chosen = st.session_state["load_sharing"]
     if chosen in SHARING_MATHS:
         st.latex(SHARING_MATHS[chosen])
     st.caption(SHARING_HELP.get(chosen) or MODELS.get(chosen, ""))
+    st.caption("Your ticks in the table below stay as they are when you "
+               "change this.")
 
 
 def piecewise_boundaries():
