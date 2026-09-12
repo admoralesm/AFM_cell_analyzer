@@ -189,6 +189,7 @@ residual_diagnostics = getattr(_piecewise_module, "residual_diagnostics", None)
 coefficient_significance = getattr(
     _piecewise_module, "coefficient_significance", None)
 model_conditioning = getattr(_piecewise_module, "model_conditioning", None)
+LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
 HAS_VALIDATION = all(f is not None for f in (
     information_criteria, akaike_weights, residual_diagnostics,
     coefficient_significance, model_conditioning))
@@ -5206,6 +5207,30 @@ def pw_regimes():
     return tuple(out)
 
 
+def pw_regimes_for(order_names):
+    """
+    The regimes with the components met in a stated order.
+
+    :func:`pw_regimes` is this read from the board. The screen needs it for
+    an order the board does not hold, so the order comes in as an argument
+    and nothing is written to the page to get it.
+    """
+    if not PW_REGIMES:
+        return ()
+    terms = {t.name: t for regime in PW_REGIMES for t in regime.terms}
+    every = [name for name, *_rest in PW_COMPONENTS]
+    wanted = [n for n in order_names if n in terms]
+    wanted += [n for n in every if n not in wanted and n in terms]
+    out = []
+    for index, (regime, name) in enumerate(zip(PW_REGIMES, wanted)):
+        out.append(_dataclasses.replace(
+            regime, terms=(terms[name],), free_offset=(index == 0),
+            title=PW_COMPONENT_TITLES.get(name, regime.title),
+            equation="",
+        ))
+    return tuple(out)
+
+
 def pw_start_index():
     """Which boundary each coefficient starts at, in the chosen order."""
     return {ORDER_COEFFICIENT[term]: index
@@ -5876,123 +5901,299 @@ def best_mixture(epsilon, force_N, model=None):
 
 # ============================================================ the screen ==
 #
-# "Which components are in this cell?" is a model-selection question, and
-# the way to answer it is the way any analytical method answers one: fit
-# every candidate to the SAME points, score each on a criterion that
-# charges for parameters, and report the whole ranking rather than the
-# winner alone.
+# "Which components are in this cell, and how are they arranged?" is a
+# model-selection question, and it is answered the way an analytical method
+# answers one: fit every candidate to the SAME points, score each on a
+# criterion that charges for parameters, and report the whole ranking
+# rather than the winner alone.
 #
-#   * Sixteen candidates: every subset of the four components (the empty
-#     one is the baseline C0 alone, which is worth seeing -- if it is not
-#     far behind, this curve has nothing in it).
-#   * The same boundaries, the same weighting, the same confinement, the
-#     same points. Only which components are free changes, so AIC
-#     differences between candidates mean what they are supposed to.
-#   * Scored on AICc, with the corresponding Akaike weight: the
-#     probability, over the set tried, that this candidate is the best one.
-#     ΔAICc under 2 is a tie, and a tie is reported as a tie rather than
-#     resolved by the fourth decimal place of R2.
-#   * Each candidate also carries how many of its components were actually
-#     DETECTED -- coefficient distinguishable from zero -- because a
-#     candidate that wins by including a component it cannot see has not
-#     learnt anything, and the screen says so instead of hiding it.
+# It is searched FROM THE TOP DOWN, and that order is the point of it.
+# Four components is the model this cell is believed to have, so all four
+# are exhausted first -- every mathematical arrangement of them, not just
+# the one on the board -- and the search only drops a component when four
+# of them cannot be made to work. A screen that started at the bottom and
+# added components would find three that fit and stop, having never asked
+# whether the fourth was there.
+#
+# WHAT "EVERY MATHEMATICAL WAY" MEANS. With the component set fixed, two
+# things are still free, and together they are the whole space:
+#
+#   ORDER   which component is met first, second, third, fourth -- that is,
+#           which one owns [0, e1), which owns [e1, e2) and so on. For four
+#           components that is 4! = 24 orders.
+#   CARRY   for each component, whether it goes on taking load to the end
+#           of the squash or stops at the next boundary and holds what it
+#           reached. 2^4 = 16 patterns, and these 16 contain all three of
+#           the named ways of fitting: all-carried is (1)(every component
+#           carried on), none-carried is (2)(one at a time), and the
+#           fourteen in between are (3)(the mixtures).
+#
+# So the four-component tier is 24 x 16 = 384 distinct fits, and it is
+# exhausted before three components is looked at. The tiers below it are
+# the same space over smaller sets:
+#
+#   4 components   C(4,4) x 4! x 2^4 = 384
+#   3 components   C(4,3) x 3! x 2^3 = 192
+#   2 components   C(4,2) x 2! x 2^2 =  48
+#   1 component    C(4,1) x 1! x 2^1 =   8
+#   0 components   the baseline C0 alone                 1
+#
+# 633 fits in all. Every one of them is at the same boundaries, on the same
+# points, with the same weighting and the same confinement, so the AICc
+# differences between them mean what they are supposed to mean.
+#
+# WHEN THE SEARCH DESCENDS. A tier is ACCEPTED, and the search stops, when
+# its best arrangement measures every component it contains -- each
+# coefficient distinguishable from zero at the 95 % level -- and leaves no
+# systematic lack of fit. Anything less and it descends, saying why in
+# words. That rule is what keeps "four components" from being a claim the
+# curve does not support: four are tried first and hardest, and dropped
+# only on evidence.
 
 PW_SCREEN_TIE = 2.0
+PW_SCREEN_BUDGET_S = 25.0
 
 
-def screen_components(model, epsilon, force_N, subsets=None, budget=None):
+def arrangement_space(on, every=None):
     """
-    Fit every subset of the components at the board's boundaries and rank them.
+    Every mathematical arrangement of one component set: (order, carry).
 
-    Returns {"rows": [...], "best", "boundaries_pct", "n_points"} where each
-    row is {"on", "label", "n_free", "r2", "aicc", "bic", "delta", "weight",
-    "detected", "unmeasured", "moduli"}. The row order is the ranking.
+    ``order`` is all four coefficient names, the chosen ones first in the
+    order they are met and the rest after (they are held at zero, so where
+    they sit does not matter, but the engine still wants four regimes so
+    that every tier is fitted over the same four stretches and the AICc
+    comparison is fair). ``carry`` is the subset that goes on taking load
+    past its own stretch.
     """
+    import itertools
+    every = list(every or [name for name, *_r in PW_COMPONENTS])
+    rest = tuple(n for n in every if n not in on)
+    for order in itertools.permutations(tuple(on)):
+        for mask in range(1 << len(order)):
+            carry = tuple(n for i, n in enumerate(order) if mask >> i & 1)
+            yield tuple(order) + rest, carry
+
+
+def arrangement_count(size):
+    """How many fits one tier is, before it is run."""
+    import math
+    return math.factorial(size) * (1 << size) if size else 1
+
+
+def fit_one_arrangement(epsilon, force_N, bounds, on, order, carry,
+                        every=None):
+    """One arrangement, fitted exactly as the page would fit it."""
+    every = list(every or [name for name, *_r in PW_COMPONENTS])
+    off = ("k_align",) + tuple(n for n in every if n not in on)
+    settings = effective_piecewise_settings(
+        piecewise_settings(), piecewise_until(), off)
+    return fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
+                         regimes=pw_regimes_for(order), settings=settings,
+                         carry=tuple(carry), **fit_extras())
+
+
+def screen_components(model, epsilon, force_N, sizes=None,
+                      budget=PW_SCREEN_BUDGET_S, progress=None):
+    """
+    Exhaust four components in every arrangement, then three, then two.
+
+    Returns {"tiers": [...], "best", "accepted_size", "boundaries_pct",
+    "n_points", "n_fits", "descents"}. Each tier is
+    {"size", "rows", "best", "accepted", "why", "n_tried", "n_possible"},
+    and each row is one arrangement: its component set, its order, its
+    carry pattern, and everything the ranking needs.
+    """
+    import time
+    started = time.time()
     bounds = piecewise_boundaries()
     every = [name for name, *_rest in PW_COMPONENTS]
-    if subsets is None:
-        subsets = []
-        for mask in range(1 << len(every)):
-            subsets.append(tuple(name for i, name in enumerate(every)
-                                 if mask >> i & 1))
     geometry = piecewise_geometry(model) if model is not None else None
     names = components_for(st.session_state.get("cell_type"))
     label_of = {coefficient: names[term][0]
                 for term, coefficient in ORDER_COEFFICIENT.items()
                 if term in names}
-    rows = []
-    for on in subsets:
-        off = ("k_align",) + tuple(n for n in every if n not in on)
-        settings = effective_piecewise_settings(
-            piecewise_settings(), piecewise_until(), off)
-        result = fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
-                               regimes=pw_regimes(), settings=settings,
-                               carry=tuple(n for n in piecewise_carry()
-                                           if n in on),
-                               **fit_extras())
-        if not result.get("success"):
-            continue
-        significance = (coefficient_significance(result)
-                        if coefficient_significance is not None else {})
-        detected = [n for n in on
-                    if (significance.get(n) or {}).get("detected")]
-        moduli = {}
-        if geometry is not None:
-            try:
-                moduli = {row["symbol"]: row["E_Pa"] for row in
-                          piecewise_moduli(result, geometry,
-                                           regimes=pw_regimes()).values()
-                          if isinstance(row, dict) and "symbol" in row}
-            except Exception:  # pragma: no cover - conversion is optional
+    short_of = {c: label_of.get(c, c).split(" ", 1)[-1] for c in every}
+    sizes = list(sizes if sizes is not None else (4, 3, 2, 1, 0))
+
+    def subsets_of(size):
+        import itertools
+        return list(itertools.combinations(every, size))
+
+    tiers = []
+    n_fits = 0
+    accepted = None
+    for size in sizes:
+        rows = []
+        possible = len(subsets_of(size)) * arrangement_count(size)
+        ran_out = False
+        for on in subsets_of(size):
+            if not on:
+                plans = [((tuple(every)), ())]
+            else:
+                plans = list(arrangement_space(on, every))
+            for order, carry in plans:
+                if budget and time.time() - started > budget:
+                    ran_out = True
+                    break
+                result = fit_one_arrangement(epsilon, force_N, bounds, on,
+                                             order, carry, every)
+                n_fits += 1
+                if progress is not None:
+                    progress(size, n_fits, possible)
+                if not result.get("success"):
+                    continue
+                significance = (coefficient_significance(result)
+                                if coefficient_significance is not None else {})
+                detected = tuple(n for n in on
+                                 if (significance.get(n) or {}).get("detected"))
                 moduli = {}
-        rows.append({
-            "on": tuple(on),
-            "label": (" + ".join(label_of.get(n, n) for n in on)
-                      if on else "baseline C₀ only"),
-            "n_free": int(result.get("n_free_params", 0)),
-            "r2": float(result.get("r_squared", float("nan"))),
-            "aicc": float(result.get("aicc", float("nan"))),
-            "bic": float(result.get("bic", float("nan"))),
-            "detected": tuple(detected),
-            "unmeasured": tuple(n for n in on if n not in detected),
-            "residuals": result.get("residuals") or {},
-            "moduli": moduli,
+                if geometry is not None:
+                    try:
+                        moduli = {r["symbol"]: r["E_Pa"] for r in
+                                  piecewise_moduli(
+                                      result, geometry,
+                                      regimes=pw_regimes_for(order)).values()
+                                  if isinstance(r, dict) and "symbol" in r}
+                    except Exception:  # pragma: no cover - optional
+                        moduli = {}
+                met = [n for n in order if n in set(on)]
+                rows.append({
+                    "size": int(size),
+                    "on": tuple(on),
+                    "order": tuple(order),
+                    "met": tuple(met),
+                    "carry": tuple(carry),
+                    "shape": ("one at a time" if not carry else
+                              "all carried on" if len(carry) == len(on)
+                              else f"mixture ({len(carry)} of {len(on)} "
+                                   "carried on)"),
+                    "label": (" → ".join(short_of.get(n, n) for n in met)
+                              if met else "baseline C₀ only"),
+                    "n_free": int(result.get("n_free_params", 0)),
+                    "r2": float(result.get("r_squared", float("nan"))),
+                    "aicc": float(result.get("aicc", float("nan"))),
+                    "bic": float(result.get("bic", float("nan"))),
+                    "detected": detected,
+                    "unmeasured": tuple(n for n in on if n not in detected),
+                    "residuals": result.get("residuals") or {},
+                    "moduli": moduli,
+                })
+            if ran_out:
+                break
+        if not rows:
+            tiers.append({"size": size, "rows": [], "best": None,
+                          "accepted": False, "n_tried": 0,
+                          "n_possible": possible,
+                          "why": ("the time budget ran out before this tier"
+                                  if ran_out else
+                                  "no arrangement of this many components "
+                                  "could be fitted at these boundaries")})
+            continue
+        delta, weight = akaike_weights([r["aicc"] for r in rows])
+        for row, d, w in zip(rows, delta, weight):
+            row["delta"] = float(d)
+            row["weight"] = float(w)
+        # Within a tier: AICc first, ties broken towards the arrangement
+        # that measures every component and then the simpler carry pattern.
+        rows.sort(key=lambda r: (round(r["delta"] / PW_SCREEN_TIE),
+                                 len(r["unmeasured"]), len(r["carry"]),
+                                 r["delta"]))
+        best = rows[0]
+        bias = float((best["residuals"] or {}).get("bias_pct", float("nan")))
+        all_measured = not best["unmeasured"]
+        # A tier is left behind for ONE reason: it contains a component the
+        # curve cannot see, which means the model is too big for the data
+        # and a smaller one may do better. Missing the curve is NOT such a
+        # reason -- taking a component away can only miss it by more -- so
+        # a tier that measures everything is accepted and the lack of fit
+        # is carried with it as a caveat, pointing at the boundaries, the
+        # conditions or the law rather than at the number of components.
+        why = ""
+        if not all_measured:
+            why = (", ".join(short_of.get(n, n) for n in best["unmeasured"])
+                   + " could not be told from zero in any of the "
+                   + f"{len(rows)} arrangements of these components, so the "
+                     "model is bigger than this curve can support")
+        caveat = ""
+        if np.isfinite(bias) and bias > LACK_OF_FIT_PCT:
+            caveat = (
+                f"the best arrangement still misses the curve by up to "
+                f"{bias:.1f} % of the force. Taking a component away cannot "
+                "mend that — it can only miss by more — so the thing to "
+                "look at is the boundaries in **B**, the regression "
+                "conditions in **C**, or whether the law over that stretch "
+                "is the right law")
+        tiers.append({
+            "size": size, "rows": rows, "best": best,
+            "accepted": bool(all_measured and size > 0),
+            "n_tried": len(rows), "n_possible": possible,
+            "ran_out": ran_out, "why": why, "caveat": caveat,
+            "bias_pct": bias,
         })
-    if not rows:
+        if tiers[-1]["accepted"]:
+            accepted = tiers[-1]
+            break
+        if ran_out:
+            break
+    if not tiers or all(not t["rows"] for t in tiers):
         return None
-    delta, weight = akaike_weights([r["aicc"] for r in rows])
-    for row, d, w in zip(rows, delta, weight):
-        row["delta"] = float(d)
-        row["weight"] = float(w)
-    # Ranked by AICc; ties (ΔAICc < 2, which is no evidence either way)
-    # broken towards the candidate with fewer unmeasured components and
-    # then fewer parameters, which is what a person would do by hand.
-    rows.sort(key=lambda r: (round(r["delta"] / PW_SCREEN_TIE),
-                             len(r["unmeasured"]), r["n_free"], r["delta"]))
-    return {"rows": rows, "best": rows[0], "boundaries_pct": bounds,
-            "n_points": int(np.size(epsilon))}
+    searched = [t for t in tiers if t["rows"]]
+    if accepted is None:
+        # Nothing cleared the bar, so the best of everything tried is
+        # reported as the best, and the page says it did not clear it.
+        accepted = min(searched, key=lambda t: t["best"]["aicc"])
+    return {
+        "tiers": tiers, "best": accepted["best"],
+        "accepted_size": int(accepted["size"]),
+        "cleared": bool(accepted.get("accepted")),
+        "boundaries_pct": bounds, "n_points": int(np.size(epsilon)),
+        "n_fits": int(n_fits),
+        "seconds": float(time.time() - started),
+        "short_of": short_of,
+    }
 
 
 def screen_verdict(screen):
     """The screen's conclusion, in a sentence a person can quote."""
-    if not screen or not screen.get("rows"):
+    if not screen or not screen.get("tiers"):
         return ""
-    best = screen["best"]
-    ties = [r for r in screen["rows"]
+    best = screen.get("best")
+    if not best:
+        return ""
+    tier = next((t for t in screen["tiers"]
+                 if t["size"] == screen["accepted_size"]), None)
+    ties = [r for r in (tier or {}).get("rows", ())
             if r is not best and r["delta"] < PW_SCREEN_TIE]
-    said = (f"**{best['label']}** is the best-supported combination "
-            f"(ΔAICc = 0, Akaike weight {best['weight']:.0%}, "
+    said = (f"**{best['label']}**, {best['shape']}, is the best-supported "
+            f"arrangement of {best['size']} component"
+            + ("s" if best["size"] != 1 else "")
+            + f" (Akaike weight {best['weight']:.0%} within its tier, "
             f"R² = {best['r2']:.5f}, {best['n_free']} free parameters)")
-    if best["unmeasured"]:
-        said += (", though "
-                 + str(len(best["unmeasured"]))
-                 + " of its components could not be told from zero")
+    dropped = [t for t in screen["tiers"]
+               if t["rows"] and t["size"] > screen["accepted_size"]]
+    if dropped:
+        said += (". " + " ".join(
+            f"All {t['n_tried']} arrangements of {t['size']} components were "
+            f"exhausted first and the tier was left behind because {t['why']}."
+            for t in dropped))
+    elif screen.get("cleared"):
+        said += (f". All {tier['n_tried']} arrangements of "
+                 f"{screen['accepted_size']} components were exhausted and "
+                 "this one measures every component it contains, so the "
+                 "search stopped there and never dropped to "
+                 f"{screen['accepted_size'] - 1}")
+    if not screen.get("cleared"):
+        said += (". No tier measured every component it contained, so this "
+                 f"is the best of {screen['n_fits']} fits rather than an "
+                 "accepted result")
+    if (tier or {}).get("caveat"):
+        said += ". ⚠️ " + tier["caveat"]
     if ties:
-        said += (f". {len(ties)} other combination"
+        said += (f". {len(ties)} other arrangement"
                  + ("s are" if len(ties) > 1 else " is")
                  + " within ΔAICc < 2 of it, which is no evidence either "
                  "way: this curve cannot separate them")
-    return said + "."
+    return said.rstrip(".") + "."
 
 
 def mixture_note(carry):
@@ -6505,25 +6706,35 @@ def small_strain_panel(model, epsilon, force_N, whole_curve=None):
 
 
 def screen_signature(epsilon, force_N):
-    """What a screen depends on: change any of it and the screen is stale."""
+    """
+    What a screen depends on: change any of it and the screen is stale.
+
+    Not the ticks, not the order, not the carry pattern: the screen
+    searches over all three, so adopting what it found must not turn it
+    stale the moment it is taken. What it does depend on is the curve, the
+    boundaries every candidate is fitted at, and the regression conditions
+    they are all fitted under.
+    """
+    data = st.session_state.get("data") or {}
     return repr((
-        piecewise_signature(epsilon, force_N),
+        data.get("source"), int(np.size(epsilon)),
+        round(float(force_N[-1]), 15) if np.size(force_N) else 0.0,
         tuple(round(float(v), 3) for v in piecewise_boundaries()),
-        piecewise_style(), tuple(sorted(piecewise_carry())),
         piecewise_weighting(), round(piecewise_squeeze(), 3),
-        tuple(sorted(component_order())),
+        repr(sorted((piecewise_settings() or {}).items())),
+        repr(sorted((piecewise_until() or {}).items())),
     ))
 
 
 def component_screen_panel(model, epsilon, force_N):
     """
-    Step E: fit every combination of the components and rank them properly.
+    Step E: exhaust four components in every arrangement, then three, then two.
 
-    One press, sixteen fits, one table. The point of it is that it answers
-    the question the ticks only pretend to answer -- which components does
-    this curve actually contain evidence for -- and it answers it the way a
-    method is validated: same points, same boundaries, a criterion that
-    charges for parameters, and the whole ranking rather than the winner.
+    The panel is the ladder, not a flat table: one row per tier, top tier
+    first, saying how many arrangements were tried, what the best of them
+    was and -- when the search went down a rung -- exactly why four (or
+    three) could not be made to work. Under it, the full ranking of the
+    tier that was accepted.
     """
     if not HAS_VALIDATION:
         return
@@ -6533,84 +6744,162 @@ def component_screen_panel(model, epsilon, force_N):
     run_col, view_col = st.columns([1.1, 1.6])
     with run_col:
         pressed = st.button(
-            "🔬 Screen every combination", key="pw_screen_go", **STRETCH,
-            help="Fits all sixteen subsets of the four components at the "
-                 "boundaries on the board, on the same points and with the "
-                 "same weighting, and ranks them by AICc. Nothing is "
-                 "changed by it: it reports, and you decide.",
+            "🔬 Exhaust the arrangements", key="pw_screen_go", **STRETCH,
+            help="Fits every order and every carry pattern of four "
+                 "components first — 24 × 16 = 384 fits — and only drops a "
+                 "component if four of them cannot be made to work. Then "
+                 "three, then two, then one. Nothing is changed by it: it "
+                 "reports, and you decide.",
         )
     with view_col:
         if stored and not fresh:
-            st.caption("⚠️ The screen below was run on different settings. "
+            st.caption("⚠️ The ladder below was run on different settings. "
                        "Press 🔬 again to bring it up to date.")
         elif not stored:
-            st.caption("Not screened yet. The ticks above are a hypothesis; "
-                       "this is the test of it.")
+            st.caption("Not screened yet. The ticks and the order above are "
+                       "one arrangement out of 384; this tries them all.")
     if pressed:
-        with st.spinner("Fitting sixteen combinations…"):
-            thin_eps, thin_force, step = thinned_for_search(epsilon, force_N)
-            screen = screen_components(model, thin_eps, thin_force)
+        bar = st.progress(0.0, text="Four components, every arrangement…")
+        seen = {"size": None}
+
+        def tick(size, done, possible):
+            if seen["size"] != size:
+                seen["size"] = size
+                seen["base"] = done
+            span = max(possible, 1)
+            inside = min((done - seen.get("base", 0)) / span, 1.0)
+            bar.progress(inside, text=(
+                f"{size} component" + ("s" if size != 1 else "")
+                + f", arrangement {done - seen.get('base', 0)} of {span}…"))
+
+        thin_eps, thin_force, step = thinned_for_search(epsilon, force_N)
+        screen = screen_components(model, thin_eps, thin_force, progress=tick)
+        bar.empty()
         if screen:
             screen["signature"] = signature
             screen["every_nth"] = step
             st.session_state["pw_screen"] = screen
             stored, fresh = screen, True
         else:
-            st.warning("No combination could be fitted at these boundaries.",
+            st.warning("No arrangement could be fitted at these boundaries.",
                        icon="⚠️")
-    if not stored or not stored.get("rows"):
+    if not stored or not stored.get("tiers"):
         return
 
     st.markdown(screen_verdict(stored))
     best = stored["best"]
-    names = components_for(st.session_state.get("cell_type"))
-    label_of = {coefficient: names[term][0]
-                for term, coefficient in ORDER_COEFFICIENT.items()
-                if term in names}
-    table = []
-    for rank, row in enumerate(stored["rows"], start=1):
-        table.append({
-            "#": rank,
-            "Combination": row["label"],
-            "k": row["n_free"],
-            "R²": round(row["r2"], 6),
-            "AICc": round(row["aicc"], 1),
-            "ΔAICc": ("—" if not np.isfinite(row["delta"])
-                      else round(row["delta"], 2)),
-            "Akaike weight": f"{row['weight']:.1%}",
-            "Detected": f"{len(row['detected'])}/{len(row['on'])}"
-            if row["on"] else "—",
+    short_of = stored.get("short_of") or {}
+
+    # ---- the ladder, top rung first ----------------------------------
+    ladder = []
+    for tier in stored["tiers"]:
+        row = tier.get("best")
+        ladder.append({
+            "Components": tier["size"],
+            "Arrangements tried": (
+                f"{tier['n_tried']} of {tier['n_possible']}"
+                if tier["n_tried"] != tier["n_possible"]
+                else f"all {tier['n_possible']}"),
+            "Best of the tier": (row["label"] if row else "—"),
+            "How it shares the load": (row["shape"] if row else "—"),
+            "R²": (round(row["r2"], 6) if row else "—"),
+            "AICc": (round(row["aicc"], 1) if row else "—"),
+            "Measured": (f"{len(row['detected'])}/{len(row['on'])}"
+                         if row and row["on"] else "—"),
             "Lack of fit": (
-                "—" if not np.isfinite(
-                    float((row["residuals"] or {}).get("bias_pct", float("nan"))))
+                "—" if not row or not np.isfinite(float(
+                    (row["residuals"] or {}).get("bias_pct", float("nan"))))
                 else f"{float(row['residuals']['bias_pct']):.1f} %"),
-            "Evidence": ("best" if rank == 1 else
-                         "tied with the best" if row["delta"] < PW_SCREEN_TIE
-                         else "weaker" if row["delta"] < 10 else "ruled out"),
+            "Verdict": (
+                ("✅ accepted — searched no further"
+                 + (" (with a caveat)" if tier.get("caveat") else ""))
+                if tier.get("accepted") else
+                ("⛔ " + tier["why"]) if tier.get("why") else "not reached"),
         })
-    st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
+    st.dataframe(pd.DataFrame(ladder), hide_index=True, **STRETCH)
     st.caption(
-        "**k** free parameters · **ΔAICc** how much worse than the best "
-        f"(under {PW_SCREEN_TIE:g} is a tie, over 10 is ruled out) · "
-        "**Akaike weight** the probability this is the best of the sixteen "
-        "· **Detected** how many of its components have a coefficient "
-        "distinguishable from zero · **Lack of fit** the worst systematic "
-        "deviation left over, as a percentage of the force there."
-        + (f" Screened on every {stored.get('every_nth', 1)}th point."
-           if stored.get("every_nth", 1) > 1 else "")
+        "Read top to bottom: four components are exhausted in **every "
+        "mathematical way** — all 24 orders × all 16 carry patterns — "
+        "before three is looked at, and a tier is left behind for one "
+        "reason only: it contains a component this curve cannot tell from "
+        "zero, which means the model is bigger than the data supports. A "
+        "tier that measures everything is accepted even if it still misses "
+        "the curve, because dropping a component can only miss by more. "
+        + f"{stored.get('n_fits', 0)} fits in "
+        f"{stored.get('seconds', 0.0):.1f} s"
+        + (f", on every {stored.get('every_nth', 1)}th point"
+           if stored.get("every_nth", 1) > 1 else "") + "."
     )
+
+    # ---- the accepted tier, in full ----------------------------------
+    tier = next((t for t in stored["tiers"]
+                 if t["size"] == stored["accepted_size"]), None)
+    if tier and tier.get("rows"):
+        with st.expander(
+                f"All {tier['n_tried']} arrangements of "
+                f"{tier['size']} components, ranked", expanded=False):
+            table = []
+            for rank, row in enumerate(tier["rows"], start=1):
+                table.append({
+                    "#": rank,
+                    "Order met": row["label"],
+                    "Carries on to the end": (
+                        ", ".join(short_of.get(n, n) for n in row["carry"])
+                        or "none — one at a time"),
+                    "k": row["n_free"],
+                    "R²": round(row["r2"], 6),
+                    "ΔAICc": ("—" if not np.isfinite(row["delta"])
+                              else round(row["delta"], 2)),
+                    "Weight": f"{row['weight']:.1%}",
+                    "Measured": f"{len(row['detected'])}/{len(row['on'])}",
+                    "Evidence": ("best" if rank == 1 else
+                                 "tied with the best"
+                                 if row["delta"] < PW_SCREEN_TIE else
+                                 "weaker" if row["delta"] < 10 else
+                                 "ruled out"),
+                })
+            st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
+            st.caption(
+                "**Order met** which component owns [0, ε₁), [ε₁, ε₂), "
+                "[ε₂, ε₃), [ε₃, x_end] · **Carries on to the end** the rest "
+                "stop at their next boundary and hold what they reached · "
+                f"**ΔAICc** under {PW_SCREEN_TIE:g} is a tie, over 10 is "
+                "ruled out · **Weight** the probability this is the best "
+                "arrangement of its tier."
+            )
+
+    # ---- adopt it ----------------------------------------------------
     on_now = tuple(n for n, *_r in PW_COMPONENTS if n not in piecewise_off())
-    if tuple(best["on"]) == on_now:
-        st.success("The ticks above already are the best-supported "
-                   "combination.", icon="✅")
-    elif st.button(f"✔️ Adopt “{best['label']}”", key="pw_screen_adopt",
-                   help="Ticks exactly the components of the winning "
-                        "combination and refits."):
-        rerun_keeping_settings({
-            **{f"pw_use_{name}": (name in best["on"])
-               for name, *_r in PW_COMPONENTS},
+    order_now = tuple(ORDER_COEFFICIENT[t] for t in component_order())
+    carry_now = tuple(piecewise_carry())
+    same = (tuple(sorted(best["on"])) == tuple(sorted(on_now))
+            and tuple(best["order"]) == order_now
+            and tuple(sorted(best["carry"])) == tuple(sorted(carry_now)))
+    if same:
+        st.success("The board already holds this arrangement.", icon="✅")
+    elif st.button(f"✔️ Adopt “{best['label']}”, {best['shape']}",
+                   key="pw_screen_adopt",
+                   help="Ticks exactly those components, puts them in that "
+                        "order, sets that carry pattern, and refits."):
+        coefficient_term = {c: t for t, c in ORDER_COEFFICIENT.items()}
+        order_terms = [coefficient_term[c] for c in best["order"]
+                       if c in coefficient_term]
+        extra = {f"pw_use_{name}": (name in best["on"])
+                 for name, *_r in PW_COMPONENTS}
+        extra.update({
+            "component_order": order_terms,
+            # The carry pattern is the choice between the three ways of
+            # fitting, so it is set as one: the mixture the screen found.
+            "pw_style": "best",
+            "pw_best_carry": list(best["carry"]),
+            "pw_membrane_throughout": bool(
+                best["order"] and best["order"][0] in best["carry"]),
             "_pw_apply": True,
         })
+        # The order control's own boxes, so they show what was adopted.
+        for index, term in enumerate(order_terms):
+            extra[f"component_order_{index}"] = term
+        rerun_keeping_settings(extra)
 
 
 def method_statement(result, screen=None):
@@ -6676,16 +6965,22 @@ def method_statement(result, screen=None):
             f"Of the {len(on)} components fitted, {len(detected)} had "
             f"coefficients distinguishable from zero at the 95 % level"
             + (f" ({', '.join(detected)})." if detected else "."))
-    if screen and screen.get("rows"):
-        best = screen["best"]
-        plain = " + ".join(
-            part.split(" ", 1)[-1] if " " in part else part
-            for part in str(best["label"]).split(" + "))
+    if screen and screen.get("tiers"):
+        best = screen.get("best") or {}
+        tried = ", ".join(
+            f"{t['n_tried']} of {t['size']} components"
+            for t in screen["tiers"] if t.get("rows"))
         lines.append(
-            f"All {len(screen['rows'])} subsets of the components were "
-            f"fitted to the same points at the same boundaries and ranked "
-            f"by AICc; the best-supported combination was "
-            f"{plain} (Akaike weight {best['weight']:.0%}).")
+            f"Model selection was carried out from the top down: every "
+            f"arrangement of four components (all 4! orders × 2^4 "
+            f"carry patterns) was fitted to the same points at the same "
+            f"boundaries before any component was dropped, and a tier was "
+            f"left behind only when its best arrangement could not measure "
+            f"every component it contained ({tried} arrangements fitted in "
+            f"all). Candidates were ranked by AICc; the best-supported "
+            f"arrangement was {best.get('label', '')} "
+            f"({best.get('shape', '')}, Akaike weight "
+            f"{best.get('weight', 0):.0%}).")
     return " ".join(lines)
 
 
@@ -9173,14 +9468,18 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "**🔄 Refresh graph** just draws the board again."
             )
 
-        st.markdown("**E · Screen — which components the curve supports**")
+        st.markdown("**E · Screen — four components first, in every "
+                    "arrangement**")
         st.caption(
-            "Every combination of the four, fitted to the same points at "
-            "the same boundaries, ranked by AICc. This is the test of the "
-            "hypothesis in **A**: it charges for parameters, so a component "
-            "that only flatters R² loses, and it reports the whole ranking "
-            "including the ties, because a tie is the honest answer when "
-            "the curve cannot separate two combinations."
+            "Four components are exhausted before three is considered: all "
+            "**24 orders × 16 carry patterns = 384 fits**, which is the "
+            "whole space — the 16 carry patterns contain ① all carried on, "
+            "② one at a time and ③ every mixture between them. A component "
+            "is dropped only when four of them cannot be made to work, and "
+            "the ladder says exactly why. Then three (192), two (48), one "
+            "(8). Same points, same boundaries, ranked by AICc, which "
+            "charges for parameters so a component that only flatters R² "
+            "loses."
         )
         st.caption(
             "One caveat, stated rather than hidden: every candidate is "
