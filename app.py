@@ -202,8 +202,10 @@ if HAS_PIECEWISE:
             regime,
             terms=tuple(t for t in regime.terms if t.name not in PW_REMOVED),
             title=("Nuclear envelope stretch" if regime.key == "R3"
+                   else "Contact artefact (baseline C₀)" if regime.key == "R1"
                    else regime.title),
             equation=("F₃(x) = K_nucleus·(x−ε₂)³ + F(ε₂)" if regime.key == "R3"
+                      else "F₁(x) = C₀" if regime.key == "R1"
                       else regime.equation),
         )
         for regime in C2C12_REGIMES
@@ -761,12 +763,11 @@ DEFAULTS = {
     # for the membrane acting throughout), so it follows the boundaries.
     "pw_until": {},
     # Each component in the model or not. Off holds its coefficient at 0.
-    # The model the page opens on is the four main components: membrane,
-    # cytoskeleton, nuclear envelope and the inside of the nucleus. The
-    # contact / alignment line over [0, ε₁) is a secondary option, off
-    # unless it is asked for: it fits the probe settling onto the cell,
-    # which is an artefact of the measurement rather than the cell.
-    "pw_use_k_align": False,
+    # The model is the four components: membrane, cytoskeleton, nuclear
+    # envelope and the inside of the nucleus, all four on. There is no
+    # contact / alignment component: the first stretch, [0, ε₁), is the
+    # probe settling onto the cell rather than the cell itself, and it is
+    # carried by the baseline C₀ alone.
     "pw_use_K_shell": True,
     "pw_use_K_cyto": True,
     "pw_use_K_nucleus": True,
@@ -4822,7 +4823,7 @@ PW_TERM_OF = {
 # otherwise.
 PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_until", "pw_membrane_throughout", "pw_target_r2",
-                   "pw_use_k_align", "pw_use_K_shell", "pw_use_K_cyto",
+                   "pw_use_K_shell", "pw_use_K_cyto",
                    "pw_use_K_nucleus", "pw_use_K_core")
 _PW_SOURCE = [None]
 
@@ -4995,9 +4996,10 @@ def piecewise_boundaries():
 PW_COMPONENTS = (
     # The square in each name is the colour of that component's line and bar
     # on the plot. The names and symbols are the spring network's own, for
-    # the four it shares with every other way of sharing the load.
-    ("k_align", "⬛ Contact / alignment", "E_align", "#555555",
-     r"$k_{align}\,x + C_0$"),
+    # the four it shares with every other way of sharing the load. Four
+    # components, four ticks, four bars, four rows in the results: what is
+    # ticked is what is fitted and what is drawn, with nothing else in the
+    # model.
     ("K_shell", "🟥 Membrane", "Eₘ", "#d62728",
      r"$K_{shell}\,[\min(x,u)-s]_+^{3}$"),
     ("K_cyto", "🟧 Cytoskeleton", "Ec", "#ff7f0e",
@@ -5034,8 +5036,14 @@ PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
 # Which boundary each component starts at: its regime's start. Moving a
 # component's start moves that boundary, and every component sharing it.
 PW_START_INDEX = {"K_shell": 1, "K_cyto": 1, "K_nucleus": 2, "K_core": 3}
-# Every component can be switched off, the contact line included.
-PW_SWITCHABLE = ("k_align",) + tuple(PW_START_INDEX)
+# Any of the four can be switched off; all four are on by default.
+PW_SWITCHABLE = tuple(PW_START_INDEX)
+# Not a component and not on the board: the constant the first stretch is
+# fitted with, [0, ε₁), where the probe is settling onto the cell. It is
+# drawn as the bottom layer of the stack so the layers still add up to the
+# fitted curve, and it is named as what it is.
+PW_BASELINE = ("k_align", "⬛ Baseline C₀ over [0, ε₁)", "C₀", "#9a9a9a",
+               r"$C_0$")
 
 
 def effective_piecewise_settings(settings=None, untils=None, off=()):
@@ -5055,9 +5063,16 @@ def effective_piecewise_settings(settings=None, untils=None, off=()):
 
 
 def piecewise_off():
-    """The components switched off on the page."""
-    return tuple(name for name in PW_SWITCHABLE
-                 if not _pw_get(f"pw_use_{name}", True))
+    """
+    The components held at zero: any the board unticks, and the contact
+    slope, which is not a component of this model at all.
+
+    k_align is a term of the engine's first regime. The page does not
+    offer it, so it is held at zero on every fit, every search and every
+    plot, and the first stretch is the constant C₀ and nothing else.
+    """
+    return ("k_align",) + tuple(
+        name for name in PW_SWITCHABLE if not _pw_get(f"pw_use_{name}", True))
 
 
 def piecewise_until():
@@ -5464,7 +5479,7 @@ def piecewise_as_fit(result, model, probe_um=None, settings=None, found=None,
 def piecewise_stage_plan(result):
     """The regimes as the record's stage plan: which elements, over what."""
     names = {
-        "R1": ["alignment"], "R2": ["membrane", "interior"],
+        "R1": ["baseline"], "R2": ["membrane", "interior"],
         "R3": ["nucleus_shell", "perinuclear_cytoskeleton"], "R4": ["nucleus"],
     }
     return [
@@ -5680,17 +5695,17 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         marks = [v for pair in ranges.values() for v in pair] + list(b)
         grid = np.unique(np.concatenate(
             [grid, [v for v in marks if b[0] <= v <= end]]))
-        for name, label, symbol, colour, _law in PW_COMPONENTS:
-            # The contact layer carries C₀ as well, so with its slope off it
-            # stays, as the offset, or the layers would not add up to F̂.
-            if name in off and name != "k_align":
+        for name, label, symbol, colour, _law in (PW_BASELINE,) + PW_COMPONENTS:
+            # The baseline layer carries C₀, the force the curve starts
+            # from, so it stays or the layers would not add up to F̂.
+            if name in off and name != PW_BASELINE[0]:
                 continue
             layer = component_force(result, name, grid)
             if layer is None:
                 continue
             a, u = ranges.get(name, (grid[0], grid[-1]))
             legend_names.append(
-                "⬛ C₀ baseline (contact slope off)" if name in off
+                PW_BASELINE[1] if name == PW_BASELINE[0]
                 else f"{label} · [{a:.1f}, {u:.1f}] %")
             fig.add_trace(go.Scatter(
                 x=grid, y=layer * scale, mode="lines", stackgroup="components",
@@ -5846,6 +5861,9 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
         ("components " + how + ": " + "; ".join(drawn)) if drawn
         else "no components (all of them are switched off)",
     ]
+    if view == "stacked" and not log_y:
+        parts.append("under them the grey baseline layer C₀, the force the "
+                     "curve starts from, which is not a component")
     if left_out:
         parts.append("switched off, so neither fitted nor drawn: "
                      + ", ".join(left_out))
@@ -5855,9 +5873,9 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
             f"ε₃ = {b[3]:.2f} %, fitted to x_end = {b[4]:.1f} %"
         )
         parts.append(
-            f"the shaded stretch [0, {b[1]:.2f}) % is the contact artefact"
-            + (", fitted by the contact line" if "k_align" not in off
-               else ", carried by the constant C₀ alone")
+            f"the shaded stretch [0, {b[1]:.2f}) % is the contact artefact, "
+            "the probe settling onto the cell, carried by the baseline C₀ "
+            "and no component"
         )
     parts.append("force axis logarithmic" if log_y else "force axis linear")
     parts.append("the bars under the curve are the same ranges, one row per "
@@ -6188,9 +6206,7 @@ def _pw_range_moved(name):
     lo, hi = sorted(float(v) for v in got)
     b = list(piecewise_boundaries())
     end = b[4]
-    if name == "k_align":
-        # Contact runs from 0 to ε₁, so only its far end means anything.
-        st.session_state["pw_b1"] = round(float(np.clip(hi, 0.5, b[2] - 1.0)), 2)
+    if name == "k_align":  # not on the board any more
         return
     i = PW_START_INDEX[name]
     start = float(np.clip(lo, b[i - 1] + (0.5 if i == 1 else 1.0), b[i + 1] - 1.0))
@@ -6256,18 +6272,11 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
         with c_name:
             st.checkbox(
                 f"{label}", key=f"pw_use_{name}",
-                help=("A secondary component, off unless it is asked for. "
-                      "On, it fits a straight line over the first stretch, "
-                      "[0, ε₁), where the probe is settling onto the cell. "
-                      "Off, that stretch is the constant C₀ and nothing "
-                      "else, and ε₁ still marks where the membrane and the "
-                      "cytoskeleton start."
-                      if name == "k_align" else
-                      "One of the four main components, on by default. Off "
-                      "holds it at zero, and it leaves the plot and the "
-                      "fit."))
-            st.caption(law + (" · secondary, off by default"
-                              if name == "k_align" else ""))
+                help="One of the four components, on by default. Ticked, it "
+                     "is fitted and drawn; unticked, it is held at zero and "
+                     "leaves both the fit and the plot. Everything on the "
+                     "graph has a tick here.")
+            st.caption(law)
         with c_bar:
             key = f"pw_range_{name}"
             # Set from the model every run, before the bar is drawn, so the
@@ -6278,9 +6287,7 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=1):
             st.slider(
                 f"{label} acts over (%)", min_value=0.0, max_value=float(end),
                 step=0.1, key=key, on_change=_pw_range_moved, args=(name,),
-                # The contact bar is ε₁ itself, so it stays movable when
-                # the contact slope is off.
-                disabled=not on and name != "k_align",
+                disabled=not on,
                 label_visibility="collapsed",
                 help="Left end: where it starts carrying load, which is its "
                 "regime's boundary, so it moves that boundary. Right end: "
@@ -6385,18 +6392,15 @@ PW_CRITERION_HELP = {
            r"charge per coefficient, so it picks the smallest model the curve "
            r"actually needs.",
 }
-# Membrane and cytoskeleton carry R1 and R2, so every combination has them;
-# the other three are what the search is about. The four main components
-# come first: that is the model the page opens on, and ties go to it.
+# Membrane and cytoskeleton carry the first stretch of the squash, so
+# every combination has them; the two nuclear components are what the
+# search is about. All four come first: that is the model the page opens
+# on, and ties go to it.
 PW_COMBINATIONS = (
     ("K_shell", "K_cyto", "K_nucleus", "K_core"),
     ("K_shell", "K_cyto", "K_nucleus"),
     ("K_shell", "K_cyto", "K_core"),
     ("K_shell", "K_cyto"),
-    ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_core"),
-    ("k_align", "K_shell", "K_cyto", "K_nucleus"),
-    ("k_align", "K_shell", "K_cyto", "K_core"),
-    ("k_align", "K_shell", "K_cyto"),
 )
 
 
@@ -6715,7 +6719,8 @@ def piecewise_settings_used(result, geometry, target, source):
                          + (" (switched off)" if name in off else ""),
                          "Initial guesses and bounds"))
     rows += [
-        ("k_align, C0", "straight-line least squares on R1, no bounds", "fixed"),
+        ("C₀ over [0, ε₁)", "the constant the first stretch is fitted with, "
+         "by least squares and with no bounds", "fixed"),
         ("Weighting", "uniform: every point counts the same (ordinary least "
                       "squares)", "fixed"),
         ("Solver", " · ".join(f"{r['key']}: {r['engine'] or 'not fitted'}"
@@ -6831,11 +6836,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
     curve_key = repr((data.get("source"), int(np.size(epsilon)),
                       round(float(force_N[-1]), 15) if np.size(force_N) else 0.0))
 
-    def place_now():
-        """ε from the chosen route, written to the board before it is drawn."""
-        method = st.session_state.get("pw_method", "refined")
+    def place_now(arriving=False):
+        """
+        ε from the chosen route, written to the board before it is drawn.
+
+        On arrival the curve has never been fitted here, so the route is
+        not the person's setting left over from the cell before: every
+        route is scored and the one that reaches R² ≥ R²★ is the one the
+        page starts on. Only when none of them reaches it is the best
+        used, and the status line says so.
+        """
+        method = ("refined" if arriving
+                  else st.session_state.get("pw_method", "refined"))
         if method == "typed":
             return
+        if arriving:
+            st.session_state["pw_method"] = "refined"
         placements = current_placements(epsilon, force_N)
         if placements is None:
             with st.spinner("Placing ε₁, ε₂, ε₃ for this cell…"):
@@ -6861,7 +6877,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_apply", False):
         apply_board()
     elif applied_state.get("curve") != curve_key:
-        place_now()
+        place_now(arriving=True)
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -6872,6 +6888,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
         graph_slot = st.container()
     with results_col:
         results_slot = st.container()
+
+    # The components sit directly under the plot, because they are the
+    # plot: one tick per curve drawn, one bar per range shown. They are
+    # not buried in the board with the rest of the parameters, which is
+    # where a person looks last and this is what they look at first.
+    components_box = st.container(border=True)
 
     # ================================================= the control board
     board = st.container(border=True)
@@ -6913,6 +6935,18 @@ def piecewise_section(model, epsilon, force_N, rupture):
             )
         status_slot = st.empty()
         st.markdown("#### 🎛️ Fitting options")
+        # Drawn into the box under the plot, staked out above; written
+        # here so the board is still read in one pass, top to bottom.
+        with components_box:
+            st.markdown("**Components θⱼ and the ranges [sⱼ, uⱼ] they act "
+                        "over** — what is ticked is what is fitted and drawn")
+            value_slots = piecewise_components_panel(
+                piecewise_boundaries(), None, None, columns=2)
+            components_note_slot = st.empty()
+        # What the board holds for each row, to compare with what the plot
+        # is drawing: the two lists must read the same, or say they differ.
+        board_off = set(piecewise_off())
+        board_ranges = piecewise_ranges(piecewise_boundaries())
         t1, t2, t3 = st.columns([1.05, 1.25, 0.9], gap="medium")
         with t1:
             st.markdown("**How the components share the load**")
@@ -6961,14 +6995,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.checkbox("log F axis", key="pw_log_y",
                         help="Applies at once; components are then drawn "
                         "each from zero.")
-
-        st.markdown("**Components θⱼ and the ranges [sⱼ, uⱼ] they act over**")
-        value_slots = piecewise_components_panel(piecewise_boundaries(), None, None,
-                                                 columns=2)
-        # What the board holds for each row, to compare with what the plot
-        # is drawing: the two lists must read the same, or say they differ.
-        board_off = set(piecewise_off())
-        board_ranges = piecewise_ranges(piecewise_boundaries())
 
         with st.expander("p₀ and bounds, constraints on ε, reset", expanded=False):
             piecewise_parameter_editor()
@@ -7105,7 +7131,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
 
             for key_, term in (("K_shell", "membrane"), ("K_cyto", "interior"),
                                ("K_nucleus", "nucleus_shell"),
-                               ("K_core", "nucleus"), ("k_align", "alignment")):
+                               ("K_core", "nucleus")):
                 slot = value_slots.get(key_)
                 if slot is None:
                     continue
@@ -7117,6 +7143,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     slot.markdown(
                         f"**{symbol} = {shown.get(f'modulus_{term}', '—')}**"
                         + waits)
+            waiting_rows = [c[1] for c in PW_COMPONENTS if not _same(c[0])]
+            components_note_slot.caption(
+                "⏳ **" + ", ".join(waiting_rows) + "**: ticked or moved "
+                "here, but not on the graph yet. Press **▶ Fit & plot**."
+                if waiting_rows else
+                "✓ Every ticked component above is fitted and drawn on the "
+                "graph, over the range on its bar; nothing else is."
+            )
 
         fitted = None
         with graph_slot:
@@ -7373,7 +7407,7 @@ def piecewise_coefficient_table(result, moduli):
 CELL_COLORS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
                "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173")
-COLLECTION_SYMBOLS = ("E_shell", "E_cyto", "E_ne", "E_core", "E_align")
+COLLECTION_SYMBOLS = ("E_shell", "E_cyto", "E_ne", "E_core")
 
 
 def refit_collection_cell(record, height_um=None):
@@ -8411,14 +8445,9 @@ def result_rows(fit):
             element_support(term, fit),
         ))
     if fit.get("piecewise"):
-        # The one component only the regime-by-regime sharing has: the
-        # contact line of the first stretch, which can be switched off.
-        switched_off = set(fit["piecewise"].get("components_off") or ())
+        # Anything the regime-by-regime sharing reports on top of the four
+        # components every way of sharing has.
         for term, symbol, key, unit_name in EXTRA_PIECEWISE_ROWS:
-            if term == "alignment" and "k_align" in switched_off:
-                rows.append((f"modulus_{term}", f"{symbol} {EXTRA_NAMES[term].lower()}",
-                             "off", "—", "—", "switched off: F = C₀ to ε₁"))
-                continue
             try:
                 value = float(fit.get(key, float("nan")))
                 error = float(fit.get(f"{key}_std", float("nan")))
@@ -8466,12 +8495,9 @@ def result_rows(fit):
 
 # The rows only the regime-by-regime sharing has, after the four it shares
 # with every other way: (support key, symbol, fit field, unit).
-EXTRA_PIECEWISE_ROWS = (
-    ("alignment", "E_align", "E_align_kPa", "kPa"),
-)
+EXTRA_PIECEWISE_ROWS = ()
 EXTRA_NAMES = {
     "perinuclear": "Perinuclear cytoskeleton",
-    "alignment": "Contact / alignment",
     "lamina": "Nuclear lamina (lump)",
 }
 
@@ -8626,10 +8652,10 @@ def fit_explainer(fit, result=None):
              "x (%)": f"{r['domain_pct'][0]:.1f}–{r['domain_pct'][1]:.1f}",
              "points": r["n_points"],
              "fitted here": ", ".join(
-                 ("contact line (k, C₀)" if n_ == "k_align" else
-                  next((c[1].split(" ", 1)[1].lower() for c in PW_COMPONENTS
-                        if c[0] == n_), n_))
-                 for n_ in r["params"] if n_ != "C0") or "—",
+                 next((c[1].split(" ", 1)[1].lower() for c in PW_COMPONENTS
+                       if c[0] == n_), n_)
+                 for n_ in r["params"]
+                 if n_ not in ("C0", "k_align")) or "C₀ alone",
              "R²_k": (f"{r['r_squared']:.4f}" if np.isfinite(r["r_squared"]) else "—")}
             for r in result["regimes"]
         ]), align_right=["points", "R²_k"])
@@ -8685,8 +8711,7 @@ def fit_explainer(fit, result=None):
                 "part": label.split(" ", 1)[1],
                 "p": f"{m['power']:g}",
                 "K ± SE (N/%ᵖ)": _pm(m.get("K"), m.get("K_se"), digits=4),
-                "A (N/Pa)": ("see below" if key_ == "k_align" else
-                             f"{m['prefactor_N_per_Pa']:.4g}"
+                "A (N/Pa)": (f"{m['prefactor_N_per_Pa']:.4g}"
                              if np.isfinite(m.get("prefactor_N_per_Pa", float("nan")))
                              else "—"),
                 "E ± SE": (modulus_display(m["symbol"], m["E_Pa"], m["E_se_Pa"])
@@ -8696,10 +8721,10 @@ def fit_explainer(fit, result=None):
         if rows:
             flat_table(pd.DataFrame(rows),
                        align_right=["p", "K ± SE (N/%ᵖ)", "A (N/Pa)", "E ± SE"],
-                       caption="The contact line is the one exception to "
-                       "E = 100ᵖK/A: its slope k is read as a tension over the "
-                       "cell's footprint, T = 100k/(2πR₀²/h₀), and E_align = "
-                       "T/h_coat is an apparent modulus of the surface coat.")
+                       caption="Every component goes through E = 100ᵖK/A. The "
+                       "first stretch, [0, ε₁), has no component at all: it is "
+                       "the probe settling onto the cell, and it is fitted by "
+                       "the constant C₀, which the curve is measured from.")
     else:
         st.markdown(
             "Here the model is written with the moduli themselves: each term is "
@@ -9163,7 +9188,7 @@ def piecewise_share_figure(result, style):
         if component_force is None:
             break
         layer = component_force(result, name, x)
-        if layer is None or (name in off and name != "k_align"):
+        if layer is None or name in off:
             continue
         share = np.where(np.abs(total) > 0, layer / total, np.nan)
         fig.add_trace(go.Scatter(
@@ -12117,6 +12142,9 @@ with tab_analysis:
                     video_slot = st.container()
                 with res_col:
                     results_area = st.container()
+                # The components go directly under the plot: they are what
+                # the plot draws, one tick per curve and one bar per range.
+                components_box = st.container(border=True)
                 fit_block = st.container(border=True)
                 explainer_box = st.expander(
                     "📘 How the fit is done — the maths, step by step",
@@ -12223,7 +12251,9 @@ with tab_analysis:
                     boundaries_slot = optimisation_controls(
                         model, guided_lo, guided_hi, chosen)
 
-                st.markdown("**Components and the ranges they act over**")
+                components_box.__enter__()
+                st.markdown("**Components and the ranges they act over** — "
+                            "what is ticked is what is fitted and drawn")
                 chosen = active_terms()
                 if not chosen:
                     st.warning("Tick at least one material before fitting.")
@@ -12247,6 +12277,7 @@ with tab_analysis:
                     here, names, guided_lo, guided_hi, step, _e1, _e2, _mem, _cyto,
                 )
                 components_slot = st.container()
+                components_box.__exit__(None, None, None)
                 chosen = active_terms()
 
 
