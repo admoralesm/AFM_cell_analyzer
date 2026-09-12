@@ -816,7 +816,7 @@ DEFAULTS = {
     # nuclear envelope at ε₂ and the inside of the nucleus after that. Each
     # component then has an onset of its own, which is what lets the fit
     # tell them apart instead of putting one of them at zero.
-    "membrane_after_break": "keeps stiffening",
+    "membrane_after_break": "holds what it reached",
     "cyto_starts_at": "at ε₁",
     "highlight_segment": "(none)",
     "composition_search": None,
@@ -3751,7 +3751,7 @@ DEFAULT_COMPOSITION_BY_TYPE = {
     # the page: it has been made unmeasurable by where it was told to
     # start. A separate onset is what makes it measurable.
     "Myoblast (C2C12)": {
-        "membrane_after_break": "keeps stiffening",
+        "membrane_after_break": "holds what it reached",
         "cyto_starts_at": "at ε₁",
     },
     "Cardiomyocyte": {
@@ -4479,6 +4479,15 @@ def default_element_window(term, lo, hi, e1, e2, membrane="freeze",
     # was worth 0.08 of R² on the one reference curve with a bad contact.
     lo, hi = 0.0, float(hi)
     span = max(hi - lo, 1e-6)
+    # There is one way of fitting on this page and it is "each on its own
+    # stretch": the membrane on 0 to ε₁, the cytoskeleton on ε₁ to ε₂, the
+    # nuclear envelope on ε₂ to ε₃ and the inside of the nucleus from ε₃
+    # on. That is what a window is, so it is what a window starts as.
+    stretches = own_stretch_windows()
+    if term in stretches:
+        a, b = stretches[term]
+        return (float(np.clip(a, lo, hi)),
+                float(np.clip(max(b, a + 0.01 * span), lo, hi)))
 
     def onset(value):
         # An onset past the far end is a component never reached inside the
@@ -4867,7 +4876,14 @@ def fit_mode_control():
 # envelope and nucleus, taking over regime by regime, each regime starting
 # from the force the one before it ended on.
 PW_SHARE = "Piecewise (regime by regime, each anchored to the last)"
+# The second of the two ways to fit: every element solved on its own
+# stretch of the squash and acting nowhere else.
+OWN_STRETCH = "Each on its own stretch (fitted only inside its own range)"
 SHARING_MATHS = {
+    OWN_STRETCH:
+        r"F(\varepsilon) = \sum_k a_k E_k \,\langle \varepsilon - s_k"
+        r"\rangle^{p_k}\,\mathbb{1}_{[s_k,\,u_k]}(\varepsilon), \qquad "
+        r"[s_k, u_k] = [\varepsilon_{k-1},\, \varepsilon_k]",
     PW_SHARE: r"F(x) = \hat F(\varepsilon_{k-1}) + \sum_{j \in k} \theta_j\,"
               r"\phi_j(x) + C_k(x),\;\; x \in [\varepsilon_{k-1}, \varepsilon_k)",
     "Segmented (each part takes over in turn)":
@@ -4878,31 +4894,30 @@ SHARING_MATHS = {
         r"\varepsilon(F) = \sum_k (F / a_k E_k)^{1/p_k}",
 }
 SHARING_HELP = {
-    PW_SHARE: "The same components, met in four regimes: membrane and "
-              "cytoskeleton from ε₁, the nuclear envelope from ε₂, the "
-              "inside of the nucleus from ε₃. Each regime is fitted from "
-              "the force the last one ended on (C⁰), and components carried "
-              "in keep the law already found for them.",
+    PW_SHARE:
+        "**Found in turn, then held.** The membrane's modulus is fitted "
+        "on the first stretch, 0 to ε₁. It is then **held at that value** "
+        "and goes on carrying load, and only the cytoskeleton's modulus is "
+        "fitted on ε₁ to ε₂. Both are then held and only the nuclear "
+        "envelope is fitted on ε₂ to ε₃, and then all three are held and "
+        "only the inside of the nucleus is fitted from ε₃ on. Each stretch "
+        "starts from the force the one before it ended on, so the curve "
+        "has no step in it. Four small fits, one unknown each.",
+    OWN_STRETCH:
+        "**Each on its own stretch.** The membrane is fitted on 0 to ε₁, "
+        "the cytoskeleton on ε₁ to ε₂, the nuclear envelope on ε₂ to ε₃, "
+        "the inside of the nucleus from ε₃ on — and each one acts **only "
+        "inside its own stretch**. A component contributes nothing before "
+        "its range and nothing after it, so at 20 % a cytoskeleton whose "
+        "range is 30 to 50 % is exactly zero. Four independent fits, one "
+        "unknown each, with no force carried across a boundary.",
 }
 # The list is read while deciding, so every entry is one short line: the
 # shape of the sum, not a sentence about it. The sentence is written under
 # the chosen one, where it is actually read.
 SHARING_SHORT = {
-    PW_SHARE: "Regime by regime  ·  each anchored to the last",
-    "Segmented (each part takes over in turn)":
-        "Segmented  ·  each part takes over in turn",
-    "Side by side (every element acts everywhere)":
-        "Side by side  ·  same squash, forces add",
-    "Stacked (elements in line)":
-        "Stacked  ·  same force, squashes add",
-    "Side by side, then stacked":
-        "Side by side → stacked  ·  at a crossover",
-    "Stacked, then side by side":
-        "Stacked → side by side  ·  at a crossover",
-    "Compare these and rank them":
-        "Compare them  ·  fit all and rank by AICc",
-    "Cardiomyocyte (Morales Maldonado)":
-        "Cardiomyocyte shell  ·  provisional",
+    PW_SHARE: "① Carried forward  ·  each modulus found in turn, then held",
+    OWN_STRETCH: "② Each on its own stretch  ·  nothing carried across",
 }
 # The four the app measures, under the name each way of sharing gives them,
 # so a tick survives a change of model: nothing about which components the
@@ -4922,16 +4937,38 @@ def _carry_the_ticks(to_piecewise):
 
 
 def sharing_options():
-    """Every way the components can share the load, for this cell."""
-    return ([PW_SHARE] if piecewise_offered() else []) + list(MODELS)
+    """
+    The two ways of fitting the four components, and there are only two.
+
+    Both fit the same four components over the same four stretches, one
+    unknown at a time. They differ in one thing: whether a component that
+    has been fitted goes on carrying load into the stretches after it.
+    """
+    return ([PW_SHARE] if piecewise_offered() else []) + [OWN_STRETCH]
 
 
 def current_sharing():
-    """The way the page is sharing the load now."""
-    if piecewise_on():
-        return PW_SHARE
-    kind = st.session_state.get("model_kind")
-    return kind if kind in MODELS else next(iter(MODELS))
+    """The way the page is fitting now."""
+    return PW_SHARE if piecewise_on() else OWN_STRETCH
+
+
+def own_stretch_boundaries():
+    """(0, ε₁, ε₂, ε₃, end) as fractions, for the stretch-by-stretch fit."""
+    end = float(st.session_state.get("window_end", 1.0))
+    e1 = float(st.session_state.get("segment_break_1", 0.05))
+    e2 = float(st.session_state.get("segment_break_2", 0.40))
+    e3 = float(st.session_state.get("pw_b3", 75.0)) / 100.0
+    e1 = float(np.clip(e1, 0.0, end))
+    e2 = float(np.clip(e2, e1, end))
+    e3 = float(np.clip(e3, e2, end))
+    return 0.0, e1, e2, e3, end
+
+
+def own_stretch_windows():
+    """One stretch each: [0,ε₁], [ε₁,ε₂], [ε₂,ε₃], [ε₃,end]."""
+    lo, e1, e2, e3, end = own_stretch_boundaries()
+    return {"membrane": (lo, e1), "interior": (e1, e2),
+            "nucleus_shell": (e2, e3), "nucleus": (e3, end)}
 
 
 def _load_sharing_changed():
@@ -4959,7 +4996,17 @@ def _load_sharing_changed():
             float(st.session_state.get("pw_b2", 50.0)) / 100.0, 4)
         _carry_the_ticks(to_piecewise=False)
     st.session_state["c2c12_fit_mode"] = ADVANCED_MODE
-    st.session_state["model_kind"] = chosen
+    # The other way is the segmented spring network with every element cut
+    # down to its own stretch: the membrane on 0 to ε₁, the cytoskeleton on
+    # ε₁ to ε₂, the nuclear envelope on ε₂ to ε₃, the inside of the nucleus
+    # from ε₃ on, and nothing acting outside its own range.
+    st.session_state["model_kind"] = "Segmented (each part takes over in turn)"
+    st.session_state["membrane_after_break"] = "holds what it reached"
+    st.session_state["cyto_starts_at"] = "at ε₁"
+    for term, window in own_stretch_windows().items():
+        st.session_state[element_window_key(term)] = (round(window[0], 4),
+                                                      round(window[1], 4))
+        st.session_state[f"_window_touched_{term}"] = True
 
 
 def load_sharing_control():
@@ -8299,32 +8346,24 @@ def share_of_load_maths():
     """
     How the elements share the load, as algebra rather than as adjectives.
 
-    Three ways of sharing, and they are different equations, not different
-    wordings: side by side adds forces at one deformation, stacked adds
-    deformations at one force, and segmented is side by side with each
-    element switched on at its own boundary. Written out, the choice is
-    obvious to anyone who has met a spring in series with another spring;
-    written as sentences it is three paragraphs that sound alike.
+    Two ways of fitting the same four components over the same four
+    stretches, one unknown at a time, and they are different equations
+    rather than different wordings. What separates them is whether a
+    component that has already been fitted goes on carrying load into the
+    stretches after it.
     """
-    st.caption("Side by side — one ε, the forces add:")
-    st.latex(
-        r"F(\varepsilon) = \sum_k a_k E_k\, g_k(\varepsilon), \qquad "
-        r"\varepsilon_k = \varepsilon \;\;\forall k"
-    )
-    st.caption("Stacked — one F, the deformations add:")
-    st.latex(
-        r"\varepsilon(F) = \sum_k \varepsilon_k(F), \qquad "
-        r"F_k = F \;\;\forall k"
-    )
-    st.caption("Segmented — side by side, each with its own onset:")
-    st.latex(
-        r"F(\varepsilon) = \sum_k a_k E_k\, \bigl\langle \varepsilon - "
-        r"s_k \bigr\rangle^{p_k}\,(1-\varepsilon)^{-q}"
-    )
-    if piecewise_offered():
-        st.caption("Piecewise — the same terms, regime by regime, each regime "
-                   "starting from the force the one before it ended on:")
-        st.latex(SHARING_MATHS[PW_SHARE])
+    st.caption("① Carried forward — each modulus fitted on its own stretch, "
+               "then held while the next is fitted, every stretch starting "
+               "from the force the one before it ended on:")
+    st.latex(SHARING_MATHS[PW_SHARE])
+    st.latex(r"\hat E_1 \;\text{on}\; [0,\varepsilon_1);\quad "
+             r"\hat E_2 \;\text{on}\; [\varepsilon_1,\varepsilon_2)"
+             r"\;\text{with}\; E_1 = \hat E_1 \;\text{fixed};\quad "
+             r"\hat E_3 \;\text{on}\; [\varepsilon_2,\varepsilon_3)"
+             r"\;\text{with}\; E_1, E_2\;\text{fixed};\;\ldots")
+    st.caption("② Each on its own stretch — every component fitted inside "
+               "its own range and acting nowhere else:")
+    st.latex(SHARING_MATHS[OWN_STRETCH])
     marks = [
         f"- {plain_name(term)} — {shape_mark(term)}"
         for term in terms_for(st.session_state.get("cell_type"))
