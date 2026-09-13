@@ -189,13 +189,8 @@ residual_diagnostics = getattr(_piecewise_module, "residual_diagnostics", None)
 coefficient_significance = getattr(
     _piecewise_module, "coefficient_significance", None)
 model_conditioning = getattr(_piecewise_module, "model_conditioning", None)
-# The early regime, every way round: which law acts from first contact,
-# which joins later and when, out to several windows, with and without the
-# shell's bending term.
-early_regime_search = getattr(_piecewise_module, "early_regime_search", None)
+# Lulevich's bending term, for the check under the early-regime results.
 bending_crossover = getattr(_piecewise_module, "bending_crossover", None)
-EARLY_WINDOWS_PCT = getattr(_piecewise_module, "EARLY_WINDOWS_PCT",
-                            (20.0, 25.0, 30.0, 35.0))
 bending_constant = getattr(_piecewise_module, "bending_constant", None)
 bending_prefactor = getattr(_piecewise_module, "bending_prefactor", None)
 LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
@@ -730,7 +725,21 @@ DEFAULTS = {
     "radius_mode": "From height",
     "radius_aspect": 0.55,
     "cell_radius_um": 4.45,
+    # The plasma membrane as a mechanical shell: one lipid bilayer, 4 nm.
+    # Lulevich et al. (Langmuir 2006) use exactly this, and their eq 2 --
+    # whether the bending term can be dropped -- turns on it.
     "membrane_thickness_nm": 4.0,
+    # The nuclear envelope as a mechanical shell. Anatomically it is two
+    # bilayers (~4 nm each) separated by the perinuclear lumen, which is
+    # ~50 nm in metazoans (Ungricht & Kutay, Nucleus 2015), with the lamin
+    # meshwork under it spanning ~14 nm and built from 3.5 nm filaments
+    # (Turgay et al., Nature 2017). 40 nm is the usual working figure for
+    # the envelope and it is what this page has always used; the two ends
+    # of the honest range are ~22 nm (the load-bearing part: two bilayers
+    # plus the lamina) and ~58 nm (the whole anatomical envelope). Because
+    # a stretch law measures E*h and not E, the page reports E_ne*h_ne
+    # beside E_ne so the choice is visible rather than buried.
+    "envelope_thickness_nm": 40.0,
     # The sub-membranous protein layer, two orders thicker than the bilayer.
     # Only used to express a fitted tension as an equivalent modulus.
     "protein_coat_nm": 200.0,
@@ -872,7 +881,6 @@ DEFAULTS = {
     # The membrane thickness the bending term is read with. 4 nm is the
     # bilayer Lulevich uses; the term goes as h^2, so this is the setting
     # that decides whether it can be dropped.
-    "pw_early_h_nm": 4.0,
     # Every route's placement for this curve, scored, and the one in use.
     "pw_placements": None,
     "pw_selected": None,
@@ -4273,6 +4281,7 @@ def apply_cell_type(name):
         "radius_aspect",
         "nucleus_fraction",
         "membrane_thickness_nm",
+        "envelope_thickness_nm",
         "nucleus_onset",
         "cell_shape",
         "confinement",
@@ -5023,7 +5032,7 @@ PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_style", "pw_best_carry",
                    "pw_weighting", "pw_squeeze", "pw_squeeze_way",
                    "pw_regime",
-                   "pw_early_h_nm", "pw_early_eps", "pw_full_eps",
+                   "pw_early_eps", "pw_full_eps",
                    "pw_early_join", "pw_early_arrangement",
                    "pw_full_arrangement",
                    "pw_use_K_shell", "pw_use_K_cyto",
@@ -5177,6 +5186,23 @@ ORDER_COEFFICIENT = {"membrane": "K_shell", "interior": "K_cyto",
 ONSET_NAMES = ("at contact, ε = 0", "at ε₁", "at ε₂", "at ε₃")
 
 
+def component_order_raw():
+    """
+    The order as the board holds it, with no regime shuffling applied.
+
+    The order control has to compare the boxes against THIS, not against
+    the regime-aware order: in the early regime the two components that
+    are not on the table are pushed to the back, so comparing the boxes
+    with the shuffled list made them differ on every run, and the control
+    rewrote and reran for ever.
+    """
+    got = st.session_state.get("component_order") or []
+    order = [t for t in got if t in COMPONENT_ORDER_DEFAULT]
+    if len(set(order)) != len(COMPONENT_ORDER_DEFAULT):
+        order = list(COMPONENT_ORDER_DEFAULT)
+    return tuple(dict.fromkeys(order))
+
+
 def component_order():
     """
     The four components in the order they are met, validated.
@@ -5186,11 +5212,7 @@ def component_order():
     engine is always handed four regimes; the ones at the back are held at
     zero and simply continue what the ones in front are carrying.
     """
-    got = st.session_state.get("component_order") or []
-    order = [t for t in got if t in COMPONENT_ORDER_DEFAULT]
-    if len(set(order)) != len(COMPONENT_ORDER_DEFAULT):
-        order = list(COMPONENT_ORDER_DEFAULT)
-    order = list(dict.fromkeys(order))
+    order = list(component_order_raw())
     if piecewise_regime() == "early":
         live = set(PW_EARLY_COMPONENTS)
         front = [t for t in order if ORDER_COEFFICIENT.get(t) in live]
@@ -5209,7 +5231,7 @@ def component_order_control():
     of one of them.
     """
     names = components_for(st.session_state.get("cell_type"))
-    order = list(component_order())
+    order = list(component_order_raw())
     picked = []
     cols = st.columns(len(order))
     for index, (col, term) in enumerate(zip(cols, order)):
@@ -6534,7 +6556,8 @@ def piecewise_geometry(model, probe_um=None, coat_nm=None):
         nucleus_radius=float(model.R_nucleus),
         probe_radius=probe_um * 0.5e-6 if probe_um > 0 else None,
         membrane_thickness=float(model.h_membrane),
-        envelope_thickness=float(getattr(model, "h_envelope", 40e-9)),
+        envelope_thickness=float(
+            st.session_state.get("envelope_thickness_nm", 40.0)) * 1e-9,
         coat_thickness=float(coat_nm) * 1e-9,
         nu_membrane=float(model.nu_m),
         nu_interior=float(model.nu_i),
@@ -6789,9 +6812,17 @@ PW_ELEMENT_COLOUR = {"membrane": "#d62728", "cytoskeleton": "#ff7f0e",
 
 
 def early_thickness_m():
-    """The membrane thickness the bending check is read with, in metres."""
+    """
+    The membrane thickness the bending check is read with, in metres.
+
+    The SAME number the rest of the page uses. It was briefly a setting of
+    its own here, which meant two boxes for one physical quantity and two
+    answers to "can bending be dropped" depending on which you had touched
+    last.
+    """
     try:
-        return max(float(st.session_state.get("pw_early_h_nm", 4.0)), 0.1) * 1e-9
+        return max(float(st.session_state.get("membrane_thickness_nm", 4.0)),
+                   0.1) * 1e-9
     except (TypeError, ValueError):
         return 4e-9
 
@@ -6940,7 +6971,7 @@ def lulevich_panel(result, model, fit=None):
                 f"{crossing['negligible_pct']:.0f} % would put it back "
                 "inside the noise.", icon="⚠️")
         else:
-            st.error(
+            st.warning(
                 f"**No, not over this window.** Keeping the bending term "
                 f"would change the fitted force by up to **{verdict:.0f} "
                 "%**. Eq 3 is not a safe approximation this close to first "
@@ -6963,11 +6994,14 @@ def lulevich_panel(result, model, fit=None):
         c2.metric("bending < 5 % of it by",
                   f"{crossing['negligible_pct']:.2f} %")
         with c3:
-            st.number_input("membrane thickness h (nm)", 0.5, 1000.0,
-                            step=1.0, format="%.1f", key="pw_early_h_nm",
-                            help="4 nm is the bilayer Lulevich uses; a "
-                                 "cortex is 100–500 nm. The bending term "
-                                 "goes as h², so this is what decides it.")
+            st.number_input("membrane thickness hₘ (nm)", 0.5, 100.0,
+                            step=0.5, format="%.1f",
+                            key="membrane_thickness_nm",
+                            help="The page's own hₘ, the same one the "
+                                 "moduli are converted with. 4 nm is the "
+                                 "bilayer Lulevich uses. The bending term "
+                                 "goes as hₘ², so this is what decides "
+                                 "whether it can be dropped.")
         st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}}"
                  r"\;=\;\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
                  r"\varepsilon^{-5/2}")
@@ -9537,6 +9571,27 @@ def component_results_strip(fit, extra=""):
     # was found to be made of.
     rows = [row for row in result_rows(fit)
             if row[0].startswith("modulus_") and row[2] != "not in this model"]
+    # E*h for the two shells, from the fit's own moduli and the thicknesses
+    # the page is set to, keyed the way result_rows keys its cards.
+    SHELL_AREAL = {}
+    for term, thickness_nm in (
+            ("membrane", st.session_state.get("membrane_thickness_nm", 4.0)),
+            ("nucleus_shell", st.session_state.get("envelope_thickness_nm",
+                                                   40.0))):
+        field, unit_name, _std = MODULUS_FIELDS[term]
+        try:
+            value = float(fit.get(field)) * (1e6 if unit_name == "MPa"
+                                             else 1e3)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value) or value <= 0:
+            continue
+        key = f"modulus_{term}"
+        areal = value * float(thickness_nm) * 1e-9
+        SHELL_AREAL[key] = (
+            f"E·h = {areal * 1e3:.4g} mN/m at h = {float(thickness_nm):g} nm "
+            "— this product is what the ε³ law measures, and it does not "
+            "move when the thickness assumed does.")
     if not rows:
         st.warning("No component is ticked, so there is nothing to report. "
                    "Tick at least one below and press ▶ Fit & plot.")
@@ -9567,6 +9622,12 @@ def component_results_strip(fit, extra=""):
                         "nothing for the component that joins there.")
                 else:
                     st.caption(f"95 % interval: {interval}")
+                # A shell's stretch law measures E*h, not E. That product is
+                # what the curve actually contains, and unlike E it does not
+                # move when the assumed thickness does, so it is said here.
+                areal = SHELL_AREAL.get(_key)
+                if areal:
+                    st.caption(areal)
                 st.caption(support)
     said_lit = literature_note(fit)
     if said_lit:
@@ -13582,6 +13643,8 @@ def current_fit_settings():
         "radius_aspect": float(st.session_state["radius_aspect"]),
         "nucleus_fraction": float(st.session_state["nucleus_fraction"]),
         "membrane_thickness_nm": float(st.session_state["membrane_thickness_nm"]),
+        "envelope_thickness_nm": float(
+            st.session_state.get("envelope_thickness_nm", 40.0)),
         "protein_coat_nm": float(st.session_state["protein_coat_nm"]),
         "sarcomere_nm": float(st.session_state["sarcomere_nm"]),
         "sarcomere_spread": float(st.session_state["sarcomere_spread"]),
@@ -14428,10 +14491,36 @@ with st.sidebar:
             max_value=100.0,
             step=0.1,
             key="membrane_thickness_nm",
-            help="A lipid bilayer is about 4 to 5 nm. The ε³ term measures the "
-            "product Eₘ·hₘ, so Eₘ scales inversely with whatever you assume here: "
-            "assume 8 nm instead of 4 and Eₘ halves, with the data unchanged. The "
-            "app reports Eₘ·hₘ alongside Eₘ for that reason.",
+            help="A lipid bilayer is about 4 to 5 nm; 4 nm is the default "
+            "and is what Lulevich et al. (Langmuir 2006) use. The ε³ term "
+            "measures the product Eₘ·hₘ, so Eₘ scales inversely with "
+            "whatever you assume here: assume 8 nm instead of 4 and Eₘ "
+            "halves, with the data unchanged. The app reports Eₘ·hₘ "
+            "alongside Eₘ for that reason. It also decides whether the "
+            "membrane's bending term can be dropped, since that goes as hₘ².",
+        )
+        st.number_input(
+            "Nuclear envelope thickness h_ne (nm)",
+            min_value=1.0,
+            max_value=200.0,
+            step=1.0,
+            key="envelope_thickness_nm",
+            help="The envelope as a mechanical shell. Anatomically: two "
+            "bilayers of about 4 nm with the perinuclear lumen between "
+            "them, about 50 nm in metazoans, and the lamin meshwork under "
+            "it spanning about 14 nm and built from 3.5 nm filaments. "
+            "40 nm is the usual working figure and the default here; "
+            "about 22 nm is the load-bearing part alone (two bilayers plus "
+            "the lamina) and about 58 nm is the whole envelope. As with "
+            "the membrane, the ε³ term measures E_ne·h_ne, so that product "
+            "is reported beside E_ne and does not move when you change "
+            "this.",
+        )
+        st.caption(
+            "Sources for these two: Lulevich et al., *Langmuir* 2006 "
+            "(4 nm bilayer); Ungricht & Kutay, *Nucleus* 2015 (~50 nm "
+            "perinuclear space); Turgay et al., *Nature* 2017 (lamin "
+            "meshwork ~14 nm of 3.5 nm filaments)."
         )
         if st.session_state["cell_type"] in HAS_SARCOMERES:
             # The in-plane membrane spring and its genotype used to be set
