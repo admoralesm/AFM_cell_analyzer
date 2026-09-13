@@ -6994,14 +6994,17 @@ def lulevich_panel(result, model, fit=None):
         c2.metric("bending < 5 % of it by",
                   f"{crossing['negligible_pct']:.2f} %")
         with c3:
-            st.number_input("membrane thickness hₘ (nm)", 0.5, 100.0,
-                            step=0.5, format="%.1f",
-                            key="membrane_thickness_nm",
-                            help="The page's own hₘ, the same one the "
-                                 "moduli are converted with. 4 nm is the "
-                                 "bilayer Lulevich uses. The bending term "
-                                 "goes as hₘ², so this is what decides "
-                                 "whether it can be dropped.")
+            # NOT a second box for hₘ. There is one widget for it, in the
+            # sidebar's model constants, and a second one with the same key
+            # is a duplicate-key error in Streamlit -- and, worse, two
+            # places to set one physical quantity. This shows what the
+            # answer above was computed with and says where to change it.
+            st.metric("membrane thickness hₘ",
+                      f"{early_thickness_m() * 1e9:.1f} nm")
+            st.caption("A lipid bilayer, 4 nm by default, the same hₘ the "
+                       "moduli are converted with. The bending term goes "
+                       "as hₘ², so this is what decides the answer above. "
+                       "Change it in **🧬 Model constants** in the sidebar.")
         st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}}"
                  r"\;=\;\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
                  r"\varepsilon^{-5/2}")
