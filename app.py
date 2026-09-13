@@ -864,6 +864,7 @@ DEFAULTS = {
     # In the early regime, whether the two components act together from
     # first contact (Lulevich's own arrangement) or one joins at ε₁.
     "pw_early_join": "parallel",
+    "pw_early_note": None,
     "pw_early_arrangement": None,
     "pw_full_arrangement": None,
     # What the fit is asked to get right. A whole-cell squash spans three
@@ -6920,10 +6921,14 @@ def lulevich_panel(result, model, fit=None):
             power = 3.0 if name == "K_shell" else 1.5
             mid = 0.5 * (float(start) + end) / 100.0
             factor = (mid / max(mid - float(start) / 100.0, 1e-9)) ** power
+            if factor < 1.15:
+                # A hair over 1 is not worth a warning, and "about 1x"
+                # reads as a bug.
+                continue
             symbol = "Eₘ" if name == "K_shell" else "Ec"
             rough.append(f"{symbol} starts at {float(start):.1f} %, so "
                          f"reading it as a modulus of the whole deformation "
-                         f"overstates it by about **{factor:.0f}×**")
+                         f"overstates it by about **{factor:.1f}×**")
         if rough:
             st.warning(" · ".join(rough) + ". Only a law acting from first "
                        "contact converts with nothing to undo — move ε₁ to "
@@ -9132,11 +9137,122 @@ def early_park(end, parallel=None, first=None):
     if parallel is None:
         parallel = st.session_state.get("pw_early_join",
                                         "parallel") == "parallel"
-    e1 = (round(max(end - 1.5, 1.0), 2) if parallel
+    # Parked with a full PW_MIN_GAP of room under x_end, so that
+    # repair_boundaries finds nothing to mend. Parking them tighter than
+    # the gap made the repair compress them AFTER the arrangement search
+    # had scored them, and the fit that came out was not the fit that won.
+    e1 = (round(max(end - 3.0, 1.0), 2) if parallel
           else round(min(max(float(first if first is not None else end * 0.4),
-                             1.0), max(end - 2.0, 1.0)), 2))
-    return [e1, round(max(end - 1.0, 1.5), 2),
-            round(max(end - 0.5, 2.0), 2), round(end, 2)]
+                             1.0), max(end - 3.5, 1.0)), 2))
+    return [e1, round(max(end - 2.0, e1 + PW_MIN_GAP), 2),
+            round(max(end - 1.0, e1 + 2 * PW_MIN_GAP), 2), round(end, 2)]
+
+
+def early_best_arrangement(model, epsilon, force_N, end=None):
+    """
+    The best way to put the two early components together, searched.
+
+    With two components and one boundary there are only three things free,
+    and they are all searched here rather than assumed:
+
+      * both from first contact, in parallel -- Lulevich's own eq 1 + 6;
+      * the membrane first, the cell interior joining at e1;
+      * the cell interior first, the membrane joining at e1;
+
+    with e1 scanned across the window for the two staggered ones. Every
+    candidate is fitted to the SAME points over the same [0, x_end], so
+    AICc compares them honestly. Ties go to the arrangement that measures
+    BOTH components: one that wins by driving the other to zero has not
+    learnt anything about the cell.
+
+    Returns {"join", "order", "eps1", "r2", "aicc", "measured", "tried"}.
+    """
+    if not HAS_PIECEWISE:
+        return None
+    end = float(end if end is not None
+                else st.session_state.get("pw_end", PW_EARLY_END_PCT))
+    thin_eps, thin_force, _step = thinned_for_search(epsilon, force_N)
+    coefficient_term = {c: t for t, c in ORDER_COEFFICIENT.items()}
+    live = list(PW_EARLY_COMPONENTS)
+    off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS if n not in live)
+    settings = effective_piecewise_settings(
+        piecewise_settings(), piecewise_until(), off)
+    terms = {t.name: t for regime in PW_REGIMES for t in regime.terms}
+    rest = [n for n, *_r in PW_COMPONENTS if n not in live]
+    extras = fit_extras()
+
+    def score(regimes, bounds):
+        # Through the same repair the board applies, so the arrangement
+        # that wins here is the arrangement that gets fitted.
+        bounds = repair_boundaries(list(bounds)[1:], top=end)[0]
+        result = fit_piecewise(thin_eps, thin_force, boundaries_pct=bounds,
+                               regimes=regimes, settings=settings,
+                               carry=tuple(live), **extras)
+        if not result.get("success"):
+            return None
+        coefficients = result.get("coefficients") or {}
+        measured = sum(1 for name in live
+                       if abs(float(coefficients.get(name) or 0.0)) > 0.0)
+        return {"r2": float(result.get("r_squared", float("nan"))),
+                "aicc": float(result.get("aicc", float("inf"))),
+                "measured": measured}
+
+    def blank(index):
+        return _dataclasses.replace(PW_REGIMES[index], terms=(),
+                                    free_offset=False, title="", equation="")
+
+    tried, best = 0, None
+
+    def keep(candidate, join, order, eps1):
+        nonlocal best, tried
+        tried += 1
+        if candidate is None or not np.isfinite(candidate["aicc"]):
+            return
+        key = (candidate["measured"], -candidate["aicc"])
+        if best is None or key > best["key"]:
+            best = {"key": key, "join": join, "order": list(order),
+                    "eps1": float(eps1), **candidate}
+
+    # both from first contact
+    parked = early_park(end, parallel=True)
+    parallel_regimes = (
+        (_dataclasses.replace(PW_REGIMES[0],
+                              terms=tuple(terms[n] for n in live),
+                              free_offset=True, equation="",
+                              title=" + ".join(PW_COMPONENT_TITLES.get(n, n)
+                                               for n in live)),)
+        + tuple(_dataclasses.replace(PW_REGIMES[i + 1], terms=(terms[n],),
+                                     free_offset=False, title="", equation="")
+                for i, n in enumerate(rest))
+        + tuple(blank(i) for i in range(1 + len(rest), len(PW_REGIMES))))
+    keep(score(parallel_regimes, (0.0,) + tuple(parked)), "parallel",
+         live, parked[0])
+
+    # one joins at e1, both ways round, e1 scanned
+    grid = np.arange(2.0, max(end - 2.0, 3.0), 1.0)
+    for order in ((live[0], live[1]), (live[1], live[0])):
+        chain = list(order) + rest
+        regimes = tuple(
+            _dataclasses.replace(PW_REGIMES[i], terms=(terms[n],),
+                                 free_offset=(i == 0),
+                                 title=PW_COMPONENT_TITLES.get(n, ""),
+                                 equation="")
+            for i, n in enumerate(chain))
+        for eps1 in grid:
+            parked = early_park(end, parallel=False, first=float(eps1))
+            keep(score(regimes, (0.0,) + tuple(parked)), "staggered",
+                 order, parked[0])
+    if best is None:
+        return None
+    # The full four-term order, the searched two in front. Storing only
+    # two would fail component_order_raw's validity check and be silently
+    # replaced by the default, which is how the searched arrangement got
+    # thrown away between finding it and fitting it.
+    front = [coefficient_term[c] for c in best["order"] if c in coefficient_term]
+    best["order"] = front + [t for t in COMPONENT_ORDER_DEFAULT
+                             if t not in front]
+    best["tried"] = tried
+    return best
 
 
 def _pw_early_end_changed():
@@ -9148,6 +9264,9 @@ def _pw_early_end_changed():
                           early_park(end,
                                      first=st.session_state.get("pw_b1"))):
         st.session_state[key] = value
+    # The best arrangement depends on the window, so moving x_end asks for
+    # it again rather than leaving the old one in place.
+    st.session_state["_pw_find_early"] = True
     st.session_state["_pw_apply"] = True
 
 
@@ -9226,6 +9345,17 @@ def _pw_regime_changed():
         # switching in never lands on an empty board.
         for name in PW_EARLY_COMPONENTS:
             st.session_state[f"pw_use_{name}"] = True
+        # Both of Lulevich's terms act from where they join to the end of
+        # the window -- that IS his model -- so the early regime carries
+        # both, always. Pinning it here is what makes the arrangement
+        # search and the fit it leads to the same fit.
+        st.session_state["pw_style"] = "carried"
+        st.session_state["pw_best_carry"] = None
+        st.session_state["pw_membrane_throughout"] = True
+        # And it arrives FITTED the best way it can be. A callback has no
+        # curve to search, so it only asks; piecewise_section does it.
+        if not kept:
+            st.session_state["_pw_find_early"] = True
         st.session_state["pw_eps_way"] = (
             "typed" if st.session_state.get("pw_early_join",
                                             "parallel") == "parallel"
@@ -9854,6 +9984,35 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_restyle", False):
         settle_mixture()
         st.session_state["_pw_apply"] = True
+    # The early regime arrives searched: every arrangement of its two
+    # components, both ways round, with e1 scanned, and the best kept.
+    if st.session_state.pop("_pw_find_early", False) and HAS_PIECEWISE:
+        with st.spinner("Finding the best arrangement of the two…"):
+            found_early = early_best_arrangement(model, epsilon, force_N)
+        if found_early:
+            st.session_state["pw_early_join"] = found_early["join"]
+            if found_early["join"] == "staggered" and found_early["order"]:
+                st.session_state["component_order"] = found_early["order"]
+                for index, term in enumerate(found_early["order"]):
+                    st.session_state[f"component_order_{index}"] = term
+            for key, value in zip(PW_BOUNDARY_KEYS, early_park(
+                    float(st.session_state.get("pw_end", PW_EARLY_END_PCT)),
+                    parallel=found_early["join"] == "parallel",
+                    first=found_early["eps1"])):
+                st.session_state[key] = value
+            st.session_state["pw_early_note"] = (
+                f"Searched {found_early['tried']} arrangements of the two "
+                "components and kept "
+                + ("**both from first contact**"
+                   if found_early["join"] == "parallel" else
+                   f"**{components_for(st.session_state.get('cell_type'))[found_early['order'][0]][0]} "
+                   f"first, the other joining at ε₁ = "
+                   f"{found_early['eps1']:.1f} %**")
+                + f" (R² = {found_early['r2']:.5f}, "
+                f"{found_early['measured']} of 2 components measured).")
+            st.session_state["pw_eps_way"] = "typed"
+        st.session_state["_pw_apply"] = True
+
     applied_state = st.session_state.get("pw_applied") or {}
     if st.session_state.pop("_pw_apply", False):
         apply_board()
@@ -9951,13 +10110,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
     with results_col:
         results_slot = st.container()
 
-    # ================================== the early regime, its own section
-    # Created here so it renders DIRECTLY under the plot and the results,
-    # above the control board, and filled once the fit is in hand. It used
-    # to be appended at the end of the section, which put it below the
-    # board, the validation panel and five tabs, where nobody found it.
-    early_slot = st.container()
-
     # ================================================= the control board
     # Directly under the plot, and the components are the first thing in
     # it: they are the plot, one tick per curve drawn and one bar per
@@ -10041,6 +10193,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
                  "nothing moves.",
         )
         if early_now:
+            said_early = st.session_state.get("pw_early_note")
+            if said_early:
+                st.caption("🔎 " + said_early)
             st.radio(
                 "How the two act", list(PW_EARLY_JOINS),
                 format_func=PW_EARLY_JOINS.get, key="pw_early_join",
@@ -10085,7 +10240,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     taken = early_park(round(float(window), 1))
                     rerun_keeping_settings(
                         {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-                         "_pw_apply": True})
+                         "_pw_find_early": True, "_pw_apply": True})
         else:
             e1c, e2c, e3c, endc = st.columns(4)
             with e1c:
@@ -10439,9 +10594,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
             validation_panel(result, epsilon, force_N, model)
 
         # ---- the early regime against its source, from this same fit ---
-        with early_slot:
-            if ok and piecewise_regime() == "early":
-                lulevich_panel(result, model, fit)
+        # Rendered HERE, in code order, so it lands under the board and the
+        # results rather than above them: it is a reading of a fit, and a
+        # reference note above the fit it refers to is just noise.
+        if ok and piecewise_regime() == "early":
+            lulevich_panel(result, model, fit)
 
         # ---- how it is done, for an undergraduate, with these numbers --
         with st.expander("📘 How the fit is done — the maths, step by step",
