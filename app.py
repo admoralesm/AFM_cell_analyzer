@@ -7043,20 +7043,38 @@ def early_deformation_section(model, epsilon, force_N, whole_curve=None):
     """
     if early_regime_search is None:
         return
+    st.divider()
     box = st.container(border=True)
     with box:
-        st.markdown("### 🔬 Early deformation")
+        st.markdown("## 🔬 Early deformation — fitted on its own")
         st.caption(
-            "Lulevich et al., *Langmuir* 2006: over the first third of a "
-            "squash a living cell is a balloon of incompressible fluid with "
-            "**two components** — a membrane that stretches (ε³) and bends "
-            "(ε^½), and the cell interior answering Hertz (ε^1.5). This "
-            "section fits those two and nothing else, and it is where the "
-            "number that compares with a paper is read."
+            "**A separate fit, over the early part of this curve only.** It "
+            "does not use the four-regime fit above and it changes nothing "
+            "about it. Lulevich et al., *Langmuir* 2006: over the first "
+            "third of a squash a living cell is a balloon of incompressible "
+            "fluid with **two components** — a membrane that stretches (ε³) "
+            "and bends (ε^½), and the cell interior answering Hertz "
+            "(ε^1.5). Those two are fitted here and nothing else, and this "
+            "is where the number that compares with a paper is read."
         )
-        on = st.checkbox("Read the early regime", key="pw_small_strain")
+        toggle, go = st.columns([2.4, 1])
+        with toggle:
+            # Drawn before the button, so the button can be disabled from
+            # it without ever writing a widget key that already exists.
+            on = st.checkbox("Fit and show this section",
+                             key="pw_small_strain")
+        with go:
+            refit = st.button("▶ Fit the early regime", type="primary",
+                              key="pw_early_go", disabled=not on, **STRETCH,
+                              help="Fits the two components over each "
+                                   "window below, every way round, and "
+                                   "keeps the best. Nothing above changes.")
         if not on:
+            st.caption("Switched off. Tick the box to fit the early regime "
+                       "on its own.")
             return
+        if refit:
+            st.session_state.pop("pw_early", None)
 
         c1, c2, c3, c4 = st.columns([1.5, 0.9, 1.5, 0.9], gap="medium")
         with c1:
@@ -7093,6 +7111,10 @@ def early_deformation_section(model, epsilon, force_N, whole_curve=None):
         best["window_pct"] = window
         geometry = piecewise_geometry(model)
 
+        st.success(
+            f"**Fitted on {best['n_points']:,} points, x = 0 to "
+            f"{window:.0f} % only.** Nothing above {window:.0f} % entered "
+            f"this fit.", icon="✅")
         st.markdown(
             f"**{early_row_label(best)}**, over **0 to {window:.0f} %**, is "
             f"the best-supported arrangement (R² = {best['r_squared']:.5f}, "
@@ -9867,6 +9889,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
     with results_col:
         results_slot = st.container()
 
+    # ================================== the early regime, its own section
+    # Created here so it renders DIRECTLY under the plot and the results,
+    # above the control board, and filled once the fit is in hand. It used
+    # to be appended at the end of the section, which put it below the
+    # board, the validation panel and five tabs, where nobody found it.
+    early_slot = st.container()
+
     # ================================================= the control board
     # Directly under the plot, and the components are the first thing in
     # it: they are the plot, one tick per curve drawn and one bar per
@@ -9884,7 +9913,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
             "specimen, **B** over what domains, **C** under what regression "
             "conditions, **D** run it, **E** test the hypothesis in A "
             "against the curve, and **F**, under the results, what the "
-            "answer is worth."
+            "answer is worth. This board fits the **whole curve**; the "
+            "early part is fitted separately in **🔬 Early deformation** "
+            "just above."
         )
         status_slot = st.empty()
 
@@ -9995,6 +10026,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "target, widening the prior only as far as it has to. "
                 "**🔄 Refresh graph** just draws the board again."
             )
+
+        st.caption(
+            "ℹ️ The early part of this curve is fitted **separately**, by "
+            "its own two components, in **🔬 Early deformation** directly "
+            "above this board. Nothing on this board affects it."
+        )
 
         st.markdown("**E · Screen — four components first, in every "
                     "arrangement**")
@@ -10257,13 +10294,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
         if ok:
             validation_panel(result, epsilon, force_N, model)
 
-        # ---- the same cell, read where the literature reads it ---------
-        early_deformation_section(
-            model, epsilon, force_N,
-            whole_curve={row["symbol"]: row["E_Pa"]
-                         for row in (moduli or {}).values()
-                         if isinstance(row, dict) and "symbol" in row},
-        )
+        # ---- the early regime, fitted on its own, up under the plot ----
+        with early_slot:
+            early_deformation_section(
+                model, epsilon, force_N,
+                whole_curve={row["symbol"]: row["E_Pa"]
+                             for row in (moduli or {}).values()
+                             if isinstance(row, dict) and "symbol" in row},
+            )
 
         # ---- how it is done, for an undergraduate, with these numbers --
         with st.expander("📘 How the fit is done — the maths, step by step",
