@@ -5657,7 +5657,11 @@ PW_EARLY_COMPONENTS = ("K_shell", "K_cyto")
 # How far the plot looks when the early regime is selected. The fit itself
 # stops at x_end; this is only the frame, kept a little wider so what the
 # curve does just past the fit is visible.
-PW_EARLY_VIEW_PCT = 40.0
+PW_EARLY_VIEW_PCT = 45.0
+# Where the early regime reads to by default. Lulevich's eq 3 is fitted
+# over e = 0.1-0.3 and a living cell is elastic and fully reversible to
+# about 30 %, so 35 % covers the range the two-term model is for.
+PW_EARLY_END_PCT = 35.0
 PW_REGIME_MODES = {
     "full": "🔵 Full deformation · the four components, the whole squash",
     "early": "🔬 Early deformation · two components (Lulevich eq 1 & 6)",
@@ -6925,6 +6929,29 @@ def lulevich_panel(result, model, fit=None):
                        "contact converts with nothing to undo — move ε₁ to "
                        "0 in **B** to read it that way.", icon="⚠️")
 
+        # A component that came back at zero over a wide early window is
+        # almost always the two shapes trading places, not an absent
+        # component: e^3 and e^1.5 are close over a short stretch, and the
+        # wider the window the more completely the cube wins. Saying which
+        # knob fixes it is more use than the zero itself.
+        silent = [name for coefficient, name in
+                  (("K_shell", "🟥 Membrane Eₘ"), ("K_cyto", "🟧 Cytoskeleton Ec"))
+                  # A bounded least squares lands on 1e-29 Pa, not on a
+                  # clean zero. Anything under a pascal is not a cell.
+                  if float((moduli.get(coefficient) or {}).get("E_Pa", 1e9)
+                           or 0.0) <= 1.0]
+        if silent:
+            st.warning(
+                "**" + " and ".join(silent)
+                + f" came back at zero over 0 to {end:.0f} %.** That is almost "
+                "never an absent component: ε³ and ε^1.5 are close in shape "
+                "over a short stretch, and the wider the window the more "
+                "completely the cube law absorbs the other one. The fix is "
+                "the window, not the model — press **📐 Read to …** in "
+                "**B** to take the stretch where this curve is still one "
+                "power law (usually near 20 %), and the two separate "
+                "again.", icon="⚠️")
+
         st.markdown("**Can the membrane's bending term be dropped here?**")
 
         # The decisive number is not the ratio between the two membrane
@@ -6951,42 +6978,71 @@ def lulevich_panel(result, model, fit=None):
                 })
             heavy = share[grid >= 2.0]
             verdict = float(np.max(heavy)) if heavy.size else float(share.max())
+        # The verdict always says WHY, in this cell's own numbers. The
+        # mechanism is Lulevich's eq 2: bending resistance goes as h^2 and
+        # stretching as h*R0, so their ratio carries a factor h/R0 -- a
+        # bilayer is three orders thinner than the cell is wide -- against
+        # e^-5/2, which is the only thing that can make up for it. Near
+        # first contact it does, and bending IS the first term; a little
+        # way in it cannot, and the term is gone.
+        slimness = h / R0 if R0 > 0 else float("nan")
+        because = (
+            f"because the bilayer is about **{1.0 / slimness:,.0f}× thinner "
+            f"than the cell is wide** (hₘ/R₀ = {slimness:.1e}). Bending "
+            "resistance goes as hₘ² and stretching as hₘ·R₀, so their ratio "
+            "carries that factor, and only ε^−5/2 can make up for it. It "
+            f"does below **x = {crossing['equal_pct']:.2f} %**, where "
+            "bending is genuinely the larger of the two — it is the first "
+            "term the cell answers with. Above that the ratio falls by "
+            "**5.7× for every doubling** of deformation, and by "
+            f"x = {crossing['negligible_pct']:.2f} % it is under a "
+            "twentieth of stretching"
+        )
         if verdict is None:
-            st.caption("The membrane came back at zero on this fit, so there "
-                       "is no bending term to keep or drop.")
+            st.info("The membrane came back at zero on this fit, so there is "
+                    "no bending term to keep or drop. The ε³ law found "
+                    "nothing to measure over this window.", icon="ℹ️")
         elif verdict < 2.0:
             st.success(
-                f"**Yes, drop it.** Above x = 2 % keeping the bending term "
-                f"would change the fitted force by at most **{verdict:.2f} "
-                "%**, which is inside the noise of the measurement. "
-                "Lulevich's eq 3, stretching alone, is what this curve "
-                "supports and it is what is fitted.", icon="✅")
+                f"**Not needed — leave it out.** Over this window, above "
+                f"x = 2 %, keeping the bending term would change the fitted "
+                f"force by at most **{verdict:.2f} %**, which is inside the "
+                f"noise. It is not needed {because}. Lulevich drops it for "
+                "exactly this reason and fits his eq 3, stretching alone, "
+                "which is what this board fits.", icon="✅")
         elif verdict < 10.0:
             st.warning(
-                f"**Borderline.** Keeping the bending term would change the "
-                f"fitted force by up to **{verdict:.1f} %** over this "
-                "window, which is more than the noise. Eₘ above carries "
-                "that much systematic uncertainty from the choice alone. "
-                f"Starting the reading past x = "
-                f"{crossing['negligible_pct']:.0f} % would put it back "
+                f"**Borderline — keep it in mind.** Keeping the bending "
+                f"term would change the fitted force by up to "
+                f"**{verdict:.1f} %** over this window, more than the "
+                f"noise, so Eₘ above carries that much systematic "
+                f"uncertainty from the choice alone. It is *nearly* not "
+                f"needed {because} — but your window starts at first "
+                "contact, which is the one end where that argument does "
+                f"not hold. Starting the reading past "
+                f"x = {crossing['negligible_pct']:.0f} % puts it back "
                 "inside the noise.", icon="⚠️")
         else:
             st.warning(
-                f"**No, not over this window.** Keeping the bending term "
-                f"would change the fitted force by up to **{verdict:.0f} "
-                "%**. Eq 3 is not a safe approximation this close to first "
-                f"contact: start the reading past x = "
-                f"{crossing['negligible_pct']:.0f} %, or treat Eₘ here as an "
-                "apparent value rather than the membrane's modulus.",
+                f"**Needed over this window — do not leave it out.** "
+                f"Keeping the bending term would change the fitted force by "
+                f"up to **{verdict:.0f} %**. The usual argument for "
+                f"dropping it — {because} — fails here because the reading "
+                "starts at first contact, below the crossover, where "
+                "bending is the larger term rather than a correction to "
+                f"it. Either start the reading past "
+                f"x = {crossing['negligible_pct']:.0f} %, or report Eₘ as "
+                "an apparent value rather than the membrane's modulus.",
                 icon="🚫")
         if rows:
             st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
             st.caption(
                 "What the term would add point by point, at the membrane "
-                "modulus fitted above. It falls as ε^½ against the ε³ of "
-                "stretching, so it matters at the contact end and nowhere "
-                "else — which is why where the reading STARTS decides this, "
-                "not where it ends."
+                "modulus fitted above. Because it dies as ε^−5/2 relative "
+                "to stretching, **where the reading starts decides this, "
+                "not where it ends** — the same window moved in by a few "
+                "per cent changes the answer, and a wider x_end barely "
+                "does."
             )
 
         c1, c2, c3 = st.columns([1, 1, 1.6])
@@ -9061,18 +9117,45 @@ PW_EARLY_JOINS = {
 }
 
 
+def early_park(end, parallel=None, first=None):
+    """
+    The four boundary numbers for an early-regime fit that reads to ``end``.
+
+    ε₂ and ε₃ belong to components held at zero here, so they are parked
+    just under x_end where they are inert. ε₁ joins them when both
+    components act from first contact. They have to be re-parked whenever
+    x_end moves: left above it, the boundary repair sees a fit with no last
+    stretch and pushes x_end back out, which is how "read to 18 %" turned
+    into "read to 91 %".
+    """
+    end = float(end)
+    if parallel is None:
+        parallel = st.session_state.get("pw_early_join",
+                                        "parallel") == "parallel"
+    e1 = (round(max(end - 1.5, 1.0), 2) if parallel
+          else round(min(max(float(first if first is not None else end * 0.4),
+                             1.0), max(end - 2.0, 1.0)), 2))
+    return [e1, round(max(end - 1.0, 1.5), 2),
+            round(max(end - 0.5, 2.0), 2), round(end, 2)]
+
+
+def _pw_early_end_changed():
+    """Callback: x_end moved in the early regime, so re-park the rest."""
+    if piecewise_regime() != "early":
+        return
+    end = float(st.session_state.get("pw_end", PW_EARLY_END_PCT))
+    for key, value in zip(PW_BOUNDARY_KEYS,
+                          early_park(end,
+                                     first=st.session_state.get("pw_b1"))):
+        st.session_state[key] = value
+    st.session_state["_pw_apply"] = True
+
+
 def _pw_early_join_changed():
     """Callback: parallel or staggered. Re-park ε so the stretches fit."""
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
-    if st.session_state.get("pw_early_join", "parallel") == "parallel":
-        # One regime doing the work, so ε₁ is parked with the others just
-        # under x_end where it owns almost the whole window.
-        st.session_state["pw_b1"] = round(max(end - 1.5, 1.0), 2)
-    else:
-        st.session_state["pw_b1"] = round(
-            min(max(end * 0.4, 1.0), max(end - 2.0, 1.0)), 2)
-    st.session_state["pw_b2"] = round(max(end - 1.0, 1.5), 2)
-    st.session_state["pw_b3"] = round(max(end - 0.5, 2.0), 2)
+    for key, value in zip(PW_BOUNDARY_KEYS, early_park(end)):
+        st.session_state[key] = value
     st.session_state["pw_eps_way"] = (
         "typed" if st.session_state.get("pw_early_join") == "parallel"
         else "found")
@@ -9119,18 +9202,18 @@ def _pw_regime_changed():
         if kept:
             values = [float(v) for v in kept]
         else:
-            found = st.session_state.get("_pw_early_window")
-            end = round(float(found if found else 30.0), 1)
+            # Lulevich fits his eq 3 over e = 0.1 to 0.3 and the cell is
+            # elastic and fully reversible to about 30 %, so 35 % is where
+            # the early regime starts: the whole of the range the two-term
+            # model is meant for, with a little of the shoulder past it so
+            # the departure is visible. The 📐 button takes the power-law
+            # window instead, which is usually nearer 20 %.
+            end = PW_EARLY_END_PCT
             # ε₂ and ε₃ belong to components held at zero, so they are
             # parked just under x_end where they are inert and where the
             # search will not spend time on them. ε₁ joins them when both
             # components act from first contact.
-            parallel = st.session_state.get("pw_early_join",
-                                            "parallel") == "parallel"
-            values = [round(max(end - 1.5, 1.0), 2) if parallel
-                      else min(here[0], round(end * 0.4, 2)),
-                      round(max(end - 1.0, 1.5), 2),
-                      round(max(end - 0.5, 2.0), 2), end]
+            values = early_park(end, first=here[0])
     else:
         st.session_state["pw_early_eps"] = here
         values = [float(v) for v in (st.session_state.get("pw_full_eps")
@@ -9983,8 +10066,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
             with endc:
                 st.number_input("x_end (%)", 2.0, 100.0, step=0.5,
                                 format="%.1f", key="pw_end",
+                                on_change=_pw_early_end_changed,
                                 help="How far the early reading goes. "
-                                     "Nothing past this enters the fit.")
+                                     "Nothing past this enters the fit. "
+                                     "35 % by default: Lulevich fits his "
+                                     "eq 3 over ε = 0.1–0.3 and a living "
+                                     "cell is reversible to about 30 %.")
             with findc:
                 window = st.session_state.get("_pw_early_window")
                 if window and st.button(
@@ -9995,8 +10082,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                              "which this curve's log-log slope is still "
                              "flat, which is as far as one power law "
                              "describes it."):
-                    rerun_keeping_settings({"pw_end": round(float(window), 1),
-                                            "_pw_apply": True})
+                    taken = early_park(round(float(window), 1))
+                    rerun_keeping_settings(
+                        {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                         "_pw_apply": True})
         else:
             e1c, e2c, e3c, endc = st.columns(4)
             with e1c:
