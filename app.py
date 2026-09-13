@@ -5613,6 +5613,10 @@ def modulus_display(symbol, value_pa, se_pa=None):
 # their terms clamped, the stretches they would own simply continue the
 # carried terms of the ones before.
 PW_EARLY_COMPONENTS = ("K_shell", "K_cyto")
+# How far the plot looks when the early regime is selected. The fit itself
+# stops at x_end; this is only the frame, kept a little wider so what the
+# curve does just past the fit is visible.
+PW_EARLY_VIEW_PCT = 40.0
 PW_REGIME_MODES = {
     "full": "🔵 Full deformation · the four components, the whole squash",
     "early": "🔬 Early deformation · two components (Lulevich eq 1 & 6)",
@@ -7661,9 +7665,11 @@ def add_tag_lines(fig, items, x_span, x_max, plot_px=None):
 
 def boundary_tag_items(bounds, scale=1.0, end_label=True):
     """ε₁, ε₂, ε₃ (and the end of the fit) as tag items, in figure units."""
+    # Everything between the first boundary and the end, however many that
+    # is: the early regime hands over fewer than three.
     items = [{"x": float(v) * scale, "text": f"{name} = {float(v):.1f} %",
               "bold": name, "kind": "boundary"}
-             for name, v in zip(EPS_NAMES, bounds[1:4])]
+             for name, v in zip(EPS_NAMES, bounds[1:-1])]
     if end_label:
         items.append({"x": float(bounds[-1]) * scale,
                       "text": f"end = {float(bounds[-1]):.1f} %", "kind": "end"})
@@ -7859,10 +7865,35 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
             ))
     x_lo = min(0.0, float(np.nanmin(x)) if x.size else 0.0) - 1.0
     x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
+    y_window = None
+    if piecewise_regime() == "early":
+        # Zoomed to the early regime: the whole squash in one frame leaves
+        # a fit over the first fifth of it as a smudge against the axis.
+        # The data are all still there, the view is simply narrower.
+        x_hi = max(PW_EARLY_VIEW_PCT, end * 1.15)
+        inside = x <= x_hi
+        if inside.any() and np.isfinite(y[inside]).any():
+            top_y = float(np.nanmax(y[inside]))
+            low_y = float(np.nanmin(y[inside]))
+            pad = max((top_y - low_y) * 0.08, abs(top_y) * 0.02, 1e-12)
+            # Plotly autoranges y over every point, not over the ones in
+            # view, so without this the curve sits flat on the axis.
+            y_window = [low_y - pad, top_y + pad]
     # The contact artefact is named once, above the plot, over its band.
     artefact = [{"x": float(b[0]), "text": "contact artefact [0, ε₁)",
                  "kind": "region"}]
-    tag_rows = add_boundary_lines(fig, b, x_span=x_hi - x_lo, x_max=x_hi,
+    marks = list(b)
+    if piecewise_regime() == "early":
+        # ε₂ and ε₃ belong to components held at zero here: they are parked
+        # under x_end and change nothing, so drawing them would invent two
+        # boundaries this fit does not have. With both components acting
+        # from first contact, ε₁ is parked too.
+        artefact = []
+        keep = [b[0], b[-1]]
+        if st.session_state.get("pw_early_join", "parallel") != "parallel":
+            keep = [b[0], b[1], b[-1]]
+        marks = keep
+    tag_rows = add_boundary_lines(fig, marks, x_span=x_hi - x_lo, x_max=x_hi,
                                   extra=artefact)
     if note:
         # Which fit this is, top left, under the regime names: the corner
@@ -7888,7 +7919,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 "traceorder": "normal"},
         xaxis={"title": "Relative deformation x (%)", "anchor": "y2",
                "range": [x_lo, x_hi]},
-        yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0]},
+        yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0],
+               **({"range": y_window} if y_window and not log_y else {})},
         yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
                 "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
                 "showgrid": False, "zeroline": False,
@@ -7948,7 +7980,20 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
                      "force, not the same accuracy in newtons"
                      if result.get("weighting") == "relative"
                      else "fitted with √F weighting")
-    if len(b) >= 5:
+    if piecewise_regime() == "early" and len(b) >= 5:
+        parallel = st.session_state.get("pw_early_join",
+                                        "parallel") == "parallel"
+        parts.append(
+            ("both components acting from first contact, fitted over "
+             f"[0, {b[4]:.1f}] %" if parallel else
+             f"the second component joining at ε₁ = {b[1]:.2f} %, fitted "
+             f"over [0, {b[4]:.1f}] %")
+            + ". The plot is zoomed to "
+            f"{max(PW_EARLY_VIEW_PCT, b[4] * 1.15):.0f} % so the early "
+            "regime fills the frame; the rest of the curve is still there, "
+            "outside the view and outside the fit"
+        )
+    elif len(b) >= 5:
         parts.append(
             f"boundaries ε₁ = {b[1]:.2f} %, ε₂ = {b[2]:.2f} %, "
             f"ε₃ = {b[3]:.2f} %, fitted to x_end = {b[4]:.1f} %"
@@ -8909,6 +8954,11 @@ def _pw_regime_changed():
     boundary that matters is a different boundary.
     """
     going = st.session_state.get("pw_regime", "full")
+    if st.session_state.get("_pw_regime_last") == going:
+        # Nothing actually changed. Running the swap again would save the
+        # regime it is already in over the one it came from.
+        return
+    st.session_state["_pw_regime_last"] = going
     here = [float(st.session_state.get(k, DEFAULTS[k]))
             for k in PW_BOUNDARY_KEYS]
     # The arrangement belongs to the regime it was chosen in: adopting a
@@ -8951,6 +9001,11 @@ def _pw_regime_changed():
     for key, value in zip(PW_BOUNDARY_KEYS, values):
         st.session_state[key] = round(float(value), 2)
     if going == "early":
+        # The early regime is its two components, so it arrives with both
+        # of them ticked. Untick one afterwards and it stays unticked, but
+        # switching in never lands on an empty board.
+        for name in PW_EARLY_COMPONENTS:
+            st.session_state[f"pw_use_{name}"] = True
         st.session_state["pw_eps_way"] = (
             "typed" if st.session_state.get("pw_early_join",
                                             "parallel") == "parallel"
@@ -9556,6 +9611,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_apply", False):
         apply_board()
     elif applied_state.get("curve") != curve_key:
+        # A new cell: the boundaries and arrangement kept for the OTHER
+        # regime belonged to the cell before it, and the early window in
+        # particular is a property of this curve. Forget them, so
+        # switching regimes on this cell reads this cell.
+        for _key in ("pw_early_eps", "pw_full_eps", "pw_early_arrangement",
+                     "pw_full_arrangement"):
+            st.session_state[_key] = None
         # A C2C12 arrives fitted the way a C2C12 is fitted: carried
         # forward, all four components, and boundaries already taken as far
         # as the target. The search starts inside the prior, so a curve the
