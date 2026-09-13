@@ -8,6 +8,7 @@ with the diagnostics needed to tell a real measurement from a bad window.
 
 from __future__ import annotations
 
+import copy
 import csv
 import importlib
 import importlib.util
@@ -176,7 +177,6 @@ component_force = getattr(_piecewise_module, "component_force", None)
 # the fit is asked to get right, the squash's own stiffening, and the
 # small-deformation reading kept beside the whole-curve one. Each is
 # optional, so an older engine loses that control and nothing else.
-small_strain_reading = getattr(_piecewise_module, "small_strain_reading", None)
 power_law_window = getattr(_piecewise_module, "power_law_window", None)
 confinement_from_profile = getattr(
     _piecewise_module, "confinement_from_profile", None)
@@ -840,6 +840,19 @@ DEFAULTS = {
     # the numbers on the board exactly as they are.
     "pw_eps_way": "found",
     "pw_target_r2": 0.999,
+    # What is being fitted: the four components over the whole squash, or
+    # the two Lulevich's model has over the early regime. One board, one
+    # plot, one set of options; this is the only thing that changes.
+    "pw_regime": "full",
+    # Each regime remembers its own boundaries, so switching back and
+    # forth does not lose where the other one was fitted to.
+    "pw_early_eps": None,
+    "pw_full_eps": None,
+    # In the early regime, whether the two components act together from
+    # first contact (Lulevich's own arrangement) or one joins at ε₁.
+    "pw_early_join": "parallel",
+    "pw_early_arrangement": None,
+    "pw_full_arrangement": None,
     # What the fit is asked to get right. A whole-cell squash spans three
     # or four decades of force, so plain least squares in newtons is very
     # nearly a fit to the last decade alone, and the components that only
@@ -852,17 +865,6 @@ DEFAULTS = {
     "pw_squeeze_way": "off",
     "pw_squeeze": 0.0,
     "pw_squeeze_note": None,
-    # The small-deformation reading, kept beside the whole-curve fit: the
-    # same laws acting from first contact over the stretch where the curve
-    # is still one power law. This is the number the literature reports.
-    "pw_small_strain": True,
-    # The early regime, tried every way round rather than assumed: which
-    # law acts from first contact and which joins later, over each of
-    # these windows, with and without the shell's bending term.
-    "pw_early_on": True,
-    "pw_early_windows": [20.0, 25.0, 30.0, 35.0],
-    "pw_early_step": 2.0,
-    "pw_early_bending": "compare",
     # The membrane thickness the bending term is read with. 4 nm is the
     # bilayer Lulevich uses; the term goes as h^2, so this is the setting
     # that decides whether it can be dropped.
@@ -5001,8 +5003,10 @@ PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_until", "pw_membrane_throughout", "pw_target_r2",
                    "pw_style", "pw_best_carry",
                    "pw_weighting", "pw_squeeze", "pw_squeeze_way",
-                   "pw_small_strain", "pw_early_on", "pw_early_step",
-                   "pw_early_bending", "pw_early_h_nm",
+                   "pw_regime",
+                   "pw_early_h_nm", "pw_early_eps", "pw_full_eps",
+                   "pw_early_join", "pw_early_arrangement",
+                   "pw_full_arrangement",
                    "pw_use_K_shell", "pw_use_K_cyto",
                    "pw_use_K_nucleus", "pw_use_K_core")
 _PW_SOURCE = [None]
@@ -5155,12 +5159,25 @@ ONSET_NAMES = ("at contact, ε = 0", "at ε₁", "at ε₂", "at ε₃")
 
 
 def component_order():
-    """The four components in the order they are met, validated."""
+    """
+    The four components in the order they are met, validated.
+
+    In the early regime the two that are not on the table are pushed to the
+    back, so that the components being fitted own the first stretches. The
+    engine is always handed four regimes; the ones at the back are held at
+    zero and simply continue what the ones in front are carrying.
+    """
     got = st.session_state.get("component_order") or []
     order = [t for t in got if t in COMPONENT_ORDER_DEFAULT]
     if len(set(order)) != len(COMPONENT_ORDER_DEFAULT):
-        return COMPONENT_ORDER_DEFAULT
-    return tuple(dict.fromkeys(order))
+        order = list(COMPONENT_ORDER_DEFAULT)
+    order = list(dict.fromkeys(order))
+    if piecewise_regime() == "early":
+        live = set(PW_EARLY_COMPONENTS)
+        front = [t for t in order if ORDER_COEFFICIENT.get(t) in live]
+        back = [t for t in order if ORDER_COEFFICIENT.get(t) not in live]
+        order = front + back
+    return tuple(order)
 
 
 def component_order_control():
@@ -5208,15 +5225,45 @@ def pw_regimes():
     with a free intercept, then one at each boundary. Nothing is met in
     pairs unless the order says so, because every position holds exactly
     one component.
+
+    The early regime is the exception, and it has to be. Lulevich's model
+    has the membrane and the cell interior BOTH acting from first contact,
+    in parallel, and a model with one component per stretch cannot say
+    that: the second one would have to wait for a boundary. So when the
+    board is fitting the early regime and "both from first contact" is
+    chosen, every active component goes into the FIRST regime together and
+    the rest are left empty. "One joins later" puts them in their own
+    stretches as usual, which is the arrangement a curve often prefers.
     """
     if not PW_REGIMES:
         return ()
     terms = {t.name: t for regime in PW_REGIMES for t in regime.terms}
+    order = [ORDER_COEFFICIENT[t] for t in component_order()
+             if t in ORDER_COEFFICIENT]
+    if any(name not in terms for name in order):
+        return PW_REGIMES
+    live = [name for name in order if name in set(active_component_names())]
+    if (piecewise_regime() == "early"
+            and st.session_state.get("pw_early_join", "parallel") == "parallel"
+            and len(live) > 1):
+        rest = [name for name in order if name not in live]
+        out = [_dataclasses.replace(
+            PW_REGIMES[0], terms=tuple(terms[n] for n in live),
+            free_offset=True, equation="",
+            title=" + ".join(PW_COMPONENT_TITLES.get(n, n) for n in live))]
+        for index, name in enumerate(rest, start=1):
+            out.append(_dataclasses.replace(
+                PW_REGIMES[index], terms=(terms[name],), free_offset=False,
+                title=PW_COMPONENT_TITLES.get(name, ""), equation=""))
+        while len(out) < len(PW_REGIMES):
+            # Keep four regimes so every boundary the board holds still has
+            # a stretch; the spare ones are empty and carry nothing.
+            out.append(_dataclasses.replace(
+                PW_REGIMES[len(out)], terms=(), free_offset=False,
+                title="", equation=""))
+        return tuple(out)
     out = []
-    for index, (regime, term) in enumerate(zip(PW_REGIMES, component_order())):
-        name = ORDER_COEFFICIENT[term]
-        if name not in terms:
-            return PW_REGIMES
+    for index, (regime, name) in enumerate(zip(PW_REGIMES, order)):
         out.append(_dataclasses.replace(
             regime, terms=(terms[name],), free_offset=(index == 0),
             title=PW_COMPONENT_TITLES.get(name, regime.title),
@@ -5438,13 +5485,29 @@ def repair_boundaries(values, top=None):
             f"{inner[1]:g}, {inner[2]:g} %")
     was_end = end
     if end <= inner[-1] + PW_MIN_GAP or end <= 0.0:
-        end = round(min(ceiling, 100.0), 1)
-        if end <= inner[-1] + PW_MIN_GAP:
-            end = round(inner[-1] + PW_MIN_GAP, 2)
-        said.append(
-            f"x_end was {was_end:g} %, not past ε₃ = {inner[-1]:g} %, so "
-            f"there was no last stretch to fit; the fit runs to {end:g} % "
-            "instead")
+        # Two ways to mend this, and which is right depends on which number
+        # is the deliberate one. If x_end still leaves room above the FIRST
+        # boundary it is the one that was meant -- reading to 20 % with
+        # boundaries left over from reading to 90 % -- so the later
+        # boundaries are brought down under it. Only when x_end is below
+        # even ε₁ is it the broken number, and then it is raised.
+        if end > inner[0] + PW_MIN_GAP:
+            room = (end - inner[0]) / 3.0
+            inner = [inner[0],
+                     round(min(inner[1], inner[0] + room), 2),
+                     round(min(inner[2], end - PW_MIN_GAP), 2)]
+            inner[1] = min(inner[1], inner[2] - PW_MIN_GAP)
+            said.append(
+                f"ε₂ and ε₃ were past x_end = {end:g} %, so they were "
+                f"brought inside it, to {inner[1]:g} % and {inner[2]:g} %")
+        else:
+            end = round(min(ceiling, 100.0), 1)
+            if end <= inner[-1] + PW_MIN_GAP:
+                end = round(inner[-1] + PW_MIN_GAP, 2)
+            said.append(
+                f"x_end was {was_end:g} %, not past ε₁ = {inner[0]:g} %, so "
+                f"there was no stretch to fit at all; the fit runs to "
+                f"{end:g} % instead")
     # Spread them: each at least PW_MIN_GAP above the one before, then, if
     # that pushed the last past x_end, compressed back down from the top.
     floor = PW_MIN_GAP
@@ -5532,6 +5595,60 @@ def modulus_display(symbol, value_pa, se_pa=None):
     return f"{text} {unit}"
 
 
+# ===================================================== what is being fitted ==
+#
+# One board, one plot, one set of options, and ONE thing that changes
+# between them: which components are on the table and how far the fit runs.
+#
+#   full    the four components over the whole squash. The default, and
+#           what every part of this page did before there was a choice.
+#   early   the two components Lulevich's model has over the early regime
+#           -- the membrane and the cell interior -- over the early window
+#           only. Everything else on the board behaves identically: the
+#           order they are met in, how they share the load, the regression
+#           conditions, the screen, the validation, the same plot.
+#
+# The two components the early regime is made of. The other two are held
+# at zero there, which has no effect on the fit beyond removing them: with
+# their terms clamped, the stretches they would own simply continue the
+# carried terms of the ones before.
+PW_EARLY_COMPONENTS = ("K_shell", "K_cyto")
+PW_REGIME_MODES = {
+    "full": "🔵 Full deformation · the four components, the whole squash",
+    "early": "🔬 Early deformation · two components (Lulevich eq 1 & 6)",
+}
+PW_REGIME_HELP = {
+    "full": "The membrane, the cytoskeleton, the nuclear envelope and the "
+            "inside of the nucleus, met one after another over the whole "
+            "squash. This is the default and it is what the four-regime "
+            "model is for.",
+    "early": "Only the two components Lulevich's model has over the early "
+             "regime — the membrane, stretching as ε³, and the cell "
+             "interior answering Hertz at ε^1.5 — fitted over the early "
+             "window alone. The number that compares with a paper is read "
+             "here, because a law that starts at first contact converts "
+             "into a modulus with nothing to undo.",
+}
+
+
+def piecewise_regime():
+    """Which of the two the board is fitting: "full" or "early"."""
+    value = _pw_get("pw_regime", DEFAULTS.get("pw_regime", "full"))
+    return value if value in PW_REGIME_MODES else "full"
+
+
+def active_components():
+    """The components this regime puts on the table, in the board's order."""
+    if piecewise_regime() == "early":
+        return tuple(c for c in PW_COMPONENTS if c[0] in PW_EARLY_COMPONENTS)
+    return PW_COMPONENTS
+
+
+def active_component_names():
+    """Just their coefficient names."""
+    return tuple(c[0] for c in active_components())
+
+
 PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
 # What a regime is called when it is that component's own stretch.
 PW_COMPONENT_TITLES = {c[0]: c[1].split(" ", 1)[1] for c in PW_COMPONENTS}
@@ -5576,8 +5693,10 @@ def piecewise_off():
     offer it, so it is held at zero on every fit, every search and every
     plot, and the first stretch is the constant C₀ and nothing else.
     """
+    live = set(active_component_names())
     return ("k_align",) + tuple(
-        name for name in PW_SWITCHABLE if not _pw_get(f"pw_use_{name}", True))
+        name for name in PW_SWITCHABLE
+        if name not in live or not _pw_get(f"pw_use_{name}", True))
 
 
 def piecewise_until():
@@ -5990,7 +6109,7 @@ def arrangement_space(on, every=None):
     past its own stretch.
     """
     import itertools
-    every = list(every or [name for name, *_r in PW_COMPONENTS])
+    every = list(every or [name for name, *_r in active_components()])
     rest = tuple(n for n in every if n not in on)
     for order in itertools.permutations(tuple(on)):
         for mask in range(1 << len(order)):
@@ -6007,8 +6126,9 @@ def arrangement_count(size):
 def fit_one_arrangement(epsilon, force_N, bounds, on, order, carry,
                         every=None):
     """One arrangement, fitted exactly as the page would fit it."""
-    every = list(every or [name for name, *_r in PW_COMPONENTS])
-    off = ("k_align",) + tuple(n for n in every if n not in on)
+    every = list(every or [name for name, *_r in active_components()])
+    off = (("k_align",) + tuple(n for n in every if n not in on)
+           + tuple(n for n, *_x in PW_COMPONENTS if n not in every))
     settings = effective_piecewise_settings(
         piecewise_settings(), piecewise_until(), off)
     return fit_piecewise(epsilon, force_N, boundaries_pct=bounds,
@@ -6030,7 +6150,7 @@ def screen_components(model, epsilon, force_N, sizes=None,
     import time
     started = time.time()
     bounds = piecewise_boundaries()
-    every = [name for name, *_rest in PW_COMPONENTS]
+    every = [name for name, *_rest in active_components()]
     geometry = piecewise_geometry(model) if model is not None else None
     names = components_for(st.session_state.get("cell_type"))
     label_of = {coefficient: names[term][0]
@@ -6287,6 +6407,14 @@ def piecewise_bands():
     )
     span = piecewise_span()
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
+    if piecewise_regime() == "early":
+        # Two components, so there is ONE boundary to place: where the
+        # second joins. ε₂ and ε₃ belong to components held at zero, so
+        # they change nothing; they are pinned just under x_end so the
+        # search spends no time on them and the board need not show them.
+        top = max(end - 1.0, 3.0)
+        return ((1.0, max(end - 4.0, 2.0)),
+                (top - 1.0, top - 1.0), (top, top))
     b3 = (b2[0] + span[0], max(b2[0] + span[0], min(b2[1] + span[1], end - 2.0)))
     return (b1, b2, b3)
 
@@ -6297,6 +6425,10 @@ def constraint_notes(bounds):
     s_lo, s_hi = piecewise_span()
     e1, e2, e3 = (float(v) for v in bounds[1:4])
     notes = []
+    if piecewise_regime() == "early":
+        # Only ε₁ exists here, and the prior's contact band is about the
+        # whole squash, not about this window.
+        return notes
     if not l1 - 1e-6 <= e1 <= h1 + 1e-6:
         notes.append(f"ε₁ = {e1:.1f} % is outside the contact zone "
                      f"({l1:g}–{h1:g} %)")
@@ -6633,626 +6765,134 @@ PW_ELEMENT_COLOUR = {"membrane": "#d62728", "cytoskeleton": "#ff7f0e",
                      "bending": "#7f7f7f"}
 
 
-def small_strain_curve(reading, x_pct):
-    """
-    A small-deformation reading evaluated anywhere: (total, {law: F}).
-
-    F(e) = C0 + sum_j E_j [ A_j (e - s_j)^p_j + A_bend,j (e - s_j) ] (1-e)^-q
-
-    which covers both shapes the page fits: every law from first contact
-    (s_j = 0), and an arrangement where one of them joins later. A_bend is
-    zero unless the shell's bending term is tied to its stretching one, in
-    which case the two share a modulus and are one curve.
-    """
-    if not reading:
-        return None, {}
-    e = np.clip(np.asarray(x_pct, dtype=float), 0.0, None) / 100.0
-    q = float(reading.get("squeeze") or 0.0)
-    room = (np.clip(1.0 - e, 0.02, None) ** (-q)) if q else 1.0
-    total = np.full(e.shape, float(reading.get("offset_N", 0.0)))
-    parts = {}
-    for name, row in (reading.get("moduli") or {}).items():
-        onset = float(row.get("onset_pct", 0.0)) / 100.0
-        shifted = np.clip(e - onset, 0.0, None)
-        prefactor = float(row.get("prefactor", row.get("A", 0.0)))
-        piece = prefactor * shifted ** float(row["power"])
-        tied = float(row.get("tied_bending_A", 0.0))
-        if tied:
-            # Lulevich eq 1: the same membrane, the same modulus, bending
-            # as e^(1/2) beside its own stretching as e^3.
-            piece = piece + tied * shifted ** float(
-                row.get("tied_bending_power", 0.5))
-        piece = float(row["E_Pa"]) * piece * room
-        parts[name] = piece
-        total = total + piece
-    return total, parts
-
-
-def small_strain_figure(epsilon, force_N, reading, style, past=1.4):
-    """
-    The small-deformation reading, zoomed to the stretch it was read over.
-
-    Its own plot, not a layer on the main one. The two fits answer
-    different questions over different stretches, and drawing the second
-    across the whole squash makes it look like a failed version of the
-    first instead of a measurement of its own.
-
-    The top panel is the reading over [0, window], solid, with the data
-    behind it and each of its laws dashed, in the colours those components
-    have everywhere else, so the split between stretching (ε³) and bending
-    (ε^1.5) can be seen rather than inferred. It is carried ``past`` times
-    the window as a dotted line, because where it leaves the data is what
-    says how far a small-deformation description reaches. The bottom panel
-    is the residual as a percentage of the force, which is where that
-    departure is actually legible.
-    """
-    window = float(reading.get("window_pct", 20.0))
-    x = np.asarray(epsilon, dtype=float) * 100.0
-    top = float(min(window * float(past),
-                    float(np.nanmax(x)) if x.size else window))
-    top = max(top, window * 1.02)
-    inside = (x >= 0.0) & (x <= top)
-    xs = x[inside]
-    raw = np.asarray(force_N, dtype=float)[inside]
-    y, unit = from_newtons(raw, style.force_unit)
-    scale = float(from_newtons(np.array([1.0]), style.force_unit)[0][0])
-
-    grid_in = np.linspace(0.0, window, 240)
-    grid_out = np.linspace(window, top, 160)
-    total_in, parts_in = small_strain_curve(reading, grid_in)
-    total_out, _out = small_strain_curve(reading, grid_out)
-
-    fig = go.Figure()
-    fig.add_vrect(x0=0.0, x1=window, fillcolor=SMALL_FILL, line_width=0,
-                  layer="below", annotation_text="read over this stretch",
-                  annotation_position="top left", annotation_font_size=11,
-                  annotation_font_color=SMALL_COLOUR, annotation_xshift=4)
-    fig.add_trace(go.Scatter(
-        x=xs, y=y, mode="markers", name="Experimental data",
-        marker={"color": style.data_color,
-                "size": max(3, int(style.marker_size * 0.6))},
-    ))
-    for element, piece in parts_in.items():
-        row = (reading.get("moduli") or {}).get(element) or {}
-        symbol = {"membrane": "E_shell", "cytoskeleton": "E_cyto",
-                  "stretch": "E_shell", "hertz": "E_cyto",
-                  "bending": "E_bend"}.get(element, element)
-        unit_e, scale_e = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
-        onset = float(row.get("onset_pct", 0.0))
-        fig.add_trace(go.Scatter(
-            x=grid_in, y=piece * scale, mode="lines",
-            name=(f"{DISPLAY_SYMBOL.get(symbol, symbol)} · "
-                  f"ε^{row.get('power', 1.5):g} · "
-                  f"{float(row.get('E_Pa', 0.0)) / scale_e:.4g} {unit_e}"
-                  + (" from contact" if onset <= 0
-                     else f" from {onset:g} %")),
-            line={"color": PW_ELEMENT_COLOUR.get(
-                element, PW_ELEMENT_COLOUR.get(
-                    (row or {}).get("element", ""), SMALL_COLOUR)),
-                  "width": 1.8, "dash": "dash"},
-            hovertemplate=("x = %{x:.1f} %<br>"
-                           f"F = %{{y:.4g}} {unit}<extra></extra>"),
-        ))
-    fig.add_trace(go.Scatter(
-        x=grid_in, y=total_in * scale, mode="lines",
-        name=f"The reading · [0, {window:.1f}] %",
-        line={"color": SMALL_COLOUR, "width": 2.8},
-        hovertemplate=("x = %{x:.1f} %<br>"
-                       f"F = %{{y:.4g}} {unit}<extra></extra>"),
-    ))
-    if top > window + 1e-6:
-        fig.add_trace(go.Scatter(
-            x=grid_out, y=total_out * scale, mode="lines",
-            name="carried past the stretch it was read over",
-            line={"color": SMALL_COLOUR, "width": 1.4, "dash": "dot"},
-            hovertemplate=("past the window it was read over<br>"
-                           "x = %{x:.1f} %<br>"
-                           f"F = %{{y:.4g}} {unit}<extra></extra>"),
-        ))
-
-    # The residual, as a percentage of the force there: the panel that says
-    # where the description stops describing. The first fraction of a per
-    # cent is left out, where the force is too small to be a fraction of.
-    fitted, _parts = small_strain_curve(reading, xs)
-    size = np.abs(raw)
-    floor = float(np.max(size)) * 0.02 if size.size and np.max(size) > 0 else 1.0
-    share = 100.0 * (raw - fitted) / np.clip(size, floor, None)
-    keep = size >= floor
-    fig.add_trace(go.Scatter(
-        x=xs[keep], y=share[keep], mode="lines", yaxis="y2",
-        showlegend=False, line={"color": SMALL_COLOUR, "width": 1.2},
-        hovertemplate="x = %{x:.1f} %<br>off by %{y:.2f} %<extra></extra>",
-    ))
-    # The zero line of the residual strip, drawn as a trace on that axis
-    # rather than a shape, so it cannot land on the force panel instead.
-    fig.add_trace(go.Scatter(
-        x=[float(xs.min()) if xs.size else 0.0, top], y=[0.0, 0.0],
-        mode="lines", yaxis="y2", showlegend=False, hoverinfo="skip",
-        line={"color": "#999999", "width": 1},
-    ))
-    fig.add_vline(x=window, line={"color": SMALL_COLOUR, "width": 1.5,
-                                  "dash": "dash"})
-    n_rows = legend_rows([t.name for t in fig.data if getattr(t, "name", None)])
-    title_font = bold_font(16)
-    tick_font = bold_font(14)
-    fig.update_layout(
-        height=int(style.height * 1.05) + 22 * n_rows,
-        template="simple_white",
-        margin={"l": 96, "r": 24, "t": 30, "b": 82 + 24 * n_rows},
-        legend={"orientation": "h", "yref": "container", "yanchor": "bottom",
-                "y": 0.005, "xanchor": "left", "x": 0.0, "font": {"size": 12},
-                "traceorder": "normal"},
-        xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
-                         "font": title_font},
-               "anchor": "y2", "range": [-0.02 * top, top * 1.02],
-               "tickfont": tick_font, "ticks": "outside", "ticklen": 6,
-               "tickwidth": 2, "linewidth": 2,
-               "exponentformat": "none", "showexponent": "none"},
-        yaxis={"title": {"text": f"<b>Force ({unit})</b>", "font": title_font},
-               "domain": [0.34, 1.0], "tickfont": tick_font,
-               "ticks": "outside", "ticklen": 6, "tickwidth": 2,
-               "linewidth": 2, **PLAIN_TICKS},
-        yaxis2={"domain": [0.0, 0.26], "anchor": "x", "zeroline": False,
-                "title": {"text": "<b>off by (%)</b>", "font": bold_font(14)},
-                "tickfont": tick_font, "ticks": "outside", "ticklen": 6,
-                "tickwidth": 2, "linewidth": 2,
-                "exponentformat": "none", "showexponent": "none"},
-    )
-    return fig
-
-
-# ========================================================= early deformation ==
-#
-# Lulevich, Zink, Chen, Liu & Liu, Langmuir 2006, 22, 8151-8155, which is
-# where this whole model comes from. Over the first third of a squash a
-# living cell is a balloon of incompressible fluid, and there are exactly
-# TWO components in it:
-#
-#   the MEMBRANE, which both stretches and bends (their eq 1)
-#
-#       F_m = 2*pi*E_m/(1-nu_m) * h*R0 * e^3   +   pi*E_m/(2*sqrt2) * h^2 * e^(1/2)
-#             \______ stretching ______/            \______ bending ______/
-#
-#   the CYTOSKELETON / cell interior, Hertzian (their eq 6)
-#
-#       F_i = sqrt2 * E_i / (3(1-nu_i^2)) * R0^2 * e^(3/2)
-#
-# and their eq 2 says when the bending half may be dropped:
-#
-#       F_bending / F_stretching  ~  (h/R0) * e^(-5/2)
-#
-# which DIVERGES as e -> 0. So bending is never negligible near contact; it
-# is negligible above a deformation, and the paper drops it over e = 0.1 to
-# 0.3 because with h = 4 nm and R0 = 5 um the ratio is under 0.05 there.
-# With the numerical factor kept, (1-nu)/(4 sqrt2) * (h/R0) * e^(-5/2), the
-# two terms are equal at about 2 % and bending is under a twentieth of
-# stretching by about 7 %. A reading that starts at first contact therefore
-# cannot inherit the approximation: it is fitted both ways here.
-#
-# The paper's own results, for comparison: E_m = 10 to 35 MPa for living
-# cell membranes, K_m = 17 to 52 kT, and E_i = 4 to 7.5 kPa for the cell
-# interior of dead cells fitted with eq 6 below 30 % deformation, which it
-# calls "in good agreement with the cytoskeleton or cell nuclei (1-10 kPa)".
-
-EARLY_LAW_NAME = {"stretch": "🟥 Membrane", "hertz": "🟧 Cytoskeleton",
-                  "bending": "⬜ Membrane bending"}
-EARLY_LAW_LAW = {"stretch": r"$2\pi\frac{E_m}{1-\nu_m}hR_0\,\varepsilon^{3}$",
-                 "hertz": r"$\frac{\sqrt{2}E_i}{3(1-\nu_i^2)}R_0^2\,"
-                          r"\varepsilon^{3/2}$",
-                 "bending": r"$\frac{\pi E_m}{2\sqrt{2}}h^2\,"
-                            r"\varepsilon^{1/2}$"}
-EARLY_LAW_SYMBOL = {"stretch": "E_shell", "hertz": "E_cyto",
-                    "bending": "E_shell"}
-EARLY_BENDING_WAYS = {
-    "compare": "Both, and compare — Lulevich eq 1 against eq 3",
-    "off": "Dropped — stretching only (their eq 3)",
-    "tied": "Kept — stretching + bending, one modulus (their eq 1)",
-}
-
-
-def early_signature(epsilon, force_N):
-    """What the early search depends on."""
-    data = st.session_state.get("data") or {}
-    return repr((
-        data.get("source"), int(np.size(epsilon)),
-        round(float(force_N[-1]), 15) if np.size(force_N) else 0.0,
-        round(float(st.session_state.get("cell_height_um", 0.0) or 0.0), 6),
-        tuple(sorted(float(v) for v in
-                     (st.session_state.get("pw_early_windows") or ()))),
-        round(float(st.session_state.get("pw_early_step", 2.0)), 3),
-        st.session_state.get("pw_early_bending", "compare"),
-        round(float(st.session_state.get("pw_early_h_nm", 4.0)), 4),
-        piecewise_weighting(), round(piecewise_squeeze(), 3),
-    ))
-
-
 def early_thickness_m():
-    """The membrane thickness the early regime is read with, in metres."""
+    """The membrane thickness the bending check is read with, in metres."""
     try:
         return max(float(st.session_state.get("pw_early_h_nm", 4.0)), 0.1) * 1e-9
     except (TypeError, ValueError):
         return 4e-9
 
 
-def early_search_now(model, epsilon, force_N):
-    """The early-regime search for this cell, cached on its settings."""
-    if early_regime_search is None or model is None:
-        return None
-    signature = early_signature(epsilon, force_N)
-    stored = st.session_state.get("pw_early") or {}
-    if stored.get("signature") == signature:
-        return stored
-    windows = tuple(sorted(float(v) for v in
-                           (st.session_state.get("pw_early_windows")
-                            or EARLY_WINDOWS_PCT)))
-    how = st.session_state.get("pw_early_bending", "compare")
-    bending = ("off", "tied") if how == "compare" else (how,)
-    try:
-        found = early_regime_search(
-            epsilon, force_N, piecewise_geometry(model),
-            windows_pct=windows,
-            onset_step=float(st.session_state.get("pw_early_step", 2.0)),
-            bending=bending, squeeze=piecewise_squeeze(),
-            weighting=piecewise_weighting(), thickness=early_thickness_m())
-    except Exception:  # pragma: no cover - a curve it cannot read
-        return None
-    if not found:
-        return None
-    found["signature"] = signature
-    st.session_state["pw_early"] = found
-    return found
+def lulevich_panel(result, model, fit=None):
+    """
+    The early regime against its source, from the board's own fit.
 
-
-def early_row_label(row, short=False):
-    """One arrangement, in words."""
-    parts = []
-    for law, onset in row.get("plan", ()):
-        name = EARLY_LAW_NAME.get(law, law)
-        if short:
-            name = name.split(" ", 1)[-1]
-        parts.append(f"{name} from contact" if onset <= 0
-                     else f"{name} joins at {onset:g} %")
-    return " → ".join(parts)
-
-
-def early_components_row(best, geometry, whole_curve=None):
-    """The two components of the early regime, side by side."""
-    cell_type = st.session_state.get("cell_type")
-    laws = [(law, row) for law, row in (best.get("moduli") or {}).items()]
-    columns = st.columns(max(len(laws), 1))
-    for column, (law, row) in zip(columns, laws):
-        symbol = EARLY_LAW_SYMBOL.get(law, law)
-        unit, scale = DISPLAY_UNIT.get(symbol, ("kPa", 1e3))
-        with column:
-            st.markdown(f"**{EARLY_LAW_NAME.get(law, law)}** · "
-                        + EARLY_LAW_LAW.get(law, ""))
-            st.metric(DISPLAY_SYMBOL.get(symbol, symbol),
-                      modulus_display(symbol, row["E_Pa"], row["E_se_Pa"]))
-            st.caption(
-                f"95 %: {row['E_lo_Pa'] / scale:.4g} to "
-                f"{row['E_hi_Pa'] / scale:.4g} {unit} · acts from "
-                + ("first contact" if row["onset_pct"] <= 0
-                   else f"{row['onset_pct']:.0f} %")
-                + (", with its bending term"
-                   if row.get("tied_bending_A") else ""))
-            if law == "stretch" and bending_constant is not None:
-                k = bending_constant(row["E_Pa"], geometry, early_thickness_m())
-                inside = 17.0 <= k["K_kT"] <= 52.0
-                st.caption(
-                    ("✅ " if inside else "⚠️ ")
-                    + f"bending constant K_m = {k['K_kT']:.0f} kT "
-                    + ("inside" if inside else "outside")
-                    + " the 17–52 kT Lulevich reports for living cell "
-                      "membranes (their eq 4, at h = "
-                    + f"{early_thickness_m() * 1e9:.0f} nm)")
-            if row["at_bound"] or float(row["E_Pa"]) <= 0:
-                st.caption("⚠️ measured as zero here: over this stretch the "
-                           "two shapes are close enough that the fit can put "
-                           "everything in the other one.")
-            factor = float(row.get("onset_factor", 1.0))
-            if factor > 1.5:
-                st.caption(
-                    f"⚠️ this law starts at {row['onset_pct']:.0f} %, not at "
-                    f"contact, so reading it as a modulus of the whole "
-                    f"deformation overstates it by about **{factor:.0f}×**.")
-            verdict = modulus_in_range(symbol, row["E_Pa"], cell_type)
-            if verdict is not None:
-                lit = (literature_for(cell_type).get("moduli")
-                       or {}).get(symbol)
-                st.caption(("✅ inside" if verdict else "⚠️ outside")
-                           + f" the {lit[0] / scale:g}–{lit[1] / scale:g} "
-                           f"{unit} reported for this cell type")
-            was = (whole_curve or {}).get(symbol)
-            if was is not None and np.isfinite(float(was)) and row["E_Pa"]:
-                times = float(was) / float(row["E_Pa"])
-                if np.isfinite(times) and times > 0:
-                    st.caption(f"The whole-curve fit puts it at "
-                               f"{modulus_display(symbol, was)} — "
-                               f"{times:.3g}× this one.")
-
-
-def early_equations(best, geometry, window):
-    """Lulevich's equations, with this cell's numbers in them."""
+    Not a second fit and not a second plot: the numbers here are the ones
+    the board just produced, checked against the paper the model comes
+    from. Shown only when the board is fitting the early regime, because
+    that is the only place these equations apply.
+    """
+    if not (result and result.get("success")) or bending_crossover is None:
+        return
+    geometry = piecewise_geometry(model)
+    moduli = result.get("moduli") or {}
+    ranges = result.get("ranges") or {}
     h = early_thickness_m()
     R0 = float(geometry.cell_radius)
     nu_m, nu_i = float(geometry.nu_membrane), float(geometry.nu_interior)
-    st.markdown("**The equations** — Lulevich et al., *Langmuir* **2006**, "
-                "22, 8151–8155")
-    st.caption("Two components over the early regime, and nothing else: a "
-               "membrane that stretches and bends, and the cell interior "
-               "answering Hertz.")
-    st.latex(r"\textbf{(1)}\quad F_m \;=\; \underbrace{2\pi\frac{E_m}"
-             r"{1-\nu_m}\,h R_0\,\varepsilon^{3}}_{\text{stretching}}"
-             r"\;+\;\underbrace{\frac{\pi E_m}{2\sqrt{2}}\,h^{2}\,"
-             r"\varepsilon^{1/2}}_{\text{bending}}")
-    st.latex(r"\textbf{(6)}\quad F_i \;=\; \frac{\sqrt{2}\,E_i}"
-             r"{3\,(1-\nu_i^{2})}\,R_0^{2}\,\varepsilon^{3/2}")
-    crossing = (bending_crossover(geometry, h)
-                if bending_crossover is not None else {})
-    st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}} \;=\; "
-             r"\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
-             r"\varepsilon^{-5/2}")
-    if crossing:
-        st.caption(
-            f"For this cell — h = {h * 1e9:.0f} nm, R₀ = {R0 * 1e6:.2f} µm, "
-            f"ν_m = {nu_m:g} — the two terms are **equal at "
-            f"x = {crossing['equal_pct']:.2f} %**, and bending falls below a "
-            f"twentieth of stretching at **x = "
-            f"{crossing['negligible_pct']:.2f} %**. At 10 % it is "
-            f"{crossing['ratio_at'](10.0):.3f} of the stretching term; at "
-            f"{window:.0f} % it is {crossing['ratio_at'](window):.4f}. The "
-            "paper drops it over ε = 0.1–0.3 for exactly this reason (their "
-            "eq 3), but the ratio diverges as ε → 0, so a reading that "
-            "starts at first contact cannot simply inherit that."
-        )
-    st.latex(r"\textbf{(4)}\quad K_m \;=\; \frac{E_m h^{3}}"
-             r"{12\,(1-\nu_m^{2})}")
-    # And the fit as it was actually made.
-    pieces = [r"C_0"]
-    for law, row in (best.get("moduli") or {}).items():
-        s = float(row.get("onset_pct", 0.0)) / 100.0
-        shift = (r"\varepsilon" if s <= 0
-                 else rf"\langle\varepsilon - {s:.2f}\rangle")
-        body = rf"A_{{{law[0]}}}\,{shift}^{{{row['power']:g}}}"
-        if row.get("tied_bending_A"):
-            body += rf" + A_b\,{shift}^{{1/2}}"
-        pieces.append(rf"E_{{{law[0]}}}\big[{body}\big]")
-    st.latex(r"\hat F(\varepsilon) = " + r" + ".join(pieces)
-             + (r"\,(1-\varepsilon)^{-q}" if piecewise_squeeze() else "")
-             + rf",\qquad 0 \le \varepsilon \le {window / 100.0:.2f}")
-    st.caption(
-        "A law acting from first contact has its coefficient **equal** to "
-        "E·A and converts with nothing to undo. One that joins at s does "
-        "not, and the factor is shown beside it above: that is the single "
-        "biggest reason a modulus read off a late-starting component comes "
-        "out too large."
-    )
+    end = float(result["boundaries_pct"][-1])
+    crossing = bending_crossover(geometry, h)
 
-
-def early_deformation_section(model, epsilon, force_N, whole_curve=None):
-    """
-    Early deformation: the two components, the graph and the equations.
-
-    A reading of its own, independent of the four-regime fit above and
-    changing nothing about it. Over the early regime Lulevich's model has
-    exactly two components, so exactly two are fitted here; what is NOT
-    assumed is how far out to read, which of them acts from first contact,
-    and whether the membrane's bending term belongs. Every arrangement is
-    fitted over every window and ranked, and the bending question is
-    settled by fitting the same points with it and without.
-    """
-    if early_regime_search is None:
-        return
-    st.divider()
     box = st.container(border=True)
     with box:
-        st.markdown("## 🔬 Early deformation — fitted on its own")
+        st.markdown("#### 📄 Against Lulevich — the model this comes from")
         st.caption(
-            "**A separate fit, over the early part of this curve only.** It "
-            "does not use the four-regime fit above and it changes nothing "
-            "about it. Lulevich et al., *Langmuir* 2006: over the first "
-            "third of a squash a living cell is a balloon of incompressible "
-            "fluid with **two components** — a membrane that stretches (ε³) "
-            "and bends (ε^½), and the cell interior answering Hertz "
-            "(ε^1.5). Those two are fitted here and nothing else, and this "
-            "is where the number that compares with a paper is read."
+            "Lulevich, Zink, Chen, Liu & Liu, *Langmuir* **2006**, 22, "
+            "8151–8155. Over the early regime a living cell is a balloon of "
+            "incompressible fluid with two components, and these are their "
+            "equations with **this fit's** numbers in them. Nothing here "
+            "refits anything."
         )
-        toggle, go = st.columns([2.4, 1])
-        with toggle:
-            # Drawn before the button, so the button can be disabled from
-            # it without ever writing a widget key that already exists.
-            on = st.checkbox("Fit and show this section",
-                             key="pw_small_strain")
-        with go:
-            refit = st.button("▶ Fit the early regime", type="primary",
-                              key="pw_early_go", disabled=not on, **STRETCH,
-                              help="Fits the two components over each "
-                                   "window below, every way round, and "
-                                   "keeps the best. Nothing above changes.")
-        if not on:
-            st.caption("Switched off. Tick the box to fit the early regime "
-                       "on its own.")
-            return
-        if refit:
-            st.session_state.pop("pw_early", None)
+        st.latex(r"\textbf{(1)}\quad F_m \;=\; \underbrace{2\pi\frac{E_m}"
+                 r"{1-\nu_m}\,h R_0\,\varepsilon^{3}}_{\text{stretching}}"
+                 r"\;+\;\underbrace{\frac{\pi E_m}{2\sqrt{2}}\,h^{2}\,"
+                 r"\varepsilon^{1/2}}_{\text{bending}}"
+                 r"\qquad\textbf{(6)}\quad F_i \;=\; \frac{\sqrt{2}\,E_i}"
+                 r"{3(1-\nu_i^{2})}\,R_0^{2}\,\varepsilon^{3/2}")
+        st.caption(
+            f"Fitted here with h = {h * 1e9:.0f} nm, R₀ = {R0 * 1e6:.2f} µm, "
+            f"ν_m = {nu_m:g}, ν_i = {nu_i:g}, over x = 0 to {end:.1f} % on "
+            f"{int(result.get('n_points', 0)):,} points. Their eq 3 is eq 1 "
+            "with the bending half dropped, which is what this board fits."
+        )
 
-        c1, c2, c3, c4 = st.columns([1.5, 0.9, 1.5, 0.9], gap="medium")
-        with c1:
-            st.multiselect("Windows to try (%)",
-                           [15.0, 20.0, 25.0, 30.0, 35.0, 40.0],
-                           key="pw_early_windows",
-                           help="Each window is its own ranking: AICc only "
-                                "compares fits of the same points.")
-        with c2:
-            st.number_input("joining step (%)", 1.0, 5.0, step=0.5,
-                            format="%.1f", key="pw_early_step",
-                            help="How finely the point where the second "
-                                 "component joins is scanned.")
+        left, right = st.columns(2)
+        with left:
+            row = moduli.get("K_shell") or {}
+            E = float(row.get("E_Pa", float("nan")))
+            st.metric("🟥 Membrane  Eₘ  (their eq 3)",
+                      modulus_display("E_shell", E, row.get("E_se_Pa")))
+            if np.isfinite(E) and bending_constant is not None:
+                k = bending_constant(E, geometry, h)
+                inside_E = 10.0e6 <= E <= 35.0e6
+                inside_K = 17.0 <= k["K_kT"] <= 52.0
+                st.caption(("✅ " if inside_E else "⚠️ ")
+                           + ("inside" if inside_E else "outside")
+                           + " the **10–35 MPa** they report for living cell "
+                             "membranes")
+                st.caption(("✅ " if inside_K else "⚠️ ")
+                           + f"bending constant K_m = {k['K_kT']:.0f} kT "
+                           + ("inside" if inside_K else "outside")
+                           + " their **17–52 kT** (their eq 4, "
+                             f"K_m = E_m h³/12(1−ν_m²))")
+        with right:
+            row = moduli.get("K_cyto") or {}
+            E = float(row.get("E_Pa", float("nan")))
+            st.metric("🟧 Cell interior  E_i  (their eq 6)",
+                      modulus_display("E_cyto", E, row.get("E_se_Pa")))
+            if np.isfinite(E):
+                inside = 1.0e3 <= E <= 10.0e3
+                st.caption(("✅ " if inside else "⚠️ ")
+                           + ("inside" if inside else "outside")
+                           + " the **1–10 kPa** they quote for the "
+                             "cytoskeleton or cell nuclei (they fit "
+                             "**4–7.5 kPa** on dead cells with eq 6 below "
+                             "30 % deformation)")
+
+        # Where each law starts, and what that costs the conversion.
+        rough = []
+        for name in active_component_names():
+            start, _u = ranges.get(name, (0.0, end))
+            if float(start) <= 0.01:
+                continue
+            power = 3.0 if name == "K_shell" else 1.5
+            mid = 0.5 * (float(start) + end) / 100.0
+            factor = (mid / max(mid - float(start) / 100.0, 1e-9)) ** power
+            symbol = "Eₘ" if name == "K_shell" else "Ec"
+            rough.append(f"{symbol} starts at {float(start):.1f} %, so "
+                         f"reading it as a modulus of the whole deformation "
+                         f"overstates it by about **{factor:.0f}×**")
+        if rough:
+            st.warning(" · ".join(rough) + ". Only a law acting from first "
+                       "contact converts with nothing to undo — move ε₁ to "
+                       "0 in **B** to read it that way.", icon="⚠️")
+
+        st.markdown("**Can the membrane's bending term be dropped here?**")
+        c1, c2, c3 = st.columns([1, 1, 1.6])
+        c1.metric("bending = stretching at", f"{crossing['equal_pct']:.2f} %")
+        c2.metric("bending < 5 % of it by",
+                  f"{crossing['negligible_pct']:.2f} %")
         with c3:
-            st.selectbox("The membrane's bending term (their eq 1 vs eq 3)",
-                         list(EARLY_BENDING_WAYS),
-                         format_func=EARLY_BENDING_WAYS.get,
-                         key="pw_early_bending")
-        with c4:
-            st.number_input("h (nm)", 0.5, 1000.0, step=1.0, format="%.1f",
-                            key="pw_early_h_nm",
-                            help="Membrane thickness. 4 nm is the bilayer "
-                                 "Lulevich uses; a cortex is 100–500 nm. "
-                                 "The bending term goes as h², so this is "
-                                 "what decides whether it can be dropped.")
-
-        search = early_search_now(model, epsilon, force_N)
-        if not search:
-            st.warning("The early regime could not be fitted on this curve.",
-                       icon="⚠️")
-            return
-        best = dict(search["best"])
-        window = float(search["chosen_window_pct"])
-        best["window_pct"] = window
-        geometry = piecewise_geometry(model)
-
-        st.success(
-            f"**Fitted on {best['n_points']:,} points, x = 0 to "
-            f"{window:.0f} % only.** Nothing above {window:.0f} % entered "
-            f"this fit.", icon="✅")
-        st.markdown(
-            f"**{early_row_label(best)}**, over **0 to {window:.0f} %**, is "
-            f"the best-supported arrangement (R² = {best['r_squared']:.5f}, "
-            f"Akaike weight {best['weight']:.0%} within that window, "
-            f"{best['bending_note']})."
-            + ("" if search.get("clean") else
-               " ⚠️ No window was free of systematic lack of fit, so the one "
-               "that misses the curve least is reported.")
-        )
-
-        st.markdown("**The two components**")
-        early_components_row(best, geometry, whole_curve)
-
-        st.markdown("**The graph**")
-        st.plotly_chart(
-            small_strain_figure(epsilon, force_N, best, current_style(force_N)),
-            key="pw_small_curve", **STRETCH,
-        )
+            st.number_input("membrane thickness h (nm)", 0.5, 1000.0,
+                            step=1.0, format="%.1f", key="pw_early_h_nm",
+                            help="4 nm is the bilayer Lulevich uses; a "
+                                 "cortex is 100–500 nm. The bending term "
+                                 "goes as h², so this is what decides it.")
+        st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}}"
+                 r"\;=\;\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
+                 r"\varepsilon^{-5/2}")
         st.caption(
-            "The data over the first "
-            f"{min(window * 1.4, 100.0):.0f} % only, the arrangement above in "
-            f"green over the [0, {window:.0f}] % it was fitted on, and each "
-            "component dashed in its own colour from the point it joins. "
-            "Past the shaded stretch the same fit is carried on dotted: it "
-            "was not fitted there, and how quickly it leaves the data is how "
-            "far a small-deformation description of this cell reaches. The "
-            "strip underneath is how far off it is, as a percentage of the "
-            "force at that point."
+            f"For this cell the ratio is {crossing['ratio_at'](10.0):.3f} at "
+            f"x = 10 % and {crossing['ratio_at'](end):.4f} at x = {end:.0f} %. "
+            "Lulevich drops the term over ε = 0.1–0.3 on exactly these "
+            "grounds (their eq 3, which is what is fitted here). But the "
+            "ratio **diverges as ε → 0**, so over the first "
+            f"{crossing['equal_pct']:.1f} % of the squash bending is the "
+            "larger of the two, and any reading that starts at first "
+            "contact is dropping a term that is not small at that end. "
+            "Raising ε₁ above it in **B**, or reading from a little way in, "
+            "is the honest way round that."
         )
-
-        early_equations(best, geometry, window)
-
-        with st.expander("How far to read, and every arrangement tried",
-                         expanded=False):
-            table = []
-            for w in search["windows"]:
-                row = w["best"]
-                bias = float((row["residuals"] or {}).get("bias_pct",
-                                                          float("nan")))
-                table.append({
-                    "Window": f"0–{w['window_pct']:.0f} %",
-                    "Best arrangement": early_row_label(row, short=True),
-                    "Bending": row["bending"],
-                    "n": row["n_points"],
-                    "R²": round(row["r_squared"], 6),
-                    "Lack of fit": ("—" if not np.isfinite(bias)
-                                    else f"{bias:.2f} %"),
-                    **{DISPLAY_SYMBOL.get(EARLY_LAW_SYMBOL.get(law, law),
-                                          law):
-                       modulus_display(EARLY_LAW_SYMBOL.get(law, law),
-                                       value["E_Pa"])
-                       for law, value in row["moduli"].items()},
-                    "Chosen": "✅" if w["window_pct"] == window else "",
-                })
-            st.dataframe(pd.DataFrame(table), hide_index=True, **STRETCH)
-            st.caption(
-                "R² always grows with the window, so it cannot choose one. "
-                "The window chosen is the widest that still has **no "
-                "systematic lack of fit**: the most taken from the cell "
-                "without leaving the stretch these laws are meant for. "
-                f"{search.get('n_fits', 0)} fits in all."
-            )
-            chosen = next((w for w in search["windows"]
-                           if w["window_pct"] == window), None)
-            if chosen:
-                st.markdown(f"**All {chosen['n_tried']} arrangements over "
-                            f"0–{window:.0f} %**")
-                rows = []
-                for rank, row in enumerate(chosen["rows"], start=1):
-                    rows.append({
-                        "#": rank,
-                        "Arrangement": early_row_label(row, short=True),
-                        "Bending": row["bending"],
-                        "R²": round(row["r_squared"], 6),
-                        "ΔAICc": ("—" if not np.isfinite(row["delta"])
-                                  else round(row["delta"], 2)),
-                        "Weight": f"{row['weight']:.1%}",
-                        **{DISPLAY_SYMBOL.get(
-                            EARLY_LAW_SYMBOL.get(law, law), law):
-                           modulus_display(EARLY_LAW_SYMBOL.get(law, law),
-                                           value["E_Pa"])
-                           for law, value in row["moduli"].items()},
-                        "Evidence": ("best" if rank == 1 else
-                                     "tied with the best"
-                                     if row["delta"] < PW_SCREEN_TIE else
-                                     "weaker" if row["delta"] < 10 else
-                                     "ruled out"),
-                    })
-                st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
-
-        st.markdown("**Can the membrane's bending term be dropped?**")
-        st.caption(bending_verdict(search, geometry))
-
-
-def bending_verdict(search, geometry):
-    """Whether the membrane's bending term can be dropped, on this curve."""
-    if bending_crossover is None or not search:
-        return ""
-    h = early_thickness_m()
-    crossing = bending_crossover(geometry, h)
-    window = float(search.get("chosen_window_pct", 20.0))
-    said = [
-        f"**What the equation says.** With h = {h * 1e9:.0f} nm and "
-        f"R₀ = {float(geometry.cell_radius) * 1e6:.2f} µm, bending and "
-        f"stretching are equal at x = {crossing['equal_pct']:.2f} % and "
-        f"bending is under a twentieth of stretching by "
-        f"x = {crossing['negligible_pct']:.2f} %. Lulevich drops it over "
-        "ε = 0.1–0.3 on the same grounds. But their eq 2 diverges as "
-        "ε → 0, so over a window that starts at first contact the term is "
-        "not small everywhere, and dropping it is an approximation being "
-        "made at the one end where it does not hold."
-    ]
-    pairs = {}
-    for w in search.get("windows", ()):
-        for row in w["rows"]:
-            pairs.setdefault((w["window_pct"], row["plan"]), {})[
-                row["bending"]] = row
-    both = [p for p in pairs.values() if "off" in p and "tied" in p]
-    if both:
-        better = sum(1 for p in both if p["off"]["aicc"] <= p["tied"]["aicc"])
-        gap = float(np.median([p["tied"]["aicc"] - p["off"]["aicc"]
-                               for p in both]))
-        said.append(
-            "**What this curve says.** Fitted both ways on the same points, "
-            "with the bending term sharing the stretching term's modulus so "
-            "it costs no parameter: "
-            + (f"dropping it is better in **{better} of {len(both)}** "
-               f"arrangements, by a median ΔAICc of {abs(gap):.0f}. On this "
-               "curve eq 3 is enough."
-               if better >= len(both) / 2 else
-               f"**keeping** it is better in {len(both) - better} of "
-               f"{len(both)} arrangements, by a median ΔAICc of "
-               f"{abs(gap):.0f}. On this curve eq 1 earns its second term.")
-        )
-    else:
-        said.append("Set the bending term to **Both, and compare** above to "
-                    "have this curve answer it.")
-    return "\n\n".join(said)
 
 
 def screen_signature(epsilon, force_N):
@@ -7419,7 +7059,8 @@ def component_screen_panel(model, epsilon, force_N):
             )
 
     # ---- adopt it ----------------------------------------------------
-    on_now = tuple(n for n, *_r in PW_COMPONENTS if n not in piecewise_off())
+    on_now = tuple(n for n, *_r in active_components()
+                   if n not in piecewise_off())
     order_now = tuple(ORDER_COEFFICIENT[t] for t in component_order())
     carry_now = tuple(piecewise_carry())
     same = (tuple(sorted(best["on"])) == tuple(sorted(on_now))
@@ -7435,7 +7076,7 @@ def component_screen_panel(model, epsilon, force_N):
         order_terms = [coefficient_term[c] for c in best["order"]
                        if c in coefficient_term]
         extra = {f"pw_use_{name}": (name in best["on"])
-                 for name, *_r in PW_COMPONENTS}
+                 for name, *_r in active_components()}
         extra.update({
             "component_order": order_terms,
             # The carry pattern is the choice between the three ways of
@@ -7468,11 +7109,11 @@ def method_statement(result, screen=None):
                 for term, coefficient in ORDER_COEFFICIENT.items()
                 if term in names}
     off = set(piecewise_off())
-    on = [label_of.get(name, name) for name, *_r in PW_COMPONENTS
+    on = [label_of.get(name, name) for name, *_r in active_components()
           if name not in off]
     significance = (coefficient_significance(result)
                     if coefficient_significance is not None else {})
-    detected = [label_of.get(name, name) for name, *_r in PW_COMPONENTS
+    detected = [label_of.get(name, name) for name, *_r in active_components()
                 if name not in off
                 and (significance.get(name) or {}).get("detected")]
     diagnostics = result.get("residuals") or {}
@@ -8096,7 +7737,14 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     end = float(b[-1])
     ranges = result.get("ranges") or {}
     stacked = view == "stacked" and not log_y and component_force is not None
+    live_off = set(off)
     for regime in result["regimes"]:
+        names = [n for n in (regime.get("params") or {})
+                 if n not in ("C0", "k_align")]
+        if names and all(n in live_off for n in names):
+            # Every term of this stretch is held at zero, so it is not a
+            # regime of this fit: drawing a band for it would invent one.
+            continue
         a, z = regime["domain_pct"]
         # The regime's name inside its band, at the top left and nudged off
         # the boundary line; the curve rises to the right, so that corner is
@@ -8118,7 +7766,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         marks = [v for pair in ranges.values() for v in pair] + list(b)
         grid = np.unique(np.concatenate(
             [grid, [v for v in marks if b[0] <= v <= end]]))
-        for name, label, symbol, colour, _law in (PW_BASELINE,) + PW_COMPONENTS:
+        for name, label, symbol, colour, _law in (
+                (PW_BASELINE,) + active_components()):
             # The baseline layer carries C₀, the force the curve starts
             # from, so it stays or the layers would not add up to F̂.
             if name in off and name != PW_BASELINE[0]:
@@ -8156,7 +7805,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         ))
     if not stacked:
         # Each component's own force, over its own range.
-        for name, label, symbol, colour, _law in PW_COMPONENTS:
+        for name, label, symbol, colour, _law in active_components():
             if name in off:
                 continue
             curve = component_curve(result, name)
@@ -8189,7 +7838,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     # One row per component that is on: the track and the ticked rows on
     # the board are the same list, in the same order.
     ticks, labels = [], []
-    drawn_rows = [c for c in PW_COMPONENTS if c[0] not in off]
+    drawn_rows = [c for c in active_components() if c[0] not in off]
     for row, (name, label, symbol, colour, _law) in enumerate(drawn_rows):
         a, u = ranges.get(name, (np.nan, np.nan))
         ticks.append(row)
@@ -8265,7 +7914,7 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
     b = result.get("boundaries_pct") or ()
     ranges = result.get("ranges") or {}
     drawn, left_out = [], []
-    for name, label, _symbol, _colour, _law in PW_COMPONENTS:
+    for name, label, _symbol, _colour, _law in active_components():
         if name in off:
             left_out.append(label)
             continue
@@ -8459,7 +8108,7 @@ def piecewise_equations_latex(bounds, ranges, off=()):
     """
     e1, end = float(bounds[1]), float(bounds[4])
     terms = []
-    for name, _label, _symbol, _colour, _law in PW_COMPONENTS:
+    for name, _label, _symbol, _colour, _law in active_components():
         if name == "k_align" or name in off or name not in ranges:
             continue
         a, u = ranges[name]
@@ -9142,7 +8791,7 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=2):
     ranges = piecewise_ranges(bounds)
     end = float(bounds[4])
     rows = []
-    for name, label, symbol, _colour, law in PW_COMPONENTS:
+    for name, label, symbol, _colour, law in active_components():
         start, until = ranges[name]
         key = f"pw_range_{name}"
         # Set from the model every run, before the bar is drawn, so the
@@ -9179,7 +8828,7 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=2):
             },
         })
     slots = component_row_table(rows, columns=columns)
-    for name, _label, _symbol, _colour, _law in PW_COMPONENTS:
+    for name, _label, _symbol, _colour, _law in active_components():
         row = (moduli or {}).get(name)
         if not st.session_state.get(f"pw_use_{name}", True):
             slots[name].caption(r"$\theta = 0$ (held)")
@@ -9222,6 +8871,94 @@ PW_EPS_WAYS = {
     "found": "🎯 Found from this curve",
     "typed": "✍️ Kept exactly as I typed them",
 }
+
+
+PW_EARLY_JOINS = {
+    "parallel": "⇉ Both from first contact (Lulevich eq 1 + 6)",
+    "staggered": "→ One joins at ε₁",
+}
+
+
+def _pw_early_join_changed():
+    """Callback: parallel or staggered. Re-park ε so the stretches fit."""
+    end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
+    if st.session_state.get("pw_early_join", "parallel") == "parallel":
+        # One regime doing the work, so ε₁ is parked with the others just
+        # under x_end where it owns almost the whole window.
+        st.session_state["pw_b1"] = round(max(end - 1.5, 1.0), 2)
+    else:
+        st.session_state["pw_b1"] = round(
+            min(max(end * 0.4, 1.0), max(end - 2.0, 1.0)), 2)
+    st.session_state["pw_b2"] = round(max(end - 1.0, 1.5), 2)
+    st.session_state["pw_b3"] = round(max(end - 0.5, 2.0), 2)
+    st.session_state["pw_eps_way"] = (
+        "typed" if st.session_state.get("pw_early_join") == "parallel"
+        else "found")
+    st.session_state["pw_placements"] = None
+    st.session_state["pw_selected"] = None
+    st.session_state["pw_screen"] = None
+    st.session_state["_pw_apply"] = True
+
+
+def _pw_regime_changed():
+    """
+    Callback: switching between the whole squash and the early regime.
+
+    Each keeps its own x_end, so going back and forth does not lose where
+    the other one was fitted to, and the placement is redone because the
+    boundary that matters is a different boundary.
+    """
+    going = st.session_state.get("pw_regime", "full")
+    here = [float(st.session_state.get(k, DEFAULTS[k]))
+            for k in PW_BOUNDARY_KEYS]
+    # The arrangement belongs to the regime it was chosen in: adopting a
+    # two-component mixture must not leave the four-component fit holding
+    # it when the board is switched back.
+    kept_keys = (("component_order", "pw_style", "pw_best_carry",
+                  "pw_membrane_throughout", "pw_eps_way")
+                 + tuple(f"pw_use_{name}" for name in PW_SWITCHABLE))
+    store = "pw_full_arrangement" if going == "early" else "pw_early_arrangement"
+    take = "pw_early_arrangement" if going == "early" else "pw_full_arrangement"
+    st.session_state[store] = {k: copy.deepcopy(st.session_state.get(k))
+                               for k in kept_keys if k in st.session_state}
+    for key, value in (st.session_state.get(take) or {}).items():
+        st.session_state[key] = value
+        if key == "component_order" and value:
+            for index, term in enumerate(value):
+                st.session_state[f"component_order_{index}"] = term
+    if going == "early":
+        st.session_state["pw_full_eps"] = here
+        kept = st.session_state.get("pw_early_eps")
+        if kept:
+            values = [float(v) for v in kept]
+        else:
+            found = st.session_state.get("_pw_early_window")
+            end = round(float(found if found else 30.0), 1)
+            # ε₂ and ε₃ belong to components held at zero, so they are
+            # parked just under x_end where they are inert and where the
+            # search will not spend time on them. ε₁ joins them when both
+            # components act from first contact.
+            parallel = st.session_state.get("pw_early_join",
+                                            "parallel") == "parallel"
+            values = [round(max(end - 1.5, 1.0), 2) if parallel
+                      else min(here[0], round(end * 0.4, 2)),
+                      round(max(end - 1.0, 1.5), 2),
+                      round(max(end - 0.5, 2.0), 2), end]
+    else:
+        st.session_state["pw_early_eps"] = here
+        values = [float(v) for v in (st.session_state.get("pw_full_eps")
+                                     or [5.0, 44.0, 62.0, DEFAULTS["pw_end"]])]
+    for key, value in zip(PW_BOUNDARY_KEYS, values):
+        st.session_state[key] = round(float(value), 2)
+    if going == "early":
+        st.session_state["pw_eps_way"] = (
+            "typed" if st.session_state.get("pw_early_join",
+                                            "parallel") == "parallel"
+            else "found")
+    st.session_state["pw_placements"] = None
+    st.session_state["pw_selected"] = None
+    st.session_state["pw_screen"] = None
+    st.session_state["_pw_apply"] = True
 
 
 def _pw_eps_way_changed():
@@ -9542,7 +9279,7 @@ def piecewise_settings_used(result, geometry, target, source):
     rows.append(("C2C12 constraints", f"ε₁ {l1:g}–{h1:g} %, ε₂ {l2:g}–{h2:g} %, "
                                       f"ε₃ − ε₂ {s_lo:g}–{s_hi:g} %",
                  "Edit the C2C12 constraints"))
-    for name, label, _symbol, _colour, _law in PW_COMPONENTS:
+    for name, label, _symbol, _colour, _law in active_components():
         a, u = ranges.get(name, (float("nan"), float("nan")))
         rows.append((f"{label}", "off (held at 0)" if name in off
                      else f"acts over {a:.2f}–{u:.2f} %", "Components"))
@@ -9723,6 +9460,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
 
     top = float(np.nanmax(epsilon)) * 100.0 if np.size(epsilon) else 100.0
     st.session_state["_pw_data_top"] = top
+    # How far this curve is still one power law, for the early regime's
+    # "read to X %" button. Cheap, cached on the curve.
+    if power_law_window is not None:
+        cached = st.session_state.get("_pw_window_cache") or {}
+        key = repr((int(np.size(epsilon)),
+                    round(float(force_N[-1]), 15) if np.size(force_N) else 0.0))
+        if cached.get("key") != key:
+            thin_e, thin_f, _s = thinned_for_search(epsilon, force_N)
+            try:
+                found = power_law_window(thin_e, thin_f) or {}
+            except Exception:  # pragma: no cover - a curve it cannot read
+                found = {}
+            st.session_state["_pw_window_cache"] = {"key": key, "found": found}
+            cached = st.session_state["_pw_window_cache"]
+        st.session_state["_pw_early_window"] = (
+            (cached.get("found") or {}).get("window_pct"))
     # Put the board's own numbers right before any of their boxes is drawn,
     # so the person never sees a fit refused for boundaries that do not
     # increase. Writing a widget key is allowed here and only here: this
@@ -9913,14 +9666,24 @@ def piecewise_section(model, epsilon, force_N, rupture):
             "specimen, **B** over what domains, **C** under what regression "
             "conditions, **D** run it, **E** test the hypothesis in A "
             "against the curve, and **F**, under the results, what the "
-            "answer is worth. This board fits the **whole curve**; the "
-            "early part is fitted separately in **🔬 Early deformation** "
-            "just above."
+            "answer is worth. **A** is also where you choose between the "
+            "whole squash and the early regime; everything else on the "
+            "board behaves the same either way."
         )
         status_slot = st.empty()
 
         st.markdown("**A · Analyte — what the cell is made of**")
-        st.caption("The components ticked here are a hypothesis about this "
+        st.radio(
+            "Which components, over how much of the squash",
+            list(PW_REGIME_MODES), format_func=PW_REGIME_MODES.get,
+            key="pw_regime", on_change=_pw_regime_changed,
+            label_visibility="collapsed",
+            help="Full: the four components over the whole squash. Early: "
+                 "the two Lulevich's model has, over the early window only. "
+                 "Everything else on this board behaves the same.",
+        )
+        st.caption(PW_REGIME_HELP.get(piecewise_regime(), ""))
+        st.caption("The components ticked below are a hypothesis about this "
                    "cell. Exactly what is ticked is fitted, drawn and "
                    "reported; step E tests whether the curve supports it.")
         share_col, model_col = st.columns([1.2, 1], gap="medium")
@@ -9939,14 +9702,27 @@ def piecewise_section(model, epsilon, force_N, rupture):
         board_off = set(piecewise_off())
         board_ranges = piecewise_ranges(piecewise_boundaries())
 
+        early_now = piecewise_regime() == "early"
         st.markdown("**B · Domains — where each part takes over**")
-        st.caption("The stretch of deformation each component is fitted "
-                   "on. Found from the curve, or held exactly where you "
-                   "put them.")
-        st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
+        st.caption(
+            ("The stretch each of the two components is fitted on: where "
+             "the second one joins, and how far the reading goes. Found "
+             "from the curve, or held exactly where you put them."
+             if early_now else
+             "The stretch of deformation each component is fitted on. "
+             "Found from the curve, or held exactly where you put them."))
+        st.latex(r"0 < \varepsilon_1 \le x_{end}" if early_now else
+                 r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
                  r"\le x_{end}")
+        if early_now and st.session_state.get("pw_early_join",
+                                              "parallel") == "parallel":
+            st.caption("Both components act from first contact, so there is "
+                       "no boundary to place: the fit runs over "
+                       "[0, x_end] exactly as set.")
         st.radio(
             "on ▶ Fit & plot", list(PW_EPS_WAYS),
+            disabled=(early_now and st.session_state.get(
+                "pw_early_join", "parallel") == "parallel"),
             format_func=PW_EPS_WAYS.get, key="pw_eps_way",
             on_change=_pw_eps_way_changed, horizontal=True,
             label_visibility="collapsed",
@@ -9955,20 +9731,62 @@ def piecewise_section(model, epsilon, force_N, rupture):
                  "as typed: the fit happens exactly at the numbers below and "
                  "nothing moves.",
         )
-        e1c, e2c, e3c, endc = st.columns(4)
-        with e1c:
-            st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
-                            key="pw_b1", help=EPS_ROLES[0])
-        with e2c:
-            st.number_input("ε₂ (%)", 1.0, 99.0, step=0.5, format="%.2f",
-                            key="pw_b2", help=EPS_ROLES[1])
-        with e3c:
-            st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
-                            key="pw_b3", help=EPS_ROLES[2])
-        with endc:
-            st.number_input("x_end (%)", 1.0, 100.0, step=0.1, format="%.1f",
-                            key="pw_end", help="Last point fitted; not moved "
-                            "by the routes.")
+        if early_now:
+            st.radio(
+                "How the two act", list(PW_EARLY_JOINS),
+                format_func=PW_EARLY_JOINS.get, key="pw_early_join",
+                horizontal=True, label_visibility="collapsed",
+                on_change=_pw_early_join_changed,
+                help="Lulevich's own arrangement has both from first "
+                     "contact, in parallel. Curves often prefer one of them "
+                     "joining a little way in; that is the other choice, "
+                     "and ε₁ is where it joins.",
+            )
+            joined = st.session_state.get("pw_early_join", "parallel")
+            # ε₂ and ε₃ belong to components held at zero here, so they
+            # change nothing and are not shown; they are kept in order
+            # behind the scenes.
+            e1c, endc, findc = st.columns([1, 1, 1.4])
+            with e1c:
+                st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
+                                key="pw_b1",
+                                disabled=(joined == "parallel"),
+                                help="Where the second component joins. Not "
+                                     "used when both act from first "
+                                     "contact.")
+            with endc:
+                st.number_input("x_end (%)", 2.0, 100.0, step=0.5,
+                                format="%.1f", key="pw_end",
+                                help="How far the early reading goes. "
+                                     "Nothing past this enters the fit.")
+            with findc:
+                window = st.session_state.get("_pw_early_window")
+                if window and st.button(
+                        f"📐 Read to {float(window):.0f} % "
+                        "(where it stays one power law)",
+                        key="pw_early_window_take", **STRETCH,
+                        help="Sets x_end to the end of the stretch over "
+                             "which this curve's log-log slope is still "
+                             "flat, which is as far as one power law "
+                             "describes it."):
+                    rerun_keeping_settings({"pw_end": round(float(window), 1),
+                                            "_pw_apply": True})
+        else:
+            e1c, e2c, e3c, endc = st.columns(4)
+            with e1c:
+                st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
+                                key="pw_b1", help=EPS_ROLES[0])
+            with e2c:
+                st.number_input("ε₂ (%)", 1.0, 99.0, step=0.5, format="%.2f",
+                                key="pw_b2", help=EPS_ROLES[1])
+            with e3c:
+                st.number_input("ε₃ (%)", 1.0, 99.5, step=0.5, format="%.2f",
+                                key="pw_b3", help=EPS_ROLES[2])
+            with endc:
+                st.number_input("x_end (%)", 1.0, 100.0, step=0.1,
+                                format="%.1f", key="pw_end",
+                                help="Last point fitted; not moved by the "
+                                     "routes.")
         for note in (st.session_state.get("_pw_boundary_repairs") or ()):
             st.caption(f"🔧 Repaired: {note}.")
         for note in constraint_notes(piecewise_boundaries()):
@@ -9986,7 +9804,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
         read_curve_control(epsilon, force_N)
 
         st.markdown("**D · Run**")
-        nothing_ticked = len(piecewise_off()) >= len(PW_SWITCHABLE) + 1
+        nothing_ticked = not [c for c in active_components()
+                              if c[0] not in piecewise_off()]
         go1, go2, go3 = st.columns([1.1, 1.3, 1])
         with go1:
             pressed = st.button(
@@ -9998,9 +9817,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 **STRETCH,
             )
         with go2:
+            no_boundaries = (piecewise_regime() == "early"
+                             and st.session_state.get("pw_early_join",
+                                                      "parallel") == "parallel")
             reaching = st.button(
                 f"🎯 Reach R² ≥ {float(_pw_get('pw_target_r2', 0.999)):g}",
-                key="pw_reach", disabled=nothing_ticked,
+                key="pw_reach", disabled=nothing_ticked or no_boundaries,
                 help="Searches for boundaries that bring the whole curve to "
                 "the target, opening the C2C12 constraints out a step at a "
                 "time until it gets there, and says what it had to open. "
@@ -10026,12 +9848,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "target, widening the prior only as far as it has to. "
                 "**🔄 Refresh graph** just draws the board again."
             )
-
-        st.caption(
-            "ℹ️ The early part of this curve is fitted **separately**, by "
-            "its own two components, in **🔬 Early deformation** directly "
-            "above this board. Nothing on this board affects it."
-        )
 
         st.markdown("**E · Screen — four components first, in every "
                     "arrangement**")
@@ -10194,7 +10010,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     slot.markdown(
                         f"**{symbol} = {shown.get(f'modulus_{term}', '—')}**"
                         + waits)
-            waiting_rows = [c[1] for c in PW_COMPONENTS if not _same(c[0])]
+            waiting_rows = [c[1] for c in active_components()
+                            if not _same(c[0])]
             components_note_slot.caption(
                 "⏳ **" + ", ".join(waiting_rows) + "**: ticked or moved "
                 "here, but not on the graph yet. Press **▶ Fit & plot**."
@@ -10294,14 +10111,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
         if ok:
             validation_panel(result, epsilon, force_N, model)
 
-        # ---- the early regime, fitted on its own, up under the plot ----
+        # ---- the early regime against its source, from this same fit ---
         with early_slot:
-            early_deformation_section(
-                model, epsilon, force_N,
-                whole_curve={row["symbol"]: row["E_Pa"]
-                             for row in (moduli or {}).values()
-                             if isinstance(row, dict) and "symbol" in row},
-            )
+            if ok and piecewise_regime() == "early":
+                lulevich_panel(result, model, fit)
 
         # ---- how it is done, for an undergraduate, with these numbers --
         with st.expander("📘 How the fit is done — the maths, step by step",
@@ -11779,7 +11592,7 @@ def fit_explainer(fit, result=None):
                  r"A_{\text{Hertz}} = \frac{\sqrt2\,R^2}{3(1-\nu^2)}\,c(R)")
         moduli = result.get("moduli") or {}
         rows = []
-        for key_, label, symbol, _c, _law in PW_COMPONENTS:
+        for key_, label, symbol, _c, _law in active_components():
             m = moduli.get(key_)
             if not m:
                 continue
@@ -12357,7 +12170,7 @@ def piecewise_share_figure(result, style):
     total = predict_piecewise(x / 100.0, result)
     fig = go.Figure()
     off = piecewise_off()
-    for name, label, _symbol, colour, _law in PW_COMPONENTS:
+    for name, label, _symbol, colour, _law in active_components():
         if component_force is None:
             break
         layer = component_force(result, name, x)
