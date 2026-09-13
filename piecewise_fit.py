@@ -621,6 +621,8 @@ def fit_piecewise(
         powers = np.array([t.power for t in regime.terms], dtype=float)
         n_free = len(regime.terms) + (1 if regime.free_offset else 0)
         need = int(min_points) if min_points else n_free + 2
+        if not regime.terms and not regime.free_offset:
+            need = 1
 
         entry = {
             "key": regime.key,
@@ -670,7 +672,8 @@ def fit_piecewise(
             # always the contact slope; it is now whichever element the
             # model puts first, which can be a cube law like any other.
             c0 = float(np.mean(f_all[:10]))
-            untils = np.array([ranges[t.name][1] for t in regime.terms])
+            untils = np.array([ranges[t.name][1] for t in regime.terms]
+                              ) if regime.terms else np.array([])
             columns = [_basis(t.shape, t.power, x, a, untils[j], squeeze)
                        for j, t in enumerate(regime.terms)]
             design = np.column_stack(columns + [np.ones_like(x)])
@@ -725,6 +728,23 @@ def fit_piecewise(
         else:
             # Each element's law runs from the regime's start to its own
             # end, and holds what it reached after that.
+            if not regime.terms:
+                # A stretch with nothing of its own in it. It is still part
+                # of the curve: the carried elements go on acting across
+                # it, and the force it ends on is what the next regime is
+                # anchored to. Nothing to solve.
+                known = _carried_force(carried, x, a)
+                predicted = anchor + known
+                entry["engine"] = "no free terms"
+                anchor = anchor + float(
+                    _carried_force(carried, np.array([b]), a)[0])
+                entry["anchor_out_N"] = float(anchor)
+                entry.update(_statistics(f, predicted, 0))
+                entry["fitted"] = True
+                regime_out.append(entry)
+                if not last:
+                    anchors[f"F_{b:g}pct"] = float(anchor)
+                continue
             untils = np.array([ranges[t.name][1] for t in regime.terms])
             design = np.column_stack([
                 _basis(t.shape, t.power, x, a, untils[j], squeeze)
