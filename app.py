@@ -670,6 +670,10 @@ DEFAULTS = {
     "pw_show_tags": True,
     "pw_show_track": True,
     "pw_show_zero": False,
+    # The C⁰ anchors: the white diamonds where each stretch picks up the
+    # force the one before it ended on. Off, because the curve already
+    # shows it is continuous there.
+    "pw_show_anchors": False,
     # A light blue field of points with no outline, and one dark dashed
     # line over it. The eye separates them by lightness and by the kind of
     # mark, which survives a greyscale print and colour blindness both.
@@ -5059,6 +5063,10 @@ PW_TERM_OF = {
 PW_APPLIED_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end", "pw_settings",
                    "pw_until", "pw_membrane_throughout", "pw_target_r2",
                    "pw_style", "pw_best_carry",
+                   # The order the components are met in is part of the
+                   # model, not a way of showing it: changing it changes
+                   # which law owns which stretch.
+                   "component_order",
                    "pw_weighting", "pw_squeeze", "pw_squeeze_way",
                    "pw_regime",
                    "pw_early_eps", "pw_full_eps",
@@ -8013,6 +8021,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     show_tags = bool(st.session_state.get("pw_show_tags", True))
     show_track = bool(st.session_state.get("pw_show_track", True))
     show_zero = bool(st.session_state.get("pw_show_zero", False))
+    show_anchors = bool(st.session_state.get("pw_show_anchors", False))
     stacked = stacked and show_areas
     live_off = set(off)
     for regime in (result["regimes"] if show_bands else ()):
@@ -8098,7 +8107,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                               "<extra></extra>",
             ))
     anchor_x, anchor_y, anchor_text = [], [], []
-    for name, value in result["anchors"].items():
+    for name, value in (result["anchors"].items() if show_anchors else ()):
         where = float(name.split("_")[1].replace("pct", ""))
         anchor_x.append(where)
         anchor_y.append(value * scale)
@@ -8185,8 +8194,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
             bgcolor="rgba(255,255,255,0.88)", bordercolor="#999999",
             borderwidth=1, borderpad=3,
         )
-    n_rows = legend_rows(legend_names + ["Experimental data", "Fitted curve F̂",
-                                         "C⁰ anchors"])
+    n_rows = legend_rows(legend_names + ["Experimental data", "Fitted curve F̂"]
+                         + (["C⁰ anchors"] if anchor_x else []))
     fig.update_layout(
         height=int(style.height * 1.3) + TAG_ROW_PX * tag_rows + 22 * n_rows,
         template="simple_white",
@@ -8199,11 +8208,11 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 "traceorder": "normal"},
         xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
                          "font": bold_font(17)},
-               # The x axis is drawn under whichever panel is the bottom
-               # one: the range track when it is on, the force plot when
-               # the track is off. Without this the axis would be anchored
-               # to a panel that is not there and the plot would lose it.
-               "anchor": "y2" if has_track else "y",
+               # Drawn under the force plot itself, always: that is the
+               # plot being read, and an axis parked under the range track
+               # reads as the track's axis rather than the curve's. The
+               # track keeps the same horizontal scale, drawn below it.
+               "anchor": "y",
                "range": [x_lo, x_hi],
                "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
                "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
@@ -8211,7 +8220,9 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                "exponentformat": "none", "showexponent": "none"},
         yaxis={"title": {"text": f"<b>Force ({unit})</b>",
                          "font": bold_font(17)},
-               "domain": [0.30, 1.0] if has_track else [0.0, 1.0],
+               # Room under the force plot for its own ticks and title,
+               # then the range track below them.
+               "domain": [0.34, 1.0] if has_track else [0.0, 1.0],
                "tickfont": bold_font(15),
                "ticks": "outside", "ticklen": 7, "tickwidth": 2.2,
                "linewidth": 2.2, "linecolor": "#111111", "showline": True,
@@ -8220,7 +8231,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                "exponentformat": "power", "showexponent": "all",
                **({"range": y_window} if y_window and not log_y else {})},
         **({"yaxis2": {
-            "domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
+            "domain": [0.0, 0.16], "anchor": "x", "tickvals": ticks,
             "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
             "showgrid": False, "zeroline": False,
             "tickfont": bold_font(14), "linewidth": 2.2,
@@ -8250,6 +8261,10 @@ PW_FURNITURE = (
     ("pw_show_zero", "F = 0 line",
      "A black horizontal line at zero force, useful when the baseline "
      "matters more than the peak."),
+    ("pw_show_anchors", "C⁰ anchors",
+     "The white diamonds where each stretch picks up the force the one "
+     "before it ended on. Off by default: the fitted curve already shows "
+     "it is continuous there."),
 )
 
 
@@ -10422,6 +10437,46 @@ def piecewise_section(model, epsilon, force_N, rupture):
         else:
             apply_board()
 
+    def refit_early_order():
+        """
+        The order changed, so where the second one joins is found again.
+
+        The hierarchy is the person's: whichever component they put first
+        acts from first contact, and the other joins at ε₁. Only ε₁ is
+        looked for, and only over this window, so changing the order
+        moves the boundary that belongs to it and nothing else.
+        """
+        live = [n for n in (ORDER_COEFFICIENT.get(t)
+                            for t in component_order())
+                if n in PW_EARLY_COMPONENTS and n not in piecewise_off()]
+        end = early_end_pct()
+        parallel = (len(live) < 2
+                    or st.session_state.get("pw_early_join",
+                                            "parallel") == "parallel")
+        found = None if parallel else early_best_eps1(model, epsilon, force_N,
+                                                      live, end)
+        parked = early_park(end, parallel=parallel,
+                            first=(found or {}).get("eps1"))
+        for _key, _value in zip(PW_BOUNDARY_KEYS, parked):
+            st.session_state[_key] = round(float(_value), 2)
+        if len(live) < 2:
+            st.session_state["pw_early_note"] = (
+                f"One component ticked ({PW_COMPONENT_TITLES.get(live[0], '')}"
+                ") — it is fitted on its own, from first contact to "
+                f"{end:.1f} %." if live else
+                "Nothing is ticked, so there is nothing to fit.")
+        elif parallel:
+            st.session_state["pw_early_note"] = (
+                "Both components act from first contact, in parallel, which "
+                f"is Lulevich's eq 1 + 6, read to {end:.1f} %.")
+        elif found:
+            st.session_state["pw_early_note"] = (
+                f"**{PW_COMPONENT_TITLES.get(live[0], live[0])} first**, as "
+                "you have them ordered, with the other joining at "
+                f"**ε₁ = {found['eps1']:.1f} %** — the joining point that "
+                f"fits this order best (R² = {found['r2']:.5f}, "
+                f"{found['measured']} of 2 components measured).")
+
     def arrive_full():
         """
         A new curve on the four-component board, fitted the way it always
@@ -10535,6 +10590,21 @@ def piecewise_section(model, epsilon, force_N, rupture):
         else:
             arrive_full()
     elif apply_now:
+        apply_board()
+    elif (piecewise_regime() == "early"
+          and pw_board_values() != (applied_state.get("values") or {})):
+        # The early regime has no ▶ Fit & plot, so a change to the board
+        # is a change to the fit: it happens now. What changed decides how
+        # much has to be found again -- a different order or a component
+        # ticked off moves where the second one joins, so that is looked
+        # for again; a window or a weighting only re-fits.
+        before = applied_state.get("values") or {}
+        now = pw_board_values()
+        moved = {key for key in PW_APPLIED_KEYS
+                 if before.get(key) != now.get(key)}
+        if moved & {"component_order", "pw_early_join", "pw_use_K_shell",
+                    "pw_use_K_cyto"}:
+            refit_early_order()
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -10797,14 +10867,6 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 values = {k: round(float(v), 2) for k, v in
                           zip(PW_BOUNDARY_KEYS, placements["rows"][key]["best_pct"])}
             rerun_keeping_settings({**values, "_pw_apply": True})
-
-    # The early regime has no ▶ Fit & plot, because it has nothing to wait
-    # for: tick a component or change the window and it is refitted at
-    # once. Only the full-deformation board holds changes back until the
-    # button is pressed.
-    if early_now and pw_board_values() != applied:
-        apply_board()
-        applied = st.session_state["pw_applied"]["values"]
 
     waiting = pw_board_values() != applied
     with status_slot.container():
@@ -11317,6 +11379,47 @@ def early_regimes_for(join, order):
                              free_offset=(i == 0),
                              title=PW_COMPONENT_TITLES.get(n, ""), equation="")
         for i, n in enumerate(chain))
+
+
+def early_best_eps1(model, epsilon, force_N, order, end=None):
+    """
+    Where the second of the two joins, for the order given.
+
+    The order is the person's: this does not go looking for a better one,
+    it finds the joining point that best serves the hierarchy they have
+    set. ε₁ is scanned across the window and scored the way the search
+    scores everything else, with the arrangement that measures both
+    components winning a tie.
+    """
+    if not HAS_PIECEWISE or len(order) < 2:
+        return None
+    end = float(end if end is not None else early_end_pct())
+    thin_eps, thin_force, _step = thinned_for_search(epsilon, force_N)
+    off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
+                               if n not in PW_EARLY_COMPONENTS)
+    settings = effective_piecewise_settings(piecewise_settings(),
+                                            piecewise_until(), off)
+    regimes = early_regimes_for("staggered", order)
+    extras = fit_extras()
+    best = None
+    for eps1 in np.arange(2.0, max(end - 2.0, 3.0), 1.0):
+        bounds = repair_boundaries(
+            list(early_park(end, parallel=False, first=float(eps1))),
+            top=end)[0]
+        result = fit_piecewise(thin_eps, thin_force, boundaries_pct=bounds,
+                               regimes=regimes, settings=settings,
+                               carry=tuple(order), **extras)
+        if not result.get("success"):
+            continue
+        coefficients = result.get("coefficients") or {}
+        measured = sum(1 for name in order
+                       if abs(float(coefficients.get(name) or 0.0)) > 0.0)
+        key = (measured, -float(result.get("aicc", float("inf"))))
+        if best is None or key > best["key"]:
+            best = {"key": key, "eps1": float(bounds[1]),
+                    "r2": float(result.get("r_squared", float("nan"))),
+                    "measured": measured}
+    return best
 
 
 def fit_early_cell(name, epsilon, force_N, height_um, model):
