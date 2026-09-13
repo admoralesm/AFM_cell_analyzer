@@ -877,7 +877,14 @@ DEFAULTS = {
     # What is being fitted: the four components over the whole squash, or
     # the two Lulevich's model has over the early regime. One board, one
     # plot, one set of options; this is the only thing that changes.
-    "pw_regime": "full",
+    # The early regime is where the page starts: two components over the
+    # first 35 %, which is the reading Lulevich's own model is for and the
+    # one a cell is elastic and reversible over.
+    "pw_regime": "early",
+    # Whether the early window was set by hand. Until it is, every curve
+    # is read to 35 %; after it is, the number set is kept from cell to
+    # cell, because a window chosen once is meant for the batch.
+    "_pw_early_end_user": False,
     # Each regime remembers its own boundaries, so switching back and
     # forth does not lose where the other one was fitted to.
     "pw_early_eps": None,
@@ -5275,9 +5282,11 @@ def component_order_control():
                    "below is still **"
                    + " → ".join(names[t][0] for t in order)
                    + "**. Give each position a component of its own.")
+    live = set(active_component_names())
     st.caption("Met in this order: "
                + " → ".join(f"{names[t][0]} {ONSET_NAMES[i]}"
-                            for i, t in enumerate(component_order())))
+                            for i, t in enumerate(component_order())
+                            if ORDER_COEFFICIENT.get(t) in live))
 
 
 def pw_regimes():
@@ -5706,6 +5715,51 @@ def piecewise_regime():
     """Which of the two the board is fitting: "full" or "early"."""
     value = _pw_get("pw_regime", DEFAULTS.get("pw_regime", "full"))
     return value if value in PW_REGIME_MODES else "full"
+
+
+def early_end_pct():
+    """
+    How far the early reading goes, in percent.
+
+    The window, never the whole squash: until it is set by hand it is
+    35 %, whatever the board happens to be holding. The board's x_end is
+    shared with the four-component fit, where it is the end of the curve,
+    so reading it blind is how a two-term fit ends up stretched over the
+    nucleus.
+    """
+    if not st.session_state.get("_pw_early_end_user"):
+        return float(PW_EARLY_END_PCT)
+    try:
+        end = float(st.session_state.get("pw_end", PW_EARLY_END_PCT))
+    except (TypeError, ValueError):
+        return float(PW_EARLY_END_PCT)
+    return end if 2.0 < end <= 100.0 else float(PW_EARLY_END_PCT)
+
+
+def eps_summary(bounds=None, latex=False):
+    """
+    The boundaries this regime actually has, written out.
+
+    The early regime has one boundary at most: ε₂ and ε₃ are parked under
+    x_end where they change nothing, so printing them alongside a two-term
+    fit is printing two numbers that are not results. Everything that
+    reports a fit asks here what to say.
+    """
+    b = [float(v) for v in (bounds if bounds is not None
+                            else piecewise_boundaries())]
+    end = b[-1] if b else float("nan")
+    b = b + [float("nan")] * (5 - len(b))
+    if piecewise_regime() == "early":
+        if st.session_state.get("pw_early_join", "parallel") == "parallel":
+            return (rf"0 \le x \le {end:.1f}\,\%" if latex
+                    else f"both from first contact, read to {end:.1f} %")
+        return (rf"\varepsilon_1 = {b[1]:.2f}\,\%, \qquad x_{{end}} = "
+                rf"{end:.1f}\,\%" if latex
+                else f"ε₁ = {b[1]:.2f} %, read to {end:.1f} %")
+    if latex:
+        return (r"(\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
+                rf"({b[1]:.2f},\,{b[2]:.2f},\,{b[3]:.2f})\,\%")
+    return f"ε₁ = {b[1]:.2f} %, ε₂ = {b[2]:.2f} %, ε₃ = {b[3]:.2f} %"
 
 
 def active_components():
@@ -8181,16 +8235,16 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
 
 
 PW_FURNITURE = (
-    ("pw_show_areas", "Shaded component areas",
+    ("pw_show_areas", "Shaded areas",
      "The stacked fills under the curve, one per component. Off leaves the "
      "data, the fitted curve and each component's own dashed line."),
     ("pw_show_bands", "Regime bands",
      "The tinted vertical bands (R1, R2, …) behind the curve that mark "
      "which stretch of the squash each regime owns."),
-    ("pw_show_tags", "Boundary tags",
+    ("pw_show_tags", "ε lines",
      "The ε lines with their labels above the plot. Off removes both the "
      "lines and the rows of tags, which shortens the figure."),
-    ("pw_show_track", "Range track [s, u]",
+    ("pw_show_track", "Range markings",
      "The panel under the plot with one bar per component showing where it "
      "acts. Off gives the force plot the whole height, x axis included."),
     ("pw_show_zero", "F = 0 line",
@@ -8207,16 +8261,15 @@ def plot_furniture():
     from the same result, so a box can be cleared to take a clean figure
     out of the app for a paper.
     """
-    with st.expander("🎨 What the plot draws", expanded=False):
-        st.caption(
-            "Display only. Clearing a box changes the picture, never the "
-            "fit, the boundaries or the moduli."
-        )
-        boxes = st.columns(len(PW_FURNITURE))
-        for column, (key, label, tip) in zip(boxes, PW_FURNITURE):
-            with column:
-                st.checkbox(label, key=key, help=tip)
-        if st.button("↺ Put everything back", key="pw_furniture_reset",
+    st.caption(
+        "🎨 **On the plot** — display only: clearing a box changes the "
+        "picture, never the fit, the boundaries or the moduli.")
+    boxes = st.columns(len(PW_FURNITURE) + 1)
+    for column, (key, label, tip) in zip(boxes, PW_FURNITURE):
+        with column:
+            st.checkbox(label, key=key, help=tip)
+    with boxes[-1]:
+        if st.button("↺ All back", key="pw_furniture_reset",
                      help="Back to the default picture: areas, bands, tags "
                           "and the range track on, the zero line off."):
             rerun_keeping_settings({key: DEFAULTS[key]
@@ -8349,6 +8402,7 @@ def early_window_panel():
                 taken = early_park(round(float(window), 1))
                 rerun_keeping_settings(
                     {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                     "_pw_early_end_user": True,
                      "_pw_find_early": True, "_pw_apply": True})
         with w2:
             if st.button(f"↺ Back to the default ({PW_EARLY_END_PCT:g} %, "
@@ -8361,8 +8415,8 @@ def early_window_panel():
                 taken = early_park(PW_EARLY_END_PCT)
                 rerun_keeping_settings(
                     {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-                     "pw_early_eps": None, "_pw_find_early": True,
-                     "_pw_apply": True})
+                     "pw_early_eps": None, "_pw_early_end_user": False,
+                     "_pw_find_early": True, "_pw_apply": True})
 
 
 def how_it_was_fitted(result):
@@ -8770,8 +8824,7 @@ def piecewise_answer(result, fit):
         rf"R^2 = {r2:.5f}"
         + (rf", \qquad \chi^2_\nu = {chi:.3g}" if np.isfinite(chi) else "")
         + rf", \qquad n = {int(result.get('n_points', 0))}"
-        + rf", \qquad (\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
-        rf"({bounds[1]:.2f},\,{bounds[2]:.2f},\,{bounds[3]:.2f})\,\%"
+        + r", \qquad " + eps_summary(bounds, latex=True)
     )
 
 
@@ -8974,10 +9027,18 @@ def carried_forward_summary(bounds=None, target=0.999):
         r"\text{(a Hertzian contact)}"
     )
     lines = []
-    for index, term in enumerate(order):
+    # Only the components this regime fits: the early one has two, and
+    # numbering four of them here would name two that are not in it.
+    live = set(active_component_names())
+    shown = [t for t in order if ORDER_COEFFICIENT.get(t) in live]
+    together = (piecewise_regime() == "early"
+                and st.session_state.get("pw_early_join", "parallel")
+                == "parallel")
+    for index, term in enumerate(shown):
         power = "3" if ORDER_COEFFICIENT[term] in ("K_shell", "K_nucleus") \
             else "3/2"
-        start = "first contact" if index == 0 else f"ε{'₁₂₃'[index - 1]}"
+        start = ("first contact" if index == 0 or together
+                 else f"ε{'₁₂₃'[index - 1]}")
         lines.append(f"{index + 1}. **{names[term][0]}** from {start}, "
                      f"as the power {power}")
     st.markdown("In this cell, in the order you have them met:\n\n"
@@ -9555,6 +9616,9 @@ def _pw_early_end_changed():
     # it again rather than leaving the old one in place.
     st.session_state["_pw_find_early"] = True
     st.session_state["_pw_apply"] = True
+    # A window set by hand is kept for the cells that follow; until one
+    # is, every curve is read to 35 %.
+    st.session_state["_pw_early_end_user"] = True
 
 
 def _pw_early_join_changed():
@@ -9614,7 +9678,7 @@ def _pw_regime_changed():
             # model is meant for, with a little of the shoulder past it so
             # the departure is visible. The 📐 button takes the power-law
             # window instead, which is usually nearer 20 %.
-            end = PW_EARLY_END_PCT
+            end = early_end_pct()
             # ε₂ and ε₃ belong to components held at zero, so they are
             # parked just under x_end where they are inert and where the
             # search will not spend time on them. ε₁ joins them when both
@@ -9622,8 +9686,16 @@ def _pw_regime_changed():
             values = early_park(end, first=here[0])
     else:
         st.session_state["pw_early_eps"] = here
-        values = [float(v) for v in (st.session_state.get("pw_full_eps")
+        full_kept = st.session_state.get("pw_full_eps")
+        values = [float(v) for v in (full_kept
                                      or [5.0, 44.0, 62.0, DEFAULTS["pw_end"]])]
+        # Never fitted on the four-component board on this curve, so it
+        # arrives there the way a curve arrives: every route scored and
+        # the boundaries moved until the whole curve reaches R²★. Without
+        # this the board would sit at the prior's starting numbers, which
+        # is not the four-component fit anybody wants to see.
+        if not full_kept:
+            st.session_state["_pw_find_full"] = True
     for key, value in zip(PW_BOUNDARY_KEYS, values):
         st.session_state[key] = round(float(value), 2)
     if going == "early":
@@ -9953,15 +10025,24 @@ def piecewise_settings_used(result, geometry, target, source):
     b = result["boundaries_pct"]
     ranges = result.get("ranges") or {}
     off = piecewise_off()
+    early_here = piecewise_regime() == "early"
     rows = [
-        ("Model", "4-regime piecewise, fitted regime by regime (R1 → R4), "
-                  "each anchored at the force the one before it ended on",
+        ("Model",
+         ("Lulevich's two terms, the membrane as a stretching shell (his "
+          "eq 3) and the interior as a Hertzian contact (his eq 6), over "
+          "the early window only"
+          if early_here else
+          "4-regime piecewise, fitted regime by regime (R1 → R4), "
+          "each anchored at the force the one before it ended on"),
          "fixed"),
-        ("Boundary placement", f"{PW_ROW_LABELS.get(st.session_state.get('pw_method', 'refined'), '')} "
-                               f"· in use: {source}",
+        ("Boundary placement",
+         ("searched: every order and every joining point, on this curve"
+          if early_here else
+          f"{PW_ROW_LABELS.get(st.session_state.get('pw_method', 'refined'), '')} "
+          f"· in use: {source}"),
          "How to place the boundaries"),
-        ("Boundaries", ", ".join(f"{n} = {v:.2f} %" for n, v in zip(EPS_NAMES, b[1:4]))
-         + f", end = {b[4]:.1f} %", "Regime boundaries"),
+        ("Boundaries", eps_summary(b) + f", end = {b[4]:.1f} %",
+         "Regime boundaries"),
         ("R² target", f"≥ {target:g} · this fit {result['r_squared']:.5f} "
                       + ("✅" if result["r_squared"] >= target else "⚠️"),
          "Fit must reach R² ≥"),
@@ -10032,9 +10113,18 @@ def collection_name():
 
 
 def collection_record(name, source, height_um, epsilon, force_N, result,
-                      geometry, route=""):
-    """One cell as the collection keeps it: its curve, its ε, its numbers."""
-    moduli = piecewise_moduli(result, geometry, regimes=pw_regimes())
+                      geometry, route="", regimes=None):
+    """
+    One cell as the collection keeps it: its curve, its ε, its numbers.
+
+    ``regimes`` are the ones this fit was actually made with. A batch in
+    the early regime searches each curve for its own arrangement, and a
+    modulus read back against a different arrangement is read against the
+    wrong prefactor, which is how a component goes missing from a row.
+    """
+    moduli = piecewise_moduli(result, geometry,
+                              regimes=regimes if regimes is not None
+                              else pw_regimes())
     lamina = lamina_summary(result, geometry) or {}
     return {
         "name": name, "source": source, "height_um": float(height_um),
@@ -10271,9 +10361,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
     if st.session_state.pop("_pw_restyle", False):
         settle_mixture()
         st.session_state["_pw_apply"] = True
-    # The early regime arrives searched: every arrangement of its two
-    # components, both ways round, with e1 scanned, and the best kept.
-    if st.session_state.pop("_pw_find_early", False) and HAS_PIECEWISE:
+
+    def find_early_arrangement():
+        """
+        Every arrangement of the two components, and the best one kept.
+
+        Both ways round, with ε₁ scanned across the window, scored through
+        the same repair the fit uses so the arrangement searched is the
+        arrangement fitted.
+        """
         with st.spinner("Finding the best arrangement of the two…"):
             found_early = early_best_arrangement(model, epsilon, force_N)
         if found_early:
@@ -10298,19 +10394,40 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 + f" (R² = {found_early['r2']:.5f}, "
                 f"{found_early['measured']} of 2 components measured).")
             st.session_state["pw_eps_way"] = "typed"
-        st.session_state["_pw_apply"] = True
-
-    applied_state = st.session_state.get("pw_applied") or {}
-    if st.session_state.pop("_pw_apply", False):
         apply_board()
-    elif applied_state.get("curve") != curve_key:
-        # A new cell: the boundaries and arrangement kept for the OTHER
-        # regime belonged to the cell before it, and the early window in
-        # particular is a property of this curve. Forget them, so
-        # switching regimes on this cell reads this cell.
-        for _key in ("pw_early_eps", "pw_full_eps", "pw_early_arrangement",
-                     "pw_full_arrangement"):
-            st.session_state[_key] = None
+
+    def arrive_early():
+        """
+        A new curve in the early regime: the window, then the search.
+
+        This is the default way in. Two components, Lulevich's own, read
+        over the first 35 % of the squash unless the window has been set
+        by hand, and the arrangement chosen on this curve rather than
+        carried over from the last one.
+        """
+        end = early_end_pct()
+        for _key, _value in zip(PW_BOUNDARY_KEYS, early_park(end)):
+            st.session_state[_key] = round(float(_value), 2)
+        for _name in PW_EARLY_COMPONENTS:
+            st.session_state[f"pw_use_{_name}"] = True
+        st.session_state["pw_style"] = "carried"
+        st.session_state["pw_best_carry"] = None
+        st.session_state["pw_mixture"] = None
+        st.session_state["pw_membrane_throughout"] = True
+        st.session_state["pw_style_note"] = None
+        st.session_state["pw_selected"] = None
+        st.session_state["pw_placements"] = None
+        if HAS_PIECEWISE:
+            find_early_arrangement()
+        else:
+            apply_board()
+
+    def arrive_full():
+        """
+        A new curve on the four-component board, fitted the way it always
+        has been: every route scored and the boundaries moved until the
+        whole curve reaches R²★.
+        """
         # A C2C12 arrives fitted the way a C2C12 is fitted: carried
         # forward, all four components, and boundaries already taken as far
         # as the target. The search starts inside the prior, so a curve the
@@ -10386,6 +10503,38 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     + f" (R² = {found_mix['r2']:.5f}). Choose "
                     "**① Carried on to the end** above to see it the other "
                     "way.")
+        apply_board()
+
+    # What to do this run. A pending apply wins, because something has
+    # just changed the board on purpose. Otherwise a new curve arrives in
+    # whichever regime the page is in -- the early one by default -- and a
+    # switch to full deformation on a curve that has never been fitted
+    # there arrives the four-component way rather than at the defaults.
+    applied_state = st.session_state.get("pw_applied") or {}
+    apply_now = st.session_state.pop("_pw_apply", False)
+    find_early_now = st.session_state.pop("_pw_find_early", False)
+    find_full_now = st.session_state.pop("_pw_find_full", False)
+    new_curve = applied_state.get("curve") != curve_key
+    if find_early_now and HAS_PIECEWISE and not new_curve:
+        find_early_arrangement()
+    elif find_full_now and not new_curve and piecewise_regime() != "early":
+        arrive_full()
+    elif apply_now and not new_curve:
+        apply_board()
+    elif new_curve:
+        # A new cell: the boundaries and arrangement kept for the OTHER
+        # regime belonged to the cell before it, and the early window in
+        # particular is a property of this curve. Forget them, so
+        # switching regimes on this cell reads this cell.
+        for _key in ("pw_early_eps", "pw_full_eps", "pw_early_arrangement",
+                     "pw_full_arrangement"):
+            st.session_state[_key] = None
+        st.session_state["pw_reach_note"] = None
+        if piecewise_regime() == "early":
+            arrive_early()
+        else:
+            arrive_full()
+    elif apply_now:
         apply_board()
     applied = st.session_state["pw_applied"]["values"]
 
@@ -10753,16 +10902,32 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 used = result["boundaries_pct"]
                 chi = result.get("chi_squared_reduced", float("nan"))
                 meets = result["r_squared"] >= target
+                # The early regime is a reading over a window, not a search
+                # for boundaries that reach a target, so it is not marked
+                # against R²★: it says what it got.
                 line = (
                     f"`fit {fid}` · "
-                    + rf"$R^2 = {result['r_squared']:.5f}\;"
-                    + (r"\ge" if meets else "<") + rf"\;R^2_\star = {target:g}$"
+                    + (rf"$R^2 = {result['r_squared']:.5f}$" if early_now else
+                       rf"$R^2 = {result['r_squared']:.5f}\;"
+                       + (r"\ge" if meets else "<")
+                       + rf"\;R^2_\star = {target:g}$")
                     + (rf" · $\chi^2_\nu = {chi:.3g}$" if np.isfinite(chi) else "")
-                    + rf" · $(\varepsilon_1,\varepsilon_2,\varepsilon_3) = "
-                    rf"({used[1]:.2f},\,{used[2]:.2f},\,{used[3]:.2f})\,\%$"
+                    + " · $" + eps_summary(used, latex=True) + "$"
                     + f" · {source}"
                 )
-                if meets:
+                if early_now:
+                    # Only the stretches that have a term in them: the rest
+                    # are parked under x_end and fit nothing.
+                    live_r = [r for r in result["regimes"]
+                              if r["fitted"] and [n for n in (r.get("params")
+                                                              or {})
+                                                  if n not in ("C0", "k_align")]]
+                    worst = (min(live_r, key=lambda r: r["r_squared"])
+                             if live_r else None)
+                    st.success(
+                        line + (rf" · worst stretch $R^2 = "
+                                rf"{worst['r_squared']:.4f}$" if worst else ""))
+                elif meets:
                     st.success(line)
                 else:
                     regimes = [r for r in result["regimes"]
@@ -10772,16 +10937,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         line + (rf" · worst $R_{{{worst['key'][1]}}}$: "
                                 rf"$R^2 = {worst['r_squared']:.4f}$"
                                 if worst else "")
-                        + (". The early regime is read over a window, not "
-                           "searched for boundaries: widen or narrow "
-                           "**x_end** under the plot if this matters, "
-                           "though a two-term fit over the first third of "
-                           "the squash is not asked to reach R²★."
-                           if early_now else
-                           f". Press **🎯 Reach R² ≥ {target:g}** on the "
-                           "board and it will look for boundaries that meet "
-                           "it, widening the C2C12 constraints only as far "
-                           "as it has to."), icon="⚠️")
+                        + f". Press **🎯 Reach R² ≥ {target:g}** on the "
+                        "board and it will look for boundaries that meet "
+                        "it, widening the C2C12 constraints only as far "
+                        "as it has to.", icon="⚠️")
                 log_y = bool(st.session_state.get("pw_log_y"))
                 st.plotly_chart(
                     piecewise_figure(
@@ -10877,19 +11036,31 @@ def piecewise_section(model, epsilon, force_N, rupture):
             fit_explainer(fit, result if ok else None)
 
         # ---- what decided it, from the same fit ------------------------
-        t_routes, t_coef, t_model, t_set, t_work = st.tabs([
-            "ε routes compared", "θ̂ by regime", "Model F(x)",
-            "Settings used", "🔍 Working",
-        ])
-        with t_routes:
-            if placements:
-                piecewise_placement_table(placements, piecewise_boundaries(),
-                                          target, selected)
-            else:
-                st.caption("Press **▶ Fit & plot** to place ε on this curve "
-                           "and compare the routes.")
-            st.divider()
-            carried_forward_summary(piecewise_boundaries(), target)
+        # The ε routes are how the four-component board places three
+        # boundaries. The early regime places at most one, by searching
+        # every arrangement, so that tab would be about a search it does
+        # not run.
+        if early_now:
+            t_coef, t_model, t_set, t_work = st.tabs([
+                "θ̂ by regime", "Model F(x)", "Settings used", "🔍 Working",
+            ])
+            t_routes = None
+        else:
+            t_routes, t_coef, t_model, t_set, t_work = st.tabs([
+                "ε routes compared", "θ̂ by regime", "Model F(x)",
+                "Settings used", "🔍 Working",
+            ])
+        if t_routes is not None:
+            with t_routes:
+                if placements:
+                    piecewise_placement_table(placements,
+                                              piecewise_boundaries(),
+                                              target, selected)
+                else:
+                    st.caption("Press **▶ Fit & plot** to place ε on this "
+                               "curve and compare the routes.")
+                st.divider()
+                carried_forward_summary(piecewise_boundaries(), target)
         with t_coef:
             if ok:
                 piecewise_coefficient_table(result, moduli)
@@ -10955,12 +11126,21 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     rf"$\nu = ({geometry.nu_membrane:.2f}, {geometry.nu_interior:.2f}, "
                     rf"{geometry.nu_nucleus:.2f})$"
                 )
+                # Only the stretches that have a term in them. In the
+                # early regime the rest are parked under x_end, and a
+                # solver line or a warning about a component this model
+                # does not contain is noise about nothing.
+                live_names = set(active_component_names()) | {"C0"}
                 st.markdown("**Solver**: " + " · ".join(
                     f"{r['key']}: {r['engine'] or '—'}, $n = {r['n_points']}$"
-                    for r in result["regimes"]))
+                    for r in result["regimes"]
+                    if any(n in live_names for n in (r.get("params") or {}))))
                 if found:
                     piecewise_search_maths(found)
                 for warning in result.get("warnings", []):
+                    if any(n in warning for n in
+                           (set(n for n, *_r in PW_COMPONENTS) - live_names)):
+                        continue
                     st.caption(f"⚠️ {warning}")
 
         if not ok:
@@ -11056,20 +11236,43 @@ CELL_COLORS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
 COLLECTION_SYMBOLS = ("E_shell", "E_cyto", "E_ne", "E_core")
 
 
+def collection_symbols(collection):
+    """
+    The moduli this collection has anything to say about.
+
+    A two-term batch measures the membrane and the cytoskeleton and never
+    touches the nucleus, so the nuclear columns and the two empty strip
+    plots are left out rather than printed as blanks.
+    """
+    cells = list((collection or {}).values())
+    if not cells:
+        return COLLECTION_SYMBOLS
+    live = [s for s in COLLECTION_SYMBOLS
+            if any(np.isfinite((rec.get("moduli") or {}).get(s, float("nan")))
+                   and (rec.get("moduli") or {}).get(s, 0.0) > 0.0
+                   for rec in cells)]
+    return tuple(live or COLLECTION_SYMBOLS)
+
+
 def refit_collection_cell(record, height_um=None):
     """Fit one kept cell again, at its own ε, with a (new) height."""
     height = float(record["height_um"] if height_um is None else height_um)
     eps, force = record["epsilon"], record["force_N"]
     model = build_model(eps, force, height_um=height)
+    early = record.get("early") or {}
+    regimes = (early_regimes_for(early["join"], early["order"]) if early
+               else pw_regimes())
     result = fit_piecewise(eps, force, boundaries_pct=record["bounds_pct"],
-                           regimes=pw_regimes(),
+                           regimes=regimes,
                            settings=record.get("settings") or {},
                            carry=tuple(record.get("carry") or ()))
     if not result.get("success"):
         return record
     new = collection_record(record["name"], record.get("source", ""), height,
                             eps, force, result, piecewise_geometry(model),
-                            record.get("route", ""))
+                            record.get("route", ""), regimes=regimes)
+    if early:
+        new["early"] = early
     new["include"] = record.get("include", True)
     # What the sheet said about this cell is not something a refit knows,
     # so it is carried across rather than quietly dropped.
@@ -11079,9 +11282,91 @@ def refit_collection_cell(record, height_um=None):
     return new
 
 
+def early_regimes_for(join, order):
+    """
+    The regimes Lulevich's two terms make, for one arrangement.
+
+    Built from the arrangement itself rather than from the board, so a
+    batch can fit every curve with the arrangement found for that curve
+    without writing any of it into the page's state.
+    """
+    terms = {t.name: t for regime in PW_REGIMES for t in regime.terms}
+    live = [n for n in order if n in PW_EARLY_COMPONENTS] or \
+        list(PW_EARLY_COMPONENTS)
+    rest = [n for n, *_r in PW_COMPONENTS if n not in live]
+
+    def blank(index):
+        return _dataclasses.replace(PW_REGIMES[index], terms=(),
+                                    free_offset=False, title="", equation="")
+
+    if join == "parallel":
+        # Both from first contact: one regime holding both terms, which
+        # is his eq 1 and eq 6 added together.
+        return ((_dataclasses.replace(
+            PW_REGIMES[0], terms=tuple(terms[n] for n in live),
+            free_offset=True, equation="",
+            title=" + ".join(PW_COMPONENT_TITLES.get(n, n) for n in live)),)
+            + tuple(_dataclasses.replace(PW_REGIMES[i + 1], terms=(terms[n],),
+                                         free_offset=False, title="",
+                                         equation="")
+                    for i, n in enumerate(rest))
+            + tuple(blank(i) for i in range(1 + len(rest), len(PW_REGIMES))))
+    chain = list(live) + rest
+    return tuple(
+        _dataclasses.replace(PW_REGIMES[i], terms=(terms[n],),
+                             free_offset=(i == 0),
+                             title=PW_COMPONENT_TITLES.get(n, ""), equation="")
+        for i, n in enumerate(chain))
+
+
+def fit_early_cell(name, epsilon, force_N, height_um, model):
+    """
+    One cell of a batch, Lulevich's two terms, searched on its own curve.
+
+    The same search the analysis tab runs when the early regime is
+    entered: every order and every joining point, over the window the
+    page is set to. Nothing is taken from the cell before it, and nothing
+    is written back to the board.
+    """
+    end = early_end_pct()
+    found = early_best_arrangement(model, epsilon, force_N, end=end)
+    if not found:
+        return None, "no arrangement of the two components fits this curve"
+    order = [ORDER_COEFFICIENT[t] for t in found["order"]
+             if ORDER_COEFFICIENT.get(t) in PW_EARLY_COMPONENTS]
+    bounds = (0.0,) + tuple(early_park(
+        end, parallel=found["join"] == "parallel", first=found["eps1"]))
+    bounds = repair_boundaries(list(bounds)[1:], top=end)[0]
+    off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
+                               if n not in PW_EARLY_COMPONENTS)
+    result = fit_piecewise(
+        epsilon, force_N, boundaries_pct=bounds,
+        regimes=early_regimes_for(found["join"], order),
+        settings=effective_piecewise_settings(piecewise_settings(),
+                                              piecewise_until(), off),
+        carry=tuple(order), **fit_extras())
+    if not result.get("success"):
+        return None, result.get("error", "fit failed")
+    route = ("both from first contact" if found["join"] == "parallel"
+             else f"{PW_COMPONENT_TITLES.get(order[0], order[0])} first, "
+                  f"the other at ε₁ = {found['eps1']:.1f} %")
+    record = collection_record(name, name, height_um, epsilon, force_N,
+                               result, piecewise_geometry(model),
+                               f"Lulevich two-term, to {end:g} % · {route}",
+                               regimes=early_regimes_for(found["join"], order))
+    record["early"] = {"join": found["join"], "order": list(order),
+                       "eps1": float(found["eps1"]), "end_pct": float(end)}
+    return record, ""
+
+
 def fit_cell_from_file(name, epsilon, force_N, height_um):
     """A new cell from a file: its own ε placed, then fitted, then kept."""
     model = build_model(epsilon, force_N, height_um=height_um)
+    if piecewise_regime() == "early":
+        # The page is on the two-term reading, so the batch is too: a
+        # collection whose cells were fitted two different ways is not a
+        # collection of anything.
+        return fit_early_cell(name, epsilon, force_N, height_um, model)
     placements = compute_placements(model, epsilon, force_N)
     key, _reason = select_placement(
         placements, st.session_state.get("pw_method", "refined"),
@@ -11107,18 +11392,22 @@ def collection_frame(collection):
     rows = []
     grouped = any(str(r.get("group", "") or "").strip()
                   for r in collection.values())
+    two_term = bool(collection) and all(rec.get("early")
+                                        for rec in collection.values())
     for rec in collection.values():
         b = rec["bounds_pct"]
         rows.append({
             "cell": rec["name"], "include": bool(rec.get("include", True)),
             **({"group": str(rec.get("group", "") or "")} if grouped else {}),
             "h₀ (µm)": float(rec["height_um"]),
-            "ε₁ (%)": round(b[1], 2), "ε₂ (%)": round(b[2], 2),
-            "ε₃ (%)": round(b[3], 2), "R²": round(rec["r2"], 5),
+            "ε₁ (%)": round(b[1], 2),
+            **({} if two_term else {"ε₂ (%)": round(b[2], 2),
+                                    "ε₃ (%)": round(b[3], 2)}),
+            "R²": round(rec["r2"], 5),
             "route": rec.get("route", ""),
             **{f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})":
                round(rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1], 4)
-               for s_ in COLLECTION_SYMBOLS},
+               for s_ in collection_symbols(collection)},
         })
     return pd.DataFrame(rows)
 
@@ -11229,8 +11518,14 @@ def collection_eps_figure(cells):
     """Each cell's ε₁, ε₂, ε₃ on one row: how the boundaries differ."""
     fig = go.Figure()
     names = [rec["name"] for rec in cells]
-    for j, (symbol, colour) in enumerate(
-            (("circle", "#555555"), ("square", "#1f77b4"), ("diamond", "#9467bd")), 1):
+    # A two-term reading has ε₁ and nothing else: ε₂ and ε₃ are parked
+    # under x_end, and drawing them would draw two boundaries that are
+    # not boundaries of anything.
+    marks = (("circle", "#555555"), ("square", "#1f77b4"),
+             ("diamond", "#9467bd"))
+    if cells and all(rec.get("early") for rec in cells):
+        marks = marks[:1]
+    for j, (symbol, colour) in enumerate(marks, 1):
         fig.add_trace(go.Scatter(
             x=[rec["bounds_pct"][j] for rec in cells], y=names, mode="markers",
             name=f"ε{j}", marker={"symbol": symbol, "size": 11, "color": colour},
@@ -11545,6 +11840,11 @@ def collection_results_frame(collection):
     for the two shells, which is what a stretching law actually measures.
     """
     rows = []
+    # A batch of two-term readings has one boundary, not three, and no
+    # nucleus in it: columns of parked numbers and empty moduli would read
+    # as measurements of nothing.
+    two_term = bool(collection) and all(rec.get("early")
+                                        for rec in collection.values())
     for rec in collection.values():
         b = list(rec.get("bounds_pct") or (0, 0, 0, 0, 0))
         b += [float("nan")] * (5 - len(b))
@@ -11555,15 +11855,15 @@ def collection_results_frame(collection):
             "included": bool(rec.get("include", True)),
             "h0_um": float(rec["height_um"]),
             "eps1_pct": round(float(b[1]), 3),
-            "eps2_pct": round(float(b[2]), 3),
-            "eps3_pct": round(float(b[3]), 3),
+            **({} if two_term else {"eps2_pct": round(float(b[2]), 3),
+                                    "eps3_pct": round(float(b[3]), 3)}),
             "x_end_pct": round(float(b[4]), 3),
             "route": rec.get("route", ""),
             "R2": round(float(rec.get("r2", float("nan"))), 6),
             "chi2_nu": float(rec.get("chi2_nu", float("nan"))),
             "n_points": int(rec.get("n", 0)),
         }
-        for symbol in COLLECTION_SYMBOLS:
+        for symbol in collection_symbols(collection):
             unit, factor = DISPLAY_UNIT[symbol]
             value = rec["moduli"].get(symbol, float("nan"))
             row[f"{DISPLAY_SYMBOL[symbol]} ({unit})"] = (
@@ -11571,6 +11871,8 @@ def collection_results_frame(collection):
         settings = rec.get("settings") or {}
         for symbol, key, default in (("E_shell", "membrane_thickness_nm", 4.0),
                                      ("E_ne", "envelope_thickness_nm", 40.0)):
+            if symbol not in collection_symbols(collection):
+                continue
             thickness = float(settings.get(key, default) or default)
             value = rec["moduli"].get(symbol, float("nan"))
             row[f"{DISPLAY_SYMBOL[symbol]}·h (mN/m) at h = {thickness:g} nm"] = (
@@ -11598,7 +11900,7 @@ def collection_summary_frame(collection, by_group=True):
     for label, members in blocks:
         if not members:
             continue
-        for symbol in COLLECTION_SYMBOLS:
+        for symbol in collection_symbols(collection):
             unit, factor = DISPLAY_UNIT[symbol]
             values = np.array([rec["moduli"].get(symbol, float("nan")) / factor
                                for rec in members], dtype=float)
@@ -11685,10 +11987,15 @@ def settings_frame(collection):
             ("weighting", st.session_state.get("pw_weighting", "absolute")),
             ("app", "AFM cell analyzer, piecewise fit")]
     if piecewise_regime() == "early":
-        rows.insert(6, ("early window (%)",
-                        st.session_state.get("pw_end", PW_EARLY_END_PCT)))
-        rows.insert(7, ("how the two act", PW_EARLY_JOINS.get(
-            st.session_state.get("pw_early_join", "parallel"), "")))
+        joins = sorted({(r.get("early") or {}).get("join", "")
+                        for r in collection.values()} - {""})
+        rows.insert(6, ("early window (%)", early_end_pct()))
+        rows.insert(7, ("how the two act",
+                        ("searched on each curve: "
+                         + ", ".join(PW_EARLY_JOINS.get(j, j) for j in joins))
+                        if joins else PW_EARLY_JOINS.get(
+                            st.session_state.get("pw_early_join", "parallel"),
+                            "")))
     return pd.DataFrame(rows, columns=["setting", "value"])
 
 
@@ -12123,7 +12430,8 @@ def all_cells_tab():
     quantities = [(DISPLAY_SYMBOL[s_],
                    [rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1]
                     for rec in cells],
-                   DISPLAY_UNIT[s_][0]) for s_ in COLLECTION_SYMBOLS]
+                   DISPLAY_UNIT[s_][0])
+                  for s_ in collection_symbols(collection)]
     for start in range(0, len(quantities), 4):
         cols = st.columns(4)
         for col, (symbol, values, unit_) in zip(cols, quantities[start:start + 4]):
@@ -12463,8 +12771,14 @@ def fit_edges(fit):
     pw = (fit or {}).get("piecewise") if fit else None
     if pw and pw.get("boundaries_pct"):
         # Regime by regime, the boundaries are ε₁, ε₂, ε₃ and nothing else:
-        # the three lines on its curve.
+        # the three lines on its curve. The early regime has one at most,
+        # and none when both components act from first contact: the rest
+        # are parked under x_end where they mark nothing.
         b = pw["boundaries_pct"]
+        if piecewise_regime() == "early":
+            if st.session_state.get("pw_early_join", "parallel") == "parallel":
+                return []
+            return [(float(b[1]) / 100.0, EPS_NAMES[0])]
         return [(float(v) / 100.0, name) for v, name in zip(b[1:4], EPS_NAMES)]
     rows = stage_rows(fit)
     if not rows:
@@ -12911,7 +13225,29 @@ def fit_explainer(fit, result=None):
         "the unknown the fit finds). The force is their sum:"
     )
     st.latex(r"\hat F(x) \;=\; \sum_j \theta_j\,\phi_j(x)")
-    if piecewise:
+    if piecewise and piecewise_regime() == "early":
+        b = fit["piecewise"]["boundaries_pct"]
+        together = (st.session_state.get("pw_early_join", "parallel")
+                    == "parallel")
+        st.latex(
+            r"\hat F(x) = C_0 + K_m\,x^{3} + K_c\,x^{3/2}"
+            if together else
+            r"\hat F(x) = C_0 + K_m\,x^{3}"
+            r" + K_c\,[x-\varepsilon_1]_+^{3/2}")
+        st.markdown(
+            "Two parts and nothing else: the membrane stretching as the cube "
+            "of the squeeze (Lulevich's eq 3) and the interior pressed as a "
+            "Hertzian contact (his eq 6), "
+            + ("both acting from first contact, which is his eq 1."
+               if together else
+               f"the second joining at $\\varepsilon_1 = {b[1]:.1f}\\,\\%$, "
+               "where $[y]_+ = \\max(y, 0)$ keeps it at nothing until then.")
+            + f" The whole of it is read over the first "
+            f"${float(b[-1]):.1f}\\,\\%$ of the squash and no further; the "
+            "nuclear envelope and the inside of the nucleus are not in this "
+            "model, because at this depth the probe has not reached them."
+        )
+    elif piecewise:
         b = fit["piecewise"]["boundaries_pct"]
         st.latex(
             r"\hat F(x) = C_0 + k\,\min(x,\varepsilon_1)"
@@ -20251,9 +20587,9 @@ with tab_results:
                                "📊 Force curve analysis tab.")
                 bounds = fit["piecewise"]["boundaries_pct"]
                 st.caption(
-                    "4-regime piecewise fit · "
-                    + ", ".join(f"{n} = {v:.2f} %"
-                                for n, v in zip(EPS_NAMES, bounds[1:4]))
+                    ("2-term Lulevich fit · " if piecewise_regime() == "early"
+                     else "4-regime piecewise fit · ")
+                    + eps_summary(bounds)
                     + f", end {bounds[4]:.1f} % "
                     f"({fit['piecewise'].get('boundary_source', '')}) · "
                     f"{fit['n_points']} points"
