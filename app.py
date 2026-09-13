@@ -197,6 +197,7 @@ bending_crossover = getattr(_piecewise_module, "bending_crossover", None)
 EARLY_WINDOWS_PCT = getattr(_piecewise_module, "EARLY_WINDOWS_PCT",
                             (20.0, 25.0, 30.0, 35.0))
 bending_constant = getattr(_piecewise_module, "bending_constant", None)
+bending_prefactor = getattr(_piecewise_module, "bending_prefactor", None)
 LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
 HAS_VALIDATION = all(f is not None for f in (
     information_criteria, akaike_weights, residual_diagnostics,
@@ -662,6 +663,9 @@ def hint(text: str):
 DEFAULTS = {
     # display
     "force_unit": "N",
+    # The piecewise plot's own force unit, separate from the page's, so the
+    # graph can be read in newtons without changing every table.
+    "pw_force_unit": "N",
     # A light blue field of points with no outline, and one dark dashed
     # line over it. The eye separates them by lightness and by the kind of
     # mark, which survives a greyscale print and colour blindness both.
@@ -3004,6 +3008,21 @@ def replace_style(style, **changes):
     import dataclasses
     try:
         return dataclasses.replace(style, **changes)
+    except TypeError:  # pragma: no cover - a PlotStyle without the field
+        return style
+
+
+def with_force_unit(style, force_N=None):
+    """The same style with the piecewise plot's own force unit applied."""
+    want = st.session_state.get("pw_force_unit", "N")
+    if want == "auto":
+        want = (autoscale_unit(force_N)
+                if force_N is not None and np.size(force_N) else "nN")
+    if want not in FORCE_UNITS:
+        return style
+    import dataclasses
+    try:
+        return dataclasses.replace(style, force_unit=want)
     except TypeError:  # pragma: no cover - a PlotStyle without the field
         return style
 
@@ -6796,6 +6815,10 @@ def lulevich_panel(result, model, fit=None):
     nu_m, nu_i = float(geometry.nu_membrane), float(geometry.nu_interior)
     end = float(result["boundaries_pct"][-1])
     crossing = bending_crossover(geometry, h)
+    style_unit = st.session_state.get("pw_force_unit", "N")
+    if style_unit not in FORCE_UNITS:
+        style_unit = "N"
+    style_unit_label = FORCE_UNITS[style_unit][1]
 
     box = st.container(border=True)
     with box:
@@ -6872,6 +6895,69 @@ def lulevich_panel(result, model, fit=None):
                        "0 in **B** to read it that way.", icon="⚠️")
 
         st.markdown("**Can the membrane's bending term be dropped here?**")
+
+        # The decisive number is not the ratio between the two membrane
+        # terms, it is what keeping the bending one would ADD to the force
+        # being fitted -- the cytoskeleton carries part of that force too,
+        # so a term that looms next to a small membrane contribution can
+        # still be nothing next to the total.
+        E_m = float((moduli.get("K_shell") or {}).get("E_Pa", float("nan")))
+        A_bend = (bending_prefactor(geometry, h)
+                  if bending_prefactor is not None else float("nan"))
+        verdict, rows = None, []
+        if np.isfinite(E_m) and np.isfinite(A_bend) and E_m > 0:
+            grid = np.array([v for v in (1.0, 2.0, 5.0, 10.0, 20.0, end)
+                             if 0 < v <= end])
+            total = np.abs(predict_piecewise(grid / 100.0, result))
+            bend = E_m * A_bend * (grid / 100.0) ** 0.5
+            share = 100.0 * bend / np.clip(total + bend, 1e-30, None)
+            for at, adds, part in zip(grid, bend, share):
+                rows.append({
+                    "x (%)": f"{at:.1f}",
+                    f"bending would add ({style_unit_label})":
+                        f"{float(from_newtons(adds, style_unit)[0]):.3g}",
+                    "as a share of the fitted force": f"{part:.2f} %",
+                })
+            heavy = share[grid >= 2.0]
+            verdict = float(np.max(heavy)) if heavy.size else float(share.max())
+        if verdict is None:
+            st.caption("The membrane came back at zero on this fit, so there "
+                       "is no bending term to keep or drop.")
+        elif verdict < 2.0:
+            st.success(
+                f"**Yes, drop it.** Above x = 2 % keeping the bending term "
+                f"would change the fitted force by at most **{verdict:.2f} "
+                "%**, which is inside the noise of the measurement. "
+                "Lulevich's eq 3, stretching alone, is what this curve "
+                "supports and it is what is fitted.", icon="✅")
+        elif verdict < 10.0:
+            st.warning(
+                f"**Borderline.** Keeping the bending term would change the "
+                f"fitted force by up to **{verdict:.1f} %** over this "
+                "window, which is more than the noise. Eₘ above carries "
+                "that much systematic uncertainty from the choice alone. "
+                f"Starting the reading past x = "
+                f"{crossing['negligible_pct']:.0f} % would put it back "
+                "inside the noise.", icon="⚠️")
+        else:
+            st.error(
+                f"**No, not over this window.** Keeping the bending term "
+                f"would change the fitted force by up to **{verdict:.0f} "
+                "%**. Eq 3 is not a safe approximation this close to first "
+                f"contact: start the reading past x = "
+                f"{crossing['negligible_pct']:.0f} %, or treat Eₘ here as an "
+                "apparent value rather than the membrane's modulus.",
+                icon="🚫")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
+            st.caption(
+                "What the term would add point by point, at the membrane "
+                "modulus fitted above. It falls as ε^½ against the ε³ of "
+                "stretching, so it matters at the contact end and nowhere "
+                "else — which is why where the reading STARTS decides this, "
+                "not where it ends."
+            )
+
         c1, c2, c3 = st.columns([1, 1, 1.6])
         c1.metric("bending = stretching at", f"{crossing['equal_pct']:.2f} %")
         c2.metric("bending < 5 % of it by",
@@ -7912,19 +7998,33 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         template="simple_white",
         # Top: room for the tags, one row each. Bottom: the x axis, then
         # the legend under it, so nothing is drawn over the data.
-        margin={"l": 80, "r": 20, "t": 16 + TAG_ROW_PX * tag_rows,
-                "b": 78 + 24 * n_rows},
+        margin={"l": 104, "r": 24, "t": 16 + TAG_ROW_PX * tag_rows,
+                "b": 84 + 24 * n_rows},
         legend={"orientation": "h", "yref": "container", "yanchor": "bottom",
                 "y": 0.005, "xanchor": "left", "x": 0.0, "font": {"size": 12},
                 "traceorder": "normal"},
-        xaxis={"title": "Relative deformation x (%)", "anchor": "y2",
-               "range": [x_lo, x_hi]},
-        yaxis={"title": f"Force ({unit})", "domain": [0.30, 1.0],
+        xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
+                         "font": bold_font(17)},
+               "anchor": "y2", "range": [x_lo, x_hi],
+               "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
+               "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
+               "mirror": False, "exponentformat": "none",
+               "showexponent": "none"},
+        yaxis={"title": {"text": f"<b>Force ({unit})</b>",
+                         "font": bold_font(17)},
+               "domain": [0.30, 1.0], "tickfont": bold_font(15),
+               "ticks": "outside", "ticklen": 7, "tickwidth": 2.2,
+               "linewidth": 2.2, "linecolor": "#111111",
+               # Scientific notation, never an SI prefix letter, and kept
+               # on every tick so zooming in never turns 1e-8 into "10n".
+               "exponentformat": "power", "showexponent": "all",
                **({"range": y_window} if y_window and not log_y else {})},
         yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
                 "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
                 "showgrid": False, "zeroline": False,
-                "title": {"text": "[s, u]", "font": {"size": 12}}},
+                "tickfont": bold_font(14), "linewidth": 2.2,
+                "linecolor": "#111111",
+                "title": {"text": "<b>[s, u]</b>", "font": bold_font(14)}},
     )
     if log_y:
         # Only the force axis; the range track stays linear.
@@ -10023,7 +10123,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
     with pw_applied_values(applied):
         target = float(_pw_get("pw_target_r2", 0.999))
         result = run_piecewise_fit(model, epsilon, force_N)
-        style = current_style(force_N)
+        # The plot's own force unit, so the graph can be read in newtons
+        # while the rest of the page keeps whatever the sidebar is set to.
+        style = with_force_unit(current_style(force_N), force_N)
         placements = current_placements(epsilon, force_N)
         selected = st.session_state.get("pw_selected") or {}
         found = (placements or {}).get("searches", {}).get(selected.get("key"))
@@ -10133,12 +10235,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 )
                 # How the plot draws it, under the plot, where it is being
                 # looked at. Both apply at once; neither changes the fit.
-                v1, v2 = st.columns([2.4, 1])
+                v1, v2, v3 = st.columns([2.1, 1.1, 0.9])
                 with v1:
                     st.radio("Components on the plot", list(PW_VIEWS),
                              format_func=PW_VIEWS.get, key="pw_view",
                              horizontal=True, label_visibility="collapsed")
                 with v2:
+                    st.selectbox(
+                        "Force unit", ["N"] + [u for u in FORCE_UNITS
+                                               if u != "N"] + ["auto"],
+                        key="pw_force_unit", label_visibility="collapsed",
+                        help="Newtons by default, with the ticks in "
+                             "scientific notation so zooming in never turns "
+                             "1e-8 into “10n”. “auto” picks the unit that "
+                             "keeps the peak between 1 and 1000.",
+                    )
+                with v3:
                     st.checkbox("log F axis", key="pw_log_y")
                 fitted = predict_piecewise(epsilon, result)
 
