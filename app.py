@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import copy
 import csv
+import fnmatch
 import importlib
 import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -661,6 +663,13 @@ DEFAULTS = {
     # The piecewise plot's own force unit, separate from the page's, so the
     # graph can be read in newtons without changing every table.
     "pw_force_unit": "N",
+    # What the plot draws besides the data and the fit. All on by default;
+    # a figure for a paper usually wants most of them off.
+    "pw_show_areas": True,
+    "pw_show_bands": True,
+    "pw_show_tags": True,
+    "pw_show_track": True,
+    "pw_show_zero": False,
     # A light blue field of points with no outline, and one dark dashed
     # line over it. The eye separates them by lightness and by the kind of
     # mark, which survives a greyscale print and colour blindness both.
@@ -826,6 +835,18 @@ DEFAULTS = {
     # The cells fitted so far this session, each with its own boundaries,
     # moduli and curve, for the All cells tab.
     "pw_collection": {},
+    # A batch: where the curve files are, the sheet that says how tall each
+    # cell was, and the workbook the answers are written into.
+    "pw_batch_folder": "",
+    "pw_batch_pattern": "*",
+    "pw_batch_found": [],
+    "pw_heights": {},
+    "pw_heights_book": None,
+    "pw_heights_name": "",
+    "pw_book": None,
+    "pw_book_at": "",
+    "pw_book_curves": True,
+    "pw_cells_by_group": True,
     # The C2C12 constraints the boundaries are found inside, in percent:
     # ε₁ (end of the contact artefact) under 5 %, ε₂ (nucleus met) in the
     # prior's 44 to 62 %, and ε₃ - ε₂ (how long the nuclear bump lasts)
@@ -5700,6 +5721,12 @@ def active_component_names():
 
 
 PW_COMPONENT_COLORS = {c[0]: c[3] for c in PW_COMPONENTS}
+# The same laws written so they can sit in a table cell: a stretching
+# shell goes as the cube of the squeeze, a Hertzian contact as its 3/2.
+PW_LAW_PLAIN = {"K_shell": "(x − s)³, a stretching shell",
+                "K_cyto": "(x − s)^1.5, a Hertzian contact",
+                "K_nucleus": "(x − s)³, a stretching shell",
+                "K_core": "(x − s)^1.5, a Hertzian contact"}
 # What a regime is called when it is that component's own stretch.
 PW_COMPONENT_TITLES = {c[0]: c[1].split(" ", 1)[1] for c in PW_COMPONENTS}
 # Which boundary each component starts at: its regime's start. Moving a
@@ -7927,8 +7954,14 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     end = float(b[-1])
     ranges = result.get("ranges") or {}
     stacked = view == "stacked" and not log_y and component_force is not None
+    show_areas = bool(st.session_state.get("pw_show_areas", True))
+    show_bands = bool(st.session_state.get("pw_show_bands", True))
+    show_tags = bool(st.session_state.get("pw_show_tags", True))
+    show_track = bool(st.session_state.get("pw_show_track", True))
+    show_zero = bool(st.session_state.get("pw_show_zero", False))
+    stacked = stacked and show_areas
     live_off = set(off)
-    for regime in result["regimes"]:
+    for regime in (result["regimes"] if show_bands else ()):
         names = [n for n in (regime.get("params") or {})
                  if n not in ("C0", "k_align")]
         if names and all(n in live_off for n in names):
@@ -8028,7 +8061,8 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     # One row per component that is on: the track and the ticked rows on
     # the board are the same list, in the same order.
     ticks, labels = [], []
-    drawn_rows = [c for c in active_components() if c[0] not in off]
+    drawn_rows = ([c for c in active_components() if c[0] not in off]
+                  if show_track else [])
     for row, (name, label, symbol, colour, _law) in enumerate(drawn_rows):
         a, u = ranges.get(name, (np.nan, np.nan))
         ticks.append(row)
@@ -8047,6 +8081,9 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 showlegend=False,
                 hovertemplate=f"{symbol} holds what it reached<extra></extra>",
             ))
+    # No rows means no track panel: the force plot then takes the whole
+    # height and the x axis sits directly under it.
+    has_track = bool(ticks)
     x_lo = min(0.0, float(np.nanmin(x)) if x.size else 0.0) - 1.0
     x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
     y_window = None
@@ -8077,8 +8114,13 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         if st.session_state.get("pw_early_join", "parallel") != "parallel":
             keep = [b[0], b[1], b[-1]]
         marks = keep
-    tag_rows = add_boundary_lines(fig, marks, x_span=x_hi - x_lo, x_max=x_hi,
-                                  extra=artefact)
+    tag_rows = (add_boundary_lines(fig, marks, x_span=x_hi - x_lo,
+                                   x_max=x_hi, extra=artefact)
+                if show_tags else 0)
+    if show_zero:
+        fig.add_trace(go.Scatter(
+            x=[x_lo, x_hi], y=[0.0, 0.0], mode="lines", showlegend=False,
+            hoverinfo="skip", line={"color": "#111111", "width": 1.2}))
     if note:
         # Which fit this is, top left, under the regime names: the corner
         # the rising curve and its layers leave empty.
@@ -8103,31 +8145,276 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 "traceorder": "normal"},
         xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
                          "font": bold_font(17)},
-               "anchor": "y2", "range": [x_lo, x_hi],
+               # The x axis is drawn under whichever panel is the bottom
+               # one: the range track when it is on, the force plot when
+               # the track is off. Without this the axis would be anchored
+               # to a panel that is not there and the plot would lose it.
+               "anchor": "y2" if has_track else "y",
+               "range": [x_lo, x_hi],
                "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
                "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
-               "mirror": False, "exponentformat": "none",
-               "showexponent": "none"},
+               "showline": True, "zeroline": False, "mirror": False,
+               "exponentformat": "none", "showexponent": "none"},
         yaxis={"title": {"text": f"<b>Force ({unit})</b>",
                          "font": bold_font(17)},
-               "domain": [0.30, 1.0], "tickfont": bold_font(15),
+               "domain": [0.30, 1.0] if has_track else [0.0, 1.0],
+               "tickfont": bold_font(15),
                "ticks": "outside", "ticklen": 7, "tickwidth": 2.2,
-               "linewidth": 2.2, "linecolor": "#111111",
+               "linewidth": 2.2, "linecolor": "#111111", "showline": True,
                # Scientific notation, never an SI prefix letter, and kept
                # on every tick so zooming in never turns 1e-8 into "10n".
                "exponentformat": "power", "showexponent": "all",
                **({"range": y_window} if y_window and not log_y else {})},
-        yaxis2={"domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
-                "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
-                "showgrid": False, "zeroline": False,
-                "tickfont": bold_font(14), "linewidth": 2.2,
-                "linecolor": "#111111",
-                "title": {"text": "<b>[s, u]</b>", "font": bold_font(14)}},
+        **({"yaxis2": {
+            "domain": [0.0, 0.24], "anchor": "x", "tickvals": ticks,
+            "ticktext": labels, "range": [len(ticks) - 0.5, -0.5],
+            "showgrid": False, "zeroline": False,
+            "tickfont": bold_font(14), "linewidth": 2.2,
+            "linecolor": "#111111",
+            "title": {"text": "<b>[s, u]</b>", "font": bold_font(14)}}}
+           if has_track else {}),
     )
     if log_y:
         # Only the force axis; the range track stays linear.
         fig.update_layout(yaxis={"type": "log"})
     return fig
+
+
+PW_FURNITURE = (
+    ("pw_show_areas", "Shaded component areas",
+     "The stacked fills under the curve, one per component. Off leaves the "
+     "data, the fitted curve and each component's own dashed line."),
+    ("pw_show_bands", "Regime bands",
+     "The tinted vertical bands (R1, R2, …) behind the curve that mark "
+     "which stretch of the squash each regime owns."),
+    ("pw_show_tags", "Boundary tags",
+     "The ε lines with their labels above the plot. Off removes both the "
+     "lines and the rows of tags, which shortens the figure."),
+    ("pw_show_track", "Range track [s, u]",
+     "The panel under the plot with one bar per component showing where it "
+     "acts. Off gives the force plot the whole height, x axis included."),
+    ("pw_show_zero", "F = 0 line",
+     "A black horizontal line at zero force, useful when the baseline "
+     "matters more than the peak."),
+)
+
+
+def plot_furniture():
+    """
+    What the plot draws, as tick boxes under it.
+
+    None of these touch the fit: they are furniture. The figure is redrawn
+    from the same result, so a box can be cleared to take a clean figure
+    out of the app for a paper.
+    """
+    with st.expander("🎨 What the plot draws", expanded=False):
+        st.caption(
+            "Display only. Clearing a box changes the picture, never the "
+            "fit, the boundaries or the moduli."
+        )
+        boxes = st.columns(len(PW_FURNITURE))
+        for column, (key, label, tip) in zip(boxes, PW_FURNITURE):
+            with column:
+                st.checkbox(label, key=key, help=tip)
+        if st.button("↺ Put everything back", key="pw_furniture_reset",
+                     help="Back to the default picture: areas, bands, tags "
+                          "and the range track on, the zero line off."):
+            rerun_keeping_settings({key: DEFAULTS[key]
+                                    for key, _l, _t in PW_FURNITURE})
+
+
+def fitting_range_panel(result=None, n_points=None):
+    """
+    What is being fitted and where each part starts, in one card.
+
+    The whole of the board's arithmetic in four lines: how far the reading
+    goes, which boundary starts which component, and how much of the curve
+    each one is fitted on. In the early regime this is the board — there is
+    nothing else to set, and nothing on this card can undo a good fit by
+    being pressed.
+    """
+    early = piecewise_regime() == "early"
+    b = list((result or {}).get("boundaries_pct")
+             or piecewise_boundaries())
+    ranges = ((result or {}).get("ranges") if (result or {}).get("success")
+              else None) or piecewise_ranges(b)
+    end = float(b[-1])
+    marks = {1: "ε₁", 2: "ε₂", 3: "ε₃"}
+    off = set(piecewise_off())
+    rows = []
+    for name, label, symbol, _colour, law in active_components():
+        if name in off:
+            continue
+        start, until = ranges.get(name, (float("nan"), float("nan")))
+        start, until = float(start), min(float(until), end)
+        if not np.isfinite(start):
+            continue
+        # Which boundary this component starts at, named the way the rest
+        # of the page names it. Anything at the very beginning is not a
+        # boundary at all: it is first contact.
+        near = [j for j in (1, 2, 3)
+                if j < len(b) and abs(float(b[j]) - start) < 0.05]
+        where = (f"{marks[near[0]]} = {start:.2f} %" if near
+                 else ("from first contact" if start <= float(b[0]) + 1e-6
+                       else f"{start:.2f} %"))
+        rows.append({
+            "component": f"{label} · {symbol}",
+            "starts at": where,
+            "fitted over": f"{start:.2f} – {until:.2f} %",
+            "share of the window": (f"{100.0 * (until - start) / max(end - float(b[0]), 1e-9):.0f} %"),
+            "its law": PW_LAW_PLAIN.get(name, ""),
+        })
+    head = (f"**Fitted over {float(b[0]):.2f} → {end:.2f} %** of the squash"
+            + (". Nothing past that point enters the fit."
+               if early else "."))
+    if result and result.get("success"):
+        head += f" · R² = {result['r_squared']:.5f}"
+        if n_points:
+            head += f" · {int(n_points):,} points"
+    st.markdown("**📏 The range being fitted, and where each part starts**")
+    st.markdown(head)
+    if rows:
+        flat_table(pd.DataFrame(rows),
+                   align_right=["fitted over", "share of the window"])
+    else:
+        st.caption("Nothing is ticked in **A**, so there is no range to "
+                   "report.")
+    if early:
+        st.caption(
+            "ε₂ and ε₃ belong to the two components this regime does not "
+            "fit, so they are not shown and change nothing: the early "
+            "regime has one boundary at most.")
+
+
+def early_window_panel():
+    """
+    The early regime's whole board: the window, and nothing that can
+    quietly undo a fit that arrived already searched.
+
+    The two-term fit is chosen for this curve the moment the regime is
+    entered — every order, every joining point, 63 arrangements — so the
+    controls it needs are the window it is read over and the way the two
+    components act. They are behind a fold because the default is the
+    answer: opened, they still cannot reach a boundary search that would
+    replace it without being asked.
+    """
+    joined = st.session_state.get("pw_early_join", "parallel")
+    said_early = st.session_state.get("pw_early_note")
+    if said_early:
+        st.caption("🔎 " + said_early)
+    with st.expander("⚙️ The early window — how far it is read, and how the "
+                     "two act", expanded=False):
+        st.caption(
+            "Both of these re-search the two components and re-fit at once. "
+            "Nothing else on this page changes the early fit: the domains, "
+            "the regression conditions and the screen belong to the full "
+            "deformation, and they are not shown here because a fit chosen "
+            "over every arrangement has nothing to gain from being taken "
+            "apart by hand.")
+        st.radio(
+            "How the two act", list(PW_EARLY_JOINS),
+            format_func=PW_EARLY_JOINS.get, key="pw_early_join",
+            horizontal=True, label_visibility="collapsed",
+            on_change=_pw_early_join_changed,
+            help="Lulevich's own arrangement has both from first contact, "
+                 "in parallel. Curves usually prefer one of them joining a "
+                 "little way in; that is the other choice, and ε₁ is where "
+                 "it joins.",
+        )
+        e1c, endc = st.columns(2)
+        with e1c:
+            st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
+                            key="pw_b1", disabled=(joined == "parallel"),
+                            help="Where the second component joins. Found by "
+                                 "the search; typing over it fits there "
+                                 "instead. Not used when both act from first "
+                                 "contact.")
+        with endc:
+            st.number_input("x_end (%)", 2.0, 100.0, step=0.5, format="%.1f",
+                            key="pw_end", on_change=_pw_early_end_changed,
+                            help="How far the early reading goes. Nothing "
+                                 "past this enters the fit. 35 % by "
+                                 "default: Lulevich fits his eq 3 over "
+                                 "ε = 0.1–0.3 and a living cell is "
+                                 "reversible to about 30 %.")
+        w1, w2 = st.columns(2)
+        with w1:
+            window = st.session_state.get("_pw_early_window")
+            if window and st.button(
+                    f"📐 Read to {float(window):.0f} % (where it stays one "
+                    "power law)", key="pw_early_window_take", **STRETCH,
+                    help="Sets x_end to the end of the stretch over which "
+                         "this curve's log-log slope is still flat, which is "
+                         "as far as one power law describes it."):
+                taken = early_park(round(float(window), 1))
+                rerun_keeping_settings(
+                    {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                     "_pw_find_early": True, "_pw_apply": True})
+        with w2:
+            if st.button(f"↺ Back to the default ({PW_EARLY_END_PCT:g} %, "
+                         "best arrangement found)", key="pw_early_default",
+                         **STRETCH,
+                         help="Whatever has been changed here, this is the "
+                              "fit the regime arrives with: the window at "
+                              f"{PW_EARLY_END_PCT:g} % and the arrangement "
+                              "the search kept for this curve."):
+                taken = early_park(PW_EARLY_END_PCT)
+                rerun_keeping_settings(
+                    {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                     "pw_early_eps": None, "_pw_find_early": True,
+                     "_pw_apply": True})
+
+
+def how_it_was_fitted(result):
+    """
+    Two sentences: what this fit is and how it was arrived at.
+
+    Beside the graph, where somebody looking at the curve for the first
+    time is standing. Everything longer lives on the board and in the
+    validation tabs; this is the caption a figure would carry.
+    """
+    if not (result and result.get("success")):
+        return ""
+    b = result.get("boundaries_pct") or ()
+    if len(b) < 5:
+        return ""
+    names = components_for(st.session_state.get("cell_type"))
+    order = [names[t][0] for t in component_order()
+             if ORDER_COEFFICIENT.get(t) in set(active_component_names())]
+    r2 = float(result.get("r_squared", float("nan")))
+    if piecewise_regime() == "early":
+        parallel = st.session_state.get("pw_early_join",
+                                        "parallel") == "parallel"
+        first = order[0] if order else "the first component"
+        second = order[1] if len(order) > 1 else "the second"
+        how = (
+            f"**How this was fitted.** Lulevich's two-component model was "
+            f"fitted to the first **{b[4]:.0f} %** of the squash and to "
+            f"nothing beyond it: the membrane as a stretching shell "
+            f"(ε³, his eq 3) and the cell interior as a Hertzian contact "
+            f"(ε^1.5, his eq 6), each converted into a modulus with his own "
+            f"prefactors. "
+            + (f"Both act from first contact, in parallel, which is his "
+               f"eq 1 arrangement"
+               if parallel else
+               f"{first} acts from first contact and {second} joins at "
+               f"ε₁ = {b[1]:.1f} %, the arrangement chosen by searching "
+               f"every order and every joining point")
+            + f", and the coefficients were found by one bounded, "
+            f"non-negative least-squares solve — R² = {r2:.5f}.")
+        return how
+    edges = ", ".join(f"{name} = {value:.1f} %" for name, value in
+                      zip(EPS_NAMES, b[1:4]))
+    return (
+        f"**How this was fitted.** The curve was cut at {edges} and fitted "
+        f"regime by regime out to {b[4]:.0f} %, each stretch anchored to "
+        f"the force the one before it ended on, so the fitted curve is "
+        f"continuous by construction. "
+        + (f"{' → '.join(order)} are met in that order" if order
+           else "The components are met in the order set on the board")
+        + f", each contributing its own power law from where it joins, and "
+        f"every coefficient came from a bounded non-negative solve — "
+        f"R² = {r2:.5f}.")
 
 
 def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
@@ -10123,13 +10410,20 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # every fit is made of exactly what they have ticked.
         st.markdown("#### 🎛️ Fitting — the method, step by step")
         st.caption(
+            "The early regime is two components over one window and it "
+            "arrives already fitted: **A** what is in the specimen, then "
+            "the range it was read over. There is no boundary search, no "
+            "R² target and no screen here, because the arrangement was "
+            "chosen over all 63 of them the moment the regime was entered. "
+            "Switch to full deformation in **A** for the four-component "
+            "board."
+            if piecewise_regime() == "early" else
             "Read top to bottom it is a method: **A** what is in the "
             "specimen, **B** over what domains, **C** under what regression "
             "conditions, **D** run it, **E** test the hypothesis in A "
             "against the curve, and **F**, under the results, what the "
             "answer is worth. **A** is also where you choose between the "
-            "whole squash and the early regime; everything else on the "
-            "board behaves the same either way."
+            "whole squash and the early regime."
         )
         status_slot = st.empty()
 
@@ -10144,9 +10438,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
                  "Everything else on this board behaves the same.",
         )
         st.caption(PW_REGIME_HELP.get(piecewise_regime(), ""))
-        st.caption("The components ticked below are a hypothesis about this "
-                   "cell. Exactly what is ticked is fitted, drawn and "
-                   "reported; step E tests whether the curve supports it.")
+        st.caption(
+            "The two components below are Lulevich's own: exactly what is "
+            "ticked is fitted, drawn and reported, and the panel under the "
+            "results says how it stands against his paper."
+            if piecewise_regime() == "early" else
+            "The components ticked below are a hypothesis about this cell. "
+            "Exactly what is ticked is fitted, drawn and reported; step E "
+            "tests whether the curve supports it.")
         share_col, model_col = st.columns([1.2, 1], gap="medium")
         with share_col:
             load_sharing_control()
@@ -10164,84 +10463,34 @@ def piecewise_section(model, epsilon, force_N, rupture):
         board_ranges = piecewise_ranges(piecewise_boundaries())
 
         early_now = piecewise_regime() == "early"
-        st.markdown("**B · Domains — where each part takes over**")
-        st.caption(
-            ("The stretch each of the two components is fitted on: where "
-             "the second one joins, and how far the reading goes. Found "
-             "from the curve, or held exactly where you put them."
-             if early_now else
-             "The stretch of deformation each component is fitted on. "
-             "Found from the curve, or held exactly where you put them."))
-        st.latex(r"0 < \varepsilon_1 \le x_{end}" if early_now else
-                 r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
-                 r"\le x_{end}")
-        if early_now and st.session_state.get("pw_early_join",
-                                              "parallel") == "parallel":
-            st.caption("Both components act from first contact, so there is "
-                       "no boundary to place: the fit runs over "
-                       "[0, x_end] exactly as set.")
-        st.radio(
-            "on ▶ Fit & plot", list(PW_EPS_WAYS),
-            disabled=(early_now and st.session_state.get(
-                "pw_early_join", "parallel") == "parallel"),
-            format_func=PW_EPS_WAYS.get, key="pw_eps_way",
-            on_change=_pw_eps_way_changed, horizontal=True,
-            label_visibility="collapsed",
-            help="Found from this curve: ▶ Fit & plot places the boundaries "
-                 "and overwrites the numbers below with what it found. Kept "
-                 "as typed: the fit happens exactly at the numbers below and "
-                 "nothing moves.",
-        )
+        nothing_ticked = not [c for c in active_components()
+                              if c[0] not in piecewise_off()]
+        pressed = reaching = refreshed = False
+        # What is being fitted and where each part starts, filled in after
+        # the fit so it can carry its R². In the early regime this IS the
+        # board: that fit arrives already searched over every arrangement,
+        # and the sections below exist to take a fit apart and put it back
+        # together, which is exactly what should not happen to it.
+        range_slot = st.container()
         if early_now:
-            said_early = st.session_state.get("pw_early_note")
-            if said_early:
-                st.caption("🔎 " + said_early)
-            st.radio(
-                "How the two act", list(PW_EARLY_JOINS),
-                format_func=PW_EARLY_JOINS.get, key="pw_early_join",
-                horizontal=True, label_visibility="collapsed",
-                on_change=_pw_early_join_changed,
-                help="Lulevich's own arrangement has both from first "
-                     "contact, in parallel. Curves often prefer one of them "
-                     "joining a little way in; that is the other choice, "
-                     "and ε₁ is where it joins.",
-            )
-            joined = st.session_state.get("pw_early_join", "parallel")
-            # ε₂ and ε₃ belong to components held at zero here, so they
-            # change nothing and are not shown; they are kept in order
-            # behind the scenes.
-            e1c, endc, findc = st.columns([1, 1, 1.4])
-            with e1c:
-                st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
-                                key="pw_b1",
-                                disabled=(joined == "parallel"),
-                                help="Where the second component joins. Not "
-                                     "used when both act from first "
-                                     "contact.")
-            with endc:
-                st.number_input("x_end (%)", 2.0, 100.0, step=0.5,
-                                format="%.1f", key="pw_end",
-                                on_change=_pw_early_end_changed,
-                                help="How far the early reading goes. "
-                                     "Nothing past this enters the fit. "
-                                     "35 % by default: Lulevich fits his "
-                                     "eq 3 over ε = 0.1–0.3 and a living "
-                                     "cell is reversible to about 30 %.")
-            with findc:
-                window = st.session_state.get("_pw_early_window")
-                if window and st.button(
-                        f"📐 Read to {float(window):.0f} % "
-                        "(where it stays one power law)",
-                        key="pw_early_window_take", **STRETCH,
-                        help="Sets x_end to the end of the stretch over "
-                             "which this curve's log-log slope is still "
-                             "flat, which is as far as one power law "
-                             "describes it."):
-                    taken = early_park(round(float(window), 1))
-                    rerun_keeping_settings(
-                        {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-                         "_pw_find_early": True, "_pw_apply": True})
+            early_window_panel()
         else:
+            st.markdown("**B · Domains — where each part takes over**")
+            st.caption(
+                "The stretch of deformation each component is fitted on. "
+                "Found from the curve, or held exactly where you put them.")
+            st.latex(r"0 < \varepsilon_1 < \varepsilon_2 < \varepsilon_3 "
+                     r"\le x_{end}")
+            st.radio(
+                "on ▶ Fit & plot", list(PW_EPS_WAYS),
+                format_func=PW_EPS_WAYS.get, key="pw_eps_way",
+                on_change=_pw_eps_way_changed, horizontal=True,
+                label_visibility="collapsed",
+                help="Found from this curve: ▶ Fit & plot places the boundaries "
+                     "and overwrites the numbers below with what it found. Kept "
+                     "as typed: the fit happens exactly at the numbers below and "
+                     "nothing moves.",
+            )
             e1c, e2c, e3c, endc = st.columns(4)
             with e1c:
                 st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
@@ -10257,91 +10506,86 @@ def piecewise_section(model, epsilon, force_N, rupture):
                                 format="%.1f", key="pw_end",
                                 help="Last point fitted; not moved by the "
                                      "routes.")
-        for note in (st.session_state.get("_pw_boundary_repairs") or ()):
-            st.caption(f"🔧 Repaired: {note}.")
-        for note in constraint_notes(piecewise_boundaries()):
-            st.caption(f"⚠️ {note}.")
-        if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
-            at = float(rupture["epsilon"]) * 100.0
-            if 0.0 < at < min(float(st.session_state["pw_end"]), top):
-                st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
-                           rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
+            for note in (st.session_state.get("_pw_boundary_repairs") or ()):
+                st.caption(f"🔧 Repaired: {note}.")
+            for note in constraint_notes(piecewise_boundaries()):
+                st.caption(f"⚠️ {note}.")
+            if (rupture or {}).get("method") == "force-drop" and rupture.get("epsilon"):
+                at = float(rupture["epsilon"]) * 100.0
+                if 0.0 < at < min(float(st.session_state["pw_end"]), top):
+                    st.caption(rf"ℹ️ Force drop at $x = {at:.1f}\,\%$ (possible "
+                               rf"rupture): set $x_{{end}} = {at:.1f}$ to exclude it.")
 
-        st.markdown("**C · Regression conditions — how the curve is read**")
-        st.caption("Neither of these changes the model. They change which "
-                   "part of the curve the model is fitted to, and over four "
-                   "decades of force that decides the answer.")
-        read_curve_control(epsilon, force_N)
+            st.markdown("**C · Regression conditions — how the curve is read**")
+            st.caption("Neither of these changes the model. They change which "
+                       "part of the curve the model is fitted to, and over four "
+                       "decades of force that decides the answer.")
+            read_curve_control(epsilon, force_N)
 
-        st.markdown("**D · Run**")
-        nothing_ticked = not [c for c in active_components()
-                              if c[0] not in piecewise_off()]
-        go1, go2, go3 = st.columns([1.1, 1.3, 1])
-        with go1:
-            pressed = st.button(
-                "▶ Fit & plot", type="primary", key="pw_fit_plot",
-                disabled=nothing_ticked,
-                help="Fits the components ticked in step 1, at the "
-                "boundaries step 2 gives, and redraws everything on this "
-                "page from that one fit.",
-                **STRETCH,
-            )
-        with go2:
-            no_boundaries = (piecewise_regime() == "early"
-                             and st.session_state.get("pw_early_join",
-                                                      "parallel") == "parallel")
-            reaching = st.button(
-                f"🎯 Reach R² ≥ {float(_pw_get('pw_target_r2', 0.999)):g}",
-                key="pw_reach", disabled=nothing_ticked or no_boundaries,
-                help="Searches for boundaries that bring the whole curve to "
-                "the target, opening the C2C12 constraints out a step at a "
-                "time until it gets there, and says what it had to open. "
-                "The boundaries it finds are written on the board as typed "
-                "numbers.",
-                **STRETCH,
-            )
-        with go3:
-            refreshed = st.button(
-                "🔄 Refresh graph", key="pw_refresh",
-                disabled=nothing_ticked,
-                help="Redraws the graph and the results at exactly what the "
-                "board holds now. Moves no boundary and chooses nothing.",
-                **STRETCH,
-            )
-        if nothing_ticked:
-            st.warning("Tick at least one component in **A** before "
-                       "fitting.", icon="⚠️")
-        else:
+            st.markdown("**D · Run**")
+            go1, go2, go3 = st.columns([1.1, 1.3, 1])
+            with go1:
+                pressed = st.button(
+                    "▶ Fit & plot", type="primary", key="pw_fit_plot",
+                    disabled=nothing_ticked,
+                    help="Fits the components ticked in step 1, at the "
+                    "boundaries step 2 gives, and redraws everything on this "
+                    "page from that one fit.",
+                    **STRETCH,
+                )
+            with go2:
+                reaching = st.button(
+                    f"🎯 Reach R² ≥ {float(_pw_get('pw_target_r2', 0.999)):g}",
+                    key="pw_reach", disabled=nothing_ticked,
+                    help="Searches for boundaries that bring the whole curve to "
+                    "the target, opening the C2C12 constraints out a step at a "
+                    "time until it gets there, and says what it had to open. "
+                    "The boundaries it finds are written on the board as typed "
+                    "numbers.",
+                    **STRETCH,
+                )
+            with go3:
+                refreshed = st.button(
+                    "🔄 Refresh graph", key="pw_refresh",
+                    disabled=nothing_ticked,
+                    help="Redraws the graph and the results at exactly what the "
+                    "board holds now. Moves no boundary and chooses nothing.",
+                    **STRETCH,
+                )
+            if nothing_ticked:
+                st.warning("Tick at least one component in **A** before "
+                           "fitting.", icon="⚠️")
+            else:
+                st.caption(
+                    "**▶ Fit & plot** uses the board as it stands. "
+                    "**🎯 Reach R²** goes looking for boundaries that meet the "
+                    "target, widening the prior only as far as it has to. "
+                    "**🔄 Refresh graph** just draws the board again."
+                )
+
+            st.markdown("**E · Screen — four components first, in every "
+                        "arrangement**")
             st.caption(
-                "**▶ Fit & plot** uses the board as it stands. "
-                "**🎯 Reach R²** goes looking for boundaries that meet the "
-                "target, widening the prior only as far as it has to. "
-                "**🔄 Refresh graph** just draws the board again."
+                "Four components are exhausted before three is considered: all "
+                "**24 orders × 16 carry patterns = 384 fits**, which is the "
+                "whole space — the 16 carry patterns contain ① all carried on, "
+                "② one at a time and ③ every mixture between them. A component "
+                "is dropped only when four of them cannot be made to work, and "
+                "the ladder says exactly why. Then three (192), two (48), one "
+                "(8). Same points, same boundaries, ranked by AICc, which "
+                "charges for parameters so a component that only flatters R² "
+                "loses."
             )
-
-        st.markdown("**E · Screen — four components first, in every "
-                    "arrangement**")
-        st.caption(
-            "Four components are exhausted before three is considered: all "
-            "**24 orders × 16 carry patterns = 384 fits**, which is the "
-            "whole space — the 16 carry patterns contain ① all carried on, "
-            "② one at a time and ③ every mixture between them. A component "
-            "is dropped only when four of them cannot be made to work, and "
-            "the ladder says exactly why. Then three (192), two (48), one "
-            "(8). Same points, same boundaries, ranked by AICc, which "
-            "charges for parameters so a component that only flatters R² "
-            "loses."
-        )
-        st.caption(
-            "One caveat, stated rather than hidden: every candidate is "
-            "fitted at the boundaries on the board, which were placed for "
-            "the combination ticked in **A**. That is what makes the AICc "
-            "differences comparable — same points, same domains — but it "
-            "does favour the combination the boundaries were chosen for. "
-            "To screen without that lean, set the boundaries by hand in "
-            "**B** first."
-        )
-        component_screen_panel(model, epsilon, force_N)
+            st.caption(
+                "One caveat, stated rather than hidden: every candidate is "
+                "fitted at the boundaries on the board, which were placed for "
+                "the combination ticked in **A**. That is what makes the AICc "
+                "differences comparable — same points, same domains — but it "
+                "does favour the combination the boundaries were chosen for. "
+                "To screen without that lean, set the boundaries by hand in "
+                "**B** first."
+            )
+            component_screen_panel(model, epsilon, force_N)
 
         # The board holds what is decided here and nothing else. The route
         # that finds ε is chosen by the fit itself -- every route is scored
@@ -10404,6 +10648,14 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 values = {k: round(float(v), 2) for k, v in
                           zip(PW_BOUNDARY_KEYS, placements["rows"][key]["best_pct"])}
             rerun_keeping_settings({**values, "_pw_apply": True})
+
+    # The early regime has no ▶ Fit & plot, because it has nothing to wait
+    # for: tick a component or change the window and it is refitted at
+    # once. Only the full-deformation board holds changes back until the
+    # button is pressed.
+    if early_now and pw_board_values() != applied:
+        apply_board()
+        applied = st.session_state["pw_applied"]["values"]
 
     waiting = pw_board_values() != applied
     with status_slot.container():
@@ -10520,10 +10772,16 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         line + (rf" · worst $R_{{{worst['key'][1]}}}$: "
                                 rf"$R^2 = {worst['r_squared']:.4f}$"
                                 if worst else "")
-                        + f". Press **🎯 Reach R² ≥ {target:g}** on the board "
-                        "and it will look for boundaries that meet it, "
-                        "widening the C2C12 constraints only as far as it "
-                        "has to.", icon="⚠️")
+                        + (". The early regime is read over a window, not "
+                           "searched for boundaries: widen or narrow "
+                           "**x_end** under the plot if this matters, "
+                           "though a two-term fit over the first third of "
+                           "the squash is not asked to reach R²★."
+                           if early_now else
+                           f". Press **🎯 Reach R² ≥ {target:g}** on the "
+                           "board and it will look for boundaries that meet "
+                           "it, widening the C2C12 constraints only as far "
+                           "as it has to."), icon="⚠️")
                 log_y = bool(st.session_state.get("pw_log_y"))
                 st.plotly_chart(
                     piecewise_figure(
@@ -10534,6 +10792,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     ),
                     key="pw_curve", **STRETCH,
                 )
+                # How this fit was made, in two sentences, beside the
+                # graph. Short on purpose: the long version is the board below.
+                said_how = how_it_was_fitted(result)
+                if said_how:
+                    st.info(said_how, icon="🧪")
                 # What is on the graph right now, in one line, under it.
                 piecewise_graph_note(
                     result, off=off_now,
@@ -10560,6 +10823,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     )
                 with v3:
                     st.checkbox("log F axis", key="pw_log_y")
+                plot_furniture()
                 fitted = predict_piecewise(epsilon, result)
 
         with results_slot:
@@ -10589,8 +10853,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     st.session_state["pw_collection"] = collection
                     rerun_keeping_settings()
 
+        # ---- the range card, back up on the board, now with its R² -----
+        with range_slot:
+            fitting_range_panel(result if ok else None, int(np.size(epsilon)))
+
         # ---- F · what the answer is worth ------------------------------
-        if ok:
+        # The early regime's answer is judged against Lulevich's own
+        # numbers, in the panel below, rather than by the four-component
+        # validation tabs, which ask questions about a model it is not.
+        if ok and not early_now:
             validation_panel(result, epsilon, force_N, model)
 
         # ---- the early regime against its source, from this same fit ---
@@ -10800,6 +11071,11 @@ def refit_collection_cell(record, height_um=None):
                             eps, force, result, piecewise_geometry(model),
                             record.get("route", ""))
     new["include"] = record.get("include", True)
+    # What the sheet said about this cell is not something a refit knows,
+    # so it is carried across rather than quietly dropped.
+    for key in ("group", "notes", "extra"):
+        if record.get(key):
+            new[key] = record[key]
     return new
 
 
@@ -10829,10 +11105,13 @@ def fit_cell_from_file(name, epsilon, force_N, height_um):
 def collection_frame(collection):
     """One row per cell: its ε, its fit and its numbers."""
     rows = []
+    grouped = any(str(r.get("group", "") or "").strip()
+                  for r in collection.values())
     for rec in collection.values():
         b = rec["bounds_pct"]
         rows.append({
             "cell": rec["name"], "include": bool(rec.get("include", True)),
+            **({"group": str(rec.get("group", "") or "")} if grouped else {}),
             "h₀ (µm)": float(rec["height_um"]),
             "ε₁ (%)": round(b[1], 2), "ε₂ (%)": round(b[2], 2),
             "ε₃ (%)": round(b[3], 2), "R²": round(rec["r2"], 5),
@@ -10850,9 +11129,17 @@ def collection_to_json(collection):
             return [None if not np.isfinite(v) else float(v) for v in value]
         if isinstance(value, (np.floating,)):
             return float(value)
+        if isinstance(value, np.generic):
+            value = value.item()
         if isinstance(value, tuple):
             return list(value)
-        return value
+        if isinstance(value, dict):
+            return {str(k): plain(v) for k, v in value.items()}
+        if isinstance(value, (str, int, float, bool, list)) or value is None:
+            return value
+        # A date out of the heights sheet, say: readable, and it comes back
+        # as what it reads as rather than stopping the save.
+        return str(value)
     return json.dumps({"cells": [{k: plain(v) for k, v in rec.items()}
                                  for rec in collection.values()]},
                       default=float)
@@ -10870,12 +11157,19 @@ def collection_from_json(text):
 
 
 def collection_overlay_figure(cells, normalise=False, log_y=False,
-                              show_data=True):
+                              show_data=True, by_group=False):
     """Every kept cell's curve and fit on one plot, each with its own ε."""
     fig = go.Figure()
     marks = {1: "circle", 2: "square", 3: "diamond"}
+    groups = collection_groups(cells) if by_group else []
     for i, rec in enumerate(cells):
         colour = CELL_COLORS[i % len(CELL_COLORS)]
+        if groups:
+            # One colour per group, so the eye reads the condition and not
+            # which cell happened to be loaded first.
+            where = str(rec.get("group", "") or "").strip()
+            colour = (CELL_COLORS[groups.index(where) % len(CELL_COLORS)]
+                      if where in groups else "#999999")
         x = rec["epsilon"] * 100.0
         f = rec["force_N"] * 1e9
         fit = np.asarray(rec["fitted_N"], dtype=float) * 1e9
@@ -10909,10 +11203,21 @@ def collection_overlay_figure(cells, normalise=False, log_y=False,
                            for j, v in zip((1, 2, 3), ex)],
         ))
     fig.update_layout(
-        height=520, template="simple_white",
-        margin={"l": 70, "r": 20, "t": 20, "b": 110},
-        xaxis_title="x = relative deformation (%)",
-        yaxis_title="F / F_max" if normalise else "F (nN)",
+        height=560, template="simple_white",
+        margin={"l": 90, "r": 20, "t": 20, "b": 110},
+        # The same bold, plain axes as the single-cell plot, so a figure
+        # taken out of here sits next to one taken out of there.
+        xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
+                         "font": bold_font(17)},
+               "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
+               "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
+               "showline": True, "exponentformat": "none",
+               "showexponent": "none"},
+        yaxis={"title": {"text": "<b>F / F_max</b>" if normalise
+                         else "<b>Force (nN)</b>", "font": bold_font(17)},
+               "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
+               "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
+               "showline": True},
         legend={"orientation": "h", "yanchor": "top", "y": -0.16, "x": 0.0},
     )
     if log_y:
@@ -10939,8 +11244,13 @@ def collection_eps_figure(cells):
         ))
     fig.update_layout(
         height=120 + 28 * len(cells), template="simple_white",
-        margin={"l": 120, "r": 20, "t": 10, "b": 60},
-        xaxis_title="x (%)",
+        margin={"l": 140, "r": 20, "t": 10, "b": 70},
+        xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
+                         "font": bold_font(15)},
+               "tickfont": bold_font(13), "ticks": "outside", "ticklen": 6,
+               "tickwidth": 2.0, "linewidth": 2.0, "linecolor": "#111111",
+               "showline": True},
+        yaxis={"tickfont": bold_font(12)},
         legend={"orientation": "h", "yanchor": "top", "y": -0.25, "x": 0.0},
     )
     fig.update_yaxes(autorange="reversed")
@@ -10968,9 +11278,13 @@ def collection_strip_figure(cells, symbol, values, unit):
     fig.update_layout(
         height=260, template="simple_white", showlegend=False,
         margin={"l": 60, "r": 10, "t": 30, "b": 20},
-        title={"text": symbol, "font": {"size": 14}},
+        title={"text": symbol, "font": bold_font(15)},
         xaxis={"visible": False, "range": [-0.5, 0.5]},
-        yaxis={"title": unit, "type": "log" if finite.size and
+        yaxis={"title": {"text": f"<b>{unit}</b>", "font": bold_font(13)},
+               "tickfont": bold_font(12), "ticks": "outside", "ticklen": 6,
+               "tickwidth": 2.0, "linewidth": 2.0, "linecolor": "#111111",
+               "showline": True,
+               "type": "log" if finite.size and
                finite.max() / max(finite.min(), 1e-30) > 20 else "linear"},
     )
     return fig
@@ -10988,6 +11302,681 @@ def unit_from_header(header):
     return next(iter(INPUT_FORCE_UNITS))
 
 
+# ------------------------------------------------------------- a batch ------
+# A folder of curve files, a sheet that says how tall each cell was and what
+# it is, and one workbook with every answer in it. Nothing here fits
+# anything: it finds the files, reads the heights, and hands both to
+# fit_cell_from_file, which is the same fit the analysis tab does.
+
+CURVE_SUFFIXES = (".csv", ".tsv", ".txt", ".xlsx", ".xls")
+HEIGHT_SHEET_NAME = "cells"
+HEIGHT_SHEET_COLUMNS = ("file", "cell", "height_um", "group", "notes")
+RESULT_SHEETS = ("AFM results", "AFM summary", "AFM settings", "AFM curves")
+
+
+def natural_key(path):
+    """Sort 2, 10 the way a person does, not the way ASCII does."""
+    name = os.path.basename(str(path))
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", name)]
+
+
+def curve_files_in_folder(folder, pattern="*", skip=()):
+    """
+    Every curve file in a folder, in order, with a reason when there are none.
+
+    The folder is read where the app is running. That is the user's own
+    machine when the app is started locally, which is the normal way this
+    one is used; on a hosted server it is the server's disk, so the
+    uploader stays next to this as the way in.
+    """
+    root = os.path.expanduser(str(folder or "").strip().strip('"').strip("'"))
+    if not root:
+        return [], ""
+    if not os.path.isdir(root):
+        return [], (f"`{root}` is not a folder this app can open. If the app "
+                    "is running on a server, the files have to be uploaded "
+                    "instead.")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:
+        return [], f"Could not read `{root}`: {exc}"
+    ignore = {str(s).strip().lower() for s in skip if s}
+    keep = []
+    for name in fnmatch.filter(names, (pattern or "*").strip() or "*"):
+        if name.startswith("~$") or name.startswith("."):
+            continue  # Excel's lock files and dotfiles are not curves
+        # Nor is a workbook this app wrote into the same folder, nor the
+        # sheet that describes the cells: reading either back as a curve
+        # is how a batch quietly grows a cell that is not one.
+        if "_results_" in name.lower() or name.strip().lower() in ignore:
+            continue
+        full = os.path.join(root, name)
+        if name.lower().endswith(CURVE_SUFFIXES) and os.path.isfile(full):
+            keep.append(full)
+    keep.sort(key=natural_key)
+    if not keep:
+        return [], (f"No .csv, .txt, .tsv, .xlsx or .xls file in `{root}` "
+                    f"matches `{pattern}`.")
+    return keep, ""
+
+
+def curve_from_table(frame, unit_choice):
+    """
+    (ε, F in newtons) out of a table, however its columns happen to be named.
+
+    The deformation column is recognised by name and read as a fraction; a
+    column that goes above 1.5 is read as percent. Force is converted from
+    whatever unit the header names, or from the unit chosen.
+    """
+    cols = frame.columns.tolist()
+    if len(cols) < 2:
+        raise ValueError("fewer than two columns")
+    e_col = cols[guess_column(cols, ("reldef", "rel def", "rel_def", "deform",
+                                     "eps", "ε", "strain"), 0)]
+    f_col = cols[guess_column(cols, ("force", "f (", "f["), 1)]
+    unit = (unit_from_header(f_col) if unit_choice == "from the column name"
+            else unit_choice)
+    eps = pd.to_numeric(frame[e_col], errors="coerce").to_numpy(float)
+    force = to_newtons(
+        pd.to_numeric(frame[f_col], errors="coerce").to_numpy(float), unit)
+    good = np.isfinite(eps) & np.isfinite(force)
+    eps, force = eps[good], force[good]
+    order = np.argsort(eps, kind="stable")
+    eps, force = eps[order], force[order]
+    if eps.size and eps.max() > 1.5:
+        eps = eps / 100.0
+    if eps.size < 8:
+        raise ValueError(f"only {eps.size} usable points in "
+                         f"'{e_col}' and '{f_col}'")
+    return eps, force
+
+
+def read_curve_source(source, name, unit_choice):
+    """One curve, from an upload's bytes or from a path on disk."""
+    if isinstance(source, (bytes, bytearray)):
+        frame = load_table(bytes(source), name)
+    else:
+        with open(source, "rb") as handle:
+            frame = load_table(handle.read(), os.path.basename(str(source)))
+    return curve_from_table(frame, unit_choice)
+
+
+def heights_template_bytes(names=()):
+    """
+    The sheet to fill in: one row per curve file, height and description.
+
+    It comes out already carrying the file names that were found, so the
+    only thing to type is the height and whatever the cell is. Extra
+    columns are kept when it is read back, so anything else worth
+    recording can be added next to these.
+    """
+    rows = [{"file": os.path.basename(str(n)),
+             "cell": os.path.splitext(os.path.basename(str(n)))[0],
+             "height_um": "", "group": "", "notes": ""}
+            for n in (names or ["example_cell_01.xlsx"])]
+    guide = pd.DataFrame({
+        "column": ["file", "cell", "height_um", "group", "notes"],
+        "what it is": [
+            "The curve file this row describes, exactly as it is named on "
+            "disk. Matched with or without its extension, and case is "
+            "ignored.",
+            "What to call the cell in every plot and table. Left empty, the "
+            "file name without its extension is used.",
+            "The cell's height h₀ before the probe touched it, in µm. This "
+            "is the one number the fit cannot get from the curve, and every "
+            "modulus scales with it, so it is the column that matters.",
+            "Anything the cells divide into: treated / control, a day, a "
+            "dish. Cells are coloured by it and summarised by it.",
+            "Free text. Carried through to the results workbook and "
+            "nothing else.",
+        ],
+        "needed": ["yes", "no", "yes", "no", "no"],
+    })
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows, columns=list(HEIGHT_SHEET_COLUMNS)).to_excel(
+            writer, sheet_name=HEIGHT_SHEET_NAME, index=False)
+        guide.to_excel(writer, sheet_name="how to fill this in", index=False)
+        for sheet, widths in ((HEIGHT_SHEET_NAME, (34, 24, 12, 16, 44)),
+                              ("how to fill this in", (14, 92, 9))):
+            page = writer.sheets[sheet]
+            for i, width in enumerate(widths, start=1):
+                page.column_dimensions[
+                    page.cell(row=1, column=i).column_letter].width = width
+            page.freeze_panes = "A2"
+    return buffer.getvalue()
+
+
+def _height_column(cols, *words, taken=()):
+    """
+    The first column whose name contains one of these words, ignoring the
+    ones already claimed. A sheet with both `filename` and `cell name` in
+    it would otherwise hand the same column to both, and every cell would
+    be called after its file, extension and all.
+    """
+    for col in cols:
+        if col in set(taken):
+            continue
+        low = str(col).strip().lower()
+        if any(w in low for w in words):
+            return col
+    return None
+
+
+def read_heights_sheet(data, filename):
+    """
+    {key: row} out of the filled-in sheet, keyed by file name and by stem.
+
+    Only the columns that are recognised are used; everything else in the
+    sheet is kept on the row and travels to the results workbook, so a
+    column of passage numbers or dates is not lost by being unexpected.
+    """
+    frame = load_table(bytes(data), filename)
+    if frame.empty:
+        raise ValueError("the sheet has no rows")
+    cols = frame.columns.tolist()
+    file_col = _height_column(cols, "file", "curve")
+    name_col = _height_column(cols, "cell", "sample", "name",
+                              taken=(file_col,))
+    h_col = _height_column(cols, "height", "h0", "h₀", "thickness",
+                           taken=(file_col, name_col))
+    group_col = _height_column(cols, "group", "condition", "treatment",
+                               taken=(file_col, name_col, h_col))
+    notes_col = _height_column(cols, "note", "comment", "description",
+                               taken=(file_col, name_col, h_col, group_col))
+    if file_col is None and name_col is None:
+        raise ValueError("no column names the file or the cell")
+    if h_col is None:
+        raise ValueError("no height column (call it 'height_um')")
+    known = {file_col, name_col, h_col, group_col, notes_col} - {None}
+    table = {}
+    for _, row in frame.iterrows():
+        stem = str(row.get(file_col, "") if file_col else "").strip()
+        cell = str(row.get(name_col, "") if name_col else "").strip()
+        if not stem and not cell:
+            continue
+        try:
+            height = float(row[h_col])
+        except (TypeError, ValueError):
+            height = float("nan")
+        entry = {
+            "file": stem, "cell": cell or os.path.splitext(stem)[0],
+            "height_um": height,
+            "group": str(row.get(group_col, "") if group_col else "").strip(),
+            "notes": str(row.get(notes_col, "") if notes_col else "").strip(),
+            "extra": {str(c): row[c] for c in cols if c not in known},
+        }
+        for key in {stem, os.path.splitext(stem)[0], cell}:
+            if key:
+                table[key.strip().lower()] = entry
+    if not table:
+        raise ValueError("no rows with a file or a cell name")
+    return table
+
+
+def heights_lookup(table, filename):
+    """The sheet's row for one curve file, by its name or its stem."""
+    base = os.path.basename(str(filename))
+    for key in (base, os.path.splitext(base)[0]):
+        found = (table or {}).get(key.strip().lower())
+        if found:
+            return found
+    return None
+
+
+def collection_groups(cells):
+    """The groups the sheet put these cells in, in the order they appear."""
+    seen = []
+    for rec in cells:
+        group = str(rec.get("group", "") or "").strip()
+        if group and group not in seen:
+            seen.append(group)
+    return seen
+
+
+def collection_results_frame(collection):
+    """
+    Every cell, every number, one row each: the sheet the workbook carries.
+
+    Wider than the table on the page, because a workbook is read later by
+    somebody who was not here: the file it came from, the height it was
+    fitted with, where its boundaries fell, how good the fit was, and E·h
+    for the two shells, which is what a stretching law actually measures.
+    """
+    rows = []
+    for rec in collection.values():
+        b = list(rec.get("bounds_pct") or (0, 0, 0, 0, 0))
+        b += [float("nan")] * (5 - len(b))
+        row = {
+            "cell": rec["name"],
+            "file": rec.get("source", ""),
+            "group": rec.get("group", ""),
+            "included": bool(rec.get("include", True)),
+            "h0_um": float(rec["height_um"]),
+            "eps1_pct": round(float(b[1]), 3),
+            "eps2_pct": round(float(b[2]), 3),
+            "eps3_pct": round(float(b[3]), 3),
+            "x_end_pct": round(float(b[4]), 3),
+            "route": rec.get("route", ""),
+            "R2": round(float(rec.get("r2", float("nan"))), 6),
+            "chi2_nu": float(rec.get("chi2_nu", float("nan"))),
+            "n_points": int(rec.get("n", 0)),
+        }
+        for symbol in COLLECTION_SYMBOLS:
+            unit, factor = DISPLAY_UNIT[symbol]
+            value = rec["moduli"].get(symbol, float("nan"))
+            row[f"{DISPLAY_SYMBOL[symbol]} ({unit})"] = (
+                float(value) / factor if np.isfinite(value) else float("nan"))
+        settings = rec.get("settings") or {}
+        for symbol, key, default in (("E_shell", "membrane_thickness_nm", 4.0),
+                                     ("E_ne", "envelope_thickness_nm", 40.0)):
+            thickness = float(settings.get(key, default) or default)
+            value = rec["moduli"].get(symbol, float("nan"))
+            row[f"{DISPLAY_SYMBOL[symbol]}·h (mN/m) at h = {thickness:g} nm"] = (
+                float(value) * thickness * 1e-9 * 1e3
+                if np.isfinite(value) else float("nan"))
+        row["lamina_A_N"] = float(rec.get("lamina_A_N", float("nan")))
+        row["lamina_work_J"] = float(rec.get("lamina_work_J", float("nan")))
+        row["notes"] = rec.get("notes", "")
+        row["fitted_at"] = rec.get("added_at", "")
+        for key, value in (rec.get("extra") or {}).items():
+            row.setdefault(str(key), value)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def collection_summary_frame(collection, by_group=True):
+    """Median, IQR and mean ± sd per quantity, over the included cells."""
+    cells = [rec for rec in collection.values() if rec.get("include", True)]
+    blocks = [("all cells", cells)]
+    if by_group:
+        blocks += [(group, [c for c in cells
+                            if str(c.get("group", "")).strip() == group])
+                   for group in collection_groups(cells)]
+    rows = []
+    for label, members in blocks:
+        if not members:
+            continue
+        for symbol in COLLECTION_SYMBOLS:
+            unit, factor = DISPLAY_UNIT[symbol]
+            values = np.array([rec["moduli"].get(symbol, float("nan")) / factor
+                               for rec in members], dtype=float)
+            values = values[np.isfinite(values)]
+            if not values.size:
+                continue
+            q1, med, q3 = np.percentile(values, [25, 50, 75])
+            rows.append({
+                "group": label, "quantity": DISPLAY_SYMBOL[symbol],
+                "unit": unit, "n": int(values.size),
+                "median": med, "Q1": q1, "Q3": q3,
+                "mean": float(values.mean()),
+                "sd": float(values.std(ddof=1)) if values.size > 1 else 0.0,
+                "min": float(values.min()), "max": float(values.max()),
+            })
+        r2 = np.array([float(rec.get("r2", float("nan"))) for rec in members])
+        r2 = r2[np.isfinite(r2)]
+        if r2.size:
+            rows.append({"group": label, "quantity": "R²", "unit": "",
+                         "n": int(r2.size), "median": float(np.median(r2)),
+                         "Q1": float(np.percentile(r2, 25)),
+                         "Q3": float(np.percentile(r2, 75)),
+                         "mean": float(r2.mean()),
+                         "sd": float(r2.std(ddof=1)) if r2.size > 1 else 0.0,
+                         "min": float(r2.min()), "max": float(r2.max())})
+    return pd.DataFrame(rows)
+
+
+def collection_curves_frame(collection):
+    """Every curve, long: one row per point, so the plots can be redrawn."""
+    frames = []
+    for rec in collection.values():
+        x = np.asarray(rec["epsilon"], dtype=float) * 100.0
+        frames.append(pd.DataFrame({
+            "cell": rec["name"],
+            "group": rec.get("group", ""),
+            "x_pct": x,
+            "F_N": np.asarray(rec["force_N"], dtype=float),
+            "F_fitted_N": np.asarray(rec["fitted_N"], dtype=float),
+        }))
+    return (pd.concat(frames, ignore_index=True) if frames
+            else pd.DataFrame(columns=["cell", "group", "x_pct", "F_N",
+                                       "F_fitted_N"]))
+
+
+def settings_frame(collection):
+    """
+    What the fits were done with, as two columns anybody can read.
+
+    A modulus is a number only alongside the assumptions it was made under,
+    so the workbook carries them: which components, over what, with which
+    thicknesses and Poisson ratios. Anything not here did not change the
+    answer.
+    """
+    rows = [("written", datetime.now().isoformat(timespec="seconds")),
+            ("cells in the workbook", len(collection)),
+            ("cells included", sum(1 for r in collection.values()
+                                   if r.get("include", True))),
+            ("regime", PW_REGIME_MODES.get(piecewise_regime(),
+                                           piecewise_regime())),
+            ("components fitted", ", ".join(
+                label for _n, label, _s, _c, _l in active_components())),
+            ("order met", " → ".join(
+                label for _n, label, _s, _c, _l in active_components())),
+            ("load sharing", st.session_state.get("pw_style", "carried")),
+            ("ε route", st.session_state.get("pw_method", "refined")),
+            ("R² target", st.session_state.get("pw_target_r2", 0.999)),
+            ("x_end (%)", st.session_state.get("pw_end", DEFAULTS["pw_end"])),
+            ("cell type", st.session_state.get("cell_type", "")),
+            ("membrane thickness hₘ (nm)",
+             st.session_state.get("membrane_thickness_nm", 4.0)),
+            ("nuclear envelope thickness (nm)",
+             st.session_state.get("envelope_thickness_nm", 40.0)),
+            ("Poisson ratio, membrane",
+             st.session_state.get("poisson_membrane", 0.5)),
+            ("Poisson ratio, interior",
+             st.session_state.get("poisson_interior", 0.5)),
+            ("R₀ / h₀ (radius from height)",
+             st.session_state.get("radius_aspect", 0.55)),
+            ("nucleus radius / R₀",
+             st.session_state.get("nucleus_fraction", 0.35)),
+            ("confinement exponent q",
+             st.session_state.get("pw_squeeze", 0.0)),
+            ("weighting", st.session_state.get("pw_weighting", "absolute")),
+            ("app", "AFM cell analyzer, piecewise fit")]
+    if piecewise_regime() == "early":
+        rows.insert(6, ("early window (%)",
+                        st.session_state.get("pw_end", PW_EARLY_END_PCT)))
+        rows.insert(7, ("how the two act", PW_EARLY_JOINS.get(
+            st.session_state.get("pw_early_join", "parallel"), "")))
+    return pd.DataFrame(rows, columns=["setting", "value"])
+
+
+def _cell_value(value):
+    """Something a spreadsheet cell can hold, whatever came out of the fit."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return ""
+    if value is None or isinstance(value, (str, int, float, bool, datetime)):
+        return value
+    return str(value)
+
+
+def _write_sheet(book, title, frame):
+    """One sheet, replacing any sheet of that name, with a tidy header."""
+    from openpyxl.styles import Font
+
+    if title in book.sheetnames:
+        del book[title]
+    page = book.create_sheet(title)
+    page.append([str(c) for c in frame.columns])
+    for cell in page[1]:
+        cell.font = Font(bold=True)
+    for record in frame.itertuples(index=False):
+        page.append([_cell_value(v) for v in record])
+    for i, column in enumerate(frame.columns, start=1):
+        longest = max([len(str(column))]
+                      + [len(str(v)) for v in frame[column].head(200)])
+        page.column_dimensions[page.cell(row=1, column=i).column_letter].width \
+            = min(46, max(10, longest + 2))
+    page.freeze_panes = "A2"
+    return page
+
+
+def collection_workbook_bytes(collection, with_curves=True, existing=None):
+    """
+    The whole batch as one workbook: results, summary, settings, curves.
+
+    Given the bytes of a workbook (the heights sheet), the results are
+    written into that workbook beside what is already in it, so the sheet
+    that describes the cells and the sheet that answers for them are one
+    file. Sheets of the same name are replaced, so writing twice updates
+    rather than piling up.
+    """
+    from openpyxl import Workbook, load_workbook
+
+    if existing:
+        book = load_workbook(io.BytesIO(bytes(existing)))
+    else:
+        book = Workbook()
+        book.remove(book.active)
+    _write_sheet(book, "AFM results", collection_results_frame(collection))
+    _write_sheet(book, "AFM summary", collection_summary_frame(collection))
+    _write_sheet(book, "AFM settings", settings_frame(collection))
+    if with_curves:
+        _write_sheet(book, "AFM curves", collection_curves_frame(collection))
+    elif "AFM curves" in book.sheetnames:
+        del book["AFM curves"]
+    buffer = io.BytesIO()
+    book.save(buffer)
+    return buffer.getvalue()
+
+
+def batch_fit_files(sources, unit_choice, fallback_height, heights=None,
+                    collection=None, progress=None):
+    """
+    Fit a list of curve files, each on its own, into the collection.
+
+    `sources` are paths on disk or (name, bytes) pairs. Each cell is fitted
+    with its own height from the sheet when the sheet has one, and with the
+    height typed on the page when it does not; nothing is averaged and no
+    file stops another from being fitted.
+    """
+    collection = dict(collection or {})
+    problems, added = [], []
+    total = max(len(sources), 1)
+    for i, source in enumerate(sources):
+        if isinstance(source, tuple):
+            filename, payload = source
+        else:
+            filename, payload = os.path.basename(str(source)), source
+        row = heights_lookup(heights, filename) or {}
+        name = row.get("cell") or os.path.splitext(filename)[0]
+        height = row.get("height_um", float("nan"))
+        if not (isinstance(height, float) and np.isfinite(height)
+                and height > 0):
+            height = float(fallback_height)
+            if heights:
+                problems.append(f"{filename}: no height in the sheet, so "
+                                f"{height:g} µm was used.")
+        try:
+            eps, force = read_curve_source(payload, filename, unit_choice)
+            record, problem = fit_cell_from_file(name, eps, force,
+                                                 float(height))
+            if not record:
+                problems.append(f"{filename}: {problem}")
+            else:
+                record["source"] = filename
+                record["group"] = row.get("group", "")
+                record["notes"] = row.get("notes", "")
+                record["extra"] = row.get("extra", {}) or {}
+                collection[name] = record
+                added.append(name)
+        except Exception as exc:  # one bad file must not stop the rest
+            problems.append(f"{filename}: {exc}")
+        if progress is not None:
+            progress.progress((i + 1) / total)
+    return collection, added, problems
+
+
+def folder_and_sheet_panel(collection):
+    """
+    Where the curves are, and the sheet that says how tall each cell was.
+
+    Returns the collection, changed or not. Three ways in, all feeding the
+    same fit: a folder on this machine, files uploaded, and the sheet that
+    carries the heights, which is also the workbook the answers are
+    written back into.
+    """
+    heights = st.session_state.get("pw_heights") or {}
+    with st.expander("📁 A folder of curve files", expanded=not collection):
+        f1, f2 = st.columns([3, 1])
+        with f1:
+            st.text_input(
+                "Folder the .xlsx / .csv curves live in", key="pw_batch_folder",
+                placeholder="/Users/you/Desktop/C2C12 curves",
+                help="Read where the app is running. Started on your own "
+                     "machine, that is your own disk and this is the quickest "
+                     "way in; on a hosted server it is the server's disk, so "
+                     "upload the files instead.")
+        with f2:
+            st.text_input("Only files matching", key="pw_batch_pattern",
+                          help="A shell pattern, e.g. *.xlsx or cell_*.csv.")
+        found, why = curve_files_in_folder(
+            st.session_state.get("pw_batch_folder", ""),
+            st.session_state.get("pw_batch_pattern", "*"),
+            skip=(st.session_state.get("pw_heights_name", ""),))
+        st.session_state["pw_batch_found"] = found
+        if why:
+            st.warning(why)
+        elif found:
+            st.success(f"{len(found)} curve files found.")
+            listed = pd.DataFrame({
+                "file": [os.path.basename(p) for p in found],
+                "h₀ (µm)": [
+                    (heights_lookup(heights, p) or {}).get("height_um", np.nan)
+                    for p in found],
+                "cell": [(heights_lookup(heights, p) or {}).get(
+                    "cell", os.path.splitext(os.path.basename(p))[0])
+                    for p in found],
+                "group": [(heights_lookup(heights, p) or {}).get("group", "")
+                          for p in found],
+                "KB": [round(os.path.getsize(p) / 1024.0, 1) for p in found],
+            })
+            flat_table(listed, align_right=["h₀ (µm)", "KB"],
+                       caption="h₀ comes from the sheet below. Blank means "
+                               "the height typed under the uploader is used.")
+
+    with st.expander("📋 The sheet that describes the cells "
+                     "(heights, groups, notes)", expanded=False):
+        st.markdown(
+            "One row per curve file: **the file name**, **the height h₀ in "
+            "µm**, and whatever else the cell is. h₀ is the one number the "
+            "fit cannot read off the curve, and every modulus scales with "
+            "it, so this sheet is what makes a batch a measurement rather "
+            "than a shape. The same workbook is where the answers are "
+            "written back."
+        )
+        h1, h2 = st.columns([1, 2])
+        with h1:
+            st.download_button(
+                "📄 Template, already listing the files found",
+                data=heights_template_bytes(
+                    [os.path.basename(p)
+                     for p in st.session_state.get("pw_batch_found", [])]),
+                file_name="cell_heights.xlsx",
+                mime=("application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet"),
+                key="pw_heights_template", **STRETCH)
+        with h2:
+            sheet = st.file_uploader(
+                "The filled-in sheet (.xlsx or .csv)",
+                type=["xlsx", "xls", "csv"], key="pw_heights_file")
+        if sheet is not None:
+            data = sheet.getvalue()
+            if st.button("Read this sheet", key="pw_heights_read", **STRETCH):
+                try:
+                    st.session_state["pw_heights"] = read_heights_sheet(
+                        data, sheet.name)
+                    st.session_state["pw_heights_book"] = (
+                        data if sheet.name.lower().endswith((".xlsx", ".xls"))
+                        else None)
+                    st.session_state["pw_heights_name"] = sheet.name
+                    rerun_keeping_settings()
+                except Exception as exc:
+                    st.error(f"Could not read it: {exc}")
+        if heights:
+            rows = {id(v): v for v in heights.values()}.values()
+            st.success(f"**{st.session_state.get('pw_heights_name', 'sheet')}** "
+                       f"read: {len(rows)} cells described.")
+            flat_table(pd.DataFrame([
+                {"file": r["file"], "cell": r["cell"],
+                 "h₀ (µm)": r["height_um"], "group": r["group"],
+                 "notes": r["notes"]} for r in rows]),
+                align_right=["h₀ (µm)"])
+            if st.button("Forget this sheet", key="pw_heights_clear"):
+                rerun_keeping_settings({"pw_heights": {},
+                                        "pw_heights_book": None,
+                                        "pw_heights_name": ""},
+                                       forget=("pw_heights_file",))
+    return collection
+
+
+def results_workbook_panel(collection):
+    """
+    The batch written out: one workbook, and into the sheet it came from.
+
+    Built on a press rather than on every rerun, because a collection with
+    every curve in it is a few megabytes and nobody wants that rebuilt
+    while they tick a box.
+    """
+    st.markdown("#### 📗 The batch as a workbook")
+    w1, w2 = st.columns([1, 2])
+    with w1:
+        st.checkbox("Include every curve, point by point", key="pw_book_curves",
+                    help="Adds an 'AFM curves' sheet with one row per point "
+                         "of every cell: x, F and the fitted F̂, so the plots "
+                         "can be redrawn anywhere. Off keeps the file small.")
+    with w2:
+        into = bool(st.session_state.get("pw_heights_book"))
+        st.caption(
+            ("The results are added to **"
+             + str(st.session_state.get("pw_heights_name", "the sheet"))
+             + "**, beside what is already in it: sheets of the same name "
+               "are replaced, so writing twice updates rather than piles up.")
+            if into else
+            "A new workbook: results, summary, settings. Read a heights "
+            "sheet above and the results are written into that workbook "
+            "instead, beside the description of the cells.")
+    if st.button("🧮 Build the workbook", key="pw_book_build",
+                 type="primary", **STRETCH):
+        try:
+            st.session_state["pw_book"] = collection_workbook_bytes(
+                collection,
+                with_curves=bool(st.session_state.get("pw_book_curves", True)),
+                existing=st.session_state.get("pw_heights_book"))
+            st.session_state["pw_book_at"] = datetime.now().isoformat(
+                timespec="seconds")
+        except Exception as exc:
+            st.session_state["pw_book"] = None
+            st.error(f"Could not build it: {exc}")
+    book = st.session_state.get("pw_book")
+    if not book:
+        return
+    stem = (os.path.splitext(st.session_state.get("pw_heights_name", ""))[0]
+            or "afm_cells")
+    filename = f"{stem}_results_{datetime.now():%Y%m%d}.xlsx"
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        st.download_button(
+            f"📥 {filename}  ({len(book) / 1024:.0f} KB)", data=book,
+            file_name=filename,
+            mime=("application/vnd.openxmlformats-officedocument."
+                  "spreadsheetml.sheet"),
+            key="pw_book_download", **STRETCH)
+    with b2:
+        folder = os.path.expanduser(
+            str(st.session_state.get("pw_batch_folder", "")).strip())
+        if folder and os.path.isdir(folder):
+            if st.button(f"💾 Save it into {os.path.basename(folder) or folder}",
+                         key="pw_book_save", **STRETCH):
+                try:
+                    where = os.path.join(folder, filename)
+                    with open(where, "wb") as handle:
+                        handle.write(book)
+                    st.success(f"Written to `{where}`.")
+                except OSError as exc:
+                    st.error(f"Could not write it there: {exc}")
+        else:
+            st.caption("Give a folder above and it can also be saved "
+                       "straight into it.")
+    st.caption(f"Built {st.session_state.get('pw_book_at', '')} · sheets: "
+               + ", ".join(s for s in RESULT_SHEETS
+                           if s != "AFM curves"
+                           or st.session_state.get("pw_book_curves", True)))
+
+
 def all_cells_tab():
     """The 📚 All cells tab."""
     st.markdown(
@@ -10997,6 +11986,9 @@ def all_cells_tab():
         r"averaged before it is plotted."
     )
     collection = dict(st.session_state.get("pw_collection") or {})
+    collection = folder_and_sheet_panel(collection)
+    in_folder = list(st.session_state.get("pw_batch_found") or [])
+    heights = st.session_state.get("pw_heights") or {}
 
     with st.expander("➕ Add cells from files (each fitted on its own)",
                      expanded=not collection):
@@ -11022,44 +12014,31 @@ def all_cells_tab():
         st.caption(
             "Each file: the deformation and force columns are recognised by "
             "name; a deformation above 1.5 is read as percent. ε is placed "
-            "on each curve by the route and R²★ chosen on the analysis tab.")
-        if files and st.button(f"Fit all {len(files)} files: per-cell ε, θ̂, E",
-                               type="primary",
-                               key="pw_batch_go"):
+            "on each curve by the route and R²★ chosen on the analysis tab, "
+            "and h₀ comes from the sheet when the sheet has a row for that "
+            "file. The number above is used for the files it does not.")
+        sources, where = [], ""
+        if in_folder:
+            sources, where = list(in_folder), "in the folder"
+        if files:
+            uploaded = [(up.name, up.getvalue()) for up in files]
+            named = {os.path.basename(str(s)) for s in sources}
+            sources += [u for u in uploaded if u[0] not in named]
+            where = "uploaded" if not in_folder else "in the folder and uploaded"
+        if sources and st.button(
+                f"▶ Fit all {len(sources)} files {where}: per-cell ε, θ̂, E",
+                type="primary", key="pw_batch_go", **STRETCH):
             progress = st.progress(0.0)
-            problems = []
-            for i, upload in enumerate(files):
-                name = upload.name.rsplit(".", 1)[0]
-                try:
-                    frame = load_table(upload.getvalue(), upload.name)
-                    cols = frame.columns.tolist()
-                    e_col = cols[guess_column(cols, ("reldef", "rel def", "rel_def",
-                                                     "deform", "eps", "ε", "strain"), 0)]
-                    f_col = cols[guess_column(cols, ("force", "f (", "f["), 1)]
-                    unit = (unit_from_header(f_col) if unit_choice ==
-                            "from the column name" else unit_choice)
-                    eps = pd.to_numeric(frame[e_col], errors="coerce").to_numpy(float)
-                    force = to_newtons(pd.to_numeric(frame[f_col], errors="coerce")
-                                       .to_numpy(float), unit)
-                    good = np.isfinite(eps) & np.isfinite(force)
-                    eps, force = eps[good], force[good]
-                    order = np.argsort(eps, kind="stable")
-                    eps, force = eps[order], force[order]
-                    if eps.size and eps.max() > 1.5:
-                        eps = eps / 100.0
-                    record, problem = fit_cell_from_file(name, eps, force, height)
-                    if record:
-                        collection[name] = record
-                    else:
-                        problems.append(f"{upload.name}: {problem}")
-                except Exception as exc:  # one bad file must not stop the rest
-                    problems.append(f"{upload.name}: {exc}")
-                progress.progress((i + 1) / len(files))
+            collection, added, problems = batch_fit_files(
+                sources, unit_choice, height, heights=heights,
+                collection=collection, progress=progress)
             st.session_state["pw_collection"] = collection
             for problem in problems:
                 st.warning(problem)
-            st.success(f"{len(files) - len(problems)} of {len(files)} cells "
-                       "fitted and added.")
+            st.success(f"{len(added)} of {len(sources)} cells fitted and "
+                       "added, each with its own ε and its own h₀.")
+        elif not sources:
+            st.info("Upload curve files here, or give a folder above.")
 
     with st.expander("📂 Load or save the collection", expanded=False):
         saved = st.file_uploader("A collection saved from here (.json)",
@@ -11117,7 +12096,7 @@ def all_cells_tab():
         st.info("Tick *include* for at least one cell to plot it.")
         return
 
-    o1, o2, o3 = st.columns(3)
+    o1, o2, o3, o4 = st.columns(4)
     with o1:
         normalise = st.checkbox("F / F_max", key="pw_cells_norm")
     with o2:
@@ -11125,7 +12104,14 @@ def all_cells_tab():
     with o3:
         show_data = st.checkbox("show data points", value=True,
                                 key="pw_cells_data")
-    st.plotly_chart(collection_overlay_figure(cells, normalise, log_y, show_data),
+    with o4:
+        groups = collection_groups(cells)
+        by_group = st.checkbox(
+            "colour by group", key="pw_cells_by_group", disabled=not groups,
+            help=("One colour per group: " + ", ".join(groups)) if groups else
+            "No groups yet: add a *group* column to the heights sheet.")
+    st.plotly_chart(collection_overlay_figure(cells, normalise, log_y,
+                                              show_data, by_group and groups),
                     key="pw_cells_overlay", **STRETCH)
     st.caption("Lines: each cell's fitted F(x). Markers on each line: that "
                "cell's own ε₁ (●), ε₂ (■), ε₃ (◆).")
@@ -11156,6 +12142,8 @@ def all_cells_tab():
                       "mean ± sd": f"{v.mean():.4g} ± {v.std(ddof=1) if v.size > 1 else 0:.2g}"})
     flat_table(pd.DataFrame(stats), align_right=["n", "median", "IQR", "mean ± sd"],
                caption="Across the included cells.")
+
+    results_workbook_panel(collection)
 
     d1, d2, d3 = st.columns(3)
     with d1:
