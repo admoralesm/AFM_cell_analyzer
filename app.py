@@ -5403,7 +5403,7 @@ def pw_regimes():
         rest = [name for name in order if name not in live]
         out = [_dataclasses.replace(
             PW_REGIMES[0], terms=tuple(terms[n] for n in live),
-            free_offset=True, equation="",
+            free_offset=False, equation="",
             title=" + ".join(PW_COMPONENT_TITLES.get(n, n) for n in live))]
         for index, name in enumerate(rest, start=1):
             out.append(_dataclasses.replace(
@@ -5416,10 +5416,16 @@ def pw_regimes():
                 PW_REGIMES[len(out)], terms=(), free_offset=False,
                 title="", equation=""))
         return tuple(out)
+    # The early regime has no free intercept. The curve starts at first
+    # contact, where the force is zero by definition, and a C₀ free to
+    # float takes up whatever the two power laws cannot -- which is force
+    # attributed to nothing at all.
+    offset = piecewise_regime() != "early"
     out = []
     for index, (regime, name) in enumerate(zip(PW_REGIMES, order)):
         out.append(_dataclasses.replace(
-            regime, terms=(terms[name],), free_offset=(index == 0),
+            regime, terms=(terms[name],),
+            free_offset=(index == 0 and offset),
             title=PW_COMPONENT_TITLES.get(name, regime.title),
             equation="",
         ))
@@ -8828,7 +8834,12 @@ def fit_equation_panel(result):
         powers.append(power)
     if not terms:
         return
-    st.latex(r"\hat F(x) = C_0 + " + " + ".join(terms)
+    # No intercept in the early regime: the curve is fitted through first
+    # contact, so writing C₀ into the equation would be writing a term
+    # that is not in the model.
+    has_c0 = "C0" in (result.get("coefficients") or {})
+    st.latex(r"\hat F(x) = " + ("C_0 + " if has_c0 else "")
+             + " + ".join(terms)
              + rf",\qquad 0 \le x \le {end:.3g}\,\%")
     st.latex(r"E_j = \frac{100^{\,p_j}\;\hat\theta_j}{A_j}"
              + r"\qquad\Longrightarrow\qquad "
@@ -8841,8 +8852,10 @@ def fit_equation_panel(result):
                  if row))
     early = piecewise_regime() == "early"
     st.caption(
-        (r"**What it says.** $x$ is the squash in per cent and $C_0$ the "
-         r"force at first contact. A shell being stretched carries force as "
+        (r"**What it says.** $x$ is the squash in per cent, and the fit "
+         r"passes through first contact: no free intercept, so no force is "
+         r"attributed to something that is not in the model. A shell being "
+         r"stretched carries force as "
          r"$x^3$ (Lulevich eq 3), a filled body pressed by a plate as "
          r"$x^{3/2}$ (Hertz, his eq 6); $[\,\cdot\,]_+$ is zero until the "
          r"component joins. Each $\hat\theta_j$ is fitted by bounded "
@@ -9224,6 +9237,11 @@ def piecewise_equations_latex(bounds, ranges, off=()):
             rf"{PW_TEX[name]}\,\big[\min(x,{u:.4g})-{a:.4g}\big]_+^{{{power}}}"
         )
     body = r" \\ &+ ".join(terms) if terms else "0"
+    if piecewise_regime() == "early":
+        # No contact line and no intercept here: the first component is
+        # fitted from first contact, through the origin.
+        return [r"\begin{aligned} F(x) = &" + body + r" \end{aligned}"
+                + rf"\qquad 0 \le x \le {end:.4g}\,\%"]
     return [
         rf"F(x) = k_{{align}}\,x + C_0, \qquad 0 \le x < {e1:.4g}",
         r"\begin{aligned} F(x) = F_{" + f"{e1:.4g}" + r"\%} &+ " + body
@@ -10617,8 +10635,11 @@ def piecewise_settings_used(result, geometry, target, source):
                          + (" (switched off)" if name in off else ""),
                          "Initial guesses and bounds"))
     rows += [
-        ("C₀ over [0, ε₁)", "the constant the first stretch is fitted with, "
-         "by least squares and with no bounds", "fixed"),
+        ("Intercept",
+         ("none: the fit passes through first contact, where the force is "
+          "zero" if early_here else
+          "C₀ over [0, ε₁), the constant the first stretch is fitted with, "
+          "by least squares and with no bounds"), "fixed"),
         ("Weighting", WEIGHTINGS_USED.get(
             result.get("weighting", "absolute"),
             "uniform: every point counts the same (ordinary least squares)"),
@@ -11004,6 +11025,22 @@ def piecewise_section(model, epsilon, force_N, rupture):
         prefer = st.session_state.pop("_pw_eps1_prefer", "aicc")
         found = None if parallel else early_best_eps1(
             model, epsilon, force_N, live, end, prefer=prefer)
+        # A curve that one power law already explains gives the second
+        # component nothing: the least squares puts it at zero wherever it
+        # joins. Then the question is not where it joins but whether the
+        # first one is allowed to carry on past that point -- capped there,
+        # the second one has to explain the rest, and it is measured.
+        if (found and found.get("measured", 0) < 2 and len(live) > 1
+                and not st.session_state.get("pw_until", {}).get(live[0])):
+            capped = early_best_eps1(model, epsilon, force_N, live, end,
+                                     prefer=prefer, cap_first=True)
+            if capped and capped.get("measured", 0) >= 2:
+                found = capped
+                untils = dict(st.session_state.get("pw_until") or {})
+                untils[live[0]] = round(float(capped["eps1"]), 2)
+                st.session_state["pw_until"] = untils
+                st.session_state["pw_membrane_throughout"] = (
+                    live[0] != "K_shell")
         # What the search saw, kept so the board can show the shape of it
         # rather than only its winner.
         st.session_state["pw_early_profile"] = (found or {}).get("profile")
@@ -11021,6 +11058,19 @@ def piecewise_section(model, epsilon, force_N, rupture):
             st.session_state["pw_early_note"] = (
                 "Both components act from first contact, in parallel, which "
                 f"is Lulevich's eq 1 + 6, read to {end:.1f} %.")
+        elif found and found.get("capped"):
+            lo, hi = early_band(end)
+            st.session_state["pw_early_note"] = (
+                f"With **{PW_COMPONENT_TITLES.get(live[0], live[0])}** "
+                f"carrying on to {end:.1f} % this curve measured no "
+                f"{PW_COMPONENT_TITLES.get(live[1], live[1])} at all — one "
+                "power law explains it, so the least squares put the second "
+                f"component at zero wherever it joined. It is fitted with "
+                f"**{PW_COMPONENT_TITLES.get(live[0], live[0])} stopping at "
+                f"ε₁ = {found['eps1']:.1f} %** instead, so what comes after "
+                f"belongs to **{PW_COMPONENT_TITLES.get(live[1], live[1])}**: "
+                f"R² = {found['r2']:.5f}, both components measured. Set the "
+                "far ends by hand above to put it back.")
         elif found:
             lo, hi = early_band(end)
             st.session_state["pw_early_note"] = (
@@ -12000,7 +12050,7 @@ def early_regimes_for(join, order):
         # is his eq 1 and eq 6 added together.
         return ((_dataclasses.replace(
             PW_REGIMES[0], terms=tuple(terms[n] for n in live),
-            free_offset=True, equation="",
+            free_offset=False, equation="",
             title=" + ".join(PW_COMPONENT_TITLES.get(n, n) for n in live)),)
             + tuple(_dataclasses.replace(PW_REGIMES[i + 1], terms=(terms[n],),
                                          free_offset=False, title="",
@@ -12010,13 +12060,13 @@ def early_regimes_for(join, order):
     chain = list(live) + rest
     return tuple(
         _dataclasses.replace(PW_REGIMES[i], terms=(terms[n],),
-                             free_offset=(i == 0),
+                             free_offset=False,
                              title=PW_COMPONENT_TITLES.get(n, ""), equation="")
         for i, n in enumerate(chain))
 
 
 def early_best_eps1(model, epsilon, force_N, order, end=None,
-                    prefer="aicc"):
+                    prefer="aicc", cap_first=False):
     """
     Where the second of the two joins, for the order given.
 
@@ -12037,8 +12087,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
                             np.asarray(force_N, dtype=float))
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
-    settings = effective_piecewise_settings(piecewise_settings(),
-                                            piecewise_until(), off)
+    untils = dict(piecewise_until())
     regimes = early_regimes_for("staggered", order)
     geometry = piecewise_geometry(model)
     extras = fit_extras()
@@ -12051,15 +12100,28 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
         bounds = repair_boundaries(
             list(early_park(end, parallel=False, first=float(eps1))),
             top=end)[0]
-        result = fit_piecewise(thin_eps, thin_force, boundaries_pct=bounds,
-                               regimes=regimes, settings=settings,
-                               carry=tuple(order), **extras)
+        # With the first component capped at the joining point it stops
+        # taking on load there and the second one has to carry what comes
+        # after: the only way a curve that one power law already explains
+        # can measure the second component at all.
+        here = dict(untils)
+        if cap_first and order:
+            here[order[0]] = float(bounds[1])
+        result = fit_piecewise(
+            thin_eps, thin_force, boundaries_pct=bounds, regimes=regimes,
+            settings=effective_piecewise_settings(piecewise_settings(),
+                                                  here, off),
+            carry=tuple(order), **extras)
         if not result.get("success"):
             continue
-        coefficients = result.get("coefficients") or {}
-        measured = sum(1 for name in order
-                       if abs(float(coefficients.get(name) or 0.0)) > 0.0)
         moduli = piecewise_moduli(result, geometry, regimes=regimes)
+        # Measured means measured, not "left a speck at its lower bound".
+        # A coefficient held at zero comes back as 1e-25, not as 0, and
+        # counting that as a measurement is how a fit with no cytoskeleton
+        # in it was kept as one that had both.
+        measured = sum(
+            1 for name in order
+            if float((moduli.get(name) or {}).get("E_Pa", 0.0)) > 1e-6)
         profile.append({
             "eps1": float(bounds[1]),
             "r2": float(result.get("r_squared", float("nan"))),
@@ -12076,6 +12138,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
     if best is not None:
         best["profile"] = profile
         best["band"] = (lo, hi)
+        best["capped"] = bool(cap_first)
     return best
 
 
@@ -12091,6 +12154,14 @@ def fit_early_cell(name, epsilon, force_N, height_um, model):
     end = early_end_pct()
     order = [ORDER_COEFFICIENT[t] for t in PW_EARLY_ORDER]
     found = early_best_eps1(model, epsilon, force_N, order, end=end)
+    if found and found.get("measured", 0) < 2:
+        # The same fallback the page uses: a curve one power law already
+        # explains gives the second component nothing until the first one
+        # is capped at the joining point.
+        capped = early_best_eps1(model, epsilon, force_N, order, end=end,
+                                 cap_first=True)
+        if capped and capped.get("measured", 0) >= 2:
+            found = capped
     if not found:
         return None, "the two components do not fit this curve"
     bounds = (0.0,) + tuple(early_park(end, parallel=False,
@@ -12099,23 +12170,29 @@ def fit_early_cell(name, epsilon, force_N, height_um, model):
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
     regimes = early_regimes_for("staggered", order)
+    untils = dict(piecewise_until())
+    if found.get("capped"):
+        untils[order[0]] = float(found["eps1"])
     result = fit_piecewise(
         epsilon, force_N, boundaries_pct=bounds, regimes=regimes,
         settings=effective_piecewise_settings(piecewise_settings(),
-                                              piecewise_until(), off),
+                                              untils, off),
         carry=tuple(order), **fit_extras())
     if not result.get("success"):
         return None, result.get("error", "fit failed")
     lo, hi = early_band(end)
-    route = (f"{PW_COMPONENT_TITLES.get(order[0], order[0])} from contact, "
-             f"{PW_COMPONENT_TITLES.get(order[1], order[1])} from "
+    route = (f"{PW_COMPONENT_TITLES.get(order[0], order[0])} from contact"
+             + (f" to ε₁" if found.get("capped") else "")
+             + f", {PW_COMPONENT_TITLES.get(order[1], order[1])} from "
              f"ε₁ = {found['eps1']:.1f} % (found in {lo:g}–{hi:g} %)")
     record = collection_record(name, name, height_um, epsilon, force_N,
                                result, piecewise_geometry(model),
                                f"Lulevich two-term, to {end:g} % · {route}",
                                regimes=regimes)
     record["early"] = {"join": "staggered", "order": list(order),
-                       "eps1": float(found["eps1"]), "end_pct": float(end)}
+                       "eps1": float(found["eps1"]), "end_pct": float(end),
+                       "capped": bool(found.get("capped")),
+                       "until": {k: float(v) for k, v in untils.items()}}
     return record, ""
 
 
@@ -13990,12 +14067,13 @@ def fit_explainer(fit, result=None):
         together = (st.session_state.get("pw_early_join", "parallel")
                     == "parallel")
         st.latex(
-            r"\hat F(x) = C_0 + K_m\,x^{3} + K_c\,x^{3/2}"
+            r"\hat F(x) = K_m\,x^{3} + K_c\,x^{3/2}"
             if together else
-            r"\hat F(x) = C_0 + K_m\,x^{3}"
+            r"\hat F(x) = K_m\,x^{3}"
             r" + K_c\,[x-\varepsilon_1]_+^{3/2}")
         st.markdown(
-            "Two parts and nothing else: the membrane stretching as the cube "
+            "Two parts and nothing else, fitted through first contact with "
+            "no free intercept: the membrane stretching as the cube "
             "of the squeeze (Lulevich's eq 3) and the interior pressed as a "
             "Hertzian contact (his eq 6), "
             + ("both acting from first contact, which is his eq 1."
