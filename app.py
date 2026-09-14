@@ -908,6 +908,9 @@ DEFAULTS = {
     "_pw_early_eps1": None,
     "_pw_early_until": {},
     "_pw_early_throughout": True,
+    # What the last joining-point search saw, for the little chart under
+    # the board: [{eps1, r2, measured, E_shell, E_cyto}, …].
+    "pw_early_profile": None,
     # Each regime remembers its own boundaries, so switching back and
     # forth does not lose where the other one was fitted to.
     "pw_early_eps": None,
@@ -8627,6 +8630,9 @@ def forget_early_by_hand():
 def _pw_early_from_changed():
     """Callback: where the second component starts was typed."""
     remember_early_by_hand()
+    # A number typed by hand is not what the search found, so the search's
+    # profile no longer describes what is on the board.
+    st.session_state["pw_early_profile"] = None
     st.session_state["_pw_apply"] = True
 
 
@@ -8723,6 +8729,71 @@ def early_boundary_control():
     said_early = st.session_state.get("pw_early_note")
     if said_early:
         st.caption("🔎 " + said_early)
+    early_scan_panel()
+
+
+def early_scan_panel():
+    """
+    What the optimiser saw, once it has looked: R² and Ec against the
+    joining point, with the one it kept marked.
+
+    A number on its own hides the shape of the thing. If R² is still
+    climbing at the edge of the band, the joining point is a slide rather
+    than a peak, and the person should know that before quoting Ec.
+    """
+    profile = [row for row in (st.session_state.get("pw_early_profile") or ())
+               if np.isfinite(row.get("r2", float("nan")))]
+    if len(profile) < 3:
+        return
+    xs = [row["eps1"] for row in profile]
+    r2 = [row["r2"] for row in profile]
+    ec = [row["E_cyto"] / 1e3 for row in profile]
+    both = [row for row in profile if row["measured"] >= 2]
+    kept = max(both or profile, key=lambda row: row["r2"])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=r2, mode="lines+markers", name="R²",
+        line={"color": "#111111", "width": 2},
+        marker={"size": 5, "color": "#111111"},
+        hovertemplate="ε₁ = %{x:.1f} %<br>R² = %{y:.5f}<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=xs, y=ec, mode="lines", name="Ec (kPa)", yaxis="y2",
+        line={"color": PW_COMPONENT_COLORS.get("K_cyto", "#ff7f0e"),
+              "width": 2, "dash": "dot"},
+        hovertemplate="ε₁ = %{x:.1f} %<br>Ec = %{y:.4g} kPa<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=[kept["eps1"]], y=[kept["r2"]], mode="markers", name="kept",
+        marker={"size": 13, "color": "#111111", "symbol": "circle-open",
+                "line": {"width": 3}}, hoverinfo="skip"))
+    fig.update_layout(
+        height=210, template="simple_white", showlegend=False,
+        margin={"l": 62, "r": 62, "t": 8, "b": 40},
+        hovermode="x unified",
+        xaxis={"title": {"text": "<b>ε₁ (%)</b>", "font": bold_font(13)},
+               "tickfont": bold_font(12), "ticks": "outside",
+               "linewidth": 2, "linecolor": "#111111", "showline": True},
+        yaxis={"title": {"text": "<b>R²</b>", "font": bold_font(13)},
+               "tickfont": bold_font(11), "linewidth": 2,
+               "linecolor": "#111111", "showline": True},
+        yaxis2={"title": {"text": "<b>Ec (kPa)</b>", "font": bold_font(13)},
+                "tickfont": bold_font(11), "overlaying": "y", "side": "right",
+                "showgrid": False})
+    st.plotly_chart(fig, key="pw_early_scan", **STRETCH)
+    top = max(profile, key=lambda row: row["r2"])
+    edge = abs(top["eps1"] - max(xs)) < 0.6
+    st.caption(
+        (f"Every joining point in the band, fitted. **R² is still rising at "
+         f"{max(xs):g} %**, the end of the band, so on this curve the "
+         "joining point is a slide and not a peak: a later one always fits "
+         "a little better and hands the cytoskeleton a shorter, steeper "
+         "stretch, which is why Ec climbs with it along the dotted line. "
+         f"The one kept, ε₁ = {kept['eps1']:.1f} %, is the best inside the "
+         "band that still measures both."
+         if edge else
+         f"Every joining point in the band, fitted. R² peaks at "
+         f"**ε₁ = {top['eps1']:.1f} %** inside the band, so this curve has "
+         "a real joining point rather than a slide. Ec along the dotted "
+         "line says what the answer would be at any other choice."))
 
 
 def fit_equation_panel(result):
@@ -10933,6 +11004,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
         prefer = st.session_state.pop("_pw_eps1_prefer", "aicc")
         found = None if parallel else early_best_eps1(
             model, epsilon, force_N, live, end, prefer=prefer)
+        # What the search saw, kept so the board can show the shape of it
+        # rather than only its winner.
+        st.session_state["pw_early_profile"] = (found or {}).get("profile")
         parked = early_park(end, parallel=parallel,
                             first=(found or {}).get("eps1"))
         for _key, _value in zip(PW_BOUNDARY_KEYS, parked):
@@ -11955,14 +12029,20 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
     if not HAS_PIECEWISE or len(order) < 2:
         return None
     end = float(end if end is not None else early_end_pct())
-    thin_eps, thin_force, _step = thinned_for_search(epsilon, force_N)
+    # Every point, not a thinned copy: 31 fits of a two-term model take a
+    # quarter of a second, and scoring the search on different points from
+    # the fit is how the joining point it hands back is not the one the
+    # page then draws.
+    thin_eps, thin_force = (np.asarray(epsilon, dtype=float),
+                            np.asarray(force_N, dtype=float))
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
     settings = effective_piecewise_settings(piecewise_settings(),
                                             piecewise_until(), off)
     regimes = early_regimes_for("staggered", order)
+    geometry = piecewise_geometry(model)
     extras = fit_extras()
-    best = None
+    best, profile = None, []
     lo, hi = early_band(end)
     # Only inside the band the cytoskeleton is allowed to appear in. A
     # joining point found at 4 % or at 30 % fits better on some curves and
@@ -11979,12 +12059,23 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
         coefficients = result.get("coefficients") or {}
         measured = sum(1 for name in order
                        if abs(float(coefficients.get(name) or 0.0)) > 0.0)
+        moduli = piecewise_moduli(result, geometry, regimes=regimes)
+        profile.append({
+            "eps1": float(bounds[1]),
+            "r2": float(result.get("r_squared", float("nan"))),
+            "measured": measured,
+            "E_shell": float((moduli.get("K_shell") or {}).get("E_Pa", 0.0)),
+            "E_cyto": float((moduli.get("K_cyto") or {}).get("E_Pa", 0.0)),
+        })
         key = (measured, float(result.get("r_squared", float("-inf")))
                if prefer == "r2" else -float(result.get("aicc", float("inf"))))
         if best is None or key > best["key"]:
             best = {"key": key, "eps1": float(bounds[1]),
                     "r2": float(result.get("r_squared", float("nan"))),
                     "measured": measured}
+    if best is not None:
+        best["profile"] = profile
+        best["band"] = (lo, hi)
     return best
 
 
