@@ -5752,9 +5752,13 @@ PW_EARLY_VIEW_PCT = 45.0
 # over e = 0.1-0.3 and a living cell is elastic and fully reversible to
 # about 30 %, so 35 % covers the range the two-term model is for.
 PW_EARLY_END_PCT = 35.0
+# No emoji in front of either name. A round one sits exactly where a
+# radio button's dot goes, and reads as "this option is selected" whether
+# it is or not -- which is how a page fitting two components was read as
+# having four chosen.
 PW_REGIME_MODES = {
-    "full": "🔵 Full deformation · the four components, the whole squash",
-    "early": "🔬 Early deformation · two components (Lulevich eq 1 & 6)",
+    "full": "Full deformation — the four components, the whole squash",
+    "early": "Early deformation — two components (Lulevich eq 1 & 6)",
 }
 PW_REGIME_HELP = {
     "full": "The membrane, the cytoskeleton, the nuclear envelope and the "
@@ -8391,6 +8395,13 @@ def fitting_range_panel(result=None, n_points=None):
         if n_points:
             head += f" · {int(n_points):,} points"
     st.markdown("**📏 The range being fitted, and where each part starts**")
+    st.caption(
+        ("🔬 **Early deformation** — Lulevich's two components. This is "
+         "where every curve starts; the four-component fit is one click "
+         "above, under *what the cell is made of*."
+         if early else
+         "🧭 **Full deformation** — the four components over the whole "
+         "squash."))
     st.markdown(head)
     if rows:
         flat_table(pd.DataFrame(rows),
@@ -10647,12 +10658,35 @@ def piecewise_section(model, epsilon, force_N, rupture):
                      "pw_full_arrangement"):
             st.session_state[_key] = None
         st.session_state["pw_reach_note"] = None
+        # And it arrives on the two-term early reading, wherever the page
+        # happened to be left. The four-component board is somewhere you
+        # go on purpose, for the cell in front of you; a new cell does not
+        # inherit it, and a session left open from before does not decide
+        # how the next curve is read.
+        st.session_state["pw_came_back_early"] = (
+            piecewise_regime() != "early")
+        st.session_state["pw_regime"] = "early"
+        # The switch callback ignores a regime it thinks it is already in,
+        # so the page's memory of which one that is has to move with it.
+        # Without this the first press of "full deformation" after a new
+        # curve does nothing at all: the radio moves, the board does not.
+        st.session_state["_pw_regime_last"] = "early"
+        arrive_early()
+    elif apply_now:
+        apply_board()
+    elif (piecewise_regime()
+          != (applied_state.get("values") or {}).get("pw_regime",
+                                                     piecewise_regime())):
+        # The regime is not a setting that waits for a button: what the
+        # radio says is what the page shows. If the two ever disagree --
+        # a session left over from another build, a rerun that skipped the
+        # callback -- the page follows the radio rather than drawing a
+        # four-component plot over a two-component fit.
+        st.session_state["_pw_regime_last"] = piecewise_regime()
         if piecewise_regime() == "early":
             arrive_early()
         else:
             arrive_full()
-    elif apply_now:
-        apply_board()
     elif (piecewise_regime() == "early"
           and pw_board_values() != (applied_state.get("values") or {})):
         # The early regime has no ▶ Fit & plot, so a change to the board
@@ -10719,6 +10753,12 @@ def piecewise_section(model, epsilon, force_N, rupture):
                  "Everything else on this board behaves the same.",
         )
         st.caption(PW_REGIME_HELP.get(piecewise_regime(), ""))
+        if st.session_state.pop("pw_came_back_early", False):
+            st.info(
+                "This cell arrived on the **early deformation** reading, as "
+                "every cell does: two components over the first "
+                f"{early_end_pct():g} %. Choose **Full deformation** above "
+                "for the four-component fit of this cell.", icon="🔬")
         st.caption(
             "The two components below are Lulevich's own: exactly what is "
             "ticked is fitted, drawn and reported, and the panel under the "
