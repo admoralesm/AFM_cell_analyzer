@@ -5301,6 +5301,13 @@ def component_order_control():
         # regime fits, so it is stated rather than offered as a choice.
         lo, hi = early_band(early_end_pct())
         end = early_end_pct()
+        if not engine_fits_through_origin():
+            st.warning(
+                "This copy of **piecewise_fit.py** is older than app.py: it "
+                "cannot fit a first stretch without a free intercept, so "
+                "the early fit keeps C₀ for now. Copy the piecewise_fit.py "
+                "that came with this app.py and it will fit through first "
+                "contact.", icon="⚠️")
         st.caption(
             f"{names[PW_EARLY_ORDER[0]][0]} **from first contact to "
             f"{end:g} %**, then {names[PW_EARLY_ORDER[1]][0]} **from ε₁ to "
@@ -5371,6 +5378,40 @@ def component_order_control():
                    if ORDER_COEFFICIENT.get(t) in live))
 
 
+def engine_fits_through_origin():
+    """
+    Whether the engine in this checkout can fit a first regime that has no
+    intercept.
+
+    app.py and piecewise_fit.py are copied separately, and an older engine
+    has no anchor for a first regime without a C₀: it fails with a type
+    error in the middle of the fit. Rather than take the page down, the
+    early regime keeps its intercept when the engine cannot do without
+    one, and the board says so.
+    """
+    known = st.session_state.get("_pw_no_intercept_ok")
+    if known is not None:
+        return bool(known)
+    ok = False
+    if HAS_PIECEWISE and PW_REGIMES and PW_REGIMES[0].terms:
+        try:
+            x = np.linspace(0.5, 10.0, 60)
+            probe = (_dataclasses.replace(
+                PW_REGIMES[0], terms=(PW_REGIMES[0].terms[0],),
+                free_offset=False),) + tuple(
+                    _dataclasses.replace(r, terms=(), free_offset=False)
+                    for r in PW_REGIMES[1:])
+            out = fit_piecewise(
+                x / 100.0, 1e-13 * x ** 3,
+                boundaries_pct=(0.0, 4.0, 6.0, 8.0, 10.0),
+                regimes=probe, settings={}, carry=())
+            ok = bool(out.get("success"))
+        except Exception:
+            ok = False
+    st.session_state["_pw_no_intercept_ok"] = bool(ok)
+    return bool(ok)
+
+
 def pw_regimes():
     """
     The four regimes, built from the order the components are met in.
@@ -5420,7 +5461,8 @@ def pw_regimes():
     # contact, where the force is zero by definition, and a C₀ free to
     # float takes up whatever the two power laws cannot -- which is force
     # attributed to nothing at all.
-    offset = piecewise_regime() != "early"
+    offset = (piecewise_regime() != "early"
+              or not engine_fits_through_origin())
     out = []
     for index, (regime, name) in enumerate(zip(PW_REGIMES, order)):
         out.append(_dataclasses.replace(
@@ -5965,8 +6007,14 @@ def piecewise_off():
 def piecewise_until():
     """The component ends set by hand, cleaned."""
     stored = _pw_get("pw_until") or {}
-    return {k: float(v) for k, v in stored.items()
-            if k in PW_SWITCHABLE and v is not None}
+    out = {}
+    for key, value in stored.items():
+        if key not in PW_SWITCHABLE:
+            continue
+        number = _pw_number(value)
+        if number is not None:
+            out[key] = number
+    return out
 
 
 def piecewise_model_settings():
@@ -8606,6 +8654,25 @@ def _pw_early_to_changed(name):
     st.session_state["_pw_apply"] = True
 
 
+def _pw_number(value, default=None):
+    """A finite float, or the default. Nothing else reaches the fit."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if np.isfinite(number) else default
+
+
+def _pw_numbers(mapping):
+    """{name: finite float} out of whatever is in a stored mapping."""
+    out = {}
+    for key, value in (mapping or {}).items():
+        number = _pw_number(value)
+        if number is not None:
+            out[str(key)] = number
+    return out
+
+
 def remember_early_by_hand():
     """
     Keep what was set by hand, so the next file starts from it.
@@ -8615,13 +8682,11 @@ def remember_early_by_hand():
     or a far end chosen here has to be remembered on its own, or every
     file comes back to the same numbers.
     """
-    try:
-        st.session_state["_pw_early_eps1"] = round(
-            float(st.session_state.get("pw_b1")), 2)
-    except (TypeError, ValueError):
-        pass
-    st.session_state["_pw_early_until"] = {
-        k: float(v) for k, v in (st.session_state.get("pw_until") or {}).items()}
+    eps1 = _pw_number(st.session_state.get("pw_b1"))
+    if eps1 is not None:
+        st.session_state["_pw_early_eps1"] = round(eps1, 2)
+    st.session_state["_pw_early_until"] = _pw_numbers(
+        st.session_state.get("pw_until"))
     st.session_state["_pw_early_throughout"] = bool(
         st.session_state.get("pw_membrane_throughout", True))
 
@@ -10974,10 +11039,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # joining point, how far each component acts. Only what has never
         # been set is read off the curve, so "I set it to 18 %" survives
         # the next file instead of springing back to the default.
-        by_hand = st.session_state.get("_pw_early_eps1")
-        st.session_state["pw_until"] = {
-            k: float(v) for k, v in
-            (st.session_state.get("_pw_early_until") or {}).items()}
+        by_hand = _pw_number(st.session_state.get("_pw_early_eps1"))
+        st.session_state["pw_until"] = _pw_numbers(
+            st.session_state.get("_pw_early_until"))
         st.session_state["pw_membrane_throughout"] = bool(
             st.session_state.get("_pw_early_throughout", True))
         for _key, _value in zip(PW_BOUNDARY_KEYS,
@@ -12045,12 +12109,13 @@ def early_regimes_for(join, order):
         return _dataclasses.replace(PW_REGIMES[index], terms=(),
                                     free_offset=False, title="", equation="")
 
+    keep_c0 = not engine_fits_through_origin()
     if join == "parallel":
         # Both from first contact: one regime holding both terms, which
         # is his eq 1 and eq 6 added together.
         return ((_dataclasses.replace(
             PW_REGIMES[0], terms=tuple(terms[n] for n in live),
-            free_offset=False, equation="",
+            free_offset=keep_c0, equation="",
             title=" + ".join(PW_COMPONENT_TITLES.get(n, n) for n in live)),)
             + tuple(_dataclasses.replace(PW_REGIMES[i + 1], terms=(terms[n],),
                                          free_offset=False, title="",
@@ -12060,7 +12125,7 @@ def early_regimes_for(join, order):
     chain = list(live) + rest
     return tuple(
         _dataclasses.replace(PW_REGIMES[i], terms=(terms[n],),
-                             free_offset=False,
+                             free_offset=(keep_c0 and i == 0),
                              title=PW_COMPONENT_TITLES.get(n, ""), equation="")
         for i, n in enumerate(chain))
 
@@ -12087,7 +12152,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
                             np.asarray(force_N, dtype=float))
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
-    untils = dict(piecewise_until())
+    untils = _pw_numbers(piecewise_until())
     regimes = early_regimes_for("staggered", order)
     geometry = piecewise_geometry(model)
     extras = fit_extras()
@@ -12107,6 +12172,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
         here = dict(untils)
         if cap_first and order:
             here[order[0]] = float(bounds[1])
+        here = _pw_numbers(here)
         result = fit_piecewise(
             thin_eps, thin_force, boundaries_pct=bounds, regimes=regimes,
             settings=effective_piecewise_settings(piecewise_settings(),
