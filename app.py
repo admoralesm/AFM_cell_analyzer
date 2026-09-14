@@ -4833,7 +4833,9 @@ def component_row_table(rows, columns=2):
                         "disabled", not on)))
                 foot_l, foot_r = st.columns([1.25, 1])
                 with foot_l:
-                    st.caption(row.get("range_text", "") if on else "off")
+                    st.caption(row.get("range_text", "") if on else
+                               "off — not in this fit, and no area on the "
+                               "plot")
                 with foot_r:
                     slots[row["key"]] = st.empty()
                 for extra in row.get("extras", ()):
@@ -8165,10 +8167,17 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
             fig.add_trace(go.Scatter(
                 x=grid, y=layer * scale, mode="lines", stackgroup="components",
                 name=legend_names[-1],
-                line={"color": colour, "width": 0.8},
-                fillcolor=_rgba(colour, 0.30),
-                hovertemplate=f"{symbol}<br>x = %{{x:.1f}} %<br>F_j = %{{y:.4g}} "
-                              f"{unit}<extra></extra>",
+                line={"color": colour, "width": 1.8},
+                fillcolor=_rgba(colour, 0.45),
+                # Its OWN force, not the stacked total. A stacked trace's
+                # %{y} is the running sum, so a tooltip over the second
+                # band used to report the first band's force plus its own
+                # and call it that component's.
+                customdata=layer * scale,
+                hovertemplate=(f"<b>{label}</b> ({symbol})<br>"
+                               f"acts over {a:.1f}–{u:.1f} %<br>"
+                               f"its own force here: %{{customdata:.4g}} "
+                               f"{unit}<extra></extra>"),
             ))
     keep = (y > 0) if log_y else np.ones_like(y, dtype=bool)
     fig.add_trace(go.Scatter(
@@ -8305,6 +8314,10 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         # the legend under it, so nothing is drawn over the data.
         margin={"l": 104, "r": 24, "t": 16 + TAG_ROW_PX * tag_rows,
                 "b": 84 + 24 * n_rows},
+        # One box listing every layer at the x under the pointer, so which
+        # band is which is read off the numbers rather than guessed from
+        # the colours of two stacked areas.
+        hovermode="x unified",
         legend={"orientation": "h", "yref": "container", "yanchor": "bottom",
                 "y": 0.005, "xanchor": "left", "x": 0.0, "font": {"size": 12},
                 "traceorder": "normal"},
@@ -9700,6 +9713,7 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=2):
             "slider": {
                 "label": f"{label} acts over (%)", "min_value": 0.0,
                 "max_value": float(end), "step": 0.1, "key": key,
+                "disabled": not st.session_state.get(f"pw_use_{name}", True),
                 "on_change": _pw_range_moved, "args": (name,),
                 "label_visibility": "collapsed",
                 "help": "Left end: where it starts carrying load, which is "
@@ -11290,6 +11304,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
             def _same(name):
                 if (name in board_off) != (name in off_now):
                     return False
+                if name in off_now:
+                    # Off on both sides. An unticked component has no range
+                    # in the fit and no area on the plot, so there is
+                    # nothing to compare -- and comparing the board's
+                    # would-be range against nothing is how a row nobody
+                    # had touched sat there saying it was not drawn yet.
+                    return True
                 a1 = tuple(round(float(v), 2) for v in board_ranges.get(name, ()))
                 a2 = tuple(round(float(v), 2) for v in applied_ranges.get(name, ()))
                 return a1 == a2
