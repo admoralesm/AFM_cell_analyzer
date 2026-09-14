@@ -899,6 +899,9 @@ DEFAULTS = {
     # is read to 35 %; after it is, the number set is kept from cell to
     # cell, because a window chosen once is meant for the batch.
     "_pw_early_end_user": False,
+    # The early window itself, once it has been set by hand. None means
+    # every curve is read to PW_EARLY_END_PCT.
+    "_pw_early_end": None,
     # Each regime remembers its own boundaries, so switching back and
     # forth does not lose where the other one was fitted to.
     "pw_early_eps": None,
@@ -5823,16 +5826,15 @@ def early_end_pct():
     """
     How far the early reading goes, in percent.
 
-    The window, never the whole squash: until it is set by hand it is
-    35 %, whatever the board happens to be holding. The board's x_end is
-    shared with the four-component fit, where it is the end of the curve,
-    so reading it blind is how a two-term fit ends up stretched over the
-    nucleus.
+    The window is remembered as its own number, not read off the board.
+    x_end on the board belongs to the four-component fit as much as to
+    this one, and loading a curve resets it to the end of the squash --
+    so a two-term reading that asked the board what its window was got
+    91 % handed back and fitted two components over the whole cell.
     """
-    if not st.session_state.get("_pw_early_end_user"):
-        return float(PW_EARLY_END_PCT)
     try:
-        end = float(st.session_state.get("pw_end", PW_EARLY_END_PCT))
+        end = float(st.session_state.get("_pw_early_end")
+                    or PW_EARLY_END_PCT)
     except (TypeError, ValueError):
         return float(PW_EARLY_END_PCT)
     return end if 2.0 < end <= 100.0 else float(PW_EARLY_END_PCT)
@@ -8248,10 +8250,13 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     x_hi = max(end, float(np.nanmax(x)) if x.size else end) + 1.5
     y_window = None
     if piecewise_regime() == "early":
-        # Zoomed to the early regime: the whole squash in one frame leaves
-        # a fit over the first fifth of it as a smudge against the axis.
-        # The data are all still there, the view is simply narrower.
-        x_hi = max(PW_EARLY_VIEW_PCT, end * 1.15)
+        # Zoomed to the window that was fitted, and barely past it. The
+        # force at 45 % can be five times the force at 35 %, so a frame
+        # that wide puts the whole fit in the bottom quarter of the plot
+        # and a component carrying a tenth of it becomes a sliver against
+        # the axis -- which is how a cytoskeleton with a modulus looked
+        # like a cytoskeleton that was not drawn.
+        x_hi = min(max(end * 1.06, end + 1.0), 100.0)
         inside = x <= x_hi
         if inside.any() and np.isfinite(y[inside]).any():
             top_y = float(np.nanmax(y[inside]))
@@ -8510,6 +8515,7 @@ def early_range_control():
                 taken = early_park(round(float(window), 1))
                 rerun_keeping_settings(
                     {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                     "_pw_early_end": round(float(window), 1),
                      "_pw_early_end_user": True,
                      "_pw_find_early": True, "_pw_apply": True})
         st.caption(
@@ -8576,7 +8582,8 @@ def early_boundary_control():
         taken = early_park(PW_EARLY_END_PCT, parallel=False)
         rerun_keeping_settings(
             {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-             "pw_early_eps": None, "_pw_early_end_user": False,
+             "pw_early_eps": None, "_pw_early_end": None,
+             "_pw_early_end_user": False,
              "_pw_find_early": True, "_pw_apply": True})
 
 
@@ -8643,6 +8650,29 @@ def fit_equation_panel(result):
         + f" $R^2 = {result['r_squared']:.5f}$ over "
         f"{int(result.get('n_points', 0)):,} points."
     )
+    # A component that came back at zero is in the model, in the equation
+    # and in the results as 0 — and has no area on the plot, because it
+    # carries no force. Saying so here is the difference between a reading
+    # and a drawing that looks broken.
+    empty = [label for name, label, _s, _c, _l in active_components()
+             if name not in piecewise_off()
+             and abs(float(((result.get("moduli") or {}).get(name)
+                            or {}).get("E_Pa", 0.0))) < 1e-6]
+    if empty:
+        ranges = result.get("ranges") or {}
+        where = ", ".join(
+            f"{label} over "
+            f"{float(ranges.get(name, (0, 0))[0]):.3g}–"
+            f"{min(float(ranges.get(name, (0, 0))[1]), float(b[-1])):.3g} %"
+            for name, label, _s, _c, _l in active_components()
+            if label in empty and name in ranges)
+        st.warning(
+            f"**Measured as zero: {', '.join(empty)}.** The least squares "
+            f"came back at the lower bound for {where or 'its stretch'}, so "
+            "it carries no force there and has no area on the plot. It has "
+            "not been removed from the model — the curve simply gives it "
+            "nothing over that stretch, which is a result about this cell.",
+            icon="⚠️")
 
 
 def copy_row_panel(result, fit=None):
@@ -8788,7 +8818,7 @@ def piecewise_graph_note(result, off=(), view="stacked", log_y=False,
              f"the second component joining at ε₁ = {b[1]:.2f} %, fitted "
              f"over [0, {b[4]:.1f}] %")
             + ". The plot is zoomed to "
-            f"{max(PW_EARLY_VIEW_PCT, b[4] * 1.15):.0f} % so the early "
+            f"{min(max(b[4] * 1.06, b[4] + 1.0), 100.0):.0f} % so the early "
             "regime fills the frame; the rest of the curve is still there, "
             "outside the view and outside the fit"
         )
@@ -9882,8 +9912,9 @@ def _pw_early_end_changed():
     # it again rather than leaving the old one in place.
     st.session_state["_pw_find_early"] = True
     st.session_state["_pw_apply"] = True
-    # A window set by hand is kept for the cells that follow; until one
-    # is, every curve is read to 35 %.
+    # A window set by hand is kept for the cells that follow, as the
+    # number itself; until one is, every curve is read to 35 %.
+    st.session_state["_pw_early_end"] = end
     st.session_state["_pw_early_end_user"] = True
 
 
@@ -10831,6 +10862,20 @@ def piecewise_section(model, epsilon, force_N, rupture):
     # wonder whether the arrangement it was handed is the model.
     if piecewise_regime() == "early":
         pin_early_arrangement()
+        # x_end on the board is shared with the four-component fit, and
+        # loading a curve resets it to the end of the squash. The early
+        # window is its own number, so the board is set from it rather
+        # than the other way round.
+        _end = early_end_pct()
+        try:
+            _on_board = float(st.session_state.get("pw_end", _end))
+        except (TypeError, ValueError):
+            _on_board = _end
+        if abs(_on_board - _end) > 1e-6:
+            for _key, _value in zip(PW_BOUNDARY_KEYS,
+                                    early_park(_end, parallel=False,
+                                               first=st.session_state.get("pw_b1"))):
+                st.session_state[_key] = round(float(_value), 2)
         _lo, _hi = early_band(early_end_pct())
         try:
             _e1 = float(st.session_state.get("pw_b1", 0.5 * (_lo + _hi)))
