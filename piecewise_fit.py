@@ -613,6 +613,12 @@ def fit_piecewise(
 
     for i, regime in enumerate(regimes):
         a, b = bounds[i], bounds[i + 1]
+        if anchor is None and not regime.free_offset:
+            # No free intercept anywhere: the first stretch is fitted
+            # through the origin, which is what first contact means -- the
+            # probe is touching and carrying nothing. Without this the
+            # first regime would have no anchor to be measured from.
+            anchor = 0.0
         last = i == len(regimes) - 1
         inside = (x_all >= a) & ((x_all <= b) if last else (x_all < b))
         x = x_all[inside]
