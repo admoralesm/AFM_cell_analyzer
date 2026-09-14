@@ -902,6 +902,12 @@ DEFAULTS = {
     # The early window itself, once it has been set by hand. None means
     # every curve is read to PW_EARLY_END_PCT.
     "_pw_early_end": None,
+    # And the rest of what a person sets on the early board: where the
+    # second component joins, and how far each one acts. None and {} mean
+    # every curve is read for itself.
+    "_pw_early_eps1": None,
+    "_pw_early_until": {},
+    "_pw_early_throughout": True,
     # Each regime remembers its own boundaries, so switching back and
     # forth does not lose where the other one was fitted to.
     "pw_early_eps": None,
@@ -8576,11 +8582,40 @@ def _pw_early_to_changed(name):
         if name == "K_shell":
             st.session_state["pw_membrane_throughout"] = False
     st.session_state["pw_until"] = untils
+    remember_early_by_hand()
     st.session_state["_pw_apply"] = True
+
+
+def remember_early_by_hand():
+    """
+    Keep what was set by hand, so the next file starts from it.
+
+    Loading a curve resets the board's boundaries and the per-component
+    ends -- that is the four-component fit's arrival -- so a joining point
+    or a far end chosen here has to be remembered on its own, or every
+    file comes back to the same numbers.
+    """
+    try:
+        st.session_state["_pw_early_eps1"] = round(
+            float(st.session_state.get("pw_b1")), 2)
+    except (TypeError, ValueError):
+        pass
+    st.session_state["_pw_early_until"] = {
+        k: float(v) for k, v in (st.session_state.get("pw_until") or {}).items()}
+    st.session_state["_pw_early_throughout"] = bool(
+        st.session_state.get("pw_membrane_throughout", True))
+
+
+def forget_early_by_hand():
+    """Back to reading each curve for itself."""
+    st.session_state["_pw_early_eps1"] = None
+    st.session_state["_pw_early_until"] = {}
+    st.session_state["_pw_early_throughout"] = True
 
 
 def _pw_early_from_changed():
     """Callback: where the second component starts was typed."""
+    remember_early_by_hand()
     st.session_state["_pw_apply"] = True
 
 
@@ -8653,6 +8688,7 @@ def early_boundary_control():
                           "only: the elements, their order and their far "
                           "ends stay exactly as they are."):
             rerun_keeping_settings({"_pw_eps1_prefer": "r2",
+                                    "_pw_early_eps1": None,
                                     "_pw_find_eps1": True,
                                     "_pw_apply": True})
     with o2:
@@ -8669,6 +8705,8 @@ def early_boundary_control():
                 {**dict(zip(PW_BOUNDARY_KEYS, taken)),
                  "pw_early_eps": None, "_pw_early_end": None,
                  "_pw_early_end_user": False, "pw_until": {},
+                 "_pw_early_eps1": None, "_pw_early_until": {},
+                 "_pw_early_throughout": True,
                  "pw_membrane_throughout": True,
                  "_pw_find_early": True, "_pw_apply": True})
     said_early = st.session_state.get("pw_early_note")
@@ -9741,6 +9779,11 @@ def _pw_range_moved(name):
         else:
             untils[name] = round(hi, 2)
     st.session_state["pw_until"] = untils
+    # A bar dragged on the early board is a setting, like a typed number:
+    # kept for the files that follow, and applied at once.
+    if piecewise_regime() == "early":
+        remember_early_by_hand()
+        st.session_state["_pw_apply"] = True
 
 
 def _pw_throughout_changed():
@@ -10806,8 +10849,19 @@ def piecewise_section(model, epsilon, force_N, rupture):
         """
         end = early_end_pct()
         pin_early_arrangement()
+        # Anything set by hand carries over to this curve: the window, the
+        # joining point, how far each component acts. Only what has never
+        # been set is read off the curve, so "I set it to 18 %" survives
+        # the next file instead of springing back to the default.
+        by_hand = st.session_state.get("_pw_early_eps1")
+        st.session_state["pw_until"] = {
+            k: float(v) for k, v in
+            (st.session_state.get("_pw_early_until") or {}).items()}
+        st.session_state["pw_membrane_throughout"] = bool(
+            st.session_state.get("_pw_early_throughout", True))
         for _key, _value in zip(PW_BOUNDARY_KEYS,
-                                early_park(end, parallel=False)):
+                                early_park(end, parallel=False,
+                                           first=by_hand)):
             st.session_state[_key] = round(float(_value), 2)
         for _name in PW_EARLY_COMPONENTS:
             st.session_state[f"pw_use_{_name}"] = True
@@ -10818,7 +10872,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
         st.session_state["pw_style_note"] = None
         st.session_state["pw_selected"] = None
         st.session_state["pw_placements"] = None
-        if HAS_PIECEWISE:
+        if by_hand:
+            # The joining point is the person's, so nothing is searched:
+            # this curve is fitted where they put it.
+            st.session_state["pw_early_note"] = (
+                f"**ε₁ = {float(by_hand):.1f} %** as you set it, kept for "
+                "this curve too. **🎯 Optimise** reads it off this curve "
+                "instead, and **↺ Back to the default** forgets it.")
+            apply_board()
+        elif HAS_PIECEWISE:
             find_early_arrangement()
         else:
             apply_board()
