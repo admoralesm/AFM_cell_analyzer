@@ -5615,11 +5615,8 @@ def load_sharing_control():
         st.markdown("**How the cell is fitted**")
         st.latex(r"F(x) = F_{\text{membrane}}(x) + F_{\text{interior}}(x)")
         st.caption(
-            "Lulevich's two terms, added: the membrane stretching as x³ "
-            "(his eq 3) and the interior as a Hertzian contact, x^1.5 (his "
-            "eq 6). Each is fitted where it joins and both carry load to "
-            "the end of the window. Switch to full deformation to choose "
-            "how four components share it instead.")
+            "Membrane as x³ (eq 3), interior as x^1.5 (eq 6), each from "
+            "where it joins to the end of the window.")
         return
     options = sharing_options()
     st.session_state["load_sharing"] = current_sharing()
@@ -5877,12 +5874,8 @@ PW_REGIME_HELP = {
             "inside of the nucleus, met one after another over the whole "
             "squash. This is the default and it is what the four-regime "
             "model is for.",
-    "early": "Only the two components Lulevich's model has over the early "
-             "regime — the membrane, stretching as ε³, and the cell "
-             "interior answering Hertz at ε^1.5 — fitted over the early "
-             "window alone. The number that compares with a paper is read "
-             "here, because a law that starts at first contact converts "
-             "into a modulus with nothing to undo.",
+    "early": "Two components over the early window: the membrane as ε³ "
+             "and the cell interior as ε^1.5.",
 }
 
 
@@ -7093,40 +7086,147 @@ def early_thickness_m():
         return 4e-9
 
 
-def lulevich_panel(result, model, fit=None):
+def bending_comparison(result, geometry, h, epsilon, force_N):
     """
-    The early regime against its source, from the board's own fit.
+    The same arrangement fitted twice: without the bending term and with it.
 
-    Not a second fit and not a second plot: the numbers here are the ones
-    the board just produced, checked against the paper the model comes
-    from. Shown only when the board is fitting the early regime, because
-    that is the only place these equations apply.
+    Lulevich's eq 1 has the shell bending as well as stretching, with the
+    SAME modulus and the same thickness, so keeping the term costs no extra
+    parameter and dropping it is a claim about size rather than a different
+    model. Fitting both ways is what settles whether it can go; the moduli
+    it returns are the answer, because a term that changes no modulus is a
+    term that measures nothing.
+    """
+    if bending_prefactor is None or epsilon is None or force_N is None:
+        return None
+    moduli = result.get("moduli") or {}
+    ranges = result.get("ranges") or {}
+    end = float(result["boundaries_pct"][-1])
+    x = np.asarray(epsilon, dtype=float).ravel()
+    f = np.asarray(force_N, dtype=float).ravel()
+    if x.size != f.size or x.size < 8:
+        return None
+    if np.isfinite(x).any() and np.nanmax(x) <= 1.5:
+        x = x * 100.0                      # a fraction, not per cent
+    keep = np.isfinite(x) & np.isfinite(f) & (x >= 0.0) & (x <= end)
+    if int(keep.sum()) < 8:
+        return None
+    e, y = x[keep] / 100.0, f[keep]
+    A_bend = float(bending_prefactor(geometry, h))
+    if not np.isfinite(A_bend) or A_bend <= 0:
+        return None
+
+    columns, rows = [], []
+    for name, label, symbol, _colour, _law in active_components():
+        if name in piecewise_off() or name not in ranges:
+            continue
+        row = moduli.get(name) or {}
+        A = float(row.get("prefactor_N_per_Pa", float("nan")))
+        power = float(row.get("power", float("nan")))
+        if not (np.isfinite(A) and np.isfinite(power)) or A <= 0:
+            return None
+        start = float(ranges[name][0]) / 100.0
+        until = min(float(ranges[name][1]), end) / 100.0
+        span = np.clip(np.minimum(e, until) - start, 0.0, None)
+        columns.append(A * span ** power)
+        rows.append({"name": name, "label": label, "symbol": symbol,
+                     "span": span})
+    if not columns:
+        return None
+
+    def solve(design):
+        """Bounded non-negative least squares, by active set. Two columns."""
+        live = list(range(design.shape[1]))
+        theta = np.zeros(design.shape[1])
+        while live:
+            try:
+                part, *_ = np.linalg.lstsq(design[:, live], y, rcond=None)
+            except np.linalg.LinAlgError:
+                return None
+            if (part >= 0).all():
+                theta = np.zeros(design.shape[1])
+                theta[live] = part
+                break
+            live = [c for c, t in zip(live, part) if t > 0]
+        predicted = design @ theta
+        ss_res = float(np.sum((y - predicted) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        return theta, (1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")), \
+            ss_res
+
+    without = np.column_stack(columns)
+    within = without.copy()
+    for j, row in enumerate(rows):
+        if row["name"] == "K_shell":
+            within[:, j] = without[:, j] + A_bend * row["span"] ** 0.5
+    left, right = solve(without), solve(within)
+    if left is None or right is None:
+        return None
+    theta_off, r2_off, ss_off = left
+    theta_on, r2_on, ss_on = right
+
+    n = int(e.size)
+
+    def aicc(ss, k):
+        if not (np.isfinite(ss) and ss > 0) or n <= k + 1:
+            return float("nan")
+        return (n * np.log(ss / n) + 2 * k
+                + 2 * k * (k + 1) / float(n - k - 1))
+
+    # Same number of free parameters both ways: the bending term rides on
+    # the membrane's own modulus, so this comparison is not paying for it.
+    k = without.shape[1]
+    worst, table = 0.0, []
+    for j, row in enumerate(rows):
+        a, b = float(theta_off[j]), float(theta_on[j])
+        change = (100.0 * abs(b - a) / a) if a > 1e-6 else float("nan")
+        if np.isfinite(change):
+            worst = max(worst, change)
+        table.append({"name": row["name"], "symbol": row["symbol"],
+                      "label": row["label"], "off_Pa": a, "on_Pa": b,
+                      "change_pct": change})
+
+    # What the term would add to the force, as a share of it, across the
+    # window: one number per decade of the squash.
+    membrane = next((j for j, row in enumerate(rows)
+                     if row["name"] == "K_shell"), None)
+    share = []
+    if membrane is not None and theta_off[membrane] > 1e-6:
+        grid = np.array([v for v in (0.5, 1.0, 2.0, 5.0, 10.0, 20.0, end)
+                         if 0 < v <= end])
+        base = np.interp(grid / 100.0, e, without @ theta_off)
+        start = float(ranges[rows[membrane]["name"]][0]) / 100.0
+        adds = theta_off[membrane] * A_bend * np.clip(
+            grid / 100.0 - start, 0.0, None) ** 0.5
+        share = list(zip(grid.tolist(), adds.tolist(),
+                         (100.0 * adds / np.clip(base + adds, 1e-30,
+                                                 None)).tolist()))
+    return {"n": n, "r2_off": r2_off, "r2_on": r2_on,
+            "delta_aicc": aicc(ss_on, k) - aicc(ss_off, k),
+            "moduli": table, "worst_change_pct": worst, "share": share}
+
+
+def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
+    """
+    The equations this fit comes from, with this cell's numbers in them.
+
+    Equations, measured moduli, and the one open question about the model:
+    whether the membrane's bending term can be left out. No commentary --
+    what the model means is in the paper, and what it gave is on the plot.
     """
     if not (result and result.get("success")) or bending_crossover is None:
         return
     geometry = piecewise_geometry(model)
     moduli = result.get("moduli") or {}
-    ranges = result.get("ranges") or {}
     h = early_thickness_m()
     R0 = float(geometry.cell_radius)
     nu_m, nu_i = float(geometry.nu_membrane), float(geometry.nu_interior)
     end = float(result["boundaries_pct"][-1])
     crossing = bending_crossover(geometry, h)
-    style_unit = st.session_state.get("pw_force_unit", "N")
-    if style_unit not in FORCE_UNITS:
-        style_unit = "N"
-    style_unit_label = FORCE_UNITS[style_unit][1]
 
     box = st.container(border=True)
     with box:
-        st.markdown("#### 📄 Against Lulevich — the model this comes from")
-        st.caption(
-            "Lulevich, Zink, Chen, Liu & Liu, *Langmuir* **2006**, 22, "
-            "8151–8155. Over the early regime a living cell is a balloon of "
-            "incompressible fluid with two components, and these are their "
-            "equations with **this fit's** numbers in them. Nothing here "
-            "refits anything."
-        )
+        st.markdown("#### 📄 The equations")
         st.latex(r"\textbf{(1)}\quad F_m \;=\; \underbrace{2\pi\frac{E_m}"
                  r"{1-\nu_m}\,h R_0\,\varepsilon^{3}}_{\text{stretching}}"
                  r"\;+\;\underbrace{\frac{\pi E_m}{2\sqrt{2}}\,h^{2}\,"
@@ -7134,17 +7234,18 @@ def lulevich_panel(result, model, fit=None):
                  r"\qquad\textbf{(6)}\quad F_i \;=\; \frac{\sqrt{2}\,E_i}"
                  r"{3(1-\nu_i^{2})}\,R_0^{2}\,\varepsilon^{3/2}")
         st.caption(
-            f"Fitted here with h = {h * 1e9:.0f} nm, R₀ = {R0 * 1e6:.2f} µm, "
-            f"ν_m = {nu_m:g}, ν_i = {nu_i:g}, over x = 0 to {end:.1f} % on "
-            f"{int(result.get('n_points', 0)):,} points. Their eq 3 is eq 1 "
-            "with the bending half dropped, which is what this board fits."
+            f"Lulevich *et al.*, *Langmuir* **2006**, 22, 8151–8155. Fitted "
+            f"here with hₘ = {h * 1e9:.0f} nm, R₀ = {R0 * 1e6:.2f} µm, "
+            f"ν_m = {nu_m:g}, ν_i = {nu_i:g}, over x = 0 → {end:.1f} % on "
+            f"{int(result.get('n_points', 0)):,} points. Eq 3 is eq 1 "
+            "without the bending half, and is what is fitted."
         )
 
         left, right = st.columns(2)
         with left:
             row = moduli.get("K_shell") or {}
             E = float(row.get("E_Pa", float("nan")))
-            st.metric("🟥 Membrane  Eₘ  (their eq 3)",
+            st.metric("🟥 Membrane  Eₘ  (eq 3)",
                       modulus_display("E_shell", E, row.get("E_se_Pa")))
             if np.isfinite(E) and bending_constant is not None:
                 k = bending_constant(E, geometry, h)
@@ -7152,196 +7253,88 @@ def lulevich_panel(result, model, fit=None):
                 inside_K = 17.0 <= k["K_kT"] <= 52.0
                 st.caption(("✅ " if inside_E else "⚠️ ")
                            + ("inside" if inside_E else "outside")
-                           + " the **10–35 MPa** they report for living cell "
-                             "membranes")
+                           + " their **10–35 MPa**")
                 st.caption(("✅ " if inside_K else "⚠️ ")
-                           + f"bending constant K_m = {k['K_kT']:.0f} kT "
+                           + f"K_m = {k['K_kT']:.0f} kT, "
                            + ("inside" if inside_K else "outside")
-                           + " their **17–52 kT** (their eq 4, "
-                             f"K_m = E_m h³/12(1−ν_m²))")
+                           + " their **17–52 kT** (eq 4)")
         with right:
             row = moduli.get("K_cyto") or {}
             E = float(row.get("E_Pa", float("nan")))
-            st.metric("🟧 Cell interior  E_i  (their eq 6)",
+            st.metric("🟧 Cell interior  E_i  (eq 6)",
                       modulus_display("E_cyto", E, row.get("E_se_Pa")))
             if np.isfinite(E):
                 inside = 1.0e3 <= E <= 10.0e3
                 st.caption(("✅ " if inside else "⚠️ ")
                            + ("inside" if inside else "outside")
-                           + " the **1–10 kPa** they quote for the "
-                             "cytoskeleton or cell nuclei (they fit "
-                             "**4–7.5 kPa** on dead cells with eq 6 below "
-                             "30 % deformation)")
+                           + " their **1–10 kPa**")
 
-        # Where each law starts, and what that costs the conversion.
-        rough = []
-        for name in active_component_names():
-            start, _u = ranges.get(name, (0.0, end))
-            if float(start) <= 0.01:
-                continue
-            power = 3.0 if name == "K_shell" else 1.5
-            mid = 0.5 * (float(start) + end) / 100.0
-            factor = (mid / max(mid - float(start) / 100.0, 1e-9)) ** power
-            if factor < 1.15:
-                # A hair over 1 is not worth a warning, and "about 1x"
-                # reads as a bug.
-                continue
-            symbol = "Eₘ" if name == "K_shell" else "Ec"
-            rough.append(f"{symbol} starts at {float(start):.1f} %, so "
-                         f"reading it as a modulus of the whole deformation "
-                         f"overstates it by about **{factor:.1f}×**")
-        if rough:
-            st.warning(" · ".join(rough) + ". Only a law acting from first "
-                       "contact converts with nothing to undo — move ε₁ to "
-                       "0 in **B** to read it that way.", icon="⚠️")
-
-        # A component that came back at zero over a wide early window is
-        # almost always the two shapes trading places, not an absent
-        # component: e^3 and e^1.5 are close over a short stretch, and the
-        # wider the window the more completely the cube wins. Saying which
-        # knob fixes it is more use than the zero itself.
-        silent = [name for coefficient, name in
-                  (("K_shell", "🟥 Membrane Eₘ"), ("K_cyto", "🟧 Cytoskeleton Ec"))
-                  # A bounded least squares lands on 1e-29 Pa, not on a
-                  # clean zero. Anything under a pascal is not a cell.
-                  if float((moduli.get(coefficient) or {}).get("E_Pa", 1e9)
-                           or 0.0) <= 1.0]
-        if silent:
-            st.warning(
-                "**" + " and ".join(silent)
-                + f" came back at zero over 0 to {end:.0f} %.** That is almost "
-                "never an absent component: ε³ and ε^1.5 are close in shape "
-                "over a short stretch, and the wider the window the more "
-                "completely the cube law absorbs the other one. The fix is "
-                "the window, not the model — press **📐 Read to …** in "
-                "**B** to take the stretch where this curve is still one "
-                "power law (usually near 20 %), and the two separate "
-                "again.", icon="⚠️")
-
-        st.markdown("**Can the membrane's bending term be dropped here?**")
-
-        # The decisive number is not the ratio between the two membrane
-        # terms, it is what keeping the bending one would ADD to the force
-        # being fitted -- the cytoskeleton carries part of that force too,
-        # so a term that looms next to a small membrane contribution can
-        # still be nothing next to the total.
-        E_m = float((moduli.get("K_shell") or {}).get("E_Pa", float("nan")))
-        A_bend = (bending_prefactor(geometry, h)
-                  if bending_prefactor is not None else float("nan"))
-        verdict, rows = None, []
-        if np.isfinite(E_m) and np.isfinite(A_bend) and E_m > 0:
-            grid = np.array([v for v in (1.0, 2.0, 5.0, 10.0, 20.0, end)
-                             if 0 < v <= end])
-            total = np.abs(predict_piecewise(grid / 100.0, result))
-            bend = E_m * A_bend * (grid / 100.0) ** 0.5
-            share = 100.0 * bend / np.clip(total + bend, 1e-30, None)
-            for at, adds, part in zip(grid, bend, share):
-                rows.append({
-                    "x (%)": f"{at:.1f}",
-                    f"bending would add ({style_unit_label})":
-                        f"{float(from_newtons(adds, style_unit)[0]):.3g}",
-                    "as a share of the fitted force": f"{part:.2f} %",
-                })
-            heavy = share[grid >= 2.0]
-            verdict = float(np.max(heavy)) if heavy.size else float(share.max())
-        # The verdict always says WHY, in this cell's own numbers. The
-        # mechanism is Lulevich's eq 2: bending resistance goes as h^2 and
-        # stretching as h*R0, so their ratio carries a factor h/R0 -- a
-        # bilayer is three orders thinner than the cell is wide -- against
-        # e^-5/2, which is the only thing that can make up for it. Near
-        # first contact it does, and bending IS the first term; a little
-        # way in it cannot, and the term is gone.
-        slimness = h / R0 if R0 > 0 else float("nan")
-        because = (
-            f"because the bilayer is about **{1.0 / slimness:,.0f}× thinner "
-            f"than the cell is wide** (hₘ/R₀ = {slimness:.1e}). Bending "
-            "resistance goes as hₘ² and stretching as hₘ·R₀, so their ratio "
-            "carries that factor, and only ε^−5/2 can make up for it. It "
-            f"does below **x = {crossing['equal_pct']:.2f} %**, where "
-            "bending is genuinely the larger of the two — it is the first "
-            "term the cell answers with. Above that the ratio falls by "
-            "**5.7× for every doubling** of deformation, and by "
-            f"x = {crossing['negligible_pct']:.2f} % it is under a "
-            "twentieth of stretching"
-        )
-        if verdict is None:
-            st.info("The membrane came back at zero on this fit, so there is "
-                    "no bending term to keep or drop. The ε³ law found "
-                    "nothing to measure over this window.", icon="ℹ️")
-        elif verdict < 2.0:
-            st.success(
-                f"**Not needed — leave it out.** Over this window, above "
-                f"x = 2 %, keeping the bending term would change the fitted "
-                f"force by at most **{verdict:.2f} %**, which is inside the "
-                f"noise. It is not needed {because}. Lulevich drops it for "
-                "exactly this reason and fits his eq 3, stretching alone, "
-                "which is what this board fits.", icon="✅")
-        elif verdict < 10.0:
-            st.warning(
-                f"**Borderline — keep it in mind.** Keeping the bending "
-                f"term would change the fitted force by up to "
-                f"**{verdict:.1f} %** over this window, more than the "
-                f"noise, so Eₘ above carries that much systematic "
-                f"uncertainty from the choice alone. It is *nearly* not "
-                f"needed {because} — but your window starts at first "
-                "contact, which is the one end where that argument does "
-                f"not hold. Starting the reading past "
-                f"x = {crossing['negligible_pct']:.0f} % puts it back "
-                "inside the noise.", icon="⚠️")
-        else:
-            st.warning(
-                f"**Needed over this window — do not leave it out.** "
-                f"Keeping the bending term would change the fitted force by "
-                f"up to **{verdict:.0f} %**. The usual argument for "
-                f"dropping it — {because} — fails here because the reading "
-                "starts at first contact, below the crossover, where "
-                "bending is the larger term rather than a correction to "
-                f"it. Either start the reading past "
-                f"x = {crossing['negligible_pct']:.0f} %, or report Eₘ as "
-                "an apparent value rather than the membrane's modulus.",
-                icon="🚫")
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, **STRETCH)
-            st.caption(
-                "What the term would add point by point, at the membrane "
-                "modulus fitted above. Because it dies as ε^−5/2 relative "
-                "to stretching, **where the reading starts decides this, "
-                "not where it ends** — the same window moved in by a few "
-                "per cent changes the answer, and a wider x_end barely "
-                "does."
-            )
-
-        c1, c2, c3 = st.columns([1, 1, 1.6])
-        c1.metric("bending = stretching at", f"{crossing['equal_pct']:.2f} %")
-        c2.metric("bending < 5 % of it by",
-                  f"{crossing['negligible_pct']:.2f} %")
-        with c3:
-            # NOT a second box for hₘ. There is one widget for it, in the
-            # sidebar's model constants, and a second one with the same key
-            # is a duplicate-key error in Streamlit -- and, worse, two
-            # places to set one physical quantity. This shows what the
-            # answer above was computed with and says where to change it.
-            st.metric("membrane thickness hₘ",
-                      f"{early_thickness_m() * 1e9:.1f} nm")
-            st.caption("A lipid bilayer, 4 nm by default, the same hₘ the "
-                       "moduli are converted with. The bending term goes "
-                       "as hₘ², so this is what decides the answer above. "
-                       "Change it in **🧬 Model constants** in the sidebar.")
+        # ---- the one question the equations leave open -----------------
+        st.markdown("**Can the bending term be dropped from eq 1?**")
         st.latex(r"\textbf{(2)}\quad \frac{F_{bending}}{F_{stretching}}"
                  r"\;=\;\frac{1-\nu_m}{4\sqrt{2}}\,\frac{h}{R_0}\,"
                  r"\varepsilon^{-5/2}")
-        st.caption(
-            f"For this cell the ratio is {crossing['ratio_at'](10.0):.3f} at "
-            f"x = 10 % and {crossing['ratio_at'](end):.4f} at x = {end:.0f} %. "
-            "Lulevich drops the term over ε = 0.1–0.3 on exactly these "
-            "grounds (their eq 3, which is what is fitted here). But the "
-            "ratio **diverges as ε → 0**, so over the first "
-            f"{crossing['equal_pct']:.1f} % of the squash bending is the "
-            "larger of the two, and any reading that starts at first "
-            "contact is dropping a term that is not small at that end. "
-            "Raising ε₁ above it in **B**, or reading from a little way in, "
-            "is the honest way round that."
-        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("bending = stretching at", f"{crossing['equal_pct']:.2f} %")
+        c2.metric("under 5 % of it by", f"{crossing['negligible_pct']:.2f} %")
+        c3.metric("membrane thickness hₘ", f"{h * 1e9:.1f} nm")
+
+        # Settled by fitting it both ways rather than by argument. Tied to
+        # the membrane's own modulus, as eq 1 has it, so neither fit buys
+        # its answer with an extra parameter.
+        check = bending_comparison(result, geometry, h, epsilon, force_N)
+        if check is None:
+            st.caption(
+                f"For this cell the ratio is "
+                f"{crossing['ratio_at'](10.0):.3f} at x = 10 % and "
+                f"{crossing['ratio_at'](end):.4f} at x = {end:.0f} %.")
+        else:
+            rows = []
+            for r in check["moduli"]:
+                unit = "E_shell" if r["name"] == "K_shell" else "E_cyto"
+                rows.append({
+                    "": DISPLAY_SYMBOL.get(r["symbol"], r["symbol"]),
+                    "eq 3 (fitted)": modulus_display(unit, r["off_Pa"]),
+                    "eq 1, bending tied in": modulus_display(unit, r["on_Pa"]),
+                    "change": (f"{r['change_pct']:.2f} %"
+                               if np.isfinite(r["change_pct"]) else "—"),
+                })
+            rows.append({"": "R²", "eq 3 (fitted)": f"{check['r2_off']:.5f}",
+                         "eq 1, bending tied in": f"{check['r2_on']:.5f}",
+                         "change": (f"ΔAICc {check['delta_aicc']:+.0f}"
+                                    if np.isfinite(check["delta_aicc"])
+                                    else "—")})
+            flat_table(pd.DataFrame(rows), align_right=["change"])
+            worst = float(check["worst_change_pct"])
+            if worst < 2.0:
+                st.success(
+                    f"**No — it can be dropped.** Tying it in moves every "
+                    f"modulus by at most **{worst:.2f} %**, which is far "
+                    f"inside the cell-to-cell spread. That is why eq 3 is "
+                    f"what is fitted.", icon="✅")
+            elif worst < 10.0:
+                st.warning(
+                    f"**Borderline.** Tying it in moves a modulus by "
+                    f"**{worst:.1f} %**, so Eₘ carries that much systematic "
+                    f"uncertainty from the choice. Starting the reading "
+                    f"past x = {crossing['negligible_pct']:.0f} % removes "
+                    f"it.", icon="⚠️")
+            else:
+                st.warning(
+                    f"**No — keep it.** Tying it in moves a modulus by "
+                    f"**{worst:.0f} %** over this window, so eq 3 alone is "
+                    f"not measuring the membrane here. Either start the "
+                    f"reading past x = {crossing['negligible_pct']:.0f} %, "
+                    f"or report Eₘ as an apparent value.", icon="🚫")
+            if check["share"]:
+                st.caption(
+                    "What the term would add, as a share of the fitted "
+                    "force: "
+                    + " · ".join(f"{at:g} % → {part:.2f} %"
+                                 for at, _adds, part in check["share"])
+                    + f". It is the whole force below "
+                    f"x = {crossing['equal_pct']:.2f} % and falls by 5.7× "
+                    "for every doubling after that.")
 
 
 def screen_signature(epsilon, force_N):
@@ -8564,9 +8557,9 @@ def fitting_range_panel(result=None, n_points=None):
             head += f" · {int(n_points):,} points"
     st.markdown("**📏 The range being fitted, and where each part starts**")
     st.caption(
-        ("🔬 **Early deformation** — Lulevich's two components. This is "
-         "where every curve starts; the four-component fit is one click "
-         "above, under *what the cell is made of*."
+        ("🔬 **Early deformation** — two components. This is where every "
+         "curve starts; the four-component fit is one click above, under "
+         "*what the cell is made of*."
          if early else
          "🧭 **Full deformation** — the four components over the whole "
          "squash."))
@@ -8915,26 +8908,9 @@ def fit_equation_panel(result):
                  for name, *_r in active_components()
                  for row in [(result.get("moduli") or {}).get(name)]
                  if row))
-    early = piecewise_regime() == "early"
     st.caption(
-        (r"**What it says.** $x$ is the squash in per cent, and the fit "
-         r"passes through first contact: no free intercept, so no force is "
-         r"attributed to something that is not in the model. A shell being "
-         r"stretched carries force as "
-         r"$x^3$ (Lulevich eq 3), a filled body pressed by a plate as "
-         r"$x^{3/2}$ (Hertz, his eq 6); $[\,\cdot\,]_+$ is zero until the "
-         r"component joins. Each $\hat\theta_j$ is fitted by bounded "
-         r"non-negative least squares and divided by that component's own "
-         r"geometric prefactor $A_j$ to give its modulus."
-         if early else
-         r"**What it says.** $x$ is the squash in per cent and $C_0$ the "
-         r"force at first contact. $[\,\cdot\,]_+$ is zero until a "
-         r"component joins, and $\min(x,u)$ holds it at what it reached "
-         r"once its own stretch ends. Shells carry force as $x^3$, filled "
-         r"bodies as $x^{3/2}$. Each $\hat\theta_j$ is fitted by bounded "
-         r"non-negative least squares and divided by that component's own "
-         r"geometric prefactor $A_j$ to give its modulus.")
-        + f" $R^2 = {result['r_squared']:.5f}$ over "
+        f"$x$ is the squash in per cent. "
+        f"$R^2 = {result['r_squared']:.5f}$ over "
         f"{int(result.get('n_points', 0)):,} points."
     )
     # A component that came back at zero is in the model, in the equation
@@ -8956,13 +8932,10 @@ def fit_equation_panel(result):
                       or {}).get("E_Pa", 0.0))
         if e1 > PW_EARLY_LATE_PCT and cyto > 1e-6:
             st.caption(
-                f"ℹ️ The cytoskeleton joins at {e1:.1f} %, in the late half "
-                f"of the {lo_band:g}–{hi_band:g} % band, so Ec is the "
-                f"stiffness of the last {float(b[-1]) - e1:.1f} % of the "
-                "squash alone and reads higher than the 10–15 kPa reported "
-                "for a C2C12 cytoskeleton. An earlier joining point gives a "
-                "lower Ec and usually a slightly worse R²; both are on this "
-                "curve, and which one is the measurement is your call.")
+                f"ℹ️ Ec is read over the last {float(b[-1]) - e1:.1f} % of "
+                f"the squash only (ε₁ = {e1:.1f} %, late in the "
+                f"{lo_band:g}–{hi_band:g} % band), so it reads above the "
+                "10–15 kPa usually quoted for a C2C12 cytoskeleton.")
     if empty:
         ranges = result.get("ranges") or {}
         where = ", ".join(
@@ -8972,11 +8945,9 @@ def fit_equation_panel(result):
             for name, label, _s, _c, _l in active_components()
             if label in empty and name in ranges)
         st.warning(
-            f"**Measured as zero: {', '.join(empty)}.** The least squares "
-            f"came back at the lower bound for {where or 'its stretch'}, so "
-            "it carries no force there and has no area on the plot. It has "
-            "not been removed from the model — the curve simply gives it "
-            "nothing over that stretch, which is a result about this cell.",
+            f"**Measured as zero: {', '.join(empty)}.** The solve came back "
+            f"at the lower bound over {where or 'its stretch'}, so it "
+            "carries no force there and has no area on the plot.",
             icon="⚠️")
 
 
@@ -9037,20 +9008,14 @@ def how_it_was_fitted(result):
         first = order[0] if order else "the first component"
         second = order[1] if len(order) > 1 else "the second"
         how = (
-            f"**How this was fitted.** Lulevich's two-component model was "
-            f"fitted to the first **{b[4]:.0f} %** of the squash and to "
-            f"nothing beyond it: the membrane as a stretching shell "
-            f"(ε³, his eq 3) and the cell interior as a Hertzian contact "
-            f"(ε^1.5, his eq 6), each converted into a modulus with his own "
-            f"prefactors. "
-            + (f"Both act from first contact, in parallel, which is his "
-               f"eq 1 arrangement"
+            f"**How this was fitted.** Two components over the first "
+            f"**{b[4]:.0f} %**: membrane as ε³, interior as ε^1.5. "
+            + ("Both from first contact"
                if parallel else
-               f"{first} acts from first contact and {second} joins at "
-               f"ε₁ = {b[1]:.1f} %, the arrangement chosen by searching "
-               f"every order and every joining point")
-            + f", and the coefficients were found by one bounded, "
-            f"non-negative least-squares solve — R² = {r2:.5f}.")
+               f"{first} from first contact, {second} from "
+               f"ε₁ = {b[1]:.1f} %")
+            + f". One bounded non-negative solve, no intercept — "
+            f"R² = {r2:.5f}.")
         return how
     edges = ", ".join(f"{name} = {value:.1f} %" for name, value in
                       zip(EPS_NAMES, b[1:4]))
@@ -11392,9 +11357,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 f"{early_end_pct():g} %. Choose **Full deformation** above "
                 "for the four-component fit of this cell.", icon="🔬")
         st.caption(
-            "The two components below are Lulevich's own: exactly what is "
-            "ticked is fitted, drawn and reported, and the panel under the "
-            "results says how it stands against his paper."
+            "Exactly what is ticked is fitted, drawn and reported."
             if piecewise_regime() == "early" else
             "The components ticked below are a hypothesis about this cell. "
             "Exactly what is ticked is fitted, drawn and reported; step E "
@@ -11833,7 +11796,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # results rather than above them: it is a reading of a fit, and a
         # reference note above the fit it refers to is just noise.
         if ok and piecewise_regime() == "early":
-            lulevich_panel(result, model, fit)
+            lulevich_panel(result, model, fit, epsilon, force_N)
 
         # ---- how it is done, for an undergraduate, with these numbers --
         with st.expander("📘 How the fit is done — the maths, step by step",
