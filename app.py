@@ -5281,6 +5281,19 @@ def component_order_control():
     order = list(component_order_raw())
     live = set(active_component_names())
     early = piecewise_regime() == "early"
+    if early:
+        # Fixed: the membrane carries load from first contact, the
+        # cytoskeleton joins inside its band. That is the model this
+        # regime fits, so it is stated rather than offered as a choice.
+        lo, hi = early_band(early_end_pct())
+        end = early_end_pct()
+        st.caption(
+            f"{names[PW_EARLY_ORDER[0]][0]} **from first contact to "
+            f"{end:g} %**, then {names[PW_EARLY_ORDER[1]][0]} **from ε₁ to "
+            f"{end:g} %**, with ε₁ inside **{lo:g}–{hi:g} %**. The order "
+            "and the ranges are the model and do not move; only where in "
+            "that band the cytoskeleton appears is read off the curve.")
+        return
     together = early and st.session_state.get("pw_early_join",
                                               "parallel") == "parallel"
     # The early regime has two components and one boundary, so it offers
@@ -5762,6 +5775,22 @@ PW_EARLY_VIEW_PCT = 45.0
 # over e = 0.1-0.3 and a living cell is elastic and fully reversible to
 # about 30 %, so 35 % covers the range the two-term model is for.
 PW_EARLY_END_PCT = 35.0
+# The early regime is one fixed arrangement, not a search over models: the
+# membrane carries load from first contact to the end of the window, and
+# the cytoskeleton joins somewhere in this band and carries to the end
+# too. Only where inside the band it joins is looked for; the order and
+# the ranges are the model, and the model does not move.
+PW_EARLY_ORDER = ("membrane", "interior")
+PW_EARLY_CYTO_BAND = (15.0, 25.0)
+
+
+def early_band(end=None):
+    """Where the cytoskeleton may join, kept inside the window."""
+    top = float(end if end is not None else PW_EARLY_END_PCT)
+    lo, hi = PW_EARLY_CYTO_BAND
+    lo = min(float(lo), max(top - 2.0 * PW_MIN_GAP, 1.0))
+    hi = min(float(hi), max(top - 1.5, lo + PW_MIN_GAP))
+    return lo, hi
 # No emoji in front of either name. A round one sits exactly where a
 # radio button's dot goes, and reads as "this option is selected" whether
 # it is or not -- which is how a page fitting two components was read as
@@ -8497,60 +8526,54 @@ def _pw_together_changed():
 
 def early_boundary_control():
     """
-    Where each of the two starts, set by hand, or found.
+    The one thing this regime reads off the curve: where the cytoskeleton
+    joins, inside the band the model allows it.
 
-    The order above says which component acts first; this says where the
-    other one joins. Both are the person's to set — typing a number fits
-    at that number — and the one button looks for the joining point that
-    fits this curve best rather than replacing what they chose with a
-    model of its own.
+    Typing a number fits exactly there; the button finds the best one in
+    the band. Nothing here can change which components are fitted, in
+    which order, or over what ranges — those are the model.
     """
-    joined = st.session_state.get("pw_early_join", "parallel")
-    st.session_state.setdefault("pw_early_together", joined == "parallel")
-    if bool(st.session_state.get("pw_early_together")) != (joined == "parallel"):
-        st.session_state["pw_early_together"] = joined == "parallel"
     names = components_for(st.session_state.get("cell_type"))
-    live = [t for t in component_order()
-            if ORDER_COEFFICIENT.get(t) in set(active_component_names())]
-    second = names[live[1]][0] if len(live) > 1 else "the second component"
-    st.markdown("**Where the second one joins**")
+    end = early_end_pct()
+    lo, hi = early_band(end)
+    second = names[PW_EARLY_ORDER[1]][0]
+    # ε₁ is bounded by the band itself, so a number outside it cannot be
+    # typed and the optimiser cannot wander out of it either.
+    current = float(st.session_state.get("pw_b1", 0.5 * (lo + hi)))
+    if not (lo - 1e-9 <= current <= hi + 1e-9):
+        st.session_state["pw_b1"] = round(min(max(current, lo), hi), 2)
+    st.markdown(f"**Where {second} joins**")
     b1, b2 = st.columns([1, 2])
     with b1:
         st.number_input(
-            "ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f", key="pw_b1",
-            disabled=bool(st.session_state.get("pw_early_together")),
-            help=f"Where {second} starts carrying load. Type a number and "
-                 "the fit is made there; press the button beside it and the "
-                 "joining point that fits this curve best is found instead.")
+            f"ε₁ (%) — between {lo:g} and {hi:g}", lo, hi, step=0.5,
+            format="%.2f", key="pw_b1",
+            help=f"Where {second} starts carrying load, and it carries to "
+                 f"{end:g} % from there. Type a number inside the band and "
+                 "the fit is made exactly there; the button beside it finds "
+                 "the best one instead.")
     with b2:
-        st.checkbox(
-            "Both act from first contact (Lulevich eq 1 + 6)",
-            key="pw_early_together", on_change=_pw_together_changed,
-            help="His own arrangement: the two terms added from the moment "
-                 "the probe touches, with no joining point at all. Most "
-                 "curves prefer one of them joining a little way in.")
-        if st.button("🎯 Optimise the boundary — the best R² this order gives",
+        if st.button("🎯 Optimise — fine-tune where the cytoskeleton appears",
                      key="pw_early_optimise", **STRETCH,
-                     disabled=bool(st.session_state.get("pw_early_together")),
-                     help="Moves ε₁ only. The order above and which "
-                          "components are ticked stay exactly as they are, "
-                          "so nothing about the picture changes except "
-                          "where the second one joins: ε₁ is scanned across "
-                          "the range and the joining point with the highest "
-                          "R² that still measures both is kept."):
+                     help=f"Moves ε₁ only, inside {lo:g}–{hi:g} %. The "
+                          "components, their order and their ranges stay "
+                          "exactly as they are, so nothing about the "
+                          "picture changes except the joining point: it is "
+                          "scanned across the band and the one with the "
+                          "highest R² that still measures both is kept."):
             rerun_keeping_settings({"_pw_eps1_prefer": "r2",
                                     "_pw_find_eps1": True,
                                     "_pw_apply": True})
     said_early = st.session_state.get("pw_early_note")
     if said_early:
         st.caption("🔎 " + said_early)
-    if st.button(f"↺ Back to the default ({PW_EARLY_END_PCT:g} %, best "
-                 "arrangement found)", key="pw_early_default",
+    if st.button(f"↺ Back to the default (read to {PW_EARLY_END_PCT:g} %, "
+                 "ε₁ found in the band)", key="pw_early_default",
                  help="Whatever has been changed here, this is the fit the "
                       f"regime arrives with: the range at "
-                      f"{PW_EARLY_END_PCT:g} % and the arrangement the "
-                      "search kept for this curve."):
-        taken = early_park(PW_EARLY_END_PCT)
+                      f"{PW_EARLY_END_PCT:g} % and the joining point found "
+                      "for this curve."):
+        taken = early_park(PW_EARLY_END_PCT, parallel=False)
         rerun_keeping_settings(
             {**dict(zip(PW_BOUNDARY_KEYS, taken)),
              "pw_early_eps": None, "_pw_early_end_user": False,
@@ -9726,9 +9749,10 @@ def early_park(end, parallel=None, first=None):
     # repair_boundaries finds nothing to mend. Parking them tighter than
     # the gap made the repair compress them AFTER the arrangement search
     # had scored them, and the fit that came out was not the fit that won.
+    lo, hi = early_band(end)
     e1 = (round(max(end - 3.0, 1.0), 2) if parallel
-          else round(min(max(float(first if first is not None else end * 0.4),
-                             1.0), max(end - 3.5, 1.0)), 2))
+          else round(min(max(float(first if first is not None
+                                   else 0.5 * (lo + hi)), lo), hi), 2))
     return [e1, round(max(end - 2.0, e1 + PW_MIN_GAP), 2),
             round(max(end - 1.0, e1 + 2 * PW_MIN_GAP), 2), round(end, 2)]
 
@@ -10620,55 +10644,44 @@ def piecewise_section(model, epsilon, force_N, rupture):
         settle_mixture()
         st.session_state["_pw_apply"] = True
 
-    def find_early_arrangement():
+    def pin_early_arrangement():
         """
-        Every arrangement of the two components, and the best one kept.
+        The early model, pinned: membrane from contact, cytoskeleton
+        joining inside its band, both carrying to the end of the window.
 
-        Both ways round, with ε₁ scanned across the window, scored through
-        the same repair the fit uses so the arrangement searched is the
-        arrangement fitted.
+        Nothing here is searched except where in the band the second one
+        joins, and that is done by refit_early_order. The order is not a
+        thing this regime discovers -- it is what the model says.
         """
-        prefer = st.session_state.pop("_pw_early_prefer", "aicc")
-        with st.spinner("Finding the best arrangement of the two…"):
-            found_early = early_best_arrangement(model, epsilon, force_N,
-                                                 prefer=prefer)
-        if found_early:
-            st.session_state["pw_early_join"] = found_early["join"]
-            if found_early["join"] == "staggered" and found_early["order"]:
-                st.session_state["component_order"] = found_early["order"]
-                for index, term in enumerate(found_early["order"]):
-                    st.session_state[f"component_order_{index}"] = term
-            for key, value in zip(PW_BOUNDARY_KEYS, early_park(
-                    float(st.session_state.get("pw_end", PW_EARLY_END_PCT)),
-                    parallel=found_early["join"] == "parallel",
-                    first=found_early["eps1"])):
-                st.session_state[key] = value
-            st.session_state["pw_early_note"] = (
-                f"Searched {found_early['tried']} arrangements of the two "
-                "components and kept "
-                + ("**both from first contact**"
-                   if found_early["join"] == "parallel" else
-                   f"**{components_for(st.session_state.get('cell_type'))[found_early['order'][0]][0]} "
-                   f"first, the other joining at ε₁ = "
-                   f"{found_early['eps1']:.1f} %**")
-                + f" (R² = {found_early['r2']:.5f}, "
-                f"{found_early['measured']} of 2 components measured"
-                + (", the highest R² these two give over this range"
-                   if prefer == "r2" else "") + ").")
-            st.session_state["pw_eps_way"] = "typed"
+        st.session_state["pw_early_join"] = "staggered"
+        st.session_state["pw_early_together"] = False
+        order = list(PW_EARLY_ORDER) + [t for t in COMPONENT_ORDER_DEFAULT
+                                        if t not in PW_EARLY_ORDER]
+        st.session_state["component_order"] = order
+        for index, term in enumerate(order):
+            st.session_state[f"component_order_{index}"] = term
+
+    def find_early_arrangement():
+        """The pinned arrangement, with ε₁ found inside its band."""
+        pin_early_arrangement()
+        with st.spinner("Finding where the cytoskeleton joins…"):
+            refit_early_order()
+        st.session_state["pw_eps_way"] = "typed"
         apply_board()
 
     def arrive_early():
         """
-        A new curve in the early regime: the window, then the search.
+        A new curve in the early regime: the window, then the joining point.
 
-        This is the default way in. Two components, Lulevich's own, read
-        over the first 35 % of the squash unless the window has been set
-        by hand, and the arrangement chosen on this curve rather than
-        carried over from the last one.
+        This is the default way in, and it is the same model every time:
+        the membrane from first contact to the end of the window, the
+        cytoskeleton joining inside its band and carrying to the end too.
+        Only where in the band it joins is read off this curve.
         """
         end = early_end_pct()
-        for _key, _value in zip(PW_BOUNDARY_KEYS, early_park(end)):
+        pin_early_arrangement()
+        for _key, _value in zip(PW_BOUNDARY_KEYS,
+                                early_park(end, parallel=False)):
             st.session_state[_key] = round(float(_value), 2)
         for _name in PW_EARLY_COMPONENTS:
             st.session_state[f"pw_use_{_name}"] = True
@@ -10718,12 +10731,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 "Both components act from first contact, in parallel, which "
                 f"is Lulevich's eq 1 + 6, read to {end:.1f} %.")
         elif found:
+            lo, hi = early_band(end)
             st.session_state["pw_early_note"] = (
-                f"**{PW_COMPONENT_TITLES.get(live[0], live[0])} first**, as "
-                "you have them ordered, with the other joining at "
-                f"**ε₁ = {found['eps1']:.1f} %** — the joining point that "
-                f"fits this order best (R² = {found['r2']:.5f}, "
-                f"{found['measured']} of 2 components measured).")
+                f"**{PW_COMPONENT_TITLES.get(live[0], live[0])}** from first "
+                f"contact to {end:.1f} %, "
+                f"**{PW_COMPONENT_TITLES.get(live[1], live[1])}** from "
+                f"**ε₁ = {found['eps1']:.1f} %** to {end:.1f} % — the "
+                f"joining point that fits best inside {lo:g}–{hi:g} % "
+                f"(R² = {found['r2']:.5f}, {found['measured']} of 2 "
+                "components measured).")
 
     def arrive_full():
         """
@@ -10807,6 +10823,21 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     "**① Carried on to the end** above to see it the other "
                     "way.")
         apply_board()
+
+    # The early regime's model is fixed, so it is pinned here, before the
+    # board is drawn and before anything is fitted: the membrane first,
+    # the cytoskeleton joining inside its band, and ε₁ pulled into that
+    # band if anything has left it outside. Nothing downstream has to
+    # wonder whether the arrangement it was handed is the model.
+    if piecewise_regime() == "early":
+        pin_early_arrangement()
+        _lo, _hi = early_band(early_end_pct())
+        try:
+            _e1 = float(st.session_state.get("pw_b1", 0.5 * (_lo + _hi)))
+        except (TypeError, ValueError):
+            _e1 = 0.5 * (_lo + _hi)
+        if not (_lo - 1e-9 <= _e1 <= _hi + 1e-9):
+            st.session_state["pw_b1"] = round(min(max(_e1, _lo), _hi), 2)
 
     # What to do this run. A pending apply wins, because something has
     # just changed the board on purpose. Otherwise a new curve arrives in
@@ -11692,7 +11723,11 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
     regimes = early_regimes_for("staggered", order)
     extras = fit_extras()
     best = None
-    for eps1 in np.arange(2.0, max(end - 2.0, 3.0), 1.0):
+    lo, hi = early_band(end)
+    # Only inside the band the cytoskeleton is allowed to appear in. A
+    # joining point found at 4 % or at 30 % fits better on some curves and
+    # means something else: this is a model, not a free knee.
+    for eps1 in np.arange(lo, hi + 0.001, 0.5):
         bounds = repair_boundaries(
             list(early_park(end, parallel=False, first=float(eps1))),
             top=end)[0]
@@ -11715,40 +11750,40 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
 
 def fit_early_cell(name, epsilon, force_N, height_um, model):
     """
-    One cell of a batch, Lulevich's two terms, searched on its own curve.
+    One cell of a batch, on the same fixed two-term model as the page.
 
-    The same search the analysis tab runs when the early regime is
-    entered: every order and every joining point, over the window the
-    page is set to. Nothing is taken from the cell before it, and nothing
-    is written back to the board.
+    The membrane from first contact to the end of the window, the
+    cytoskeleton joining inside its band and carrying to the end; only
+    where in the band it joins is read off this curve. Nothing is taken
+    from the cell before it, and nothing is written back to the board.
     """
     end = early_end_pct()
-    found = early_best_arrangement(model, epsilon, force_N, end=end)
+    order = [ORDER_COEFFICIENT[t] for t in PW_EARLY_ORDER]
+    found = early_best_eps1(model, epsilon, force_N, order, end=end)
     if not found:
-        return None, "no arrangement of the two components fits this curve"
-    order = [ORDER_COEFFICIENT[t] for t in found["order"]
-             if ORDER_COEFFICIENT.get(t) in PW_EARLY_COMPONENTS]
-    bounds = (0.0,) + tuple(early_park(
-        end, parallel=found["join"] == "parallel", first=found["eps1"]))
+        return None, "the two components do not fit this curve"
+    bounds = (0.0,) + tuple(early_park(end, parallel=False,
+                                       first=found["eps1"]))
     bounds = repair_boundaries(list(bounds)[1:], top=end)[0]
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
+    regimes = early_regimes_for("staggered", order)
     result = fit_piecewise(
-        epsilon, force_N, boundaries_pct=bounds,
-        regimes=early_regimes_for(found["join"], order),
+        epsilon, force_N, boundaries_pct=bounds, regimes=regimes,
         settings=effective_piecewise_settings(piecewise_settings(),
                                               piecewise_until(), off),
         carry=tuple(order), **fit_extras())
     if not result.get("success"):
         return None, result.get("error", "fit failed")
-    route = ("both from first contact" if found["join"] == "parallel"
-             else f"{PW_COMPONENT_TITLES.get(order[0], order[0])} first, "
-                  f"the other at ε₁ = {found['eps1']:.1f} %")
+    lo, hi = early_band(end)
+    route = (f"{PW_COMPONENT_TITLES.get(order[0], order[0])} from contact, "
+             f"{PW_COMPONENT_TITLES.get(order[1], order[1])} from "
+             f"ε₁ = {found['eps1']:.1f} % (found in {lo:g}–{hi:g} %)")
     record = collection_record(name, name, height_um, epsilon, force_N,
                                result, piecewise_geometry(model),
                                f"Lulevich two-term, to {end:g} % · {route}",
-                               regimes=early_regimes_for(found["join"], order))
-    record["early"] = {"join": found["join"], "order": list(order),
+                               regimes=regimes)
+    record["early"] = {"join": "staggered", "order": list(order),
                        "eps1": float(found["eps1"]), "end_pct": float(end)}
     return record, ""
 
