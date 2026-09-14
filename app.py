@@ -677,6 +677,9 @@ DEFAULTS = {
     # force the one before it ended on. Off, because the curve already
     # shows it is continuous there.
     "pw_show_anchors": False,
+    # The baseline C₀ layer: the force the curve starts from, drawn under
+    # everything else. Off, so the shaded areas are the components.
+    "pw_show_baseline": False,
     # Both early components from first contact, or one joining at ε₁. The
     # tick box on the board and pw_early_join say the same thing; the box
     # is what a person sets, the key is what the fit reads.
@@ -8084,6 +8087,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
     show_track = bool(st.session_state.get("pw_show_track", True))
     show_zero = bool(st.session_state.get("pw_show_zero", False))
     show_anchors = bool(st.session_state.get("pw_show_anchors", False))
+    show_base = bool(st.session_state.get("pw_show_baseline", False))
     stacked = stacked and show_areas
     live_off = set(off)
     for regime in (result["regimes"] if show_bands else ()):
@@ -8115,7 +8119,7 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         grid = np.unique(np.concatenate(
             [grid, [v for v in marks if b[0] <= v <= end]]))
         for name, label, symbol, colour, _law in (
-                (PW_BASELINE,) + active_components()):
+                ((PW_BASELINE,) if show_base else ()) + active_components()):
             # The baseline layer carries C₀, the force the curve starts
             # from, so it stays or the layers would not add up to F̂.
             if name in off and name != PW_BASELINE[0]:
@@ -8147,9 +8151,11 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
         fs = np.concatenate([p[2] for p in pieces])
         fig.add_trace(go.Scatter(
             x=xs, y=fs * scale, mode="lines",
-            name="Fitted curve F̂" + (" = Σ layers" if stacked else ""),
+            name="Fitted curve F̂" + (" = Σ layers" if stacked and show_base
+                                      else ""),
             line={"color": style.fit_color or "#000000",
-                  "width": max(2, int(style.line_width * 0.8))},
+                  "width": max(2, int(style.line_width * 0.9)),
+                  "dash": "dash"},
         ))
     if not stacked:
         # Each component's own force, over its own range.
@@ -8269,25 +8275,25 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
                 "y": 0.005, "xanchor": "left", "x": 0.0, "font": {"size": 12},
                 "traceorder": "normal"},
         xaxis={"title": {"text": "<b>Relative deformation x (%)</b>",
-                         "font": bold_font(17)},
+                         "font": bold_font(21)},
                # Drawn under the force plot itself, always: that is the
                # plot being read, and an axis parked under the range track
                # reads as the track's axis rather than the curve's. The
                # track keeps the same horizontal scale, drawn below it.
                "anchor": "y",
                "range": [x_lo, x_hi],
-               "tickfont": bold_font(15), "ticks": "outside", "ticklen": 7,
-               "tickwidth": 2.2, "linewidth": 2.2, "linecolor": "#111111",
+               "tickfont": bold_font(18), "ticks": "outside", "ticklen": 8,
+               "tickwidth": 2.4, "linewidth": 2.4, "linecolor": "#111111",
                "showline": True, "zeroline": False, "mirror": False,
                "exponentformat": "none", "showexponent": "none"},
         yaxis={"title": {"text": f"<b>Force ({unit})</b>",
-                         "font": bold_font(17)},
+                         "font": bold_font(21)},
                # Room under the force plot for its own ticks and title,
                # then the range track below them.
                "domain": [0.34, 1.0] if has_track else [0.0, 1.0],
-               "tickfont": bold_font(15),
-               "ticks": "outside", "ticklen": 7, "tickwidth": 2.2,
-               "linewidth": 2.2, "linecolor": "#111111", "showline": True,
+               "tickfont": bold_font(18),
+               "ticks": "outside", "ticklen": 8, "tickwidth": 2.4,
+               "linewidth": 2.4, "linecolor": "#111111", "showline": True,
                # Scientific notation, never an SI prefix letter, and kept
                # on every tick so zooming in never turns 1e-8 into "10n".
                "exponentformat": "power", "showexponent": "all",
@@ -8323,6 +8329,10 @@ PW_FURNITURE = (
     ("pw_show_zero", "F = 0 line",
      "A black horizontal line at zero force, useful when the baseline "
      "matters more than the peak."),
+    ("pw_show_baseline", "Baseline C₀",
+     "The grey layer under the components: the force the curve starts "
+     "from. Off, the areas are the components' own contributions and the "
+     "fitted curve sits C₀ above them."),
     ("pw_show_anchors", "C⁰ anchors",
      "The white diamonds where each stretch picks up the force the one "
      "before it ended on. Off by default: the fitted curve already shows "
@@ -8591,6 +8601,40 @@ def fit_equation_panel(result):
         + f" $R^2 = {result['r_squared']:.5f}$ over "
         f"{int(result.get('n_points', 0)):,} points."
     )
+
+
+def copy_row_panel(result, fit=None):
+    """
+    The five numbers, as one row to paste into a spreadsheet.
+
+    Header line and value line, tab separated: select, copy, paste, and
+    each value lands in its own column. The same names the sheet already
+    uses, so a paste goes under the headings that are there.
+    """
+    if not (result and result.get("success")):
+        return
+    moduli = result.get("moduli") or {}
+
+    def modulus(name, scale):
+        row = moduli.get(name) or {}
+        value = float(row.get("E_Pa", float("nan")))
+        if not np.isfinite(value) or abs(value) < 1e-6:
+            return ""
+        return f"{value / scale:.4g}"
+
+    chi = float(result.get("chi_squared_reduced", float("nan")))
+    values = [
+        eps_summary(result["boundaries_pct"]),
+        modulus("K_shell", 1e6),
+        modulus("K_cyto", 1e3),
+        f"{float(result.get('r_squared', float('nan'))):.5f}",
+        f"{chi:.4g}" if np.isfinite(chi) else "",
+    ]
+    header = ["Boundaries (ε1 and ε2)", "Young's Modulus, Em (MPa)",
+              "Young's Modulus, Ec (kPa)", "Fit Quality (R²)", "Chi squared"]
+    st.caption("📋 **For the sheet** — copy both lines and paste: one "
+               "column each.")
+    st.code("\t".join(header) + "\n" + "\t".join(values), language=None)
 
 
 def how_it_was_fitted(result):
@@ -11239,6 +11283,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
                 # it, and one line saying what it means. Everything that
                 # used to sit here said the same thing in prose.
                 fit_equation_panel(result)
+                copy_row_panel(result)
                 # How the plot draws it, under the plot, where it is being
                 # looked at. Both apply at once; neither changes the fit.
                 v1, v2, v3 = st.columns([2.1, 1.1, 0.9])
