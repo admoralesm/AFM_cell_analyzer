@@ -5792,7 +5792,18 @@ PW_EARLY_END_PCT = 35.0
 # too. Only where inside the band it joins is looked for; the order and
 # the ranges are the model, and the model does not move.
 PW_EARLY_ORDER = ("membrane", "interior")
-PW_EARLY_CYTO_BAND = (15.0, 25.0)
+# 15 to 30 %. Measured on the C2C12 curves this page was built from: past
+# 25 % four of six fit better -- 0.99586 to 0.99838 on one, 0.99587 to
+# 0.99847 on another -- because their cytoskeletal upturn comes late. The
+# cost is that a joining point at 29 % makes Ec the stiffness of the last
+# few per cent alone, so it reads higher than the 10-15 kPa a C2C12
+# cytoskeleton is reported at; the panel under the results says so when
+# it happens. Narrow it here to hold the modulus closer to the prior.
+PW_EARLY_CYTO_BAND = (15.0, 30.0)
+# Past this the cytoskeleton is being read off the last few per cent of
+# the squash alone, and its modulus climbs away from what is reported for
+# a C2C12. Not an error -- a thing worth saying next to the number.
+PW_EARLY_LATE_PCT = 25.0
 
 
 def early_band(end=None):
@@ -8785,6 +8796,24 @@ def fit_equation_panel(result):
              if name not in piecewise_off()
              and abs(float(((result.get("moduli") or {}).get(name)
                             or {}).get("E_Pa", 0.0))) < 1e-6]
+    # A joining point late in the window leaves the cytoskeleton only the
+    # steepest part of the curve to explain, and its modulus rises with
+    # it. Worth one line where the number is, not a warning: it is a
+    # consequence of where the boundary is, and the boundary is a choice.
+    if piecewise_regime() == "early" and len(b) > 1:
+        lo_band, hi_band = early_band(float(b[-1]))
+        e1 = float(b[1])
+        cyto = float(((result.get("moduli") or {}).get("K_cyto")
+                      or {}).get("E_Pa", 0.0))
+        if e1 > PW_EARLY_LATE_PCT and cyto > 1e-6:
+            st.caption(
+                f"ℹ️ The cytoskeleton joins at {e1:.1f} %, in the late half "
+                f"of the {lo_band:g}–{hi_band:g} % band, so Ec is the "
+                f"stiffness of the last {float(b[-1]) - e1:.1f} % of the "
+                "squash alone and reads higher than the 10–15 kPa reported "
+                "for a C2C12 cytoskeleton. An earlier joining point gives a "
+                "lower Ec and usually a slightly worse R²; both are on this "
+                "curve, and which one is the measurement is your call.")
     if empty:
         ranges = result.get("ranges") or {}
         where = ", ".join(
