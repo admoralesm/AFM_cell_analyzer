@@ -171,6 +171,19 @@ def _basis(shape, power, x, start, until, squeeze=0.0):
     force it reached instead of being carried up by the squash.
     """
     x = np.asarray(x, dtype=float)
+    # An element with no end takes on load to the end of the curve. Coerced
+    # here as well as where the ranges are resolved: this is arithmetic on
+    # arrays, and a None arriving in it is a page-wide error, not a bad fit.
+    try:
+        until = float(until)
+    except (TypeError, ValueError):
+        until = np.inf
+    if not np.isfinite(until):
+        until = np.inf
+    try:
+        start = float(start)
+    except (TypeError, ValueError):
+        start = 0.0
     if shape == LUMP:
         width = max(float(until) - float(start), 1e-9)
         inside = (x >= start) & (x <= until)
@@ -490,7 +503,10 @@ def _resolve_ranges(regimes, bounds, carry=()):
                 # A lump lives and dies inside its own regime.
                 out[term.name] = (a, b)
                 continue
-            u = term.until
+            try:
+                u = float(term.until)
+            except (TypeError, ValueError):
+                u = None
             if u is None or not np.isfinite(u) or u <= a:
                 u = end if term.name in carry else b
             out[term.name] = (a, float(min(max(u, a + 1e-6), end)))
@@ -759,6 +775,10 @@ def fit_piecewise(
             # What the carried elements add on top of the anchor here. Zero
             # at the regime's start, so the anchor is still the force there.
             known = _carried_force(carried, x, a)
+            if anchor is None:
+                # No earlier regime and no intercept of its own: the fit
+                # starts from zero force at first contact.
+                anchor = 0.0
             target = f - anchor - known
             p0 = [t.p0 for t in regime.terms]
             lower = [t.lower for t in regime.terms]
