@@ -5269,32 +5269,69 @@ def component_order_control():
     """
     names = components_for(st.session_state.get("cell_type"))
     order = list(component_order_raw())
+    live = set(active_component_names())
+    early = piecewise_regime() == "early"
+    together = early and st.session_state.get("pw_early_join",
+                                              "parallel") == "parallel"
+    # The early regime has two components and one boundary, so it offers
+    # two positions and only the two components that are in it. Four
+    # positions, two of them naming parts of the nucleus and boundaries
+    # this fit does not have, is the four-component board wearing the
+    # early one's clothes.
+    offer = ([t for t in COMPONENT_ORDER_DEFAULT
+              if ORDER_COEFFICIENT.get(t) in live] if early
+             else list(COMPONENT_ORDER_DEFAULT))
+    # Every position must hold one of the components it is offered. The
+    # early regime offers two, and an order left over from the full board
+    # can put the nucleus first; writing the position back before the box
+    # is made is what keeps that from being a value not in its own list.
+    shown = [t for t in order if t in offer]
+    shown += [t for t in offer if t not in shown]
+    shown = shown[:len(offer)]
+    if early and together:
+        st.caption(
+            "Both components act from first contact, so there is no order "
+            "to set: they are fitted together, which is Lulevich's eq 1 "
+            "+ 6. Choose **→ One joins at ε₁** below to order them.")
+        return
+    if len(offer) < 2:
+        st.caption("One component is ticked, so there is no order to set.")
+        return
     picked = []
-    cols = st.columns(len(order))
-    for index, (col, term) in enumerate(zip(cols, order)):
+    cols = st.columns(len(shown))
+    onsets = (("acts from first contact", "joins at ε₁") if early
+              else tuple(f"starts {w}" for w in ONSET_NAMES))
+    for index, term in enumerate(shown):
+        if st.session_state.get(f"component_order_{index}") not in offer:
+            st.session_state[f"component_order_{index}"] = term
+    for index, (col, term) in enumerate(zip(cols, shown)):
         with col:
             choice = st.selectbox(
-                f"{index + 1}ᵉ · starts {ONSET_NAMES[index]}",
-                list(COMPONENT_ORDER_DEFAULT),
-                index=list(COMPONENT_ORDER_DEFAULT).index(term),
+                f"{index + 1}ᵉ · {onsets[index]}", offer,
+                index=offer.index(term) if term in offer else index,
                 format_func=lambda t: names[t][0],
                 key=f"component_order_{index}",
             )
             picked.append(choice)
     if len(set(picked)) == len(picked):
-        if tuple(picked) != tuple(order):
-            st.session_state["component_order"] = list(picked)
+        # The order kept is always the full four, the chosen ones in
+        # front: a two-term order would fail the validity check and be
+        # replaced by the default, which is how a searched arrangement
+        # got thrown away between choosing it and fitting it.
+        full = picked + [t for t in order if t not in picked]
+        if tuple(full) != tuple(order):
+            st.session_state["component_order"] = list(full)
             rerun_keeping_settings()
     else:
         st.caption("⚠️ Two positions name the same component, so the order "
                    "below is still **"
-                   + " → ".join(names[t][0] for t in order)
+                   + " → ".join(names[t][0] for t in shown)
                    + "**. Give each position a component of its own.")
-    live = set(active_component_names())
     st.caption("Met in this order: "
-               + " → ".join(f"{names[t][0]} {ONSET_NAMES[i]}"
-                            for i, t in enumerate(component_order())
-                            if ORDER_COEFFICIENT.get(t) in live))
+               + " → ".join(
+                   f"{names[t][0]} {('from first contact' if i == 0 else 'joins at ε₁') if early else ONSET_NAMES[i]}"
+                   for i, t in enumerate(component_order())
+                   if ORDER_COEFFICIENT.get(t) in live))
 
 
 def pw_regimes():
@@ -5485,6 +5522,20 @@ def load_sharing_control():
     is how the components add up. Piecewise sits in the same list as side
     by side, stacked and segmented, because that is all it is.
     """
+    if piecewise_regime() == "early":
+        # Lulevich's model says how his two terms add: both act from where
+        # they join to the end of the window. There is nothing to choose,
+        # so nothing is offered -- a picker that can only be set one way
+        # is an invitation to break the fit.
+        st.markdown("**How the cell is fitted**")
+        st.latex(r"F(x) = F_{\text{membrane}}(x) + F_{\text{interior}}(x)")
+        st.caption(
+            "Lulevich's two terms, added: the membrane stretching as x³ "
+            "(his eq 3) and the interior as a Hertzian contact, x^1.5 (his "
+            "eq 6). Each is fitted where it joins and both carry load to "
+            "the end of the window. Switch to full deformation to choose "
+            "how four components share it instead.")
+        return
     options = sharing_options()
     st.session_state["load_sharing"] = current_sharing()
     if st.session_state["load_sharing"] not in options:
@@ -9406,7 +9457,7 @@ def piecewise_components_panel(bounds, moduli=None, lamina=None, columns=2):
         shown_until = float(min(max(until, shown_start), end))
         st.session_state[key] = (round(shown_start, 2), round(shown_until, 2))
         extras = ()
-        if name == "K_shell":
+        if name == "K_shell" and piecewise_regime() != "early":
             def _throughout(on):
                 st.checkbox("acts throughout (to the end of the fit)",
                             key="pw_membrane_throughout",
@@ -10062,18 +10113,29 @@ def piecewise_settings_used(result, geometry, target, source):
                       + ("✅" if result["r_squared"] >= target else "⚠️"),
          "Fit must reach R² ≥"),
     ]
-    (l1, h1), (l2, h2), _b3 = piecewise_bands()
-    s_lo, s_hi = piecewise_span()
-    rows.append(("C2C12 constraints", f"ε₁ {l1:g}–{h1:g} %, ε₂ {l2:g}–{h2:g} %, "
-                                      f"ε₃ − ε₂ {s_lo:g}–{s_hi:g} %",
-                 "Edit the C2C12 constraints"))
+    if not early_here:
+        # The prior's bands constrain a search for three boundaries. The
+        # early regime searches for one, over its window, and never looks
+        # at them.
+        (l1, h1), (l2, h2), _b3 = piecewise_bands()
+        s_lo, s_hi = piecewise_span()
+        rows.append(("C2C12 constraints",
+                     f"ε₁ {l1:g}–{h1:g} %, ε₂ {l2:g}–{h2:g} %, "
+                     f"ε₃ − ε₂ {s_lo:g}–{s_hi:g} %",
+                     "Edit the C2C12 constraints"))
+    else:
+        rows.append(("Early window", f"0 → {b[4]:.1f} % · "
+                     + PW_EARLY_JOINS.get(
+                         st.session_state.get("pw_early_join", "parallel"), ""),
+                     "The window on the board"))
     for name, label, _symbol, _colour, _law in active_components():
         a, u = ranges.get(name, (float("nan"), float("nan")))
         rows.append((f"{label}", "off (held at 0)" if name in off
                      else f"acts over {a:.2f}–{u:.2f} %", "Components"))
+    live_here = set(active_component_names())
     for regime in result["regimes"]:
         for name, p in regime["params"].items():
-            if name == "C0" or name == "k_align":
+            if name == "C0" or name == "k_align" or name not in live_here:
                 continue
             rows.append((f"{name} guess and bounds",
                          f"p0 {p['p0']:.3g}, [{_pw_text(p['lower'])}, "
@@ -11242,6 +11304,9 @@ def piecewise_coefficient_table(result, moduli):
     """Every fitted and carried coefficient, regime by regime."""
     table = []
     off = piecewise_off()
+    # A component this regime does not contain has no coefficient to
+    # report: in the early regime the nucleus terms are absent, not zero.
+    live_here = set(active_component_names()) | {"C0", "k_align"}
     for regime in result["regimes"]:
         a, z = regime["domain_pct"]
         common = {
@@ -11252,6 +11317,8 @@ def piecewise_coefficient_table(result, moduli):
                      if np.isfinite(regime["r_squared"]) else "—"),
         }
         for n, p in regime["params"].items():
+            if n not in live_here:
+                continue
             row = moduli.get(n, {})
             value = p["value"]
             unit = ("N" if n == "C0" or p.get("shape") == "lump"
@@ -11272,7 +11339,7 @@ def piecewise_coefficient_table(result, moduli):
                 "flag": "at bound" if p.get("at_bound") else "",
             })
         for n, c in (regime.get("carried") or {}).items():
-            if not regime["fitted"]:
+            if not regime["fitted"] or n not in live_here:
                 continue
             table.append({
                 **common, "θ_j": f"{n} (carried)",
@@ -13458,12 +13525,26 @@ def fit_explainer(fit, result=None):
                  for n_ in r["params"]
                  if n_ not in ("C0", "k_align")) or "C₀ alone",
              "R²_k": (f"{r['r_squared']:.4f}" if np.isfinite(r["r_squared"]) else "—")}
+            # Only the stretches this fit has. In the early regime the
+            # rest are parked under x_end with nothing in them, and a row
+            # for one is a row about no part of the cell.
             for r in result["regimes"]
+            if any(n_ in (set(active_component_names()) | {"C0"})
+                   for n_ in (r.get("params") or {}))
         ]), align_right=["points", "R²_k"])
         st.markdown(
-            "**Where ε₁, ε₂, ε₃ come from.** For a single power law "
-            "$F = a x^{p}$, $\\ln F = \\ln a + p\\ln x$: the slope on log–log "
-            "axes *is* the power. The local slope"
+            ("**Where ε₁ comes from.** The two components are put together "
+             "every way there is -- both from first contact, or either one "
+             "first with the other joining at ε₁, scanned across the window "
+             "-- and the arrangement that fits best while still measuring "
+             "both is kept. The power laws below are why the two are told "
+             "apart at all: for a single power law $F = a x^{p}$, "
+             "$\\ln F = \\ln a + p\\ln x$, so the slope on log–log axes "
+             "*is* the power. The local slope"
+             if piecewise_regime() == "early" else
+             "**Where ε₁, ε₂, ε₃ come from.** For a single power law "
+             "$F = a x^{p}$, $\\ln F = \\ln a + p\\ln x$: the slope on "
+             "log–log axes *is* the power. The local slope")
         )
         st.latex(r"p(x) = \frac{d\ln F}{d\ln x}")
         st.markdown(
@@ -19588,7 +19669,9 @@ with tab_explore:
             on_ex = [label.split(" ", 1)[1].lower() for name, label, *_ in
                      PW_COMPONENTS if name not in piecewise_off()]
             st.caption(
-                f"Piecewise sharing, ε₁, ε₂, ε₃ as on the analysis tab"
+                ("Lulevich's two terms, " if piecewise_regime() == "early"
+                 else "Piecewise sharing, ")
+                + eps_summary() + " as on the analysis tab"
                 + (f" (`fit {fit_ex['fit_id']}`)" if fit_ex.get("fit_id") else "")
                 + ", with " + ", ".join(on_ex) + ". Change them there and "
                 "this follows."
@@ -19670,10 +19753,14 @@ with tab_explore:
         st.markdown("#### Find the boundaries from this curve")
         if pw_ex:
             st.caption(
-                "With piecewise sharing, ε₁, ε₂, ε₃ are placed by **▶ Place "
-                "ε₁, ε₂, ε₃** on the analysis tab, which compares the power "
-                "law read off this curve with fitting everything; the routes "
-                "are in its **ε routes compared** tab."
+                "The early regime places one boundary, ε₁, by searching "
+                "every arrangement of the two components on this curve; the "
+                "board on the analysis tab says which it kept."
+                if piecewise_regime() == "early" else
+                "With piecewise sharing, ε₁, ε₂, ε₃ are placed by **▶ Fit & "
+                "plot** on the analysis tab, which compares the power law "
+                "read off this curve with fitting everything; the routes are "
+                "in its **ε routes compared** tab."
             )
             placements_ex = st.session_state.get("pw_placements") or {}
             power_ex = placements_ex.get("power") or {}
