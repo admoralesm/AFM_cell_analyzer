@@ -8164,9 +8164,22 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
             legend_names.append(
                 PW_BASELINE[1] if name == PW_BASELINE[0]
                 else f"{label} · [{a:.1f}, {u:.1f}] %")
+            # A dot on the band's top edge where this component stops
+            # taking on load. Past it the band keeps the height it had --
+            # that is what "holds the force it reached" looks like -- and
+            # without the dot a range that ends inside the window looks
+            # like a range that was ignored.
+            stops = float(min(u, end))
+            marks = np.zeros_like(grid)
+            if stops < end - 0.05:
+                marks[int(np.argmin(np.abs(grid - stops)))] = 11.0
             fig.add_trace(go.Scatter(
-                x=grid, y=layer * scale, mode="lines", stackgroup="components",
+                x=grid, y=layer * scale,
+                mode="lines+markers" if marks.any() else "lines",
+                stackgroup="components",
                 name=legend_names[-1],
+                marker={"size": marks, "color": colour, "symbol": "line-ns",
+                        "line": {"color": colour, "width": 2.5}},
                 line={"color": colour, "width": 1.8},
                 fillcolor=_rgba(colour, 0.45),
                 # Its OWN force, not the stacked total. A stacked trace's
@@ -8543,61 +8556,124 @@ def _pw_together_changed():
     _pw_early_join_changed()
 
 
+def _pw_early_to_changed(name):
+    """Callback: a component's far end was typed. Write it to the model."""
+    top = early_end_pct()
+    try:
+        value = float(st.session_state.get(f"pw_to_{name}", top))
+    except (TypeError, ValueError):
+        value = top
+    floor = (0.0 if name == PW_EARLY_COMPONENTS[0]
+             else float(st.session_state.get("pw_b1", 0.0)))
+    value = min(max(value, floor + PW_MIN_GAP), top)
+    untils = dict(st.session_state.get("pw_until") or {})
+    if abs(value - top) < 0.05:
+        untils.pop(name, None)          # to the end of the window: the default
+        if name == "K_shell":
+            st.session_state["pw_membrane_throughout"] = True
+    else:
+        untils[name] = round(value, 2)
+        if name == "K_shell":
+            st.session_state["pw_membrane_throughout"] = False
+    st.session_state["pw_until"] = untils
+    st.session_state["_pw_apply"] = True
+
+
+def _pw_early_from_changed():
+    """Callback: where the second component starts was typed."""
+    st.session_state["_pw_apply"] = True
+
+
 def early_boundary_control():
     """
-    The one thing this regime reads off the curve: where the cytoskeleton
-    joins, inside the band the model allows it.
+    The range each element acts over, as numbers to type.
 
-    Typing a number fits exactly there; the button finds the best one in
-    the band. Nothing here can change which components are fitted, in
-    which order, or over what ranges — those are the model.
+    Two rows, one per component, from and to. What is typed here is what
+    is fitted and what the plot draws: the membrane from first contact,
+    the cytoskeleton from where you put it, each to where you say it
+    stops. The one button finds the cytoskeleton's start for you.
     """
     names = components_for(st.session_state.get("cell_type"))
-    end = early_end_pct()
-    lo, hi = early_band(end)
-    second = names[PW_EARLY_ORDER[1]][0]
-    # ε₁ is bounded by the band itself, so a number outside it cannot be
-    # typed and the optimiser cannot wander out of it either.
-    current = float(st.session_state.get("pw_b1", 0.5 * (lo + hi)))
-    if not (lo - 1e-9 <= current <= hi + 1e-9):
-        st.session_state["pw_b1"] = round(min(max(current, lo), hi), 2)
-    st.markdown(f"**Where {second} joins**")
-    b1, b2 = st.columns([1, 2])
-    with b1:
-        st.number_input(
-            f"ε₁ (%) — between {lo:g} and {hi:g}", lo, hi, step=0.5,
-            format="%.2f", key="pw_b1",
-            help=f"Where {second} starts carrying load, and it carries to "
-                 f"{end:g} % from there. Type a number inside the band and "
-                 "the fit is made exactly there; the button beside it finds "
-                 "the best one instead.")
-    with b2:
-        if st.button("🎯 Optimise — fine-tune where the cytoskeleton appears",
-                     key="pw_early_optimise", **STRETCH,
-                     help=f"Moves ε₁ only, inside {lo:g}–{hi:g} %. The "
-                          "components, their order and their ranges stay "
-                          "exactly as they are, so nothing about the "
-                          "picture changes except the joining point: it is "
-                          "scanned across the band and the one with the "
-                          "highest R² that still measures both is kept."):
+    top = early_end_pct()
+    lo, hi = early_band(top)
+    ranges = piecewise_ranges(piecewise_boundaries())
+    order = [t for t in component_order()
+             if ORDER_COEFFICIENT.get(t) in set(active_component_names())]
+    st.markdown("**The range each element acts over**")
+    head = st.columns([1.6, 1, 1])
+    for column, text in zip(head, ("element", "from (%)", "to (%)")):
+        column.caption(text)
+    for term in order:
+        key = ORDER_COEFFICIENT[term]
+        first = key == PW_EARLY_COMPONENTS[0]
+        a, u = ranges.get(key, (0.0, top))
+        # The far end is seeded from the model every run, before its box
+        # is made, so the number in it is always the number being fitted.
+        st.session_state[f"pw_to_{key}"] = round(
+            float(min(max(u, 0.0), top)), 2)
+        c1, c2, c3 = st.columns([1.6, 1, 1])
+        with c1:
+            st.markdown(f"{names[term][0]}")
+            st.caption("from first contact" if first else "joins later")
+        with c2:
+            if first:
+                st.markdown("**0.00**")
+                st.caption("at contact")
+            else:
+                st.number_input(
+                    f"{names[term][0]} from", PW_MIN_GAP,
+                    round(max(top - 3.5, 1.0), 2), step=0.5, format="%.2f",
+                    key="pw_b1", on_change=_pw_early_from_changed,
+                    label_visibility="collapsed",
+                    help="Where this component starts carrying load. Type "
+                         "any value inside the window; the fit is made "
+                         f"exactly there. The optimiser looks between "
+                         f"{lo:g} and {hi:g} %, where a C2C12's "
+                         "cytoskeleton is expected to come in.")
+        with c3:
+            st.number_input(
+                f"{names[term][0]} to", PW_MIN_GAP, round(top, 2), step=0.5,
+                format="%.2f", key=f"pw_to_{key}",
+                on_change=_pw_early_to_changed, args=(key,),
+                label_visibility="collapsed",
+                help="Where it stops taking on more load. Past this point "
+                     "it holds the force it had reached. The end of the "
+                     "window is the default.")
+    st.caption(
+        f"Both are read over 0 → {top:g} % (**The range of this analysis**, "
+        "above). What is typed here is what is fitted and what the plot "
+        "draws.")
+    o1, o2 = st.columns(2)
+    with o1:
+        if st.button(f"🎯 Optimise — where the cytoskeleton appears "
+                     f"({lo:g}–{hi:g} %)", key="pw_early_optimise", **STRETCH,
+                     help="Scans the joining point across the band and "
+                          "keeps the one with the highest R² that still "
+                          "measures both components. It moves that number "
+                          "only: the elements, their order and their far "
+                          "ends stay exactly as they are."):
             rerun_keeping_settings({"_pw_eps1_prefer": "r2",
                                     "_pw_find_eps1": True,
                                     "_pw_apply": True})
+    with o2:
+        if st.button(f"↺ Back to the default (read to {PW_EARLY_END_PCT:g} %, "
+                     "ε₁ found in the band)", key="pw_early_default",
+                     **STRETCH,
+                     help="Whatever has been changed here, this is the fit "
+                          "the regime arrives with: the window at "
+                          f"{PW_EARLY_END_PCT:g} %, both elements acting to "
+                          "the end of it, and the joining point found for "
+                          "this curve."):
+            taken = early_park(PW_EARLY_END_PCT, parallel=False)
+            rerun_keeping_settings(
+                {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+                 "pw_early_eps": None, "_pw_early_end": None,
+                 "_pw_early_end_user": False, "pw_until": {},
+                 "pw_membrane_throughout": True,
+                 "_pw_find_early": True, "_pw_apply": True})
     said_early = st.session_state.get("pw_early_note")
     if said_early:
         st.caption("🔎 " + said_early)
-    if st.button(f"↺ Back to the default (read to {PW_EARLY_END_PCT:g} %, "
-                 "ε₁ found in the band)", key="pw_early_default",
-                 help="Whatever has been changed here, this is the fit the "
-                      f"regime arrives with: the range at "
-                      f"{PW_EARLY_END_PCT:g} % and the joining point found "
-                      "for this curve."):
-        taken = early_park(PW_EARLY_END_PCT, parallel=False)
-        rerun_keeping_settings(
-            {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-             "pw_early_eps": None, "_pw_early_end": None,
-             "_pw_early_end_user": False,
-             "_pw_find_early": True, "_pw_apply": True})
 
 
 def fit_equation_panel(result):
@@ -9794,9 +9870,14 @@ def early_park(end, parallel=None, first=None):
     # the gap made the repair compress them AFTER the arrangement search
     # had scored them, and the fit that came out was not the fit that won.
     lo, hi = early_band(end)
+    # The band is where the SEARCH looks. A number set by hand is the
+    # person's, and is kept: only the window itself bounds it, or the
+    # boundary they typed would spring back to the band every run.
+    room_hi = max(end - 3.5, 1.0)
     e1 = (round(max(end - 3.0, 1.0), 2) if parallel
           else round(min(max(float(first if first is not None
-                                   else 0.5 * (lo + hi)), lo), hi), 2))
+                                   else 0.5 * (lo + hi)),
+                             PW_MIN_GAP), room_hi), 2))
     return [e1, round(max(end - 2.0, e1 + PW_MIN_GAP), 2),
             round(max(end - 1.0, e1 + 2 * PW_MIN_GAP), 2), round(end, 2)]
 
@@ -10890,11 +10971,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                                     early_park(_end, parallel=False,
                                                first=st.session_state.get("pw_b1"))):
                 st.session_state[_key] = round(float(_value), 2)
-        _lo, _hi = early_band(early_end_pct())
+        # ε₁ is the person's to set anywhere inside the window; the band
+        # is where the optimiser looks, not a cage around what they type.
+        _lo, _hi = PW_MIN_GAP, max(_end - 3.5, 1.0)
         try:
-            _e1 = float(st.session_state.get("pw_b1", 0.5 * (_lo + _hi)))
+            _e1 = float(st.session_state.get("pw_b1", _lo))
         except (TypeError, ValueError):
-            _e1 = 0.5 * (_lo + _hi)
+            _e1 = _lo
         if not (_lo - 1e-9 <= _e1 <= _hi + 1e-9):
             st.session_state["pw_b1"] = round(min(max(_e1, _lo), _hi), 2)
 
