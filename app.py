@@ -8314,16 +8314,16 @@ def piecewise_figure(epsilon, force_N, result, style, log_y=False, off=(),
 
 
 PW_FURNITURE = (
-    ("pw_show_areas", "Shaded areas",
+    ("pw_show_areas", "Contribution areas",
      "The stacked fills under the curve, one per component. Off leaves the "
      "data, the fitted curve and each component's own dashed line."),
     ("pw_show_bands", "Regime bands",
      "The tinted vertical bands (R1, R2, …) behind the curve that mark "
      "which stretch of the squash each regime owns."),
-    ("pw_show_tags", "ε lines",
+    ("pw_show_tags", "ε lines and tags",
      "The ε lines with their labels above the plot. Off removes both the "
      "lines and the rows of tags, which shortens the figure."),
-    ("pw_show_track", "Range markings",
+    ("pw_show_track", "Range track",
      "The panel under the plot with one bar per component showing where it "
      "acts. Off gives the force plot the whole height, x axis included."),
     ("pw_show_zero", "F = 0 line",
@@ -8340,27 +8340,44 @@ PW_FURNITURE = (
 )
 
 
+def _pw_furniture_changed():
+    """Callback: the chosen names become the plot's display switches."""
+    chosen = set(st.session_state.get("pw_furniture") or ())
+    for key, label, _tip in PW_FURNITURE:
+        st.session_state[key] = label in chosen
+
+
 def plot_furniture():
     """
-    What the plot draws, as tick boxes under it.
+    What the plot draws, in one line.
 
-    None of these touch the fit: they are furniture. The figure is redrawn
-    from the same result, so a box can be cleared to take a clean figure
-    out of the app for a paper.
+    Seven tick boxes across one row left seven truncated words; the same
+    seven as a list of names is one control, reads in full, and wraps
+    instead of shrinking. None of them touch the fit: they are furniture.
     """
-    st.caption(
-        "🎨 **On the plot** — display only: clearing a box changes the "
-        "picture, never the fit, the boundaries or the moduli.")
-    boxes = st.columns(len(PW_FURNITURE) + 1)
-    for column, (key, label, tip) in zip(boxes, PW_FURNITURE):
-        with column:
-            st.checkbox(label, key=key, help=tip)
-    with boxes[-1]:
-        if st.button("↺ All back", key="pw_furniture_reset",
-                     help="Back to the default picture: areas, bands, tags "
-                          "and the range track on, the zero line off."):
-            rerun_keeping_settings({key: DEFAULTS[key]
-                                    for key, _l, _t in PW_FURNITURE})
+    st.session_state["pw_furniture"] = [
+        label for key, label, _tip in PW_FURNITURE
+        if st.session_state.get(key, DEFAULTS.get(key, False))]
+    row, back = st.columns([5, 1])
+    with row:
+        st.multiselect(
+            "On the plot", [label for _k, label, _t in PW_FURNITURE],
+            key="pw_furniture", on_change=_pw_furniture_changed,
+            label_visibility="collapsed",
+            placeholder="Nothing but the curve, the fit and the data",
+            help="Display only: what is drawn on top of the curve. None of "
+                 "it changes the fit, the boundaries or the moduli. "
+                 + " · ".join(f"{label}: {tip}"
+                              for _k, label, tip in PW_FURNITURE),
+        )
+    with back:
+        if st.button("↺ Default", key="pw_furniture_reset", **STRETCH,
+                     help="Back to the default picture: the contribution "
+                          "areas over the data and the fitted curve, and "
+                          "nothing drawn on top of them."):
+            rerun_keeping_settings(
+                {key: DEFAULTS[key] for key, _l, _t in PW_FURNITURE},
+                forget=("pw_furniture",))
 
 
 def fitting_range_panel(result=None, n_points=None):
@@ -8512,15 +8529,17 @@ def early_boundary_control():
             help="His own arrangement: the two terms added from the moment "
                  "the probe touches, with no joining point at all. Most "
                  "curves prefer one of them joining a little way in.")
-        if st.button("🎯 Optimise the boundary — the best R² these two give",
+        if st.button("🎯 Optimise the boundary — the best R² this order gives",
                      key="pw_early_optimise", **STRETCH,
-                     help="Tries every way of putting the two together over "
-                          "this range — both from first contact, and either "
-                          "one first with the other joining anywhere in it — "
-                          "and keeps the one with the highest R² that still "
-                          "measures both components."):
-            rerun_keeping_settings({"_pw_early_prefer": "r2",
-                                    "_pw_find_early": True,
+                     disabled=bool(st.session_state.get("pw_early_together")),
+                     help="Moves ε₁ only. The order above and which "
+                          "components are ticked stay exactly as they are, "
+                          "so nothing about the picture changes except "
+                          "where the second one joins: ε₁ is scanned across "
+                          "the range and the joining point with the highest "
+                          "R² that still measures both is kept."):
+            rerun_keeping_settings({"_pw_eps1_prefer": "r2",
+                                    "_pw_find_eps1": True,
                                     "_pw_apply": True})
     said_early = st.session_state.get("pw_early_note")
     if said_early:
@@ -10681,8 +10700,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
         parallel = (len(live) < 2
                     or st.session_state.get("pw_early_join",
                                             "parallel") == "parallel")
-        found = None if parallel else early_best_eps1(model, epsilon, force_N,
-                                                      live, end)
+        prefer = st.session_state.pop("_pw_eps1_prefer", "aicc")
+        found = None if parallel else early_best_eps1(
+            model, epsilon, force_N, live, end, prefer=prefer)
         parked = early_park(end, parallel=parallel,
                             first=(found or {}).get("eps1"))
         for _key, _value in zip(PW_BOUNDARY_KEYS, parked):
