@@ -674,6 +674,10 @@ DEFAULTS = {
     # force the one before it ended on. Off, because the curve already
     # shows it is continuous there.
     "pw_show_anchors": False,
+    # Both early components from first contact, or one joining at ε₁. The
+    # tick box on the board and pw_early_join say the same thing; the box
+    # is what a person sets, the key is what the fit reads.
+    "pw_early_together": False,
     # A light blue field of points with no outline, and one dark dashed
     # line over it. The eye separates them by lightness and by the kind of
     # mark, which survives a greyscale print and colour blindness both.
@@ -8416,84 +8420,109 @@ def fitting_range_panel(result=None, n_points=None):
             "regime has one boundary at most.")
 
 
-def early_window_panel():
+def early_range_control():
     """
-    The early regime's whole board: the window, and nothing that can
-    quietly undo a fit that arrived already searched.
+    How far this analysis reads — the first thing on the board.
 
-    The two-term fit is chosen for this curve the moment the regime is
-    entered — every order, every joining point, 63 arrangements — so the
-    controls it needs are the window it is read over and the way the two
-    components act. They are behind a fold because the default is the
-    answer: opened, they still cannot reach a boundary search that would
-    replace it without being asked.
+    The window is not one setting among many: it decides which part of the
+    curve is being measured at all, and every modulus below it is a
+    modulus over this stretch and no other. So it comes before the
+    components, not after them.
     """
-    joined = st.session_state.get("pw_early_join", "parallel")
-    said_early = st.session_state.get("pw_early_note")
-    if said_early:
-        st.caption("🔎 " + said_early)
-    with st.expander("⚙️ The early window — how far it is read, and how the "
-                     "two act", expanded=False):
-        st.caption(
-            "Both of these re-search the two components and re-fit at once. "
-            "Nothing else on this page changes the early fit: the domains, "
-            "the regression conditions and the screen belong to the full "
-            "deformation, and they are not shown here because a fit chosen "
-            "over every arrangement has nothing to gain from being taken "
-            "apart by hand.")
-        st.radio(
-            "How the two act", list(PW_EARLY_JOINS),
-            format_func=PW_EARLY_JOINS.get, key="pw_early_join",
-            horizontal=True, label_visibility="collapsed",
-            on_change=_pw_early_join_changed,
-            help="Lulevich's own arrangement has both from first contact, "
-                 "in parallel. Curves usually prefer one of them joining a "
-                 "little way in; that is the other choice, and ε₁ is where "
-                 "it joins.",
-        )
-        e1c, endc = st.columns(2)
-        with e1c:
-            st.number_input("ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f",
-                            key="pw_b1", disabled=(joined == "parallel"),
-                            help="Where the second component joins. Found by "
-                                 "the search; typing over it fits there "
-                                 "instead. Not used when both act from first "
-                                 "contact.")
-        with endc:
-            st.number_input("x_end (%)", 2.0, 100.0, step=0.5, format="%.1f",
-                            key="pw_end", on_change=_pw_early_end_changed,
-                            help="How far the early reading goes. Nothing "
-                                 "past this enters the fit. 35 % by "
-                                 "default: Lulevich fits his eq 3 over "
-                                 "ε = 0.1–0.3 and a living cell is "
-                                 "reversible to about 30 %.")
-        w1, w2 = st.columns(2)
-        with w1:
-            window = st.session_state.get("_pw_early_window")
-            if window and st.button(
-                    f"📐 Read to {float(window):.0f} % (where it stays one "
-                    "power law)", key="pw_early_window_take", **STRETCH,
-                    help="Sets x_end to the end of the stretch over which "
-                         "this curve's log-log slope is still flat, which is "
-                         "as far as one power law describes it."):
+    st.markdown("**The range of this analysis**")
+    r1, r2 = st.columns([1, 2])
+    with r1:
+        st.number_input("Read to (%)", 2.0, 100.0, step=0.5, format="%.1f",
+                        key="pw_end", on_change=_pw_early_end_changed,
+                        help="Nothing past this point enters the fit. 35 % "
+                             "by default: Lulevich fits his eq 3 over "
+                             "ε = 0.1–0.3, and a living cell is elastic and "
+                             "reversible to about 30 %.")
+    with r2:
+        window = st.session_state.get("_pw_early_window")
+        if window:
+            if st.button(f"📐 Read to {float(window):.0f} % — as far as this "
+                         "curve stays one power law",
+                         key="pw_early_window_take", **STRETCH,
+                         help="Sets the range to the end of the stretch over "
+                              "which this curve's log-log slope is still "
+                              "flat, which is as far as one power law "
+                              "describes it."):
                 taken = early_park(round(float(window), 1))
                 rerun_keeping_settings(
                     {**dict(zip(PW_BOUNDARY_KEYS, taken)),
                      "_pw_early_end_user": True,
                      "_pw_find_early": True, "_pw_apply": True})
-        with w2:
-            if st.button(f"↺ Back to the default ({PW_EARLY_END_PCT:g} %, "
-                         "best arrangement found)", key="pw_early_default",
-                         **STRETCH,
-                         help="Whatever has been changed here, this is the "
-                              "fit the regime arrives with: the window at "
-                              f"{PW_EARLY_END_PCT:g} % and the arrangement "
-                              "the search kept for this curve."):
-                taken = early_park(PW_EARLY_END_PCT)
-                rerun_keeping_settings(
-                    {**dict(zip(PW_BOUNDARY_KEYS, taken)),
-                     "pw_early_eps": None, "_pw_early_end_user": False,
-                     "_pw_find_early": True, "_pw_apply": True})
+        st.caption(
+            f"Everything below is measured over 0 → "
+            f"{early_end_pct():g} % of the squash.")
+
+
+def _pw_together_changed():
+    """Callback: both from first contact, or one joining at ε₁."""
+    together = bool(st.session_state.get("pw_early_together"))
+    st.session_state["pw_early_join"] = "parallel" if together else "staggered"
+    _pw_early_join_changed()
+
+
+def early_boundary_control():
+    """
+    Where each of the two starts, set by hand, or found.
+
+    The order above says which component acts first; this says where the
+    other one joins. Both are the person's to set — typing a number fits
+    at that number — and the one button looks for the joining point that
+    fits this curve best rather than replacing what they chose with a
+    model of its own.
+    """
+    joined = st.session_state.get("pw_early_join", "parallel")
+    st.session_state.setdefault("pw_early_together", joined == "parallel")
+    if bool(st.session_state.get("pw_early_together")) != (joined == "parallel"):
+        st.session_state["pw_early_together"] = joined == "parallel"
+    names = components_for(st.session_state.get("cell_type"))
+    live = [t for t in component_order()
+            if ORDER_COEFFICIENT.get(t) in set(active_component_names())]
+    second = names[live[1]][0] if len(live) > 1 else "the second component"
+    st.markdown("**Where the second one joins**")
+    b1, b2 = st.columns([1, 2])
+    with b1:
+        st.number_input(
+            "ε₁ (%)", 0.5, 99.0, step=0.5, format="%.2f", key="pw_b1",
+            disabled=bool(st.session_state.get("pw_early_together")),
+            help=f"Where {second} starts carrying load. Type a number and "
+                 "the fit is made there; press the button beside it and the "
+                 "joining point that fits this curve best is found instead.")
+    with b2:
+        st.checkbox(
+            "Both act from first contact (Lulevich eq 1 + 6)",
+            key="pw_early_together", on_change=_pw_together_changed,
+            help="His own arrangement: the two terms added from the moment "
+                 "the probe touches, with no joining point at all. Most "
+                 "curves prefer one of them joining a little way in.")
+        if st.button("🎯 Optimise the boundary — the best R² these two give",
+                     key="pw_early_optimise", **STRETCH,
+                     help="Tries every way of putting the two together over "
+                          "this range — both from first contact, and either "
+                          "one first with the other joining anywhere in it — "
+                          "and keeps the one with the highest R² that still "
+                          "measures both components."):
+            rerun_keeping_settings({"_pw_early_prefer": "r2",
+                                    "_pw_find_early": True,
+                                    "_pw_apply": True})
+    said_early = st.session_state.get("pw_early_note")
+    if said_early:
+        st.caption("🔎 " + said_early)
+    if st.button(f"↺ Back to the default ({PW_EARLY_END_PCT:g} %, best "
+                 "arrangement found)", key="pw_early_default",
+                 help="Whatever has been changed here, this is the fit the "
+                      f"regime arrives with: the range at "
+                      f"{PW_EARLY_END_PCT:g} % and the arrangement the "
+                      "search kept for this curve."):
+        taken = early_park(PW_EARLY_END_PCT)
+        rerun_keeping_settings(
+            {**dict(zip(PW_BOUNDARY_KEYS, taken)),
+             "pw_early_eps": None, "_pw_early_end_user": False,
+             "_pw_find_early": True, "_pw_apply": True})
 
 
 def how_it_was_fitted(result):
@@ -9573,7 +9602,7 @@ def early_park(end, parallel=None, first=None):
             round(max(end - 1.0, e1 + 2 * PW_MIN_GAP), 2), round(end, 2)]
 
 
-def early_best_arrangement(model, epsilon, force_N, end=None):
+def early_best_arrangement(model, epsilon, force_N, end=None, prefer="aicc"):
     """
     The best way to put the two early components together, searched.
 
@@ -9633,7 +9662,12 @@ def early_best_arrangement(model, epsilon, force_N, end=None):
         tried += 1
         if candidate is None or not np.isfinite(candidate["aicc"]):
             return
-        key = (candidate["measured"], -candidate["aicc"])
+        # Both components measured first, always: an arrangement that
+        # wins by driving one of them to zero has learnt nothing about the
+        # cell. Then AICc, or R² when the person asked for the best fit
+        # these two can give.
+        key = (candidate["measured"],
+               candidate["r2"] if prefer == "r2" else -candidate["aicc"])
         if best is None or key > best["key"]:
             best = {"key": key, "join": join, "order": list(order),
                     "eps1": float(eps1), **candidate}
@@ -9703,6 +9737,11 @@ def _pw_early_join_changed():
     end = float(st.session_state.get("pw_end", DEFAULTS["pw_end"]))
     for key, value in zip(PW_BOUNDARY_KEYS, early_park(end)):
         st.session_state[key] = value
+    # Turning "both from first contact" off asks for a joining point, and
+    # the middle of the window is not an answer: the one that fits this
+    # order best is looked for, keeping the order the person set.
+    st.session_state["_pw_find_eps1"] = (
+        st.session_state.get("pw_early_join") != "parallel")
     st.session_state["pw_eps_way"] = (
         "typed" if st.session_state.get("pw_early_join") == "parallel"
         else "found")
@@ -10458,8 +10497,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
         the same repair the fit uses so the arrangement searched is the
         arrangement fitted.
         """
+        prefer = st.session_state.pop("_pw_early_prefer", "aicc")
         with st.spinner("Finding the best arrangement of the two…"):
-            found_early = early_best_arrangement(model, epsilon, force_N)
+            found_early = early_best_arrangement(model, epsilon, force_N,
+                                                 prefer=prefer)
         if found_early:
             st.session_state["pw_early_join"] = found_early["join"]
             if found_early["join"] == "staggered" and found_early["order"]:
@@ -10480,7 +10521,9 @@ def piecewise_section(model, epsilon, force_N, rupture):
                    f"first, the other joining at ε₁ = "
                    f"{found_early['eps1']:.1f} %**")
                 + f" (R² = {found_early['r2']:.5f}, "
-                f"{found_early['measured']} of 2 components measured).")
+                f"{found_early['measured']} of 2 components measured"
+                + (", the highest R² these two give over this range"
+                   if prefer == "r2" else "") + ").")
             st.session_state["pw_eps_way"] = "typed"
         apply_board()
 
@@ -10640,10 +10683,15 @@ def piecewise_section(model, epsilon, force_N, rupture):
     # there arrives the four-component way rather than at the defaults.
     applied_state = st.session_state.get("pw_applied") or {}
     apply_now = st.session_state.pop("_pw_apply", False)
+    find_eps1_now = st.session_state.pop("_pw_find_eps1", False)
     find_early_now = st.session_state.pop("_pw_find_early", False)
     find_full_now = st.session_state.pop("_pw_find_full", False)
     new_curve = applied_state.get("curve") != curve_key
-    if find_early_now and HAS_PIECEWISE and not new_curve:
+    if find_eps1_now and not new_curve and piecewise_regime() == "early":
+        # The order stands; only where the second one joins is looked for.
+        refit_early_order()
+        apply_board()
+    elif find_early_now and HAS_PIECEWISE and not new_curve:
         find_early_arrangement()
     elif find_full_now and not new_curve and piecewise_regime() != "early":
         arrive_full()
@@ -10767,6 +10815,11 @@ def piecewise_section(model, epsilon, force_N, rupture):
             "The components ticked below are a hypothesis about this cell. "
             "Exactly what is ticked is fitted, drawn and reported; step E "
             "tests whether the curve supports it.")
+        # How far the analysis reads comes before what is in it: the
+        # window decides which part of the curve is being measured, and
+        # every component below is a component over that stretch.
+        if piecewise_regime() == "early":
+            early_range_control()
         share_col, model_col = st.columns([1.2, 1], gap="medium")
         with share_col:
             load_sharing_control()
@@ -10775,6 +10828,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
                      r"\theta_k\,\phi_k(x)")
         st.markdown("**The order they are met in**")
         component_order_control()
+        if piecewise_regime() == "early":
+            early_boundary_control()
         value_slots = piecewise_components_panel(
             piecewise_boundaries(), None, None, columns=2)
         components_note_slot = st.empty()
@@ -10793,9 +10848,7 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # and the sections below exist to take a fit apart and put it back
         # together, which is exactly what should not happen to it.
         range_slot = st.container()
-        if early_now:
-            early_window_panel()
-        else:
+        if not early_now:
             st.markdown("**B · Domains — where each part takes over**")
             st.caption(
                 "The stretch of deformation each component is fitted on. "
@@ -11488,7 +11541,8 @@ def early_regimes_for(join, order):
         for i, n in enumerate(chain))
 
 
-def early_best_eps1(model, epsilon, force_N, order, end=None):
+def early_best_eps1(model, epsilon, force_N, order, end=None,
+                    prefer="aicc"):
     """
     Where the second of the two joins, for the order given.
 
@@ -11521,7 +11575,8 @@ def early_best_eps1(model, epsilon, force_N, order, end=None):
         coefficients = result.get("coefficients") or {}
         measured = sum(1 for name in order
                        if abs(float(coefficients.get(name) or 0.0)) > 0.0)
-        key = (measured, -float(result.get("aicc", float("inf"))))
+        key = (measured, float(result.get("r_squared", float("-inf")))
+               if prefer == "r2" else -float(result.get("aicc", float("inf"))))
         if best is None or key > best["key"]:
             best = {"key": key, "eps1": float(bounds[1]),
                     "r2": float(result.get("r_squared", float("nan"))),
