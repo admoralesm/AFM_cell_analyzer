@@ -665,10 +665,13 @@ DEFAULTS = {
     "pw_force_unit": "N",
     # What the plot draws besides the data and the fit. All on by default;
     # a figure for a paper usually wants most of them off.
+    # The default picture is the curve, the fit and what each component
+    # contributes -- and nothing drawn on top of it. The bands, the ε
+    # lines and the range track are all one tick away under the plot.
     "pw_show_areas": True,
-    "pw_show_bands": True,
-    "pw_show_tags": True,
-    "pw_show_track": True,
+    "pw_show_bands": False,
+    "pw_show_tags": False,
+    "pw_show_track": False,
     "pw_show_zero": False,
     # The C⁰ anchors: the white diamonds where each stretch picks up the
     # force the one before it ended on. Off, because the curve already
@@ -8525,6 +8528,71 @@ def early_boundary_control():
              "_pw_find_early": True, "_pw_apply": True})
 
 
+def fit_equation_panel(result):
+    """
+    The fit as one equation, and what it means. Nothing else.
+
+    A fitted curve deserves its equation, with this cell's own boundaries
+    and this cell's own numbers in it, and then the one line that says
+    what turns a coefficient into a modulus. Everything else that used to
+    sit under the plot said the same thing in prose.
+    """
+    if not (result and result.get("success")):
+        return
+    b = [float(v) for v in result["boundaries_pct"]]
+    end = b[-1]
+    ranges = result.get("ranges") or {}
+    off = set(piecewise_off())
+    terms, powers = [], []
+    for name, _label, _symbol, _colour, _law in active_components():
+        if name in off or name not in ranges:
+            continue
+        start = float(ranges[name][0])
+        until = min(float(ranges[name][1]), end)
+        power = "3" if name in ("K_shell", "K_nucleus") else "3/2"
+        if until < end - 1e-6:
+            inner = rf"\big[\min(x,\,{until:.3g}) - {start:.3g}\big]_+"
+        elif start <= b[0] + 1e-6:
+            inner = "x"
+        else:
+            inner = rf"\big[x - {start:.3g}\big]_+"
+        terms.append(rf"{PW_TEX.get(name, name)}\,{inner}^{{{power}}}")
+        powers.append(power)
+    if not terms:
+        return
+    st.latex(r"\hat F(x) = C_0 + " + " + ".join(terms)
+             + rf",\qquad 0 \le x \le {end:.3g}\,\%")
+    st.latex(r"E_j = \frac{100^{\,p_j}\;\hat\theta_j}{A_j}"
+             + r"\qquad\Longrightarrow\qquad "
+             + r",\quad ".join(
+                 f"{DISPLAY_SYMBOL.get(row['symbol'], row['symbol'])} = "
+                 + modulus_display(row["symbol"], row["E_Pa"]).replace(
+                     " ", r"\,")
+                 for name, *_r in active_components()
+                 for row in [(result.get("moduli") or {}).get(name)]
+                 if row))
+    early = piecewise_regime() == "early"
+    st.caption(
+        (r"**What it says.** $x$ is the squash in per cent and $C_0$ the "
+         r"force at first contact. A shell being stretched carries force as "
+         r"$x^3$ (Lulevich eq 3), a filled body pressed by a plate as "
+         r"$x^{3/2}$ (Hertz, his eq 6); $[\,\cdot\,]_+$ is zero until the "
+         r"component joins. Each $\hat\theta_j$ is fitted by bounded "
+         r"non-negative least squares and divided by that component's own "
+         r"geometric prefactor $A_j$ to give its modulus."
+         if early else
+         r"**What it says.** $x$ is the squash in per cent and $C_0$ the "
+         r"force at first contact. $[\,\cdot\,]_+$ is zero until a "
+         r"component joins, and $\min(x,u)$ holds it at what it reached "
+         r"once its own stretch ends. Shells carry force as $x^3$, filled "
+         r"bodies as $x^{3/2}$. Each $\hat\theta_j$ is fitted by bounded "
+         r"non-negative least squares and divided by that component's own "
+         r"geometric prefactor $A_j$ to give its modulus.")
+        + f" $R^2 = {result['r_squared']:.5f}$ over "
+        f"{int(result.get('n_points', 0)):,} points."
+    )
+
+
 def how_it_was_fitted(result):
     """
     Two sentences: what this fit is and how it was arrived at.
@@ -11164,22 +11232,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                         epsilon, force_N, result, style, log_y=log_y,
                         off=off_now,
                         view=st.session_state.get("pw_view", "stacked"),
-                        note=f"fit {fid} · R² = {result['r_squared']:.5f}",
                     ),
                     key="pw_curve", **STRETCH,
                 )
-                # How this fit was made, in two sentences, beside the
-                # graph. Short on purpose: the long version is the board below.
-                said_how = how_it_was_fitted(result)
-                if said_how:
-                    st.info(said_how, icon="🧪")
-                # What is on the graph right now, in one line, under it.
-                piecewise_graph_note(
-                    result, off=off_now,
-                    view=st.session_state.get("pw_view", "stacked"),
-                    log_y=log_y, fit_id_text=fid,
-                    n_points=int(np.size(epsilon)),
-                )
+                # The fit, as one equation, with this cell's numbers in
+                # it, and one line saying what it means. Everything that
+                # used to sit here said the same thing in prose.
+                fit_equation_panel(result)
                 # How the plot draws it, under the plot, where it is being
                 # looked at. Both apply at once; neither changes the fit.
                 v1, v2, v3 = st.columns([2.1, 1.1, 0.9])
@@ -11230,8 +11289,13 @@ def piecewise_section(model, epsilon, force_N, rupture):
                     rerun_keeping_settings()
 
         # ---- the range card, back up on the board, now with its R² -----
-        with range_slot:
-            fitting_range_panel(result if ok else None, int(np.size(epsilon)))
+        # Only where it earns its place: with four components and three
+        # boundaries a table says something a sentence cannot. The two-term
+        # reading has its whole model in the equation under the plot.
+        if not early_now:
+            with range_slot:
+                fitting_range_panel(result if ok else None,
+                                    int(np.size(epsilon)))
 
         # ---- F · what the answer is worth ------------------------------
         # The early regime's answer is judged against Lulevich's own
