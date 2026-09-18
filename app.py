@@ -892,6 +892,7 @@ DEFAULTS = {
     "mt_follow": True,
     "mt_subpix": True,
     "mt_anchor": True,
+    "mt_trails": True,
     # Where the cytoskeleton is allowed to join in the two-term reading.
     # The low edge is a floor, not only a search range: nothing on the
     # page can put the joining point below it.
@@ -7640,39 +7641,109 @@ def motion_set_markers(points):
     return True
 
 
-def motion_preview(frame_bgr, markers, scale=1.0, trail=None):
+def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
+                   microns=None, thickness=1.0):
     """
-    The frame with the markers drawn on it, as RGB for st.image.
+    The frame with the four corners on it, drawn the way the desktop app
+    draws them: a crosshair and a ring on each corner, its label beside it,
+    the dashed quadrilateral joining them in the order they were picked,
+    the centroid, and the area that quadrilateral encloses.
 
-    A dot on the tracked pixel and a label beside it. Not the desktop app's
-    leader lines: at preview size they take more room than the cell.
+    ``dots=False`` leaves the rings off, for the canvas background: the
+    canvas puts its own dot on each corner and two dots on one spot read as
+    two corners.
     """
+    cv = ct.cv2
     image = frame_bgr.copy()
+    line = cv.LINE_AA
+    width = max(1, int(round(thickness)))
+
+    def colour_of(index):
+        text = ct.POINT_COLORS[index % len(ct.POINT_COLORS)]
+        return tuple(int(text[i:i + 2], 16) for i in (5, 3, 1))
+
     if trail is not None and len(trail):
         for k in range(trail.shape[1]):
-            colour = ct.POINT_COLORS[k % len(ct.POINT_COLORS)]
-            bgr = tuple(int(colour[i:i + 2], 16) for i in (5, 3, 1))
             path = trail[:, k, :]
             good = np.isfinite(path[:, 0]) & np.isfinite(path[:, 1])
             drawn = np.round(path[good]).astype(np.int32)
             if drawn.shape[0] >= 2:
-                ct.cv2.polylines(image, [drawn], False, (0, 0, 0), 3,
-                              ct.cv2.LINE_AA)
-                ct.cv2.polylines(image, [drawn], False, bgr, 1, ct.cv2.LINE_AA)
+                cv.polylines(image, [drawn], False, (0, 0, 0), width * 3, line)
+                cv.polylines(image, [drawn], False, colour_of(k), width, line)
+
+    placed = [(float(x), float(y)) for x, y in markers
+              if np.isfinite(x) and np.isfinite(y)]
+
+    # The quadrilateral, dashed, in the order the corners were picked. It is
+    # what makes four dots read as one cell, and what shows at a glance that
+    # they were picked round it rather than across it.
+    if connect and len(placed) >= 2:
+        closed = len(placed) >= 3
+        for index in range(len(placed) if closed else len(placed) - 1):
+            ax, ay = placed[index]
+            bx, by = placed[(index + 1) % len(placed)]
+            length = float(np.hypot(bx - ax, by - ay))
+            if length < 1.0:
+                continue
+            ux, uy = (bx - ax) / length, (by - ay) / length
+            step = 0.0
+            while step < length:
+                stop = min(step + 9.0, length)
+                p = (int(round(ax + ux * step)), int(round(ay + uy * step)))
+                q = (int(round(ax + ux * stop)), int(round(ay + uy * stop)))
+                cv.line(image, p, q, (0, 0, 0), width * 3, line)
+                cv.line(image, p, q, (225, 225, 225), width, line)
+                step += 15.0
+
     for index, (x, y) in enumerate(markers):
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
-        colour = ct.POINT_COLORS[index % len(ct.POINT_COLORS)]
-        bgr = tuple(int(colour[i:i + 2], 16) for i in (5, 3, 1))
+        bgr = colour_of(index)
         px, py = int(round(float(x))), int(round(float(y)))
-        ct.cv2.circle(image, (px, py), 6, (0, 0, 0), -1, ct.cv2.LINE_AA)
-        ct.cv2.circle(image, (px, py), 4, bgr, -1, ct.cv2.LINE_AA)
+        arm = int(round(13 * thickness))
+        cv.line(image, (px - arm, py), (px + arm, py), (0, 0, 0),
+                width * 3, line)
+        cv.line(image, (px, py - arm), (px, py + arm), (0, 0, 0),
+                width * 3, line)
+        cv.line(image, (px - arm, py), (px + arm, py), bgr, width, line)
+        cv.line(image, (px, py - arm), (px, py + arm), bgr, width, line)
+        if dots:
+            cv.circle(image, (px, py), int(round(6 * thickness)), (0, 0, 0),
+                      -1, line)
+            cv.circle(image, (px, py), int(round(4 * thickness)), bgr, -1,
+                      line)
         label = ct.POINT_LABELS[index % len(ct.POINT_LABELS)]
-        ct.cv2.putText(image, label, (px + 9, py - 9),
-                    ct.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, ct.cv2.LINE_AA)
-        ct.cv2.putText(image, label, (px + 9, py - 9),
-                    ct.cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 1, ct.cv2.LINE_AA)
-    return ct.cv2.cvtColor(image, ct.cv2.COLOR_BGR2RGB)
+        spot = (px + arm - 2, py - arm + 2)
+        cv.putText(image, label, spot, cv.FONT_HERSHEY_SIMPLEX,
+                   0.6 * thickness, (0, 0, 0), width * 4, line)
+        cv.putText(image, label, spot, cv.FONT_HERSHEY_SIMPLEX,
+                   0.6 * thickness, bgr, width, line)
+
+    # The centroid, and what the four corners enclose. The area is the
+    # reading that says the cell is being squashed; a white dot on its own
+    # only says where the middle is.
+    if len(placed) >= 3:
+        cx = int(round(float(np.mean([p[0] for p in placed]))))
+        cy = int(round(float(np.mean([p[1] for p in placed]))))
+        cv.circle(image, (cx, cy), int(round(6 * thickness)), (0, 0, 0), -1,
+                  line)
+        cv.circle(image, (cx, cy), int(round(4 * thickness)), (255, 255, 255),
+                  -1, line)
+        if len(placed) == 4:
+            area = float(ct.quad_area(
+                np.asarray(placed, dtype=np.float64).reshape(1, 4, 2))[0])
+            if np.isfinite(area):
+                if microns:
+                    text = f"{area * microns * microns:.0f} um2"
+                else:
+                    text = f"{area:.0f} px2"
+                spot = (cx + int(round(10 * thickness)),
+                        cy + int(round(18 * thickness)))
+                cv.putText(image, text, spot, cv.FONT_HERSHEY_SIMPLEX,
+                           0.55 * thickness, (0, 0, 0), width * 4, line)
+                cv.putText(image, text, spot, cv.FONT_HERSHEY_SIMPLEX,
+                           0.55 * thickness, (170, 255, 170), width, line)
+    return cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
 
 def motion_adopt(uploaded, widget_key="mt_upload"):
@@ -7705,7 +7776,7 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
     # A frame number, a typed coordinate or a canvas drawing from the last
     # video is not a fact about this one, and a stored value outside a new
     # widget's range is an exception before the page draws.
-    for stale in ("mt_start", "mt_end"):
+    for stale in ("mt_start", "mt_end", "mt_show"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -7719,38 +7790,77 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
     return True
 
 
-def motion_pick_panel(frame_bgr, canvas_key="mt_canvas",
+def motion_canvas_point(shape, scale):
+    """
+    Where one canvas dot sits, in video pixels.
+
+    Fabric can place a shape by its centre or by the top-left of its box,
+    and the canvas component is free to use either. ``originX``/``originY``
+    say which, so the radius is added only when the anchor is the corner --
+    guessing would put every corner a few pixels off, in the same
+    direction, on every cell.
+    """
+    x = float(shape["left"])
+    y = float(shape["top"])
+    radius = float(shape.get("radius", 0.0) or 0.0)
+    if radius:
+        if str(shape.get("originX", "left")).lower() != "center":
+            x += radius * float(shape.get("scaleX", 1.0) or 1.0)
+        if str(shape.get("originY", "top")).lower() != "center":
+            y += radius * float(shape.get("scaleY", 1.0) or 1.0)
+    if scale <= 0:
+        return None
+    return (x / scale, y / scale)
+
+
+def motion_pick_panel(frame_bgr, canvas_key="mt_canvas", microns=None,
                       width_px=720):
     """
-    Place the four markers on the frame.
+    Select the four corners of the cell, on the frame.
 
-    With the canvas component installed this is four clicks on the picture.
-    Without it, the same four pairs of numbers are typed, and the preview
-    beside them shows where they landed, which is slower but needs nothing
-    installed. Either way the picks are snapped onto the nearest corner to
-    sub-pixel accuracy before anything is tracked.
+    Click them in order round the cell -- P1, P2, P3, P4 -- and the dashed
+    quadrilateral joining them, its centroid and the area it encloses are
+    drawn as you go, so it is obvious straight away whether they went round
+    the cell or across it. Switch to **Nudge a corner** to drag one onto
+    exactly the feature you meant.
+
+    Without the canvas component the same four corners are typed as
+    coordinates, with the same picture beside them.
     """
     height, width = frame_bgr.shape[:2]
     markers = motion_markers()
     if HAS_CANVAS:
-        shown = int(min(width_px, width))
-        scale = shown / float(width)
         from PIL import Image
 
-        background = Image.fromarray(
-            ct.cv2.cvtColor(frame_bgr, ct.cv2.COLOR_BGR2RGB)).resize(
-                (shown, int(round(height * scale))), Image.BILINEAR)
+        shown = int(min(width_px, width))
+        scale = shown / float(width)
+        # Drawn at full size and then shrunk, so the crosshairs are thickened
+        # by however much the shrinking will thin them.
+        painted = motion_preview(frame_bgr, markers, dots=False,
+                                 microns=microns,
+                                 thickness=max(1.0, 1.0 / max(scale, 0.05)))
+        background = Image.fromarray(painted).resize(
+            (shown, int(round(height * scale))), Image.BILINEAR)
+        mode = st.radio(
+            "How the corners are placed",
+            ("Click the corners", "Nudge a corner"),
+            horizontal=True, key="mt_pick_mode",
+            label_visibility="collapsed",
+            help="Click places a corner where you click. Nudge lets you "
+                 "pick one up and drag it onto the feature you meant.")
         st.caption(
-            "Click the four markers on the cell, in order round it. Click "
-            "again to add another; the ↶ and 🗑 icons under the canvas "
-            "undo one and clear them all. Pick "
-            "features with texture — a speckle, an edge, a corner of the "
-            "cell — not flat grey.")
+            "Click the **four corners of the cell**, in order round it — "
+            "P1, P2, P3, P4. The dashed quadrilateral between them, its "
+            "centre and its area appear as you go. Choose features with "
+            "texture (a speckle, an edge, a corner) rather than flat grey; "
+            "↶ and 🗑 under the picture undo one and clear them all.")
         drawing = st_canvas(
             background_image=background,
-            drawing_mode="point", point_display_radius=4,
+            drawing_mode=("transform" if mode == "Nudge a corner"
+                          else "point"),
+            point_display_radius=5,
             stroke_width=2, stroke_color="#00e5ff",
-            fill_color="rgba(0, 229, 255, 0.6)",
+            fill_color="rgba(0, 229, 255, 0.85)",
             height=int(round(height * scale)), width=shown,
             update_streamlit=True, key=canvas_key,
         )
@@ -7758,26 +7868,26 @@ def motion_pick_panel(frame_bgr, canvas_key="mt_canvas",
         if drawing is not None and drawing.json_data:
             for shape in (drawing.json_data.get("objects") or []):
                 try:
-                    clicked.append((float(shape["left"]) / scale,
-                                    float(shape["top"]) / scale))
+                    clicked.append(motion_canvas_point(shape, scale))
                 except (KeyError, TypeError, ValueError, ZeroDivisionError):
                     continue
+        clicked = [point for point in clicked if point is not None]
         # The canvas keeps its own list of what has been drawn on it, so it
-        # is the truth about the picks and session state follows it -- not
+        # is the truth about the corners and session state follows it -- not
         # the other way round, which is how a cleared canvas came back with
-        # the old markers on the next rerun.
+        # the old corners on the next rerun.
         if motion_set_markers(clicked):
             markers = motion_markers()
         if len(clicked) > 4:
             st.caption(
                 f"⚠️ {len(clicked)} points are on the canvas; the first four "
-                "are the ones tracked. **↩ Undo the last** removes one.")
+                "are the ones tracked. ↶ under the picture removes one.")
     else:
         st.info(
-            "Install **streamlit-drawable-canvas** to click the markers "
+            "Install **streamlit-drawable-canvas** to click the corners "
             "straight onto the frame (add it to requirements.txt and "
-            "reboot). Until then, read the coordinates off the preview and "
-            "type them here.", icon="ℹ️")
+            "reboot). Until then, read the coordinates off the picture and "
+            "type them here — still in order round the cell.", icon="ℹ️")
         typed = []
         rows = st.columns(4)
         for index, column in enumerate(rows):
@@ -7795,9 +7905,11 @@ def motion_pick_panel(frame_bgr, canvas_key="mt_canvas",
                 typed.append((x, y))
         if motion_set_markers(typed):
             markers = motion_markers()
-        st.image(motion_preview(frame_bgr, markers),
-                 caption="Where those coordinates land. x runs right, y runs "
-                         "down, from the top-left corner.")
+        st.image(
+            motion_preview(frame_bgr, markers, microns=microns),
+            caption="The four corners, the quadrilateral they make and the "
+                    "area it encloses. x runs right, y runs down, from the "
+                    "top-left corner.", **STRETCH)
     return markers
 
 
@@ -7893,6 +8005,36 @@ def motion_results_panel(result, held, microns):
             f"were, so the cell keeps moving rather than freezing. The "
             f"**markers_tracked** column in the table says which frames "
             f"those are.")
+
+    # Watch it happen. Four numbers in a table cannot say whether a corner
+    # came off the cell halfway through; one frame with the quadrilateral
+    # drawn on it can, and this is the frame by frame version of the
+    # desktop app's trajectory picture.
+    path = st.session_state.get("video_path")
+    if path and os.path.exists(path):
+        with st.expander("🎞️ Watch the corners move", expanded=True):
+            w1, w2 = st.columns([3, 1])
+            with w1:
+                st.session_state["mt_show"] = clamp_int(
+                    st.session_state.get("mt_show", start),
+                    int(frames[0]), int(frames[-1]))
+                at = st.slider("Frame", int(frames[0]), int(frames[-1]),
+                               key="mt_show", label_visibility="collapsed")
+            with w2:
+                st.checkbox("Show the trails", key="mt_trails")
+            row = int(np.argmin(np.abs(frames - int(at))))
+            shot = motion_frame(path, video_signature(), int(frames[row]))
+            if shot is not None:
+                trail = (held[:row + 1]
+                         if st.session_state.get("mt_trails", True) else None)
+                st.image(
+                    motion_preview(shot, held[row], trail=trail,
+                                   microns=microns),
+                    caption=(f"Frame {int(frames[row])} · "
+                             f"t = {ct.format_time(times[row])} · "
+                             f"{int(tracked[row])} of {held.shape[1]} corners "
+                             f"tracked here"),
+                    **STRETCH)
 
     labels = [ct.POINT_LABELS[i % len(ct.POINT_LABELS)]
               for i in range(held.shape[1])]
@@ -21184,12 +21326,13 @@ with tab_motion:
             icon="🚫")
     else:
         st.markdown(
-            "Pick four markers on the cell and follow them through the "
-            "compression. Each marker is tracked as a patch of a dozen "
+            "Select the four corners of the cell and follow them through "
+            "the compression. Each corner is tracked as a patch of a dozen "
             "features rather than one pixel, checked against its own first "
             "frame so it cannot drift, and held to the motion of the other "
             "three when it goes under the probe. What comes out is how fast "
-            "each part of the cell moved, and how far.")
+            "each part of the cell moved, how far, and what the "
+            "quadrilateral they make does as the cell is squashed.")
 
         # ---- 1 · the video -------------------------------------------
         st.markdown("**1 · The video**")
@@ -21246,11 +21389,13 @@ with tab_motion:
                     f"t = {ct.format_time(start_frame / fps)}")
 
                 # ---- 3 · the four markers ------------------------------
-                st.markdown("**3 · The four markers**")
+                st.markdown("**3 · Select the four corners**")
                 # A canvas keyed to the video: a new file gets a new,
                 # empty one instead of the last video's dots.
+                pick_microns = float(
+                    st.session_state.get("mt_um_per_px", 0.0)) or None
                 markers = motion_pick_panel(
-                    frame_bgr,
+                    frame_bgr, microns=pick_microns,
                     canvas_key="mt_canvas_" + str(
                         abs(hash((motion_path, video_signature()))) % 10 ** 9))
                 # The canvas draws its own undo / redo / bin under itself,
@@ -21279,9 +21424,11 @@ with tab_motion:
                             f"<b>{len(markers)} of 4</b> placed</div>",
                             unsafe_allow_html=True)
                 if HAS_CANVAS and markers:
-                    st.image(motion_preview(frame_bgr, markers),
-                             caption="Where they landed, at full size.",
-                             **STRETCH)
+                    st.image(
+                        motion_preview(frame_bgr, markers,
+                                       microns=pick_microns),
+                        caption="The four corners at full size, with the "
+                                "quadrilateral they make.", **STRETCH)
 
                 # ---- 4 · how far to read -------------------------------
                 st.markdown("**4 · How far to read**")
@@ -21358,7 +21505,7 @@ with tab_motion:
                 ready = len(markers) == 4
                 if not ready:
                     st.info(
-                        f"Place {4 - len(markers)} more marker"
+                        f"Select {4 - len(markers)} more corner"
                         f"{'' if 4 - len(markers) == 1 else 's'} to track.",
                         icon="🖱️")
                 signature = repr((
@@ -21370,7 +21517,7 @@ with tab_motion:
                     bool(st.session_state.get("mt_subpix", True)),
                     bool(st.session_state.get("mt_anchor", True)),
                 ))
-                if st.button("▶️ Track the four markers", key="mt_go",
+                if st.button("▶️ Track the four corners", key="mt_go",
                              disabled=not ready, type="primary", **STRETCH):
                     seeds = np.array(markers, dtype=np.float32)
                     if st.session_state.get("mt_subpix", True):
@@ -21433,13 +21580,13 @@ with tab_motion:
                         result,
                         follow_under_probe=bool(
                             st.session_state.get("mt_follow", True)))
-                    st.markdown("**5 · What the markers did**")
+                    st.markdown("**5 · What the corners did**")
                     if st.session_state.get("mt_signature") != signature:
                         st.warning(
                             "Something has changed since this was tracked — "
-                            "the markers, the range or a setting. What is "
+                            "the corners, the range or a setting. What is "
                             "below is the previous reading; press **▶️ Track "
-                            "the four markers** to redo it.", icon="⚠️")
+                            "the four corners** to redo it.", icon="⚠️")
                     microns = float(st.session_state.get("mt_um_per_px", 0.0))
                     motion_results_panel(result, held,
                                          microns if microns > 0 else None)
