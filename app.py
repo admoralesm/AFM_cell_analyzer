@@ -510,6 +510,29 @@ except Exception as exc:  # pragma: no cover
     va = None
     VIDEO_IMPORT_ERROR = str(exc)
 
+# The four-marker video tracker. Optional in the same way as the rest: a
+# deploy without cell_tracking.py, or without OpenCV, loses the Cell motion
+# tab and nothing else.
+try:
+    import cell_tracking as ct
+
+    TRACKING_ERROR = "" if ct.cv2 is not None else ct.CV2_ERROR
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    ct = None
+    TRACKING_ERROR = str(exc)
+
+# Clicking the markers straight onto the frame needs one small component.
+# Without it the tab still works, from typed coordinates and a preview with
+# a ruler on it, which is slower but takes no extra package.
+try:
+    from streamlit_drawable_canvas import st_canvas
+
+    HAS_CANVAS = True
+except Exception:  # pragma: no cover - the package is optional
+    st_canvas = None
+    HAS_CANVAS = False
+
+
 try:
     from igor_parser import IgorParser
     from baseline_correction import BaselineCorrector
@@ -853,6 +876,27 @@ DEFAULTS = {
     # cell was, and the workbook the answers are written into.
     "pw_batch_folder": "",
     "pw_batch_pattern": "*",
+    # The same idea on the analysis tab: one folder, stepped through a
+    # curve at a time with the two arrows next to the uploader.
+    "cv_folder": "",
+    "cv_pattern": "*",
+    "cv_unit": "from the column name",
+    # The four-marker video tracker on the Cell motion tab.
+    "mt_points": [],
+    "mt_start": 0,
+    "mt_end": 0,
+    "mt_window": 41,
+    "mt_contrast": 1.0,
+    "mt_um_per_px": 0.0,
+    "mt_gentle": True,
+    "mt_follow": True,
+    "mt_subpix": True,
+    "mt_anchor": True,
+    # Where the cytoskeleton is allowed to join in the two-term reading.
+    # The low edge is a floor, not only a search range: nothing on the
+    # page can put the joining point below it.
+    "pw_cyto_lo": 20.0,
+    "pw_cyto_hi": 40.0,
     "pw_batch_found": [],
     "pw_heights": {},
     "pw_heights_book": None,
@@ -5754,14 +5798,32 @@ def piecewise_boundaries():
     :func:`repair_boundaries`; :func:`boundary_repairs` is the same call
     kept for its notes, which the board prints.
     """
-    return repair_boundaries(
-        [_pw_get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS])[0]
+    return repair_boundaries(board_boundary_values())[0]
+
+
+def board_boundary_values():
+    """
+    What the board holds, with the early regime's floor already applied.
+
+    The floor belongs to the model, so it is applied where the FIT reads
+    the boundary and not only at the box it is typed into. Clamped at the
+    widget alone, a joining point written straight into session state
+    fitted at one place and drew the board at another, which is the one
+    failure that makes a plot untrustworthy.
+    """
+    values = [_pw_get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS]
+    if piecewise_regime() == "early":
+        floor = early_join_floor(early_end_pct())
+        try:
+            values[0] = max(float(values[0]), floor)
+        except (TypeError, ValueError):
+            values[0] = floor
+    return values
 
 
 def boundary_repairs():
     """What had to be repaired to make the board's boundaries a fit."""
-    return repair_boundaries(
-        [_pw_get(key, DEFAULTS[key]) for key in PW_BOUNDARY_KEYS])[1]
+    return repair_boundaries(board_boundary_values())[1]
 
 
 # The components of the four-regime model, in the order the plates meet
@@ -5840,27 +5902,54 @@ PW_EARLY_END_PCT = 35.0
 # too. Only where inside the band it joins is looked for; the order and
 # the ranges are the model, and the model does not move.
 PW_EARLY_ORDER = ("membrane", "interior")
-# 15 to 30 %. Measured on the C2C12 curves this page was built from: past
-# 25 % four of six fit better -- 0.99586 to 0.99838 on one, 0.99587 to
-# 0.99847 on another -- because their cytoskeletal upturn comes late. The
-# cost is that a joining point at 29 % makes Ec the stiffness of the last
-# few per cent alone, so it reads higher than the 10-15 kPa a C2C12
-# cytoskeleton is reported at; the panel under the results says so when
-# it happens. Narrow it here to hold the modulus closer to the prior.
-PW_EARLY_CYTO_BAND = (15.0, 30.0)
+# 20 to 40 %. The low edge is not only where the search starts looking,
+# it is a FLOOR: the cytoskeleton is not allowed to join before it, by
+# hand or by optimiser, on a good curve or a bad one. A joining point
+# found at 8 % fits some curves better and is not a cytoskeleton coming
+# in -- it is the cube law and the 3/2 law trading places over a short
+# stretch, and a model that lets that happen measures a different thing
+# on every cell. Both edges can be moved on the board; the floor follows
+# the low one.
+PW_EARLY_CYTO_BAND = (20.0, 40.0)
 # Past this the cytoskeleton is being read off the last few per cent of
 # the squash alone, and its modulus climbs away from what is reported for
 # a C2C12. Not an error -- a thing worth saying next to the number.
-PW_EARLY_LATE_PCT = 25.0
+PW_EARLY_LATE_PCT = 30.0
 
 
 def early_band(end=None):
-    """Where the cytoskeleton may join, kept inside the window."""
+    """
+    Where the cytoskeleton may join: the search range and the floor.
+
+    The two edges come from the board when they have been set there and
+    from PW_EARLY_CYTO_BAND otherwise, and both are then kept inside the
+    window -- a band whose top is past x_end would have the optimiser
+    scoring joining points that are not in the fit.
+    """
     top = float(end if end is not None else PW_EARLY_END_PCT)
-    lo, hi = PW_EARLY_CYTO_BAND
-    lo = min(float(lo), max(top - 2.0 * PW_MIN_GAP, 1.0))
-    hi = min(float(hi), max(top - 1.5, lo + PW_MIN_GAP))
+    wide_lo, wide_hi = PW_EARLY_CYTO_BAND
+    lo = _pw_finite(st.session_state.get("pw_cyto_lo"), float(wide_lo))
+    hi = _pw_finite(st.session_state.get("pw_cyto_hi"), float(wide_hi))
+    lo = min(max(float(lo), PW_MIN_GAP), 95.0)
+    hi = max(float(hi), lo + PW_MIN_GAP)
+    # The window has the last word on both, because nothing outside it is
+    # fitted. The floor gives way only when the window is too short to
+    # hold it, which is a window worth noticing rather than a floor worth
+    # ignoring.
+    lo = min(lo, max(top - 2.0 * PW_MIN_GAP, 1.0))
+    hi = min(hi, max(top - 1.5, lo + PW_MIN_GAP))
     return lo, hi
+
+
+def early_join_floor(end=None):
+    """
+    The earliest the cytoskeleton is allowed to join, in percent.
+
+    One number, asked for by everything that can move ε₁ -- the arrival,
+    the optimiser, the typed box, the batch -- so there is no route to a
+    joining point below it.
+    """
+    return float(early_band(end)[0])
 # No emoji in front of either name. A round one sits exactly where a
 # radio button's dot goes, and reads as "this option is selected" whether
 # it is or not -- which is how a page fitting two components was read as
@@ -7337,6 +7426,535 @@ def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
                     "for every doubling after that.")
 
 
+def curve_folder_stepper():
+    """
+    A folder of curves on this machine, stepped through one at a time.
+
+    The uploader takes one file. Most of the time the curves already sit
+    in a folder together and what is wanted is to see them one after
+    another, so this lists them and the two arrows walk the list. Whatever
+    is showing is loaded exactly as an upload is -- same columns, same
+    units, same session state -- so the fit, the plot and the board all
+    follow it without anything else being touched.
+
+    The height comes from the cells sheet when one has been read on the
+    **All cells** tab, because h0 is the one number the curve cannot give
+    and stepping past it silently would put the wrong modulus on screen.
+    """
+    with st.expander("📂 Step through a folder of curves", expanded=False):
+        f1, f2, f3 = st.columns([3, 1, 1.4])
+        with f1:
+            st.text_input(
+                "Folder the curves live in", key="cv_folder",
+                placeholder="/Users/you/Desktop/C2C12 curves",
+                help="Read where the app is running. Started on your own "
+                     "machine, that is your own disk; on a hosted server it "
+                     "is the server's disk, so use the uploader above.")
+        with f2:
+            st.text_input("Only files matching", key="cv_pattern",
+                          help="A shell pattern, e.g. *.xlsx or cell_*.csv.")
+        with f3:
+            st.selectbox(
+                "Force unit in the files",
+                ["from the column name"] + list(INPUT_FORCE_UNITS.keys()),
+                key="cv_unit",
+                help="The same choice the uploader offers, for every file "
+                     "in the folder at once.")
+        found, why = curve_files_in_folder(
+            st.session_state.get("cv_folder", ""),
+            st.session_state.get("cv_pattern", "*") or "*",
+            skip=(st.session_state.get("pw_heights_name", ""),))
+        if not st.session_state.get("cv_folder", "").strip():
+            st.caption(
+                "Type a folder and every curve in it can be stepped "
+                "through with ◀ and ▶, one fit per curve.")
+            return
+        if why:
+            st.warning(why)
+            return
+        names = [os.path.basename(p) for p in found]
+        # Which one is showing is remembered by NAME, not by position: a
+        # file added to the folder shifts every index, and an arrow that
+        # moves to a different curve than the one on screen is worse than
+        # no arrow at all.
+        here = st.session_state.get("cv_at")
+        index = names.index(here) if here in names else 0
+        heights = st.session_state.get("pw_heights") or {}
+
+        def go(where):
+            """Move to a file and load it, carrying its height if known."""
+            target = names[max(0, min(int(where), len(names) - 1))]
+            st.session_state["cv_at"] = target
+            st.session_state["cv_active"] = True
+            row = heights_lookup(heights, target) or {}
+            extra = {}
+            try:
+                tall = float(row.get("height_um"))
+                if np.isfinite(tall) and tall > 0:
+                    extra["cell_height_um"] = round(tall, 4)
+            except (TypeError, ValueError):
+                pass
+            rerun_keeping_settings(extra)
+
+        # The box is seeded before it is made, every run, so the name in
+        # it is the name of the curve on the plot.
+        st.session_state["cv_pick"] = names[index]
+        b1, b2, b3, b4 = st.columns([1, 1, 4, 1.6])
+        with b1:
+            if st.button("◀", key="cv_prev", disabled=index <= 0, **STRETCH,
+                         help="The curve before this one in the folder."):
+                go(index - 1)
+        with b2:
+            # Nothing loaded yet: the first press starts at the top of the
+            # list rather than skipping the file the box is showing.
+            started = bool(st.session_state.get("cv_active"))
+            if st.button("▶", key="cv_next", **STRETCH,
+                         disabled=started and index >= len(names) - 1,
+                         help="The next curve in the folder. It is read, "
+                              "fitted and drawn straight away."):
+                go(index + 1 if started else index)
+        with b3:
+            picked = st.selectbox(
+                "Curve on screen", names, key="cv_pick",
+                label_visibility="collapsed",
+                help="Any file in the folder, by name.")
+        with b4:
+            st.markdown(f"**{index + 1} of {len(names)}**")
+        if picked != names[index]:
+            go(names.index(picked))
+
+        # The load itself, done once per file rather than once per run:
+        # re-reading a workbook on every widget change is seconds of wait
+        # for a curve that has not changed.
+        chosen = names[index]
+        cached = st.session_state.get("cv_cache") or {}
+        if st.session_state.get("cv_active") and cached.get("source") != chosen:
+            try:
+                eps, force = read_curve_source(
+                    found[index], chosen,
+                    st.session_state.get("cv_unit", "from the column name"))
+            except Exception as exc:
+                st.error(f"Could not read **{chosen}**: {exc}")
+                st.session_state["cv_cache"] = {}
+                return
+            st.session_state["cv_cache"] = {
+                "source": chosen, "epsilon": eps, "force_N": force,
+                "n_dropped": 0}
+        cached = st.session_state.get("cv_cache") or {}
+        if st.session_state.get("cv_active") and cached.get("source") == chosen:
+            # Written AFTER the uploader's own block, so a folder curve is
+            # what the page is looking at until a new file is uploaded.
+            st.session_state["data"] = {
+                "epsilon": cached["epsilon"], "force_N": cached["force_N"],
+                "source": chosen, "n_dropped": 0}
+            row = heights_lookup(heights, chosen) or {}
+            st.caption(
+                f"**{chosen}** · {np.size(cached['epsilon']):,} points"
+                + (f" · h₀ = {float(row['height_um']):.3g} µm from the cells "
+                   "sheet" if row.get("height_um") not in (None, "")
+                   else " · h₀ is whatever is typed above"))
+        elif not st.session_state.get("cv_active"):
+            st.caption(f"{len(names)} curves found. Press ▶ to start.")
+
+
+# =========================================== the four-marker video tracker ==
+#
+# Four markers on the cell, followed through the squash, and what they say
+# about how it moved. The engine is in cell_tracking.py; everything here is
+# the page around it: choosing the video, placing the markers, setting how
+# far to read, and drawing what came back.
+
+# Where each reading is kept. Tracking is slow enough that it must survive a
+# rerun, and stale enough after a change of markers that it must be thrown
+# away on purpose rather than left to look current.
+MOTION_KEYS = ("mt_result", "mt_signature")
+
+
+def clamp_int(value, low, high):
+    """A whole number inside [low, high], whatever was stored."""
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        number = int(low)
+    return int(max(int(low), min(int(high), number)))
+
+
+def motion_forget():
+    """Drop the last tracking: what is on screen no longer describes it."""
+    for key in MOTION_KEYS:
+        st.session_state.pop(key, None)
+
+
+@st.cache_data(show_spinner=False)
+def motion_frame(path, signature, index):
+    """One frame, kept across reruns. `signature` busts it on a new file."""
+    return ct.read_frame(path, int(index))
+
+
+@st.cache_data(show_spinner=False)
+def motion_info(path, signature):
+    """fps, frame count and size, read once per file."""
+    return ct.video_info(path)
+
+
+def motion_markers():
+    """The four markers as they stand, in video pixels."""
+    stored = st.session_state.get("mt_points") or []
+    out = []
+    for item in stored:
+        try:
+            out.append((float(item[0]), float(item[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out[:4]
+
+
+def motion_rounded(points):
+    """Marker coordinates as they are stored: two decimals, at most four."""
+    out = []
+    for item in (points or ())[:4]:
+        try:
+            out.append((round(float(item[0]), 2), round(float(item[1]), 2)))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def motion_set_markers(points):
+    """
+    Replace the markers. Returns True when they actually changed.
+
+    Compared at the precision they are STORED at. Compared raw, the canvas
+    hands back coordinates that differ in the eighth decimal every rerun,
+    and every rerun would count as a change.
+
+    A reading made from other markers is NOT thrown away here. Nudging one
+    marker would then wipe the plot you were reading, which is a bad trade
+    for a mistaken click; the reading is kept, and marked as no longer
+    describing what is on screen, by the signature check on the tab.
+    """
+    wanted = motion_rounded(points)
+    if wanted == motion_markers():
+        return False
+    st.session_state["mt_points"] = wanted
+    return True
+
+
+def motion_preview(frame_bgr, markers, scale=1.0, trail=None):
+    """
+    The frame with the markers drawn on it, as RGB for st.image.
+
+    A dot on the tracked pixel and a label beside it. Not the desktop app's
+    leader lines: at preview size they take more room than the cell.
+    """
+    image = frame_bgr.copy()
+    if trail is not None and len(trail):
+        for k in range(trail.shape[1]):
+            colour = ct.POINT_COLORS[k % len(ct.POINT_COLORS)]
+            bgr = tuple(int(colour[i:i + 2], 16) for i in (5, 3, 1))
+            path = trail[:, k, :]
+            good = np.isfinite(path[:, 0]) & np.isfinite(path[:, 1])
+            drawn = np.round(path[good]).astype(np.int32)
+            if drawn.shape[0] >= 2:
+                ct.cv2.polylines(image, [drawn], False, (0, 0, 0), 3,
+                              ct.cv2.LINE_AA)
+                ct.cv2.polylines(image, [drawn], False, bgr, 1, ct.cv2.LINE_AA)
+    for index, (x, y) in enumerate(markers):
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        colour = ct.POINT_COLORS[index % len(ct.POINT_COLORS)]
+        bgr = tuple(int(colour[i:i + 2], 16) for i in (5, 3, 1))
+        px, py = int(round(float(x))), int(round(float(y)))
+        ct.cv2.circle(image, (px, py), 6, (0, 0, 0), -1, ct.cv2.LINE_AA)
+        ct.cv2.circle(image, (px, py), 4, bgr, -1, ct.cv2.LINE_AA)
+        label = ct.POINT_LABELS[index % len(ct.POINT_LABELS)]
+        ct.cv2.putText(image, label, (px + 9, py - 9),
+                    ct.cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, ct.cv2.LINE_AA)
+        ct.cv2.putText(image, label, (px + 9, py - 9),
+                    ct.cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 1, ct.cv2.LINE_AA)
+    return ct.cv2.cvtColor(image, ct.cv2.COLOR_BGR2RGB)
+
+
+def motion_adopt(uploaded, widget_key="mt_upload"):
+    """
+    Take an uploaded video as *the* video for this session.
+
+    The same one room, one more door: this writes to the same
+    ``video_path`` the compression-video tab reads, so a video uploaded in
+    either place is the video both are looking at. It does not need
+    video_analysis.py to work, which is the difference from adopt_video --
+    this tab has to keep running when that companion is missing.
+    """
+    seen = st.session_state.setdefault("_video_seen", {})
+    signature = None if uploaded is None else (uploaded.name, uploaded.size)
+    if signature == seen.get(widget_key):
+        return False
+    seen[widget_key] = signature
+    if uploaded is None:
+        return False
+    destination = os.path.join(tempfile.gettempdir(),
+                               f"afm_video_{uploaded.name}")
+    with open(destination, "wb") as handle:
+        handle.write(uploaded.getvalue())
+    st.session_state["video_path"] = destination
+    st.session_state["video_name"] = uploaded.name
+    st.session_state["video_track"] = None
+    st.session_state["video_saved_frame"] = None
+    st.session_state["video_saved_frame_index"] = None
+    st.session_state["mt_points"] = []
+    # A frame number, a typed coordinate or a canvas drawing from the last
+    # video is not a fact about this one, and a stored value outside a new
+    # widget's range is an exception before the page draws.
+    for stale in ("mt_start", "mt_end"):
+        st.session_state.pop(stale, None)
+    for index in range(4):
+        st.session_state.pop(f"mt_x{index}", None)
+        st.session_state.pop(f"mt_y{index}", None)
+    motion_forget()
+    if va is not None and not VIDEO_IMPORT_ERROR:
+        try:
+            st.session_state["video_info"] = va.probe(destination)
+        except Exception:
+            st.session_state["video_info"] = None
+    return True
+
+
+def motion_pick_panel(frame_bgr, canvas_key="mt_canvas",
+                      width_px=720):
+    """
+    Place the four markers on the frame.
+
+    With the canvas component installed this is four clicks on the picture.
+    Without it, the same four pairs of numbers are typed, and the preview
+    beside them shows where they landed, which is slower but needs nothing
+    installed. Either way the picks are snapped onto the nearest corner to
+    sub-pixel accuracy before anything is tracked.
+    """
+    height, width = frame_bgr.shape[:2]
+    markers = motion_markers()
+    if HAS_CANVAS:
+        shown = int(min(width_px, width))
+        scale = shown / float(width)
+        from PIL import Image
+
+        background = Image.fromarray(
+            ct.cv2.cvtColor(frame_bgr, ct.cv2.COLOR_BGR2RGB)).resize(
+                (shown, int(round(height * scale))), Image.BILINEAR)
+        st.caption(
+            "Click the four markers on the cell, in order round it. Click "
+            "again to add another; the ↶ and 🗑 icons under the canvas "
+            "undo one and clear them all. Pick "
+            "features with texture — a speckle, an edge, a corner of the "
+            "cell — not flat grey.")
+        drawing = st_canvas(
+            background_image=background,
+            drawing_mode="point", point_display_radius=4,
+            stroke_width=2, stroke_color="#00e5ff",
+            fill_color="rgba(0, 229, 255, 0.6)",
+            height=int(round(height * scale)), width=shown,
+            update_streamlit=True, key=canvas_key,
+        )
+        clicked = []
+        if drawing is not None and drawing.json_data:
+            for shape in (drawing.json_data.get("objects") or []):
+                try:
+                    clicked.append((float(shape["left"]) / scale,
+                                    float(shape["top"]) / scale))
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    continue
+        # The canvas keeps its own list of what has been drawn on it, so it
+        # is the truth about the picks and session state follows it -- not
+        # the other way round, which is how a cleared canvas came back with
+        # the old markers on the next rerun.
+        if motion_set_markers(clicked):
+            markers = motion_markers()
+        if len(clicked) > 4:
+            st.caption(
+                f"⚠️ {len(clicked)} points are on the canvas; the first four "
+                "are the ones tracked. **↩ Undo the last** removes one.")
+    else:
+        st.info(
+            "Install **streamlit-drawable-canvas** to click the markers "
+            "straight onto the frame (add it to requirements.txt and "
+            "reboot). Until then, read the coordinates off the preview and "
+            "type them here.", icon="ℹ️")
+        typed = []
+        rows = st.columns(4)
+        for index, column in enumerate(rows):
+            with column:
+                st.markdown(f"**{ct.POINT_LABELS[index]}**")
+                here = markers[index] if index < len(markers) else (
+                    width * (0.3 if index in (0, 3) else 0.7),
+                    height * (0.3 if index in (0, 1) else 0.7))
+                x = st.number_input(
+                    "x", 0.0, float(width - 1), value=float(here[0]),
+                    step=1.0, key=f"mt_x{index}", label_visibility="visible")
+                y = st.number_input(
+                    "y", 0.0, float(height - 1), value=float(here[1]),
+                    step=1.0, key=f"mt_y{index}", label_visibility="visible")
+                typed.append((x, y))
+        if motion_set_markers(typed):
+            markers = motion_markers()
+        st.image(motion_preview(frame_bgr, markers),
+                 caption="Where those coordinates land. x runs right, y runs "
+                         "down, from the top-left corner.")
+    return markers
+
+
+def motion_speed_figure(times, values, labels, colours, y_title, title=None):
+    """One trace per marker, over time. The plot every reading here makes."""
+    figure = go.Figure()
+    for series, label, colour in zip(values, labels, colours):
+        figure.add_trace(go.Scatter(
+            x=times, y=series, mode="lines", name=label,
+            line=dict(color=colour, width=2)))
+    figure.update_layout(
+        height=380, margin=dict(l=70, r=20, t=40 if title else 16, b=55),
+        title=title, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+        plot_bgcolor="white", paper_bgcolor="white")
+    figure.update_xaxes(title_text="Time from the first tracked frame (s)",
+                        showline=True, linewidth=1, linecolor="#333",
+                        mirror=True, ticks="outside", gridcolor="#eee")
+    figure.update_yaxes(title_text=y_title, showline=True, linewidth=1,
+                        linecolor="#333", mirror=True, ticks="outside",
+                        gridcolor="#eee")
+    return figure
+
+
+def motion_frame_table(result, held, microns):
+    """
+    Every tracked frame, as the table the CSV is written from.
+
+    One row per frame: the time, each marker's position and speed, the
+    centroid's, and how many markers were genuinely tracked on that frame.
+    That last column is the one to look at before quoting anything: a run of
+    small numbers is a run where the reading is the group's motion filling
+    in for markers that were lost.
+    """
+    frames = result["frames"]
+    fps = float(result["fps"])
+    start = int(result["start_frame"])
+    scale = float(microns) if microns else 1.0
+    unit = "um" if microns else "px"
+    marker_speed = ct.speeds(held, fps, gentle=bool(result.get("gentle")))
+    middle = ct.centroid(held)
+    centre_speed = ct.speeds(middle.reshape(-1, 1, 2), fps,
+                             gentle=bool(result.get("gentle")))[:, 0]
+    table = {
+        "time_s": np.round((frames - start) / fps, 6),
+        "frame": frames.astype(int),
+    }
+    for index in range(held.shape[1]):
+        name = ct.POINT_LABELS[index % len(ct.POINT_LABELS)]
+        table[f"{name}_x_{unit}"] = np.round(held[:, index, 0] * scale, 4)
+        table[f"{name}_y_{unit}"] = np.round(held[:, index, 1] * scale, 4)
+        table[f"{name}_speed_{unit}_per_s"] = np.round(
+            marker_speed[:, index] * scale, 4)
+    table[f"centroid_x_{unit}"] = np.round(middle[:, 0] * scale, 4)
+    table[f"centroid_y_{unit}"] = np.round(middle[:, 1] * scale, 4)
+    table[f"centroid_speed_{unit}_per_s"] = np.round(centre_speed * scale, 4)
+    table[f"centroid_displacement_{unit}"] = np.round(
+        ct.displacement(middle) * scale, 4)
+    area = ct.quad_area(held)
+    table[f"marker_quad_area_{unit}2"] = np.round(area * scale * scale, 4)
+    table["markers_tracked"] = result["status"].sum(axis=1).astype(int)
+    return pd.DataFrame(table)
+
+
+def motion_results_panel(result, held, microns):
+    """The readings: what moved, how fast, and how much of it was measured."""
+    fps = float(result["fps"])
+    frames = result["frames"]
+    start = int(result["start_frame"])
+    times = (frames - start) / fps
+    scale = float(microns) if microns else 1.0
+    unit = "µm" if microns else "px"
+    gentle = bool(result.get("gentle"))
+
+    marker_speed = ct.speeds(held, fps, gentle=gentle)
+    middle = ct.centroid(held)
+    centre_speed = ct.speeds(middle.reshape(-1, 1, 2), fps, gentle=gentle)[:, 0]
+    tracked = result["status"].sum(axis=1)
+
+    lost = int(np.sum(result["status"] == 0))
+    total = int(result["status"].size)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Frames read", f"{len(frames):,}")
+    m2.metric("Over", f"{times[-1]:.2f} s")
+    m3.metric(f"Peak centroid speed ({unit}/s)",
+              f"{np.nanmax(centre_speed) * scale:.3g}")
+    m4.metric("Markers measured",
+              f"{100.0 * (total - lost) / max(total, 1):.0f} %")
+    if lost:
+        st.caption(
+            f"ℹ️ {lost:,} of {total:,} marker-frames were not measured "
+            f"directly. Those are filled from the motion of the markers that "
+            f"were, so the cell keeps moving rather than freezing. The "
+            f"**markers_tracked** column in the table says which frames "
+            f"those are.")
+
+    labels = [ct.POINT_LABELS[i % len(ct.POINT_LABELS)]
+              for i in range(held.shape[1])]
+    colours = [ct.POINT_COLORS[i % len(ct.POINT_COLORS)]
+               for i in range(held.shape[1])]
+
+    view = st.radio(
+        "What to draw", ("Speed", "Displacement", "Marker quadrilateral area"),
+        horizontal=True, key="mt_view", label_visibility="collapsed")
+
+    if view == "Speed":
+        series = [marker_speed[:, i] * scale for i in range(held.shape[1])]
+        series.append(centre_speed * scale)
+        st.plotly_chart(
+            motion_speed_figure(times, series, labels + ["cell centroid"],
+                                colours + ["#333333"], f"Speed ({unit}/s)"),
+            **STRETCH)
+        st.caption(
+            "Position is smoothed, differentiated by Savitzky-Golay and the "
+            "speed smoothed again, because the difference of two noisy "
+            "positions is mostly noise. The centroid is the mean of the "
+            "markers: it is the cell moving, while a single marker also "
+            "carries the cell changing shape.")
+    elif view == "Displacement":
+        series = [ct.displacement(held[:, i, :]) * scale
+                  for i in range(held.shape[1])]
+        series.append(ct.displacement(middle) * scale)
+        st.plotly_chart(
+            motion_speed_figure(times, series, labels + ["cell centroid"],
+                                colours + ["#333333"],
+                                f"Distance from where it started ({unit})"),
+            **STRETCH)
+    else:
+        area = ct.quad_area(held) * scale * scale
+        st.plotly_chart(
+            motion_speed_figure(times, [area], ["marker quadrilateral"],
+                                ["#00796B"], f"Area ({unit}²)"),
+            **STRETCH)
+        st.caption(
+            "The quadrilateral the four markers make, in the order they "
+            "were picked. It is the cell's area only if they were picked "
+            "round the cell rather than across it, and it is a shape "
+            "reading either way: it falls as the markers come together.")
+
+    st.plotly_chart(
+        motion_speed_figure(
+            times, [tracked.astype(float)], ["markers measured"], ["#9e9e9e"],
+            "Markers measured on this frame"),
+        **STRETCH)
+
+    table = motion_frame_table(result, held, microns)
+    with st.expander(f"📋 Every tracked frame ({len(table):,} rows)"):
+        st.dataframe(table, hide_index=True, **STRETCH)
+    st.download_button(
+        "💾 Download the tracking as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name=(os.path.splitext(
+            st.session_state.get("video_name", "video"))[0]
+            + "_marker_tracking.csv"),
+        mime="text/csv", key="mt_csv", **STRETCH)
+
+
 def screen_signature(epsilon, force_N):
     """
     What a screen depends on: change any of it and the screen is stale.
@@ -8647,8 +9265,15 @@ def _pw_early_to_changed(name):
     st.session_state["_pw_apply"] = True
 
 
-def _pw_number(value, default=None):
-    """A finite float, or the default. Nothing else reaches the fit."""
+def _pw_finite(value, default=None):
+    """
+    A finite float, or the default. Nothing else reaches the fit.
+
+    Not _pw_number: that one is the bounds editor's text parser and has to
+    keep returning inf for an upper bound typed as "inf". Two jobs, two
+    names -- when they shared one, the later definition won and typing
+    "inf" into a bound came back as "not a number".
+    """
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -8656,11 +9281,11 @@ def _pw_number(value, default=None):
     return number if np.isfinite(number) else default
 
 
-def _pw_numbers(mapping):
+def _pw_finites(mapping):
     """{name: finite float} out of whatever is in a stored mapping."""
     out = {}
     for key, value in (mapping or {}).items():
-        number = _pw_number(value)
+        number = _pw_finite(value)
         if number is not None:
             out[str(key)] = number
     return out
@@ -8675,10 +9300,10 @@ def remember_early_by_hand():
     or a far end chosen here has to be remembered on its own, or every
     file comes back to the same numbers.
     """
-    eps1 = _pw_number(st.session_state.get("pw_b1"))
+    eps1 = _pw_finite(st.session_state.get("pw_b1"))
     if eps1 is not None:
         st.session_state["_pw_early_eps1"] = round(eps1, 2)
-    st.session_state["_pw_early_until"] = _pw_numbers(
+    st.session_state["_pw_early_until"] = _pw_finites(
         st.session_state.get("pw_until"))
     st.session_state["_pw_early_throughout"] = bool(
         st.session_state.get("pw_membrane_throughout", True))
@@ -8689,6 +9314,23 @@ def forget_early_by_hand():
     st.session_state["_pw_early_eps1"] = None
     st.session_state["_pw_early_until"] = {}
     st.session_state["_pw_early_throughout"] = True
+
+
+def _pw_early_band_changed():
+    """
+    Callback: the band the cytoskeleton may join in was moved.
+
+    The floor moved with it, so a joining point now below the floor is
+    lifted to it before anything is fitted, and the fit is redone. A
+    profile measured over the old band no longer describes the new one.
+    """
+    lo, hi = early_band(early_end_pct())
+    here = _pw_finite(st.session_state.get("pw_b1"))
+    if here is not None and here < lo:
+        st.session_state["pw_b1"] = round(lo, 2)
+        st.session_state["_pw_early_eps1"] = round(lo, 2)
+    st.session_state["pw_early_profile"] = None
+    st.session_state["_pw_apply"] = True
 
 
 def _pw_early_from_changed():
@@ -8736,16 +9378,25 @@ def early_boundary_control():
                 st.markdown("**0.00**")
                 st.caption("at contact")
             else:
+                room_hi = round(max(top - 3.5, 1.0), 2)
+                floor = round(min(lo, room_hi), 2)
+                # Seeded before the box is made, so a value carried in
+                # from another curve or another band cannot sit below the
+                # floor the moment the box appears.
+                st.session_state["pw_b1"] = round(
+                    min(max(_pw_finite(st.session_state.get("pw_b1"), floor),
+                            floor), room_hi), 2)
                 st.number_input(
-                    f"{names[term][0]} from", PW_MIN_GAP,
-                    round(max(top - 3.5, 1.0), 2), step=0.5, format="%.2f",
+                    f"{names[term][0]} from", floor, room_hi,
+                    step=0.5, format="%.2f",
                     key="pw_b1", on_change=_pw_early_from_changed,
                     label_visibility="collapsed",
-                    help="Where this component starts carrying load. Type "
-                         "any value inside the window; the fit is made "
-                         f"exactly there. The optimiser looks between "
-                         f"{lo:g} and {hi:g} %, where a C2C12's "
-                         "cytoskeleton is expected to come in.")
+                    help=f"Where this component starts carrying load. "
+                         f"{floor:g} % is the earliest it is allowed to "
+                         f"join; the optimiser looks between {lo:g} and "
+                         f"{hi:g} %, where a C2C12's cytoskeleton is "
+                         "expected to come in. Move either edge just "
+                         "below.")
         with c3:
             st.number_input(
                 f"{names[term][0]} to", PW_MIN_GAP, round(top, 2), step=0.5,
@@ -8759,6 +9410,34 @@ def early_boundary_control():
         f"Both are read over 0 → {top:g} % (**The range of this analysis**, "
         "above). What is typed here is what is fitted and what the plot "
         "draws.")
+    # The band, as two numbers. It is the optimiser's search range AND the
+    # floor under the box above, so it sits next to both rather than in a
+    # settings panel somewhere else.
+    w1, w2, w3 = st.columns([1, 1, 2.4])
+    with w1:
+        st.number_input("Cytoskeleton joins no earlier than (%)",
+                        PW_MIN_GAP, 95.0, step=0.5, format="%.1f",
+                        key="pw_cyto_lo", on_change=_pw_early_band_changed,
+                        help="A hard floor. Nothing on this page may put "
+                             "the joining point below it -- not the "
+                             "optimiser, not a value typed by hand, not a "
+                             "curve that fits better with one earlier.")
+    with w2:
+        st.number_input("and no later than (%)", 1.0, 99.0, step=0.5,
+                        format="%.1f", key="pw_cyto_hi",
+                        on_change=_pw_early_band_changed,
+                        help="The far end of the optimiser's search. Past "
+                             "the end of the window it has no effect, "
+                             "because nothing out there is fitted.")
+    with w3:
+        st.markdown("<div style='height:1.7rem'></div>",
+                    unsafe_allow_html=True)
+        st.caption(
+            f"Searched and held inside **{lo:g} – {hi:g} %** on this "
+            f"curve"
+            + (f" (the window ends at {top:g} %)."
+               if hi < float(st.session_state.get("pw_cyto_hi", hi)) - 1e-9
+               else "."))
     o1, o2 = st.columns(2)
     with o1:
         if st.button(f"🎯 Optimise — where the cytoskeleton appears "
@@ -10065,10 +10744,15 @@ def early_park(end, parallel=None, first=None):
     # person's, and is kept: only the window itself bounds it, or the
     # boundary they typed would spring back to the band every run.
     room_hi = max(end - 3.5, 1.0)
+    # The floor is the low edge of the band, and it holds here whoever is
+    # asking: a number typed by hand, one the optimiser found, one carried
+    # from the last curve. Only the window itself can push it lower, and
+    # only when the window is too short to hold it.
+    floor = min(lo, room_hi)
     e1 = (round(max(end - 3.0, 1.0), 2) if parallel
           else round(min(max(float(first if first is not None
                                    else 0.5 * (lo + hi)),
-                             PW_MIN_GAP), room_hi), 2))
+                             floor), room_hi), 2))
     return [e1, round(max(end - 2.0, e1 + PW_MIN_GAP), 2),
             round(max(end - 1.0, e1 + 2 * PW_MIN_GAP), 2), round(end, 2)]
 
@@ -11004,8 +11688,8 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # joining point, how far each component acts. Only what has never
         # been set is read off the curve, so "I set it to 18 %" survives
         # the next file instead of springing back to the default.
-        by_hand = _pw_number(st.session_state.get("_pw_early_eps1"))
-        st.session_state["pw_until"] = _pw_numbers(
+        by_hand = _pw_finite(st.session_state.get("_pw_early_eps1"))
+        st.session_state["pw_until"] = _pw_finites(
             st.session_state.get("_pw_early_until"))
         st.session_state["pw_membrane_throughout"] = bool(
             st.session_state.get("_pw_early_throughout", True))
@@ -12115,7 +12799,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
                             np.asarray(force_N, dtype=float))
     off = ("k_align",) + tuple(n for n, *_r in PW_COMPONENTS
                                if n not in PW_EARLY_COMPONENTS)
-    untils = _pw_numbers(piecewise_until())
+    untils = _pw_finites(piecewise_until())
     regimes = early_regimes_for("staggered", order)
     geometry = piecewise_geometry(model)
     extras = fit_extras()
@@ -12135,7 +12819,7 @@ def early_best_eps1(model, epsilon, force_N, order, end=None,
         here = dict(untils)
         if cap_first and order:
             here[order[0]] = float(bounds[1])
-        here = _pw_numbers(here)
+        here = _pw_finites(here)
         result = fit_piecewise(
             thin_eps, thin_force, boundaries_pct=bounds, regimes=regimes,
             settings=effective_piecewise_settings(piecewise_settings(),
@@ -17416,10 +18100,10 @@ SHOW_DATABASE_TAB = False
 
 # The two tabs that can be hidden go last. They are hidden by CSS on the
 # n-th tab button, and a tab bar inside a page (the fit's own tabs) has
-# fewer than seven buttons, so its buttons are never the ones hidden.
+# fewer than eight buttons, so its buttons are never the ones hidden.
 (
     tab_analysis, tab_cells, tab_explore, tab_igor, tab_results,
-    tab_export, tab_video, tab_db,
+    tab_export, tab_motion, tab_video, tab_db,
 ) = st.tabs(
     [
         "📊 Force curve analysis",
@@ -17428,13 +18112,14 @@ SHOW_DATABASE_TAB = False
         "🔧 Create curve (Igor)",
         "📈 Results",
         "💾 Export",
+        "🎬 Cell motion",
         "🎥 Compression video",
         "📋 Database",
     ]
 )
 
 _hidden = [
-    index for index, wanted in ((7, SHOW_VIDEO_TAB), (8, SHOW_DATABASE_TAB))
+    index for index, wanted in ((8, SHOW_VIDEO_TAB), (9, SHOW_DATABASE_TAB))
     if not wanted
 ]
 if _hidden:
@@ -17616,8 +18301,16 @@ with tab_analysis:
                 "source": uploaded.name,
                 "n_dropped": int((~finite).sum()),
             }
+            # A NEW upload takes the page back from the folder stepper. The
+            # same file sitting in the uploader across reruns does not, or
+            # stepping a folder would bounce back to it every run.
+            if st.session_state.get("cv_upload_name") != uploaded.name:
+                st.session_state["cv_upload_name"] = uploaded.name
+                st.session_state["cv_active"] = False
         elif df is not None:
             st.error("The file needs at least two columns (deformation and force).")
+
+    curve_folder_stepper()
 
     data = st.session_state.get("data")
 
@@ -20479,6 +21172,278 @@ with tab_explore:
 
 
 # ==================================================== TAB 3: video analysis ==
+
+with tab_motion:
+    section("Cell motion — four markers through the squash")
+
+    if ct is None or TRACKING_ERROR:
+        st.error(
+            "This tab needs **cell_tracking.py** beside app.py and "
+            "**opencv-python-headless** installed"
+            + (f" ({TRACKING_ERROR})." if TRACKING_ERROR else "."),
+            icon="🚫")
+    else:
+        st.markdown(
+            "Pick four markers on the cell and follow them through the "
+            "compression. Each marker is tracked as a patch of a dozen "
+            "features rather than one pixel, checked against its own first "
+            "frame so it cannot drift, and held to the motion of the other "
+            "three when it goes under the probe. What comes out is how fast "
+            "each part of the cell moved, and how far.")
+
+        # ---- 1 · the video -------------------------------------------
+        st.markdown("**1 · The video**")
+        up1, up2 = st.columns([2, 1])
+        with up1:
+            motion_upload = st.file_uploader(
+                "Compression video", type=["mp4", "avi", "mov", "mkv", "m4v"],
+                key="mt_upload",
+                help="The same video the compression-video tab uses: upload "
+                     "it in either place and both have it.")
+        if motion_adopt(motion_upload):
+            rerun_keeping_settings()
+        motion_path = st.session_state.get("video_path")
+        motion_ok = bool(motion_path and os.path.exists(motion_path))
+        details = None
+        if motion_ok:
+            try:
+                details = motion_info(motion_path, video_signature())
+            except Exception as exc:
+                st.error(f"Could not read that video: {exc}")
+                motion_ok = False
+        with up2:
+            if details:
+                st.metric("Frames", f"{details['frame_count']:,}")
+                st.caption(
+                    f"{details['width']}×{details['height']} · "
+                    f"{details['fps']:.2f} fps · "
+                    f"{ct.format_time(details['duration'])}")
+
+        if not motion_ok or not details:
+            st.info("Upload a video to begin.", icon="🎬")
+        else:
+            last = int(details["frame_count"]) - 1
+            fps = float(details["fps"])
+
+            # ---- 2 · the frame the markers are placed on -------------
+            st.markdown("**2 · The frame to start from**")
+            st.caption(
+                "Tracking runs forward from this frame, so place the markers "
+                "on a frame where all four are clearly visible — usually just "
+                "before the probe touches.")
+            st.session_state["mt_start"] = int(clamp_int(
+                st.session_state.get("mt_start", 0), 0, last))
+            start_frame = st.slider(
+                "Start frame", 0, max(last, 0), key="mt_start",
+                help="The markers are placed here and followed from here.")
+            frame_bgr = motion_frame(motion_path, video_signature(),
+                                     start_frame)
+            if frame_bgr is None:
+                st.error(f"Could not read frame {start_frame}.")
+            else:
+                st.caption(
+                    f"Frame {start_frame} of {last} · "
+                    f"t = {ct.format_time(start_frame / fps)}")
+
+                # ---- 3 · the four markers ------------------------------
+                st.markdown("**3 · The four markers**")
+                # A canvas keyed to the video: a new file gets a new,
+                # empty one instead of the last video's dots.
+                markers = motion_pick_panel(
+                    frame_bgr,
+                    canvas_key="mt_canvas_" + str(
+                        abs(hash((motion_path, video_signature()))) % 10 ** 9))
+                # The canvas draws its own undo / redo / bin under itself,
+                # and those are the buttons that can actually remove a dot
+                # from it. A second pair here would only change this page's
+                # list, and the canvas would put the dot back on the next
+                # run.
+                if HAS_CANVAS:
+                    st.markdown(
+                        f"<div style='text-align:right'><b>"
+                        f"{len(markers)} of 4</b> placed</div>",
+                        unsafe_allow_html=True)
+                else:
+                    c1, c2 = st.columns([1, 3])
+                    with c1:
+                        if st.button("🗑️ Clear", key="mt_clear",
+                                     disabled=not markers, **STRETCH):
+                            motion_set_markers([])
+                            for _i in range(4):
+                                st.session_state.pop(f"mt_x{_i}", None)
+                                st.session_state.pop(f"mt_y{_i}", None)
+                            rerun_keeping_settings()
+                    with c2:
+                        st.markdown(
+                            f"<div style='padding-top:0.5rem'>"
+                            f"<b>{len(markers)} of 4</b> placed</div>",
+                            unsafe_allow_html=True)
+                if HAS_CANVAS and markers:
+                    st.image(motion_preview(frame_bgr, markers),
+                             caption="Where they landed, at full size.",
+                             **STRETCH)
+
+                # ---- 4 · how far to read -------------------------------
+                st.markdown("**4 · How far to read**")
+                stored_end = st.session_state.get("mt_end", 0)
+                st.session_state["mt_end"] = int(clamp_int(
+                    last if not stored_end else stored_end,
+                    int(start_frame), last))
+                end_frame = st.slider(
+                    "Read to frame", int(start_frame),
+                    max(last, int(start_frame)), key="mt_end",
+                    help="Nothing past this frame is tracked. Stop before the "
+                         "cell leaves the field or the probe covers it.")
+                span = int(end_frame) - int(start_frame) + 1
+                st.caption(
+                    f"{span:,} frames · {span / fps:.2f} s of video. "
+                    + ("Long runs take a while: tracking reads every frame."
+                       if span > 1500 else
+                       "About a second of work per few hundred frames."))
+
+                # ---- 5 · how it is tracked -----------------------------
+                with st.expander("⚙️ How it is tracked, and in what units"):
+                    o1, o2 = st.columns(2)
+                    with o1:
+                        st.number_input(
+                            "µm per pixel (0 = report in pixels)",
+                            0.0, 100.0, step=0.001, format="%.4f",
+                            key="mt_um_per_px",
+                            help="Everything is reported in pixels unless "
+                                 "this is set. A sphere of known diameter is "
+                                 "the usual way to get it: diameter in µm "
+                                 "divided by its diameter in pixels.")
+                        st.number_input(
+                            "Tracking window (px)", 7, 101, step=2,
+                            key="mt_window",
+                            help="How far around each marker the tracker "
+                                 "looks. Wide enough to cover how far a "
+                                 "marker moves between frames, narrow enough "
+                                 "not to swallow its neighbours. 41 suits "
+                                 "10x video of a beating cell.")
+                        st.slider(
+                            "Contrast", 0.5, 3.0, step=0.1, key="mt_contrast",
+                            help="Applied to the frames the tracker sees, not "
+                                 "to the video. Raise it on a flat, dim "
+                                 "field; it changes what is trackable, not "
+                                 "what is measured.")
+                    with o2:
+                        st.checkbox(
+                            "Gentle tracking", key="mt_gentle",
+                            help="Softer corrections and wider smoothing: a "
+                                 "calmer trace, a little slower to follow a "
+                                 "sharp move.")
+                        st.checkbox(
+                            "Keep tracking under the probe", key="mt_follow",
+                            help="A marker that goes out of sight is moved by "
+                                 "the motion of the three still tracked, so "
+                                 "its displacement goes on counting as cell "
+                                 "motion. Off, it freezes where it was last "
+                                 "seen, which reads as the cell stopping.")
+                        st.checkbox(
+                            "Snap the picks onto corners", key="mt_subpix",
+                            help="Moves each pick to the nearest corner to "
+                                 "sub-pixel accuracy before tracking. A click "
+                                 "is worth about two pixels; everything here "
+                                 "is measured in tenths of one.")
+                        st.checkbox(
+                            "Anchor against the first frame", key="mt_anchor",
+                            help="Each frame, check the tracker against a "
+                                 "template of the marker as it was on the "
+                                 "first frame. This is what stops slow drift "
+                                 "over a few hundred frames, and what "
+                                 "recovers a marker that is lost outright.")
+
+                # ---- 6 · track ----------------------------------------
+                ready = len(markers) == 4
+                if not ready:
+                    st.info(
+                        f"Place {4 - len(markers)} more marker"
+                        f"{'' if 4 - len(markers) == 1 else 's'} to track.",
+                        icon="🖱️")
+                signature = repr((
+                    motion_path, video_signature(), start_frame, end_frame,
+                    [tuple(np.round(p, 2)) for p in markers],
+                    int(st.session_state.get("mt_window", 41)),
+                    float(st.session_state.get("mt_contrast", 1.0)),
+                    bool(st.session_state.get("mt_gentle", True)),
+                    bool(st.session_state.get("mt_subpix", True)),
+                    bool(st.session_state.get("mt_anchor", True)),
+                ))
+                if st.button("▶️ Track the four markers", key="mt_go",
+                             disabled=not ready, type="primary", **STRETCH):
+                    seeds = np.array(markers, dtype=np.float32)
+                    if st.session_state.get("mt_subpix", True):
+                        try:
+                            seeds = ct.refine_corners_subpix(
+                                ct.gray_for_lk(
+                                    frame_bgr,
+                                    float(st.session_state.get(
+                                        "mt_contrast", 1.0))),
+                                seeds)
+                        except Exception:
+                            pass
+                    bar = st.progress(0.0, text="Tracking…")
+                    seen = {"at": 0.0}
+
+                    def _tick(done, total):
+                        fraction = float(done) / float(max(total, 1))
+                        if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
+                            seen["at"] = fraction
+                            bar.progress(
+                                min(1.0, fraction),
+                                text=f"Tracking… {int(fraction * 100)} % "
+                                     f"({done:,} of {total:,} frames)")
+                        return False
+
+                    try:
+                        found = ct.track_points(
+                            motion_path, seeds,
+                            start_frame=int(start_frame),
+                            end_frame=int(end_frame),
+                            window_size=int(
+                                st.session_state.get("mt_window", 41)),
+                            contrast=float(
+                                st.session_state.get("mt_contrast", 1.0)),
+                            gentle=bool(
+                                st.session_state.get("mt_gentle", True)),
+                            anchor=bool(
+                                st.session_state.get("mt_anchor", True)),
+                            progress=_tick)
+                    except Exception as exc:
+                        bar.empty()
+                        st.error(f"Tracking failed: {exc}", icon="🚫")
+                    else:
+                        bar.empty()
+                        st.session_state["mt_result"] = found
+                        st.session_state["mt_signature"] = signature
+                        st.success(
+                            f"Tracked {found['points'].shape[0]:,} frames "
+                            f"from frame {int(found['start_frame'])}.",
+                            icon="✅")
+
+                # ---- 7 · the readings ---------------------------------
+                result = st.session_state.get("mt_result")
+                if result is not None:
+                    # Settled here rather than at tracking time: whether a
+                    # lost marker follows the group is a reading of the same
+                    # track, so the switch takes effect at once instead of
+                    # asking for the whole video again.
+                    held, _fixed = ct.settle(
+                        result,
+                        follow_under_probe=bool(
+                            st.session_state.get("mt_follow", True)))
+                    st.markdown("**5 · What the markers did**")
+                    if st.session_state.get("mt_signature") != signature:
+                        st.warning(
+                            "Something has changed since this was tracked — "
+                            "the markers, the range or a setting. What is "
+                            "below is the previous reading; press **▶️ Track "
+                            "the four markers** to redo it.", icon="⚠️")
+                    microns = float(st.session_state.get("mt_um_per_px", 0.0))
+                    motion_results_panel(result, held,
+                                         microns if microns > 0 else None)
+
 
 with tab_video:
     section("Compression video")
