@@ -10,4 +10,6 @@ google-auth-httplib2
 google-api-python-client
 gspread
 scikit-learn
- 
+# Clicking the tracking markers onto the video frame (Cell motion tab).
+# The tab still works without it, from typed coordinates.
+streamlit-drawable-canvas>=0.9
