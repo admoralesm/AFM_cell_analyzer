@@ -261,7 +261,9 @@ def test_the_default_model_is_the_additive_one():
 def test_the_stacked_layers_add_up_to_the_fit():
     """Each element's own force, held past its until, sums to the curve."""
     eps, f = curve(noise=0.3e-9, n=1500)
-    names = ("k_align", "K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto",
+    # C0 is the baseline the curve starts from: its own layer, belonging
+    # to no component, and the layers only add up to the fit with it in.
+    names = ("C0", "k_align", "K_shell", "K_cyto", "K_nucleus", "K_nuc_cyto",
              "A_lamina", "K_core")
     for until in ({}, {"K_cyto": 30.0, "K_nucleus": 80.0, "K_core": 85.0}):
         r = fit_piecewise(eps, f, settings={n: {"until": u} for n, u in until.items()})
@@ -274,7 +276,7 @@ def test_the_stacked_layers_add_up_to_the_fit():
         # A layer is zero before its element starts and constant after it
         # stops, so its thickness changes only over [s, u].
         for n, layer in zip(names, layers):
-            if layer is None or n in ("k_align", "A_lamina"):
+            if layer is None or n in ("C0", "k_align", "A_lamina"):
                 continue
             a, u = r["ranges"][n]
             assert np.all(layer[x < a - 1e-9] == 0.0), n
@@ -594,6 +596,57 @@ def test_spec_defaults():
     assert p0["K_core"] == 1e-7
     # C0's starting value is the mean of the first ten points.
     assert np.isclose(p0["C0"], np.mean(f[:10]))
+
+
+
+def _cardio_curve(Em, Ei, reserve, delta, seed=0):
+    import piecewise_fit as pf
+    g = pf.Geometry(cell_height=19e-6, cell_radius=0.55 * 19e-6,
+                    nucleus_radius=3e-6, probe_radius=None,
+                    membrane_thickness=8e-9)
+    rng = np.random.default_rng(seed)
+    e = np.linspace(-0.02, 0.45, 5000)
+    s = np.clip(e - delta, 0, None)
+    A = 2 * np.pi * 8e-9 * g.cell_radius / 0.5 * Em
+    B = np.sqrt(2) * g.cell_radius ** 2 / (3 * 0.75) * Ei
+    f0 = A * np.clip(s - reserve, 0, None) ** 3 + B * s ** 1.5
+    wob = np.convolve(rng.normal(0, 1, e.size), np.ones(400) / 400, "same")
+    f = f0 * (1 + 0.02 * wob / wob.std()) + rng.normal(0, 25e-12, e.size)
+    return g, e, f
+
+
+def test_eq1_recovers_a_sarcolemma_reserve():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(5e6, 6e3, 0.10, 0.004)
+    r = pf.lulevich_eq1_fit(e, f, g, window_pct=35.0, n_boot=50)
+    assert abs(r["reserve"] - 0.10) < 0.015, r["reserve"]
+    assert abs(np.log(r["E_i_Pa"] / 6e3)) < 0.08, r["E_i_Pa"]
+    assert abs(np.log(r["E_m_Pa"] / 5e6)) < 0.30, r["E_m_Pa"]
+    lo, hi = r["E_i_ci_Pa"]
+    assert lo < r["E_i_Pa"] < hi
+    # eq 1 as written cannot follow it and says so
+    assert r["alternative"]["rel_rms_pct"] > r["rel_rms_pct"]
+    assert r["delta_aicc"] > 10
+
+
+def test_eq1_without_a_reserve_finds_none():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(2e6, 6e3, 0.0, -0.003, seed=1)
+    r = pf.lulevich_eq1_fit(e, f, g, window_pct=35.0, n_boot=50)
+    assert r["reserve"] < 0.015, r["reserve"]
+    assert abs(np.log(r["E_i_Pa"] / 6e3)) < 0.08, r["E_i_Pa"]
+    assert abs(np.log(r["E_m_Pa"] / 2e6)) < 0.15, r["E_m_Pa"]
+    assert abs(r["delta"] + 0.003) < 0.003, r["delta"]
+
+
+def test_eq1_window_ends_where_p_reaches_3():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(5e6, 6e3, 0.05, 0.0, seed=2)
+    # a confined cell: past 30 % the force climbs faster than any power 3
+    f = f * np.where(e > 0.30, np.exp(8 * (e - 0.30)) ** 2, 1.0)
+    r = pf.lulevich_eq1_fit(e, f, g, n_boot=0)
+    assert 25.0 <= r["window_pct"] <= 36.0, r["window_pct"]
+    assert r["beyond_pct"] > 5.0, r["beyond_pct"]
 
 
 if __name__ == "__main__":
