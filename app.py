@@ -3184,22 +3184,291 @@ def current_style(force_N=None) -> PlotStyle:
     )
 
 
-@st.cache_data(show_spinner=False)
-def load_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Parse an uploaded CSV/Excel once and keep it across reruns."""
-    buffer = io.BytesIO(file_bytes)
-    if filename.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(buffer)
-    for sep in (None, ",", ";", "\t"):
-        buffer.seek(0)
-        try:
-            df = pd.read_csv(buffer, sep=sep, engine="python")
-            if df.shape[1] >= 2:
-                return df
-        except Exception:
+# The file types a force curve may come in. One list, used by every door a
+# curve can come through -- the uploader, the folder stepper, the batch --
+# so a file that loads in one place loads in all of them.
+CURVE_UPLOAD_TYPES = ["csv", "txt", "tsv", "xlsx", "xlsm", "xls"]
+EXCEL_SUFFIXES = (".xlsx", ".xlsm", ".xls")
+
+
+def _numeric_share(series):
+    """What fraction of a column's non-empty cells read as numbers."""
+    values = series.dropna()
+    if values.empty:
+        return 0.0
+    if pd.api.types.is_numeric_dtype(values):
+        return 1.0
+    text = values.astype(str).str.strip()
+    text = text[text != ""]
+    if text.empty:
+        return 0.0
+    parsed = pd.to_numeric(text.str.replace(",", ".", regex=False),
+                           errors="coerce")
+    return float(parsed.notna().mean())
+
+
+def _decimal_commas(frame):
+    """
+    Columns written with a decimal comma, turned into numbers.
+
+    A spreadsheet saved in a Spanish, French or German locale writes
+    0,125 for 0.125, and read as text every one of those cells becomes NaN:
+    the curve loads with its columns and no points in it. A column is only
+    converted when nearly all of it reads as numbers that way, so a column
+    of names or notes is left exactly as it was.
+    """
+    out = frame.copy()
+    for column in out.columns:
+        series = out[column]
+        if pd.api.types.is_numeric_dtype(series):
             continue
-    buffer.seek(0)
-    return pd.read_csv(buffer)
+        text = series.astype(str).str.strip()
+        filled = series.notna() & (text != "")
+        if not filled.any():
+            continue
+        parsed = pd.to_numeric(
+            text[filled].str.replace(",", ".", regex=False), errors="coerce")
+        if parsed.notna().mean() >= 0.8:
+            out[column] = pd.to_numeric(
+                text.str.replace(",", ".", regex=False), errors="coerce")
+    return out
+
+
+def _numeric_columns(frame):
+    """How many columns of this frame are mostly numbers."""
+    return sum(1 for c in frame.columns if _numeric_share(frame[c]) >= 0.8)
+
+
+def _promote_header(raw):
+    """
+    Find where the table starts in a sheet that has lines above it.
+
+    Instrument exports put the date, the operator and the settings above
+    the data, so the first row is not the header and every column reads as
+    text. The table starts at the first run of rows with at least two
+    numbers in them; the row just above it is the header if it is words,
+    and there is no header if it is not.
+    """
+    raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(
+        drop=True)
+    if raw.empty:
+        return raw
+    numeric = raw.apply(
+        lambda row: sum(_numeric_share(pd.Series([v])) == 1.0 for v in row),
+        axis=1)
+    start = None
+    for index in range(len(raw)):
+        window = numeric.iloc[index:index + 5]
+        if len(window) and (window >= 2).all():
+            start = index
+            break
+    if start is None:
+        return raw
+    body = raw.iloc[start:].reset_index(drop=True)
+    header = None
+    if start > 0:
+        above = raw.iloc[start - 1]
+        words = [str(v).strip() for v in above]
+        if sum(_numeric_share(pd.Series([v])) == 1.0 for v in above) == 0 \
+                and sum(bool(w) and w.lower() != "nan" for w in words) >= 2:
+            header = words
+    if header is None:
+        header = [f"column {i + 1}" for i in range(body.shape[1])]
+    # Two blank or repeated header cells would collide as column names.
+    seen, unique = {}, []
+    for name in header:
+        name = name if name and name.lower() != "nan" else "column"
+        seen[name] = seen.get(name, 0) + 1
+        unique.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    body.columns = unique[:body.shape[1]]
+    return body
+
+
+def _header_is_data(frame):
+    """
+    True when the "header" pandas took is really the first row of numbers.
+
+    A file with no header at all is read with its first point as the column
+    names, which silently loses that point and names the columns 0.0 and
+    1.2e-12. Every column name reading as a number is the tell.
+    """
+    names = [str(c).strip().replace(",", ".") for c in frame.columns]
+    if len(names) < 2:
+        return False
+    return all(pd.notna(pd.to_numeric(n, errors="coerce")) for n in names)
+
+
+def _numbers_in(line):
+    """How many numbers a line of text holds, however it is separated."""
+    tokens = re.split(r"[\s;,\t]+", line.strip())
+    # A decimal comma splits a number in two under that pattern; counting
+    # the numbers in the dot form as well catches that case.
+    tokens_dot = re.split(r"[\s;\t]+", line.strip().replace(",", "."))
+    def count(parts):
+        return sum(1 for t in parts if t and pd.notna(
+            pd.to_numeric(t, errors="coerce")))
+    return max(count(tokens), count(tokens_dot))
+
+
+def _trim_preamble(text):
+    """
+    The table in a text file with lines above it, and whether it has a header.
+
+    Instrument exports open with the date, the operator and the settings,
+    each line a different width, and a parser that takes the first line's
+    width as the table's fails on the third. The table starts where three
+    lines running have at least two numbers each; the line just above is
+    kept as the header when it is words rather than numbers.
+    """
+    lines = text.splitlines()
+    for index in range(len(lines)):
+        window = [l for l in lines[index:index + 3]]
+        if len(window) == 3 and all(_numbers_in(l) >= 2 for l in window):
+            above = next((lines[j] for j in range(index - 1, -1, -1)
+                          if lines[j].strip()), "")
+            words = [t for t in re.split(r"[\s;,\t]+", above.strip()) if t]
+            header = (len(words) >= 2 and _numbers_in(above) == 0
+                      and not above.lstrip().startswith(("#", "%", "//")))
+            body = lines[index:]
+            return "\n".join(([above] if header else []) + body), header
+    return text, True
+
+
+@st.cache_data(show_spinner=False)
+def excel_sheets(file_bytes: bytes, filename: str):
+    """The names of the sheets in a workbook, in order. [] for a text file."""
+    if not filename.lower().endswith(EXCEL_SUFFIXES):
+        return []
+    try:
+        return list(pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names)
+    except Exception:
+        return []
+
+
+def _read_excel(file_bytes, filename, sheet, header):
+    """One sheet of a workbook, with the reason spelled out when it cannot."""
+    try:
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet,
+                             header=header)
+    except ImportError as exc:
+        if filename.lower().endswith(".xls"):
+            raise ValueError(
+                "This is an old-style .xls workbook, and reading those needs "
+                "the xlrd package. Add `xlrd>=2.0.1` to requirements.txt and "
+                "reboot, or open the file in Excel and save it as .xlsx."
+            ) from exc
+        raise
+
+
+def _read_text(file_bytes, header):
+    """A delimited text file, whatever its separator and encoding."""
+    last = None
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = file_bytes.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last = exc
+            continue
+        # A semicolon file is the one a comma-decimal locale writes, and it
+        # has to be read before the comma is tried or 0,125;1,5 splits into
+        # four columns of nonsense.
+        candidates = []
+        for sep, decimal in ((None, "."), (";", ","), (";", "."), ("\t", "."),
+                             ("\t", ","), (",", "."), (r"\s+", ".")):
+            try:
+                frame = pd.read_csv(io.StringIO(text), sep=sep,
+                                    decimal=decimal, header=header,
+                                    engine="python")
+            except Exception as exc:
+                last = exc
+                continue
+            if frame.shape[1] >= 2:
+                candidates.append(frame)
+        if candidates:
+            # The reading that finds the most numeric columns is the one
+            # that understood the file.
+            return max(candidates,
+                       key=lambda f: (_numeric_columns(_decimal_commas(f)),
+                                      -f.shape[1]))
+    if last is not None:
+        raise last
+    raise ValueError("the file is empty")
+
+
+@st.cache_data(show_spinner=False)
+def load_table(file_bytes: bytes, filename: str, sheet=None,
+               curve=False) -> pd.DataFrame:
+    """
+    Parse an uploaded CSV, text or Excel file once and keep it across reruns.
+
+    ``curve=True`` is for force curves, and turns on the two things a curve
+    file needs that a sheet of cell heights does not: when the workbook has
+    several sheets and none is named, the first one with a curve on it is
+    used; and when there are lines above the table, the table is found
+    beneath them. Decimal commas and odd separators and encodings are
+    handled for every file.
+    """
+    name = str(filename or "")
+    excel = name.lower().endswith(EXCEL_SUFFIXES)
+
+    if excel:
+        sheets = excel_sheets(file_bytes, name) or [0]
+        if sheet is None and curve:
+            # The first sheet with two columns of numbers in it. A workbook
+            # whose first sheet is a cover page or a list of settings is
+            # common, and failing on it would be failing on nothing.
+            chosen = sheets[0]
+            for candidate in sheets:
+                try:
+                    probe = _decimal_commas(_read_excel(
+                        file_bytes, name, candidate, 0))
+                except ValueError:
+                    raise
+                except Exception:
+                    continue
+                if _numeric_columns(probe) >= 2 or _numeric_columns(
+                        _promote_header(_read_excel(
+                            file_bytes, name, candidate, None))) >= 2:
+                    chosen = candidate
+                    break
+            sheet = chosen
+        frame = _decimal_commas(_read_excel(
+            file_bytes, name, sheets[0] if sheet is None else sheet, 0))
+        if curve and _header_is_data(frame):
+            frame = _decimal_commas(_read_excel(
+                file_bytes, name, sheets[0] if sheet is None else sheet,
+                None))
+            frame.columns = [f"column {i + 1}" for i in range(frame.shape[1])]
+        if curve and _numeric_columns(frame) < 2:
+            frame = _decimal_commas(_promote_header(_read_excel(
+                file_bytes, name, sheets[0] if sheet is None else sheet,
+                None)))
+        return frame
+
+    try:
+        frame = _decimal_commas(_read_text(file_bytes, 0))
+    except Exception:
+        if not curve:
+            raise
+        frame = pd.DataFrame()
+    if curve and (_numeric_columns(frame) < 2 or _header_is_data(frame)):
+        # Either the table is under a preamble, or it has no header at all.
+        # Decode once more and cut straight to where the numbers start.
+        text = None
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is not None:
+            trimmed, has_header = _trim_preamble(text)
+            frame = _decimal_commas(_read_text(
+                trimmed.encode("utf-8"), 0 if has_header else None))
+            if not has_header:
+                frame.columns = [f"column {i + 1}"
+                                 for i in range(frame.shape[1])]
+    return frame
 
 
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -5099,7 +5368,13 @@ def fit_verdict(fit=None):
 PIECEWISE_MODE = "4-regime piecewise (C2C12)"
 ADVANCED_MODE = "Spring-network models (advanced)"
 FIT_MODES = (PIECEWISE_MODE, ADVANCED_MODE)
-PIECEWISE_CELL_TYPES = ("Myoblast (C2C12)",)
+# The cardiomyocyte gets the same board as the myoblast, on its two-term
+# reading only: a sarcolemma stretching as a shell and the non-sarcomeric
+# cytoskeleton pressed as a Hertzian body, both from Lulevich's eq 1 and 6.
+# The four-regime reading is written for a nucleus the cardiomyocyte model
+# does not have, so it is not offered there (see piecewise_regime).
+PIECEWISE_CELL_TYPES = ("Myoblast (C2C12)", "Cardiomyocyte")
+EARLY_ONLY_CELL_TYPES = ("Cardiomyocyte",)
 PW_BOUNDARY_KEYS = ("pw_b1", "pw_b2", "pw_b3", "pw_end")
 PW_BAND_KEYS = (("pw_band1_lo", "pw_band1_hi"), ("pw_band2_lo", "pw_band2_hi"))
 PW_SPAN_KEYS = ("pw_span_lo", "pw_span_hi")
@@ -5831,6 +6106,17 @@ def boundary_repairs():
 # them: (coefficient, name, modulus, colour, law). The same list builds the
 # range rows, the curves on the plot and the range track under it, so a
 # component cannot appear in one and not the others.
+# What the first two components are called depends on the cell. The law,
+# the symbol, the colour and every number are the same: a stretching shell
+# and a Hertzian body. Only the words change, because a cardiomyocyte's
+# membrane is its sarcolemma and what fills it from first contact is its
+# non-sarcomeric cytoskeleton, and a results table that called them
+# "membrane" and "cytoskeleton" would be describing a different cell.
+PW_EARLY_NAMES = {
+    "Cardiomyocyte": ("🟥 Sarcolemma", "🟧 Non-sarcomeric cytoskeleton"),
+}
+_pw_first_two = PW_EARLY_NAMES.get(
+    st.session_state.get("cell_type"), ("🟥 Membrane", "🟧 Cytoskeleton"))
 PW_COMPONENTS = (
     # The square in each name is the colour of that component's line and bar
     # on the plot. The names and symbols are the spring network's own, for
@@ -5838,9 +6124,9 @@ PW_COMPONENTS = (
     # components, four ticks, four bars, four rows in the results: what is
     # ticked is what is fitted and what is drawn, with nothing else in the
     # model.
-    ("K_shell", "🟥 Membrane", "Eₘ", "#d62728",
+    ("K_shell", _pw_first_two[0], "Eₘ", "#d62728",
      r"$K_{shell}\,[\min(x,u)-s]_+^{3}$"),
-    ("K_cyto", "🟧 Cytoskeleton", "Ec", "#ff7f0e",
+    ("K_cyto", _pw_first_two[1], "Ec", "#ff7f0e",
      r"$K_{cyto}\,[\min(x,u)-s]_+^{3/2}$"),
     ("K_nucleus", "🟦 Nuclear envelope", "E_ne", "#1f77b4",
      r"$K_{ne}\,[\min(x,u)-s]_+^{3}$"),
@@ -5969,8 +6255,18 @@ PW_REGIME_HELP = {
 }
 
 
+def early_only():
+    """This cell type is read on the two-term early regime and nothing else."""
+    return st.session_state.get("cell_type") in EARLY_ONLY_CELL_TYPES
+
+
 def piecewise_regime():
     """Which of the two the board is fitting: "full" or "early"."""
+    # A cardiomyocyte is read on the two components alone. Its model has no
+    # nucleus for the four-regime reading to find, so offering it would be
+    # offering four numbers of which two measure nothing.
+    if early_only():
+        return "early"
     value = _pw_get("pw_regime", DEFAULTS.get("pw_regime", "full"))
     return value if value in PW_REGIME_MODES else "full"
 
@@ -7335,7 +7631,7 @@ def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
         with left:
             row = moduli.get("K_shell") or {}
             E = float(row.get("E_Pa", float("nan")))
-            st.metric("🟥 Membrane  Eₘ  (eq 3)",
+            st.metric(f"{PW_COMPONENTS[0][1]}  Eₘ  (eq 3)",
                       modulus_display("E_shell", E, row.get("E_se_Pa")))
             if np.isfinite(E) and bending_constant is not None:
                 k = bending_constant(E, geometry, h)
@@ -7351,7 +7647,7 @@ def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
         with right:
             row = moduli.get("K_cyto") or {}
             E = float(row.get("E_Pa", float("nan")))
-            st.metric("🟧 Cell interior  E_i  (eq 6)",
+            st.metric(f"{PW_COMPONENTS[1][1]}  Ec  (eq 6)",
                       modulus_display("E_cyto", E, row.get("E_se_Pa")))
             if np.isfinite(E):
                 inside = 1.0e3 <= E <= 10.0e3
@@ -7776,7 +8072,8 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
     # A frame number, a typed coordinate or a canvas drawing from the last
     # video is not a fact about this one, and a stored value outside a new
     # widget's range is an exception before the page draws.
-    for stale in ("mt_start", "mt_end", "mt_show"):
+    for stale in ("mt_start", "mt_end", "mt_show", "clip_range",
+                  "clip_made", "clip_start_text", "clip_end_text"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -7813,6 +8110,166 @@ def motion_canvas_point(shape, scale):
     return (x / scale, y / scale)
 
 
+def motion_rulers(image_rgb, step=None):
+    """
+    Tick marks and numbers along the top and left edges, in video pixels.
+
+    Only for the typed-coordinate fallback, where "read the coordinates off
+    the picture" has to be something a person can actually do. The canvas
+    does not need them: there you click the place instead of reading it.
+    """
+    cv = ct.cv2
+    image = image_rgb.copy()
+    height, width = image.shape[:2]
+    if step is None:
+        longest = max(width, height)
+        step = 200 if longest >= 1800 else (
+            100 if longest >= 900 else (50 if longest >= 450 else 25))
+    font = cv.FONT_HERSHEY_SIMPLEX
+    line = cv.LINE_AA
+    pale = (235, 235, 235)
+    for x in range(0, width, int(step)):
+        major = (x % (int(step) * 2) == 0)
+        length = 14 if major else 8
+        cv.line(image, (x, 0), (x, length), (0, 0, 0), 3, line)
+        cv.line(image, (x, 0), (x, length), pale, 1, line)
+        if major and x:
+            spot = (min(x + 3, width - 34), 26)
+            cv.putText(image, str(x), spot, font, 0.42, (0, 0, 0), 3, line)
+            cv.putText(image, str(x), spot, font, 0.42, pale, 1, line)
+    for y in range(0, height, int(step)):
+        major = (y % (int(step) * 2) == 0)
+        length = 14 if major else 8
+        cv.line(image, (0, y), (length, y), (0, 0, 0), 3, line)
+        cv.line(image, (0, y), (length, y), pale, 1, line)
+        if major and y:
+            spot = (3, min(y + 16, height - 4))
+            cv.putText(image, str(y), spot, font, 0.42, (0, 0, 0), 3, line)
+            cv.putText(image, str(y), spot, font, 0.42, pale, 1, line)
+    return image
+
+
+def motion_canvas_panel(frame_bgr, canvas_key, microns, width_px):
+    """The corners, clicked onto the frame. Raises if the canvas will not."""
+    from PIL import Image
+
+    height, width = frame_bgr.shape[:2]
+    markers = motion_markers()
+    shown = int(min(width_px, width))
+    scale = shown / float(width)
+    # Drawn at full size and then shrunk, so the crosshairs are thickened by
+    # however much the shrinking will thin them.
+    painted = motion_preview(frame_bgr, markers, dots=False, microns=microns,
+                             thickness=max(1.0, 1.0 / max(scale, 0.05)))
+    background = Image.fromarray(painted).resize(
+        (shown, int(round(height * scale))), Image.BILINEAR)
+    mode = st.radio(
+        "How the corners are placed",
+        ("Click the corners", "Nudge a corner"),
+        horizontal=True, key="mt_pick_mode", label_visibility="collapsed",
+        help="Click places a corner where you click. Nudge lets you pick "
+             "one up and drag it onto the feature you meant.")
+    st.caption(
+        "Click the **four corners of the cell**, in order round it — "
+        "P1, P2, P3, P4. The dashed quadrilateral between them, its centre "
+        "and its area appear as you go. Choose features with texture (a "
+        "speckle, an edge, a corner) rather than flat grey; ↶ and 🗑 under "
+        "the picture undo one and clear them all.")
+    drawing = st_canvas(
+        background_image=background,
+        drawing_mode=("transform" if mode == "Nudge a corner" else "point"),
+        point_display_radius=5,
+        stroke_width=2, stroke_color="#00e5ff",
+        fill_color="rgba(0, 229, 255, 0.85)",
+        height=int(round(height * scale)), width=shown,
+        update_streamlit=True, key=canvas_key,
+    )
+    clicked = []
+    if drawing is not None and drawing.json_data:
+        for shape in (drawing.json_data.get("objects") or []):
+            try:
+                clicked.append(motion_canvas_point(shape, scale))
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+    clicked = [point for point in clicked if point is not None]
+    # The canvas keeps its own list of what has been drawn on it, so it is
+    # the truth about the corners and session state follows it -- not the
+    # other way round, which is how a cleared canvas came back with the old
+    # corners on the next rerun.
+    if motion_set_markers(clicked):
+        markers = motion_markers()
+    if len(clicked) > 4:
+        st.caption(
+            f"⚠️ {len(clicked)} points are on the canvas; the first four are "
+            "the ones tracked. ↶ under the picture removes one.")
+    return markers
+
+
+def motion_typed_panel(frame_bgr, microns, reason=""):
+    """
+    The same four corners, typed as coordinates.
+
+    What the tab falls back to when the canvas is not installed, or is
+    installed and will not run. The picture carries a ruler down two edges
+    so the numbers can be read off it, which is the whole difference
+    between this being usable and being a puzzle.
+    """
+    height, width = frame_bgr.shape[:2]
+    markers = motion_markers()
+    if not reason:
+        st.info(
+            "Clicking the corners onto the frame needs "
+            "**streamlit-drawable-canvas**. Add this line to "
+            "`requirements.txt`, push it, and reboot the app "
+            "(**Manage app → Reboot**):\n\n"
+            "```\nstreamlit-drawable-canvas>=0.9\n```\n"
+            "Until then, read the corners off the ruled picture below and "
+            "type them here — still in order round the cell. Everything "
+            "else on this tab works exactly the same either way.",
+            icon="ℹ️")
+    else:
+        st.warning(
+            "**streamlit-drawable-canvas is installed but would not run**, "
+            f"so the corners are typed instead:\n\n`{reason[:300]}`\n\n"
+            + ("That name was moved out of Streamlit, so this build of the "
+               "canvas is older than the Streamlit it is running against. "
+               "Pinning `streamlit<1.28` in requirements.txt, or installing "
+               "a build of the canvas made for a current Streamlit, fixes "
+               "it."
+               if "image_to_url" in reason else
+               "Everything else on this tab works exactly the same.")
+            + " The corners below are typed against a ruled picture.",
+            icon="⚠️")
+        if st.button("↺ Try the canvas again", key="mt_canvas_retry"):
+            st.session_state.pop("mt_canvas_error", None)
+            rerun_keeping_settings()
+    typed = []
+    rows = st.columns(4)
+    for index, column in enumerate(rows):
+        with column:
+            st.markdown(f"**{ct.POINT_LABELS[index]}**")
+            here = markers[index] if index < len(markers) else (
+                width * (0.3 if index in (0, 3) else 0.7),
+                height * (0.3 if index in (0, 1) else 0.7))
+            x = st.number_input(
+                "x", 0.0, float(width - 1), value=float(here[0]),
+                step=1.0, key=f"mt_x{index}")
+            y = st.number_input(
+                "y", 0.0, float(height - 1), value=float(here[1]),
+                step=1.0, key=f"mt_y{index}")
+            typed.append((x, y))
+    if motion_set_markers(typed):
+        markers = motion_markers()
+    st.image(
+        motion_rulers(motion_preview(frame_bgr, markers, microns=microns)),
+        caption=(f"The four corners and the quadrilateral they make. The "
+                 f"ruler is in video pixels: x runs right, y runs down, "
+                 f"from the top-left corner. This frame is "
+                 f"{width}×{height}."),
+        **STRETCH)
+    return markers
+
+
 def motion_pick_panel(frame_bgr, canvas_key="mt_canvas", microns=None,
                       width_px=720):
     """
@@ -7821,96 +8278,156 @@ def motion_pick_panel(frame_bgr, canvas_key="mt_canvas", microns=None,
     Click them in order round the cell -- P1, P2, P3, P4 -- and the dashed
     quadrilateral joining them, its centroid and the area it encloses are
     drawn as you go, so it is obvious straight away whether they went round
-    the cell or across it. Switch to **Nudge a corner** to drag one onto
-    exactly the feature you meant.
+    the cell or across it.
 
-    Without the canvas component the same four corners are typed as
-    coordinates, with the same picture beside them.
+    A canvas that is installed can still refuse to run: the component
+    reaches into Streamlit's own internals to put the frame behind it, and
+    those move between Streamlit versions. That must not take the tab down
+    with it, so the failure is caught, named, and the typed coordinates
+    take over -- and it is remembered, because a component that threw once
+    will throw on every rerun.
     """
-    height, width = frame_bgr.shape[:2]
-    markers = motion_markers()
-    if HAS_CANVAS:
-        from PIL import Image
+    broken = str(st.session_state.get("mt_canvas_error", "") or "")
+    if HAS_CANVAS and not broken:
+        try:
+            return motion_canvas_panel(frame_bgr, canvas_key, microns,
+                                       width_px)
+        except Exception as exc:  # pragma: no cover - depends on the deploy
+            broken = f"{type(exc).__name__}: {exc}"
+            st.session_state["mt_canvas_error"] = broken
+    return motion_typed_panel(frame_bgr, microns, broken)
 
-        shown = int(min(width_px, width))
-        scale = shown / float(width)
-        # Drawn at full size and then shrunk, so the crosshairs are thickened
-        # by however much the shrinking will thin them.
-        painted = motion_preview(frame_bgr, markers, dots=False,
-                                 microns=microns,
-                                 thickness=max(1.0, 1.0 / max(scale, 0.05)))
-        background = Image.fromarray(painted).resize(
-            (shown, int(round(height * scale))), Image.BILINEAR)
-        mode = st.radio(
-            "How the corners are placed",
-            ("Click the corners", "Nudge a corner"),
-            horizontal=True, key="mt_pick_mode",
-            label_visibility="collapsed",
-            help="Click places a corner where you click. Nudge lets you "
-                 "pick one up and drag it onto the feature you meant.")
-        st.caption(
-            "Click the **four corners of the cell**, in order round it — "
-            "P1, P2, P3, P4. The dashed quadrilateral between them, its "
-            "centre and its area appear as you go. Choose features with "
-            "texture (a speckle, an edge, a corner) rather than flat grey; "
-            "↶ and 🗑 under the picture undo one and clear them all.")
-        drawing = st_canvas(
-            background_image=background,
-            drawing_mode=("transform" if mode == "Nudge a corner"
-                          else "point"),
-            point_display_radius=5,
-            stroke_width=2, stroke_color="#00e5ff",
-            fill_color="rgba(0, 229, 255, 0.85)",
-            height=int(round(height * scale)), width=shown,
-            update_streamlit=True, key=canvas_key,
-        )
-        clicked = []
-        if drawing is not None and drawing.json_data:
-            for shape in (drawing.json_data.get("objects") or []):
-                try:
-                    clicked.append(motion_canvas_point(shape, scale))
-                except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                    continue
-        clicked = [point for point in clicked if point is not None]
-        # The canvas keeps its own list of what has been drawn on it, so it
-        # is the truth about the corners and session state follows it -- not
-        # the other way round, which is how a cleared canvas came back with
-        # the old corners on the next rerun.
-        if motion_set_markers(clicked):
-            markers = motion_markers()
-        if len(clicked) > 4:
-            st.caption(
-                f"⚠️ {len(clicked)} points are on the canvas; the first four "
-                "are the ones tracked. ↶ under the picture removes one.")
+
+def motion_clip_panel(path, details):
+    """
+    Cut a stretch of the video out as its own file.
+
+    The desktop clipper, on the page: pick where the clip starts and ends
+    by frame on the slider or by typing the times, see the first and last
+    frame of it, and download it. The two ways of setting it are the same
+    two numbers -- typed times move the slider -- so there is never a
+    question of which one the export will use.
+    """
+    fps = float(details["fps"])
+    last = int(details["frame_count"]) - 1
+    signature = video_signature()
+
+    # The range, kept in frames and clamped before the slider exists: a
+    # range from a longer video is out of bounds for a shorter one.
+    stored = st.session_state.get("clip_range")
+    try:
+        lo, hi = int(stored[0]), int(stored[1])
+    except (TypeError, ValueError, IndexError):
+        lo, hi = 0, last
+    lo = clamp_int(lo, 0, last)
+    hi = clamp_int(hi, lo, last)
+    st.session_state["clip_range"] = (lo, hi)
+
+    st.markdown("**Where the clip starts and ends**")
+    lo, hi = st.slider(
+        "Clip, in frames", 0, max(last, 1), key="clip_range",
+        label_visibility="collapsed",
+        help="Drag either end. The times and the two frames below follow.")
+    t0, t1 = lo / fps, (hi + 1) / fps
+    st.caption(
+        f"Frames **{lo} → {hi}** · **{ct.format_time(t0)} → "
+        f"{ct.format_time(t1)}** · {hi - lo + 1:,} frames, "
+        f"{t1 - t0:.3f} s")
+
+    with st.expander("⌨️ Type the times instead (HH:MM:SS.mmm, MM:SS or s)"):
+        e1, e2, e3 = st.columns([1, 1, 1])
+        with e1:
+            start_text = st.text_input("Start", key="clip_start_text",
+                                       placeholder=ct.format_time(t0))
+        with e2:
+            end_text = st.text_input("End", key="clip_end_text",
+                                     placeholder=ct.format_time(t1))
+        with e3:
+            st.markdown("<div style='height:1.7rem'></div>",
+                        unsafe_allow_html=True)
+            apply = st.button("Use these times", key="clip_apply_times",
+                              **STRETCH)
+        if apply:
+            a = ct.parse_time(start_text) if start_text.strip() else t0
+            b = ct.parse_time(end_text) if end_text.strip() else t1
+            if a is None or b is None:
+                st.error("Write each time as 1:02.5, 00:01:02.500 or 62.5.")
+            elif b <= a:
+                st.error("The end has to come after the start.")
+            else:
+                first = clamp_int(round(a * fps), 0, last)
+                final = clamp_int(round(b * fps) - 1, first, last)
+                rerun_keeping_settings({"clip_range": (first, final)})
+
+    # The first and last frame of the clip, side by side, which is how you
+    # know the cut is where you meant before waiting for an export.
+    f1, f2 = st.columns(2)
+    for column, index, label in ((f1, lo, "First frame"),
+                                 (f2, hi, "Last frame")):
+        with column:
+            frame = motion_frame(path, signature, index)
+            if frame is not None:
+                st.image(ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2RGB),
+                         caption=f"{label} · frame {index} · "
+                                 f"{ct.format_time(index / fps)}",
+                         **STRETCH)
+
+    have_ffmpeg = bool(ct.ffmpeg_path())
+    accurate = True
+    if have_ffmpeg:
+        accurate = st.checkbox(
+            "Accurate export (re-encode; recommended)", value=True,
+            key="clip_accurate",
+            help="Re-encodes to H.264 so the clip starts exactly on the frame "
+                 "above. Off copies the streams: instant and lossless, but "
+                 "it can only start on a keyframe, so it may begin a little "
+                 "early.")
     else:
-        st.info(
-            "Install **streamlit-drawable-canvas** to click the corners "
-            "straight onto the frame (add it to requirements.txt and "
-            "reboot). Until then, read the coordinates off the picture and "
-            "type them here — still in order round the cell.", icon="ℹ️")
-        typed = []
-        rows = st.columns(4)
-        for index, column in enumerate(rows):
-            with column:
-                st.markdown(f"**{ct.POINT_LABELS[index]}**")
-                here = markers[index] if index < len(markers) else (
-                    width * (0.3 if index in (0, 3) else 0.7),
-                    height * (0.3 if index in (0, 1) else 0.7))
-                x = st.number_input(
-                    "x", 0.0, float(width - 1), value=float(here[0]),
-                    step=1.0, key=f"mt_x{index}", label_visibility="visible")
-                y = st.number_input(
-                    "y", 0.0, float(height - 1), value=float(here[1]),
-                    step=1.0, key=f"mt_y{index}", label_visibility="visible")
-                typed.append((x, y))
-        if motion_set_markers(typed):
-            markers = motion_markers()
-        st.image(
-            motion_preview(frame_bgr, markers, microns=microns),
-            caption="The four corners, the quadrilateral they make and the "
-                    "area it encloses. x runs right, y runs down, from the "
-                    "top-left corner.", **STRETCH)
-    return markers
+        st.caption(
+            "ℹ️ FFmpeg is not installed where this app runs, so clips are "
+            "cut frame by frame with OpenCV: exact, but video only and in a "
+            "format some browsers will not preview. Add a file called "
+            "`packages.txt` beside app.py containing the single line "
+            "`ffmpeg` and reboot to get H.264 with sound.")
+
+    if st.button("✂️ Cut the clip", key="clip_go", type="primary",
+                 disabled=hi <= lo, **STRETCH):
+        name = ct.clip_name(st.session_state.get("video_name") or path,
+                            t0, t1)
+        destination = os.path.join(tempfile.gettempdir(), name)
+        bar = st.progress(0.0, text="Cutting…")
+
+        def _tick(done, total):
+            bar.progress(min(1.0, done / float(max(total, 1))),
+                         text=f"Cutting… {done:,} of {total:,} frames")
+            return False
+
+        try:
+            made = ct.clip_video(path, destination, t0, t1,
+                                 accurate=accurate, progress=_tick)
+        except Exception as exc:
+            bar.empty()
+            st.error(f"Could not cut the clip: {exc}", icon="🚫")
+        else:
+            bar.empty()
+            st.session_state["clip_made"] = {**made, "name": name,
+                                             "range": (lo, hi)}
+
+    made = st.session_state.get("clip_made")
+    if made and os.path.exists(made.get("path", "")):
+        if tuple(made.get("range", ())) != (lo, hi):
+            st.caption("ℹ️ The clip below is from an earlier range. Cut again "
+                       "to get this one.")
+        with open(made["path"], "rb") as handle:
+            clip_bytes = handle.read()
+        st.success(
+            f"**{made['name']}** · {len(clip_bytes) / 1e6:.1f} MB · "
+            f"{made['method']}. {made.get('note', '')}", icon="✂️")
+        st.download_button(
+            "💾 Download the clip", data=clip_bytes, file_name=made["name"],
+            mime="video/mp4", key="clip_download", **STRETCH)
+        if made.get("method", "").startswith("ffmpeg"):
+            st.video(clip_bytes)
 
 
 def motion_speed_figure(times, values, labels, colours, y_title, title=None):
@@ -9536,9 +10053,8 @@ def early_boundary_control():
                     help=f"Where this component starts carrying load. "
                          f"{floor:g} % is the earliest it is allowed to "
                          f"join; the optimiser looks between {lo:g} and "
-                         f"{hi:g} %, where a C2C12's cytoskeleton is "
-                         "expected to come in. Move either edge just "
-                         "below.")
+                         f"{hi:g} %, where the cytoskeleton is expected "
+                         "to come in. Move either edge just below.")
         with c3:
             st.number_input(
                 f"{names[term][0]} to", PW_MIN_GAP, round(top, 2), step=0.5,
@@ -9751,12 +10267,17 @@ def fit_equation_panel(result):
         e1 = float(b[1])
         cyto = float(((result.get("moduli") or {}).get("K_cyto")
                       or {}).get("E_Pa", 0.0))
-        if e1 > PW_EARLY_LATE_PCT and cyto > 1e-6:
+        # Only where there is a reported value to read above. The 10-15 kPa
+        # is a C2C12 number; quoting it next to a cardiomyocyte would be
+        # comparing two different cells.
+        reported = ((literature_for() or {}).get("moduli") or {}).get(
+            "E_cyto")
+        if e1 > PW_EARLY_LATE_PCT and cyto > 1e-6 and reported:
             st.caption(
                 f"ℹ️ Ec is read over the last {float(b[-1]) - e1:.1f} % of "
                 f"the squash only (ε₁ = {e1:.1f} %, late in the "
-                f"{lo_band:g}–{hi_band:g} % band), so it reads above the "
-                "10–15 kPa usually quoted for a C2C12 cytoskeleton.")
+                f"{lo_band:g}–{hi_band:g} % band), so it reads above what "
+                f"is reported ({reported[2]}).")
     if empty:
         ranges = result.get("ranges") or {}
         where = ", ".join(
@@ -12166,16 +12687,29 @@ def piecewise_section(model, epsilon, force_N, rupture):
         status_slot = st.empty()
 
         st.markdown("**A · Analyte — what the cell is made of**")
-        st.radio(
-            "Which components, over how much of the squash",
-            list(PW_REGIME_MODES), format_func=PW_REGIME_MODES.get,
-            key="pw_regime", on_change=_pw_regime_changed,
-            label_visibility="collapsed",
-            help="Full: the four components over the whole squash. Early: "
-                 "the two Lulevich's model has, over the early window only. "
-                 "Everything else on this board behaves the same.",
-        )
-        st.caption(PW_REGIME_HELP.get(piecewise_regime(), ""))
+        if early_only():
+            # Nothing to choose: the widget is not drawn, and the stored
+            # choice is set to what is being fitted so nothing downstream
+            # that reads it can disagree with the page.
+            st.session_state["pw_regime"] = "early"
+            st.caption(
+                f"**Early deformation — two components.** A "
+                f"{str(st.session_state.get('cell_type', '')).lower()} is "
+                f"read as its sarcolemma stretching (x³) and its "
+                f"non-sarcomeric cytoskeleton pressed as a Hertzian body "
+                f"(x^1.5), over the early window only.")
+        else:
+            st.radio(
+                "Which components, over how much of the squash",
+                list(PW_REGIME_MODES), format_func=PW_REGIME_MODES.get,
+                key="pw_regime", on_change=_pw_regime_changed,
+                label_visibility="collapsed",
+                help="Full: the four components over the whole squash. "
+                     "Early: the two Lulevich's model has, over the early "
+                     "window only. Everything else on this board behaves "
+                     "the same.",
+            )
+            st.caption(PW_REGIME_HELP.get(piecewise_regime(), ""))
         if st.session_state.pop("pw_came_back_early", False):
             st.info(
                 "This cell arrived on the **early deformation** reading, as "
@@ -13295,7 +13829,7 @@ def unit_from_header(header):
 # anything: it finds the files, reads the heights, and hands both to
 # fit_cell_from_file, which is the same fit the analysis tab does.
 
-CURVE_SUFFIXES = (".csv", ".tsv", ".txt", ".xlsx", ".xls")
+CURVE_SUFFIXES = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls")
 HEIGHT_SHEET_NAME = "cells"
 HEIGHT_SHEET_COLUMNS = ("file", "cell", "height_um", "group", "notes")
 RESULT_SHEETS = ("AFM results", "AFM summary", "AFM settings", "AFM curves")
@@ -13343,9 +13877,17 @@ def curve_files_in_folder(folder, pattern="*", skip=()):
             keep.append(full)
     keep.sort(key=natural_key)
     if not keep:
-        return [], (f"No .csv, .txt, .tsv, .xlsx or .xls file in `{root}` "
+        return [], (f"No .csv, .txt, .tsv, .xlsx, .xlsm or .xls file in `{root}` "
                     f"matches `{pattern}`.")
     return keep, ""
+
+
+# How a deformation or force column is recognised by its name, in the
+# languages the files come in.
+CURVE_EPS_WORDS = ("reldef", "rel def", "rel_def", "deform", "eps", "ε",
+                   "strain", "compression", "squeeze")
+CURVE_FORCE_WORDS = ("force", "fuerza", "kraft", "corrected", "load", "f (",
+                     "f[")
 
 
 def curve_from_table(frame, unit_choice):
@@ -13359,9 +13901,8 @@ def curve_from_table(frame, unit_choice):
     cols = frame.columns.tolist()
     if len(cols) < 2:
         raise ValueError("fewer than two columns")
-    e_col = cols[guess_column(cols, ("reldef", "rel def", "rel_def", "deform",
-                                     "eps", "ε", "strain"), 0)]
-    f_col = cols[guess_column(cols, ("force", "f (", "f["), 1)]
+    e_col = cols[guess_column(cols, CURVE_EPS_WORDS, 0)]
+    f_col = cols[guess_column(cols, CURVE_FORCE_WORDS, 1)]
     unit = (unit_from_header(f_col) if unit_choice == "from the column name"
             else unit_choice)
     eps = pd.to_numeric(frame[e_col], errors="coerce").to_numpy(float)
@@ -13382,10 +13923,11 @@ def curve_from_table(frame, unit_choice):
 def read_curve_source(source, name, unit_choice):
     """One curve, from an upload's bytes or from a path on disk."""
     if isinstance(source, (bytes, bytearray)):
-        frame = load_table(bytes(source), name)
+        frame = load_table(bytes(source), name, curve=True)
     else:
         with open(source, "rb") as handle:
-            frame = load_table(handle.read(), os.path.basename(str(source)))
+            frame = load_table(handle.read(), os.path.basename(str(source)),
+                               curve=True)
     return curve_from_table(frame, unit_choice)
 
 
@@ -13992,8 +14534,8 @@ def all_cells_tab():
     with st.expander("➕ Add cells from files (each fitted on its own)",
                      expanded=not collection):
         files = st.file_uploader(
-            "Force curves (.csv or .xlsx), one cell per file",
-            type=["csv", "xlsx", "xls"], accept_multiple_files=True,
+            "Force curves (.csv, .txt or Excel), one cell per file",
+            type=CURVE_UPLOAD_TYPES, accept_multiple_files=True,
             key="pw_batch_files",
         )
         u1, u2 = st.columns(2)
@@ -15072,7 +15614,7 @@ def fit_explainer(fit, result=None):
         st.latex(r"p(x) = \frac{d\ln F}{d\ln x}")
         st.markdown(
             "jumps where a new part joins in, so the boundaries are placed where "
-            "$p$ bends, inside the C2C12 bands, and then every nearby "
+            "$p$ bends, inside the prior's bands, and then every nearby "
             "placement is fitted and the one with the smallest $S$ is kept. "
             f"Here: **{fit['piecewise'].get('boundary_source', '')}**."
         )
@@ -18254,7 +18796,7 @@ SHOW_DATABASE_TAB = False
         "🔧 Create curve (Igor)",
         "📈 Results",
         "💾 Export",
-        "🎬 Cell motion",
+        "🎬 Video: track & clip",
         "🎥 Compression video",
         "📋 Database",
     ]
@@ -18387,48 +18929,80 @@ with tab_analysis:
 
     section("2 · Load force curve")
     uploaded = st.file_uploader(
-        "Force vs relative deformation (.csv or .xlsx)",
-        type=["csv", "xlsx", "xls"],
+        "Force vs relative deformation (.csv, .txt or Excel)",
+        type=CURVE_UPLOAD_TYPES,
         key="force_curve_file",
+        help="CSV, tab- or space-separated text, or an Excel workbook "
+             "(.xlsx, .xlsm, .xls). Decimal commas, lines above the table "
+             "and curves on a sheet other than the first are all found.",
     )
 
     if uploaded is not None:
+        # A workbook with more than one sheet gets a choice of sheet. Left
+        # on automatic, the first sheet with a curve on it is read, which
+        # is what a cover page or a settings sheet in front needs.
+        sheets = excel_sheets(uploaded.getvalue(), uploaded.name)
+        sheet = None
+        if len(sheets) > 1:
+            automatic = "the first sheet with a curve on it"
+            if st.session_state.get("curve_sheet") not in [automatic] + sheets:
+                st.session_state["curve_sheet"] = automatic
+            picked = st.selectbox(
+                f"Sheet ({len(sheets)} in this workbook)",
+                [automatic] + sheets, key="curve_sheet")
+            sheet = None if picked == automatic else picked
         try:
-            df = load_table(uploaded.getvalue(), uploaded.name)
+            df = load_table(uploaded.getvalue(), uploaded.name, sheet=sheet,
+                            curve=True)
         except Exception as exc:
             df = None
             st.error(f"Could not read the file: {exc}")
 
         if df is not None and df.shape[1] >= 2:
             columns = df.columns.tolist()
+            eps_guess = columns[guess_column(columns, CURVE_EPS_WORDS, 0)]
+            force_guess = columns[guess_column(columns, CURVE_FORCE_WORDS, 1)]
+            # A column picked on the last file is not a column of this one.
+            # Left in place, the name it stores is looked up in a table that
+            # does not have it, and the page stops on a KeyError.
+            if st.session_state.get("eps_col") not in columns:
+                st.session_state["eps_col"] = eps_guess
+            if st.session_state.get("force_col") not in columns:
+                st.session_state["force_col"] = force_guess
             c1, c2, c3 = st.columns([2, 2, 2])
             with c1:
                 eps_col = st.selectbox(
-                    "Relative deformation column",
-                    columns,
-                    index=guess_column(
-                        columns, ("reldef", "rel def", "rel_def", "deform", "eps", "ε",
-                                  "strain"), 0,
-                    ),
-                    key="eps_col",
-                )
+                    "Relative deformation column", columns, key="eps_col")
             with c2:
                 force_col = st.selectbox(
-                    "Force column",
-                    columns,
-                    index=guess_column(columns, ("force", "f (", "f["), 1),
-                    key="force_col",
-                )
+                    "Force column", columns, key="force_col")
             with c3:
+                # The unit the header names, taken once per file and column,
+                # so a header saying (nN) is read in nN without being told --
+                # and a unit chosen by hand is not overwritten on the next
+                # rerun of the same file.
+                seen_unit = (uploaded.name, str(force_col))
+                if st.session_state.get("_curve_unit_for") != seen_unit:
+                    st.session_state["_curve_unit_for"] = seen_unit
+                    st.session_state["input_force_unit"] = unit_from_header(
+                        force_col)
                 input_unit = st.selectbox(
                     "Force unit in the file",
                     list(INPUT_FORCE_UNITS.keys()),
-                    index=0,
                     key="input_force_unit",
-                    help="Files exported by this app are in newtons.",
+                    help="Read from the column name when it says, e.g. "
+                         "'Force (nN)'. Files exported by this app are in "
+                         "newtons.",
                 )
 
             raw_eps = pd.to_numeric(df[eps_col], errors="coerce").to_numpy(dtype=float)
+            # Deformation written in per cent rather than as a fraction. Read
+            # as a fraction it would say the cell was squashed ninety times
+            # over, and every modulus would be off by a million.
+            if np.isfinite(raw_eps).any() and np.nanmax(raw_eps) > 1.5:
+                raw_eps = raw_eps / 100.0
+                st.caption("ℹ️ The deformation column goes past 1.5, so it "
+                           "is read as per cent and divided by 100.")
             raw_force = pd.to_numeric(df[force_col], errors="coerce").to_numpy(dtype=float)
             force_N = to_newtons(raw_force, input_unit)
 
@@ -21316,7 +21890,7 @@ with tab_explore:
 # ==================================================== TAB 3: video analysis ==
 
 with tab_motion:
-    section("Cell motion — four markers through the squash")
+    section("Video — track the cell, or clip the recording")
 
     if ct is None or TRACKING_ERROR:
         st.error(
@@ -21368,228 +21942,237 @@ with tab_motion:
             last = int(details["frame_count"]) - 1
             fps = float(details["fps"])
 
-            # ---- 2 · the frame the markers are placed on -------------
-            st.markdown("**2 · The frame to start from**")
-            st.caption(
-                "Tracking runs forward from this frame, so place the markers "
-                "on a frame where all four are clearly visible — usually just "
-                "before the probe touches.")
-            st.session_state["mt_start"] = int(clamp_int(
-                st.session_state.get("mt_start", 0), 0, last))
-            start_frame = st.slider(
-                "Start frame", 0, max(last, 0), key="mt_start",
-                help="The markers are placed here and followed from here.")
-            frame_bgr = motion_frame(motion_path, video_signature(),
-                                     start_frame)
-            if frame_bgr is None:
-                st.error(f"Could not read frame {start_frame}.")
-            else:
-                st.caption(
-                    f"Frame {start_frame} of {last} · "
-                    f"t = {ct.format_time(start_frame / fps)}")
+            # Two jobs on one video: following the corners, and cutting the
+            # stretch that matters out of the recording. The upload above
+            # serves both.
+            motion_track_tab, motion_clip_tab = st.tabs(
+                ["🎯 Track the corners", "✂️ Clip the video"])
+            with motion_clip_tab:
+                motion_clip_panel(motion_path, details)
+            with motion_track_tab:
 
-                # ---- 3 · the four markers ------------------------------
-                st.markdown("**3 · Select the four corners**")
-                # A canvas keyed to the video: a new file gets a new,
-                # empty one instead of the last video's dots.
-                pick_microns = float(
-                    st.session_state.get("mt_um_per_px", 0.0)) or None
-                markers = motion_pick_panel(
-                    frame_bgr, microns=pick_microns,
-                    canvas_key="mt_canvas_" + str(
-                        abs(hash((motion_path, video_signature()))) % 10 ** 9))
-                # The canvas draws its own undo / redo / bin under itself,
-                # and those are the buttons that can actually remove a dot
-                # from it. A second pair here would only change this page's
-                # list, and the canvas would put the dot back on the next
-                # run.
-                if HAS_CANVAS:
-                    st.markdown(
-                        f"<div style='text-align:right'><b>"
-                        f"{len(markers)} of 4</b> placed</div>",
-                        unsafe_allow_html=True)
+                # ---- 2 · the frame the markers are placed on -------------
+                st.markdown("**2 · The frame to start from**")
+                st.caption(
+                    "Tracking runs forward from this frame, so place the markers "
+                    "on a frame where all four are clearly visible — usually just "
+                    "before the probe touches.")
+                st.session_state["mt_start"] = int(clamp_int(
+                    st.session_state.get("mt_start", 0), 0, last))
+                start_frame = st.slider(
+                    "Start frame", 0, max(last, 0), key="mt_start",
+                    help="The markers are placed here and followed from here.")
+                frame_bgr = motion_frame(motion_path, video_signature(),
+                                         start_frame)
+                if frame_bgr is None:
+                    st.error(f"Could not read frame {start_frame}.")
                 else:
-                    c1, c2 = st.columns([1, 3])
-                    with c1:
-                        if st.button("🗑️ Clear", key="mt_clear",
-                                     disabled=not markers, **STRETCH):
-                            motion_set_markers([])
-                            for _i in range(4):
-                                st.session_state.pop(f"mt_x{_i}", None)
-                                st.session_state.pop(f"mt_y{_i}", None)
-                            rerun_keeping_settings()
-                    with c2:
+                    st.caption(
+                        f"Frame {start_frame} of {last} · "
+                        f"t = {ct.format_time(start_frame / fps)}")
+
+                    # ---- 3 · the four markers ------------------------------
+                    st.markdown("**3 · Select the four corners**")
+                    # A canvas keyed to the video: a new file gets a new,
+                    # empty one instead of the last video's dots.
+                    pick_microns = float(
+                        st.session_state.get("mt_um_per_px", 0.0)) or None
+                    markers = motion_pick_panel(
+                        frame_bgr, microns=pick_microns,
+                        canvas_key="mt_canvas_" + str(
+                            abs(hash((motion_path, video_signature()))) % 10 ** 9))
+                    # The canvas draws its own undo / redo / bin under itself,
+                    # and those are the buttons that can actually remove a dot
+                    # from it. A second pair here would only change this page's
+                    # list, and the canvas would put the dot back on the next
+                    # run.
+                    if HAS_CANVAS:
                         st.markdown(
-                            f"<div style='padding-top:0.5rem'>"
-                            f"<b>{len(markers)} of 4</b> placed</div>",
+                            f"<div style='text-align:right'><b>"
+                            f"{len(markers)} of 4</b> placed</div>",
                             unsafe_allow_html=True)
-                if HAS_CANVAS and markers:
-                    st.image(
-                        motion_preview(frame_bgr, markers,
-                                       microns=pick_microns),
-                        caption="The four corners at full size, with the "
-                                "quadrilateral they make.", **STRETCH)
-
-                # ---- 4 · how far to read -------------------------------
-                st.markdown("**4 · How far to read**")
-                stored_end = st.session_state.get("mt_end", 0)
-                st.session_state["mt_end"] = int(clamp_int(
-                    last if not stored_end else stored_end,
-                    int(start_frame), last))
-                end_frame = st.slider(
-                    "Read to frame", int(start_frame),
-                    max(last, int(start_frame)), key="mt_end",
-                    help="Nothing past this frame is tracked. Stop before the "
-                         "cell leaves the field or the probe covers it.")
-                span = int(end_frame) - int(start_frame) + 1
-                st.caption(
-                    f"{span:,} frames · {span / fps:.2f} s of video. "
-                    + ("Long runs take a while: tracking reads every frame."
-                       if span > 1500 else
-                       "About a second of work per few hundred frames."))
-
-                # ---- 5 · how it is tracked -----------------------------
-                with st.expander("⚙️ How it is tracked, and in what units"):
-                    o1, o2 = st.columns(2)
-                    with o1:
-                        st.number_input(
-                            "µm per pixel (0 = report in pixels)",
-                            0.0, 100.0, step=0.001, format="%.4f",
-                            key="mt_um_per_px",
-                            help="Everything is reported in pixels unless "
-                                 "this is set. A sphere of known diameter is "
-                                 "the usual way to get it: diameter in µm "
-                                 "divided by its diameter in pixels.")
-                        st.number_input(
-                            "Tracking window (px)", 7, 101, step=2,
-                            key="mt_window",
-                            help="How far around each marker the tracker "
-                                 "looks. Wide enough to cover how far a "
-                                 "marker moves between frames, narrow enough "
-                                 "not to swallow its neighbours. 41 suits "
-                                 "10x video of a beating cell.")
-                        st.slider(
-                            "Contrast", 0.5, 3.0, step=0.1, key="mt_contrast",
-                            help="Applied to the frames the tracker sees, not "
-                                 "to the video. Raise it on a flat, dim "
-                                 "field; it changes what is trackable, not "
-                                 "what is measured.")
-                    with o2:
-                        st.checkbox(
-                            "Gentle tracking", key="mt_gentle",
-                            help="Softer corrections and wider smoothing: a "
-                                 "calmer trace, a little slower to follow a "
-                                 "sharp move.")
-                        st.checkbox(
-                            "Keep tracking under the probe", key="mt_follow",
-                            help="A marker that goes out of sight is moved by "
-                                 "the motion of the three still tracked, so "
-                                 "its displacement goes on counting as cell "
-                                 "motion. Off, it freezes where it was last "
-                                 "seen, which reads as the cell stopping.")
-                        st.checkbox(
-                            "Snap the picks onto corners", key="mt_subpix",
-                            help="Moves each pick to the nearest corner to "
-                                 "sub-pixel accuracy before tracking. A click "
-                                 "is worth about two pixels; everything here "
-                                 "is measured in tenths of one.")
-                        st.checkbox(
-                            "Anchor against the first frame", key="mt_anchor",
-                            help="Each frame, check the tracker against a "
-                                 "template of the marker as it was on the "
-                                 "first frame. This is what stops slow drift "
-                                 "over a few hundred frames, and what "
-                                 "recovers a marker that is lost outright.")
-
-                # ---- 6 · track ----------------------------------------
-                ready = len(markers) == 4
-                if not ready:
-                    st.info(
-                        f"Select {4 - len(markers)} more corner"
-                        f"{'' if 4 - len(markers) == 1 else 's'} to track.",
-                        icon="🖱️")
-                signature = repr((
-                    motion_path, video_signature(), start_frame, end_frame,
-                    [tuple(np.round(p, 2)) for p in markers],
-                    int(st.session_state.get("mt_window", 41)),
-                    float(st.session_state.get("mt_contrast", 1.0)),
-                    bool(st.session_state.get("mt_gentle", True)),
-                    bool(st.session_state.get("mt_subpix", True)),
-                    bool(st.session_state.get("mt_anchor", True)),
-                ))
-                if st.button("▶️ Track the four corners", key="mt_go",
-                             disabled=not ready, type="primary", **STRETCH):
-                    seeds = np.array(markers, dtype=np.float32)
-                    if st.session_state.get("mt_subpix", True):
-                        try:
-                            seeds = ct.refine_corners_subpix(
-                                ct.gray_for_lk(
-                                    frame_bgr,
-                                    float(st.session_state.get(
-                                        "mt_contrast", 1.0))),
-                                seeds)
-                        except Exception:
-                            pass
-                    bar = st.progress(0.0, text="Tracking…")
-                    seen = {"at": 0.0}
-
-                    def _tick(done, total):
-                        fraction = float(done) / float(max(total, 1))
-                        if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
-                            seen["at"] = fraction
-                            bar.progress(
-                                min(1.0, fraction),
-                                text=f"Tracking… {int(fraction * 100)} % "
-                                     f"({done:,} of {total:,} frames)")
-                        return False
-
-                    try:
-                        found = ct.track_points(
-                            motion_path, seeds,
-                            start_frame=int(start_frame),
-                            end_frame=int(end_frame),
-                            window_size=int(
-                                st.session_state.get("mt_window", 41)),
-                            contrast=float(
-                                st.session_state.get("mt_contrast", 1.0)),
-                            gentle=bool(
-                                st.session_state.get("mt_gentle", True)),
-                            anchor=bool(
-                                st.session_state.get("mt_anchor", True)),
-                            progress=_tick)
-                    except Exception as exc:
-                        bar.empty()
-                        st.error(f"Tracking failed: {exc}", icon="🚫")
                     else:
-                        bar.empty()
-                        st.session_state["mt_result"] = found
-                        st.session_state["mt_signature"] = signature
-                        st.success(
-                            f"Tracked {found['points'].shape[0]:,} frames "
-                            f"from frame {int(found['start_frame'])}.",
-                            icon="✅")
+                        c1, c2 = st.columns([1, 3])
+                        with c1:
+                            if st.button("🗑️ Clear", key="mt_clear",
+                                         disabled=not markers, **STRETCH):
+                                motion_set_markers([])
+                                for _i in range(4):
+                                    st.session_state.pop(f"mt_x{_i}", None)
+                                    st.session_state.pop(f"mt_y{_i}", None)
+                                rerun_keeping_settings()
+                        with c2:
+                            st.markdown(
+                                f"<div style='padding-top:0.5rem'>"
+                                f"<b>{len(markers)} of 4</b> placed</div>",
+                                unsafe_allow_html=True)
+                    if HAS_CANVAS and markers:
+                        st.image(
+                            motion_preview(frame_bgr, markers,
+                                           microns=pick_microns),
+                            caption="The four corners at full size, with the "
+                                    "quadrilateral they make.", **STRETCH)
 
-                # ---- 7 · the readings ---------------------------------
-                result = st.session_state.get("mt_result")
-                if result is not None:
-                    # Settled here rather than at tracking time: whether a
-                    # lost marker follows the group is a reading of the same
-                    # track, so the switch takes effect at once instead of
-                    # asking for the whole video again.
-                    held, _fixed = ct.settle(
-                        result,
-                        follow_under_probe=bool(
-                            st.session_state.get("mt_follow", True)))
-                    st.markdown("**5 · What the corners did**")
-                    if st.session_state.get("mt_signature") != signature:
-                        st.warning(
-                            "Something has changed since this was tracked — "
-                            "the corners, the range or a setting. What is "
-                            "below is the previous reading; press **▶️ Track "
-                            "the four corners** to redo it.", icon="⚠️")
-                    microns = float(st.session_state.get("mt_um_per_px", 0.0))
-                    motion_results_panel(result, held,
-                                         microns if microns > 0 else None)
+                    # ---- 4 · how far to read -------------------------------
+                    st.markdown("**4 · How far to read**")
+                    stored_end = st.session_state.get("mt_end", 0)
+                    st.session_state["mt_end"] = int(clamp_int(
+                        last if not stored_end else stored_end,
+                        int(start_frame), last))
+                    end_frame = st.slider(
+                        "Read to frame", int(start_frame),
+                        max(last, int(start_frame)), key="mt_end",
+                        help="Nothing past this frame is tracked. Stop before the "
+                             "cell leaves the field or the probe covers it.")
+                    span = int(end_frame) - int(start_frame) + 1
+                    st.caption(
+                        f"{span:,} frames · {span / fps:.2f} s of video. "
+                        + ("Long runs take a while: tracking reads every frame."
+                           if span > 1500 else
+                           "About a second of work per few hundred frames."))
+
+                    # ---- 5 · how it is tracked -----------------------------
+                    with st.expander("⚙️ How it is tracked, and in what units"):
+                        o1, o2 = st.columns(2)
+                        with o1:
+                            st.number_input(
+                                "µm per pixel (0 = report in pixels)",
+                                0.0, 100.0, step=0.001, format="%.4f",
+                                key="mt_um_per_px",
+                                help="Everything is reported in pixels unless "
+                                     "this is set. A sphere of known diameter is "
+                                     "the usual way to get it: diameter in µm "
+                                     "divided by its diameter in pixels.")
+                            st.number_input(
+                                "Tracking window (px)", 7, 101, step=2,
+                                key="mt_window",
+                                help="How far around each marker the tracker "
+                                     "looks. Wide enough to cover how far a "
+                                     "marker moves between frames, narrow enough "
+                                     "not to swallow its neighbours. 41 suits "
+                                     "10x video of a beating cell.")
+                            st.slider(
+                                "Contrast", 0.5, 3.0, step=0.1, key="mt_contrast",
+                                help="Applied to the frames the tracker sees, not "
+                                     "to the video. Raise it on a flat, dim "
+                                     "field; it changes what is trackable, not "
+                                     "what is measured.")
+                        with o2:
+                            st.checkbox(
+                                "Gentle tracking", key="mt_gentle",
+                                help="Softer corrections and wider smoothing: a "
+                                     "calmer trace, a little slower to follow a "
+                                     "sharp move.")
+                            st.checkbox(
+                                "Keep tracking under the probe", key="mt_follow",
+                                help="A marker that goes out of sight is moved by "
+                                     "the motion of the three still tracked, so "
+                                     "its displacement goes on counting as cell "
+                                     "motion. Off, it freezes where it was last "
+                                     "seen, which reads as the cell stopping.")
+                            st.checkbox(
+                                "Snap the picks onto corners", key="mt_subpix",
+                                help="Moves each pick to the nearest corner to "
+                                     "sub-pixel accuracy before tracking. A click "
+                                     "is worth about two pixels; everything here "
+                                     "is measured in tenths of one.")
+                            st.checkbox(
+                                "Anchor against the first frame", key="mt_anchor",
+                                help="Each frame, check the tracker against a "
+                                     "template of the marker as it was on the "
+                                     "first frame. This is what stops slow drift "
+                                     "over a few hundred frames, and what "
+                                     "recovers a marker that is lost outright.")
+
+                    # ---- 6 · track ----------------------------------------
+                    ready = len(markers) == 4
+                    if not ready:
+                        st.info(
+                            f"Select {4 - len(markers)} more corner"
+                            f"{'' if 4 - len(markers) == 1 else 's'} to track.",
+                            icon="🖱️")
+                    signature = repr((
+                        motion_path, video_signature(), start_frame, end_frame,
+                        [tuple(np.round(p, 2)) for p in markers],
+                        int(st.session_state.get("mt_window", 41)),
+                        float(st.session_state.get("mt_contrast", 1.0)),
+                        bool(st.session_state.get("mt_gentle", True)),
+                        bool(st.session_state.get("mt_subpix", True)),
+                        bool(st.session_state.get("mt_anchor", True)),
+                    ))
+                    if st.button("▶️ Track the four corners", key="mt_go",
+                                 disabled=not ready, type="primary", **STRETCH):
+                        seeds = np.array(markers, dtype=np.float32)
+                        if st.session_state.get("mt_subpix", True):
+                            try:
+                                seeds = ct.refine_corners_subpix(
+                                    ct.gray_for_lk(
+                                        frame_bgr,
+                                        float(st.session_state.get(
+                                            "mt_contrast", 1.0))),
+                                    seeds)
+                            except Exception:
+                                pass
+                        bar = st.progress(0.0, text="Tracking…")
+                        seen = {"at": 0.0}
+
+                        def _tick(done, total):
+                            fraction = float(done) / float(max(total, 1))
+                            if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
+                                seen["at"] = fraction
+                                bar.progress(
+                                    min(1.0, fraction),
+                                    text=f"Tracking… {int(fraction * 100)} % "
+                                         f"({done:,} of {total:,} frames)")
+                            return False
+
+                        try:
+                            found = ct.track_points(
+                                motion_path, seeds,
+                                start_frame=int(start_frame),
+                                end_frame=int(end_frame),
+                                window_size=int(
+                                    st.session_state.get("mt_window", 41)),
+                                contrast=float(
+                                    st.session_state.get("mt_contrast", 1.0)),
+                                gentle=bool(
+                                    st.session_state.get("mt_gentle", True)),
+                                anchor=bool(
+                                    st.session_state.get("mt_anchor", True)),
+                                progress=_tick)
+                        except Exception as exc:
+                            bar.empty()
+                            st.error(f"Tracking failed: {exc}", icon="🚫")
+                        else:
+                            bar.empty()
+                            st.session_state["mt_result"] = found
+                            st.session_state["mt_signature"] = signature
+                            st.success(
+                                f"Tracked {found['points'].shape[0]:,} frames "
+                                f"from frame {int(found['start_frame'])}.",
+                                icon="✅")
+
+                    # ---- 7 · the readings ---------------------------------
+                    result = st.session_state.get("mt_result")
+                    if result is not None:
+                        # Settled here rather than at tracking time: whether a
+                        # lost marker follows the group is a reading of the same
+                        # track, so the switch takes effect at once instead of
+                        # asking for the whole video again.
+                        held, _fixed = ct.settle(
+                            result,
+                            follow_under_probe=bool(
+                                st.session_state.get("mt_follow", True)))
+                        st.markdown("**5 · What the corners did**")
+                        if st.session_state.get("mt_signature") != signature:
+                            st.warning(
+                                "Something has changed since this was tracked — "
+                                "the corners, the range or a setting. What is "
+                                "below is the previous reading; press **▶️ Track "
+                                "the four corners** to redo it.", icon="⚠️")
+                        microns = float(st.session_state.get("mt_um_per_px", 0.0))
+                        motion_results_panel(result, held,
+                                             microns if microns > 0 else None)
 
 
 with tab_video:
