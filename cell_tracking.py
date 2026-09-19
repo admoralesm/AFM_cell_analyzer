@@ -887,3 +887,176 @@ def quad_area(points):
             total += row[j, 0] * row[nxt, 1] - row[nxt, 0] * row[j, 1]
         out[i] = abs(total) * 0.5
     return out
+
+
+# ------------------------------------------------------------- clipping ---
+#
+# The desktop app's clipper: cut the stretch of the video that matters out
+# of the recording, by frame or by time, as its own file. FFmpeg does it
+# properly -- frame-accurate, sound kept, H.264 that every browser plays --
+# and OpenCV does it when FFmpeg is not there, video only, so the button
+# never simply fails.
+
+import os as _os
+import re as _re
+import shutil as _shutil
+import subprocess as _subprocess
+
+
+def ffmpeg_path():
+    """Where FFmpeg is, or None. The system one first, then imageio's."""
+    found = _shutil.which("ffmpeg")
+    if found:
+        return found
+    try:  # pragma: no cover - only where imageio-ffmpeg is installed
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def parse_time(text):
+    """
+    '1:02.5', '00:01:02.500' or '62.5' as seconds; None when it is not one.
+
+    The same three forms the desktop clipper takes, so a time copied out of
+    a video player's position box can be pasted straight in.
+    """
+    if text is None:
+        return None
+    value = str(text).strip()
+    if not value:
+        return None
+    if ":" not in value:
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if number >= 0 else None
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        numbers = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(n < 0 for n in numbers):
+        return None
+    if len(numbers) == 2:
+        return numbers[0] * 60.0 + numbers[1]
+    return numbers[0] * 3600.0 + numbers[1] * 60.0 + numbers[2]
+
+
+def clip_name(video_path, t0, t1, ext=".mp4"):
+    """video_clip_00m01s250_to_00m04s000.mp4 -- the desktop app's naming."""
+    stem = _os.path.splitext(_os.path.basename(str(video_path)))[0]
+    stem = _re.sub(r"^afm_video_", "", stem)
+
+    def tag(seconds):
+        seconds = max(0.0, float(seconds))
+        minutes = int(seconds // 60)
+        whole = int(seconds % 60)
+        millis = int(round((seconds - int(seconds)) * 1000)) % 1000
+        return f"{minutes:02d}m{whole:02d}s{millis:03d}"
+
+    return f"{stem}_clip_{tag(t0)}_to_{tag(t1)}{ext}"
+
+
+def clip_video(video_path, out_path, start_s, end_s, accurate=True,
+               progress=None):
+    """
+    Write ``start_s``..``end_s`` of the video to ``out_path``.
+
+    With FFmpeg: ``accurate`` re-encodes (H.264, sound kept, starts exactly
+    on the frame asked for); otherwise the streams are copied, which is
+    instant and lossless but can only start on a keyframe, so the clip may
+    begin a little early. Without FFmpeg the frames are copied through
+    OpenCV: frame-exact, no sound.
+
+    Returns {"path", "method", "frames" (OpenCV only), "note"}.
+    """
+    start_s = max(0.0, float(start_s))
+    end_s = max(start_s, float(end_s))
+    duration = end_s - start_s
+    if duration <= 0:
+        raise ValueError("The clip ends where it starts.")
+
+    exe = ffmpeg_path()
+    if exe:
+        if accurate:
+            command = [exe, "-y", "-i", str(video_path),
+                       "-ss", f"{start_s:.6f}", "-t", f"{duration:.6f}",
+                       "-map", "0:v:0?", "-map", "0:a:0?",
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                       "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-b:a", "192k",
+                       "-movflags", "+faststart", str(out_path)]
+        else:
+            command = [exe, "-y", "-ss", f"{start_s:.6f}",
+                       "-t", f"{duration:.6f}", "-i", str(video_path),
+                       "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+                       str(out_path)]
+        done = _subprocess.run(command, capture_output=True, text=True,
+                               timeout=900)
+        if done.returncode == 0 and _os.path.exists(out_path) \
+                and _os.path.getsize(out_path) > 0:
+            return {"path": str(out_path),
+                    "method": "ffmpeg, re-encoded" if accurate
+                              else "ffmpeg, streams copied",
+                    "note": ("Frame-accurate, H.264, sound kept."
+                             if accurate else
+                             "Lossless and instant; starts on the nearest "
+                             "keyframe, so it may begin a little early.")}
+        # FFmpeg is there but refused this file. Say so, then fall through
+        # to OpenCV rather than leave the person with nothing.
+        failure = (done.stderr or "").strip().splitlines()[-1:] or [""]
+        fallback_note = f"FFmpeg could not cut it ({failure[0][:160]}). "
+    else:
+        fallback_note = ""
+
+    if cv2 is None:
+        raise RuntimeError(f"Neither FFmpeg nor OpenCV is available: "
+                           f"{CV2_ERROR}")
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError("Could not open that video to clip it.")
+    writer = None
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        fps = float(fps) if fps and fps > 0 else DEFAULT_FPS
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        first = int(clamp(round(start_s * fps), 0, max(0, total - 1)))
+        # The end is exclusive, as it is for FFmpeg's -t: 1.0 to 2.0 s at
+        # 30 fps is frames 30 to 59, thirty of them, whichever engine cuts it.
+        last = int(clamp(round(end_s * fps) - 1, first, max(0, total - 1)))
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(str(out_path),
+                                 cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                                 (width, height))
+        if not writer.isOpened():
+            raise RuntimeError("OpenCV could not open a video file to write.")
+        capture.set(cv2.CAP_PROP_POS_FRAMES, first)
+        written = 0
+        span = max(1, last - first + 1)
+        for index in range(first, last + 1):
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            if frame.shape[1] != width or frame.shape[0] != height:
+                frame = cv2.resize(frame, (width, height))
+            writer.write(frame)
+            written += 1
+            if progress is not None and progress(written, span):
+                break
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+    if written == 0:
+        raise RuntimeError("No frames could be read in that range.")
+    return {"path": str(out_path), "method": "OpenCV", "frames": written,
+            "note": fallback_note + "Frame-exact, video only (no sound), "
+                    "MPEG-4 Part 2. It downloads and opens in VLC or "
+                    "Fiji; some browsers will not preview it. Installing "
+                    "FFmpeg gives H.264 with sound."}
