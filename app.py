@@ -195,6 +195,10 @@ model_conditioning = getattr(_piecewise_module, "model_conditioning", None)
 bending_crossover = getattr(_piecewise_module, "bending_crossover", None)
 bending_constant = getattr(_piecewise_module, "bending_constant", None)
 bending_prefactor = getattr(_piecewise_module, "bending_prefactor", None)
+# Lulevich's two laws fitted the way the cardiomyocyte curves ask for
+# (interior from contact, sarcolemma from its reserve), and eq 1 as written.
+lulevich_eq1_fit = getattr(_piecewise_module, "lulevich_eq1_fit", None)
+eq1_force = getattr(_piecewise_module, "eq1_force", None)
 LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
 HAS_VALIDATION = all(f is not None for f in (
     information_criteria, akaike_weights, residual_diagnostics,
@@ -879,6 +883,11 @@ DEFAULTS = {
     # The same idea on the analysis tab: one folder, stepped through a
     # curve at a time with the two arrows next to the uploader.
     "cv_folder": "",
+    # The cardiomyocyte fit: the sarcolemma from its reserve, the window
+    # ended where the curve's own log-log slope reaches 3.
+    "eq1_arrangement": "reserve",
+    "eq1_window_mode": "auto",
+    "eq1_window": 35.0,
     "cv_pattern": "*",
     "cv_unit": "from the column name",
     # The four-marker video tracker on the Cell motion tab.
@@ -7723,6 +7732,356 @@ def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
                     "for every doubling after that.")
 
 
+# ================================================ the cardiomyocyte fit ==
+#
+# Lulevich's eq 3 and eq 6, fitted the way these curves ask for. The board
+# above places the cytoskeleton's join by searching a band; this fits the
+# two laws with the interior from contact and the sarcolemma from its own
+# reserve ε_r, weighted by the noise, with the contact offset and the
+# reserve profiled and the window ended where the curve's own local
+# exponent reaches 3. Its reasons are in piecewise_fit.lulevich_eq1_fit.
+
+EQ1_WINDOW_MODES = {"auto": "Where p(ε) reaches 3 (auto)",
+                    "manual": "Set it"}
+EQ1_ARRANGEMENTS = {
+    "reserve": "Sarcolemma from its reserve ε_r (recommended)",
+    "eq1": "Eq 1 as written: both from contact",
+}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def cached_eq1_fit(epsilon, force_N, height_m, radius_m, thickness_m,
+                   nu_m, nu_i, probe_radius_m, reserve, window, n_boot):
+    geometry = Geometry(
+        cell_height=float(height_m), cell_radius=float(radius_m),
+        nucleus_radius=float(radius_m) * 0.3,
+        probe_radius=probe_radius_m if probe_radius_m else None,
+        membrane_thickness=float(thickness_m),
+        nu_membrane=float(nu_m), nu_interior=float(nu_i))
+    return lulevich_eq1_fit(
+        np.asarray(epsilon, dtype=float), np.asarray(force_N, dtype=float),
+        geometry, reserve=bool(reserve), window_pct=window,
+        n_boot=int(n_boot))
+
+
+def eq1_for(epsilon, force_N, model, reserve=None, window=None, n_boot=200):
+    """The cardiomyocyte fit of this curve with the page's own geometry."""
+    if lulevich_eq1_fit is None or not HAS_PIECEWISE:
+        return None
+    g = model if hasattr(model, "cell_radius") else piecewise_geometry(model)
+    if reserve is None:
+        reserve = st.session_state.get("eq1_arrangement", "reserve") == "reserve"
+    if window is None:
+        window = ("auto" if st.session_state.get("eq1_window_mode", "auto")
+                  == "auto" else float(st.session_state.get("eq1_window", 35.0)))
+    try:
+        return cached_eq1_fit(
+            np.asarray(epsilon, dtype=float), np.asarray(force_N, dtype=float),
+            float(g.cell_height), float(g.cell_radius),
+            float(early_thickness_m()), float(g.nu_membrane),
+            float(g.nu_interior), float(g.probe_radius or 0.0),
+            bool(reserve), window, int(n_boot))
+    except Exception as exc:          # a curve the fit cannot read
+        return {"success": False, "error": str(exc)}
+
+
+def eq1_summary(fit):
+    """The numbers a collection keeps from a cardiomyocyte fit."""
+    if not (fit and fit.get("success")):
+        return None
+    keys = ("E_m_Pa", "E_i_Pa", "K_s_N_per_m", "eps_star", "delta", "reserve",
+            "window_pct", "r_squared", "rel_rms_pct", "E_m_window_pct",
+            "E_i_window_pct", "beyond_pct", "delta_aicc", "model")
+    out = {k: fit.get(k) for k in keys}
+    for k in ("E_m_ci_Pa", "E_i_ci_Pa", "reserve_ci"):
+        out[k] = list(fit.get(k) or (float("nan"), float("nan")))
+    return out
+
+
+def _eq1_ci_text(ci, scale, unit, digits=3):
+    lo, hi = ci
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return ""
+    return f"95 % CI {lo / scale:.{digits}g} to {hi / scale:.{digits}g} {unit}"
+
+
+def eq1_verdicts(fit):
+    """What each number is worth, from the fit's own tests."""
+    out = {}
+    ei_ci, em_ci = fit["E_i_ci_Pa"], fit["E_m_ci_Pa"]
+    ei, em = fit["E_i_Pa"], fit["E_m_Pa"]
+
+    def width(ci, v):
+        return ((ci[1] - ci[0]) / v * 100.0
+                if v > 0 and np.isfinite(ci[0]) else float("inf"))
+    wi, wm = width(ei_ci, ei), width(em_ci, em)
+    mi = fit["E_i_window_pct"]
+    mm = fit["E_m_window_pct"]
+    out["E_i"] = (
+        "solid" if wi < 25 and (not np.isfinite(mi) or mi < 15)
+        else "usable" if wi < 60 and (not np.isfinite(mi) or mi < 35)
+        else "weak")
+    engaged = fit["window_pct"] - (fit["delta"] + fit["reserve"]) * 100.0
+    out["E_m"] = (
+        "not resolved" if em <= 0 or engaged < 6.0
+        else "solid" if wm < 40 and (not np.isfinite(mm) or mm < 25)
+        else "usable" if wm < 100 and (not np.isfinite(mm) or mm < 60)
+        else "weak")
+    out["engaged_pct"] = engaged
+    return out
+
+
+def eq1_curve_figure(fit, epsilon, force_N, unit, scale):
+    x = np.asarray(epsilon, dtype=float) * 100.0
+    f = np.asarray(force_N, dtype=float)
+    reach = float(fit["curve"]["x_pct"][-1])
+    keep = (x >= -2.0) & (x <= reach)
+    idx = np.flatnonzero(keep)
+    if idx.size > 3000:
+        idx = idx[np.linspace(0, idx.size - 1, 3000).astype(int)]
+    fig = go.Figure()
+    fig.add_vrect(x0=float(fit["window_pct"]), x1=reach,
+                  fillcolor="rgba(120,120,120,0.10)", line_width=0,
+                  annotation_text="past the window", annotation_position="top left")
+    fig.add_trace(go.Scatter(
+        x=x[idx], y=f[idx] / scale, mode="markers", name="data",
+        marker={"size": 3, "color": "rgba(80,80,80,0.35)"}, hoverinfo="skip"))
+    cx = fit["curve"]["x_pct"]
+    inner = fit["curve"]["interior_N"] / scale
+    fig.add_trace(go.Scatter(
+        x=cx, y=inner, mode="lines", name=PW_COMPONENTS[1][1] + " (eq 6)",
+        line={"color": "#f28e2b", "width": 0}, fill="tozeroy",
+        fillcolor="rgba(242,142,43,0.35)"))
+    fig.add_trace(go.Scatter(
+        x=cx, y=inner + fit["curve"]["shell_N"] / scale, mode="lines",
+        name=PW_COMPONENTS[0][1] + " (eq 3)", line={"color": "#e15759",
+                                                    "width": 0},
+        fill="tonexty", fillcolor="rgba(225,87,89,0.35)"))
+    fig.add_trace(go.Scatter(
+        x=cx, y=fit["curve"]["total_N"] / scale, mode="lines",
+        name="eq 3 + eq 6", line={"color": "#111", "width": 2.5}))
+    marks = [(fit["delta"] * 100.0, "contact δ"),
+             ((fit["delta"] + fit["reserve"]) * 100.0, "sarcolemma engages")]
+    if np.isfinite(fit["eps_star"]):
+        marks.append(((fit["delta"] + fit["eps_star"]) * 100.0
+                      if fit["reserve"] <= 0 else float("nan"), "ε*"))
+    for at, label in marks:
+        if np.isfinite(at) and 0 <= at <= reach and (
+                label != "sarcolemma engages" or fit["reserve"] > 0):
+            fig.add_vline(x=at, line_dash="dot", line_color="#666",
+                          annotation_text=label, annotation_position="top")
+    fig.update_layout(
+        height=380, margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        xaxis_title="deformation ε (%)", yaxis_title=f"force ({unit})",
+        legend={"orientation": "h", "y": -0.22})
+    return fig
+
+
+def eq1_apparent_figure(fit):
+    a = fit["apparent"]
+    fig = go.Figure()
+    col = np.where(a["in_window"], "#4e79a7", "#bbbbbb")
+    fig.add_trace(go.Scatter(
+        x=a["x_pct"], y=a["E_Pa"] / 1e3, mode="markers", name="data",
+        marker={"size": 6, "color": col}))
+    fig.add_trace(go.Scatter(
+        x=a["model_x_pct"], y=a["model_E_Pa"] / 1e3, mode="lines",
+        name="fit", line={"color": "#111", "width": 2}))
+    fig.add_hline(y=fit["E_i_Pa"] / 1e3, line_dash="dash",
+                  line_color="#f28e2b",
+                  annotation_text=f"Eᵢ = {fit['E_i_Pa'] / 1e3:.3g} kPa",
+                  annotation_position="bottom right")
+    fig.update_layout(
+        height=300, margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        title={"text": "Apparent Hertz modulus F / (Aᵢ·s^1.5)",
+               "font": {"size": 13}},
+        xaxis_title="ε (%)", yaxis_title="kPa", showlegend=False)
+    return fig
+
+
+def eq1_exponent_figure(fit):
+    p = fit["exponent"]
+    fig = go.Figure()
+    fig.add_hrect(y0=1.5, y1=3.0, fillcolor="rgba(78,121,167,0.07)",
+                  line_width=0)
+    fig.add_trace(go.Scatter(x=p["x_pct"], y=p["p_data"], mode="lines",
+                             name="data", line={"color": "#4e79a7",
+                                                "width": 2}))
+    fig.add_trace(go.Scatter(x=p["x_pct"], y=p["p_model"], mode="lines",
+                             name="fit", line={"color": "#111", "width": 2,
+                                               "dash": "dash"}))
+    fig.add_vline(x=fit["window_pct"], line_dash="dot", line_color="#666",
+                  annotation_text="window end", annotation_position="top")
+    fig.update_layout(
+        height=300, margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        title={"text": "Local exponent p(ε) = d ln F / d ln ε",
+               "font": {"size": 13}},
+        xaxis_title="ε (%)", yaxis_title="p", yaxis_range=[0.5, 4.5],
+        showlegend=False)
+    return fig
+
+
+def eq1_panel(epsilon, force_N, model, result=None, style=None):
+    """
+    The cardiomyocyte answer: Eᵢ and Eₘ from eq 3 + eq 6, with what they
+    are worth, and the two plots that show whether the laws hold.
+    """
+    if lulevich_eq1_fit is None:
+        st.caption("The cardiomyocyte fit needs the piecewise_fit.py shipped "
+                   "with this app.py.")
+        return None
+    box = st.container(border=True)
+    with box:
+        st.markdown("#### 🫀 Cardiomyocyte fit: eq 3 + eq 6")
+        c1, c2, c3 = st.columns([2.2, 1.6, 1.2])
+        with c1:
+            st.radio("How the two laws share the load",
+                     list(EQ1_ARRANGEMENTS), key="eq1_arrangement",
+                     format_func=EQ1_ARRANGEMENTS.get,
+                     help="Reserve: the non-sarcomeric cytoskeleton carries "
+                          "the load from contact and the sarcolemma starts "
+                          "stretching once its reserve (caveolae, folds) is "
+                          "used up. ε_r = 0 is eq 1 exactly, so this never "
+                          "fits worse. Eq 1: both from contact.")
+        with c2:
+            st.radio("Window end", list(EQ1_WINDOW_MODES),
+                     key="eq1_window_mode", format_func=EQ1_WINDOW_MODES.get,
+                     help="Neither law can make the force rise faster than "
+                          "ε³, so where the curve's own log-log slope "
+                          "reaches 3 the cell has left the model (it is "
+                          "confined between the plates). Auto ends there, "
+                          "held between 25 and 45 %.")
+        with c3:
+            if st.session_state.get("eq1_window_mode") == "manual":
+                st.number_input("to ε (%)", min_value=10.0, max_value=80.0,
+                                step=1.0, key="eq1_window")
+        reserve = st.session_state.get("eq1_arrangement") == "reserve"
+        if reserve:
+            st.latex(r"F=\underbrace{\frac{\sqrt{2}\,E_i R_0^{2}}{3(1-\nu_i^{2})}"
+                     r"\,s^{3/2}}_{\text{eq 6, from contact}}+"
+                     r"\underbrace{\frac{2\pi E_m h_m R_0}{1-\nu_m}\,"
+                     r"(s-\varepsilon_r)_+^{3}}_{\text{eq 3, from its reserve}}"
+                     r",\qquad s=\varepsilon-\delta")
+        else:
+            st.latex(r"F=\frac{2\pi E_m h_m R_0}{1-\nu_m}\,s^{3}+"
+                     r"\frac{\sqrt{2}\,E_i R_0^{2}}{3(1-\nu_i^{2})}\,s^{3/2},"
+                     r"\qquad s=\varepsilon-\delta")
+        fit = eq1_for(epsilon, force_N, model)
+        if not (fit and fit.get("success")):
+            st.warning("The two laws could not be fitted to this curve"
+                       + (f": {fit.get('error')}" if fit else
+                          " (it is shorter than 5 % deformation)."))
+            return fit
+        v = eq1_verdicts(fit)
+        badge = {"solid": "✅", "usable": "🟡", "weak": "⚠️",
+                 "not resolved": "🚫"}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"{PW_COMPONENTS[1][1]}  Eᵢ",
+                  f"{fit['E_i_Pa'] / 1e3:.3g} kPa")
+        m1.caption(f"{badge[v['E_i']]} {v['E_i']} · "
+                   + _eq1_ci_text(fit["E_i_ci_Pa"], 1e3, "kPa"))
+        m2.metric(f"{PW_COMPONENTS[0][1]}  Eₘ",
+                  f"{fit['E_m_Pa'] / 1e6:.3g} MPa")
+        m2.caption(f"{badge[v['E_m']]} {v['E_m']} · "
+                   + _eq1_ci_text(fit["E_m_ci_Pa"], 1e6, "MPa"))
+        m3.metric("Kₛ = Eₘhₘ/(1−νₘ)",
+                  f"{fit['K_s_N_per_m'] * 1e3:.3g} mN/m")
+        m3.caption(f"what the curve measures; Eₘ assumes hₘ = "
+                   f"{fit['thickness_m'] * 1e9:g} nm")
+        if reserve:
+            m4.metric("reserve ε_r", f"{fit['reserve'] * 100:.1f} %")
+            lo, hi = fit["reserve_ci"]
+            m4.caption(f"95 % CI {lo * 100:.1f} to {hi * 100:.1f} %"
+                       if np.isfinite(lo) else "")
+        else:
+            m4.metric("crossover ε*", f"{fit['eps_star'] * 100:.1f} %"
+                      if np.isfinite(fit["eps_star"]) else "n/a")
+            m4.caption("where the two laws carry equal load")
+
+        unit = (style.force_unit if style is not None and
+                getattr(style, "force_unit", None) in ("pN", "nN", "µN", "N")
+                else "nN")
+        scale = {"pN": 1e-12, "nN": 1e-9, "µN": 1e-6, "N": 1.0}[unit]
+        st.plotly_chart(eq1_curve_figure(fit, epsilon, force_N, unit, scale),
+                        key="eq1_curve", **STRETCH)
+        g1, g2 = st.columns(2)
+        with g1:
+            st.plotly_chart(eq1_apparent_figure(fit), key="eq1_apparent",
+                            **STRETCH)
+            st.caption("Flat while the interior carries the load alone: its "
+                       "height is Eᵢ. It turns up where the sarcolemma joins.")
+        with g2:
+            st.plotly_chart(eq1_exponent_figure(fit), key="eq1_exponent",
+                            **STRETCH)
+            st.caption("1.5 is the interior alone, 3 the shell alone. The "
+                       "window ends where the data reach 3.")
+
+        alt = fit["alternative"]
+        rows = [
+            {"": "window", "value": f"0 → {fit['window_pct']:.1f} %",
+             "reads": fit["window_rule"]},
+            {"": "contact offset δ", "value": f"{fit['delta'] * 100:+.1f} %",
+             "reads": "profiled, not fixed"},
+            {"": "misfit (relative RMS, ε > 3 %)",
+             "value": f"{fit['rel_rms_pct']:.1f} %",
+             "reads": f"{alt['model']}: {alt['rel_rms_pct']:.1f} %"},
+            {"": "reserve vs eq 1, ΔAICc",
+             "value": f"{fit['delta_aicc']:+.0f}",
+             "reads": ("the reserve is supported" if fit["delta_aicc"] > 10
+                       else "no reserve needed" if fit["delta_aicc"] < 2
+                       else "weak preference")},
+            {"": "window moved ±5 points",
+             "value": (f"Eᵢ {fit['E_i_window_pct']:.0f} % · "
+                       f"Eₘ {fit['E_m_window_pct']:.0f} %"),
+             "reads": "largest change in each modulus"},
+            {"": "curve past the window",
+             "value": (f"{fit['beyond_pct']:+.0f} %"
+                       if np.isfinite(fit["beyond_pct"]) else "n/a"),
+             "reads": "above the laws: confinement between the plates"
+             if np.isfinite(fit["beyond_pct"]) and fit["beyond_pct"] > 5
+             else "the laws still hold"},
+            {"": "R²", "value": f"{fit['r_squared']:.5f}",
+             "reads": f"{fit['n_points']:,} points, noise-weighted"},
+        ]
+        if result and result.get("success"):
+            mods = result.get("moduli") or {}
+            em_b = float((mods.get("K_shell") or {}).get("E_Pa", float("nan")))
+            ei_b = float((mods.get("K_cyto") or {}).get("E_Pa", float("nan")))
+            rows.append({
+                "": "the board above (staggered join)",
+                "value": (f"Eᵢ {ei_b / 1e3:.3g} kPa · Eₘ {em_b / 1e6:.3g} MPa"
+                          if np.isfinite(em_b) and np.isfinite(ei_b)
+                          else "n/a"),
+                "reads": "for comparison only"})
+        flat_table(pd.DataFrame(rows))
+        if v["E_m"] in ("weak", "not resolved"):
+            st.info(
+                f"**Eₘ is {v['E_m']} on this cell.** The sarcolemma law acts "
+                f"over only {max(v['engaged_pct'], 0):.0f} points of strain "
+                f"inside the window, or moves by "
+                f"{fit['E_m_window_pct']:.0f} % when the window does. Report "
+                f"Eᵢ for this cell, and Eₘ only with its interval.",
+                icon="ℹ️")
+        table = pd.DataFrame([{
+            "model": fit["model"], "E_i_Pa": fit["E_i_Pa"],
+            "E_i_lo_Pa": fit["E_i_ci_Pa"][0], "E_i_hi_Pa": fit["E_i_ci_Pa"][1],
+            "E_m_Pa": fit["E_m_Pa"], "E_m_lo_Pa": fit["E_m_ci_Pa"][0],
+            "E_m_hi_Pa": fit["E_m_ci_Pa"][1],
+            "K_s_N_per_m": fit["K_s_N_per_m"], "reserve": fit["reserve"],
+            "eps_star": fit["eps_star"], "delta": fit["delta"],
+            "window_pct": fit["window_pct"], "r_squared": fit["r_squared"],
+            "rel_rms_pct": fit["rel_rms_pct"], "delta_aicc": fit["delta_aicc"],
+            "E_i_window_pct": fit["E_i_window_pct"],
+            "E_m_window_pct": fit["E_m_window_pct"],
+            "beyond_pct": fit["beyond_pct"], "h_m": fit["thickness_m"],
+            "R0_m": fit["R0_m"]}])
+        st.download_button(
+            "⬇️ This fit as CSV", table.to_csv(index=False).encode(),
+            file_name="cardiomyocyte_eq3_eq6_fit.csv", mime="text/csv",
+            key="eq1_download")
+    return fit
+
+
 def curve_folder_stepper():
     """
     A folder of curves on this machine, stepped through one at a time.
@@ -12091,6 +12450,10 @@ def collection_record(name, source, height_um, epsilon, force_N, result,
         "settings": piecewise_model_settings(),
         "carry": list(result.get("carry") or ()),
         "added_at": datetime.now().isoformat(timespec="seconds"),
+        # A cardiomyocyte also keeps its eq 3 + eq 6 fit, the numbers its
+        # genotype comparison is made of.
+        **({"eq1": eq1_summary(eq1_for(epsilon, force_N, geometry))}
+           if early_only() and lulevich_eq1_fit is not None else {}),
     }
 
 
@@ -13155,6 +13518,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
         # Rendered HERE, in code order, so it lands under the board and the
         # results rather than above them: it is a reading of a fit, and a
         # reference note above the fit it refers to is just noise.
+        # A cardiomyocyte's answer: the two laws fitted the way its curves
+        # ask for, beside the board's staggered reading.
+        if early_only():
+            eq1_panel(epsilon, force_N, model, result if ok else None, style)
         if ok and piecewise_regime() == "early":
             lulevich_panel(result, model, fit, epsilon, force_N)
 
@@ -13620,6 +13987,7 @@ def collection_frame(collection):
                   for r in collection.values())
     two_term = bool(collection) and all(rec.get("early")
                                         for rec in collection.values())
+    with_eq1 = any(rec.get("eq1") for rec in collection.values())
     for rec in collection.values():
         b = rec["bounds_pct"]
         rows.append({
@@ -13634,8 +14002,35 @@ def collection_frame(collection):
             **{f"{DISPLAY_SYMBOL[s_]} ({DISPLAY_UNIT[s_][0]})":
                round(rec["moduli"].get(s_, float("nan")) / DISPLAY_UNIT[s_][1], 4)
                for s_ in collection_symbols(collection)},
+            **(eq1_columns(rec.get("eq1")) if with_eq1 else {}),
         })
     return pd.DataFrame(rows)
+
+
+def eq1_columns(eq):
+    """A cardiomyocyte's eq 3 + eq 6 numbers as collection columns."""
+    eq = eq or {}
+
+    def num(value, scale=1.0, digits=4):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return (round(value / scale, digits) if np.isfinite(value)
+                else float("nan"))
+    ci_i = list(eq.get("E_i_ci_Pa") or (None, None))
+    ci_m = list(eq.get("E_m_ci_Pa") or (None, None))
+    return {
+        "eq3+6 Eᵢ (kPa)": num(eq.get("E_i_Pa"), 1e3),
+        "Eᵢ 95% lo": num(ci_i[0], 1e3), "Eᵢ 95% hi": num(ci_i[1], 1e3),
+        "eq3+6 Eₘ (MPa)": num(eq.get("E_m_Pa"), 1e6),
+        "Eₘ 95% lo": num(ci_m[0], 1e6), "Eₘ 95% hi": num(ci_m[1], 1e6),
+        "Kₛ (mN/m)": num(eq.get("K_s_N_per_m"), 1e-3),
+        "ε_r (%)": num(eq.get("reserve"), 0.01, 2),
+        "δ (%)": num(eq.get("delta"), 0.01, 2),
+        "window (%)": num(eq.get("window_pct"), 1.0, 1),
+        "misfit (%)": num(eq.get("rel_rms_pct"), 1.0, 2),
+    }
 
 
 def collection_to_json(collection):
@@ -14079,6 +14474,7 @@ def collection_results_frame(collection):
     # as measurements of nothing.
     two_term = bool(collection) and all(rec.get("early")
                                         for rec in collection.values())
+    with_eq1 = any(rec.get("eq1") for rec in collection.values())
     for rec in collection.values():
         b = list(rec.get("bounds_pct") or (0, 0, 0, 0, 0))
         b += [float("nan")] * (5 - len(b))
@@ -14114,6 +14510,8 @@ def collection_results_frame(collection):
                 if np.isfinite(value) else float("nan"))
         row["lamina_A_N"] = float(rec.get("lamina_A_N", float("nan")))
         row["lamina_work_J"] = float(rec.get("lamina_work_J", float("nan")))
+        if with_eq1:
+            row.update(eq1_columns(rec.get("eq1")))
         row["notes"] = rec.get("notes", "")
         row["fitted_at"] = rec.get("added_at", "")
         for key, value in (rec.get("extra") or {}).items():
