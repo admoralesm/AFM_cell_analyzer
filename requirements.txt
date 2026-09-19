@@ -4,6 +4,8 @@ scipy>=1.10
 pandas>=2.0
 plotly>=5.18
 openpyxl>=3.1
+# Old-style .xls workbooks. .xlsx and .xlsm are read by openpyxl above.
+xlrd>=2.0.1
 opencv-python-headless>=4.8
 google-auth-oauthlib
 google-auth-httplib2
