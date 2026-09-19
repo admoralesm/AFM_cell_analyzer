@@ -2660,3 +2660,477 @@ def piecewise_moduli(result, geometry: Geometry, regimes=C2C12_REGIMES):
                 row["note"] = ""
             out[term.name] = row
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Lulevich's two laws for a cardiomyocyte: the interior from contact, the
+# sarcolemma once its reserve is used up
+# ---------------------------------------------------------------------------
+# Lulevich's eq 1 puts the two laws in parallel from first contact,
+#
+#     F = A·s³ + B·s^1.5,        s = ε − δ,
+#     A = 2π hₘ R₀ Eₘ/(1−νₘ)     (eq 3, the shell stretching)
+#     B = √2 R₀² Eᵢ/(3(1−νᵢ²))   (eq 6, the interior, Hertzian)
+#
+# and that is a law with a signature: the local exponent
+# p(ε) = d ln F / d ln ε climbs from 1.5 to 3 and never past it. The
+# cardiomyocyte curves follow it only roughly. Holding them to it leaves a
+# systematic misfit (a 6 % relative RMS on all 139 curves), under-predicts
+# the curve just past the window by 10 %, and moves Eᵢ by 12 % when the
+# window moves by ten points.
+#
+# The same two laws, with one physical change, remove all three: the
+# sarcolemma does not start stretching at contact. A cardiomyocyte's
+# membrane carries a reserve (caveolae, folds, the mouths of the
+# T-tubules), and while that reserve unfolds the shell is slack and the
+# interior carries the load alone. The shell law then starts at ε_r:
+#
+#     F = B·s^1.5 + A·(s − ε_r)³₊
+#
+# Still eq 3 and eq 6, with their prefactors and their moduli; ε_r is where
+# the shell law's strain is counted from. On the 139 curves this halves
+# the misfit (3.3 % against 6.3 %), is preferred by AICc in three cells out
+# of four, puts the curve past the window within 1 % instead of 10 %, and
+# holds Eᵢ to 1 % when the window moves. It is nested: ε_r = 0 is eq 1,
+# and on synthetic eq 1 curves the fit returns ε_r ≈ 0.2 % and the same
+# moduli, so allowing it costs nothing when there is no reserve.
+#
+# How it is fitted, so that it measures the cell rather than the fitting:
+#   * weights from the noise, 1/√(σ₀² + (r·F)²), the instrument floor σ₀
+#     where the force is small and a relative error r where it is large, so
+#     the small strains that carry Eᵢ are not drowned by the large ones;
+#   * the contact offset δ profiled rather than fixed, because the interior
+#     law starts at contact and a contact point a fraction of a percent off
+#     moves Eᵢ;
+#   * the window ended where the cell's own p(ε) reaches 3, which neither
+#     law can follow (past it the cell is confined between the plates);
+#   * linear in (A, B) at each (δ, ε_r), so every candidate is an exact
+#     two-column non-negative least squares and (δ, ε_r) a 2-D profile;
+#   * uncertainty from a block bootstrap of the weighted residuals, with
+#     ε_r re-profiled in every replicate, because AFM residuals are
+#     correlated along the curve and the textbook standard error, which
+#     assumes they are not, is far too small.
+
+EQ1_WINDOW_PCT = (25.0, 45.0)
+EQ1_DELTA_PCT = (-2.0, 3.0)
+EQ1_RESERVE_MAX_PCT = 30.0
+EQ1_REL_NOISE = 0.03
+
+
+def _eq1_noise_floor(e, f):
+    """σ₀: the scatter of the force over the first 2 %, point to point."""
+    m = np.abs(e) < 0.02
+    if m.sum() > 20:
+        value = float(np.std(np.diff(f[m])) / np.sqrt(2.0))
+        if np.isfinite(value) and value > 0:
+            return value
+    peak = float(np.nanmax(np.abs(f))) if f.size else 1.0
+    return max(peak * 1e-3, 1e-15)
+
+
+def _eq1_thin(e, f, n):
+    if e.size <= n:
+        return e, f
+    idx = np.unique(np.linspace(0, e.size - 1, n).astype(int))
+    return e[idx], f[idx]
+
+
+def local_exponent(epsilon, force_N, at_pct=None, half_width=0.2,
+                   min_points=30):
+    """
+    p(ε) = d ln F / d ln ε, the curve's own power law, strain by strain.
+
+    A straight line in log-log through the points between ε·e^−w and
+    ε·e^+w (w = ``half_width``). Returns (at_pct, p), NaN where there are
+    too few positive points to say.
+    """
+    x, f = _prepare(epsilon, force_N)
+    e = x / 100.0
+    if at_pct is None:
+        top = float(np.nanmax(e)) * 100.0 if e.size else 0.0
+        at_pct = np.arange(2.0, max(top * np.exp(-half_width), 2.0) + 1e-9,
+                           0.5)
+    at_pct = np.asarray(at_pct, dtype=float)
+    p = np.full(at_pct.shape, np.nan)
+    good = (e > 0) & (f > 0)
+    le, lf = np.log(e[good]), np.log(f[good])
+    for i, a in enumerate(at_pct / 100.0):
+        if a <= 0:
+            continue
+        m = (le >= np.log(a) - half_width) & (le <= np.log(a) + half_width)
+        if m.sum() >= min_points:
+            p[i] = float(np.polyfit(le[m], lf[m], 1)[0])
+    return at_pct, p
+
+
+def eq1_p3_window(epsilon, force_N, bounds_pct=EQ1_WINDOW_PCT):
+    """
+    Where the cell's own p(ε) first reaches 3, which neither law can.
+
+    Returns (window_pct, crossing_pct): the crossing clipped into
+    ``bounds_pct`` and to the data, and the crossing itself (None when the
+    curve does not reach 3 between 15 and 50 %).
+    """
+    x, _f = _prepare(epsilon, force_N)
+    top = float(np.nanmax(x)) if x.size else 0.0
+    at, p = local_exponent(epsilon, force_N,
+                           at_pct=np.arange(15.0, 50.0 + 1e-9, 0.5))
+    crossing = None
+    for a, v in zip(at, p):
+        if np.isfinite(v) and v >= 3.0:
+            crossing = float(a)
+            break
+    lo, hi = float(bounds_pct[0]), float(bounds_pct[1])
+    window = hi if crossing is None else float(np.clip(crossing, lo, hi))
+    return float(min(window, top)), crossing
+
+
+def _eq1_design(e, delta, reserve=0.0):
+    s = np.clip(e - delta, 0.0, None)
+    return np.column_stack([np.clip(s - reserve, 0.0, None) ** 3, s ** 1.5])
+
+
+def _eq1_nnls(X, y, w):
+    from scipy.optimize import nnls
+    coef, _ = nnls(X * w[:, None], y * w)
+    return coef
+
+
+def _eq1_solve(e, f, w, window, delta, reserve=0.0):
+    m = (e > 0) & (e <= window)
+    X = _eq1_design(e[m], delta, reserve)
+    coef = _eq1_nnls(X, f[m], w[m])
+    r = (f[m] - X @ coef) * w[m]
+    return coef, float(np.sum(r * r)), m
+
+
+def _eq1_profile(e, f, w, window, deltas, reserves):
+    """The (δ, ε_r) with the least weighted residual, and its (A, B)."""
+    best = None
+    for d in deltas:
+        for r in reserves:
+            coef, rss, _m = _eq1_solve(e, f, w, window, float(d), float(r))
+            if best is None or rss < best[0]:
+                best = (rss, float(d), float(r), coef)
+    return best
+
+
+def _eq1_aicc(rss, n, k):
+    n = max(int(n), 1)
+    rss = max(float(rss), 1e-300)
+    return float(n * np.log(rss / n) + 2 * k
+                 + 2 * k * (k + 1) / max(n - k - 1, 1))
+
+
+def eq1_force(epsilon, fit):
+    """The fitted force at these strains (fractions), both laws summed."""
+    e = np.asarray(epsilon, dtype=float)
+    X = _eq1_design(e, fit["delta"], fit.get("reserve", 0.0))
+    return X @ np.array([fit["A_N"], fit["B_N"]])
+
+
+def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
+                     reserve=True, window_pct="auto",
+                     window_bounds_pct=EQ1_WINDOW_PCT,
+                     delta_range_pct=EQ1_DELTA_PCT,
+                     reserve_max_pct=EQ1_RESERVE_MAX_PCT,
+                     rel_noise=EQ1_REL_NOISE, n_boot=200, block_pct=3.0,
+                     seed=0, max_points=3000):
+    """
+    Lulevich's eq 3 + eq 6 fitted to one curve (see the note above).
+
+    ``reserve``: True lets the sarcolemma start at its own ε_r (profiled
+    from 0 to ``reserve_max_pct``); False is eq 1 exactly as written. Both
+    are always fitted, so the result carries the other one's numbers and
+    the AICc between them. ``window_pct``: "auto" ends the window where
+    the curve's own p(ε) reaches 3 (inside ``window_bounds_pct``), or a
+    number. ``thickness`` is hₘ in metres (the geometry's when None); only
+    Eₘ depends on it, not the stretch stiffness Kₛ = Eₘ·hₘ/(1−νₘ) that the
+    curve actually measures.
+
+    Returns a dict: moduli, bootstrap 95 % intervals, how far each modulus
+    moves when the window moves by ±5 points, the contact offset δ, the
+    reserve ε_r, the crossover ε*, the fit statistics, how far the curve
+    runs above the fit past the window, and what the plots need. None when
+    the curve is too short to say anything.
+    """
+    x, f = _prepare(epsilon, force_N)
+    e = x / 100.0
+    if e.size < 30 or float(np.nanmax(e)) < 0.05:
+        return None
+    top = float(np.nanmax(e))
+    R0 = float(geometry.cell_radius)
+    nu_m = float(geometry.nu_membrane)
+    h = float(thickness) if thickness else float(geometry.membrane_thickness)
+    A_m = 2.0 * np.pi * h * R0 / (1.0 - nu_m)
+    A_i = float(_prefactors(geometry)["cytoskeleton"]["A"])
+
+    lo_w, hi_w = (float(v) for v in window_bounds_pct)
+    if window_pct in (None, "auto"):
+        W_pct, crossing = eq1_p3_window(epsilon, force_N, window_bounds_pct)
+        if crossing is None:
+            rule = (f"p(ε) does not reach 3 before {hi_w:g} %; held there"
+                    if top * 100.0 >= hi_w else "to the end of the curve")
+        elif crossing < lo_w:
+            rule = (f"p(ε) reaches 3 at {crossing:.1f} %, before "
+                    f"{lo_w:g} %; held at {lo_w:g} %")
+        elif crossing > hi_w:
+            rule = f"p(ε) reaches 3 past {hi_w:g} %; held there"
+        else:
+            rule = "where the curve's own p(ε) reaches 3"
+    else:
+        W_pct, crossing = float(min(float(window_pct), top * 100.0)), None
+        rule = "set by hand"
+    W = W_pct / 100.0
+
+    sigma0 = _eq1_noise_floor(e, f)
+
+    def w_of(y):
+        return 1.0 / np.sqrt(sigma0 ** 2 + (rel_noise * np.abs(y)) ** 2)
+
+    w_all = w_of(f)
+    et, ft = _eq1_thin(e, f, max_points)
+    wt = w_of(ft)
+    d_lo, d_hi = (float(v) / 100.0 for v in delta_range_pct)
+    r_hi = min(float(reserve_max_pct) / 100.0, max(W - 0.03, 0.0))
+
+    def profile(allow_reserve, e_, f_, w_, window):
+        rs = (np.arange(0.0, r_hi + 1e-12, 0.01) if allow_reserve
+              else np.array([0.0]))
+        _q, d, r, _c = _eq1_profile(e_, f_, w_, window,
+                                    np.arange(d_lo, d_hi + 1e-12, 0.005), rs)
+        rs = (np.arange(max(0.0, r - 0.01), min(r_hi, r + 0.01) + 1e-12,
+                        0.0025) if allow_reserve else np.array([0.0]))
+        _q, d, r, _c = _eq1_profile(
+            e_, f_, w_, window,
+            np.arange(max(d_lo, d - 0.005), min(d_hi, d + 0.005) + 1e-12,
+                      0.001), rs)
+        # then continuous, a coordinate at a time: a grid step in δ is a
+        # bias in Eᵢ (0.05 % of strain at 5 % is 1.5 % of Eᵢ), and a grid
+        # step in ε_r one in Eₘ
+        from scipy.optimize import minimize_scalar
+        for _round in range(2):
+            d = float(minimize_scalar(
+                lambda v: _eq1_solve(e_, f_, w_, window, v, r)[1],
+                bounds=(max(d_lo, d - 0.0015), min(d_hi, d + 0.0015)),
+                method="bounded", options={"xatol": 1e-6}).x)
+            if allow_reserve:
+                cand = float(minimize_scalar(
+                    lambda v: _eq1_solve(e_, f_, w_, window, d, v)[1],
+                    bounds=(max(0.0, r - 0.004), min(r_hi, r + 0.004)),
+                    method="bounded", options={"xatol": 1e-6}).x)
+                # ε_r = 0 is eq 1 itself: keep it when it is as good
+                if (_eq1_solve(e_, f_, w_, window, d, 0.0)[1]
+                        <= _eq1_solve(e_, f_, w_, window, d, cand)[1]):
+                    cand = 0.0
+                r = cand
+        return d, r
+
+    def moduli(a, b):
+        star = (b / a) ** (2.0 / 3.0) if a > 0 and b > 0 else float("nan")
+        return float(a / A_m), float(b / A_i), float(star)
+
+    def evaluate(d, r):
+        (a, b), rss, m = _eq1_solve(e, f, w_all, W, d, r)
+        y = f[m]
+        pred = _eq1_design(e[m], d, r) @ np.array([a, b])
+        resid = y - pred
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        big = e[m] > 0.03
+        rel = (float(np.sqrt(np.mean((resid[big] / np.maximum(
+            np.abs(y[big]), 3 * sigma0)) ** 2))) * 100.0 if big.any()
+            else float("nan"))
+        return {"A": float(a), "B": float(b), "delta": d, "reserve": r,
+                "rss_w": rss, "n": int(m.sum()), "mask": m, "pred": pred,
+                "r2": (1.0 - float(np.sum(resid ** 2)) / ss_tot
+                       if ss_tot > 0 else float("nan")),
+                "rel_rms": rel}
+
+    fits = {}
+    for key, allow in (("reserve", True), ("eq1", False)):
+        fits[key] = evaluate(*profile(allow, et, ft, wt, W))
+    for key, k in (("reserve", 4), ("eq1", 3)):
+        fits[key]["aicc"] = _eq1_aicc(fits[key]["rss_w"], fits[key]["n"], k)
+    chosen = fits["reserve"] if reserve else fits["eq1"]
+    other = fits["eq1"] if reserve else fits["reserve"]
+    A, B, delta, res = chosen["A"], chosen["B"], chosen["delta"], chosen["reserve"]
+    Em, Ei, eps_star = moduli(A, B)
+
+    # ---- block bootstrap of the weighted residuals ---------------------
+    # δ held; ε_r re-profiled near its value in every replicate, because
+    # Eₘ and ε_r trade against each other and an interval that holds ε_r
+    # fixed would be too narrow.
+    boot = {"Em": [], "Ei": [], "eps_star": [], "reserve": []}
+    mt = (et > 0) & (et <= W)
+    if n_boot and mt.sum() > 20:
+        rng = np.random.default_rng(seed)
+        wtt, ett = wt[mt], et[mt]
+        pt = _eq1_design(ett, delta, res) @ np.array([A, B])
+        z = (ft[mt] - pt) * wtt
+        n = z.size
+        span = max(float(ett.max() - ett.min()), 1e-9)
+        # Blocks at least twice as long as the residuals stay correlated
+        # (the first lag where their autocorrelation falls under 0.1), and
+        # never shorter than ``block_pct`` of strain: shorter blocks break
+        # the correlation up and give intervals that are too narrow.
+        zc = z - z.mean()
+        denom = float(np.dot(zc, zc)) or 1.0
+        corr_len = 1
+        for lag in range(1, max(2, n // 4)):
+            if float(np.dot(zc[:-lag], zc[lag:])) / denom < 0.1:
+                corr_len = lag
+                break
+        else:
+            corr_len = n // 4
+        L = int(np.clip(max(2 * corr_len,
+                            round(n * (block_pct / 100.0) / span)),
+                        5, max(5, n // 4)))
+        rs = (np.arange(max(0.0, res - 0.03), min(r_hi, res + 0.03) + 1e-12,
+                        0.0025) if reserve else np.array([0.0]))
+        ds = np.arange(max(d_lo, delta - 0.004), min(d_hi, delta + 0.004)
+                       + 1e-12, 0.0005)
+        grid = [(d, r) for d in ds for r in rs]
+        # Every (δ, ε_r) candidate re-profiled in every replicate, as 2×2
+        # normal equations on precomputed Gram matrices: δ trades against
+        # Eᵢ and ε_r against Eₘ, and an interval that held either fixed
+        # would be too narrow.
+        Xw = np.stack([_eq1_design(ett, d, r) * wtt[:, None]
+                       for d, r in grid])                      # K×n×2
+        G = np.einsum("kni,knj->kij", Xw, Xw)                  # K×2×2
+        det = G[:, 0, 0] * G[:, 1, 1] - G[:, 0, 1] ** 2
+        for _ in range(int(n_boot)):
+            starts = rng.integers(0, n - L + 1, int(np.ceil(n / L)))
+            zb = np.concatenate([z[i:i + L] for i in starts])[:n]
+            yw = (pt + zb / wtt) * wtt
+            b = np.einsum("kni,n->ki", Xw, yw)                 # K×2
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cA = (G[:, 1, 1] * b[:, 0] - G[:, 0, 1] * b[:, 1]) / det
+                cB = (G[:, 0, 0] * b[:, 1] - G[:, 0, 1] * b[:, 0]) / det
+                onlyA = np.clip(b[:, 0] / G[:, 0, 0], 0, None)
+                onlyB = np.clip(b[:, 1] / G[:, 1, 1], 0, None)
+            both = np.isfinite(cA) & np.isfinite(cB) & (cA >= 0) & (cB >= 0)
+            # the reduction in RSS each candidate buys: c·b (at the optimum)
+            gain_both = np.where(both, cA * b[:, 0] + cB * b[:, 1], -np.inf)
+            gain_A = np.nan_to_num(onlyA * b[:, 0], nan=-np.inf)
+            gain_B = np.nan_to_num(onlyB * b[:, 1], nan=-np.inf)
+            gains = np.stack([gain_both, gain_A, gain_B])      # 3×K
+            which, k = np.unravel_index(int(np.argmax(gains)), gains.shape)
+            a_, b_ = ((cA[k], cB[k]) if which == 0 else
+                      (onlyA[k], 0.0) if which == 1 else (0.0, onlyB[k]))
+            em, ei, st_ = moduli(float(a_), float(b_))
+            boot["Em"].append(em); boot["Ei"].append(ei)
+            boot["eps_star"].append(st_); boot["reserve"].append(grid[k][1])
+
+    def ci(values):
+        v = np.asarray(values, dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size < 10:
+            return (float("nan"), float("nan"))
+        return (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+
+    # ---- does the answer depend on where the window ends? ---------------
+    moves = []
+    for dW in (-0.05, 0.05):
+        W2 = W + dW
+        if W2 < 0.10 or W2 > top + 1e-9:
+            continue
+        rs2 = (np.arange(0.0, min(r_hi, W2 - 0.03) + 1e-12, 0.005)
+               if reserve else np.array([0.0]))
+        _q, d2, r2_, (a2, b2) = _eq1_profile(
+            et, ft, wt, W2, np.arange(d_lo, d_hi + 1e-12, 0.005), rs2)
+        em2, ei2, _s = moduli(a2, b2)
+        moves.append({"window_pct": W2 * 100.0, "Em": em2, "Ei": ei2,
+                      "reserve": float(r2_)})
+
+    def worst(key, ref):
+        vals = [mv[key] for mv in moves if mv[key] > 0 and ref > 0]
+        if not vals:
+            return float("nan")
+        return float(max(abs(np.log(v / ref)) for v in vals) * 100.0)
+
+    # ---- past the window: how far the cell runs above the two laws ------
+    past = (e > W) & (e <= min(W + 0.10, top))
+    beyond = float("nan")
+    if past.sum() > 10:
+        pp = _eq1_design(e[past], delta, res) @ np.array([A, B])
+        ok = pp > 0
+        if ok.any():
+            beyond = float(np.median(f[past][ok] / pp[ok] - 1.0) * 100.0)
+
+    # ---- what the plots need ------------------------------------------
+    reach = min(top, W + 0.10)
+    grid = np.linspace(0.0, reach, 300)
+    s = np.clip(grid - delta, 0.0, None)
+    shell = A * np.clip(s - res, 0.0, None) ** 3
+    interior = B * s ** 1.5
+    # The apparent Hertz modulus, F / (A_i·s^1.5): flat at Eᵢ while the
+    # interior carries the load alone, rising once the shell joins. The
+    # plateau is Eᵢ read straight off the curve, and where the rise starts
+    # is the reserve.
+    s_all = e - delta
+    edges = np.linspace(max(0.02, delta + 0.01), reach, 61)
+    ax, ay, inside = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        mm = (e > a) & (e <= b) & (s_all > 0.005)
+        if mm.sum() < 3:
+            continue
+        ax.append(float(np.mean(e[mm])) * 100.0)
+        ay.append(float(np.mean(f[mm] / (A_i * s_all[mm] ** 1.5))))
+        inside.append(bool(0.5 * (a + b) <= W + 1e-12))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        app_model = np.where(s > 0.005, (shell + interior)
+                             / (A_i * np.where(s > 0, s, 1.0) ** 1.5), np.nan)
+    at, p_data = local_exponent(epsilon, force_N, at_pct=np.arange(
+        2.0, reach * 100.0 * np.exp(-0.2) + 1e-9, 0.5))
+    sa = np.clip(at / 100.0 - delta, 1e-9, None)
+    u = np.clip(sa - res, 0.0, None)
+    num = 3.0 * A * u ** 2 * (at / 100.0) + 1.5 * B * sa ** 0.5 * (at / 100.0)
+    den = A * u ** 3 + B * sa ** 1.5
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_model = np.where(den > 0, num / den, np.nan)
+
+    y = f[chosen["mask"]]
+    diagnostics = residual_diagnostics(y, chosen["pred"],
+                                       x=e[chosen["mask"]] * 100.0)
+    Em_o, Ei_o, star_o = moduli(other["A"], other["B"])
+    return {
+        "success": True,
+        "model": ("eq 3 + eq 6, sarcolemma from its reserve" if reserve
+                  else "eq 1 as written, both from contact"),
+        "reserve_allowed": bool(reserve),
+        "A_N": A, "B_N": B, "E_m_Pa": Em, "E_i_Pa": Ei,
+        "K_s_N_per_m": float(Em * h / (1.0 - nu_m)),
+        "eps_star": eps_star, "delta": float(delta), "reserve": float(res),
+        "window_pct": float(W_pct), "window_rule": rule,
+        "p3_crossing_pct": crossing,
+        "thickness_m": h, "R0_m": R0, "A_m": float(A_m), "A_i": A_i,
+        "sigma0_N": float(sigma0), "rel_noise": float(rel_noise),
+        "n_points": chosen["n"], "r_squared": chosen["r2"],
+        "rel_rms_pct": chosen["rel_rms"], "aicc": chosen["aicc"],
+        "E_m_ci_Pa": ci(boot["Em"]), "E_i_ci_Pa": ci(boot["Ei"]),
+        "eps_star_ci": ci(boot["eps_star"]), "reserve_ci": ci(boot["reserve"]),
+        "n_boot": len(boot["Em"]),
+        "window_moves": moves,
+        "E_m_window_pct": worst("Em", Em), "E_i_window_pct": worst("Ei", Ei),
+        "beyond_pct": beyond,
+        "alternative": {
+            "model": ("eq 1 as written, both from contact" if reserve
+                      else "eq 3 + eq 6, sarcolemma from its reserve"),
+            "E_m_Pa": Em_o, "E_i_Pa": Ei_o, "eps_star": star_o,
+            "delta": other["delta"], "reserve": other["reserve"],
+            "r_squared": other["r2"], "rel_rms_pct": other["rel_rms"],
+            "aicc": other["aicc"],
+        },
+        # AICc of eq 1 minus that of the reserve: positive favours the
+        # reserve. With correlated residuals its size is inflated, so the
+        # page reads it with the misfit and the window test, not alone.
+        "delta_aicc": float(fits["eq1"]["aicc"] - fits["reserve"]["aicc"]),
+        "curve": {"x_pct": grid * 100.0, "shell_N": shell,
+                  "interior_N": interior, "total_N": shell + interior},
+        "apparent": {"x_pct": np.array(ax), "E_Pa": np.array(ay),
+                     "in_window": np.array(inside, dtype=bool),
+                     "model_x_pct": grid * 100.0, "model_E_Pa": app_model},
+        "exponent": {"x_pct": at, "p_data": p_data, "p_model": p_model},
+        "residuals": diagnostics,
+    }
