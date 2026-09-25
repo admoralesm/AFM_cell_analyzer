@@ -599,17 +599,19 @@ def test_spec_defaults():
 
 
 
-def _cardio_curve(Em, Ei, reserve, delta, seed=0):
+def _cardio_curve(Em, Ei, reserve, delta, seed=0, squeeze=0.0, top=0.45):
     import piecewise_fit as pf
     g = pf.Geometry(cell_height=19e-6, cell_radius=0.55 * 19e-6,
                     nucleus_radius=3e-6, probe_radius=None,
                     membrane_thickness=8e-9)
     rng = np.random.default_rng(seed)
-    e = np.linspace(-0.02, 0.45, 5000)
+    e = np.linspace(-0.02, top, 5000)
     s = np.clip(e - delta, 0, None)
     A = 2 * np.pi * 8e-9 * g.cell_radius / 0.5 * Em
     B = np.sqrt(2) * g.cell_radius ** 2 / (3 * 0.75) * Ei
-    f0 = A * np.clip(s - reserve, 0, None) ** 3 + B * s ** 1.5
+    f0 = (A * np.clip(s - reserve, 0, None) ** 3 + B * s ** 1.5)
+    if squeeze:
+        f0 = f0 * np.clip(1 - e, 0.02, None) ** (-squeeze)
     wob = np.convolve(rng.normal(0, 1, e.size), np.ones(400) / 400, "same")
     f = f0 * (1 + 0.02 * wob / wob.std()) + rng.normal(0, 25e-12, e.size)
     return g, e, f
@@ -637,6 +639,44 @@ def test_eq1_without_a_reserve_finds_none():
     assert abs(np.log(r["E_i_Pa"] / 6e3)) < 0.08, r["E_i_Pa"]
     assert abs(np.log(r["E_m_Pa"] / 2e6)) < 0.15, r["E_m_Pa"]
     assert abs(r["delta"] + 0.003) < 0.003, r["delta"]
+
+
+def test_eq1_reads_the_whole_squash_with_the_squeeze():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(5e6, 6e3, 0.10, 0.003, seed=4, squeeze=0.8,
+                            top=0.65)
+    r = pf.lulevich_eq1_fit(e, f, g, squeeze=0.8, window_pct="full",
+                            n_boot=50)
+    assert r["window_pct"] > 60.0, r["window_pct"]
+    assert abs(np.log(r["E_i_Pa"] / 6e3)) < 0.10, r["E_i_Pa"]
+    assert abs(np.log(r["E_m_Pa"] / 5e6)) < 0.30, r["E_m_Pa"]
+    assert abs(r["reserve"] - 0.10) < 0.02, r["reserve"]
+    assert r["rel_rms_pct"] < 6.0, r["rel_rms_pct"]
+    # and with q fitted rather than held, q comes back near the truth
+    free = pf.lulevich_eq1_fit(e, f, g, squeeze="fit", window_pct="full",
+                               n_boot=0)
+    assert abs(free["squeeze"] - 0.8) < 0.25, free["squeeze"]
+    assert free["squeeze_fitted"]
+
+
+def test_eq1_without_the_squeeze_stops_early():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(5e6, 6e3, 0.10, 0.0, seed=5, squeeze=0.8,
+                            top=0.65)
+    r = pf.lulevich_eq1_fit(e, f, g, squeeze=0.0, window_pct="auto",
+                            n_boot=0)
+    assert r["window_pct"] <= 45.0, r["window_pct"]
+    assert r["beyond_pct"] > 5.0, r["beyond_pct"]
+
+
+def test_eq1_usable_end_stops_at_a_break():
+    import piecewise_fit as pf
+    g, e, f = _cardio_curve(5e6, 6e3, 0.05, 0.0, seed=6, squeeze=0.8,
+                            top=0.65)
+    f = np.where(e > 0.50, f * 0.4, f)          # the cell lets go at 50 %
+    assert abs(pf.eq1_usable_end(e, f) - 50.0) < 1.5, pf.eq1_usable_end(e, f)
+    r = pf.lulevich_eq1_fit(e, f, g, squeeze=0.8, window_pct="full", n_boot=0)
+    assert r["window_pct"] < 51.0, r["window_pct"]
 
 
 def test_eq1_window_ends_where_p_reaches_3():
