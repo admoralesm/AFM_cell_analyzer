@@ -198,6 +198,10 @@ bending_prefactor = getattr(_piecewise_module, "bending_prefactor", None)
 # Lulevich's two laws fitted the way the cardiomyocyte curves ask for
 # (interior from contact, sarcolemma from its reserve), and eq 1 as written.
 lulevich_eq1_fit = getattr(_piecewise_module, "lulevich_eq1_fit", None)
+lulevich_protocol_fit = getattr(_piecewise_module, "lulevich_protocol_fit",
+                                None)
+PROTOCOL_THICKNESS_M = float(getattr(_piecewise_module,
+                                     "PROTOCOL_THICKNESS_M", 4e-9))
 eq1_force = getattr(_piecewise_module, "eq1_force", None)
 LACK_OF_FIT_PCT = float(getattr(_piecewise_module, "LACK_OF_FIT_PCT", 2.0))
 HAS_VALIDATION = all(f is not None for f in (
@@ -4430,9 +4434,14 @@ CELL_TYPES = {
     # the answer and cannot be traced.
     "Cardiomyocyte": {
         "cell_height_um": 19.0,
-        "radius_aspect": 0.55,
+        # R₀ = half the cell's height and hₘ = 4 nm, the bare bilayer:
+        # the constants of the published protocol for these cells (Morales
+        # Maldonado et al., STAR Protocols 2025), so that a modulus from
+        # this page can be set beside one from that protocol without a
+        # conversion in between.
+        "radius_aspect": 0.50,
         "nucleus_fraction": 0.35,
-        "membrane_thickness_nm": 8.0,
+        "membrane_thickness_nm": 4.0,
         "nucleus_onset": 0.20,
         "cell_shape": "Sphere (a rounded cell)",
         "schematic_style": "Balloon with a spring inside",
@@ -4693,11 +4702,17 @@ def apply_cell_type(name):
         st.session_state["pw_cyto_hi"] = 30.0
         st.session_state["pw_squeeze_way"] = "typed"
         st.session_state["pw_squeeze"] = PW_CARDIO_SQUEEZE
+        # The force on these curves runs from tens of piconewtons to
+        # micronewtons. Weighted by the noise the first decade counts for
+        # what it is worth instead of being flattened by a floor set at a
+        # thousandth of the peak.
+        st.session_state["pw_weighting"] = "noise"
     else:
         st.session_state["pw_cyto_lo"] = 20.0
         st.session_state["pw_cyto_hi"] = 40.0
         st.session_state["pw_squeeze_way"] = DEFAULTS["pw_squeeze_way"]
         st.session_state["pw_squeeze"] = DEFAULTS["pw_squeeze"]
+        st.session_state["pw_weighting"] = DEFAULTS["pw_weighting"]
     # The early window is the cell type's own: a myoblast is read to 35 %,
     # a cardiomyocyte to the end of its curve. Either way a window set by
     # hand for the previous cell type does not follow the new one.
@@ -7304,8 +7319,14 @@ PW_WEIGHTINGS = {
     "absolute": "⚖️ Newtons · plain least squares",
     "relative": "📐 Per cent · every decade counts the same",
     "sqrt": "🤝 In between · √F",
+    "noise": "🔬 By the noise · σ₀ near contact, then per cent",
 }
 PW_WEIGHTING_HELP = {
+    "noise": "The error is measured against what the instrument can see: "
+             "the scatter of the force zero where the cell has not pushed "
+             "back yet, and a per cent of the force where it has. It is "
+             "the per-cent weighting without the floor that a thousandth "
+             "of the peak force puts under the whole first decade.",
     "absolute": "The error in newtons is minimised. The last decade of the "
                 "squash carries almost all of the weight, because that is "
                 "where almost all of the force is.",
@@ -7329,6 +7350,9 @@ WEIGHTINGS_USED = {
                 "force counts the same and a component acting only early "
                 "can still be measured",
     "sqrt": "√F: halfway between newtons and per cent",
+    "noise": "by the noise: 1/√(σ₀² + (0.01 F)²), with σ₀ read off the force "
+             "zero near contact, so the small forces count for what the "
+             "instrument can actually see there",
 }
 
 
@@ -8119,12 +8143,39 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
             st.caption("1.5 is the interior alone, 3 the shell alone. The "
                        "window ends where the data reach 3.")
 
+        star = (lulevich_protocol_fit(
+            np.asarray(epsilon, dtype=float),
+            np.asarray(force_N, dtype=float), piecewise_geometry(model),
+            thickness=PROTOCOL_THICKNESS_M)
+            if lulevich_protocol_fit is not None else None)
+        if star:
+            st.caption(
+                f"**The published reading of this same curve:** one term, "
+                f"the shell alone, {star['law']}, with hₘ = "
+                f"{star['thickness_m'] * 1e9:g} nm and R₀ = "
+                f"{star['R0_m'] * 1e6:.2f} µm gives **Eₘ = "
+                f"{star['E_m_Pa'] / 1e6:.3g} MPa** (R² = "
+                f"{star['r_squared']:.4f}). That number carries everything "
+                f"the cell does, because it is the only term there; the "
+                f"{fit['E_m_Pa'] / 1e6:.3g} MPa above is what is left for "
+                f"the sarcolemma once the interior and the squash have "
+                f"their own. Morales Maldonado *et al.*, *STAR Protocols* "
+                f"**2025**.")
         alt = fit["alternative"]
         rows = [
             {"": "window", "value": f"0 → {fit['window_pct']:.1f} %",
              "reads": fit["window_rule"]},
-            {"": "contact offset δ", "value": f"{fit['delta'] * 100:+.1f} %",
-             "reads": "profiled, not fixed"},
+            {"": "contact offset δ", "value": f"{fit['delta'] * 100:+.2f} %",
+             "reads": "profiled, not fixed: it sets the first decade"},
+            {"": "baseline left in the force zero",
+             "value": f"{fit.get('offset_N', 0.0) * 1e12:+.0f} pN",
+             "reads": (f"bounded to ±5σ₀ = ±"
+                       f"{fit['sigma0_N'] * 5e12:.0f} pN")},
+            {"": "the fit over the first 15 %",
+             "value": f"{fit['early_gap_pct']:+.1f} %",
+             "reads": ("median gap, fit minus data: under the data"
+                       if fit["early_gap_pct"] < -1 else "above the data"
+                       if fit["early_gap_pct"] > 1 else "on the data")},
             {"": "misfit (relative RMS, ε > 3 %)",
              "value": f"{fit['rel_rms_pct']:.1f} %",
              "reads": f"{alt['model']}: {alt['rel_rms_pct']:.1f} %"},
