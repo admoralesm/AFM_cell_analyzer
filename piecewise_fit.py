@@ -357,7 +357,32 @@ WEIGHTINGS = {
     "absolute": "Newtons — every point counts the same (plain least squares)",
     "relative": "Per cent — every decade of force counts the same",
     "sqrt": "In between — √F, halfway between newtons and per cent",
+    "noise": "By the noise — the force zero's own scatter, then per cent",
 }
+
+
+def _measured_noise(f, share=0.10):
+    """
+    σ₀: the scatter of the force where there is almost none of it.
+
+    The points are in order of deformation, so the first tenth of them sit
+    just after contact, where the cell has not pushed back yet. The scatter
+    of the difference between neighbours there is the instrument's own
+    noise, and it is the right floor for a weight -- far smaller than a
+    thousandth of the peak force, which on a whole-cell squash is nanonewtons
+    and flattens the weight over the whole first decade.
+    """
+    f = np.asarray(f, dtype=float)
+    n = max(int(f.size * share), 10)
+    head = f[:n]
+    if head.size > 5:
+        diff = np.diff(head)
+        mad = float(np.median(np.abs(diff - np.median(diff))))
+        value = 1.4826 * mad / np.sqrt(2.0)
+        if np.isfinite(value) and value > 0:
+            return value
+    peak = float(np.nanmax(np.abs(f))) if f.size else 1.0
+    return max(peak * 1e-3, 1e-15)
 
 
 def _weights(f, weighting):
@@ -365,6 +390,13 @@ def _weights(f, weighting):
     f = np.asarray(f, dtype=float)
     if weighting in (None, "", "absolute") or f.size == 0:
         return np.ones(f.shape)
+    if weighting == "noise":
+        # 1/√(σ₀² + (0.01 F)²): the instrument's noise where the force is
+        # small, a per cent of the force where it is large.
+        sigma0 = _measured_noise(f)
+        w = 1.0 / np.sqrt(sigma0 ** 2 + (0.01 * np.abs(f)) ** 2)
+        mean = float(np.mean(w))
+        return w / mean if mean > 0 else np.ones(f.shape)
     size = np.abs(f)
     floor = float(np.max(size)) * 1e-3 if np.max(size) > 0 else 1.0
     size = np.clip(size, floor, None)
@@ -2713,9 +2745,9 @@ def piecewise_moduli(result, geometry: Geometry, regimes=C2C12_REGIMES):
 #     assumes they are not, is far too small.
 
 EQ1_WINDOW_PCT = (25.0, 45.0)
-EQ1_DELTA_PCT = (-2.0, 3.0)
+EQ1_DELTA_PCT = (-4.0, 2.0)
 EQ1_RESERVE_MAX_PCT = 30.0
-EQ1_REL_NOISE = 0.03
+EQ1_REL_NOISE = 0.01
 # The thickness the by-hand fits of these cells used: a bare bilayer.
 EQ1_BILAYER_M = 4e-9
 # The squash's own stiffening for a cardiomyocyte, (1−ε)^−q. Fitted free
@@ -2800,34 +2832,58 @@ def _eq1_squash(e, squeeze):
     return np.clip(1.0 - np.asarray(e, dtype=float), 0.02, None) ** (-q)
 
 
-def _eq1_design(e, delta, reserve=0.0, squeeze=0.0):
+def _eq1_design(e, delta, reserve=0.0, squeeze=0.0, baseline=False):
     s = np.clip(e - delta, 0.0, None)
     g = _eq1_squash(e, squeeze)
-    return np.column_stack([np.clip(s - reserve, 0.0, None) ** 3 * g,
-                            s ** 1.5 * g])
+    cols = [np.clip(s - reserve, 0.0, None) ** 3 * g, s ** 1.5 * g]
+    if baseline:
+        # A free constant, either sign: the force zero is set on the
+        # approach before contact, and what is left of adhesion or drift
+        # is a few tens of piconewtons that otherwise bend the first
+        # decade of the fit down under the data.
+        cols.append(np.ones_like(np.asarray(e, dtype=float)))
+    return np.column_stack(cols)
 
 
-def _eq1_nnls(X, y, w):
+def _eq1_nnls(X, y, w, offset_limit=np.inf):
+    """
+    Both moduli non-negative; the baseline, when there is one, bounded.
+
+    The baseline is a correction to the force zero, so it is held inside a
+    few times the noise of that zero. Left free it stops being a baseline:
+    on some cells it goes hundreds of piconewtons negative to buy a better
+    fit in the middle of the curve, and leaves the first decade under the
+    data -- the very thing it is there to prevent.
+    """
     from scipy.optimize import nnls
-    coef, _ = nnls(X * w[:, None], y * w)
-    return coef
+    if X.shape[1] == 2:
+        coef, _ = nnls(X * w[:, None], y * w)
+        return coef
+    limit = max(float(abs(offset_limit)), 1e-18)
+    out = lsq_linear(X * w[:, None], y * w,
+                     bounds=(np.array([0.0, 0.0, -limit]),
+                             np.array([np.inf, np.inf, limit])),
+                     method="bvls")
+    return np.asarray(out.x, dtype=float)
 
 
-def _eq1_solve(e, f, w, window, delta, reserve=0.0, squeeze=0.0):
+def _eq1_solve(e, f, w, window, delta, reserve=0.0, squeeze=0.0,
+               baseline=False, offset_limit=np.inf):
     m = (e > 0) & (e <= window)
-    X = _eq1_design(e[m], delta, reserve, squeeze)
-    coef = _eq1_nnls(X, f[m], w[m])
+    X = _eq1_design(e[m], delta, reserve, squeeze, baseline)
+    coef = _eq1_nnls(X, f[m], w[m], offset_limit)
     r = (f[m] - X @ coef) * w[m]
     return coef, float(np.sum(r * r)), m
 
 
-def _eq1_profile(e, f, w, window, deltas, reserves, squeeze=0.0):
+def _eq1_profile(e, f, w, window, deltas, reserves, squeeze=0.0,
+                 baseline=False, offset_limit=np.inf):
     """The (δ, ε_r) with the least weighted residual, and its (A, B)."""
     best = None
     for d in deltas:
         for r in reserves:
             coef, rss, _m = _eq1_solve(e, f, w, window, float(d), float(r),
-                                       squeeze)
+                                       squeeze, baseline, offset_limit)
             if best is None or rss < best[0]:
                 best = (rss, float(d), float(r), coef)
     return best
@@ -2845,7 +2901,7 @@ def eq1_force(epsilon, fit):
     e = np.asarray(epsilon, dtype=float)
     X = _eq1_design(e, fit["delta"], fit.get("reserve", 0.0),
                     fit.get("squeeze", 0.0))
-    return X @ np.array([fit["A_N"], fit["B_N"]])
+    return X @ np.array([fit["A_N"], fit["B_N"]]) + fit.get("offset_N", 0.0)
 
 
 def eq1_usable_end(epsilon, force_N, drop=0.02):
@@ -2865,8 +2921,58 @@ def eq1_usable_end(epsilon, force_N, drop=0.02):
     return float(x[fell[0]]) if fell.size else float(np.nanmax(x))
 
 
+PROTOCOL_WINDOW_PCT = 55.0
+PROTOCOL_THICKNESS_M = 4e-9
+
+
+def lulevich_protocol_fit(epsilon, force_N, geometry,
+                          thickness=PROTOCOL_THICKNESS_M,
+                          window_pct=PROTOCOL_WINDOW_PCT):
+    """
+    The published reading: one term, the shell alone, over 0 to 55 %.
+
+        F = 2π Eₘ hₘ R₀ ε³ / (1 − νₘ)
+
+    fitted by plain least squares, with hₘ = 4 nm and R₀ = half the cell's
+    height, as in Morales Maldonado et al., STAR Protocols 2025 (protocol
+    for measuring membrane elasticity of mouse cardiomyocytes by AFM).
+    Everything the cell does that is not a stretching shell is inside this
+    Eₘ, which is why it is larger than the Eₘ of a fit that also gives the
+    interior a term of its own. It is here so that the two can be compared
+    on the same curve.
+    """
+    x, f = _prepare(epsilon, force_N)
+    e = x / 100.0
+    m = (e > 0) & (e <= float(window_pct) / 100.0)
+    if m.sum() < 30:
+        return None
+    s, y = e[m], f[m]
+    denom = float(np.sum(s ** 6))
+    if denom <= 0:
+        return None
+    A = float(np.sum(s ** 3 * y) / denom)
+    pred = A * s ** 3
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    h = float(thickness) if thickness else float(geometry.membrane_thickness)
+    R0 = float(geometry.cell_radius)
+    nu = float(geometry.nu_membrane)
+    prefactor = 2.0 * np.pi * h * R0 / (1.0 - nu)
+    resid = y - pred
+    return {
+        "E_m_Pa": A / prefactor, "A_N": A, "thickness_m": h, "R0_m": R0,
+        "window_pct": float(window_pct), "n_points": int(m.sum()),
+        "r_squared": (1.0 - float(np.sum(resid ** 2)) / ss_tot
+                      if ss_tot > 0 else float("nan")),
+        "rel_rms_pct": float(np.sqrt(np.mean(
+            (resid / np.maximum(np.abs(y), 1e-15)) ** 2)) * 100.0),
+        "law": "F = 2π·Eₘ·hₘ·R₀·ε³/(1−νₘ), least squares, 0 → "
+               f"{float(window_pct):g} %",
+    }
+
+
 def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
-                     reserve=True, squeeze=0.0, window_pct="auto",
+                     reserve=True, squeeze=0.0, baseline=True,
+                     window_pct="auto",
                      window_bounds_pct=EQ1_WINDOW_PCT,
                      delta_range_pct=EQ1_DELTA_PCT,
                      reserve_max_pct=EQ1_RESERVE_MAX_PCT,
@@ -2926,6 +3032,9 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
     W = W_pct / 100.0
 
     sigma0 = _eq1_noise_floor(e, f)
+    # The baseline correction is allowed a few times the noise of the force
+    # zero it corrects, and no more: left free it stops being a baseline.
+    off_limit = 5.0 * sigma0 if baseline else 0.0
 
     def w_of(y):
         return 1.0 / np.sqrt(sigma0 ** 2 + (rel_noise * np.abs(y)) ** 2)
@@ -2941,35 +3050,38 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
               else np.array([float(squeeze or 0.0)]))
 
     def profile(allow_reserve, e_, f_, w_, window, squeeze=0.0):
+        base, lim = bool(baseline), off_limit
         rs = (np.arange(0.0, r_hi + 1e-12, 0.01) if allow_reserve
               else np.array([0.0]))
         _q, d, r, _c = _eq1_profile(e_, f_, w_, window,
                                     np.arange(d_lo, d_hi + 1e-12, 0.005), rs,
-                                    squeeze)
+                                    squeeze, base, lim)
         rs = (np.arange(max(0.0, r - 0.01), min(r_hi, r + 0.01) + 1e-12,
                         0.0025) if allow_reserve else np.array([0.0]))
         _q, d, r, _c = _eq1_profile(
             e_, f_, w_, window,
             np.arange(max(d_lo, d - 0.005), min(d_hi, d + 0.005) + 1e-12,
-                      0.001), rs, squeeze)
+                      0.001), rs, squeeze, base, lim)
         # then continuous, a coordinate at a time: a grid step in δ is a
         # bias in Eᵢ (0.05 % of strain at 5 % is 1.5 % of Eᵢ), and a grid
         # step in ε_r one in Eₘ
         from scipy.optimize import minimize_scalar
+
+        def cost(dd, rr):
+            return _eq1_solve(e_, f_, w_, window, dd, rr, squeeze, base, lim)[1]
+
         for _round in range(2):
             d = float(minimize_scalar(
-                lambda v: _eq1_solve(e_, f_, w_, window, v, r, squeeze)[1],
+                lambda v: cost(v, r),
                 bounds=(max(d_lo, d - 0.0015), min(d_hi, d + 0.0015)),
                 method="bounded", options={"xatol": 1e-6}).x)
             if allow_reserve:
                 cand = float(minimize_scalar(
-                    lambda v: _eq1_solve(e_, f_, w_, window, d, v, squeeze)[1],
+                    lambda v: cost(d, v),
                     bounds=(max(0.0, r - 0.004), min(r_hi, r + 0.004)),
                     method="bounded", options={"xatol": 1e-6}).x)
                 # ε_r = 0 is eq 1 itself: keep it when it is as good
-                if (_eq1_solve(e_, f_, w_, window, d, 0.0, squeeze)[1]
-                        <= _eq1_solve(e_, f_, w_, window, d, cand,
-                                      squeeze)[1]):
+                if cost(d, 0.0) <= cost(d, cand):
                     cand = 0.0
                 r = cand
         return d, r
@@ -2979,17 +3091,20 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
         return float(a / A_m), float(b / A_i), float(star)
 
     def evaluate(d, r, q=0.0):
-        (a, b), rss, m = _eq1_solve(e, f, w_all, W, d, r, q)
+        coef, rss, m = _eq1_solve(e, f, w_all, W, d, r, q, bool(baseline),
+                                  off_limit)
+        a, b = float(coef[0]), float(coef[1])
+        off = float(coef[2]) if len(coef) > 2 else 0.0
         y = f[m]
-        pred = _eq1_design(e[m], d, r, q) @ np.array([a, b])
+        pred = _eq1_design(e[m], d, r, q, bool(baseline)) @ coef
         resid = y - pred
         ss_tot = float(np.sum((y - y.mean()) ** 2))
         big = e[m] > 0.03
         rel = (float(np.sqrt(np.mean((resid[big] / np.maximum(
             np.abs(y[big]), 3 * sigma0)) ** 2))) * 100.0 if big.any()
             else float("nan"))
-        return {"A": float(a), "B": float(b), "delta": d, "reserve": r,
-                "squeeze": float(q),
+        return {"A": float(a), "B": float(b), "offset": off,
+                "delta": d, "reserve": r, "squeeze": float(q),
                 "rss_w": rss, "n": int(m.sum()), "mask": m, "pred": pred,
                 "r2": (1.0 - float(np.sum(resid ** 2)) / ss_tot
                        if ss_tot > 0 else float("nan")),
@@ -3011,6 +3126,7 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
     other = fits["eq1"] if reserve else fits["reserve"]
     A, B, delta, res = chosen["A"], chosen["B"], chosen["delta"], chosen["reserve"]
     q_used = float(chosen["squeeze"])
+    off = float(chosen.get("offset", 0.0))
     Em, Ei, eps_star = moduli(A, B)
 
     # ---- block bootstrap of the weighted residuals ---------------------
@@ -3023,7 +3139,7 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
         rng = np.random.default_rng(seed)
         wtt, ett = wt[mt], et[mt]
         pt = _eq1_design(ett, delta, res, q_used) @ np.array([A, B])
-        z = (ft[mt] - pt) * wtt
+        z = (ft[mt] - off - pt) * wtt
         n = z.size
         span = max(float(ett.max() - ett.min()), 1e-9)
         # Blocks at least twice as long as the residuals stay correlated
@@ -3093,10 +3209,10 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
             continue
         rs2 = (np.arange(0.0, min(r_hi, W2 - 0.03) + 1e-12, 0.005)
                if reserve else np.array([0.0]))
-        _q, d2, r2_, (a2, b2) = _eq1_profile(
+        _q, d2, r2_, c2 = _eq1_profile(
             et, ft, wt, W2, np.arange(d_lo, d_hi + 1e-12, 0.005), rs2,
-            q_used)
-        em2, ei2, _s = moduli(a2, b2)
+            q_used, bool(baseline), off_limit)
+        em2, ei2, _s = moduli(float(c2[0]), float(c2[1]))
         moves.append({"window_pct": W2 * 100.0, "Em": em2, "Ei": ei2,
                       "reserve": float(r2_)})
 
@@ -3110,10 +3226,21 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
     past = (e > W) & (e <= min(W + 0.10, top))
     beyond = float("nan")
     if past.sum() > 10:
-        pp = _eq1_design(e[past], delta, res, q_used) @ np.array([A, B])
+        pp = (_eq1_design(e[past], delta, res, q_used) @ np.array([A, B])
+              + off)
         ok = pp > 0
         if ok.any():
             beyond = float(np.median(f[past][ok] / pp[ok] - 1.0) * 100.0)
+
+    # ---- how the fit sits on the first decade, where the forces are
+    # smallest and a contact point half a per cent out shows up ----------
+    early = (e > 0.02) & (e <= 0.15) & (e <= W)
+    early_gap = float("nan")
+    if early.sum() > 20:
+        pe = (_eq1_design(e[early], delta, res, q_used)
+              @ np.array([A, B]) + off)
+        early_gap = float(np.median((pe - f[early]) / np.maximum(
+            np.abs(f[early]), 3 * sigma0)) * 100.0)
 
     # ---- what the plots need ------------------------------------------
     reach = min(top, W + 0.10)
@@ -3121,7 +3248,7 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
     s = np.clip(grid - delta, 0.0, None)
     g_grid = _eq1_squash(grid, q_used)
     shell = A * np.clip(s - res, 0.0, None) ** 3 * g_grid
-    interior = B * s ** 1.5 * g_grid
+    interior = B * s ** 1.5 * g_grid + off
     # The apparent Hertz modulus, F / (A_i·s^1.5): flat at Eᵢ while the
     # interior carries the load alone, rising once the shell joins. The
     # plateau is Eᵢ read straight off the curve, and where the rise starts
@@ -3146,7 +3273,8 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
     sa = np.clip(at / 100.0 - delta, 1e-9, None)
     u = np.clip(sa - res, 0.0, None)
     num = 3.0 * A * u ** 2 * (at / 100.0) + 1.5 * B * sa ** 0.5 * (at / 100.0)
-    den = A * u ** 3 + B * sa ** 1.5
+    den = A * u ** 3 + B * sa ** 1.5 + off / np.maximum(
+        _eq1_squash(at / 100.0, q_used), 1e-12)
     # the squash's own stiffening adds q·ε/(1−ε) to the exponent
     squash_p = q_used * (at / 100.0) / np.clip(1.0 - at / 100.0, 0.02, None)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -3165,6 +3293,7 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
         "K_s_N_per_m": float(Em * h / (1.0 - nu_m)),
         "eps_star": eps_star, "delta": float(delta), "reserve": float(res),
         "squeeze": q_used, "squeeze_fitted": bool(fit_q),
+        "offset_N": off,
         # The same coefficient A read the way the earlier by-hand fits read
         # it: a bare 4 nm bilayer and 1/(1−ν²) rather than 1/(1−ν). It is
         # the same measurement in another convention, so it is reported
@@ -3184,6 +3313,7 @@ def lulevich_eq1_fit(epsilon, force_N, geometry, thickness=None,
         "window_moves": moves,
         "E_m_window_pct": worst("Em", Em), "E_i_window_pct": worst("Ei", Ei),
         "beyond_pct": beyond,
+        "early_gap_pct": early_gap,
         "alternative": {
             "model": ("eq 1 as written, both from contact" if reserve
                       else "eq 3 + eq 6, sarcolemma from its reserve"),
