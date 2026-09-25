@@ -886,8 +886,9 @@ DEFAULTS = {
     # The cardiomyocyte fit: the sarcolemma from its reserve, the window
     # ended where the curve's own log-log slope reaches 3.
     "eq1_arrangement": "reserve",
-    "eq1_window_mode": "auto",
+    "eq1_window_mode": "full",
     "eq1_window": 35.0,
+    "eq1_squeeze_way": "population",
     "cv_pattern": "*",
     "cv_unit": "from the column name",
     # The four-marker video tracker on the Cell motion tab.
@@ -4684,6 +4685,25 @@ def apply_cell_type(name):
         st.session_state[f"use_{term}"] = bool(
             wanted.get(term, False) and term in terms_for(name)
         )
+    # The early board, which is the whole board for a cardiomyocyte: which
+    # component joins where, and whether the squash's own stiffening is on.
+    # A myoblast keeps what it always had.
+    if name in ("Cardiomyocyte",):
+        st.session_state["pw_cyto_lo"] = 2.0
+        st.session_state["pw_cyto_hi"] = 30.0
+        st.session_state["pw_squeeze_way"] = "typed"
+        st.session_state["pw_squeeze"] = PW_CARDIO_SQUEEZE
+    else:
+        st.session_state["pw_cyto_lo"] = 20.0
+        st.session_state["pw_cyto_hi"] = 40.0
+        st.session_state["pw_squeeze_way"] = DEFAULTS["pw_squeeze_way"]
+        st.session_state["pw_squeeze"] = DEFAULTS["pw_squeeze"]
+    # The early window is the cell type's own: a myoblast is read to 35 %,
+    # a cardiomyocyte to the end of its curve. Either way a window set by
+    # hand for the previous cell type does not follow the new one.
+    st.session_state["_pw_early_end"] = None
+    st.session_state["_pw_early_end_user"] = False
+
     # Composition too, and always to a known state rather than only where a
     # cell type happens to override it.
     composition = dict(BASE_COMPOSITION)
@@ -5642,7 +5662,8 @@ def component_order_control():
             f"{end:g} %**, then {names[PW_EARLY_ORDER[1]][0]} **from ε₁ to "
             f"{end:g} %**, with ε₁ inside **{lo:g}–{hi:g} %**. The order "
             "and the ranges are the model and do not move; only where in "
-            "that band the cytoskeleton appears is read off the curve.")
+            f"that band the {early_join_name()} appears is read off the "
+            "curve.")
         return
     together = early and st.session_state.get("pw_early_join",
                                               "parallel") == "parallel"
@@ -6192,12 +6213,30 @@ PW_EARLY_VIEW_PCT = 45.0
 # over e = 0.1-0.3 and a living cell is elastic and fully reversible to
 # about 30 %, so 35 % covers the range the two-term model is for.
 PW_EARLY_END_PCT = 35.0
+# Where a cardiomyocyte's reading stops when no curve is loaded to ask.
+PW_CARDIO_END_PCT = 60.0
+# The squash's own stiffening, (1-x/100)^-q, for a cardiomyocyte. Fitted
+# free on all 139 traces it comes out at 0.80 (IQR 0.45 to 1.10), and
+# holding every cell at that one value costs a point of misfit (4.0 %
+# against 3.0 %) while making E_m comparable from cell to cell: q and E_m
+# trade against each other (r = -0.78), so a q of its own per cell moves
+# the modulus by 41 %.
+PW_CARDIO_SQUEEZE = 0.80
 # The early regime is one fixed arrangement, not a search over models: the
 # membrane carries load from first contact to the end of the window, and
 # the cytoskeleton joins somewhere in this band and carries to the end
 # too. Only where inside the band it joins is looked for; the order and
 # the ranges are the model, and the model does not move.
-PW_EARLY_ORDER = ("membrane", "interior")
+# ...for a myoblast. A cardiomyocyte is the other way round, and the
+# reason is in its own curves: their log-log slope starts at 1.5, not at 3,
+# so the Hertzian interior is what meets the plates first and the
+# sarcolemma joins later, once its reserve (caveolae, folds, the mouths of
+# the T-tubules) has unfolded. Measured on all 139 traces, fitting a
+# cardiomyocyte membrane-first leaves the interior at exactly zero on four
+# cells in five; the other way round it never does.
+_PW_CARDIO = st.session_state.get("cell_type") in EARLY_ONLY_CELL_TYPES
+PW_EARLY_ORDER = (("interior", "membrane") if _PW_CARDIO
+                  else ("membrane", "interior"))
 # 20 to 40 %. The low edge is not only where the search starts looking,
 # it is a FLOOR: the cytoskeleton is not allowed to join before it, by
 # hand or by optimiser, on a good curve or a bad one. A joining point
@@ -6206,7 +6245,7 @@ PW_EARLY_ORDER = ("membrane", "interior")
 # stretch, and a model that lets that happen measures a different thing
 # on every cell. Both edges can be moved on the board; the floor follows
 # the low one.
-PW_EARLY_CYTO_BAND = (20.0, 40.0)
+PW_EARLY_CYTO_BAND = (2.0, 30.0) if _PW_CARDIO else (20.0, 40.0)
 # Past this the cytoskeleton is being read off the last few per cent of
 # the squash alone, and its modulus climbs away from what is reported for
 # a C2C12. Not an error -- a thing worth saying next to the number.
@@ -6235,6 +6274,12 @@ def early_band(end=None):
     lo = min(lo, max(top - 2.0 * PW_MIN_GAP, 1.0))
     hi = min(hi, max(top - 1.5, lo + PW_MIN_GAP))
     return lo, hi
+
+
+def early_join_name():
+    """What the second component is called on this cell type, lower case."""
+    key = ORDER_COEFFICIENT.get(PW_EARLY_ORDER[1], "")
+    return (PW_COMPONENT_TITLES.get(key, "the second component")).lower()
 
 
 def early_join_floor(end=None):
@@ -6291,11 +6336,23 @@ def early_end_pct():
     91 % handed back and fitted two components over the whole cell.
     """
     try:
-        end = float(st.session_state.get("_pw_early_end")
-                    or PW_EARLY_END_PCT)
+        end = float(st.session_state.get("_pw_early_end") or 0.0)
     except (TypeError, ValueError):
-        return float(PW_EARLY_END_PCT)
-    return end if 2.0 < end <= 100.0 else float(PW_EARLY_END_PCT)
+        end = 0.0
+    if 2.0 < end <= 100.0:
+        return end
+    if early_only():
+        # A cardiomyocyte is read over the whole squash, to the end of its
+        # own curve. Its two laws plus the squash's own stiffening follow
+        # the force all the way to 60 or 70 %, and stopping at 35 % was
+        # what left the fitted curve under the data.
+        eps = np.asarray((st.session_state.get("data") or {}).get(
+            "epsilon", ()), dtype=float)
+        eps = eps[np.isfinite(eps)]
+        if eps.size:
+            return float(min(100.0, max(10.0, np.nanmax(eps) * 100.0)))
+        return float(PW_CARDIO_END_PCT)
+    return float(PW_EARLY_END_PCT)
 
 
 def eps_summary(bounds=None, latex=False):
@@ -7741,8 +7798,14 @@ def lulevich_panel(result, model, fit=None, epsilon=None, force_N=None):
 # reserve profiled and the window ended where the curve's own local
 # exponent reaches 3. Its reasons are in piecewise_fit.lulevich_eq1_fit.
 
-EQ1_WINDOW_MODES = {"auto": "Where p(ε) reaches 3 (auto)",
+EQ1_WINDOW_MODES = {"full": "The whole squash",
+                    "auto": "Where p(ε) reaches 3",
                     "manual": "Set it"}
+EQ1_SQUEEZE_WAYS = {
+    "population": "q = 0.80, the value from 139 traces",
+    "fit": "Fit q on this cell",
+    "off": "Off (the plain two laws)",
+}
 EQ1_ARRANGEMENTS = {
     "reserve": "Sarcolemma from its reserve ε_r (recommended)",
     "eq1": "Eq 1 as written: both from contact",
@@ -7751,7 +7814,8 @@ EQ1_ARRANGEMENTS = {
 
 @st.cache_data(show_spinner=False, max_entries=64)
 def cached_eq1_fit(epsilon, force_N, height_m, radius_m, thickness_m,
-                   nu_m, nu_i, probe_radius_m, reserve, window, n_boot):
+                   nu_m, nu_i, probe_radius_m, reserve, window, n_boot,
+                   squeeze=0.0):
     geometry = Geometry(
         cell_height=float(height_m), cell_radius=float(radius_m),
         nucleus_radius=float(radius_m) * 0.3,
@@ -7761,10 +7825,21 @@ def cached_eq1_fit(epsilon, force_N, height_m, radius_m, thickness_m,
     return lulevich_eq1_fit(
         np.asarray(epsilon, dtype=float), np.asarray(force_N, dtype=float),
         geometry, reserve=bool(reserve), window_pct=window,
-        n_boot=int(n_boot))
+        squeeze=squeeze, n_boot=int(n_boot))
 
 
-def eq1_for(epsilon, force_N, model, reserve=None, window=None, n_boot=200):
+def eq1_squeeze():
+    """The confinement exponent the cardiomyocyte fit uses."""
+    way = st.session_state.get("eq1_squeeze_way", "population")
+    if way == "fit":
+        return "fit"
+    if way == "off":
+        return 0.0
+    return float(getattr(_piecewise_module, "EQ1_SQUEEZE", 0.80))
+
+
+def eq1_for(epsilon, force_N, model, reserve=None, window=None, n_boot=200,
+            squeeze=None):
     """The cardiomyocyte fit of this curve with the page's own geometry."""
     if lulevich_eq1_fit is None or not HAS_PIECEWISE:
         return None
@@ -7772,15 +7847,18 @@ def eq1_for(epsilon, force_N, model, reserve=None, window=None, n_boot=200):
     if reserve is None:
         reserve = st.session_state.get("eq1_arrangement", "reserve") == "reserve"
     if window is None:
-        window = ("auto" if st.session_state.get("eq1_window_mode", "auto")
-                  == "auto" else float(st.session_state.get("eq1_window", 35.0)))
+        mode = st.session_state.get("eq1_window_mode", "full")
+        window = (float(st.session_state.get("eq1_window", 35.0))
+                  if mode == "manual" else mode)
+    if squeeze is None:
+        squeeze = eq1_squeeze()
     try:
         return cached_eq1_fit(
             np.asarray(epsilon, dtype=float), np.asarray(force_N, dtype=float),
             float(g.cell_height), float(g.cell_radius),
             float(early_thickness_m()), float(g.nu_membrane),
             float(g.nu_interior), float(g.probe_radius or 0.0),
-            bool(reserve), window, int(n_boot))
+            bool(reserve), window, int(n_boot), squeeze)
     except Exception as exc:          # a curve the fit cannot read
         return {"success": False, "error": str(exc)}
 
@@ -7791,7 +7869,8 @@ def eq1_summary(fit):
         return None
     keys = ("E_m_Pa", "E_i_Pa", "K_s_N_per_m", "eps_star", "delta", "reserve",
             "window_pct", "r_squared", "rel_rms_pct", "E_m_window_pct",
-            "E_i_window_pct", "beyond_pct", "delta_aicc", "model")
+            "E_i_window_pct", "beyond_pct", "delta_aicc", "model",
+            "squeeze", "E_m_bilayer_Pa")
     out = {k: fit.get(k) for k in keys}
     for k in ("E_m_ci_Pa", "E_i_ci_Pa", "reserve_ci"):
         out[k] = list(fit.get(k) or (float("nan"), float("nan")))
@@ -7933,39 +8012,56 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
     box = st.container(border=True)
     with box:
         st.markdown("#### 🫀 Cardiomyocyte fit: eq 3 + eq 6")
-        c1, c2, c3 = st.columns([2.2, 1.6, 1.2])
+        c1, c2, c3, c4 = st.columns([2.1, 1.5, 1.7, 1.0])
         with c1:
             st.radio("How the two laws share the load",
                      list(EQ1_ARRANGEMENTS), key="eq1_arrangement",
                      format_func=EQ1_ARRANGEMENTS.get,
                      help="Reserve: the non-sarcomeric cytoskeleton carries "
                           "the load from contact and the sarcolemma starts "
-                          "stretching once its reserve (caveolae, folds) is "
-                          "used up. ε_r = 0 is eq 1 exactly, so this never "
-                          "fits worse. Eq 1: both from contact.")
+                          "stretching once its reserve (caveolae, folds, the "
+                          "mouths of the T-tubules) is used up. ε_r = 0 is "
+                          "eq 1 exactly, so this never fits worse. Eq 1: "
+                          "both from contact.")
         with c2:
-            st.radio("Window end", list(EQ1_WINDOW_MODES),
+            st.radio("How far it is read", list(EQ1_WINDOW_MODES),
                      key="eq1_window_mode", format_func=EQ1_WINDOW_MODES.get,
-                     help="Neither law can make the force rise faster than "
-                          "ε³, so where the curve's own log-log slope "
-                          "reaches 3 the cell has left the model (it is "
-                          "confined between the plates). Auto ends there, "
-                          "held between 25 and 45 %.")
+                     help="The whole squash is the default: with the "
+                          "squash's own stiffening the two laws follow the "
+                          "force to 60 or 70 %. The p(ε) = 3 rule stops "
+                          "where the plain laws run out, which is what to "
+                          "use with the stiffening switched off.")
         with c3:
+            st.radio("The squash's own stiffening  (1−ε)^−q",
+                     list(EQ1_SQUEEZE_WAYS), key="eq1_squeeze_way",
+                     format_func=EQ1_SQUEEZE_WAYS.get,
+                     help="A cell pressed flat has nowhere to put the "
+                          "volume it is losing, so everything in it "
+                          "stiffens together as the gap closes. Fitted free "
+                          "on 139 traces q is 0.80 (IQR 0.45 to 1.10). Held "
+                          "at that one value every cell's Eₘ is on the same "
+                          "footing; fitted per cell it is a point of misfit "
+                          "better and Eₘ moves by 41 %, because q and Eₘ "
+                          "trade against each other.")
+        with c4:
             if st.session_state.get("eq1_window_mode") == "manual":
-                st.number_input("to ε (%)", min_value=10.0, max_value=80.0,
+                st.number_input("to ε (%)", min_value=10.0, max_value=90.0,
                                 step=1.0, key="eq1_window")
         reserve = st.session_state.get("eq1_arrangement") == "reserve"
+        squashing = st.session_state.get("eq1_squeeze_way", "population") != "off"
+        tail = (r"\,\big(1-\varepsilon\big)^{-q}" if squashing else "")
         if reserve:
-            st.latex(r"F=\underbrace{\frac{\sqrt{2}\,E_i R_0^{2}}{3(1-\nu_i^{2})}"
-                     r"\,s^{3/2}}_{\text{eq 6, from contact}}+"
-                     r"\underbrace{\frac{2\pi E_m h_m R_0}{1-\nu_m}\,"
-                     r"(s-\varepsilon_r)_+^{3}}_{\text{eq 3, from its reserve}}"
-                     r",\qquad s=\varepsilon-\delta")
+            st.latex(r"F=\Bigg[\underbrace{\frac{\sqrt{2}\,E_i R_0^{2}}"
+                     r"{3(1-\nu_i^{2})}\,s^{3/2}}_{\text{eq 6, from contact}}"
+                     r"+\underbrace{\frac{2\pi E_m h_m R_0}{1-\nu_m}\,"
+                     r"(s-\varepsilon_r)_+^{3}}_{\text{eq 3, from its "
+                     r"reserve}}\Bigg]" + tail
+                     + r",\qquad s=\varepsilon-\delta")
         else:
-            st.latex(r"F=\frac{2\pi E_m h_m R_0}{1-\nu_m}\,s^{3}+"
-                     r"\frac{\sqrt{2}\,E_i R_0^{2}}{3(1-\nu_i^{2})}\,s^{3/2},"
-                     r"\qquad s=\varepsilon-\delta")
+            st.latex(r"F=\Bigg[\frac{2\pi E_m h_m R_0}{1-\nu_m}\,s^{3}+"
+                     r"\frac{\sqrt{2}\,E_i R_0^{2}}{3(1-\nu_i^{2})}\,"
+                     r"s^{3/2}\Bigg]" + tail
+                     + r",\qquad s=\varepsilon-\delta")
         fit = eq1_for(epsilon, force_N, model)
         if not (fit and fit.get("success")):
             st.warning("The two laws could not be fitted to this curve"
@@ -7986,13 +8082,20 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
                    + _eq1_ci_text(fit["E_m_ci_Pa"], 1e6, "MPa"))
         m3.metric("Kₛ = Eₘhₘ/(1−νₘ)",
                   f"{fit['K_s_N_per_m'] * 1e3:.3g} mN/m")
-        m3.caption(f"what the curve measures; Eₘ assumes hₘ = "
-                   f"{fit['thickness_m'] * 1e9:g} nm")
+        m3.caption(
+            f"what the curve measures; Eₘ assumes hₘ = "
+            f"{fit['thickness_m'] * 1e9:g} nm. Read the earlier way "
+            f"(hₘ = {fit['bilayer_h_m'] * 1e9:g} nm, 1/(1−ν²)): "
+            f"**{fit['E_m_bilayer_Pa'] / 1e6:.3g} MPa**")
         if reserve:
             m4.metric("reserve ε_r", f"{fit['reserve'] * 100:.1f} %")
             lo, hi = fit["reserve_ci"]
-            m4.caption(f"95 % CI {lo * 100:.1f} to {hi * 100:.1f} %"
-                       if np.isfinite(lo) else "")
+            m4.caption((f"95 % CI {lo * 100:.1f} to {hi * 100:.1f} % · "
+                        if np.isfinite(lo) else "")
+                       + (f"q = {fit['squeeze']:.2f}"
+                          + (" (fitted here)" if fit.get("squeeze_fitted")
+                             else "")
+                          if fit["squeeze"] else "no stiffening term"))
         else:
             m4.metric("crossover ε*", f"{fit['eps_star'] * 100:.1f} %"
                       if np.isfinite(fit["eps_star"]) else "n/a")
@@ -8034,12 +8137,17 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
              "value": (f"Eᵢ {fit['E_i_window_pct']:.0f} % · "
                        f"Eₘ {fit['E_m_window_pct']:.0f} %"),
              "reads": "largest change in each modulus"},
+            {"": "the squash's own stiffening q",
+             "value": (f"{fit['squeeze']:.2f}" if fit["squeeze"] else "off"),
+             "reads": ("fitted on this cell" if fit.get("squeeze_fitted")
+                       else "held at the value from 139 traces"
+                       if fit["squeeze"] else "the plain two laws")},
             {"": "curve past the window",
              "value": (f"{fit['beyond_pct']:+.0f} %"
                        if np.isfinite(fit["beyond_pct"]) else "n/a"),
-             "reads": "above the laws: confinement between the plates"
+             "reads": "above the fit, so the reading stops short of the cell"
              if np.isfinite(fit["beyond_pct"]) and fit["beyond_pct"] > 5
-             else "the laws still hold"},
+             else "the model still holds there"},
             {"": "R²", "value": f"{fit['r_squared']:.5f}",
              "reads": f"{fit['n_points']:,} points, noise-weighted"},
         ]
@@ -8048,7 +8156,7 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
             em_b = float((mods.get("K_shell") or {}).get("E_Pa", float("nan")))
             ei_b = float((mods.get("K_cyto") or {}).get("E_Pa", float("nan")))
             rows.append({
-                "": "the board above (staggered join)",
+                "": "the board above",
                 "value": (f"Eᵢ {ei_b / 1e3:.3g} kPa · Eₘ {em_b / 1e6:.3g} MPa"
                           if np.isfinite(em_b) and np.isfinite(ei_b)
                           else "n/a"),
@@ -10432,7 +10540,8 @@ def early_boundary_control():
     # settings panel somewhere else.
     w1, w2, w3 = st.columns([1, 1, 2.4])
     with w1:
-        st.number_input("Cytoskeleton joins no earlier than (%)",
+        st.number_input(
+            f"{early_join_name().capitalize()} joins no earlier than (%)",
                         PW_MIN_GAP, 95.0, step=0.5, format="%.1f",
                         key="pw_cyto_lo", on_change=_pw_early_band_changed,
                         help="A hard floor. Nothing on this page may put "
@@ -10457,7 +10566,7 @@ def early_boundary_control():
                else "."))
     o1, o2 = st.columns(2)
     with o1:
-        if st.button(f"🎯 Optimise — where the cytoskeleton appears "
+        if st.button(f"🎯 Optimise — where the {early_join_name()} appears "
                      f"({lo:g}–{hi:g} %)", key="pw_early_optimise", **STRETCH,
                      help="Scans the joining point across the band and "
                           "keeps the one with the highest R² that still "
