@@ -503,7 +503,7 @@ def track_points(video_path, points_xy, start_frame=0, end_frame=None,
     max_correction = (GENTLE_ANCHOR_MAX_CORR_PX if gentle
                       else ANCHOR_MAX_CORR_PX)
 
-    capture = cv2.VideoCapture(str(video_path))
+    capture = RobustCapture(video_path)
     if not capture.isOpened():
         raise RuntimeError("Could not open that video for tracking.")
     try:
@@ -676,6 +676,786 @@ def track_points(video_path, points_xy, start_frame=0, end_frame=None,
         capture.release()
 
 
+# ------------------------------------------- v1.9.4: reading past damage ---
+
+# Frame rates re-measured from the frames' time stamps when the file header
+# is wrong (path -> fps). RobustCapture reports these; the automatic
+# analysis fills it in.
+FPS_FIX = {}
+
+
+class RobustCapture:
+    """
+    cv2.VideoCapture that does not stop at a damaged spot.
+
+    OpenCV's read() returns False at the first frame it cannot decode and
+    then every following read fails too, so anything that reads the video
+    in order stopped there, often halfway. This wrapper finds the next
+    readable frame by re-opening the file and seeking, and while it skips
+    the unreadable frames it hands back the last good picture so frame
+    numbers stay aligned. The skipped frame numbers are listed in
+    ``bad_frames`` (and ``last_was_bad`` tells about the frame just read),
+    so measurements on them can be left out. Everything else behaves like
+    cv2.VideoCapture.
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self._cap = cv2.VideoCapture(self.path)
+        try:
+            self._n = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self._fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            self._n, self._fps = 0, 0.0
+        if not (self._fps > 0):
+            self._fps = float(DEFAULT_FPS)
+        self._pos = 0
+        self._last = None
+        self._skip_to = None
+        self._broken = False
+        self._after_seek = True
+        self.bad_frames = []
+        self.unreadable_from = None
+        self.last_was_bad = False
+
+    def __getattr__(self, name):
+        return getattr(self._cap, name)
+
+    def _reopen(self, frame):
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+        self._cap = cv2.VideoCapture(self.path)
+        if frame > 0:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame))
+        self._broken = False
+
+    def _readable(self, k):
+        c = cv2.VideoCapture(self.path)
+        try:
+            if k > 0:
+                c.set(cv2.CAP_PROP_POS_FRAMES, int(k))
+            ok, f = c.read()
+            return bool(ok) and f is not None
+        finally:
+            c.release()
+
+    def _find_next(self, bad):
+        """First readable frame after ``bad`` (None if there is none)."""
+        last = self._n - 1
+        if bad >= last:
+            return None
+        lo, step, hi = bad, 1, None
+        while hi is None:
+            k = min(last, lo + step)
+            if self._readable(k):
+                hi = k
+            elif k >= last:
+                return None
+            else:
+                lo, step = k, step * 2
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if self._readable(mid):
+                hi = mid
+            else:
+                lo = mid
+        return hi
+
+    def release(self):
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self._pos = max(0, int(round(value)))
+            self._skip_to = None
+            self._after_seek = True
+            if self._broken:
+                self._reopen(self._pos)
+                return True
+        return self._cap.set(prop, value)
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return float(self._pos)
+        if prop == cv2.CAP_PROP_FPS and self.path in FPS_FIX:
+            return float(FPS_FIX[self.path])
+        if prop == cv2.CAP_PROP_POS_MSEC and self.last_was_bad:
+            return float("nan")
+        return self._cap.get(prop)
+
+    def grab(self):
+        ok, _f = self.read()
+        return ok
+
+    def read(self, *args):
+        self.last_was_bad = False
+        if self._skip_to is not None:
+            if self._pos < self._skip_to:
+                self.bad_frames.append(self._pos)
+                self._pos += 1
+                self.last_was_bad = True
+                return True, self._last.copy()
+            self._reopen(self._skip_to)
+            self._skip_to = None
+        ok, f = self._cap.read()
+        if ok and f is not None:
+            self._pos += 1
+            self._last = f
+            self._after_seek = False
+            return True, f
+        self._broken = True
+        if self._after_seek or self._last is None or self._pos >= self._n - 1:
+            return False, None
+        k = self._find_next(self._pos)
+        if k is None:
+            self.unreadable_from = self._pos
+            return False, None
+        self._skip_to = k
+        self.bad_frames.append(self._pos)
+        self._pos += 1
+        self.last_was_bad = True
+        return True, self._last.copy()
+
+
+# ------------------------------- v1.7: the reference-anchored tracker ---
+#
+# Each marker owns ONE circular area of radius ``radius`` px. On every frame
+# that area is found again by matching it, to sub-pixel precision and
+# independently of brightness, against how it looked on the FIRST tracked
+# frame. Matching against the first frame instead of the previous one is
+# what stops the slow creep off the picked spot, so every contraction is
+# measured from the same place. The v1.6 patch tracker above is kept as
+# ``track_points`` for comparison.
+
+TRACK_AREA_RADIUS = 15            # px; the ring drawn on the preview
+TRACK_AREA_RADIUS_MIN = 6
+TRACK_AREA_RADIUS_MAX = 40
+REF_MATCH_SIGMA = 1.0             # px Gaussian pre-blur for the matcher
+REF_LOCK_CONF = 0.55              # min correlation to stay anchored
+REF_RELOCK_CONF = 0.75            # min correlation to re-anchor after a loss
+REF_STRONG_CONF = 0.80            # at/above this a match is taken as certain
+REF_SEARCH_PAD = 10               # px searched around the predicted position
+REF_RECOVER_PAD = 40              # px, widest search while un-anchored
+REF_GROUP_TOL_PX = 4.0            # px a point may differ from the others
+REF_REREF_SECONDS = 1.5           # un-anchored this long -> adopt a new look
+REF_MIN_CONTRAST = 4.0            # grey levels; below = "nothing to track"
+REF_MIN_EIG_RATIO = 0.12          # below = straight edge (can slide along it)
+
+# Lock states, per frame and marker, in result["lock"].
+LOST, ESTIMATED, ANCHORED, REANCHORED = 0, 1, 2, 3
+LOCK_NAMES = {LOST: "lost", ESTIMATED: "estimated",
+              ANCHORED: "anchored", REANCHORED: "re-anchored"}
+
+
+class RefPatch:
+    """
+    One circular tracking area, remembered as it looked on the reference
+    frame, plus a sub-pixel matcher for finding it again later.
+
+    The matcher is the inverse-compositional Gauss-Newton scheme used in
+    digital image correlation, with a zero-mean NORMALISED criterion, so a
+    change of brightness or contrast (flicker, the cell darkening as it
+    thickens) does not move the answer. Only pixels inside the circle take
+    part (soft 2-px rim), so the circle drawn on the preview is the truth.
+    """
+
+    def __init__(self, img, cx, cy, radius, taper=2.0):
+        self.r = int(max(2, radius))
+        r = self.r
+        ys, xs = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+        dist = np.hypot(xs, ys)
+        w = np.clip((r + 0.5 - dist) / float(taper), 0.0, 1.0)
+        self.w = w.astype(np.float64)
+        self.wsum = float(self.w.sum())
+        self.cx, self.cy = float(cx), float(cy)
+
+        f = self._grab(img, self.cx, self.cy)
+        fx = 0.5 * (self._grab(img, self.cx + 1.0, self.cy)
+                    - self._grab(img, self.cx - 1.0, self.cy))
+        fy = 0.5 * (self._grab(img, self.cx, self.cy + 1.0)
+                    - self._grab(img, self.cx, self.cy - 1.0))
+        self.square = f.astype(np.float32)
+        fm = float((self.w * f).sum() / self.wsum)
+        fz = f - fm
+        fn = float(np.sqrt((self.w * fz * fz).sum()))
+        self.contrast = fn / math.sqrt(self.wsum) if self.wsum > 0 else 0.0
+        self.eig_ratio = 0.0
+        self.Hinv = None
+        self.ok = fn > 1e-6
+        if not self.ok:
+            return
+        self.ft = fz / fn
+        self.jx = fx / fn
+        self.jy = fy / fn
+        hxx = float((self.w * self.jx * self.jx).sum())
+        hxy = float((self.w * self.jx * self.jy).sum())
+        hyy = float((self.w * self.jy * self.jy).sum())
+        H = np.array([[hxx, hxy], [hxy, hyy]], dtype=np.float64)
+        ev = np.linalg.eigvalsh(H)
+        self.eig_ratio = float(ev[0] / ev[1]) if ev[1] > 0 else 0.0
+        self.ok = bool(ev[0] > 1e-9)
+        if self.ok:
+            self.Hinv = np.linalg.inv(H)
+
+    def _grab(self, img, x, y):
+        """
+        The (2r+1)² patch centred on sub-pixel (x, y), by Catmull-Rom cubic
+        interpolation done in NumPy. cv2.remap is deliberately not used: it
+        rounds sampling positions to 1/32 px, which stops the sub-pixel
+        iteration settling, and its a=-0.75 kernel adds a ripple that
+        repeats every pixel of travel; both would end up in the speeds.
+        """
+        r = self.r
+        S = 2 * r + 1
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return np.zeros((S, S), dtype=np.float64)
+        H, W = img.shape[:2]
+        x = float(clamp(x, -4.0 * S, W + 4.0 * S))
+        y = float(clamp(y, -4.0 * S, H + 4.0 * S))
+        ix, iy = int(math.floor(x)), int(math.floor(y))
+        tx, ty = x - ix, y - iy
+        rows = np.clip(np.arange(iy - r - 1, iy + r + 3), 0, H - 1)
+        cols = np.clip(np.arange(ix - r - 1, ix + r + 3), 0, W - 1)
+        blk = img[np.ix_(rows, cols)].astype(np.float64)
+
+        def taps(t):
+            t2, t3 = t * t, t * t * t
+            return (0.5 * (-t3 + 2.0 * t2 - t),
+                    0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+                    0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+                    0.5 * (t3 - t2))
+
+        a0, a1, a2, a3 = taps(tx)
+        h = (a0 * blk[:, 0:S] + a1 * blk[:, 1:S + 1]
+             + a2 * blk[:, 2:S + 2] + a3 * blk[:, 3:S + 3])
+        b0, b1, b2, b3 = taps(ty)
+        return (b0 * h[0:S] + b1 * h[1:S + 1]
+                + b2 * h[2:S + 2] + b3 * h[3:S + 3])
+
+    def score(self, img, x, y):
+        """Normalised correlation (-1..1) of the area at (x, y)."""
+        if not self.ok:
+            return -1.0
+        g = self._grab(img, x, y)
+        gz = g - (self.w * g).sum() / self.wsum
+        gn = math.sqrt(float((self.w * gz * gz).sum()))
+        if gn < 1e-6:
+            return -1.0
+        return float((self.w * self.ft * (gz / gn)).sum())
+
+    def refine(self, img, x, y, iters=30, eps=0.003, max_move=None):
+        """Sub-pixel refinement from (x, y) -> (x, y, corr, converged)."""
+        if not self.ok:
+            return (float(x), float(y), -1.0, False)
+        x0, y0 = float(x), float(y)
+        x, y = x0, y0
+        limit = float(max_move if max_move is not None else self.r)
+        w = self.w
+        step = float("inf")
+        for _ in range(int(iters)):
+            g = self._grab(img, x, y)
+            gz = g - (w * g).sum() / self.wsum
+            gn = math.sqrt(float((w * gz * gz).sum()))
+            if gn < 1e-6:
+                return (x, y, -1.0, False)
+            e = self.ft - gz / gn
+            b = np.array([(w * self.jx * e).sum(), (w * self.jy * e).sum()])
+            dp = self.Hinv @ b
+            step = float(np.hypot(dp[0], dp[1]))
+            if step > 2.0:
+                dp = dp * (2.0 / step)
+            x += float(dp[0])
+            y += float(dp[1])
+            if np.hypot(x - x0, y - y0) > limit:
+                return (x, y, self.score(img, x, y), False)
+            if step < eps:
+                break
+        return (x, y, self.score(img, x, y), bool(step < 0.05))
+
+    def search(self, img, cx, cy, pad):
+        """Whole-pixel search within ±pad of (cx, cy) -> (x, y, corr)|None."""
+        r = self.r
+        H, W = img.shape[:2]
+        pad = int(max(1, pad))
+        ix, iy = int(round(cx)), int(round(cy))
+        x0, y0 = max(0, ix - r - pad), max(0, iy - r - pad)
+        x1, y1 = min(W, ix + r + pad + 1), min(H, iy + r + pad + 1)
+        if x1 - x0 < 2 * r + 2 or y1 - y0 < 2 * r + 2:
+            return None
+        try:
+            res = cv2.matchTemplate(img[y0:y1, x0:x1], self.square,
+                                    cv2.TM_CCOEFF_NORMED)
+        except cv2.error:
+            return None
+        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _, maxv, _, maxloc = cv2.minMaxLoc(res)
+        return (float(x0 + maxloc[0] + r), float(y0 + maxloc[1] + r),
+                float(maxv))
+
+
+def group_predict(src, dst, p, rigid=False):
+    """
+    If the points ``src`` moved to ``dst``, where is ``p`` now?
+
+    rigid=False: the cell stretched, shortened, turned or shifted as one
+    piece (affine); needs three points not on one line. rigid=True: shift,
+    turn and uniform scale only; needs two. Returns None when it cannot be
+    determined.
+    """
+    src = np.asarray(src, dtype=np.float64).reshape(-1, 2)
+    dst = np.asarray(dst, dtype=np.float64).reshape(-1, 2)
+    n = src.shape[0]
+    if n < 2 or not (np.all(np.isfinite(src)) and np.all(np.isfinite(dst))):
+        return None
+    c = src.mean(axis=0)
+    X = src - c
+    if rigid:
+        d = dst.mean(axis=0)
+        a = X[:, 0] + 1j * X[:, 1]
+        b = (dst[:, 0] - d[0]) + 1j * (dst[:, 1] - d[1])
+        den = float(np.sum(np.abs(a) ** 2))
+        if den < 1e-9:
+            return None
+        z = np.sum(np.conj(a) * b) / den
+        q = z * complex(float(p[0]) - c[0], float(p[1]) - c[1])
+        return np.array([d[0] + q.real, d[1] + q.imag])
+    if n < 3:
+        return None
+    sv = np.linalg.svd(X, compute_uv=False)
+    if sv[0] < 1e-6 or sv[-1] / sv[0] < 0.08:
+        return None
+    A = np.hstack([X, np.ones((n, 1))])
+    M, *_ = np.linalg.lstsq(A, dst, rcond=None)
+    return np.array([float(p[0]) - c[0], float(p[1]) - c[1], 1.0]) @ M
+
+
+def track_points_ref(video_path, points_xy, start_frame=0, end_frame=None,
+                     radius=TRACK_AREA_RADIUS, fb_threshold=FB_THRESHOLD,
+                     contrast=1.0, progress=None):
+    """
+    The v1.7 four-point tracker: every marker anchored to its own area.
+
+    While a marker is anchored (state 2) it is always compared with the
+    reference, so errors do not add up frame to frame: after each
+    contraction it is back on the spot that was picked. When its own area
+    cannot be found (under the probe, badly blurred) it is carried by the
+    stretch and shift of the other markers if three are anchored, else by
+    frame-to-frame optical flow (state 1, "estimated"). When it is seen
+    again it re-anchors, and the error collected meanwhile is spread evenly
+    over the gap, so no jump and no speed spike appears. If the area has
+    not been recognisable for REF_REREF_SECONDS while only flow carried it,
+    its present look becomes the new reference (state 3): stable again from
+    there, but any error built up until then stays.
+
+    Returns the same dict as ``track_points`` plus:
+        method      "ref"
+        lock        (N,K) 2 anchored, 3 re-anchored, 1 estimated, 0 lost
+        zncc        (N,K) the match score
+        radius      the area radius used
+        rerefs      [(frame, marker)] where a new reference was taken
+        contrast, eig_ratio   how trackable each picked spot was
+        bad_frames  frames the file would not give (last good one reused)
+    """
+    if cv2 is None:
+        raise RuntimeError(f"OpenCV is not available: {CV2_ERROR}")
+    P0 = np.asarray(points_xy, dtype=np.float64).reshape(-1, 2)
+    if P0.shape[0] < 1:
+        raise RuntimeError("No markers were given to track.")
+
+    cap = RobustCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open that video for tracking.")
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = float(fps) if fps and fps > 0 else DEFAULT_FPS
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        start_frame = int(clamp(start_frame, 0, max(0, total - 1)))
+        if end_frame is None:
+            end_frame = total - 1
+        end_frame = int(clamp(end_frame, start_frame, max(0, total - 1)))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        ok, frame0 = cap.read()
+        if not ok or frame0 is None:
+            raise RuntimeError(
+                f"Could not read frame {start_frame} to start from.")
+
+        r = int(clamp(int(radius), 3, 200))
+        sigma = float(REF_MATCH_SIGMA)
+        lock_thr, relock_thr = float(REF_LOCK_CONF), float(REF_RELOCK_CONF)
+        strong_thr = float(REF_STRONG_CONF)
+        pad, recover_pad = int(REF_SEARCH_PAD), int(REF_RECOVER_PAD)
+        group_tol = float(REF_GROUP_TOL_PX)
+        reref_after = max(10, int(round(float(REF_REREF_SECONDS) * fps)))
+        ANCH, ESTM, GONE = ANCHORED, ESTIMATED, LOST
+
+        def match_image(bgr):
+            # Plain grey, no CLAHE: the matcher is already independent of
+            # brightness and contrast. A light blur tames sensor noise and
+            # compression blocks.
+            g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            if sigma > 0:
+                g = cv2.GaussianBlur(g, (0, 0), sigma)
+            return g
+
+        gray8 = gray_for_lk(frame0, contrast)
+        gm = match_image(frame0)
+        K = P0.shape[0]
+        refs = [RefPatch(gm, P0[k, 0], P0[k, 1], r) for k in range(K)]
+        first_refs = list(refs)
+
+        lk_win = ensure_odd(2 * r + 1)
+        lk_params = dict(
+            winSize=(lk_win, lk_win), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                      30, 0.01))
+
+        est = P0.copy()
+        base = P0.copy()
+        state = np.full(K, ANCH, dtype=np.uint8)
+        gen = np.zeros(K, dtype=int)
+        n_un = np.zeros(K, dtype=int)
+        n_free = np.zeros(K, dtype=int)
+        span_a = [None] * K
+        delta = [None] * K
+        pts = [P0.copy()]
+        locks = [state.copy()]
+        scores = [np.ones(K, dtype=np.float32)]
+        frames = [start_frame]
+        rerefs = []
+        prev8 = gray8
+        span = max(1, end_frame - start_frame)
+
+        def try_lock(k, centre, spad, thr):
+            ref = refs[k]
+            best = None
+            res = ref.refine(gm, centre[0], centre[1], max_move=spad + 1.5)
+            if res[3]:
+                best = res
+            if best is None or best[2] < strong_thr:
+                c = ref.search(gm, centre[0], centre[1], spad)
+                if c is not None and c[2] >= 0.3:
+                    r2 = ref.refine(gm, c[0], c[1], max_move=4.0)
+                    if (r2[3] and (best is None or r2[2] > best[2])
+                            and np.hypot(r2[0] - centre[0],
+                                         r2[1] - centre[1]) <= spad + 1.5):
+                        best = r2
+            z = best[2] if best is not None else float("nan")
+            if best is not None and best[2] >= thr:
+                return np.array(best[:2], dtype=np.float64), z
+            return None, z
+
+        for frame_idx in range(start_frame + 1, end_frame + 1):
+            if progress is not None and progress(frame_idx - start_frame,
+                                                 span):
+                break
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            gray8 = gray_for_lk(frame, contrast)
+            gm = match_image(frame)
+
+            # Frame-to-frame flow: only a first guess of where to look, and
+            # the fallback for a marker with nothing better.
+            p_prev = est.astype(np.float32).reshape(-1, 1, 2)
+            nxt, st_f, _ = cv2.calcOpticalFlowPyrLK(
+                prev8, gray8, p_prev, None, **lk_params)
+            bck, st_b, _ = cv2.calcOpticalFlowPyrLK(
+                gray8, prev8, nxt, None, **lk_params)
+            fb = np.linalg.norm(
+                p_prev.reshape(-1, 2) - bck.reshape(-1, 2), axis=1)
+            flow_ok = ((st_f.reshape(-1) == 1) & (st_b.reshape(-1) == 1)
+                       & (fb <= float(fb_threshold)))
+            nxt = nxt.reshape(-1, 2).astype(np.float64)
+
+            out = np.full((K, 2), np.nan, dtype=np.float64)
+            st = np.zeros(K, dtype=np.uint8)
+            zz = np.full(K, np.nan, dtype=np.float32)
+            idx = len(pts)
+            prev = pts[idx - 1]
+
+            def group_tolerance(A):
+                d = out[A] - base[A]
+                d = d - d.mean(axis=0)
+                return max(group_tol,
+                           0.5 * float(np.hypot(d[:, 0], d[:, 1]).max()))
+
+            def expected_from(A, k):
+                if len(A) >= 3:
+                    p = group_predict(base[A], out[A], base[k])
+                    if p is not None:
+                        return p, group_tolerance(A)
+                if len(A) >= 2:
+                    p = group_predict(base[A], out[A], base[k], rigid=True)
+                    if p is not None:
+                        return p, max(2.0 * group_tol, group_tolerance(A))
+                return None, 0.0
+
+            def unanchored(k, anchored_mask):
+                A = [j for j in range(K) if j != k and anchored_mask[j]]
+                pred = (group_predict(base[A], out[A], base[k])
+                        if len(A) >= 3 else None)
+                if pred is not None:
+                    if delta[k] is None:
+                        d = np.zeros(2)
+                        if (np.isfinite(prev[k, 0])
+                                and np.all(np.isfinite(prev[A]))):
+                            q = group_predict(base[A], prev[A], base[k])
+                            if q is not None:
+                                d = prev[k] - q
+                        delta[k] = d
+                    return pred + delta[k], False
+                delta[k] = None
+                if not flow_ok[k]:
+                    return None, False
+                return nxt[k].copy(), True
+
+            # 1) anchored markers: is my own area still there?
+            for k in range(K):
+                if state[k] == ANCH:
+                    p, zz[k] = try_lock(
+                        k, nxt[k] if flow_ok[k] else est[k], pad, lock_thr)
+                    if p is not None:
+                        out[k] = p
+                        st[k] = ANCH
+
+            # 2) un-anchored markers: look for my own area again
+            first_pass = st == ANCH
+            regained = {}
+            for k in range(K):
+                if state[k] == ANCH:
+                    continue
+                u, _ = unanchored(k, first_pass)
+                centre = u if u is not None else est[k]
+                p, zz[k] = try_lock(
+                    k, centre, min(recover_pad, pad + 2 * int(n_un[k])),
+                    relock_thr)
+                if p is not None:
+                    out[k] = p
+                    st[k] = ANCH
+                    regained[k] = centre
+
+            # 3) plausibility: a marker just re-found must sit where the
+            #    markers that never lost their area say the cell is; if not
+            #    it is a look-alike (the rim of the probe) and stays lost.
+            steady = [j for j in range(K)
+                      if st[j] == ANCH and j not in regained]
+            for k in sorted(list(regained), key=lambda j: zz[j]):
+                pred, tol = expected_from(steady, k)
+                if pred is None or np.hypot(*(out[k] - pred)) <= tol:
+                    continue
+                p, z = try_lock(k, pred, group_tol, relock_thr)
+                if p is not None:
+                    out[k] = p
+                    zz[k] = z
+                else:
+                    st[k] = GONE
+                    out[k] = np.nan
+                    regained.pop(k, None)
+            #    An established match is never overridden by the group.
+            #    Only if its weakest member disagrees with the rest AND a
+            #    better match exists where they point, that one is taken.
+            C = [int(j) for j in np.where(st == ANCH)[0]]
+            if len(C) >= 4:
+                wk = min(C, key=lambda j: zz[j])
+                A = [j for j in C if j != wk]
+                pred = group_predict(base[A], out[A], base[wk])
+                if (pred is not None and np.hypot(
+                        *(out[wk] - pred)) > group_tolerance(A)):
+                    p, z = try_lock(wk, pred, group_tol,
+                                    max(relock_thr, float(zz[wk]) + 0.05))
+                    if p is not None:
+                        out[wk] = p
+                        zz[wk] = z
+
+            # 4) settle every marker for this frame
+            anchored_now = st == ANCH
+            for k in range(K):
+                if st[k] == ANCH:
+                    if k in regained and span_a[k] is not None:
+                        a = span_a[k]
+                        closure = out[k] - regained[k]
+                        for j in range(a + 1, idx):
+                            if np.isfinite(pts[j][k, 0]):
+                                pts[j][k] += ((j - a) / float(idx - a)) \
+                                    * closure
+                    n_un[k] = 0
+                    n_free[k] = 0
+                    span_a[k] = None
+                    delta[k] = None
+                    continue
+                u, flow_only = unanchored(k, anchored_now)
+                if state[k] == ANCH:
+                    span_a[k] = idx - 1
+                n_un[k] += 1
+                if u is None:
+                    st[k] = GONE
+                    out[k] = np.nan
+                    n_free[k] = 0
+                    continue
+                out[k] = u
+                st[k] = ESTM
+                if flow_only:
+                    A = [j for j in range(K) if j != k and anchored_now[j]]
+                    pred, tol = expected_from(A, k)
+                    if pred is not None and np.hypot(*(u - pred)) > tol:
+                        flow_only = False
+                n_free[k] = n_free[k] + 1 if flow_only else 0
+
+            # 5) the area looks different for good and nothing contradicts
+            #    the flow: adopt its present look as the new reference.
+            for k in range(K):
+                if st[k] == ESTM and n_free[k] >= reref_after:
+                    fresh = RefPatch(gm, out[k, 0], out[k, 1], r)
+                    if fresh.ok:
+                        refs[k] = fresh
+                        gen[k] += 1
+                        st[k] = ANCH
+                        n_un[k] = 0
+                        n_free[k] = 0
+                        span_a[k] = None
+                        delta[k] = None
+                        rerefs.append((int(frame_idx), int(k)))
+                        base = np.where(np.isfinite(out), out, est)
+
+            for k in range(K):
+                if np.isfinite(out[k, 0]):
+                    est[k] = out[k]
+                state[k] = st[k]
+            frames.append(frame_idx)
+            pts.append(out)
+            rec = st.copy()
+            rec[(st == ANCH) & (gen > 0)] = REANCHORED
+            locks.append(rec)
+            scores.append(zz)
+            prev8 = gray8
+        bad = list(cap.bad_frames)
+    finally:
+        cap.release()
+
+    lock_arr = np.array(locks, dtype=np.uint8)
+    return {
+        "frames": np.asarray(frames, dtype=int),
+        "points": np.array(pts, dtype=np.float32),
+        # 1 where the marker was found on its own area this frame
+        "status": ((lock_arr == ANCHORED) | (lock_arr == REANCHORED))
+        .astype(np.uint8),
+        "fps": float(fps),
+        "start_frame": int(start_frame),
+        "window_size": int(2 * r + 1),
+        "gentle": False,
+        "method": "ref",
+        "lock": lock_arr,
+        "zncc": np.array(scores, dtype=np.float32),
+        "radius": int(r),
+        "rerefs": rerefs,
+        "contrast": [float(rf.contrast) for rf in first_refs],
+        "eig_ratio": [float(rf.eig_ratio) for rf in first_refs],
+        "bad_frames": bad,
+    }
+
+
+def bridge_lost_points(points):
+    """
+    v1.7: fill ONLY the frames where a marker has no position.
+
+    A lost marker is carried with the median frame-to-frame motion of the
+    markers still tracked, and when it comes back the gap is closed onto
+    the re-found position by spreading the mismatch evenly over the gap, so
+    there is no jump on return and no speed spike. Tracked positions are
+    never touched (the v1.6 reconciler also snapped tracked markers to the
+    group, which flattened fast contractions). Returns (filled, mask).
+    """
+    src = np.asarray(points, dtype=np.float64)
+    N, K, _ = src.shape
+    out = src.copy()
+    filled = np.zeros((N, K), dtype=bool)
+    fin = np.isfinite(src[:, :, 0]) & np.isfinite(src[:, :, 1])
+    step = np.zeros((N, 2), dtype=np.float64)
+    for i in range(1, N):
+        m = fin[i] & fin[i - 1]
+        if m.any():
+            step[i] = np.median(src[i, m] - src[i - 1, m], axis=0)
+    cum = np.cumsum(step, axis=0)
+    for k in range(K):
+        idx = np.where(fin[:, k])[0]
+        if idx.size == 0:
+            continue
+        first, last = int(idx[0]), int(idx[-1])
+        if first > 0:
+            out[:first, k] = src[first, k]
+            filled[:first, k] = True
+        for a, b in zip(idx[:-1], idx[1:]):
+            a, b = int(a), int(b)
+            if b - a <= 1:
+                continue
+            dead = src[a, k] + (cum[a + 1:b + 1] - cum[a])
+            closure = src[b, k] - dead[-1]
+            for n, j in enumerate(range(a + 1, b)):
+                out[j, k] = dead[n] + ((j - a) / float(b - a)) * closure
+                filled[j, k] = True
+        if last < N - 1:
+            out[last + 1:, k] = src[last, k] + (cum[last + 1:] - cum[last])
+            filled[last + 1:, k] = True
+    return out.astype(np.float32), filled
+
+
+def quality_report(result):
+    """
+    v1.7 honesty report for the reference-anchored tracker.
+
+    Returns (warnings, summary): how much of the time each marker was
+    locked on its own area, and anything about the picked spots that makes
+    them hard to track. Both empty for a v1.6 result.
+    """
+    if not result or result.get("method") != "ref":
+        return [], ""
+    lock = np.asarray(result.get("lock"))
+    if lock.ndim != 2 or lock.shape[0] == 0:
+        return [], ""
+    K = lock.shape[1]
+    rad = int(result.get("radius", 0))
+    labels = list(POINT_LABELS) + [f"P{i + 1}" for i in range(len(POINT_LABELS), K)]
+    pct = [100.0 * float(np.mean(lock[:, k] == ANCHORED)) for k in range(K)]
+    if min(pct) >= 99.95:
+        summary = (f"All {K} markers locked on their own {rad}-px areas on "
+                   "every frame.")
+    else:
+        summary = ("Locked on own area: " + " · ".join(
+            f"{labels[k]} {pct[k]:.0f}%" for k in range(K))
+            + f" (r = {rad} px).")
+    warn = []
+    con = list(result.get("contrast") or [])
+    eig = list(result.get("eig_ratio") or [])
+    for k in range(K):
+        if k < len(con) and con[k] < float(REF_MIN_CONTRAST):
+            warn.append(f"{labels[k]}: almost nothing to see inside its "
+                        "ring. Move it onto an edge or corner, or enlarge "
+                        "the ring.")
+        elif k < len(eig) and eig[k] < float(REF_MIN_EIG_RATIO):
+            warn.append(f"{labels[k]} sits on a straight edge and can slide "
+                        "along it. A corner or spot is safer.")
+    rr = result.get("rerefs") or []
+    if rr:
+        first = {}
+        for f, k in rr:
+            first.setdefault(int(k), int(f))
+        warn.append(
+            "Area no longer recognisable, new reference taken: "
+            + ", ".join(f"{labels[k]} from frame {first[k]}"
+                        for k in sorted(first))
+            + ". Positions after that may be offset; check them.")
+    bad = result.get("bad_frames") or []
+    if bad:
+        warn.append(f"{len(bad)} frame(s) could not be decoded and repeat "
+                    "the frame before them.")
+    return warn, summary
+
+
 # ------------------------------------------------- keeping the cell whole ---
 
 def hold_invalid_corners(points):
@@ -794,6 +1574,10 @@ def settle(result, follow_under_probe=True, gentle=None):
     points = result["points"]
     if gentle is None:
         gentle = bool(result.get("gentle"))
+    if follow_under_probe and result.get("method") == "ref":
+        # v1.7: only frames with NO position are filled. Tracked positions
+        # are never snapped to the group: that flattened fast contractions.
+        return bridge_lost_points(points)
     if follow_under_probe:
         if gentle:
             return reconcile_group_motion(
