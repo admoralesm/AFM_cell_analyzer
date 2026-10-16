@@ -529,6 +529,17 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     ct = None
     TRACKING_ERROR = str(exc)
 
+# The desktop tracker's automatic analysis (v1.8 to v1.9.7): finds the probe
+# and the cell by itself and lists every contraction. Optional like the
+# rest: without auto_analysis.py only its sub-tab is lost.
+try:
+    import auto_analysis as aa
+
+    AUTO_ERROR = "" if aa.available() else aa.CV2_ERROR
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    aa = None
+    AUTO_ERROR = str(exc)
+
 # Clicking the markers straight onto the frame needs one small component.
 # Without it the tab still works, from typed coordinates and a preview with
 # a ruler on it, which is slower but takes no extra package.
@@ -907,6 +918,19 @@ DEFAULTS = {
     "mt_subpix": True,
     "mt_anchor": True,
     "mt_trails": True,
+    # v1.7: each marker anchored to its own circular area on the first
+    # frame. The v1.6 patch tracker stays selectable for comparison.
+    "mt_method": "Area-anchored (v1.7)",
+    "mt_radius": 15,
+    "mt_rings": True,
+    # The automatic analysis (v1.9.7) on the same video.
+    "au_start": 0,
+    "au_end": 0,
+    "au_probe_um": 40.0,
+    "au_use_scale": False,
+    "au_hint": True,
+    "au_smooth": 5,
+    "au_view": "Length change",
     # Where the cytoskeleton is allowed to join in the two-term reading.
     # The low edge is a floor, not only a search range: nothing on the
     # page can put the joining point below it.
@@ -8382,7 +8406,7 @@ def curve_folder_stepper():
 # Where each reading is kept. Tracking is slow enough that it must survive a
 # rerun, and stale enough after a change of markers that it must be thrown
 # away on purpose rather than left to look current.
-MOTION_KEYS = ("mt_result", "mt_signature")
+MOTION_KEYS = ("mt_result", "mt_signature", "au_result", "au_signature")
 
 
 def clamp_int(value, low, high):
@@ -8456,7 +8480,7 @@ def motion_set_markers(points):
 
 
 def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
-                   microns=None, thickness=1.0):
+                   microns=None, thickness=1.0, radius=None, lock=None):
     """
     The frame with the four corners on it, drawn the way the desktop app
     draws them: a crosshair and a ring on each corner, its label beside it,
@@ -8466,6 +8490,12 @@ def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
     ``dots=False`` leaves the rings off, for the canvas background: the
     canvas puts its own dot on each corner and two dots on one spot read as
     two corners.
+
+    ``radius`` draws each marker's tracking area (v1.7), the circle whose
+    pixels the marker is found from. ``lock`` is that frame's state per
+    marker: SOLID while the marker was found on its own area, DASHED amber
+    where its position was only estimated from the other markers, and no
+    ring at all where it was lost.
     """
     cv = ct.cv2
     image = frame_bgr.copy()
@@ -8521,6 +8551,18 @@ def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
                 width * 3, line)
         cv.line(image, (px - arm, py), (px + arm, py), bgr, width, line)
         cv.line(image, (px, py - arm), (px, py + arm), bgr, width, line)
+        if radius:
+            state = None if lock is None else int(lock[index])
+            ring = int(round(float(radius)))
+            if state is None or state in (2, 3):
+                cv.circle(image, (px, py), ring, (0, 0, 0), width * 3, line)
+                cv.circle(image, (px, py), ring, bgr, width, line)
+            elif state == 1:
+                for start in range(0, 360, 30):
+                    cv.ellipse(image, (px, py), (ring, ring), 0, start,
+                               start + 17, (0, 0, 0), width * 3, line)
+                    cv.ellipse(image, (px, py), (ring, ring), 0, start,
+                               start + 17, (0, 179, 255), width, line)
         if dots:
             cv.circle(image, (px, py), int(round(6 * thickness)), (0, 0, 0),
                       -1, line)
@@ -8591,7 +8633,8 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
     # video is not a fact about this one, and a stored value outside a new
     # widget's range is an exception before the page draws.
     for stale in ("mt_start", "mt_end", "mt_show", "clip_range",
-                  "clip_made", "clip_start_text", "clip_end_text"):
+                  "clip_made", "clip_start_text", "clip_end_text",
+                  "au_start", "au_end", "au_show"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -9006,6 +9049,17 @@ def motion_frame_table(result, held, microns):
     area = ct.quad_area(held)
     table[f"marker_quad_area_{unit}2"] = np.round(area * scale * scale, 4)
     table["markers_tracked"] = result["status"].sum(axis=1).astype(int)
+    lock = result.get("lock")
+    if lock is not None and np.ndim(lock) == 2 and len(lock) == len(frames):
+        # v1.7: how each marker's position on that frame was arrived at.
+        for index in range(held.shape[1]):
+            name = ct.POINT_LABELS[index % len(ct.POINT_LABELS)]
+            table[f"{name}_state"] = [ct.LOCK_NAMES.get(int(v), "")
+                                      for v in lock[:, index]]
+            zncc = result.get("zncc")
+            if zncc is not None:
+                table[f"{name}_match"] = np.round(
+                    np.asarray(zncc)[:, index].astype(float), 3)
     return pd.DataFrame(table)
 
 
@@ -9033,7 +9087,25 @@ def motion_results_panel(result, held, microns):
               f"{np.nanmax(centre_speed) * scale:.3g}")
     m4.metric("Markers measured",
               f"{100.0 * (total - lost) / max(total, 1):.0f} %")
-    if lost:
+    anchored = result.get("method") == "ref"
+    if anchored:
+        warnings, summary = ct.quality_report(result)
+        st.caption(f"Area-anchored tracker (v1.7), r = "
+                   f"{int(result.get('radius', 0))} px. {summary}")
+        for text in warnings:
+            st.warning(text, icon="⚠️")
+    else:
+        st.caption("Patch tracker (v1.6).")
+    if lost and anchored:
+        st.caption(
+            f"ℹ️ On {lost:,} of {total:,} marker-frames a marker's own area "
+            f"could not be found (under the probe, or blurred). There its "
+            f"position is estimated from the stretch and shift of the other "
+            f"markers, drawn as a dashed amber ring, and when the area is "
+            f"seen again the difference is spread over the gap so there is "
+            f"no jump. The **_state** columns in the table say which frames "
+            f"those are.")
+    elif lost:
         st.caption(
             f"ℹ️ {lost:,} of {total:,} marker-frames were not measured "
             f"directly. Those are filled from the motion of the markers that "
@@ -9057,14 +9129,22 @@ def motion_results_panel(result, held, microns):
                                key="mt_show", label_visibility="collapsed")
             with w2:
                 st.checkbox("Show the trails", key="mt_trails")
+                if anchored:
+                    st.checkbox("Show the tracking areas", key="mt_rings")
             row = int(np.argmin(np.abs(frames - int(at))))
             shot = motion_frame(path, video_signature(), int(frames[row]))
             if shot is not None:
                 trail = (held[:row + 1]
                          if st.session_state.get("mt_trails", True) else None)
+                rings = (anchored and st.session_state.get("mt_rings", True))
+                lock = result.get("lock")
                 st.image(
                     motion_preview(shot, held[row], trail=trail,
-                                   microns=microns),
+                                   microns=microns,
+                                   radius=(result.get("radius")
+                                           if rings else None),
+                                   lock=(lock[row] if rings and lock
+                                         is not None else None)),
                     caption=(f"Frame {int(frames[row])} · "
                              f"t = {ct.format_time(times[row])} · "
                              f"{int(tracked[row])} of {held.shape[1]} corners "
@@ -9130,6 +9210,390 @@ def motion_results_panel(result, held, microns):
             st.session_state.get("video_name", "video"))[0]
             + "_marker_tracking.csv"),
         mime="text/csv", key="mt_csv", **STRETCH)
+
+
+# ================================ the automatic analysis (desktop v1.9.7) ==
+#
+# The desktop tracker's one-button analysis: it finds the probe tip and the
+# cell by itself, sets the scale from the probe tip, follows the cell's two
+# ends through the clip, reads the sarcomere length from the striations,
+# and lists every contraction. The engine is auto_analysis.py; this is the
+# page around it.
+
+AUTO_VIEWS = ("Length change", "Shortening speed", "Sarcomere length",
+              "Probe and gap")
+
+
+def auto_signature(path, start, end, probe_um, um_per_px, hint):
+    """What a reading depends on: change any of it and it is stale."""
+    return repr((path, video_signature(), int(start), int(end),
+                 round(float(probe_um), 4),
+                 None if um_per_px is None else round(float(um_per_px), 6),
+                 None if hint is None else tuple(np.round(hint, 1))))
+
+
+def auto_overlay(res, row=None, picture=None):
+    """
+    The reference picture (or ``picture``) with what was found drawn on it:
+    the cell's outline in green, the part rebuilt under the probe dashed
+    orange, the long axis, and the probe tip. ``row`` moves the outline and
+    the tip to where they were on that analysed frame.
+    """
+    cv = ct.cv2
+    line = cv.LINE_AA
+    base = res["ref_u8"] if picture is None else picture
+    image = (cv.cvtColor(base, cv.COLOR_GRAY2BGR) if base.ndim == 2
+             else base.copy())
+    dx = dy = 0.0
+    if row is not None:
+        dx = float(res["cell_dx"][row])
+        dy = float(res["cell_dy"][row])
+    cell = res["cell"]
+    contour = np.round(cell["contour"] + [dx, dy]).astype(np.int32)
+    cv.polylines(image, [contour], True, (0, 0, 0), 4, line)
+    cv.polylines(image, [contour], True, (80, 220, 80), 2, line)
+    for piece in aa.AutoCellAnalysis.hidden_contours(cell):
+        pts = np.round(piece + [dx, dy]).astype(np.int32)
+        for j in range(0, len(pts) - 1, 8):
+            cv.polylines(image, [pts[j:j + 5]], False, (0, 140, 255), 2, line)
+    cx, cy = cell["center"]
+    ax, ay = cell["axis"]
+    half = 0.5 * float(cell["length_px"])
+    p = (int(round(cx + dx - half * ax)), int(round(cy + dy - half * ay)))
+    q = (int(round(cx + dx + half * ax)), int(round(cy + dy + half * ay)))
+    cv.line(image, p, q, (255, 255, 255), 1, line)
+    probe = res.get("probe")
+    if probe is not None:
+        px, py = probe["center"]
+        if row is not None and np.isfinite(res["probe_x"][row]):
+            px, py = float(res["probe_x"][row]), float(res["probe_y"][row])
+        centre = (int(round(px)), int(round(py)))
+        radius = int(round(float(probe["radius"])))
+        cv.circle(image, centre, radius, (0, 0, 0), 4, line)
+        cv.circle(image, centre, radius, (36, 202, 249), 2, line)
+        cv.drawMarker(image, centre, (36, 202, 249), cv.MARKER_CROSS, 12, 2)
+    return cv.cvtColor(image, cv.COLOR_BGR2RGB)
+
+
+def auto_trace_figure(t, series, y_title, events=None, zero=False):
+    """One or more traces over time, contractions shaded."""
+    figure = go.Figure()
+    for values, name, colour, dash in series:
+        figure.add_trace(go.Scatter(
+            x=t, y=values, mode="lines", name=name,
+            line=dict(color=colour, width=2 if dash is None else 1.5,
+                      dash=dash)))
+    for e in (events or []):
+        a, b = e.get("t_onset"), e.get("t_end")
+        if a is not None and b is not None:
+            figure.add_vrect(x0=a, x1=b, fillcolor="#E6194B", opacity=0.08,
+                             line_width=0)
+    if zero:
+        figure.add_hline(y=0, line=dict(color="#999", width=1))
+    figure.update_layout(
+        height=340, margin=dict(l=70, r=20, t=16, b=50),
+        hovermode="x unified", plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0))
+    figure.update_xaxes(title_text="Time (s)", showline=True, linewidth=1,
+                        linecolor="#333", mirror=True, ticks="outside",
+                        gridcolor="#eee")
+    figure.update_yaxes(title_text=y_title, showline=True, linewidth=1,
+                        linecolor="#333", mirror=True, ticks="outside",
+                        gridcolor="#eee")
+    return figure
+
+
+def auto_events_table(res, sp):
+    """Every contraction, in the display units."""
+    um = res.get("um_per_px")
+    length = float(res["cell"]["length_px"])
+    k = um if um is not None else 1.0
+    unit = "um" if um is not None else "px"
+    na, nb = res["end_names"]
+    rows = []
+    for j, e in enumerate(res["events"]):
+        rows.append({
+            "n": j + 1,
+            "t_peak_s": round(e["t_peak"], 3),
+            "frame": int(res["frames"][e["index"]]),
+            "shortening_pct": round(e["amp_pct"], 3),
+            f"shortening_{unit}": round(e["amp_pct"] / 100 * length * k, 3),
+            "time_to_peak_s": round(e["time_to_peak"], 3),
+            "duration_half_s": round(e["dur50"], 3),
+            "relax90_s": round(e["relax90"], 3),
+            f"shortening_speed_{unit}_per_s": round(sp["ev_vshort"][j], 3),
+            f"relaxation_speed_{unit}_per_s": round(sp["ev_vrelax"][j], 3),
+            f"{na}_end_move_{unit}": round(
+                e.get("end_a_move_px", float("nan")) * k, 3),
+            f"{nb}_end_move_{unit}": round(
+                e.get("end_b_move_px", float("nan")) * k, 3),
+            "interval_s": round(e["interval"], 3),
+            "sarcomere_shortening_pct": round(sp["ev_sl_short"][j], 3),
+            "cut_off_by_range": bool(e["partial"]),
+        })
+    return pd.DataFrame(rows)
+
+
+def auto_files(res):
+    """The desktop app's three files (time series, contractions, report)."""
+    stem = os.path.splitext(st.session_state.get("video_name") or "video")[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem) or "video"
+    if res["start_frame"] > 0 or res["end_frame"] < res["frames_total"] - 2:
+        stem += f"_f{res['start_frame']}-{res['end_frame']}"
+    out = {}
+    with tempfile.TemporaryDirectory(prefix="afm_auto_") as folder:
+        paths = aa.AutoCellAnalysis.save_csvs(
+            res, os.path.join(folder, stem + "_auto"))
+        for path in paths:
+            with open(path, "rb") as handle:
+                out[os.path.basename(path)] = handle.read()
+    return out
+
+
+def auto_results_panel(res):
+    """What the automatic analysis found, and the files to take away."""
+    A = aa.AutoCellAnalysis
+    um = res.get("um_per_px")
+    unit = "µm" if um is not None else "px"
+    k = um if um is not None else 1.0
+
+    lines = A.summary_lines(res)
+    if lines and lines[0].startswith("File:"):
+        lines[0] = f"File: {st.session_state.get('video_name') or lines[0][6:]}"
+    verdict_kind = {"probe_over_cell": st.success,
+                    "probe_on_cell": st.info}.get(res["verdict_code"],
+                                                  st.info)
+    verdict_kind(f"**Probe:** {res['verdict']}", icon="🔎")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Contractions", f"{res['n_events']}")
+    m2.metric("Per minute", (f"{res['rate_per_min']:.1f}"
+                             if np.isfinite(res["rate_per_min"]) else "–"))
+    m3.metric("Shortening (mean)", (f"{res['amp_mean_pct']:.2f} %"
+                                    if np.isfinite(res["amp_mean_pct"])
+                                    else "–"))
+    sl = np.asarray(res["sl_px"], dtype=float)
+    sl = sl[np.isfinite(sl)]
+    m4.metric("Sarcomere (median)",
+              (f"{np.median(sl) * k:.2f} {unit}" if res.get("sl_found")
+               and sl.size else "–"))
+
+    with st.expander("📝 Summary, as the desktop app reports it",
+                     expanded=True):
+        st.markdown("\n".join(f"- {text}" for text in lines))
+
+    # Where it looked. The first thing to check: if the green outline is on
+    # the wrong object, every number above is about the wrong object.
+    p1, p2 = st.columns(2)
+    with p1:
+        st.image(auto_overlay(res),
+                 caption="Reference picture: the cell (green), the part "
+                         "rebuilt under the probe (dashed orange), the long "
+                         "axis and the probe tip (yellow).", **STRETCH)
+    with p2:
+        if res.get("peak_u8") is not None:
+            row = A.index_of_frame(res, res["peak_frame"])
+            st.image(auto_overlay(res, row=row, picture=res["peak_u8"]),
+                     caption=f"The largest contraction, frame "
+                             f"{res['peak_frame']}.", **STRETCH)
+        else:
+            frames = res["frames"]
+            st.session_state["au_show"] = clamp_int(
+                st.session_state.get("au_show", int(frames[0])),
+                int(frames[0]), int(frames[-1]))
+            at = st.slider("Frame", int(frames[0]), int(frames[-1]),
+                           key="au_show")
+            row = A.index_of_frame(res, int(at))
+            shot = motion_frame(res["video_path"], video_signature(),
+                                int(frames[row]))
+            if shot is not None:
+                gray = ct.cv2.cvtColor(shot, ct.cv2.COLOR_BGR2GRAY)
+                st.image(auto_overlay(res, row=row, picture=gray),
+                         caption=f"Frame {int(frames[row])}.", **STRETCH)
+
+    st.slider(
+        "Speed smoothing (frames)", 1, 15, step=2, key="au_smooth",
+        help="Width of the Savitzky-Golay window the speeds are taken "
+             "with: 4th order from 5 frames up, so the peak of a fast "
+             "upstroke is kept. 1 is a plain difference between frames.")
+    sp = A.speed_series(res, int(st.session_state.get("au_smooth", 5)))
+    t = sp["t"]
+    events = res["events"]
+    view = st.radio("What to draw", AUTO_VIEWS, horizontal=True,
+                    key="au_view", label_visibility="collapsed")
+    if view == "Length change":
+        st.plotly_chart(auto_trace_figure(
+            t, [(res["length_pct"], "length change", "#4363D8", None),
+                (res["baseline_pct"], "running baseline", "#999999", "dot")],
+            "Cell length change (%)", events), **STRETCH)
+        st.caption(
+            f"Each end of the cell is followed on its own and the length "
+            f"change is how far the two moved towards each other. A "
+            f"contraction is a dip below the running baseline of at least "
+            f"{res['event_thr_pct']:.2f} % (here {res['noise_pct']:.3f} % "
+            f"is the trace's own noise); shaded bands are the contractions "
+            f"found.")
+    elif view == "Shortening speed":
+        na, nb = res["end_names"]
+        st.plotly_chart(auto_trace_figure(
+            t, [(sp["rate_u"], "length", "#4363D8", None),
+                (sp["end_a_speed"], f"{na} end", "#E6194B", "dot"),
+                (sp["end_b_speed"], f"{nb} end", "#3CB44B", "dot")],
+            f"Rate of change ({unit}/s)", events, zero=True), **STRETCH)
+        st.caption("Below zero the cell is shortening, above zero it is "
+                   "lengthening again. Frames where the length could not "
+                   "be measured stay empty: the derivative is never taken "
+                   "across a gap.")
+    elif view == "Sarcomere length":
+        if res.get("sl_found"):
+            st.plotly_chart(auto_trace_figure(
+                t, [(sp["sl_u"], "sarcomere length", "#911EB4", None),
+                    (sp["sl_base"], "running baseline", "#999999", "dot")],
+                f"Sarcomere length ({unit})", events), **STRETCH)
+            if um is None:
+                st.caption("No scale: the period is in pixels. Set the probe "
+                           "tip diameter or a µm-per-pixel scale for µm.")
+        else:
+            st.info(f"Sarcomeres not measured: {res.get('sl_reason', '')}.",
+                    icon="ℹ️")
+    else:
+        st.plotly_chart(auto_trace_figure(
+            t, [(sp["gap_u"], "probe-to-cell gap", "#F58231", None),
+                (sp["probe_u"], "probe movement", "#4363D8", "dot"),
+                (100.0 * np.asarray(res["overlap"]), "cell covered (%)",
+                 "#E6194B", "dash")],
+            f"{unit} (covered: %)", events, zero=True), **STRETCH)
+        if res.get("probe") is None:
+            st.caption("No probe was found in the picture.")
+
+    if events:
+        table = auto_events_table(res, sp)
+        with st.expander(f"📋 Every contraction ({len(table)})",
+                         expanded=True):
+            st.dataframe(table, hide_index=True, **STRETCH)
+
+    files = auto_files(res)
+    cols = st.columns(len(files))
+    for column, (name, data) in zip(cols, files.items()):
+        with column:
+            st.download_button(
+                f"💾 {name.rsplit('_', 1)[-1]}", data=data, file_name=name,
+                mime="text/csv" if name.endswith(".csv") else "text/plain",
+                key=f"au_dl_{name.rsplit('_', 1)[-1]}", **STRETCH)
+    with st.expander("🔬 How the automatic analysis works, with this "
+                     "video's numbers"):
+        for kind, text in A.method_text(
+                res, int(st.session_state.get("au_smooth", 5))):
+            if kind == "h1":
+                st.markdown(f"#### {text}")
+            elif kind == "h2":
+                st.markdown(f"**{text}**")
+            elif kind == "num":
+                st.markdown(f"<span style='color:#888'>{text}</span>",
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(text)
+
+
+def auto_panel(path, details):
+    """The 🤖 sub-tab: choose a range, press go, read the result."""
+    if aa is None or AUTO_ERROR:
+        st.error("The automatic analysis needs **auto_analysis.py** beside "
+                 "app.py" + (f" ({AUTO_ERROR})." if AUTO_ERROR else "."),
+                 icon="🚫")
+        return
+    st.caption(
+        "Nothing to pick: the probe tip and the cell are found by "
+        "themselves, the scale comes from the probe tip, and every "
+        "contraction is listed with its size, timing and speeds. Frames "
+        "the file will not decode, pictures the recorder stored twice and "
+        "a wrong frame rate in the file header are found and dealt with.")
+    last = int(details["frame_count"]) - 1
+    fps = float(details["fps"])
+
+    st.markdown("**Range to analyse**")
+    st.session_state["au_start"] = int(clamp_int(
+        st.session_state.get("au_start", 0), 0, last))
+    start = st.slider("From frame", 0, max(last, 0), key="au_start",
+                      help="The first 3 s from here make the reference "
+                           "picture, so start where the cell is in focus "
+                           "and at rest.")
+    stored_end = st.session_state.get("au_end", 0)
+    st.session_state["au_end"] = int(clamp_int(
+        last if not stored_end else stored_end, int(start), last))
+    end = st.slider("To frame", int(start), max(last, int(start)),
+                    key="au_end")
+    st.caption(f"{int(end) - int(start) + 1:,} frames · "
+               f"{ct.format_time(int(start) / fps)} to "
+               f"{ct.format_time(int(end) / fps)}")
+
+    s1, s2 = st.columns(2)
+    with s1:
+        st.number_input(
+            "Probe tip diameter (µm)", 1.0, 500.0, step=1.0,
+            key="au_probe_um",
+            help="The scale is the tip's real diameter over its diameter "
+                 "in pixels, measured edge to edge at half darkness.")
+    with s2:
+        typed = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+        st.checkbox(
+            f"Use the scale from Track the corners ({typed:.4f} µm/px)"
+            if typed > 0 else "Use the scale from Track the corners (not set)",
+            key="au_use_scale", disabled=typed <= 0,
+            help="Takes the µm per pixel set under ⚙️ on the Track the "
+                 "corners tab instead of the probe tip.")
+    markers = motion_markers()
+    hint = None
+    if len(markers) >= 3:
+        st.checkbox(
+            "The cell is the one my corners are on", key="au_hint",
+            help="When more than one cell-sized object is in view, the one "
+                 "nearest the probe is taken. With this, the one under the "
+                 "corners placed on Track the corners is taken instead.")
+        if st.session_state.get("au_hint", True):
+            hint = (float(np.mean([p[0] for p in markers])),
+                    float(np.mean([p[1] for p in markers])))
+    um_per_px = (typed if st.session_state.get("au_use_scale") and typed > 0
+                 else None)
+    probe_um = float(st.session_state.get("au_probe_um", 40.0))
+    signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
+
+    if st.button("▶️ Run the automatic analysis", key="au_go",
+                 type="primary", **STRETCH):
+        bar = st.progress(0.0, text="Reading the video…")
+        seen = {"at": 0.0}
+
+        def _tick(done, total):
+            fraction = float(done) / float(max(total, 1))
+            if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
+                seen["at"] = fraction
+                bar.progress(min(1.0, fraction),
+                             text=f"Analysing… {int(fraction * 100)} % "
+                                  f"({done:,} of {total:,} frames)")
+            return False
+
+        try:
+            res = aa.AutoCellAnalysis.analyze(
+                path, start_frame=int(start), end_frame=int(end),
+                um_per_px=um_per_px, probe_diameter_um=probe_um,
+                hint_xy=hint, progress_callback=_tick)
+        except Exception as exc:
+            bar.empty()
+            st.error(f"{exc}", icon="🚫")
+        else:
+            bar.empty()
+            st.session_state["au_result"] = res
+            st.session_state["au_signature"] = signature
+
+    res = st.session_state.get("au_result")
+    if res is not None:
+        if st.session_state.get("au_signature") != signature:
+            st.warning("The range or a setting has changed since this was "
+                       "analysed. What is below is the previous reading; "
+                       "press **▶️ Run the automatic analysis** to redo it.",
+                       icon="⚠️")
+        auto_results_panel(res)
+
 
 
 def screen_signature(epsilon, force_N):
@@ -22459,12 +22923,16 @@ with tab_motion:
     else:
         st.markdown(
             "Select the four corners of the cell and follow them through "
-            "the compression. Each corner is tracked as a patch of a dozen "
-            "features rather than one pixel, checked against its own first "
-            "frame so it cannot drift, and held to the motion of the other "
-            "three when it goes under the probe. What comes out is how fast "
-            "each part of the cell moved, how far, and what the "
-            "quadrilateral they make does as the cell is squashed.")
+            "the compression, or let the **automatic analysis** find the "
+            "probe and the cell by itself and list every contraction. Each "
+            "corner owns one small circular area, and on every frame that "
+            "area is found again by matching it, to a fraction of a pixel, "
+            "against how it looked on the first frame, so the corner cannot "
+            "creep off the spot that was picked. When the probe hides a "
+            "corner it is carried by the other three until its area is seen "
+            "again. What comes out is how fast each part of the cell moved, "
+            "how far, and what the quadrilateral they make does as the cell "
+            "is squashed.")
 
         # ---- 1 · the video -------------------------------------------
         st.markdown("**1 · The video**")
@@ -22503,10 +22971,13 @@ with tab_motion:
             # Two jobs on one video: following the corners, and cutting the
             # stretch that matters out of the recording. The upload above
             # serves both.
-            motion_track_tab, motion_clip_tab = st.tabs(
-                ["🎯 Track the corners", "✂️ Clip the video"])
+            motion_track_tab, motion_auto_tab, motion_clip_tab = st.tabs(
+                ["🎯 Track the corners", "🤖 Automatic analysis",
+                 "✂️ Clip the video"])
             with motion_clip_tab:
                 motion_clip_panel(motion_path, details)
+            with motion_auto_tab:
+                auto_panel(motion_path, details)
             with motion_track_tab:
 
                 # ---- 2 · the frame the markers are placed on -------------
@@ -22564,12 +23035,23 @@ with tab_motion:
                                 f"<div style='padding-top:0.5rem'>"
                                 f"<b>{len(markers)} of 4</b> placed</div>",
                                 unsafe_allow_html=True)
+                    area_anchored = (st.session_state.get("mt_method", "")
+                                     .startswith("Area"))
                     if HAS_CANVAS and markers:
                         st.image(
-                            motion_preview(frame_bgr, markers,
-                                           microns=pick_microns),
+                            motion_preview(
+                                frame_bgr, markers, microns=pick_microns,
+                                radius=(int(st.session_state.get(
+                                    "mt_radius", 15)) if area_anchored
+                                    else None)),
                             caption="The four corners at full size, with the "
-                                    "quadrilateral they make.", **STRETCH)
+                                    "quadrilateral they make"
+                                    + (" and the area each one is tracked "
+                                       "from. Put each ring on something "
+                                       "with texture in two directions: a "
+                                       "corner or a spot, not a straight "
+                                       "edge." if area_anchored else "."),
+                            **STRETCH)
 
                     # ---- 4 · how far to read -------------------------------
                     st.markdown("**4 · How far to read**")
@@ -22591,6 +23073,31 @@ with tab_motion:
 
                     # ---- 5 · how it is tracked -----------------------------
                     with st.expander("⚙️ How it is tracked, and in what units"):
+                        st.radio(
+                            "Tracker",
+                            ("Area-anchored (v1.7)", "Patch of features (v1.6)"),
+                            key="mt_method", horizontal=True,
+                            help="Area-anchored: each marker is found on every "
+                                 "frame by matching its own circle against "
+                                 "the first frame, sub-pixel and independent "
+                                 "of brightness, so errors cannot add up. "
+                                 "Patch of features: the older tracker, a "
+                                 "dozen optical-flow features per marker, "
+                                 "kept for comparison.")
+                        area_anchored = (st.session_state.get("mt_method", "")
+                                         .startswith("Area"))
+                        if area_anchored:
+                            st.slider(
+                                "Tracking area radius (px)",
+                                int(ct.TRACK_AREA_RADIUS_MIN),
+                                int(ct.TRACK_AREA_RADIUS_MAX),
+                                key="mt_radius",
+                                help="The ring drawn on each marker. Its "
+                                     "pixels are what the marker is found "
+                                     "from. Bigger is steadier, smaller "
+                                     "follows the cell's own deformation "
+                                     "more closely. Keep the rings off the "
+                                     "probe and off each other.")
                         o1, o2 = st.columns(2)
                         with o1:
                             st.number_input(
@@ -22604,6 +23111,7 @@ with tab_motion:
                             st.number_input(
                                 "Tracking window (px)", 7, 101, step=2,
                                 key="mt_window",
+                                disabled=area_anchored,
                                 help="How far around each marker the tracker "
                                      "looks. Wide enough to cover how far a "
                                      "marker moves between frames, narrow enough "
@@ -22618,6 +23126,7 @@ with tab_motion:
                         with o2:
                             st.checkbox(
                                 "Gentle tracking", key="mt_gentle",
+                                disabled=area_anchored,
                                 help="Softer corrections and wider smoothing: a "
                                      "calmer trace, a little slower to follow a "
                                      "sharp move.")
@@ -22636,6 +23145,7 @@ with tab_motion:
                                      "is measured in tenths of one.")
                             st.checkbox(
                                 "Anchor against the first frame", key="mt_anchor",
+                                disabled=area_anchored,
                                 help="Each frame, check the tracker against a "
                                      "template of the marker as it was on the "
                                      "first frame. This is what stops slow drift "
@@ -22657,6 +23167,8 @@ with tab_motion:
                         bool(st.session_state.get("mt_gentle", True)),
                         bool(st.session_state.get("mt_subpix", True)),
                         bool(st.session_state.get("mt_anchor", True)),
+                        str(st.session_state.get("mt_method", "")),
+                        int(st.session_state.get("mt_radius", 15)),
                     ))
                     if st.button("▶️ Track the four corners", key="mt_go",
                                  disabled=not ready, type="primary", **STRETCH):
@@ -22685,19 +23197,30 @@ with tab_motion:
                             return False
 
                         try:
-                            found = ct.track_points(
-                                motion_path, seeds,
-                                start_frame=int(start_frame),
-                                end_frame=int(end_frame),
-                                window_size=int(
-                                    st.session_state.get("mt_window", 41)),
-                                contrast=float(
-                                    st.session_state.get("mt_contrast", 1.0)),
-                                gentle=bool(
-                                    st.session_state.get("mt_gentle", True)),
-                                anchor=bool(
-                                    st.session_state.get("mt_anchor", True)),
-                                progress=_tick)
+                            if area_anchored:
+                                found = ct.track_points_ref(
+                                    motion_path, seeds,
+                                    start_frame=int(start_frame),
+                                    end_frame=int(end_frame),
+                                    radius=int(
+                                        st.session_state.get("mt_radius", 15)),
+                                    contrast=float(
+                                        st.session_state.get("mt_contrast", 1.0)),
+                                    progress=_tick)
+                            else:
+                                found = ct.track_points(
+                                    motion_path, seeds,
+                                    start_frame=int(start_frame),
+                                    end_frame=int(end_frame),
+                                    window_size=int(
+                                        st.session_state.get("mt_window", 41)),
+                                    contrast=float(
+                                        st.session_state.get("mt_contrast", 1.0)),
+                                    gentle=bool(
+                                        st.session_state.get("mt_gentle", True)),
+                                    anchor=bool(
+                                        st.session_state.get("mt_anchor", True)),
+                                    progress=_tick)
                         except Exception as exc:
                             bar.empty()
                             st.error(f"Tracking failed: {exc}", icon="🚫")
