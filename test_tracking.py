@@ -109,6 +109,46 @@ def main():
     check("with no jump where it is found again",
           float(np.abs(filled[60, 1] - held[60, 1]).max()) < 1e-4)
 
+    print("hand corrections")
+    fixed = res["points"][100].astype(float).copy()
+    fixed[1, 0] += 3.0
+    redone = ct.track_points_corrected(path, {0: picks, 100: fixed}, 170,
+                                       radius=12)
+    check("the corrected frame sits exactly where it was placed",
+          float(np.abs(redone["points"][100] - fixed).max()) < 1e-3)
+    half = redone["points"][50, 1, 0] - res["points"][50, 1, 0]
+    check("half the correction is spread back to halfway",
+          abs(half - 1.5) < 0.05, f"{half:.3f} px")
+    check("and the anchors are reported", redone["anchors"] == [0, 100])
+
+    print("probe sphere")
+    frame = ct.read_frame(path, 0)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    fit = aa.snap_sphere(gray, (334.0, 113.0, 19.0))
+    check("a roughly marked circle snaps onto the tip (centre 330, 110, "
+          "r 22)",
+          fit["ok"] and np.hypot(fit["center"][0] - 330,
+                                 fit["center"][1] - 110) < 1.5
+          and abs(fit["radius"] - 22) < 1.0,
+          f"{fit['center']} r {fit['radius']:.2f}")
+    disk = np.full((200, 200), 128, np.uint8)
+    cv2.circle(disk, (100, 100), 30, 25, -1)
+    disk = cv2.GaussianBlur(disk, (0, 0), 1.0)
+    fit = aa.snap_sphere(disk, (104.0, 97.0, 26.0))
+    centre, radius = fit["center"], fit["radius"]
+    check("and onto a whole round sphere (centre 100, 100, r 30)",
+          np.hypot(centre[0] - 100, centre[1] - 100) < 0.75
+          and abs(radius - 30) < 1.0, f"{centre} r {radius:.2f}")
+    still = aa.snap_sphere(gray, (330.0, 110.0, 22.0))
+    check("and a circle already on the tip stays there",
+          np.hypot(still["center"][0] - 330, still["center"][1] - 110) < 1.5,
+          f"{still['center']} r {still['radius']:.2f}")
+    hinted = aa.AutoCellAnalysis.analyze(path, probe_diameter_um=14.5,
+                                         probe_hint=(330.0, 110.0, 22.0))
+    check("the analysis takes a marked sphere as the probe tip",
+          abs(hinted["probe"]["radius"] - 22.0) < 1e-9
+          and abs(hinted["um_per_px"] - 14.5 / 44.0) < 1e-9)
+
     print("automatic analysis")
     auto = aa.AutoCellAnalysis.analyze(path, probe_diameter_um=14.5)
     check("finds the probe tip at its real size",
