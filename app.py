@@ -937,6 +937,19 @@ DEFAULTS = {
     "au_smooth": 5,
     "au_view": "Length change",
     "au_um_typed": 0.3,
+    # Publication style for the video tab's plots.
+    "vp_on": False,
+    "vp_title_size": 20,
+    "vp_tick_size": 16,
+    "vp_line": 2.5,
+    "vp_axis": 1.5,
+    "vp_bold": False,
+    "vp_grid": False,
+    "vp_legend": True,
+    "vp_w": 900,
+    "vp_h": 560,
+    "vp_fmt": "svg",
+    "vp_scale": 3,
     # Where the cytoskeleton is allowed to join in the two-term reading.
     # The low edge is a floor, not only a search range: nothing on the
     # page can put the joining point below it.
@@ -8645,7 +8658,7 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
                   "au_start", "au_end", "au_show", "sp_circle", "sp_edge",
                   "sp_centre_only", "sp_frame", "mt_corrections", "mt_cedit",
                   "mt_cframe", "vz_x", "vz_y", "au_outline",
-                  "_au_scale_auto"):
+                  "_au_scale_auto", "vw_frame"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -9378,6 +9391,226 @@ def motion_pick_panel(frame_bgr, canvas_key="mt_canvas", microns=None,
     return motion_typed_panel(frame_bgr, microns, broken)
 
 
+
+# ------------------------------------------------- looking through it ------
+
+def video_viewer(path, details):
+    """
+    The video, frame by frame, as soon as it is loaded. The slider and the
+    step buttons move through it; the buttons under the picture make the
+    frame on show the start or end of whatever comes next.
+    """
+    last = int(details["frame_count"]) - 1
+    fps = float(details["fps"])
+    st.session_state["vw_frame"] = clamp_int(
+        st.session_state.get("vw_frame", 0), 0, last)
+
+    def step(n):
+        st.session_state["vw_frame"] = clamp_int(
+            int(st.session_state.get("vw_frame", 0)) + n, 0, last)
+
+    def put(key, value):
+        st.session_state[key] = value
+
+    def clip_edge(which):
+        f = int(st.session_state.get("vw_frame", 0))
+        lo, hi = st.session_state.get("clip_range") or (0, last)
+        lo, hi = (f, max(int(hi), f)) if which == 0 else (min(int(lo), f), f)
+        st.session_state["clip_range"] = (lo, hi)
+
+    b1, b2, mid, b3, b4 = st.columns([1, 1, 8, 1, 1])
+    with b1:
+        st.button("⏪", key="vw_back10", on_click=step, args=(-10,),
+                  help="10 frames back", **STRETCH)
+    with b2:
+        st.button("◀", key="vw_back1", on_click=step, args=(-1,),
+                  help="One frame back", **STRETCH)
+    with mid:
+        frame_no = st.slider("Frame", 0, max(last, 1), key="vw_frame",
+                             label_visibility="collapsed")
+    with b3:
+        st.button("▶", key="vw_fwd1", on_click=step, args=(1,),
+                  help="One frame on", **STRETCH)
+    with b4:
+        st.button("⏩", key="vw_fwd10", on_click=step, args=(10,),
+                  help="10 frames on", **STRETCH)
+    frame = motion_frame(path, video_signature(), int(frame_no))
+    if frame is None:
+        st.error(f"Could not read frame {frame_no}.")
+        return
+    box = view_box(frame.shape)
+    view, _scale = view_render(frame, box)
+    st.image(ct.cv2.cvtColor(view, ct.cv2.COLOR_BGR2RGB),
+             caption=(f"Frame {int(frame_no)} of {last} · "
+                      f"t = {ct.format_time(int(frame_no) / fps)}"
+                      + ("" if box[2] - box[0] == frame.shape[1]
+                         else f" · zoomed on x {box[0]}–{box[2]}, "
+                              f"y {box[1]}–{box[3]}")),
+             **STRETCH)
+    f = int(frame_no)
+    c = st.columns(6)
+    c[0].button("🎯 Track from here", key="vw_mt_start", on_click=put,
+                args=("mt_start", f), **STRETCH,
+                help="Makes this the frame the corners are placed on.")
+    c[1].button("🤖 Analyse from here", key="vw_au_start", on_click=put,
+                args=("au_start", f), **STRETCH)
+    c[2].button("🤖 … to here", key="vw_au_end", on_click=put,
+                args=("au_end", f), **STRETCH)
+    c[3].button("✂️ Clip from here", key="vw_clip_lo", on_click=clip_edge,
+                args=(0,), **STRETCH)
+    c[4].button("✂️ … to here", key="vw_clip_hi", on_click=clip_edge,
+                args=(1,), **STRETCH)
+    c[5].button("⚪ Sphere on this frame", key="vw_sp", on_click=put,
+                args=("sp_frame", f), **STRETCH)
+
+
+# --------------------------------------------------------- export names ----
+#
+# Every file that leaves the video tab is named after the video it came
+# from and the stretch of it that was used, the way the desktop clipper
+# names clips: <video>_00m01s250_to_00m04s000. The name is shown in a box
+# before the download and can be changed there.
+
+def range_stem(t0, t1):
+    """<video name>_<start>_to_<end>, from times in seconds."""
+    source = st.session_state.get("video_name") or \
+        st.session_state.get("video_path") or "video"
+    stem = ct.clip_name(source, t0, t1, ext="").replace("_clip_", "_", 1)
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem) or "video"
+
+
+def frames_stem(first, last, fps):
+    """range_stem for a range of frames (the last one included)."""
+    fps = float(fps) if fps else ct.DEFAULT_FPS
+    return range_stem(int(first) / fps, (int(last) + 1) / fps)
+
+
+def name_box(key, default, label="Save as"):
+    """
+    An editable file name that starts as ``default`` and follows it (when
+    the range changes) until it is typed over.
+    """
+    previous = st.session_state.get(f"_{key}_default")
+    if st.session_state.get(key) in (None, "", previous):
+        st.session_state[key] = default
+    st.session_state[f"_{key}_default"] = default
+    name = st.text_input(
+        label, key=key,
+        help="The name the file is saved under: the video's own name and "
+             "the stretch of it used. Change it here if you like. Whether "
+             "the browser then asks where to save it is a browser setting "
+             "(Chrome: Settings → Downloads → Ask where to save each file).")
+    name = re.sub(r'[\\\\/:*?"<>|]+', "_", str(name or "").strip())
+    return name or default
+
+
+# ------------------------------------------------- publication figures -----
+
+VIDEO_PLOT_DEFAULTS = {
+    "vp_on": False, "vp_title_size": 20, "vp_tick_size": 16,
+    "vp_line": 2.5, "vp_axis": 1.5, "vp_bold": False, "vp_grid": False,
+    "vp_legend": True, "vp_w": 900, "vp_h": 560, "vp_fmt": "svg",
+    "vp_scale": 3,
+}
+
+
+def video_plot_controls():
+    """The 📐 switch and its settings, once for the whole video tab."""
+    with st.expander("📐 Plots for publication"):
+        st.toggle("Publication style for the plots on this tab", key="vp_on",
+                  help="White background, black framed axes with outward "
+                       "ticks, no grid, Arial, thicker lines. The camera "
+                       "icon on each plot then saves it at the size and in "
+                       "the format set here.")
+        on = bool(st.session_state.get("vp_on"))
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            st.number_input("Axis title size", 8, 48, key="vp_title_size",
+                            disabled=not on)
+            st.number_input("Tick label size", 6, 40, key="vp_tick_size",
+                            disabled=not on)
+        with p2:
+            st.number_input("Line width", 0.5, 8.0, step=0.5, key="vp_line",
+                            disabled=not on)
+            st.number_input("Axis width", 0.5, 6.0, step=0.5, key="vp_axis",
+                            disabled=not on)
+        with p3:
+            st.number_input("Width (px)", 300, 3000, step=50, key="vp_w",
+                            disabled=not on)
+            st.number_input("Height (px)", 200, 2400, step=50, key="vp_h",
+                            disabled=not on)
+        with p4:
+            st.selectbox("Save as", ("svg", "png", "jpeg", "webp"),
+                         key="vp_fmt",
+                         help="SVG stays sharp at any size and opens in "
+                              "Illustrator / Inkscape. PNG for slides.")
+            st.number_input("Resolution ×", 1, 8, key="vp_scale",
+                            help="PNG only: 3 × 900 px = 2700 px wide, "
+                                 "about 300 dpi at 9 inches.")
+        q1, q2, q3 = st.columns(3)
+        q1.checkbox("Bold axis labels", key="vp_bold", disabled=not on)
+        q2.checkbox("Grid lines", key="vp_grid", disabled=not on)
+        q3.checkbox("Legend", key="vp_legend", disabled=not on)
+        st.caption("Save any plot with the 📷 camera icon in its top-right "
+                   "corner; it is named after the video and the time range.")
+
+
+def video_chart(fig, key=None, stem=None, **_ignored):
+    """Show a video-tab plot, in publication style when that is on, with
+    the camera icon set to save it under the video's own name."""
+    s = st.session_state
+    pub = bool(s.get("vp_on"))
+    y_title = ""
+    try:
+        y_title = fig.layout.yaxis.title.text or ""
+    except Exception:
+        pass
+    if pub:
+        size_t = int(s.get("vp_title_size", 20))
+        size_k = int(s.get("vp_tick_size", 16))
+        width = float(s.get("vp_axis", 1.5))
+        bold = bool(s.get("vp_bold"))
+        family = ("Arial Black, Arial Bold, Helvetica, sans-serif" if bold
+                  else "Arial, Helvetica, sans-serif")
+        axes = dict(
+            showline=True, linewidth=width, linecolor="black", mirror=True,
+            showgrid=bool(s.get("vp_grid")), gridcolor="#e6e6e6",
+            zeroline=False, ticks="outside", tickwidth=width,
+            ticklen=max(5, int(3 * width)), tickcolor="black",
+            title_font=dict(size=size_t, color="black", family=family),
+            tickfont=dict(size=size_k, color="black", family=family),
+            exponentformat="power", automargin=True)
+        fig.update_xaxes(**axes)
+        fig.update_yaxes(**axes)
+        for axis in ("xaxis", "yaxis"):
+            title = getattr(fig.layout, axis).title.text
+            if title and bold and not title.startswith("<b>"):
+                getattr(fig.layout, axis).title.text = f"<b>{title}</b>"
+        fig.update_traces(line=dict(width=float(s.get("vp_line", 2.5))),
+                          selector=dict(type="scatter"))
+        fig.update_layout(
+            title=None, plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family=family, color="black", size=size_k),
+            showlegend=bool(s.get("vp_legend", True)),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="left", x=0, bgcolor="rgba(0,0,0,0)",
+                        borderwidth=0, font=dict(size=max(8, size_k - 2))),
+            height=int(s.get("vp_h", 560)),
+            margin=dict(l=40 + 3 * size_t, r=30, t=30 + 3 * size_k,
+                        b=30 + 3 * size_t))
+    name = (stem or s.get("_chart_stem") or "plot") + "_" + (
+        re.sub(r"[^A-Za-z0-9]+", "_", re.sub(r"<[^>]+>", "", y_title))
+        .strip("_").lower() or "plot")
+    config = {"displaylogo": False,
+              "toImageButtonOptions": {
+                  "format": s.get("vp_fmt", "svg"), "filename": name,
+                  "width": int(s.get("vp_w", 900)) if pub else None,
+                  "height": int(s.get("vp_h", 560)) if pub else None,
+                  "scale": int(s.get("vp_scale", 3))}}
+    st.plotly_chart(fig, key=key, config=config, **STRETCH)
+
+
+
 def motion_clip_panel(path, details):
     """
     Cut a stretch of the video out as its own file.
@@ -9470,10 +9703,12 @@ def motion_clip_panel(path, details):
             "`packages.txt` beside app.py containing the single line "
             "`ffmpeg` and reboot to get H.264 with sound.")
 
+    clip_file = name_box("clip_filename", range_stem(t0, t1) + ".mp4")
+    if not clip_file.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+        clip_file += ".mp4"
     if st.button("✂️ Cut the clip", key="clip_go", type="primary",
                  disabled=hi <= lo, **STRETCH):
-        name = ct.clip_name(st.session_state.get("video_name") or path,
-                            t0, t1)
+        name = clip_file
         destination = os.path.join(tempfile.gettempdir(), name)
         bar = st.progress(0.0, text="Cutting…")
 
@@ -9504,7 +9739,9 @@ def motion_clip_panel(path, details):
             f"**{made['name']}** · {len(clip_bytes) / 1e6:.1f} MB · "
             f"{made['method']}. {made.get('note', '')}", icon="✂️")
         st.download_button(
-            "💾 Download the clip", data=clip_bytes, file_name=made["name"],
+            "💾 Download the clip", data=clip_bytes,
+            file_name=(clip_file if tuple(made.get("range", ())) == (lo, hi)
+                       else made["name"]),
             mime="video/mp4", key="clip_download", **STRETCH)
         if made.get("method", "").startswith("ffmpeg"):
             st.video(clip_bytes)
@@ -9588,6 +9825,8 @@ def motion_results_panel(result, held, microns):
     frames = result["frames"]
     start = int(result["start_frame"])
     times = (frames - start) / fps
+    stem = frames_stem(int(frames[0]), int(frames[-1]), fps)
+    st.session_state["_chart_stem"] = stem
     scale = float(microns) if microns else 1.0
     unit = "µm" if microns else "px"
     gentle = bool(result.get("gentle"))
@@ -9691,7 +9930,7 @@ def motion_results_panel(result, held, microns):
     if view == "Speed":
         series = [marker_speed[:, i] * scale for i in range(held.shape[1])]
         series.append(centre_speed * scale)
-        st.plotly_chart(
+        video_chart(
             motion_speed_figure(times, series, labels + ["cell centroid"],
                                 colours + ["#333333"], f"Speed ({unit}/s)"),
             **STRETCH)
@@ -9705,14 +9944,14 @@ def motion_results_panel(result, held, microns):
         series = [ct.displacement(held[:, i, :]) * scale
                   for i in range(held.shape[1])]
         series.append(ct.displacement(middle) * scale)
-        st.plotly_chart(
+        video_chart(
             motion_speed_figure(times, series, labels + ["cell centroid"],
                                 colours + ["#333333"],
                                 f"Distance from where it started ({unit})"),
             **STRETCH)
     else:
         area = ct.quad_area(held) * scale * scale
-        st.plotly_chart(
+        video_chart(
             motion_speed_figure(times, [area], ["marker quadrilateral"],
                                 ["#00796B"], f"Area ({unit}²)"),
             **STRETCH)
@@ -9722,7 +9961,7 @@ def motion_results_panel(result, held, microns):
             "round the cell rather than across it, and it is a shape "
             "reading either way: it falls as the markers come together.")
 
-    st.plotly_chart(
+    video_chart(
         motion_speed_figure(
             times, [tracked.astype(float)], ["markers measured"], ["#9e9e9e"],
             "Markers measured on this frame"),
@@ -9731,12 +9970,12 @@ def motion_results_panel(result, held, microns):
     table = motion_frame_table(result, held, microns)
     with st.expander(f"📋 Every tracked frame ({len(table):,} rows)"):
         st.dataframe(table, hide_index=True, **STRETCH)
+    csv_name = name_box("mt_csv_name", stem + "_tracking.csv")
     st.download_button(
         "💾 Download the tracking as CSV",
         data=table.to_csv(index=False).encode("utf-8"),
-        file_name=(os.path.splitext(
-            st.session_state.get("video_name", "video"))[0]
-            + "_marker_tracking.csv"),
+        file_name=csv_name if csv_name.lower().endswith(".csv")
+        else csv_name + ".csv",
         mime="text/csv", key="mt_csv", **STRETCH)
 
 
@@ -9750,7 +9989,6 @@ def motion_results_panel(result, held, microns):
 
 AUTO_VIEWS = ("Length change", "Shortening speed", "Sarcomere length",
               "Probe and gap")
-
 
 def auto_signature(path, start, end, probe_um, um_per_px, hint):
     """What a reading depends on: change any of it and it is stale."""
@@ -9866,16 +10104,12 @@ def auto_events_table(res, sp):
     return pd.DataFrame(rows)
 
 
-def auto_files(res):
-    """The desktop app's three files (time series, contractions, report)."""
-    stem = os.path.splitext(st.session_state.get("video_name") or "video")[0]
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem) or "video"
-    if res["start_frame"] > 0 or res["end_frame"] < res["frames_total"] - 2:
-        stem += f"_f{res['start_frame']}-{res['end_frame']}"
+def auto_files(res, base):
+    """The desktop app's three files (time series, contractions, report),
+    named <base>_timeseries.csv, <base>_events.csv, <base>_report.txt."""
     out = {}
     with tempfile.TemporaryDirectory(prefix="afm_auto_") as folder:
-        paths = aa.AutoCellAnalysis.save_csvs(
-            res, os.path.join(folder, stem + "_auto"))
+        paths = aa.AutoCellAnalysis.save_csvs(res, os.path.join(folder, base))
         for path in paths:
             with open(path, "rb") as handle:
                 out[os.path.basename(path)] = handle.read()
@@ -9889,6 +10123,8 @@ def auto_results_panel(res):
     unit = "µm" if um is not None else "px"
     k = um if um is not None else 1.0
 
+    stem = frames_stem(res["start_frame"], res["end_frame"], res["fps"])
+    st.session_state["_chart_stem"] = stem
     lines = A.summary_lines(res)
     if lines and lines[0].startswith("File:"):
         lines[0] = f"File: {st.session_state.get('video_name') or lines[0][6:]}"
@@ -9960,7 +10196,7 @@ def auto_results_panel(res):
     view = st.radio("What to draw", AUTO_VIEWS, horizontal=True,
                     key="au_view", label_visibility="collapsed")
     if view == "Length change":
-        st.plotly_chart(auto_trace_figure(
+        video_chart(auto_trace_figure(
             t, [(res["length_pct"], "length change", "#4363D8", None),
                 (res["baseline_pct"], "running baseline", "#999999", "dot")],
             "Cell length change (%)", events), **STRETCH)
@@ -9973,7 +10209,7 @@ def auto_results_panel(res):
             f"found.")
     elif view == "Shortening speed":
         na, nb = res["end_names"]
-        st.plotly_chart(auto_trace_figure(
+        video_chart(auto_trace_figure(
             t, [(sp["rate_u"], "length", "#4363D8", None),
                 (sp["end_a_speed"], f"{na} end", "#E6194B", "dot"),
                 (sp["end_b_speed"], f"{nb} end", "#3CB44B", "dot")],
@@ -9984,7 +10220,7 @@ def auto_results_panel(res):
                    "across a gap.")
     elif view == "Sarcomere length":
         if res.get("sl_found"):
-            st.plotly_chart(auto_trace_figure(
+            video_chart(auto_trace_figure(
                 t, [(sp["sl_u"], "sarcomere length", "#911EB4", None),
                     (sp["sl_base"], "running baseline", "#999999", "dot")],
                 f"Sarcomere length ({unit})", events), **STRETCH)
@@ -9995,7 +10231,7 @@ def auto_results_panel(res):
             st.info(f"Sarcomeres not measured: {res.get('sl_reason', '')}.",
                     icon="ℹ️")
     else:
-        st.plotly_chart(auto_trace_figure(
+        video_chart(auto_trace_figure(
             t, [(sp["gap_u"], "probe-to-cell gap", "#F58231", None),
                 (sp["probe_u"], "probe movement", "#4363D8", "dot"),
                 (100.0 * np.asarray(res["overlap"]), "cell covered (%)",
@@ -10010,12 +10246,15 @@ def auto_results_panel(res):
                          expanded=True):
             st.dataframe(table, hide_index=True, **STRETCH)
 
-    files = auto_files(res)
+    base = name_box("au_name", stem + "_auto",
+                    label="Save the files as (each adds _timeseries.csv, "
+                          "_events.csv or _report.txt)")
+    files = auto_files(res, base)
     cols = st.columns(len(files))
     for column, (name, data) in zip(cols, files.items()):
         with column:
             st.download_button(
-                f"💾 {name.rsplit('_', 1)[-1]}", data=data, file_name=name,
+                f"💾 {name}", data=data, file_name=name,
                 mime="text/csv" if name.endswith(".csv") else "text/plain",
                 key=f"au_dl_{name.rsplit('_', 1)[-1]}", **STRETCH)
     with st.expander("🔬 How the automatic analysis works, with this "
@@ -10031,6 +10270,40 @@ def auto_results_panel(res):
                             unsafe_allow_html=True)
             else:
                 st.markdown(text)
+
+
+def outline_edit(points, click, mode, picked=None):
+    """One click's worth of change to an outline (a list of (x, y))."""
+    pts = [tuple(p) for p in points]
+    st.session_state["au_outline_pick"] = None
+    if mode == "Add" or not pts:
+        return pts + [click]
+    arr = np.asarray(pts, dtype=np.float64)
+    nearest = int(np.argmin(np.hypot(arr[:, 0] - click[0],
+                                     arr[:, 1] - click[1])))
+    if mode == "Delete":
+        return pts[:nearest] + pts[nearest + 1:]
+    if mode == "Move":
+        if picked is None:
+            st.session_state["au_outline_pick"] = nearest
+            return pts
+        pts[int(picked)] = click
+        return pts
+    # Insert: into the side of the closed outline nearest the click.
+    if len(pts) < 2:
+        return pts + [click]
+    best, where = float("inf"), len(pts)
+    p = np.asarray(click, dtype=np.float64)
+    for i in range(len(pts)):
+        a = arr[i]
+        b = arr[(i + 1) % len(pts)]
+        ab = b - a
+        t = float(np.clip(np.dot(p - a, ab) / max(np.dot(ab, ab), 1e-9),
+                          0.0, 1.0))
+        d = float(np.hypot(*(a + t * ab - p)))
+        if d < best:
+            best, where = d, i + 1
+    return pts[:where] + [click] + pts[where:]
 
 
 def auto_outline_panel(path, frame_index, circle=None):
@@ -10053,6 +10326,26 @@ def auto_outline_panel(path, frame_index, circle=None):
         st.error(f"Could not read frame {frame_index}.")
         return None
     points = [tuple(p) for p in (st.session_state.get("au_outline") or [])]
+    modes = ("Add", "Insert", "Move", "Delete")
+    mode_help = {
+        "Add": "each click adds a point at the end of the outline",
+        "Insert": "a click adds a point into the nearest side of the "
+                  "outline, to follow a bend more closely",
+        "Move": "click a point to pick it up (it turns yellow), then click "
+                "where it should go",
+        "Delete": "a click removes the nearest point",
+    }
+    mode = st.radio("A click on the picture", modes, horizontal=True,
+                    key="au_outline_mode",
+                    format_func=lambda m: {"Add": "➕ Add",
+                                           "Insert": "➰ Insert",
+                                           "Move": "✋ Move",
+                                           "Delete": "✖ Delete"}[m])
+    st.caption(f"**{mode}:** {mode_help[mode]}.")
+    picked = st.session_state.get("au_outline_pick")
+    if mode != "Move" or picked is None or picked >= len(points):
+        picked = None
+        st.session_state["au_outline_pick"] = None
     box = view_box(frame.shape)
     view, scale = view_render(frame, box)
     cv = ct.cv2
@@ -10073,6 +10366,10 @@ def auto_outline_panel(path, frame_index, circle=None):
         cv.polylines(image, [poly], len(shown) >= 3, (80, 220, 80), 2, line)
         for k, (x, y) in enumerate(shown):
             spot = (int(round(x)), int(round(y)))
+            if k == picked:
+                cv.circle(image, spot, 9, (0, 0, 0), -1, line)
+                cv.circle(image, spot, 7, (0, 215, 255), -1, line)
+                continue
             cv.circle(image, spot, 5, (0, 0, 0), -1, line)
             cv.circle(image, spot, 3, (255, 255, 255) if k else (0, 0, 255),
                       -1, line)
@@ -10080,7 +10377,8 @@ def auto_outline_panel(path, frame_index, circle=None):
     if HAS_CANVAS and not st.session_state.get("mt_canvas_error"):
         clicked = click_on(painted, "au_outline_canvas", box, scale)
         if clicked is not None:
-            st.session_state["au_outline"] = points + [clicked]
+            st.session_state["au_outline"] = outline_edit(
+                points, clicked, mode, picked)
             rerun_keeping_settings()
     else:
         st.image(painted, **STRETCH)
@@ -23734,6 +24032,9 @@ with tab_motion:
                 (int(details["height"]), int(details["width"])),
                 centre=(tuple(np.mean(np.asarray(placed), axis=0))
                         if placed else None))
+            with st.expander("🎞️ Look through the video", expanded=True):
+                video_viewer(motion_path, details)
+            video_plot_controls()
             (motion_sphere_tab, motion_track_tab, motion_auto_tab,
              motion_clip_tab) = st.tabs(
                 ["⚪ Probe sphere", "🎯 Track the corners",
