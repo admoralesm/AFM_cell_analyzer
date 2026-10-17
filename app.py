@@ -933,10 +933,10 @@ DEFAULTS = {
     "au_start": 0,
     "au_end": 0,
     "au_probe_um": 40.0,
-    "au_use_scale": False,
     "au_hint": True,
     "au_smooth": 5,
     "au_view": "Length change",
+    "au_um_typed": 0.3,
     # Where the cytoskeleton is allowed to join in the two-term reading.
     # The low edge is a floor, not only a search range: nothing on the
     # page can put the joining point below it.
@@ -8644,7 +8644,8 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
                   "clip_made", "clip_start_text", "clip_end_text",
                   "au_start", "au_end", "au_show", "sp_circle", "sp_edge",
                   "sp_centre_only", "sp_frame", "mt_corrections", "mt_cedit",
-                  "mt_cframe", "vz_x", "vz_y"):
+                  "mt_cframe", "vz_x", "vz_y", "au_outline",
+                  "_au_scale_auto"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -9157,6 +9158,15 @@ def motion_corrections():
     stored = st.session_state.get("mt_corrections") or {}
     return {int(f): [tuple(map(float, p)) for p in pts]
             for f, pts in stored.items() if len(pts) == 4}
+
+
+def motion_microns():
+    """µm per pixel for the corner tracking: the one set under ⚙️, or else
+    the marked probe sphere's, or None (pixels)."""
+    typed = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+    if typed > 0:
+        return typed
+    return sphere_scale()
 
 
 def corrections_panel(result, held, microns):
@@ -9846,6 +9856,10 @@ def auto_events_table(res, sp):
             f"{nb}_end_move_{unit}": round(
                 e.get("end_b_move_px", float("nan")) * k, 3),
             "interval_s": round(e["interval"], 3),
+            f"sarcomere_rest_{unit}": round(sp["ev_sl_rest"][j], 4),
+            f"sarcomere_shortest_{unit}": round(sp["ev_sl_min"][j], 4),
+            f"sarcomere_shortening_{unit}": round(
+                sp["ev_sl_rest"][j] - sp["ev_sl_min"][j], 4),
             "sarcomere_shortening_pct": round(sp["ev_sl_short"][j], 3),
             "cut_off_by_range": bool(e["partial"]),
         })
@@ -9893,8 +9907,14 @@ def auto_results_panel(res):
     sl = np.asarray(res["sl_px"], dtype=float)
     sl = sl[np.isfinite(sl)]
     m4.metric("Sarcomere (median)",
-              (f"{np.median(sl) * k:.2f} {unit}" if res.get("sl_found")
+              (f"{np.median(sl) * k:.3f} {unit}" if res.get("sl_found")
                and sl.size else "–"))
+    st.caption(
+        f"Scale: {um:.4f} µm/px ({res.get('scale_source', '')}). Lengths, "
+        f"speeds and sarcomere lengths below are in µm."
+        if um is not None else
+        "No scale: lengths and sarcomere periods are in pixels. Choose a "
+        "scale above and run again for µm.")
 
     with st.expander("📝 Summary, as the desktop app reports it",
                      expanded=True):
@@ -10013,6 +10033,79 @@ def auto_results_panel(res):
                 st.markdown(text)
 
 
+def auto_outline_panel(path, frame_index, circle=None):
+    """
+    The cell, outlined by hand: click round it, one corner of the outline
+    per click. Needed when the automatic search takes the wrong object, or
+    cuts away the part of the cell under the probe. Where the cell is
+    visible the outline is snapped to its real edge; under the probe it is
+    used as drawn. Returns the outline (video pixels) once it has three
+    points, else None.
+    """
+    st.caption(
+        "Click round the cell, one point at a time; the outline closes "
+        "itself. Draw it on this frame, the first of the range, and include "
+        "the part under the probe. Where the cell can be seen the outline is "
+        "pulled onto its real edge, so it does not need to be exact; zoom in "
+        "for the ends.")
+    frame = motion_frame(path, video_signature(), int(frame_index))
+    if frame is None:
+        st.error(f"Could not read frame {frame_index}.")
+        return None
+    points = [tuple(p) for p in (st.session_state.get("au_outline") or [])]
+    box = view_box(frame.shape)
+    view, scale = view_render(frame, box)
+    cv = ct.cv2
+    line = cv.LINE_AA
+    image = view.copy()
+    shown = to_view(points, box, scale) if points else np.zeros((0, 2))
+    if circle:
+        c = to_view([circle[:2]], box, scale)[0]
+        cv.circle(image, (int(round(c[0])), int(round(c[1]))),
+                  int(round(circle[2] * scale)), (36, 202, 249), 1, line)
+    if len(shown):
+        poly = np.round(shown).astype(np.int32).reshape(-1, 1, 2)
+        if len(shown) >= 3:
+            fill = image.copy()
+            cv.fillPoly(fill, [poly], (80, 220, 80))
+            image = cv.addWeighted(fill, 0.18, image, 0.82, 0)
+        cv.polylines(image, [poly], len(shown) >= 3, (0, 0, 0), 4, line)
+        cv.polylines(image, [poly], len(shown) >= 3, (80, 220, 80), 2, line)
+        for k, (x, y) in enumerate(shown):
+            spot = (int(round(x)), int(round(y)))
+            cv.circle(image, spot, 5, (0, 0, 0), -1, line)
+            cv.circle(image, spot, 3, (255, 255, 255) if k else (0, 0, 255),
+                      -1, line)
+    painted = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+    if HAS_CANVAS and not st.session_state.get("mt_canvas_error"):
+        clicked = click_on(painted, "au_outline_canvas", box, scale)
+        if clicked is not None:
+            st.session_state["au_outline"] = points + [clicked]
+            rerun_keeping_settings()
+    else:
+        st.image(painted, **STRETCH)
+        st.info("Drawing the outline needs the click canvas "
+                "(streamlit-drawable-canvas).", icon="ℹ️")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("↶ Remove the last point", key="au_outline_undo",
+                     disabled=not points, **STRETCH):
+            st.session_state["au_outline"] = points[:-1]
+            rerun_keeping_settings()
+    with c2:
+        if st.button("🗑️ Start again", key="au_outline_clear",
+                     disabled=not points, **STRETCH):
+            st.session_state["au_outline"] = []
+            rerun_keeping_settings()
+    with c3:
+        st.markdown(
+            f"<div style='text-align:right;padding-top:0.5rem'><b>"
+            f"{len(points)}</b> point{'' if len(points) == 1 else 's'}"
+            + ("" if len(points) >= 3 else " (at least 3 needed)")
+            + "</div>", unsafe_allow_html=True)
+    return points if len(points) >= 3 else None
+
+
 def auto_panel(path, details):
     """The 🤖 sub-tab: choose a range, press go, read the result."""
     if aa is None or AUTO_ERROR:
@@ -10046,54 +10139,108 @@ def auto_panel(path, details):
                f"{ct.format_time(int(end) / fps)}")
 
     circle = sphere_circle()
-    st.checkbox(
-        ("Use the probe sphere marked on ⚪ Probe sphere "
-         f"(centre {circle[0]:.0f}, {circle[1]:.0f} px · "
-         f"{2 * circle[2]:.1f} px = "
-         f"{float(st.session_state.get('sp_um', 40.0)):g} µm)")
-        if circle else "Use the probe sphere marked on ⚪ Probe sphere "
-                       "(none marked yet)",
-        key="au_use_sphere", disabled=circle is None,
-        help="Your circle is taken as the probe tip, as it is: its centre "
-             "and size, and so the scale. Otherwise the tip is searched "
-             "for, and a blurred dark halo can make it come out too big.")
-    use_sphere = bool(circle and st.session_state.get("au_use_sphere", True))
-    s1, s2 = st.columns(2)
-    with s1:
+    tracking_scale = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+
+    # ---- the scale. It decides more than the units: the sarcomeres are
+    # looked for between 1.3 and 3.0 µm, so a wrong scale searches the wrong
+    # band and finds nothing, or a harmonic.
+    st.markdown("**Scale**")
+    sources = []
+    if circle and sphere_scale():
+        sources.append("sphere")
+    if tracking_scale > 0:
+        sources.append("tracking")
+    sources += ["tip", "typed"]
+    names = {
+        "sphere": (f"The probe sphere I marked ({sphere_scale() or 0:.4f} "
+                   f"µm/px: {float(st.session_state.get('sp_um', 40.0)):g} "
+                   f"µm over {2 * circle[2]:.1f} px)") if circle else "",
+        "tracking": f"The one set for the corner tracking "
+                    f"({tracking_scale:.4f} µm/px)",
+        "typed": "Type it",
+        "tip": "Measure the probe tip automatically",
+    }
+    # Until a choice is made here, follow the best scale there is: a
+    # sphere marked later, or a scale set later for the corner tracking,
+    # takes over from measuring the probe tip, instead of the first default
+    # sticking.
+    if (st.session_state.get("_au_scale_auto", True)
+            or st.session_state.get("au_scale_src") not in sources):
+        st.session_state["au_scale_src"] = sources[0]
+        st.session_state["_au_scale_auto"] = True
+
+    def _scale_chosen():
+        st.session_state["_au_scale_auto"] = False
+
+    source = st.radio("Where the µm per pixel comes from", sources,
+                      format_func=lambda k: names[k], key="au_scale_src",
+                      label_visibility="collapsed", on_change=_scale_chosen)
+    um_per_px = None
+    probe_um = float(st.session_state.get("au_probe_um", 40.0))
+    if source == "sphere":
+        um_per_px = sphere_scale()
+        probe_um = float(st.session_state.get("sp_um", 40.0))
+    elif source == "tracking":
+        um_per_px = tracking_scale
+    elif source == "typed":
+        st.number_input("µm per pixel", 0.0001, 100.0, step=0.001,
+                        format="%.4f", key="au_um_typed")
+        um_per_px = float(st.session_state.get("au_um_typed", 0.3))
+    else:
         st.number_input(
             "Probe tip diameter (µm)", 1.0, 500.0, step=1.0,
-            key="au_probe_um", disabled=use_sphere,
+            key="au_probe_um",
             help="The scale is the tip's real diameter over its diameter "
-                 "in pixels, measured edge to edge at half darkness. Not "
-                 "used while the marked sphere is.")
-    with s2:
-        typed = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+                 "in pixels, measured edge to edge at half darkness.")
+        probe_um = float(st.session_state.get("au_probe_um", 40.0))
+    if um_per_px:
+        lo = aa.Config.AUTO_SL_MIN_UM / um_per_px
+        hi = aa.Config.AUTO_SL_MAX_UM / um_per_px
+        st.caption(
+            f"At {um_per_px:.4f} µm/px, sarcomeres are looked for with a "
+            f"period of {aa.Config.AUTO_SL_MIN_UM:g} to "
+            f"{aa.Config.AUTO_SL_MAX_UM:g} µm, i.e. {lo:.1f} to {hi:.1f} px, "
+            f"and every length, speed and sarcomere reading is reported in "
+            f"µm.")
+    else:
+        st.caption("The scale is measured from the probe tip when the "
+                   "analysis runs; the summary says what it came out as.")
+
+    # ---- the probe
+    use_sphere = False
+    if circle:
         st.checkbox(
-            f"Use the scale from Track the corners ({typed:.4f} µm/px)"
-            if typed > 0 else "Use the scale from Track the corners (not set)",
-            key="au_use_scale", disabled=typed <= 0,
-            help="Takes the µm per pixel set under ⚙️ on the Track the "
-                 "corners tab instead of the probe tip.")
+            f"The probe tip is the sphere I marked (centre {circle[0]:.0f}, "
+            f"{circle[1]:.0f} px)", key="au_use_sphere",
+            help="Your circle is taken as the probe tip as it is. Otherwise "
+                 "the tip is searched for, and a blurred dark halo can make "
+                 "it come out too big.")
+        use_sphere = bool(st.session_state.get("au_use_sphere", True))
+    probe_hint = circle if use_sphere else None
+
+    # ---- the cell
+    st.markdown("**The cell**")
     markers = motion_markers()
+    modes = ["auto"] + (["corners"] if len(markers) >= 3 else []) + ["outline"]
+    mode_names = {"auto": "Find it automatically",
+                  "corners": "The one my tracking corners are on",
+                  "outline": "Draw its outline"}
+    if st.session_state.get("au_cell_mode") not in modes:
+        st.session_state["au_cell_mode"] = modes[0]
+    cell_mode = st.radio("Which cell", modes, format_func=mode_names.get,
+                         key="au_cell_mode", horizontal=True,
+                         label_visibility="collapsed")
     hint = None
-    if len(markers) >= 3:
-        st.checkbox(
-            "The cell is the one my corners are on", key="au_hint",
-            help="When more than one cell-sized object is in view, the one "
-                 "nearest the probe is taken. With this, the one under the "
-                 "corners placed on Track the corners is taken instead.")
-        if st.session_state.get("au_hint", True):
-            hint = (float(np.mean([p[0] for p in markers])),
-                    float(np.mean([p[1] for p in markers])))
-    um_per_px = (typed if st.session_state.get("au_use_scale") and typed > 0
-                 else None)
-    probe_um = float(st.session_state.get("au_probe_um", 40.0))
-    probe_hint = None
-    if use_sphere:
-        probe_hint = circle
-        probe_um = float(st.session_state.get("sp_um", 40.0))
+    outline = None
+    if cell_mode == "corners":
+        hint = (float(np.mean([p[0] for p in markers])),
+                float(np.mean([p[1] for p in markers])))
+    elif cell_mode == "outline":
+        outline = auto_outline_panel(path, int(start), circle)
+
     signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
     signature += repr(probe_hint and tuple(np.round(probe_hint, 2)))
+    signature += repr(outline and [tuple(np.round(p, 1)) for p in outline])
 
     if st.button("▶️ Run the automatic analysis", key="au_go",
                  type="primary", **STRETCH):
@@ -10114,12 +10261,20 @@ def auto_panel(path, details):
                 path, start_frame=int(start), end_frame=int(end),
                 um_per_px=um_per_px, probe_diameter_um=probe_um,
                 hint_xy=hint, progress_callback=_tick,
-                probe_hint=probe_hint)
+                probe_hint=probe_hint, cell_outline=outline)
         except Exception as exc:
             bar.empty()
             st.error(f"{exc}", icon="🚫")
         else:
             bar.empty()
+            if res is not None and um_per_px:
+                # Say where the scale came from in this page's words, not
+                # the desktop's ("scale locked in Step 2").
+                res["scale_source"] = {
+                    "sphere": f"probe sphere, {probe_um:g} µm wide",
+                    "tracking": "the corner-tracking setting",
+                    "typed": "typed in",
+                }.get(source, res["scale_source"])
             st.session_state["au_result"] = res
             st.session_state["au_signature"] = signature
 
@@ -23615,8 +23770,7 @@ with tab_motion:
                     st.markdown("**3 · Select the four corners**")
                     # A canvas keyed to the video: a new file gets a new,
                     # empty one instead of the last video's dots.
-                    pick_microns = float(
-                        st.session_state.get("mt_um_per_px", 0.0)) or None
+                    pick_microns = motion_microns()
                     markers = motion_pick_panel(
                         frame_bgr, microns=pick_microns,
                         canvas_key="mt_canvas_" + str(
@@ -23694,7 +23848,13 @@ with tab_motion:
                                 help="Everything is reported in pixels unless "
                                      "this is set. A sphere of known diameter is "
                                      "the usual way to get it: diameter in µm "
-                                     "divided by its diameter in pixels.")
+                                     "divided by its diameter in pixels. Left "
+                                     "at 0, the sphere marked on ⚪ Probe "
+                                     "sphere is used if there is one.")
+                            if (float(st.session_state.get("mt_um_per_px", 0)
+                                      or 0) <= 0 and sphere_scale()):
+                                st.caption(f"Using the probe sphere's "
+                                           f"{sphere_scale():.4f} µm/px.")
                             st.number_input(
                                 "Tracking window (px)", 7, 101, step=2,
                                 key="mt_window",
@@ -23790,7 +23950,7 @@ with tab_motion:
                                 "the corners, the range or a setting. What is "
                                 "below is the previous reading; press **▶️ Track "
                                 "the four corners** to redo it.", icon="⚠️")
-                        microns = float(st.session_state.get("mt_um_per_px", 0.0))
+                        microns = motion_microns() or 0.0
                         motion_results_panel(result, held,
                                              microns if microns > 0 else None)
 
