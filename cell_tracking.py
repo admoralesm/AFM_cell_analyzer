@@ -1359,6 +1359,85 @@ def track_points_ref(video_path, points_xy, start_frame=0, end_frame=None,
     }
 
 
+def track_points_corrected(video_path, anchors, end_frame=None,
+                           radius=TRACK_AREA_RADIUS,
+                           fb_threshold=FB_THRESHOLD, contrast=1.0,
+                           progress=None):
+    """
+    The area-anchored tracker, restarted at every hand correction.
+
+    ``anchors`` maps frame -> the (K, 2) positions someone placed there: the
+    first is where tracking starts, every later one is a correction. Each
+    stretch between two anchors is tracked by ``track_points_ref`` starting
+    from the earlier anchor (so each marker's reference look is taken from
+    that frame), and whatever the tracker is off by when it reaches the next
+    anchor is spread evenly over the stretch, as the desktop app's anchored
+    re-track does. The anchor frames themselves sit exactly where they were
+    placed. After the last anchor, tracking simply runs on to ``end_frame``.
+
+    Returns the same dict as ``track_points_ref`` plus ``anchors``, the
+    anchor frame numbers.
+    """
+    if not anchors:
+        raise RuntimeError("No starting positions were given.")
+    keys = sorted(int(f) for f in anchors)
+    placed = {int(f): np.asarray(anchors[f], dtype=np.float64).reshape(-1, 2)
+              for f in anchors}
+    first = keys[0]
+    if end_frame is None:
+        end_frame = keys[-1]
+    end_frame = int(max(end_frame, keys[-1]))
+    stops = [f for f in keys if f <= end_frame]
+    bounds = list(zip(stops, stops[1:] + [end_frame]))
+    if bounds and bounds[-1][0] == bounds[-1][1] and len(bounds) > 1:
+        bounds = bounds[:-1]
+    total = max(1, end_frame - first)
+    parts = []
+    for a, b in bounds:
+        def tick(done, span, _a=a):
+            if progress is None:
+                return False
+            return progress(int(_a - first + done), total)
+
+        part = track_points_ref(video_path, placed[a], start_frame=a,
+                                end_frame=b, radius=radius,
+                                fb_threshold=fb_threshold,
+                                contrast=contrast, progress=tick)
+        pts = part["points"].astype(np.float64)
+        frames = part["frames"]
+        if b in placed and int(frames[-1]) == b and len(frames) > 1:
+            # Close onto the correction, the error growing linearly from
+            # nothing at the earlier anchor to all of it at this one.
+            miss = placed[b] - pts[-1]
+            weight = (frames - a) / float(b - a)
+            for k in range(pts.shape[1]):
+                if np.all(np.isfinite(miss[k])):
+                    pts[:, k, :] += weight[:, None] * miss[k][None, :]
+                else:
+                    pts[-1, k, :] = placed[b][k]
+            part["lock"][-1, :] = ANCHORED
+        part["points"] = pts.astype(np.float32)
+        parts.append(part)
+        if int(frames[-1]) < b:
+            break                   # the file stopped giving frames
+
+    def joined(name):
+        pieces = [np.asarray(p[name]) for p in parts]
+        return np.concatenate([pieces[0]] + [x[1:] for x in pieces[1:]],
+                              axis=0)
+
+    out = dict(parts[0])
+    for name in ("frames", "points", "status", "lock", "zncc"):
+        out[name] = joined(name)
+    out["status"] = ((out["lock"] == ANCHORED)
+                     | (out["lock"] == REANCHORED)).astype(np.uint8)
+    out["rerefs"] = [r for p in parts for r in p["rerefs"]]
+    out["bad_frames"] = sorted({b for p in parts for b in p["bad_frames"]})
+    out["start_frame"] = int(first)
+    out["anchors"] = [f for f in stops]
+    return out
+
+
 def bridge_lost_points(points):
     """
     v1.7: fill ONLY the frames where a marker has no position.
