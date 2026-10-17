@@ -95,6 +95,31 @@ class Config:
     AUTO_SPEED_POLYORDER = 4          # 4th order keeps fast peaks
     AUTO_VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".wmv", ".webm")
 
+    # The probe sphere: snapping a marked circle onto its edge, and finding
+    # it without being shown (SphereEdgeRefiner, desktop v1.6+).
+    SPHERE_REFINE_NUM_RAYS = 36
+    SPHERE_REFINE_BAND_PX = 12
+    SPHERE_REFINE_MIN_GRAD = 6.0
+    SPHERE_REFINE_MIN_VALID_RAYS_FRAC = 0.30
+    SPHERE_REFINE_BLUR_KSIZE = 3
+    SPHERE_DETECT_NUM_FRAMES = 7
+    SPHERE_DETECT_FRAME_STRIDE = 3
+    SPHERE_DETECT_RADIUS_FRAC_MIN = 0.04
+    SPHERE_DETECT_RADIUS_FRAC_MAX = 0.55
+    SPHERE_DETECT_HOUGH_PARAM1 = 100
+    SPHERE_DETECT_HOUGH_PARAM2 = 35
+    SPHERE_DETECT_BLUR_KSIZE = 7
+    SPHERE_DETECT_MEDIAN_KSIZE = 5
+    SPHERE_DETECT_AGREEMENT_PX = 12.0
+    SPHERE_DETECT_HINT_RADIUS_FRAC = 0.55
+    SPHERE_DETECT_HINT_RMIN_FRAC = 0.10
+    SPHERE_DETECT_EDGE_SHARPNESS_MIN = 0.55
+    SPHERE_DETECT_EDGE_PROBE_BAND_FRAC = 0.12
+    SPHERE_DETECT_EDGE_PROBE_RAYS = 24
+    SPHERE_DETECT_TOP_K_BEFORE_SCORE = 8
+    SPECULAR_THRESH = 235
+    SPECULAR_INPAINT_RADIUS = 4
+
 
 class Utils:
     clamp = staticmethod(_ct.clamp)
@@ -2853,6 +2878,579 @@ class AutoCellAnalysis:
 
 # ---------------------------- Auto analysis: results window ----------------------------
 
+
+
+# ------------------------------------- the probe sphere, as is (desktop) ---
+
+class SphereEdgeRefiner:
+    @staticmethod
+    def refine(
+        gray: np.ndarray,
+        center_pred: Tuple[float, float],
+        r_pred: float,
+        num_rays: int = Config.SPHERE_REFINE_NUM_RAYS,
+        band: float = Config.SPHERE_REFINE_BAND_PX,
+        min_grad: float = Config.SPHERE_REFINE_MIN_GRAD,
+        min_valid_frac: float = Config.SPHERE_REFINE_MIN_VALID_RAYS_FRAC,
+        blur_ksize: int = Config.SPHERE_REFINE_BLUR_KSIZE,
+    ) -> dict:
+        h, w = gray.shape[:2]
+        cx, cy = float(center_pred[0]), float(center_pred[1])
+        r_pred = float(r_pred)
+
+        result = {
+            "ok": False,
+            "center": (cx, cy),
+            "radius": r_pred,
+            "edge": (cx + r_pred, cy),
+            "confidence": 0.0,
+            "num_rays_valid": 0,
+        }
+
+        if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r_pred)) or r_pred <= 2.0:
+            return result
+
+        ksize = max(1, int(blur_ksize))
+        if ksize % 2 == 0:
+            ksize += 1
+        if ksize >= 3:
+            blurred = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+        else:
+            blurred = gray
+
+        r_min = max(1.0, r_pred - band)
+        r_max = r_pred + band
+        n_samples = max(5, int(round(r_max - r_min)) + 1)
+        radii = np.linspace(r_min, r_max, n_samples)
+
+        thetas = np.linspace(0.0, 2.0 * np.pi, num_rays, endpoint=False)
+
+        refined_radii = []
+        offset_x_list = []
+        offset_y_list = []
+
+        for theta in thetas:
+            ct, st = np.cos(theta), np.sin(theta)
+            xs = cx + radii * ct
+            ys = cy + radii * st
+
+            if (xs.min() < 0 or xs.max() >= w - 1 or
+                    ys.min() < 0 or ys.max() >= h - 1):
+                continue
+
+            samples = cv2.remap(
+                blurred,
+                xs.astype(np.float32).reshape(1, -1),
+                ys.astype(np.float32).reshape(1, -1),
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            ).reshape(-1).astype(np.float64)
+
+            if samples.size < 3:
+                continue
+
+            grad = np.abs(np.gradient(samples))
+            peak_idx = int(np.argmax(grad))
+            peak_val = float(grad[peak_idx])
+
+            if peak_val < min_grad:
+                continue
+
+            r_found = float(radii[peak_idx])
+            refined_radii.append(r_found)
+            residual = r_found - r_pred
+            offset_x_list.append(residual * ct)
+            offset_y_list.append(residual * st)
+
+        n_valid = len(refined_radii)
+        confidence = n_valid / float(num_rays) if num_rays > 0 else 0.0
+
+        if n_valid == 0:
+            return result
+
+        radius_refined = float(np.median(refined_radii))
+
+        if n_valid >= max(6, int(0.5 * num_rays)):
+            dx = float(np.mean(offset_x_list))
+            dy = float(np.mean(offset_y_list))
+            cap = 0.5 * band
+            dx = float(Utils.clamp(dx, -cap, cap))
+            dy = float(Utils.clamp(dy, -cap, cap))
+            cx_ref = cx + dx
+            cy_ref = cy + dy
+        else:
+            cx_ref, cy_ref = cx, cy
+
+        ok = confidence >= min_valid_frac
+
+        ex = cx_ref + radius_refined
+        ey = cy_ref
+
+        return {
+            "ok": ok,
+            "center": (cx_ref, cy_ref),
+            "radius": radius_refined,
+            "edge": (ex, ey),
+            "confidence": confidence,
+            "num_rays_valid": n_valid,
+        }
+
+    @staticmethod
+    def snap_edge_to_gradient(
+        gray: np.ndarray,
+        center_xy: Tuple[float, float],
+        edge_click_xy: Tuple[float, float],
+        search_band_px: float = Config.SPHERE_REFINE_BAND_PX,
+        min_grad: float = Config.SPHERE_REFINE_MIN_GRAD,
+        blur_ksize: int = Config.SPHERE_REFINE_BLUR_KSIZE,
+    ) -> Tuple[Tuple[float, float], bool]:
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        ex, ey = float(edge_click_xy[0]), float(edge_click_xy[1])
+
+        dx, dy = ex - cx, ey - cy
+        r_click = float(np.hypot(dx, dy))
+        if r_click < 2.0:
+            return (ex, ey), False
+
+        ux, uy = dx / r_click, dy / r_click
+        h, w = gray.shape[:2]
+
+        ksize = max(1, int(blur_ksize))
+        if ksize % 2 == 0:
+            ksize += 1
+        blurred = cv2.GaussianBlur(
+            gray, (ksize, ksize), 0) if ksize >= 3 else gray
+
+        r_min = max(1.0, r_click - search_band_px)
+        r_max = r_click + search_band_px
+        n_samples = max(7, int(round(r_max - r_min)) + 1)
+        radii = np.linspace(r_min, r_max, n_samples)
+
+        xs = cx + radii * ux
+        ys = cy + radii * uy
+        if (xs.min() < 0 or xs.max() >= w - 1
+                or ys.min() < 0 or ys.max() >= h - 1):
+            return (ex, ey), False
+
+        samples = cv2.remap(
+            blurred,
+            xs.astype(np.float32).reshape(1, -1),
+            ys.astype(np.float32).reshape(1, -1),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).reshape(-1).astype(np.float64)
+        if samples.size < 3:
+            return (ex, ey), False
+
+        grad = np.abs(np.gradient(samples))
+        peak_idx = int(np.argmax(grad))
+        if float(grad[peak_idx]) < min_grad:
+            return (ex, ey), False
+
+        r_snapped = float(radii[peak_idx])
+        return (cx + r_snapped * ux, cy + r_snapped * uy), True
+
+    @staticmethod
+    def _radial_edge_sharpness(
+        gray: np.ndarray,
+        cx: float,
+        cy: float,
+        r: float,
+        band_frac: float = Config.SPHERE_DETECT_EDGE_PROBE_BAND_FRAC,
+        num_rays: int = Config.SPHERE_DETECT_EDGE_PROBE_RAYS,
+    ) -> Tuple[float, float]:
+        h, w = gray.shape[:2]
+        band = max(2.0, r * band_frac)
+        r_min = max(1.0, r - band)
+        r_max = r + band
+        n_samples = max(7, int(round(r_max - r_min)) + 1)
+        radii = np.linspace(r_min, r_max, n_samples)
+
+        thetas = np.linspace(0.0, 2.0 * np.pi, num_rays, endpoint=False)
+        peak_radii = []
+        centered_scores = []
+
+        for theta in thetas:
+            ct, st = np.cos(theta), np.sin(theta)
+            xs = cx + radii * ct
+            ys = cy + radii * st
+
+            if (xs.min() < 0 or xs.max() >= w - 1
+                    or ys.min() < 0 or ys.max() >= h - 1):
+                continue
+
+            samples = cv2.remap(
+                gray,
+                xs.astype(np.float32).reshape(1, -1),
+                ys.astype(np.float32).reshape(1, -1),
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            ).reshape(-1).astype(np.float64)
+            if samples.size < 5:
+                continue
+
+            grad = np.abs(np.gradient(samples))
+            if grad.max() < 2.0:
+                continue
+
+            peak_idx = int(np.argmax(grad))
+            peak_radii.append(float(radii[peak_idx]))
+
+            third = max(1, n_samples // 3)
+            central_slice = grad[third:n_samples - third] if (
+                n_samples - 2 * third) > 0 else grad
+            central = float(central_slice.sum())
+            total = float(grad.sum()) + 1e-9
+            centered_scores.append(central / total)
+
+        if not peak_radii:
+            return 0.0, r
+
+        sharpness = float(np.median(centered_scores))
+        r_refined = float(np.median(peak_radii))
+        return sharpness, r_refined
+
+    @staticmethod
+    def _hough_detect_single(
+        gray: np.ndarray,
+        top_k: int = 3,
+        hint_xy: Optional[Tuple[float, float]] = None,
+    ) -> List[Tuple[float, float, float]]:
+        h, w = gray.shape[:2]
+
+        mksize = int(getattr(Config, "SPHERE_DETECT_MEDIAN_KSIZE", 5))
+        if mksize % 2 == 0:
+            mksize += 1
+        if mksize >= 3:
+            smoothed = cv2.medianBlur(gray, mksize)
+        else:
+            smoothed = gray
+
+        min_dim = min(h, w)
+        if hint_xy is not None:
+            r_max_search = max(
+                10, int(round(Config.SPHERE_DETECT_HINT_RADIUS_FRAC * min_dim)))
+            min_r = max(5, int(round(
+                Config.SPHERE_DETECT_HINT_RMIN_FRAC * r_max_search)))
+            max_r = max(min_r + 5, r_max_search)
+        else:
+            min_r = max(5, int(round(
+                Config.SPHERE_DETECT_RADIUS_FRAC_MIN * min_dim)))
+            max_r = max(min_r + 5, int(round(
+                Config.SPHERE_DETECT_RADIUS_FRAC_MAX * min_dim)))
+
+        min_dist = max(min_r * 2, min_dim // 4)
+
+        circles = cv2.HoughCircles(
+            smoothed,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=min_dist,
+            param1=Config.SPHERE_DETECT_HOUGH_PARAM1,
+            param2=Config.SPHERE_DETECT_HOUGH_PARAM2,
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+        if circles is None or circles.shape[1] == 0:
+            return []
+
+        k_pre = int(getattr(
+            Config, "SPHERE_DETECT_TOP_K_BEFORE_SCORE", 8))
+        cand: List[Tuple[float, float, float]] = []
+        if hint_xy is not None:
+            hx, hy = float(hint_xy[0]), float(hint_xy[1])
+            tol = float(max_r)
+            for c in circles[0]:
+                cx, cy, cr = float(c[0]), float(c[1]), float(c[2])
+                if np.hypot(cx - hx, cy - hy) <= tol:
+                    cand.append((cx, cy, cr))
+                if len(cand) >= k_pre:
+                    break
+        else:
+            for c in circles[0, :k_pre]:
+                cand.append((float(c[0]), float(c[1]), float(c[2])))
+
+        if not cand:
+            return []
+
+        band_frac = float(getattr(
+            Config, "SPHERE_DETECT_EDGE_PROBE_BAND_FRAC", 0.12))
+        num_rays = int(getattr(
+            Config, "SPHERE_DETECT_EDGE_PROBE_RAYS", 24))
+        sharp_min = float(getattr(
+            Config, "SPHERE_DETECT_EDGE_SHARPNESS_MIN", 0.55))
+
+        scored: List[Tuple[float, Tuple[float, float, float]]] = []
+        fallback: List[Tuple[float, Tuple[float, float, float]]] = []
+
+        for cx, cy, cr in cand:
+            sharpness, r_ref = SphereEdgeRefiner._radial_edge_sharpness(
+                smoothed, cx, cy, cr,
+                band_frac=band_frac, num_rays=num_rays)
+            refined = (cx, cy, r_ref)
+            if sharpness >= sharp_min:
+                scored.append((sharpness, refined))
+            else:
+                fallback.append((sharpness, refined))
+
+        if scored:
+            scored.sort(key=lambda t: t[0], reverse=True)
+            return [t[1] for t in scored[:int(top_k)]]
+
+        fallback.sort(key=lambda t: t[0], reverse=True)
+        return [t[1] for t in fallback[:int(top_k)]]
+
+    @staticmethod
+    def _suppress_specular(gray: np.ndarray) -> np.ndarray:
+        """Remove the bright specular dot many spheres show at 60x. That white
+        highlight otherwise fools HoughCircles into a tiny/false detection.
+        Inpaint the near-saturated pixels with surrounding intensity."""
+        thr = int(getattr(Config, "SPECULAR_THRESH", 235))
+        mask = (gray >= thr).astype(np.uint8)
+        if float(mask.mean()) > 0.0002:
+            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+            try:
+                gray = cv2.inpaint(
+                    gray, mask * 255,
+                    int(getattr(Config, "SPECULAR_INPAINT_RADIUS", 4)),
+                    cv2.INPAINT_TELEA)
+            except Exception:
+                gray = cv2.medianBlur(gray, 5)
+        return gray
+
+    @staticmethod
+    def _detect_dark_disk(gray: np.ndarray,
+                          hint_xy=None):
+        """Fallback when Hough finds nothing: the sphere is a large dark disk
+        on a lighter background. Otsu-threshold the dark region, take the most
+        circular blob in the plausible size range, fit an enclosing circle."""
+        h, w = gray.shape[:2]
+        g = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, th = cv2.threshold(
+            g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        cnts, _ = cv2.findContours(
+            th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        min_dim = min(h, w)
+        rmin = Config.SPHERE_DETECT_RADIUS_FRAC_MIN * min_dim
+        rmax = Config.SPHERE_DETECT_RADIUS_FRAC_MAX * min_dim
+        best = None
+        best_score = -1.0
+        for c in cnts:
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            if r < rmin or r > rmax:
+                continue
+            area = cv2.contourArea(c)
+            circ = area / (math.pi * r * r + 1e-9)
+            if circ < 0.55:
+                continue
+            score = circ
+            if hint_xy is not None:
+                d = math.hypot(cx - float(hint_xy[0]), cy - float(hint_xy[1]))
+                score -= 0.001 * d
+            if score > best_score:
+                best_score = score
+                best = (float(cx), float(cy), float(r))
+        return best
+
+    @staticmethod
+    def _radius_from_center(gray, cx, cy, num_rays=48, min_grad=3.0):
+        """Given a trusted center (the user's hint), find the sphere radius by
+        shooting rays outward and taking the median radius of the strongest
+        intensity edge. Guarantees the detection sits AT the hint."""
+        h, w = gray.shape[:2]
+        min_dim = min(h, w)
+        r_min = max(4.0, Config.SPHERE_DETECT_RADIUS_FRAC_MIN * min_dim)
+        r_max = max(r_min + 5.0, Config.SPHERE_DETECT_RADIUS_FRAC_MAX * min_dim)
+        radii = np.arange(r_min, r_max, 1.0, dtype=np.float32)
+        if radii.size < 5:
+            return None
+        g = cv2.GaussianBlur(gray, (5, 5), 0)
+        thetas = np.linspace(0.0, 2.0 * np.pi, int(num_rays), endpoint=False)
+        found = []
+        for th in thetas:
+            ct, st = math.cos(th), math.sin(th)
+            xs = cx + radii * ct
+            ys = cy + radii * st
+            inb = (xs >= 0) & (xs < w - 1) & (ys >= 0) & (ys < h - 1)
+            if int(inb.sum()) < 5:
+                continue
+            xs2 = xs[inb]
+            ys2 = ys[inb]
+            rr = radii[inb]
+            samples = cv2.remap(
+                g, xs2.astype(np.float32).reshape(1, -1),
+                ys2.astype(np.float32).reshape(1, -1),
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE).reshape(-1).astype(np.float64)
+            if samples.size < 5:
+                continue
+            grad = np.abs(np.gradient(samples))
+            gmax = float(grad.max()) if grad.size else 0.0
+            if gmax < min_grad:
+                continue
+            # Take the OUTERMOST strong edge, so we reach the outer boundary of
+            # the dark shadow halo (the sphere can be transparent inside with a
+            # dark rim). Require it to be >= half the strongest edge on the ray.
+            thr = max(min_grad, 0.5 * gmax)
+            sig = np.where(grad >= thr)[0]
+            if sig.size:
+                found.append(float(rr[int(sig[-1])]))
+        if len(found) >= max(6, int(0.25 * num_rays)):
+            return float(np.median(found))
+        return None
+
+    @staticmethod
+    def auto_detect_multiframe(
+        video_path: str,
+        center_frame: int,
+        num_frames: int = Config.SPHERE_DETECT_NUM_FRAMES,
+        stride: int = Config.SPHERE_DETECT_FRAME_STRIDE,
+        agreement_px: float = Config.SPHERE_DETECT_AGREEMENT_PX,
+        hint_xy: Optional[Tuple[float, float]] = None,
+    ) -> Optional[dict]:
+        cap = RobustCapture(video_path)
+        if not cap.isOpened():
+            return None
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total <= 0:
+                return None
+            half = num_frames // 2
+            offsets = [(i - half) * stride for i in range(num_frames)]
+
+            # Hint given -> TRUST the clicked center, find radius radially so
+            # the detection lands exactly where the user clicked.
+            if hint_xy is not None:
+                hx, hy = float(hint_xy[0]), float(hint_xy[1])
+                hradii = []
+                for off in offsets:
+                    idx = int(Utils.clamp(center_frame + off, 0, total - 1))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        continue
+                    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    g = SphereEdgeRefiner._suppress_specular(g)
+                    rr = SphereEdgeRefiner._radius_from_center(g, hx, hy)
+                    if rr is not None:
+                        hradii.append(rr)
+                if hradii:
+                    r_med = float(np.median(hradii))
+                    if np.isfinite(r_med) and r_med >= 3:
+                        return {
+                            "center": (hx, hy),
+                            "radius": r_med,
+                            "n_frames_used": len(hradii),
+                            "n_frames_agreed": len(hradii),
+                        }
+
+            detections = []
+            for off in offsets:
+                idx = int(Utils.clamp(center_frame + off, 0, total - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = SphereEdgeRefiner._suppress_specular(gray)
+                hits = SphereEdgeRefiner._hough_detect_single(
+                    gray, top_k=1, hint_xy=hint_xy)
+                cand = hits[0] if hits else \
+                    SphereEdgeRefiner._detect_dark_disk(gray, hint_xy=hint_xy)
+                if cand is None:
+                    continue
+                cx, cy, r0 = cand
+                # The 60x sphere is transparent in the middle with a dark shadow
+                # rim, so Hough tends to lock the small bright inner circle. The
+                # center is still concentric, so push the radius OUT to the outer
+                # edge of the dark shadow (the true sphere boundary).
+                r_out = SphereEdgeRefiner._radius_from_center(gray, cx, cy)
+                if r_out is not None and r_out >= r0:
+                    r0 = float(r_out)
+                detections.append((cx, cy, r0))
+        finally:
+            cap.release()
+
+        if not detections:
+            return None
+
+        arr = np.array(detections, dtype=np.float64)
+        med_cx = float(np.median(arr[:, 0]))
+        med_cy = float(np.median(arr[:, 1]))
+        med_r = float(np.median(arr[:, 2]))
+
+        d = np.hypot(arr[:, 0] - med_cx, arr[:, 1] - med_cy)
+        keep = d <= float(agreement_px)
+        n_agreed = int(keep.sum())
+        if n_agreed >= 2:
+            kept = arr[keep]
+            cx = float(np.median(kept[:, 0]))
+            cy = float(np.median(kept[:, 1]))
+            r = float(np.median(kept[:, 2]))
+        else:
+            cx, cy, r = med_cx, med_cy, med_r
+
+        if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r)) or r < 3:
+            return None
+
+        return {
+            "center": (cx, cy),
+            "radius": r,
+            "n_frames_used": int(arr.shape[0]),
+            "n_frames_agreed": n_agreed,
+        }
+
+
+# ---------------------------- Reference Image Saver (4-point mode) ----------------------------
+
+_PT_BGR = [
+    (107, 107, 255),
+    (196, 205,  78),
+    (209, 183,  69),
+    (36, 202, 249),
+]
+_PT_LABELS = ["P1", "P2", "P3", "P4"]
+
+_SPHERE_CENTER_BGR = (107, 107, 255)
+_SPHERE_EDGE_BGR = (196, 205,  78)
+_SPHERE_RING_BGR = (36, 202, 249)
+
+
+def snap_sphere(gray, circle):
+    """
+    Fit a marked circle to the sphere's edge (SphereEdgeRefiner).
+
+    Each refine moves the circle only part of the way, so it is repeated
+    while it is converging: on a round edge every step is about half the
+    last. When the steps stop shrinking the circle is creeping somewhere
+    with no edge to stop it (into the cantilever, on a sphere it partly
+    hides), so it stops there and keeps the last converging fit.
+    """
+    cx, cy, r = (float(v) for v in circle)
+    fit = SphereEdgeRefiner.refine(gray, (cx, cy), r)
+    if not fit.get("ok"):
+        return fit
+    last = (float(np.hypot(fit["center"][0] - cx, fit["center"][1] - cy))
+            + abs(float(fit["radius"]) - r))
+    for _ in range(8):
+        if last < 0.05:
+            break
+        cx, cy = fit["center"]
+        r = float(fit["radius"])
+        step = SphereEdgeRefiner.refine(gray, (cx, cy), r)
+        if not step.get("ok"):
+            break
+        size = (float(np.hypot(step["center"][0] - cx,
+                               step["center"][1] - cy))
+                + abs(float(step["radius"]) - r))
+        if size >= 0.9 * last:
+            break
+        fit, last = step, size
+    return fit
 
 
 def available():
