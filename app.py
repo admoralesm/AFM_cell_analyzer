@@ -923,6 +923,12 @@ DEFAULTS = {
     "mt_method": "Area-anchored (v1.7)",
     "mt_radius": 15,
     "mt_rings": True,
+    # One zoom for every picture on the video tab.
+    "vz_zoom": 1.0,
+    # The probe sphere: its real diameter, and whether the automatic
+    # analysis takes it as the probe tip (desktop v1.9.7).
+    "sp_um": 40.0,
+    "au_use_sphere": True,
     # The automatic analysis (v1.9.7) on the same video.
     "au_start": 0,
     "au_end": 0,
@@ -8480,7 +8486,8 @@ def motion_set_markers(points):
 
 
 def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
-                   microns=None, thickness=1.0, radius=None, lock=None):
+                   microns=None, thickness=1.0, radius=None, lock=None,
+                   view_scale=1.0):
     """
     The frame with the four corners on it, drawn the way the desktop app
     draws them: a crosshair and a ring on each corner, its label beside it,
@@ -8588,6 +8595,7 @@ def motion_preview(frame_bgr, markers, trail=None, connect=True, dots=True,
         if len(placed) == 4:
             area = float(ct.quad_area(
                 np.asarray(placed, dtype=np.float64).reshape(1, 4, 2))[0])
+            area /= float(view_scale or 1.0) ** 2
             if np.isfinite(area):
                 if microns:
                     text = f"{area * microns * microns:.0f} um2"
@@ -8634,7 +8642,9 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
     # widget's range is an exception before the page draws.
     for stale in ("mt_start", "mt_end", "mt_show", "clip_range",
                   "clip_made", "clip_start_text", "clip_end_text",
-                  "au_start", "au_end", "au_show"):
+                  "au_start", "au_end", "au_show", "sp_circle", "sp_edge",
+                  "sp_centre_only", "sp_frame", "mt_corrections", "mt_cedit",
+                  "mt_cframe", "vz_x", "vz_y"):
         st.session_state.pop(stale, None)
     for index in range(4):
         st.session_state.pop(f"mt_x{index}", None)
@@ -8710,60 +8720,559 @@ def motion_rulers(image_rgb, step=None):
     return image
 
 
-def motion_canvas_panel(frame_bgr, canvas_key, microns, width_px):
-    """The corners, clicked onto the frame. Raises if the canvas will not."""
+# ------------------------------------------------- zoom, and clicking on it --
+#
+# One zoom for every picture on the video tab: the corners, the probe
+# sphere, the corrections and the playback. A click on a zoomed picture is
+# mapped back to video pixels, so zooming in is simply a way of clicking
+# more precisely. The canvas only ever catches ONE click: the point it
+# lands on is handed to whatever "the next click places" says, and the
+# canvas is then replaced by an empty one. What is drawn on the picture is
+# the page's own record, so there is never a second, disagreeing copy of
+# the points living inside the canvas.
+
+ZOOM_LEVELS = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+VIEW_WIDTH_PX = 760
+
+
+def zoom_text(value):
+    return f"{value:g}×"
+
+
+def view_box(shape):
+    """The part of the frame on show, (x0, y0, x1, y1) in video pixels."""
+    height, width = shape[:2]
+    zoom = float(st.session_state.get("vz_zoom", 1.0) or 1.0)
+    if zoom <= 1.0:
+        return (0, 0, int(width), int(height))
+    crop_w = max(8, int(round(width / zoom)))
+    crop_h = max(8, int(round(height / zoom)))
+    cx = float(st.session_state.get("vz_x", width / 2.0))
+    cy = float(st.session_state.get("vz_y", height / 2.0))
+    x0 = int(round(min(max(cx - crop_w / 2.0, 0), width - crop_w)))
+    y0 = int(round(min(max(cy - crop_h / 2.0, 0), height - crop_h)))
+    return (x0, y0, x0 + crop_w, y0 + crop_h)
+
+
+def view_render(frame_bgr, box, width_px=VIEW_WIDTH_PX):
+    """The zoomed part of the frame at display size -> (image, scale)."""
+    x0, y0, x1, y1 = box
+    crop = frame_bgr[y0:y1, x0:x1]
+    scale = float(width_px) / float(max(1, x1 - x0))
+    size = (int(width_px), max(1, int(round((y1 - y0) * scale))))
+    method = ct.cv2.INTER_CUBIC if scale > 1.0 else ct.cv2.INTER_AREA
+    return ct.cv2.resize(crop, size, interpolation=method), scale
+
+
+def to_view(points, box, scale):
+    """Video pixels -> display pixels, for anything with an x and a y."""
+    x0, y0 = box[0], box[1]
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.size == 0:
+        return arr.reshape(0, 2)
+    out = arr.copy()
+    out[..., 0] = (arr[..., 0] - x0) * scale
+    out[..., 1] = (arr[..., 1] - y0) * scale
+    return out
+
+
+def zoom_controls(shape, centre=None):
+    """The zoom row above the video's sub-tabs."""
+    height, width = shape[:2]
+    if float(st.session_state.get("vz_zoom", 1.0)) not in ZOOM_LEVELS:
+        st.session_state["vz_zoom"] = 1.0
+    pending = st.session_state.pop("_vz_centre_next", None)
+    if pending is not None:
+        st.session_state["vz_x"], st.session_state["vz_y"] = pending
+    st.session_state["vz_x"] = clamp_int(
+        st.session_state.get("vz_x", width // 2), 0, width - 1)
+    st.session_state["vz_y"] = clamp_int(
+        st.session_state.get("vz_y", height // 2), 0, height - 1)
+    z1, z2, z3, z4 = st.columns([2, 2, 2, 1.3])
+    with z1:
+        st.select_slider(
+            "🔍 Zoom", ZOOM_LEVELS, key="vz_zoom", format_func=zoom_text,
+            help="Applies to every picture on this tab you click on, and to "
+                 "the playback. Zoom in to place a corner, the sphere's edge "
+                 "or a correction to a fraction of a pixel; the numbers are "
+                 "always in the video's own pixels.")
+    zoomed = float(st.session_state.get("vz_zoom", 1.0)) > 1.0
+    with z2:
+        st.slider("Centre across (px)", 0, width - 1, key="vz_x",
+                  disabled=not zoomed)
+    with z3:
+        st.slider("Centre down (px)", 0, height - 1, key="vz_y",
+                  disabled=not zoomed)
+    with z4:
+        st.markdown("<div style='height:1.7rem'></div>",
+                    unsafe_allow_html=True)
+        if st.button("🎯 On the cell", key="vz_centre",
+                     disabled=centre is None, **STRETCH,
+                     help="Centre the zoom on the corners placed so far."):
+            st.session_state["_vz_centre_next"] = (
+                int(round(centre[0])), int(round(centre[1])))
+            rerun_keeping_settings()
+
+
+def canvas_click_xy(shape):
+    """Where one canvas dot sits, in display pixels.
+
+    The point tool puts a circle's LEFT edge (plus half its outline) at
+    the click and centres it vertically, and says so in originX/originY;
+    reading only the radius, as before, put every click about a pixel to
+    the left."""
+    x = float(shape["left"])
+    y = float(shape["top"])
+    radius = float(shape.get("radius", 0.0) or 0.0)
+    stroke = float(shape.get("strokeWidth", 0.0) or 0.0)
+    sx = float(shape.get("scaleX", 1.0) or 1.0)
+    sy = float(shape.get("scaleY", 1.0) or 1.0)
+    origin_x = str(shape.get("originX", "left")).lower()
+    origin_y = str(shape.get("originY", "top")).lower()
+    if origin_x == "left":
+        x += (radius + stroke / 2.0) * sx
+    if origin_y == "top":
+        y += (radius + stroke / 2.0) * sy
+    return x, y
+
+
+def click_on(display_rgb, key, box, scale):
+    """
+    Show the picture and catch one click on it, in video pixels, or None.
+
+    After a click the canvas behind ``key`` is retired and a fresh, empty
+    one takes its place on the next run.
+    """
     from PIL import Image
 
-    height, width = frame_bgr.shape[:2]
-    markers = motion_markers()
-    shown = int(min(width_px, width))
-    scale = shown / float(width)
-    # Drawn at full size and then shrunk, so the crosshairs are thickened by
-    # however much the shrinking will thin them.
-    painted = motion_preview(frame_bgr, markers, dots=False, microns=microns,
-                             thickness=max(1.0, 1.0 / max(scale, 0.05)))
-    background = Image.fromarray(painted).resize(
-        (shown, int(round(height * scale))), Image.BILINEAR)
-    mode = st.radio(
-        "How the corners are placed",
-        ("Click the corners", "Nudge a corner"),
-        horizontal=True, key="mt_pick_mode", label_visibility="collapsed",
-        help="Click places a corner where you click. Nudge lets you pick "
-             "one up and drag it onto the feature you meant.")
-    st.caption(
-        "Click the **four corners of the cell**, in order round it — "
-        "P1, P2, P3, P4. The dashed quadrilateral between them, its centre "
-        "and its area appear as you go. Choose features with texture (a "
-        "speckle, an edge, a corner) rather than flat grey; ↶ and 🗑 under "
-        "the picture undo one and clear them all.")
+    version = int(st.session_state.get(f"{key}_ver", 0))
+    height, width = display_rgb.shape[:2]
     drawing = st_canvas(
-        background_image=background,
-        drawing_mode=("transform" if mode == "Nudge a corner" else "point"),
-        point_display_radius=5,
+        background_image=Image.fromarray(display_rgb),
+        drawing_mode="point", point_display_radius=4,
         stroke_width=2, stroke_color="#00e5ff",
-        fill_color="rgba(0, 229, 255, 0.85)",
-        height=int(round(height * scale)), width=shown,
-        update_streamlit=True, key=canvas_key,
-    )
-    clicked = []
+        fill_color="rgba(0, 229, 255, 0.9)",
+        height=int(height), width=int(width),
+        update_streamlit=True, key=f"{key}_v{version}")
+    shapes = []
     if drawing is not None and drawing.json_data:
-        for shape in (drawing.json_data.get("objects") or []):
-            try:
-                clicked.append(motion_canvas_point(shape, scale))
-            except (KeyError, TypeError, ValueError, ZeroDivisionError):
-                continue
-    clicked = [point for point in clicked if point is not None]
-    # The canvas keeps its own list of what has been drawn on it, so it is
-    # the truth about the corners and session state follows it -- not the
-    # other way round, which is how a cleared canvas came back with the old
-    # corners on the next rerun.
-    if motion_set_markers(clicked):
-        markers = motion_markers()
-    if len(clicked) > 4:
-        st.caption(
-            f"⚠️ {len(clicked)} points are on the canvas; the first four are "
-            "the ones tracked. ↶ under the picture removes one.")
+        shapes = drawing.json_data.get("objects") or []
+    for shape in reversed(shapes):
+        try:
+            dx, dy = canvas_click_xy(shape)
+        except (KeyError, TypeError, ValueError):
+            continue
+        st.session_state[f"{key}_ver"] = version + 1
+        return (box[0] + dx / scale, box[1] + dy / scale)
+    return None
+
+
+def next_target(key, options, wanted=None):
+    """Keep a "the next click places" radio on a valid choice. A choice
+    asked for on the previous run (after a click) is applied here, before
+    the radio exists, which is the only time Streamlit allows it."""
+    pending = st.session_state.pop(f"_{key}_next", None)
+    if pending in options:
+        st.session_state[key] = pending
+    elif wanted in options and st.session_state.get(key) not in options:
+        st.session_state[key] = wanted
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[-1]
+
+
+def place_points_panel(frame_bgr, points, key, labels, painter, max_points,
+                       radio_label="The next click places", help_text=""):
+    """
+    Click-to-place on a zoomable picture. Returns the new list of points
+    when a click changed it, else None. ``painter(image, points_in_view,
+    scale)`` draws the current points onto the display image.
+    """
+    box = view_box(frame_bgr.shape)
+    view, scale = view_render(frame_bgr, box)
+    shown = to_view(points, box, scale) if len(points) else []
+    painted = painter(view, shown, scale)
+    count = len(points)
+    options = list(labels[:min(max_points, count + 1)])
+    next_target(f"{key}_target", options,
+                wanted=labels[count] if count < max_points else None)
+    target = st.radio(radio_label, options, horizontal=True,
+                      key=f"{key}_target", help=help_text or None)
+    clicked = click_on(painted, f"{key}_canvas", box, scale)
+    if clicked is None:
+        return None
+    index = options.index(target)
+    new = [tuple(p) for p in points]
+    if index < len(new):
+        new[index] = clicked
+    else:
+        new.append(clicked)
+    # Still filling in: move on to the next one. All there: stay on the
+    # same one, so a second click (zoomed in further) refines it.
+    following = labels[len(new)] if len(new) < max_points else target
+    st.session_state[f"_{key}_target_next"] = following
+    return new
+
+
+def motion_canvas_panel(frame_bgr, canvas_key, microns, width_px):
+    """The corners, clicked onto the (zoomable) frame."""
+    markers = motion_markers()
+    anchored = str(st.session_state.get("mt_method", "")).startswith("Area")
+    radius = int(st.session_state.get("mt_radius", 15)) if anchored else None
+
+    def paint(view, shown, scale):
+        return motion_preview(
+            view, [tuple(p) for p in shown], microns=microns,
+            radius=(radius * scale if radius else None), view_scale=scale)
+
+    st.caption(
+        "Choose which corner the next click places, then click it on the "
+        "picture: **P1, P2, P3, P4 in order round the cell**. After a click "
+        "the next corner is chosen for you; once all four are there, a "
+        "click moves whichever corner is chosen, so zoom in and click again "
+        "to place it more precisely."
+        + (" The ring is the area each corner is tracked from: put it on "
+           "something with texture in two directions (a corner or a spot, "
+           "not a straight edge), clear of the probe." if anchored else ""))
+    new = place_points_panel(frame_bgr, markers, canvas_key,
+                             list(ct.POINT_LABELS), paint, 4,
+                             help_text="Pick a corner here, then click where "
+                                       "it belongs on the picture.")
+    if new is not None:
+        motion_set_markers(new)
+        rerun_keeping_settings()
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("↶ Remove the last", key="mt_undo",
+                     disabled=not markers, **STRETCH):
+            motion_set_markers(markers[:-1])
+            rerun_keeping_settings()
+    with c2:
+        if st.button("🗑️ Clear", key="mt_clear_all",
+                     disabled=not markers, **STRETCH):
+            motion_set_markers([])
+            rerun_keeping_settings()
+    with c3:
+        st.markdown(f"<div style='text-align:right;padding-top:0.5rem'>"
+                    f"<b>{len(markers)} of 4</b> placed</div>",
+                    unsafe_allow_html=True)
+    if markers:
+        st.caption("In video pixels: " + " · ".join(
+            f"{ct.POINT_LABELS[k]} ({x:.1f}, {y:.1f})"
+            for k, (x, y) in enumerate(markers)))
     return markers
+
+
+# ------------------------------------------------------- the probe sphere --
+#
+# Marked by hand (centre, then a point on its edge), found by the desktop
+# app's detector, or both: found near where it was clicked. Snapping fits
+# the circle to the sphere's actual edge. What comes out is used twice: its
+# diameter in pixels against its diameter in µm is the scale, and on the
+# automatic analysis it IS the probe tip (desktop v1.9.7), which stops the
+# blurred dark halo from being taken for part of the sphere.
+
+SPHERE_LABELS = ("centre", "edge")
+
+
+def sphere_circle():
+    """The marked sphere as (cx, cy, r) in video pixels, or None."""
+    circle = st.session_state.get("sp_circle")
+    if not circle or len(circle) != 3:
+        return None
+    cx, cy, r = (float(v) for v in circle)
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r)) or r < 2:
+        return None
+    return (cx, cy, r)
+
+
+def sphere_scale():
+    """µm per pixel from the marked sphere, or None."""
+    circle = sphere_circle()
+    um = float(st.session_state.get("sp_um", 0.0) or 0.0)
+    if circle is None or um <= 0:
+        return None
+    return um / (2.0 * circle[2])
+
+
+def sphere_paint(view, centre, edge, radius, scale):
+    """The sphere as marked, on the display image (RGB out)."""
+    cv = ct.cv2
+    line = cv.LINE_AA
+    image = view.copy()
+    if centre is not None:
+        c = (int(round(centre[0])), int(round(centre[1])))
+        if radius:
+            r = int(round(radius))
+            cv.circle(image, c, r, (0, 0, 0), 4, line)
+            cv.circle(image, c, r, (36, 202, 249), 2, line)
+        cv.drawMarker(image, c, (0, 0, 0), cv.MARKER_CROSS, 22, 4, line)
+        cv.drawMarker(image, c, (107, 107, 255), cv.MARKER_CROSS, 22, 2, line)
+    if edge is not None:
+        e = (int(round(edge[0])), int(round(edge[1])))
+        cv.circle(image, e, 6, (0, 0, 0), -1, line)
+        cv.circle(image, e, 4, (196, 205, 78), -1, line)
+    return cv.cvtColor(image, cv.COLOR_BGR2RGB)
+
+
+def sphere_panel(path, details):
+    """The ⚪ sub-tab: where the probe sphere is, and how big."""
+    A = aa.AutoCellAnalysis if aa is not None and not AUTO_ERROR else None
+    st.caption(
+        "Show the program where the probe sphere is. Click its **centre**, "
+        "then **a point on its edge**, or press **Find it for me**. "
+        "**Snap to its edge** then fits the circle to the sphere's real "
+        "outline. The sphere sets the scale (its diameter in µm over its "
+        "diameter in pixels), and the automatic analysis takes it as the "
+        "probe tip instead of searching for one. Mark it on a frame near "
+        "the start of the stretch you will analyse.")
+    last = int(details["frame_count"]) - 1
+    st.session_state["sp_frame"] = int(clamp_int(
+        st.session_state.get("sp_frame", 0), 0, last))
+    frame_index = st.slider("Frame to mark it on", 0, max(last, 0),
+                            key="sp_frame")
+    frame = motion_frame(path, video_signature(), int(frame_index))
+    if frame is None:
+        st.error(f"Could not read frame {frame_index}.")
+        return
+    circle = sphere_circle()
+    centre = ((circle[0], circle[1]) if circle
+              else st.session_state.get("sp_centre_only"))
+    edge = st.session_state.get("sp_edge")
+    if circle and not edge:
+        edge = (circle[0] + circle[2], circle[1])
+    points = [p for p in (centre, edge) if p is not None]
+
+    def paint(view, shown, scale):
+        c = tuple(shown[0]) if len(shown) >= 1 else None
+        e = tuple(shown[1]) if len(shown) >= 2 else None
+        r = circle[2] * scale if circle else None
+        return sphere_paint(view, c, e, r, scale)
+
+    if HAS_CANVAS and not st.session_state.get("mt_canvas_error"):
+        try:
+            new = place_points_panel(
+                frame, points, "sp", list(SPHERE_LABELS), paint, 2,
+                help_text="Centre first, then any point on the sphere's "
+                          "edge. Either can be clicked again to move it.")
+        except Exception as exc:  # pragma: no cover - depends on deploy
+            st.session_state["mt_canvas_error"] = f"{type(exc).__name__}: {exc}"
+            new = None
+        if new is not None:
+            c = new[0]
+            e = new[1] if len(new) > 1 else None
+            if e is None and circle:
+                # A new centre keeps the size already found.
+                e = (c[0] + circle[2], c[1])
+            r = float(np.hypot(e[0] - c[0], e[1] - c[1])) if e else 0.0
+            st.session_state["sp_circle"] = (c[0], c[1], r) if r >= 2 else None
+            st.session_state["sp_centre_only"] = c if r < 2 else None
+            st.session_state["sp_edge"] = e
+            rerun_keeping_settings()
+    else:
+        st.image(paint(*view_render(frame, view_box(frame.shape))[:1],
+                       [], 1.0), **STRETCH)
+        st.info("Clicking needs the canvas; **Find it for me** still works.",
+                icon="ℹ️")
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("🔎 Find it for me", key="sp_find", disabled=A is None,
+                     **STRETCH,
+                     help="Looks for a round dark object over a few frames "
+                          "around this one. If a centre has been clicked, "
+                          "it is trusted and only the size is measured."):
+            hint = centre or st.session_state.get("sp_centre_only")
+            found = aa.SphereEdgeRefiner.auto_detect_multiframe(
+                path, int(frame_index), hint_xy=hint)
+            if found is None:
+                st.session_state["_sp_note"] = (
+                    "No sphere found. Click its centre and try again, or "
+                    "click its centre and edge yourself.")
+            else:
+                cx, cy = found["center"]
+                r = float(found["radius"])
+                st.session_state["sp_circle"] = (float(cx), float(cy), r)
+                st.session_state["sp_edge"] = (float(cx) + r, float(cy))
+                st.session_state["_sp_note"] = (
+                    f"Found on {found.get('n_frames_agreed', 1)} of "
+                    f"{found.get('n_frames_used', 1)} frames looked at.")
+            rerun_keeping_settings()
+    with b2:
+        if st.button("🧲 Snap to its edge", key="sp_snap",
+                     disabled=(circle is None or A is None), **STRETCH,
+                     help="Fits the circle to the sphere's outline: the "
+                          "strongest edge along 36 rays from the centre."):
+            gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
+            fit = aa.snap_sphere(gray, circle)
+            if fit.get("ok"):
+                cx, cy = fit["center"]
+                r = float(fit["radius"])
+                st.session_state["sp_circle"] = (float(cx), float(cy), r)
+                st.session_state["sp_edge"] = (float(cx) + r, float(cy))
+                st.session_state["_sp_note"] = (
+                    f"Snapped: {100 * fit['confidence']:.0f} % of the rays "
+                    "found the edge.")
+            else:
+                st.session_state["_sp_note"] = (
+                    "Could not find a clear edge near that circle "
+                    f"({100 * fit.get('confidence', 0):.0f} % of rays). Left "
+                    "as marked; zoom in and click the edge more carefully.")
+            rerun_keeping_settings()
+    with b3:
+        if st.button("🗑️ Forget it", key="sp_clear",
+                     disabled=circle is None and not points, **STRETCH):
+            for name in ("sp_circle", "sp_edge", "sp_centre_only"):
+                st.session_state.pop(name, None)
+            rerun_keeping_settings()
+    note = st.session_state.pop("_sp_note", None)
+    if note:
+        st.caption(note)
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.number_input(
+            "Sphere diameter (µm)", 0.1, 1000.0, step=1.0, key="sp_um",
+            help="The probe sphere's real diameter, from its datasheet.")
+    circle = sphere_circle()
+    scale = sphere_scale()
+    m2.metric("Diameter on screen",
+              f"{2 * circle[2]:.1f} px" if circle else "–")
+    m3.metric("Scale", f"{scale:.4f} µm/px" if scale else "–")
+    if circle:
+        st.caption(f"Centre at ({circle[0]:.1f}, {circle[1]:.1f}) px on "
+                   f"frame {int(frame_index)}.")
+        current = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+        if scale and abs(current - scale) > 1e-6:
+            if st.button("🔒 Use this scale for the corner tracking",
+                         key="sp_lock", **STRETCH):
+                rerun_keeping_settings(extra={"mt_um_per_px": float(scale)})
+        elif scale:
+            st.caption("✅ The corner tracking reports in µm with this scale.")
+
+
+# ------------------------------------------------- correcting the tracking --
+
+def motion_corrections():
+    """{frame: [(x, y) × 4]} placed by hand, in video pixels."""
+    stored = st.session_state.get("mt_corrections") or {}
+    return {int(f): [tuple(map(float, p)) for p in pts]
+            for f, pts in stored.items() if len(pts) == 4}
+
+
+def corrections_panel(result, held, microns):
+    """
+    Put the corners back where they belong on any frame, and re-track.
+
+    Opens on the tracked positions of the frame chosen; a click moves the
+    chosen corner. Saving makes that frame a correction: tracking restarts
+    from it, and whatever the tracker was off by when it got there is
+    spread evenly back to the previous correction (or the start).
+    """
+    frames = result["frames"]
+    start = int(frames[0])
+    corrections = motion_corrections()
+    st.caption(
+        "Go to a frame where a corner has come off its spot, choose that "
+        "corner, and click where it belongs (zoom in for precision). "
+        "**Save** makes the frame a correction. **Re-track** then restarts "
+        "the tracking from every correction and spreads what it was off by "
+        "evenly over the frames before it, so nothing jumps.")
+    st.session_state["mt_cframe"] = clamp_int(
+        st.session_state.get("mt_cframe", int(frames[len(frames) // 2])),
+        int(frames[0]), int(frames[-1]))
+    at = st.slider("Frame to correct", int(frames[0]), int(frames[-1]),
+                   key="mt_cframe")
+    row = int(np.argmin(np.abs(frames - int(at))))
+    frame_no = int(frames[row])
+    edit = st.session_state.get("mt_cedit")
+    if not edit or int(edit.get("frame", -1)) != frame_no:
+        source = corrections.get(frame_no)
+        if source is None:
+            source = [tuple(map(float, p)) for p in held[row]]
+        edit = {"frame": frame_no, "points": source}
+        st.session_state["mt_cedit"] = edit
+    points = edit["points"]
+    shot = motion_frame(st.session_state.get("video_path"),
+                        video_signature(), frame_no)
+    if shot is None:
+        st.error(f"Could not read frame {frame_no}.")
+        return
+    lock = result.get("lock")
+    radius = result.get("radius")
+    tracked = [tuple(map(float, p)) for p in held[row]]
+
+    def paint(view, shown, scale):
+        image = motion_preview(
+            view, [tuple(p) for p in shown], microns=microns,
+            radius=(radius * scale if radius else None),
+            lock=(lock[row] if lock is not None
+                  and frame_no not in corrections else None),
+            view_scale=scale)
+        # Where the tracker had each corner, as a small grey cross, for
+        # any corner that has been moved.
+        cv = ct.cv2
+        for k, (p, q) in enumerate(zip(points, tracked)):
+            if np.hypot(p[0] - q[0], p[1] - q[1]) > 0.05:
+                v = to_view([q], view_box(shot.shape), scale)[0]
+                c = (int(round(v[0])), int(round(v[1])))
+                cv.drawMarker(image, c, (0, 0, 0), cv.MARKER_TILTED_CROSS,
+                              14, 4, cv.LINE_AA)
+                cv.drawMarker(image, c, (200, 200, 200),
+                              cv.MARKER_TILTED_CROSS, 14, 1, cv.LINE_AA)
+        return image
+
+    if HAS_CANVAS and not st.session_state.get("mt_canvas_error"):
+        new = place_points_panel(
+            shot, points, "mt_corr", list(ct.POINT_LABELS), paint, 4,
+            radio_label="The next click moves",
+            help_text="Choose the corner that is off, then click where it "
+                      "belongs.")
+        if new is not None:
+            st.session_state["mt_cedit"] = {"frame": frame_no, "points": new}
+            rerun_keeping_settings()
+    else:
+        st.info("Correcting needs the click canvas "
+                "(streamlit-drawable-canvas).", icon="ℹ️")
+        return
+
+    moved = [ct.POINT_LABELS[k] for k, (p, q) in enumerate(zip(points,
+                                                              tracked))
+             if np.hypot(p[0] - q[0], p[1] - q[1]) > 0.05]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button(f"✅ Save frame {frame_no}", key="mt_csave",
+                     type="primary", disabled=frame_no <= start, **STRETCH,
+                     help="The first frame is where the corners were placed; "
+                          "move those in step 3 instead."):
+            stored = dict(st.session_state.get("mt_corrections") or {})
+            stored[frame_no] = [tuple(map(float, p)) for p in points]
+            st.session_state["mt_corrections"] = stored
+            rerun_keeping_settings()
+    with c2:
+        if st.button("↺ Undo moves here", key="mt_creset", **STRETCH,
+                     disabled=not moved):
+            st.session_state["mt_cedit"] = {"frame": frame_no,
+                                            "points": tracked}
+            rerun_keeping_settings()
+    with c3:
+        if st.button("🗑️ Remove this correction", key="mt_cdel", **STRETCH,
+                     disabled=frame_no not in corrections):
+            stored = dict(st.session_state.get("mt_corrections") or {})
+            stored.pop(frame_no, None)
+            st.session_state["mt_corrections"] = stored
+            st.session_state.pop("mt_cedit", None)
+            rerun_keeping_settings()
+    if moved:
+        st.caption("Moved here: " + ", ".join(moved)
+                   + " (grey × = where the tracker had them)."
+                   + ("" if frame_no in corrections
+                      else " Not saved yet."))
+    if corrections:
+        st.caption("Corrections saved at frame"
+                   + ("s " if len(corrections) > 1 else " ")
+                   + ", ".join(str(f) for f in sorted(corrections))
+                   + ". Press **▶️ Track** above (or below) to apply them.")
+
 
 
 def motion_typed_panel(frame_bgr, microns, reason=""):
@@ -9138,17 +9647,26 @@ def motion_results_panel(result, held, microns):
                          if st.session_state.get("mt_trails", True) else None)
                 rings = (anchored and st.session_state.get("mt_rings", True))
                 lock = result.get("lock")
+                box = view_box(shot.shape)
+                view, scale = view_render(shot, box)
+                corrected = int(frames[row]) in set(
+                    result.get("anchors") or [])
                 st.image(
-                    motion_preview(shot, held[row], trail=trail,
+                    motion_preview(view, to_view(held[row], box, scale),
+                                   trail=(to_view(trail, box, scale)
+                                          if trail is not None else None),
                                    microns=microns,
-                                   radius=(result.get("radius")
+                                   radius=(result.get("radius") * scale
                                            if rings else None),
                                    lock=(lock[row] if rings and lock
-                                         is not None else None)),
+                                         is not None else None),
+                                   view_scale=scale),
                     caption=(f"Frame {int(frames[row])} · "
                              f"t = {ct.format_time(times[row])} · "
                              f"{int(tracked[row])} of {held.shape[1]} corners "
-                             f"tracked here"),
+                             f"tracked here"
+                             + (" · ✏️ placed by hand here" if corrected
+                                else "")),
                     **STRETCH)
 
     labels = [ct.POINT_LABELS[i % len(ct.POINT_LABELS)]
@@ -9527,13 +10045,27 @@ def auto_panel(path, details):
                f"{ct.format_time(int(start) / fps)} to "
                f"{ct.format_time(int(end) / fps)}")
 
+    circle = sphere_circle()
+    st.checkbox(
+        ("Use the probe sphere marked on ⚪ Probe sphere "
+         f"(centre {circle[0]:.0f}, {circle[1]:.0f} px · "
+         f"{2 * circle[2]:.1f} px = "
+         f"{float(st.session_state.get('sp_um', 40.0)):g} µm)")
+        if circle else "Use the probe sphere marked on ⚪ Probe sphere "
+                       "(none marked yet)",
+        key="au_use_sphere", disabled=circle is None,
+        help="Your circle is taken as the probe tip, as it is: its centre "
+             "and size, and so the scale. Otherwise the tip is searched "
+             "for, and a blurred dark halo can make it come out too big.")
+    use_sphere = bool(circle and st.session_state.get("au_use_sphere", True))
     s1, s2 = st.columns(2)
     with s1:
         st.number_input(
             "Probe tip diameter (µm)", 1.0, 500.0, step=1.0,
-            key="au_probe_um",
+            key="au_probe_um", disabled=use_sphere,
             help="The scale is the tip's real diameter over its diameter "
-                 "in pixels, measured edge to edge at half darkness.")
+                 "in pixels, measured edge to edge at half darkness. Not "
+                 "used while the marked sphere is.")
     with s2:
         typed = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
         st.checkbox(
@@ -9556,7 +10088,12 @@ def auto_panel(path, details):
     um_per_px = (typed if st.session_state.get("au_use_scale") and typed > 0
                  else None)
     probe_um = float(st.session_state.get("au_probe_um", 40.0))
+    probe_hint = None
+    if use_sphere:
+        probe_hint = circle
+        probe_um = float(st.session_state.get("sp_um", 40.0))
     signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
+    signature += repr(probe_hint and tuple(np.round(probe_hint, 2)))
 
     if st.button("▶️ Run the automatic analysis", key="au_go",
                  type="primary", **STRETCH):
@@ -9576,7 +10113,8 @@ def auto_panel(path, details):
             res = aa.AutoCellAnalysis.analyze(
                 path, start_frame=int(start), end_frame=int(end),
                 um_per_px=um_per_px, probe_diameter_um=probe_um,
-                hint_xy=hint, progress_callback=_tick)
+                hint_xy=hint, progress_callback=_tick,
+                probe_hint=probe_hint)
         except Exception as exc:
             bar.empty()
             st.error(f"{exc}", icon="🚫")
@@ -9594,6 +10132,71 @@ def auto_panel(path, details):
                        icon="⚠️")
         auto_results_panel(res)
 
+
+
+def motion_track(path, frame_bgr, markers, start_frame, end_frame,
+                 area_anchored, corrections, signature):
+    """Track the four corners (and apply any corrections), store it."""
+    seeds = np.array(markers, dtype=np.float32)
+    contrast = float(st.session_state.get("mt_contrast", 1.0))
+    if st.session_state.get("mt_subpix", True):
+        try:
+            seeds = ct.refine_corners_subpix(
+                ct.gray_for_lk(frame_bgr, contrast), seeds)
+        except Exception:
+            pass
+    bar = st.progress(0.0, text="Tracking…")
+    seen = {"at": 0.0}
+
+    def _tick(done, total):
+        fraction = float(done) / float(max(total, 1))
+        if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
+            seen["at"] = fraction
+            bar.progress(min(1.0, fraction),
+                         text=f"Tracking… {int(fraction * 100)} % "
+                              f"({done:,} of {total:,} frames)")
+        return False
+
+    radius = int(st.session_state.get("mt_radius", 15))
+    try:
+        if corrections:
+            # Corrections always use the area-anchored tracker: each one
+            # restarts it from what was placed there.
+            anchors = {int(start_frame): seeds}
+            anchors.update({int(f): np.asarray(p, dtype=np.float64)
+                            for f, p in corrections.items()})
+            found = ct.track_points_corrected(
+                path, anchors, end_frame=int(end_frame), radius=radius,
+                contrast=contrast, progress=_tick)
+        elif area_anchored:
+            found = ct.track_points_ref(
+                path, seeds, start_frame=int(start_frame),
+                end_frame=int(end_frame), radius=radius,
+                contrast=contrast, progress=_tick)
+        else:
+            found = ct.track_points(
+                path, seeds, start_frame=int(start_frame),
+                end_frame=int(end_frame),
+                window_size=int(st.session_state.get("mt_window", 41)),
+                contrast=contrast,
+                gentle=bool(st.session_state.get("mt_gentle", True)),
+                anchor=bool(st.session_state.get("mt_anchor", True)),
+                progress=_tick)
+    except Exception as exc:
+        bar.empty()
+        st.error(f"Tracking failed: {exc}", icon="🚫")
+        return False
+    bar.empty()
+    st.session_state["mt_result"] = found
+    st.session_state["mt_signature"] = signature
+    st.session_state.pop("mt_cedit", None)
+    st.success(
+        f"Tracked {found['points'].shape[0]:,} frames from frame "
+        f"{int(found['start_frame'])}"
+        + (f", restarted at {len(corrections)} correction"
+           f"{'' if len(corrections) == 1 else 's'}." if corrections
+           else "."), icon="✅")
+    return True
 
 
 def screen_signature(epsilon, force_N):
@@ -22971,9 +23574,17 @@ with tab_motion:
             # Two jobs on one video: following the corners, and cutting the
             # stretch that matters out of the recording. The upload above
             # serves both.
-            motion_track_tab, motion_auto_tab, motion_clip_tab = st.tabs(
-                ["🎯 Track the corners", "🤖 Automatic analysis",
-                 "✂️ Clip the video"])
+            placed = motion_markers()
+            zoom_controls(
+                (int(details["height"]), int(details["width"])),
+                centre=(tuple(np.mean(np.asarray(placed), axis=0))
+                        if placed else None))
+            (motion_sphere_tab, motion_track_tab, motion_auto_tab,
+             motion_clip_tab) = st.tabs(
+                ["⚪ Probe sphere", "🎯 Track the corners",
+                 "🤖 Automatic analysis", "✂️ Clip the video"])
+            with motion_sphere_tab:
+                sphere_panel(motion_path, details)
             with motion_clip_tab:
                 motion_clip_panel(motion_path, details)
             with motion_auto_tab:
@@ -23010,17 +23621,8 @@ with tab_motion:
                         frame_bgr, microns=pick_microns,
                         canvas_key="mt_canvas_" + str(
                             abs(hash((motion_path, video_signature()))) % 10 ** 9))
-                    # The canvas draws its own undo / redo / bin under itself,
-                    # and those are the buttons that can actually remove a dot
-                    # from it. A second pair here would only change this page's
-                    # list, and the canvas would put the dot back on the next
-                    # run.
-                    if HAS_CANVAS:
-                        st.markdown(
-                            f"<div style='text-align:right'><b>"
-                            f"{len(markers)} of 4</b> placed</div>",
-                            unsafe_allow_html=True)
-                    else:
+                    if not HAS_CANVAS or st.session_state.get(
+                            "mt_canvas_error"):
                         c1, c2 = st.columns([1, 3])
                         with c1:
                             if st.button("🗑️ Clear", key="mt_clear",
@@ -23037,21 +23639,6 @@ with tab_motion:
                                 unsafe_allow_html=True)
                     area_anchored = (st.session_state.get("mt_method", "")
                                      .startswith("Area"))
-                    if HAS_CANVAS and markers:
-                        st.image(
-                            motion_preview(
-                                frame_bgr, markers, microns=pick_microns,
-                                radius=(int(st.session_state.get(
-                                    "mt_radius", 15)) if area_anchored
-                                    else None)),
-                            caption="The four corners at full size, with the "
-                                    "quadrilateral they make"
-                                    + (" and the area each one is tracked "
-                                       "from. Put each ring on something "
-                                       "with texture in two directions: a "
-                                       "corner or a spot, not a straight "
-                                       "edge." if area_anchored else "."),
-                            **STRETCH)
 
                     # ---- 4 · how far to read -------------------------------
                     st.markdown("**4 · How far to read**")
@@ -23159,6 +23746,9 @@ with tab_motion:
                             f"Select {4 - len(markers)} more corner"
                             f"{'' if 4 - len(markers) == 1 else 's'} to track.",
                             icon="🖱️")
+                    corrections = {
+                        f: p for f, p in motion_corrections().items()
+                        if int(start_frame) < f <= int(end_frame)}
                     signature = repr((
                         motion_path, video_signature(), start_frame, end_frame,
                         [tuple(np.round(p, 2)) for p in markers],
@@ -23169,69 +23759,18 @@ with tab_motion:
                         bool(st.session_state.get("mt_anchor", True)),
                         str(st.session_state.get("mt_method", "")),
                         int(st.session_state.get("mt_radius", 15)),
+                        sorted((f, tuple(np.round(np.ravel(p), 2)))
+                               for f, p in corrections.items()),
                     ))
-                    if st.button("▶️ Track the four corners", key="mt_go",
+                    go_label = ("▶️ Track the four corners" if not corrections
+                                else f"▶️ Track the four corners with "
+                                     f"{len(corrections)} correction"
+                                     f"{'' if len(corrections) == 1 else 's'}")
+                    if st.button(go_label, key="mt_go",
                                  disabled=not ready, type="primary", **STRETCH):
-                        seeds = np.array(markers, dtype=np.float32)
-                        if st.session_state.get("mt_subpix", True):
-                            try:
-                                seeds = ct.refine_corners_subpix(
-                                    ct.gray_for_lk(
-                                        frame_bgr,
-                                        float(st.session_state.get(
-                                            "mt_contrast", 1.0))),
-                                    seeds)
-                            except Exception:
-                                pass
-                        bar = st.progress(0.0, text="Tracking…")
-                        seen = {"at": 0.0}
-
-                        def _tick(done, total):
-                            fraction = float(done) / float(max(total, 1))
-                            if fraction - seen["at"] >= 0.02 or fraction >= 1.0:
-                                seen["at"] = fraction
-                                bar.progress(
-                                    min(1.0, fraction),
-                                    text=f"Tracking… {int(fraction * 100)} % "
-                                         f"({done:,} of {total:,} frames)")
-                            return False
-
-                        try:
-                            if area_anchored:
-                                found = ct.track_points_ref(
-                                    motion_path, seeds,
-                                    start_frame=int(start_frame),
-                                    end_frame=int(end_frame),
-                                    radius=int(
-                                        st.session_state.get("mt_radius", 15)),
-                                    contrast=float(
-                                        st.session_state.get("mt_contrast", 1.0)),
-                                    progress=_tick)
-                            else:
-                                found = ct.track_points(
-                                    motion_path, seeds,
-                                    start_frame=int(start_frame),
-                                    end_frame=int(end_frame),
-                                    window_size=int(
-                                        st.session_state.get("mt_window", 41)),
-                                    contrast=float(
-                                        st.session_state.get("mt_contrast", 1.0)),
-                                    gentle=bool(
-                                        st.session_state.get("mt_gentle", True)),
-                                    anchor=bool(
-                                        st.session_state.get("mt_anchor", True)),
-                                    progress=_tick)
-                        except Exception as exc:
-                            bar.empty()
-                            st.error(f"Tracking failed: {exc}", icon="🚫")
-                        else:
-                            bar.empty()
-                            st.session_state["mt_result"] = found
-                            st.session_state["mt_signature"] = signature
-                            st.success(
-                                f"Tracked {found['points'].shape[0]:,} frames "
-                                f"from frame {int(found['start_frame'])}.",
-                                icon="✅")
+                        motion_track(motion_path, frame_bgr, markers,
+                                     start_frame, end_frame, area_anchored,
+                                     corrections, signature)
 
                     # ---- 7 · the readings ---------------------------------
                     result = st.session_state.get("mt_result")
@@ -23254,6 +23793,20 @@ with tab_motion:
                         microns = float(st.session_state.get("mt_um_per_px", 0.0))
                         motion_results_panel(result, held,
                                              microns if microns > 0 else None)
+
+                        # ---- 8 · corrections ------------------------------
+                        st.markdown("**6 · Correct the tracking**")
+                        corrections_panel(result, held,
+                                          microns if microns > 0 else None)
+                        if corrections and ready and st.button(
+                                f"🔁 Re-track with {len(corrections)} "
+                                f"correction{'' if len(corrections) == 1 else 's'}",
+                                key="mt_retrack", type="primary", **STRETCH):
+                            if motion_track(motion_path, frame_bgr, markers,
+                                            start_frame, end_frame,
+                                            area_anchored, corrections,
+                                            signature):
+                                rerun_keeping_settings()
 
 
 with tab_video:
