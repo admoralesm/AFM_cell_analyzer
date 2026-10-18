@@ -15,3 +15,5 @@ scikit-learn
 # Clicking the tracking markers onto the video frame (Cell motion tab).
 # The tab still works without it, from typed coordinates.
 streamlit-drawable-canvas>=0.9
+# Reading Asylum .ibw images (AFM images tab).
+igor2>=0.5
