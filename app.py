@@ -25510,6 +25510,7 @@ with tab_export:
 
 AI_CMAPS = ("Viridis", "Cividis", "Inferno", "Magma", "Plasma", "Greys",
             "Gray", "Hot", "Jet", "RdBu", "Turbo", "YlOrBr")
+AI_SVG_MAX_POINTS = 120_000
 AI_IMAGE_SCALES = {"as stored": (1.0, ""), "m → nm": (1e9, "nm"),
                    "m → µm": (1e6, "µm"), "V → mV": (1e3, "mV")}
 
@@ -26126,6 +26127,7 @@ def ai_panel():
         r6.text_input("y₂ to", key="ai_y2max")
         st.checkbox("Legend", key="ai_legend")
     ai_pub_controls()
+    ai_quick_line_controls(2 in processed)
 
     fig = ai_time_figure(processed, units, tlabel)
     base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
@@ -26228,6 +26230,52 @@ def ai_excel(sheets):
     return ai.write_excel_bytes(sheets)
 
 
+def ai_quick_line_controls(two):
+    """The desktop's quick row, right above the plot: one switch for a
+    continuous line, smoothing, and the line widths. They write the same
+    settings as the detailed panels above, so the two always agree."""
+    s = st.session_state
+    # follow whatever the detailed panels say before drawing the row
+    s["ai_q_cont"] = bool(s.get("ai_connect1")) and (
+        bool(s.get("ai_connect2")) or not two)
+    s["ai_q_smooth"] = s.get("ai_smooth", "Off") != "Off"
+    s["ai_q_replace"] = s.get("ai_smooth", "Off") == "Replace"
+    s["ai_qlw1"] = float(s.get("ai_lw1", 1.8))
+    s["ai_qlw2"] = float(s.get("ai_lw2", 1.8))
+
+    def cont():
+        s["ai_connect1"] = s["ai_connect2"] = bool(s.get("ai_q_cont"))
+
+    def smooth():
+        on, replace = bool(s.get("ai_q_smooth")), bool(s.get("ai_q_replace"))
+        s["ai_smooth"] = ("Replace" if on and replace else
+                          "Overlay" if on else "Off")
+
+    def replace():
+        if s.get("ai_q_replace"):
+            s["ai_q_smooth"] = True
+        smooth()
+
+    def width(which):
+        s[f"ai_lw{which}"] = float(s.get(f"ai_qlw{which}", 1.8))
+
+    q1, q2, q3, q4, q5 = st.columns([1.5, 1.2, 1.5, 1.5, 1.5])
+    q1.toggle("Continuous line", key="ai_q_cont", on_change=cont,
+              help="Joins the trace across the gaps (the turnaround and the "
+                   "move between lines), so it draws as one unbroken line. "
+                   "Both plots.")
+    q2.toggle("Smooth", key="ai_q_smooth", on_change=smooth,
+              help="Method and window are under Baseline, smoothing and Y "
+                   "math.")
+    q3.toggle("Replace raw", key="ai_q_replace", on_change=replace,
+              help="The smoothed curve replaces the raw line instead of "
+                   "being drawn dashed over it.")
+    q4.slider("Line width · Plot 1", 0.5, 6.0, step=0.1, key="ai_qlw1",
+              on_change=width, args=(1,))
+    q5.slider("Line width · Plot 2", 0.5, 6.0, step=0.1, key="ai_qlw2",
+              on_change=width, args=(2,), disabled=not two)
+
+
 def ai_time_figure(processed, units, tlabel):
     """Plot 1 on the left axis, Plot 2 on the right, as the desktop draws
     them: gaps stay gaps unless joined, smoothing overlaid or replacing."""
@@ -26260,7 +26308,11 @@ def ai_time_figure(processed, units, tlabel):
                 "both": "lines+markers"}[mode]
         yaxis = "y2" if which == 2 else "y"
         name = f"Plot {which} ({units[which]})"
-        fig.add_trace(go.Scattergl(
+        # SVG lines are anti-aliased with round joins, which is what makes
+        # a dense trace read as one smooth line; WebGL only for traces too
+        # long for SVG to stay responsive.
+        kind = go.Scatter if xp.size <= AI_SVG_MAX_POINTS else go.Scattergl
+        fig.add_trace(kind(
             x=xp, y=yp, mode=draw, name=name, yaxis=yaxis,
             line=dict(color=colour, width=float(s.get(f"ai_lw{which}", 1.8))),
             marker=dict(color=colour, size=4), connectgaps=False))
@@ -26268,7 +26320,8 @@ def ai_time_figure(processed, units, tlabel):
             xs, ys = ai.smooth_xy(xp, yp if scale != "symlog" else yp,
                                   s.get("ai_smethod"), s.get("ai_swin", 101),
                                   s.get("ai_spoly", 3))
-            fig.add_trace(go.Scattergl(
+            fig.add_trace((go.Scatter if xs.size <= AI_SVG_MAX_POINTS
+                           else go.Scattergl)(
                 x=xs, y=ys, mode="lines", name=f"{name}, smoothed",
                 yaxis=yaxis, line=dict(color=colour, dash="dash",
                                        width=max(1.5, 0.75 * float(
