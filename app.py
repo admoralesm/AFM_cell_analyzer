@@ -15,6 +15,7 @@ import importlib
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -540,6 +541,17 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     aa = None
     AUTO_ERROR = str(exc)
 
+# AFM image analysis (.ibw images, 2D/3D, signal against time). Optional in
+# the same way: without afm_images.py only its tab is lost, and without igor2
+# the tab says so when a file is opened.
+try:
+    import afm_images as ai
+
+    AFM_IMAGE_ERROR = ""
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    ai = None
+    AFM_IMAGE_ERROR = str(exc)
+
 # Clicking the markers straight onto the frame needs one small component.
 # Without it the tab still works, from typed coordinates and a preview with
 # a ruler on it, which is slower but takes no extra package.
@@ -937,6 +949,86 @@ DEFAULTS = {
     "au_smooth": 5,
     "au_view": "Length change",
     "au_um_typed": 0.3,
+    # AFM images tab (the desktop AFM IBW Viewer's defaults).
+    "ai_orient": "Rotate 90° CW",
+    "ai_cmap": "Viridis",
+    "ai_contrast": "percentile",
+    "ai_pct": (1.0, 99.0),
+    "ai_img_scale": "as stored",
+    "ai_img_unit": "",
+    "ai_um": True,
+    "ai_ds": 2,
+    "ai_presets": True,
+    "ai_p2": False,
+    "ai_fmode1": "None",
+    "ai_fmode2": "None",
+    "ai_rate": 10.0,
+    "ai_tf": 1 / 3,
+    "ai_rf": 1 / 3,
+    "ai_mf": 1 / 3,
+    "ai_move": True,
+    "ai_revB": True,
+    "ai_transpose": True,
+    "ai_turn": False,
+    "ai_turn_s": 0.0,
+    "ai_tunit": "s",
+    "ai_k": 0.1,
+    "ai_invols": 50.0,
+    "ai_sp": 0.0,
+    "ai_subsp": False,
+    "ai_funit": "nN",
+    "ai_bl1": "None",
+    "ai_bl2": "None",
+    "ai_mult1": "1",
+    "ai_mult2": "1",
+    "ai_add1": "0",
+    "ai_add2": "0",
+    "ai_formula1": "",
+    "ai_formula2": "",
+    "ai_yunit1": "",
+    "ai_yunit2": "",
+    "ai_scale1": "linear",
+    "ai_scale2": "linear",
+    "ai_zone1": "",
+    "ai_zone2": "",
+    "ai_smooth": "Off",
+    "ai_smethod": "Savitzky-Golay",
+    "ai_swin": 101,
+    "ai_spoly": 3,
+    "ai_preset": "Custom",
+    "ai_mode1": "line",
+    "ai_mode2": "line",
+    "ai_lw1": 1.8,
+    "ai_lw2": 1.8,
+    "ai_col1": "#1f77b4",
+    "ai_col2": "#d62728",
+    "ai_connect1": False,
+    "ai_connect2": False,
+    "ai_ylabel1": "",
+    "ai_ylabel2": "",
+    "ai_title": "Signal vs Time",
+    "ai_xlabel": "",
+    "ai_xmin": "",
+    "ai_xmax": "",
+    "ai_ymin": "",
+    "ai_ymax": "",
+    "ai_y2min": "",
+    "ai_y2max": "",
+    "ai_legend": False,
+    "ai_theme": "Origin/Nature",
+    "ai_ticks": "inside",
+    "ai_title_fs": 14,
+    "ai_label_fs": 12,
+    "ai_tick_fs": 10,
+    "ai_axis_lw": 1.2,
+    "ai_bold": False,
+    "ai_grid": False,
+    "ai_height": 480,
+    "ai_fmt": "svg",
+    "ai_w_in": 7.0,
+    "ai_h_in": 4.0,
+    "ai_dpi": 600,
+    "ai_xfmt": "xlsx",
     # Publication style for the video tab's plots.
     "vp_on": False,
     "vp_title_size": 20,
@@ -20862,10 +20954,10 @@ SHOW_DATABASE_TAB = False
 
 # The two tabs that can be hidden go last. They are hidden by CSS on the
 # n-th tab button, and a tab bar inside a page (the fit's own tabs) has
-# fewer than eight buttons, so its buttons are never the ones hidden.
+# fewer than nine buttons, so its buttons are never the ones hidden.
 (
     tab_analysis, tab_cells, tab_explore, tab_igor, tab_results,
-    tab_export, tab_motion, tab_video, tab_db,
+    tab_export, tab_motion, tab_afm, tab_video, tab_db,
 ) = st.tabs(
     [
         "📊 Force curve analysis",
@@ -20875,13 +20967,14 @@ SHOW_DATABASE_TAB = False
         "📈 Results",
         "💾 Export",
         "🎬 Video: track & clip",
+        "🔬 AFM images",
         "🎥 Compression video",
         "📋 Database",
     ]
 )
 
 _hidden = [
-    index for index, wanted in ((8, SHOW_VIDEO_TAB), (9, SHOW_DATABASE_TAB))
+    index for index, wanted in ((9, SHOW_VIDEO_TAB), (10, SHOW_DATABASE_TAB))
     if not wanted
 ]
 if _hidden:
@@ -25405,6 +25498,839 @@ with tab_export:
                 mime="application/json",
                 **STRETCH,
             )
+
+
+# ====================================================== AFM image analysis ==
+#
+# The desktop AFM IBW Viewer on the page: Igor .ibw images, each channel as
+# a 2-D image and a 3-D surface, and the signal against time that the scan
+# lines make (trace, retrace, the turnaround and the move between lines),
+# with the cantilever conversion, baseline, smoothing, Y math and a second
+# trace on its own axis. The engine is afm_images.py.
+
+AI_CMAPS = ("Viridis", "Cividis", "Inferno", "Magma", "Plasma", "Greys",
+            "Gray", "Hot", "Jet", "RdBu", "Turbo", "YlOrBr")
+AI_IMAGE_SCALES = {"as stored": (1.0, ""), "m → nm": (1e9, "nm"),
+                   "m → µm": (1e6, "µm"), "V → mV": (1e3, "mV")}
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def ai_load(data, name):
+    """An uploaded .ibw, read once per file."""
+    return ai.load_ibw_bytes(data, name)
+
+
+def ai_choice(key, options, default):
+    """Keep a stored widget value inside today's options."""
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = default if default in options else options[0]
+
+
+def ai_number(text, default, label):
+    """A 'Multiply by' / 'Add' box: a number or simple arithmetic."""
+    try:
+        return ai.ymath_scalar(text, default), ""
+    except ai.YMathError as exc:
+        return float(default), f"{label}: {exc}"
+
+
+def ai_pub_controls():
+    """Publication settings for this tab's plots (Origin/Nature look)."""
+    with st.expander("📐 Plot style and saving"):
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            st.selectbox("Theme", ai.PUB_THEMES, key="ai_theme",
+                         help="Origin/Nature: boxed axes, ticks on all four "
+                              "sides, minor ticks, no grid, Arial.")
+            st.selectbox("Ticks", ("inside", "outside"), key="ai_ticks")
+        with p2:
+            st.number_input("Title size", 6, 40, key="ai_title_fs")
+            st.number_input("Axis label size", 6, 40, key="ai_label_fs")
+        with p3:
+            st.number_input("Tick label size", 6, 40, key="ai_tick_fs")
+            st.number_input("Axis line width", 0.5, 5.0, step=0.1,
+                            key="ai_axis_lw")
+        with p4:
+            st.number_input("Plot height on screen (px)", 250, 1400,
+                            step=10, key="ai_height")
+            st.checkbox("Bold axis text", key="ai_bold")
+            st.checkbox("Grid", key="ai_grid")
+        q1, q2, q3, q4 = st.columns(4)
+        with q1:
+            st.selectbox("Save as", ("svg", "png", "jpeg", "webp"),
+                         key="ai_fmt")
+        with q2:
+            st.number_input("Width (in)", 1.0, 20.0, step=0.5, key="ai_w_in")
+        with q3:
+            st.number_input("Height (in)", 1.0, 20.0, step=0.5,
+                            key="ai_h_in")
+        with q4:
+            st.number_input("Resolution (dpi)", 72, 1200, step=50,
+                            key="ai_dpi", help="PNG only.")
+        st.caption("Save any plot with the 📷 camera icon in its top-right "
+                   "corner: it is saved at this size and resolution, named "
+                   "after the file and what is plotted.")
+
+
+def ai_style(fig, three_d=False):
+    """The tab's publication look on a figure. Sizes are typed in points,
+    as on the desktop, and drawn at 96 px per inch, so a 12 pt label is
+    12 pt on the saved figure."""
+    s = st.session_state
+    pt = 96.0 / 72.0
+    bold = bool(s.get("ai_bold"))
+    family = ("Arial Black, Arial Bold, Helvetica, sans-serif" if bold
+              else "Arial, Helvetica, sans-serif")
+    lw = float(s.get("ai_axis_lw", 1.2))
+    origin = s.get("ai_theme", "Origin/Nature") == "Origin/Nature"
+    ticks = s.get("ai_ticks", "inside")
+    fig.update_layout(
+        font=dict(family=family, color="black",
+                  size=round(pt * int(s.get("ai_tick_fs", 10)))),
+        title_font=dict(size=round(pt * int(s.get("ai_title_fs", 14))),
+                        family=family, color="black"),
+        plot_bgcolor="white", paper_bgcolor="white")
+    if three_d:
+        return fig
+    axes = dict(
+        showline=True, linewidth=lw, linecolor="black",
+        mirror="ticks" if origin else True,
+        ticks=ticks, tickwidth=lw, ticklen=6, tickcolor="black",
+        showgrid=bool(s.get("ai_grid")), gridcolor="#e6e6e6", zeroline=False,
+        title_font=dict(size=round(pt * int(s.get("ai_label_fs", 12))),
+                        family=family, color="black"),
+        tickfont=dict(size=round(pt * int(s.get("ai_tick_fs", 10))),
+                      family=family, color="black"),
+        exponentformat="power", automargin=True)
+    if origin:
+        axes["minor"] = dict(ticks=ticks, ticklen=3, tickwidth=lw * 0.8,
+                             tickcolor="black", showgrid=False)
+    fig.update_xaxes(**axes)
+    fig.update_yaxes(**axes)
+    return fig
+
+
+def ai_chart(fig, name, key=None):
+    """Show a plot with the camera icon set to save it as configured."""
+    s = st.session_state
+    px_w = int(round(float(s.get("ai_w_in", 7.0)) * 96))
+    px_h = int(round(float(s.get("ai_h_in", 4.0)) * 96))
+    config = {"displaylogo": False,
+              "toImageButtonOptions": {
+                  "format": s.get("ai_fmt", "svg"),
+                  "filename": re.sub(r"[^A-Za-z0-9._-]+", "_", name),
+                  "width": px_w, "height": px_h,
+                  "scale": max(1.0, float(s.get("ai_dpi", 600)) / 96.0)}}
+    # theme=None: Streamlit's own chart theme would grey and shrink the
+    # publication fonts.
+    st.plotly_chart(fig, key=key, config=config, theme=None, **STRETCH)
+
+
+def ai_image_figure(img, zmin, zmax, cmap, unit, title, extent=None):
+    """One channel as an image; equal aspect, in µm when the size is known."""
+    ny, nx = img.shape
+    if extent:
+        xs = np.linspace(0, extent[0], nx)
+        ys = np.linspace(0, extent[1], ny)
+        xt, yt = "x (µm)", "y (µm)"
+    else:
+        xs, ys = np.arange(nx), np.arange(ny)
+        xt, yt = "X (pixels)", "Y (lines)"
+    fig = go.Figure(go.Heatmap(
+        z=img, x=xs, y=ys, zmin=zmin, zmax=zmax, colorscale=cmap,
+        colorbar=dict(title=unit or "", thickness=14),
+        hovertemplate=f"%{{x:.3g}}, %{{y:.3g}}: %{{z:.4g}} {unit}"
+                      "<extra></extra>"))
+    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1,
+                     title_text=yt)
+    fig.update_xaxes(title_text=xt, constrain="domain")
+    fig.update_layout(title=title, height=520,
+                      margin=dict(l=60, r=20, t=50, b=50))
+    return ai_style(fig)
+
+
+def ai_surface_figure(img, zmin, zmax, cmap, unit, title, ds=2, extent=None):
+    z = np.asarray(img, dtype=float)[::ds, ::ds]
+    ny, nx = img.shape
+    if extent:
+        xs = np.linspace(0, extent[0], nx)[::ds]
+        ys = np.linspace(0, extent[1], ny)[::ds]
+        xt, yt = "x (µm)", "y (µm)"
+    else:
+        xs, ys = np.arange(nx)[::ds], np.arange(ny)[::ds]
+        xt, yt = "X", "Y"
+    fig = go.Figure(go.Surface(z=z, x=xs, y=ys, cmin=zmin, cmax=zmax,
+                               colorscale=cmap,
+                               colorbar=dict(title=unit or "", thickness=14)))
+    fig.update_layout(
+        title=title, height=560, margin=dict(l=0, r=0, t=50, b=0),
+        scene=dict(xaxis_title=xt, yaxis_title=yt,
+                   zaxis_title=f"Z ({unit})" if unit else "Z",
+                   aspectmode="manual",
+                   aspectratio=dict(x=1, y=ny / max(nx, 1), z=0.5),
+                   camera=dict(eye=dict(x=1.4, y=-1.4, z=0.9))))
+    return ai_style(fig, three_d=True)
+
+
+def ai_gallery_figure(images, titles, cmap, cols=4):
+    """Several channels side by side, each with its own colour range."""
+    from plotly.subplots import make_subplots
+    n = len(images)
+    cols = max(1, min(cols, n))
+    rows = int(math.ceil(n / cols))
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
+                        horizontal_spacing=0.03, vertical_spacing=0.08)
+    for i, img in enumerate(images):
+        r, c = i // cols + 1, i % cols + 1
+        lo, hi = ai.contrast_limits(img, st.session_state.get(
+            "ai_contrast", "percentile"), *st.session_state.get(
+            "ai_pct", (1.0, 99.0)))
+        fig.add_trace(go.Heatmap(z=img, zmin=lo, zmax=hi, colorscale=cmap,
+                                 showscale=False), row=r, col=c)
+        axis = "" if i == 0 else str(i + 1)
+        fig.update_yaxes(autorange="reversed", scaleanchor=f"x{axis}",
+                         showticklabels=False, row=r, col=c)
+        fig.update_xaxes(showticklabels=False, row=r, col=c)
+    fig.update_layout(height=260 * rows + 40,
+                      margin=dict(l=10, r=10, t=40, b=10))
+    return ai_style(fig)
+
+
+def ai_trace(arr, axis, a, b, timing):
+    """Signal against time (s) for segment channels a / b (None = unused)."""
+    if a is None and b is None:
+        return None, None
+    seg_a = ai.channel_image(arr, axis, a) if a is not None else None
+    seg_b = ai.channel_image(arr, axis, b) if b is not None else None
+    if timing["transpose"]:
+        seg_a = seg_a.T if seg_a is not None else None
+        seg_b = seg_b.T if seg_b is not None else None
+    return ai.build_continuous_time(
+        seg_a, seg_b, timing["rate"], timing["tf"], timing["rf"],
+        timing["mf"], useA=a is not None, useB=b is not None,
+        include_move_gap=timing["move"], reverse_B_x=timing["revB"],
+        turnaround_on=timing["turn"], turnaround_gap_s=timing["turn_s"])
+
+
+def ai_channel_pick(label, key, n, names, allow_none=True):
+    options = (["None"] if allow_none else []) + list(range(n))
+    ai_choice(key, options, options[0])
+    return st.selectbox(
+        label, options, key=key,
+        format_func=lambda v: "None" if v == "None" else f"{v}: {names[v]}")
+
+
+def ai_files_panel():
+    """Upload, choose and step through the files. -> (name, item) or None."""
+    uploads = st.file_uploader(
+        "Igor .ibw images", type=["ibw"], accept_multiple_files=True,
+        key="ai_files",
+        help="One or several Asylum Research .ibw image files. Every "
+             "channel in them (height, deflection, trace, retrace…) can be "
+             "shown.")
+    if not uploads:
+        st.info("Upload one or more .ibw images to begin.", icon="🔬")
+        return None
+    names = [u.name for u in uploads]
+    ai_choice("ai_file", names, names[0])
+
+    def step(n):
+        i = names.index(st.session_state.get("ai_file", names[0]))
+        st.session_state["ai_file"] = names[(i + n) % len(names)]
+
+    f1, f2, f3 = st.columns([1, 8, 1])
+    f1.button("◀", key="ai_prev", on_click=step, args=(-1,), **STRETCH,
+              disabled=len(names) < 2)
+    with f2:
+        st.selectbox("File", names, key="ai_file",
+                     label_visibility="collapsed")
+    f3.button("▶", key="ai_next", on_click=step, args=(1,), **STRETCH,
+              disabled=len(names) < 2)
+    upload = uploads[names.index(st.session_state["ai_file"])]
+    try:
+        item = ai_load(upload.getvalue(), upload.name)
+    except ImportError:
+        st.error("Reading .ibw files needs the **igor2** package. Add the "
+                 "line `igor2` to requirements.txt and reboot the app.",
+                 icon="🚫")
+        return None
+    except Exception as exc:
+        st.error(f"Could not read {upload.name}: {exc}", icon="🚫")
+        return None
+    return upload.name, item
+
+
+def ai_panel():
+    """The whole 🔬 tab."""
+    loaded = ai_files_panel()
+    if loaded is None:
+        return
+    name, item = loaded
+    arr, meta, nd = item["arr"], item["meta"], item["note_dict"]
+    guess = item.get("guess") or {}
+    if arr.ndim not in (2, 3):
+        st.error(f"{name} holds a {arr.ndim}-D wave; an image needs 2 or 3 "
+                 "dimensions.", icon="🚫")
+        return
+
+    # A new file brings its own channel axis and line rate.
+    if st.session_state.get("_ai_for") != name:
+        st.session_state["_ai_for"] = name
+        st.session_state["ai_axis"] = ai.guess_channel_axis(arr)
+        if guess.get("scan_hz"):
+            st.session_state["ai_rate"] = float(guess["scan_hz"])
+    axis = int(st.session_state.get("ai_axis", 2))
+    nch = ai.n_channels(arr, axis)
+    presets = bool(st.session_state.get("ai_presets", True))
+    names = [ai.channel_display_name(meta, axis, i, presets)
+             for i in range(nch)]
+    st.caption(f"{name} · {' × '.join(str(s) for s in arr.shape)} · "
+               f"{nch} channel{'s' if nch != 1 else ''}: "
+               + ", ".join(names)
+               + (f" · line rate {guess['scan_hz']:g} Hz (from the note)"
+                  if guess.get("scan_hz") else ""))
+
+    # ---------------------------------------------------------- the image
+    st.markdown("**The image**")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        ai_choice("ai_ch", list(range(nch)), 0)
+        st.selectbox("Channel", list(range(nch)), key="ai_ch",
+                     format_func=lambda v: f"{v}: {names[v]}")
+        if arr.ndim == 3:
+            st.selectbox("Channels are along axis", (0, 1, 2), key="ai_axis",
+                         help="Found automatically: the axis with few "
+                              "entries. Change it only if the channels "
+                              "come out as slices of one image.")
+    with c2:
+        st.selectbox("Orientation", ai.IMAGE_ORIENTATIONS, key="ai_orient")
+        st.selectbox("Colour map", AI_CMAPS, key="ai_cmap")
+    with c3:
+        st.radio("Contrast", ("percentile", "minmax"), key="ai_contrast",
+                 horizontal=True,
+                 format_func=lambda m: {"percentile": "Percentiles",
+                                        "minmax": "Min–max"}[m])
+        st.slider("Percentiles", 0.0, 100.0, step=0.5, key="ai_pct",
+                  disabled=st.session_state.get("ai_contrast") == "minmax")
+    with c4:
+        st.selectbox("Values", list(AI_IMAGE_SCALES), key="ai_img_scale",
+                     help="Asylum stores heights in metres; nm reads "
+                          "better.")
+        st.text_input("Unit label", key="ai_img_unit",
+                      placeholder=AI_IMAGE_SCALES[st.session_state.get(
+                          "ai_img_scale", "as stored")][1] or "nm")
+    factor, auto_unit = AI_IMAGE_SCALES[st.session_state.get(
+        "ai_img_scale", "as stored")]
+    unit = st.session_state.get("ai_img_unit") or auto_unit or \
+        guess.get("units") or ""
+    ch = int(st.session_state.get("ai_ch", 0))
+    img = ai.orient_image(ai.channel_image(arr, axis, ch) * factor,
+                          st.session_state.get("ai_orient"))
+    lo, hi = ai.contrast_limits(img, st.session_state.get("ai_contrast"),
+                                *st.session_state.get("ai_pct", (1.0, 99.0)))
+    fast, slow = ai.scan_size_um(nd)
+    extent = None
+    if fast and slow:
+        # the size goes with the picture as it is shown
+        ny, nx = img.shape
+        extent = (fast, slow) if nx >= ny else (slow, fast)
+        if not st.checkbox(f"Axes in µm (scan {fast:g} × {slow:g} µm)",
+                           key="ai_um"):
+            extent = None
+    stats = ai.image_stats(img)
+    if stats:
+        m = st.columns(6)
+        for col, (lab, key) in zip(m, (("Min", "min"), ("Max", "max"),
+                                       ("Mean", "mean"), ("Rq", "rms_rq"),
+                                       ("Ra", "ra"), ("Peak–valley", "pv"))):
+            col.metric(f"{lab} ({unit})" if unit else lab,
+                       f"{stats[key]:.4g}")
+    stem = ai._safe_filename(ai.infer_basename(name)) or "afm"
+    cmap = st.session_state.get("ai_cmap", "Viridis")
+    t2d, t3d, tall, tinfo = st.tabs(["🖼️ 2D", "⛰️ 3D", "🗂️ All channels",
+                                     "ℹ️ Info"])
+    with t2d:
+        ai_chart(ai_image_figure(img, lo, hi, cmap, unit,
+                                 f"ch {ch}: {names[ch]}", extent),
+                 f"{stem}_{names[ch]}_2D", key="ai_img2d")
+    with t3d:
+        st.slider("Every n-th pixel", 1, 8, key="ai_ds",
+                  help="Fewer points turn faster; 1 is every pixel.")
+        ai_chart(ai_surface_figure(img, lo, hi, cmap, unit,
+                                   f"ch {ch}: {names[ch]}",
+                                   int(st.session_state.get("ai_ds", 2)),
+                                   extent),
+                 f"{stem}_{names[ch]}_3D", key="ai_img3d")
+    with tall:
+        imgs = [ai.orient_image(ai.channel_image(arr, axis, i) * factor,
+                                st.session_state.get("ai_orient"))
+                for i in range(nch)]
+        ai_chart(ai_gallery_figure(imgs, [f"{i}: {names[i]}"
+                                          for i in range(nch)], cmap),
+                 f"{stem}_all_channels", key="ai_gallery")
+    with tinfo:
+        k_n, iv_n, sp_n = ai.note_calibration(nd)
+        info = ai.image_info_text(
+            item, f"{ch} ({names[ch]})", st.session_state.get("ai_orient"),
+            stats, unit, st.session_state.get("ai_k"),
+            st.session_state.get("ai_invols"),
+            st.session_state.get("ai_sp"))
+        st.code(info, language=None)
+        st.download_button("💾 Save the info as text", info.encode("utf-8"),
+                           file_name=f"{stem}_info.txt", mime="text/plain",
+                           key="ai_info_dl")
+
+    # ------------------------------------------------- signal against time
+    st.divider()
+    st.markdown("**Signal against time**")
+    st.caption(
+        "Each scan line is read in order: segment A (trace) across the "
+        "line, the turnaround, segment B (retrace, reversed so it runs "
+        "forward in time) and the move to the next line, at the line rate. "
+        "Put one channel in A, B or both; Plot 2 goes on its own axis on "
+        "the right.")
+    s1, s2 = st.columns(2)
+    with s1:
+        st.markdown("Plot 1 · left axis")
+        a1 = ai_channel_pick("Segment A", "ai_a1", nch, names)
+        b1 = ai_channel_pick("Segment B", "ai_b1", nch, names)
+        st.selectbox("Convert", ai.FORCE_MODES, key="ai_fmode1")
+    with s2:
+        p2_on = st.toggle("Plot 2 · right axis", key="ai_p2")
+        a2 = ai_channel_pick("Segment A₂", "ai_a2", nch, names)
+        b2 = ai_channel_pick("Segment B₂", "ai_b2", nch, names)
+        st.selectbox("Convert ", ai.FORCE_MODES, key="ai_fmode2")
+    a1 = None if a1 == "None" else int(a1)
+    b1 = None if b1 == "None" else int(b1)
+    a2 = None if (a2 == "None" or not p2_on) else int(a2)
+    b2 = None if (b2 == "None" or not p2_on) else int(b2)
+
+    with st.expander("⏱️ Timing", expanded=False):
+        g1, g2, g3, g4 = st.columns(4)
+        g1.number_input("Line rate (Hz)", 0.001, 10000.0, step=0.1,
+                        format="%.4g", key="ai_rate",
+                        help="Lines per second. Filled from the note's scan "
+                             "rate when it has one.")
+        g2.number_input("Segment A share", 0.0, 1.0, step=0.01,
+                        format="%.4f", key="ai_tf")
+        g3.number_input("Segment B share", 0.0, 1.0, step=0.01,
+                        format="%.4f", key="ai_rf")
+        g4.number_input("Move share", 0.0, 1.0, step=0.01, format="%.4f",
+                        key="ai_mf")
+        h1, h2, h3, h4 = st.columns(4)
+        h1.checkbox("Gap for the move between lines", key="ai_move")
+        h2.checkbox("Reverse segment B", key="ai_revB")
+        h3.checkbox("Transpose (lines along the other axis)",
+                    key="ai_transpose")
+        h4.selectbox("Time in", ai.TIME_UNIT_CHOICES, key="ai_tunit")
+        i1, i2 = st.columns(2)
+        i1.checkbox("Gap at the turnaround", key="ai_turn")
+        i2.number_input("Turnaround gap (s)", 0.0, 10.0, step=0.001,
+                        format="%.4f", key="ai_turn_s",
+                        disabled=not st.session_state.get("ai_turn"))
+    with st.expander("🪝 Cantilever: deflection → force", expanded=False):
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.number_input("k (N/m)", 0.0001, 1000.0, step=0.01, format="%.5g",
+                        key="ai_k")
+        k2.number_input("Defl InvOLS (nm/V)", 0.001, 100000.0, step=1.0,
+                        format="%.5g", key="ai_invols")
+        k3.number_input("Setpoint (raw)", -1000.0, 1000.0, step=0.01,
+                        format="%.5g", key="ai_sp")
+        k4.checkbox("Subtract the setpoint", key="ai_subsp")
+        k5.selectbox("Force unit", ai.FORCE_UNITS, key="ai_funit")
+        k_n, iv_n, sp_n = ai.note_calibration(nd)
+
+        def use_note():
+            if k_n:
+                st.session_state["ai_k"] = float(k_n)
+            if iv_n:
+                st.session_state["ai_invols"] = float(iv_n)
+            if sp_n is not None:
+                st.session_state["ai_sp"] = float(sp_n)
+
+        st.button(
+            "📄 Use the file's own values"
+            + (f" (k {k_n:g} N/m, InvOLS {iv_n:g} nm/V"
+               + (f", setpoint {sp_n:g}" if sp_n is not None else "") + ")"
+               if (k_n or iv_n) else " (none in its note)"),
+            key="ai_use_note", on_click=use_note,
+            disabled=not (k_n or iv_n or sp_n is not None))
+        st.caption("V → nm: (y − setpoint) × InvOLS · V → force: "
+                   "(y − setpoint) × InvOLS × k · nm → force: "
+                   "(y − setpoint) × k.")
+
+    timing = {
+        "rate": float(st.session_state.get("ai_rate", 10.0)),
+        "tf": float(st.session_state.get("ai_tf", 1 / 3)),
+        "rf": float(st.session_state.get("ai_rf", 1 / 3)),
+        "mf": float(st.session_state.get("ai_mf", 1 / 3)),
+        "move": bool(st.session_state.get("ai_move", True)),
+        "revB": bool(st.session_state.get("ai_revB", True)),
+        "transpose": bool(st.session_state.get("ai_transpose", True)),
+        "turn": bool(st.session_state.get("ai_turn", False)),
+        "turn_s": float(st.session_state.get("ai_turn_s", 0.0)),
+    }
+    tfactor, tlabel, tcol = ai.TIME_UNIT_MAP[st.session_state.get(
+        "ai_tunit", "s")]
+    cal = dict(k=st.session_state.get("ai_k", 0.1),
+               invols=st.session_state.get("ai_invols", 50.0),
+               setpoint=st.session_state.get("ai_sp", 0.0),
+               subtract_setpoint=bool(st.session_state.get("ai_subsp")),
+               force_unit=st.session_state.get("ai_funit", "nN"))
+    traces = {}
+    try:
+        for which, (a, b) in ((1, (a1, b1)), (2, (a2, b2))):
+            t, y = ai_trace(arr, axis, a, b, timing)
+            if t is not None:
+                fmode = st.session_state.get(f"ai_fmode{which}", "None")
+                if fmode == "None":
+                    # unconverted: in the same units as the image above
+                    y = np.asarray(y, dtype=float) * factor
+                y = ai.force_convert(y, fmode, **cal)
+                traces[which] = (np.asarray(t) * tfactor, np.asarray(y))
+    except Exception as exc:
+        st.error(f"Could not build the time trace: {exc}", icon="🚫")
+        return
+    if not traces:
+        st.info("Choose a channel for segment A and/or B of Plot 1 (or "
+                "turn on Plot 2) to draw the signal against time.",
+                icon="⏱️")
+        return
+
+    # baseline, Y math -------------------------------------------------
+    with st.expander("📏 Baseline, smoothing and Y math", expanded=False):
+        errors, warnings, processed = [], [], {}
+        cols = st.columns(len(traces))
+        stage = {}
+        for col, which in zip(cols, sorted(traces)):
+            x, y = traces[which]
+            with col:
+                st.markdown(f"**Plot {which}**"
+                            + (" · left" if which == 1 else " · right"))
+                mode = st.radio("Baseline", ("None", "Offset", "Linear"),
+                                key=f"ai_bl{which}", horizontal=True)
+                xf = x[np.isfinite(x)]
+                lo_t, hi_t = float(xf.min()), float(xf.max())
+                key = f"ai_blr{which}"
+                stored = st.session_state.get(key)
+                if (not stored or stored[0] < lo_t or stored[1] > hi_t
+                        or stored[0] >= stored[1]):
+                    st.session_state[key] = (lo_t, lo_t + 0.1 * (hi_t - lo_t))
+                st.slider(f"Fit it on ({tlabel.split('(')[-1].rstrip(')')})",
+                          lo_t, hi_t, key=key, disabled=mode == "None",
+                          help="Offset: the median there. Linear: a "
+                               "straight line through it.")
+                a_b = (0.0, 0.0)
+                if mode != "None":
+                    try:
+                        a_b = ai.fit_baseline(x, y, *st.session_state[key],
+                                              mode)
+                        st.caption(f"y − ({a_b[0]:.4g}·t + {a_b[1]:.4g})"
+                                   if mode == "Linear"
+                                   else f"y − {a_b[1]:.4g}")
+                    except ValueError as exc:
+                        errors.append(f"Plot {which}, baseline: {exc}")
+                y_b = ai.apply_baseline(x, y, mode, *a_b)
+                mt = st.text_input("Multiply by", key=f"ai_mult{which}")
+                ad = st.text_input("Add", key=f"ai_add{which}")
+                st.text_input(
+                    "Formula", key=f"ai_formula{which}",
+                    placeholder="e.g. y*1000, abs(y), deriv(y), smooth(y, 21)",
+                    help="Variables: y (this trace), t (time), y1 and y2 "
+                         "(the two plots). Functions: abs, sqrt, exp, ln, "
+                         "log10, deriv, integ, smooth(y, n), norm, clip, "
+                         "where, min, max, mean, … Use * to multiply.")
+                st.text_input("Unit label (if the math changes it)",
+                              key=f"ai_yunit{which}")
+                st.radio("Axis", ai.Y_SCALES, key=f"ai_scale{which}",
+                         horizontal=True)
+                if st.session_state.get(f"ai_scale{which}") == "symlog":
+                    st.text_input("Symlog linear zone (blank = automatic)",
+                                  key=f"ai_zone{which}")
+                mult, e1 = ai_number(mt, 1.0, f"Plot {which}, multiply")
+                add, e2 = ai_number(ad, 0.0, f"Plot {which}, add")
+                errors += [e for e in (e1, e2) if e]
+                stage[which] = (x, y_b, mult, add)
+        st.markdown("**Smoothing** (both plots)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.radio("Show", ("Off", "Overlay", "Replace"), key="ai_smooth",
+                 horizontal=True,
+                 help="Overlay draws the smoothed curve dashed over the "
+                      "raw one; Replace draws only the smoothed curve.")
+        m2.selectbox("Method", ai.SMOOTH_METHODS, key="ai_smethod")
+        m3.number_input("Window (points)", 3, 100001, step=2, key="ai_swin")
+        m4.number_input("Order (Savitzky-Golay)", 1, 7, key="ai_spoly")
+    # The math of each plot can use the other (y1, y2), after the other's
+    # own baseline, multiply and add.
+    linear = {w: s_[1] * s_[2] + s_[3] for w, s_ in stage.items()}
+    for which, (x, y_b, mult, add) in stage.items():
+        res, err, warn = ai.apply_ymath(
+            x, y_b, mult, add, st.session_state.get(f"ai_formula{which}", ""),
+            which, others={f"y{w}": v for w, v in linear.items()})
+        if err:
+            errors.append(f"Plot {which}, formula: {err}")
+        if warn:
+            warnings.append(f"Plot {which}: {warn}")
+        processed[which] = (x, res)
+    for msg in errors:
+        st.error(msg, icon="🧮")
+    for msg in warnings:
+        st.warning(msg, icon="⚠️")
+
+    units = {w: ai.units_for(
+        st.session_state.get(f"ai_fmode{w}"), unit or "raw",
+        st.session_state.get("ai_funit", "nN"),
+        st.session_state.get(f"ai_yunit{w}", "")) for w in processed}
+
+    # style --------------------------------------------------------------
+    with st.expander("🎨 Lines, labels and ranges", expanded=False):
+        def preset():
+            p = st.session_state.get("ai_preset")
+            values = {
+                "Publication (thin, smooth)": ("line", 1.5, True, "Replace"),
+                "Clean line (continuous)": ("line", 3.0, True, None),
+                "Clean line (break at gaps)": ("line", 3.0, False, None),
+                "Line + dots (break at gaps)": ("both", 2.6, False, None),
+                "Scatter only": ("scatter", 0.0, True, None)}.get(p)
+            if not values:
+                return
+            for w in (1, 2):
+                st.session_state[f"ai_mode{w}"] = values[0]
+                st.session_state[f"ai_lw{w}"] = max(0.5, values[1])
+                st.session_state[f"ai_connect{w}"] = values[2]
+            if values[3]:
+                st.session_state["ai_smooth"] = values[3]
+
+        st.selectbox("Preset", ai.TIME_STYLE_PRESETS, key="ai_preset",
+                     on_change=preset)
+        l1, l2 = st.columns(2)
+        for col, w in ((l1, 1), (l2, 2)):
+            with col:
+                st.markdown(f"Plot {w}")
+                st.radio("Draw as", ("line", "scatter", "both"),
+                         key=f"ai_mode{w}", horizontal=True)
+                st.number_input("Line width", 0.5, 10.0, step=0.1,
+                                key=f"ai_lw{w}")
+                st.color_picker("Colour", key=f"ai_col{w}")
+                st.checkbox("Join across the gaps", key=f"ai_connect{w}")
+                st.text_input("Y label (blank = automatic)",
+                              key=f"ai_ylabel{w}")
+        st.text_input("Title", key="ai_title")
+        st.text_input("X label (blank = automatic)", key="ai_xlabel")
+        r1, r2, r3, r4, r5, r6 = st.columns(6)
+        r1.text_input("x from", key="ai_xmin")
+        r2.text_input("x to", key="ai_xmax")
+        r3.text_input("y from", key="ai_ymin")
+        r4.text_input("y to", key="ai_ymax")
+        r5.text_input("y₂ from", key="ai_y2min")
+        r6.text_input("y₂ to", key="ai_y2max")
+        st.checkbox("Legend", key="ai_legend")
+    ai_pub_controls()
+
+    fig = ai_time_figure(processed, units, tlabel)
+    base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
+                                labels=names)
+    ai_chart(fig, base, key="ai_time")
+
+    # P1 against P2 -----------------------------------------------------
+    if 1 in processed and 2 in processed:
+        with st.expander("🌀 Plot 1 against Plot 2", expanded=False):
+            t, y1, y2 = ai.p1_p2_aligned(*processed[1], *processed[2])
+            if t is None:
+                st.info("Plot 1 and Plot 2 have no points in common.")
+            else:
+                step = max(1, int(math.ceil(t.size / 20000)))
+                t_, y1_, y2_ = t[::step], y1[::step], y2[::step]
+                view = st.radio("View", ("2D phase, coloured by time",
+                                         "3D: time, Plot 1, Plot 2",
+                                         "3D: Plot 1, Plot 2, time"),
+                                key="ai_phase", horizontal=True)
+                u1, u2 = units[1], units[2]
+                marker = dict(color=t_, colorscale="Viridis", size=3,
+                              colorbar=dict(title=tlabel, thickness=12))
+                if view.startswith("2D"):
+                    fig_p = go.Figure(go.Scattergl(
+                        x=y1_, y=y2_, mode="markers", marker=marker))
+                    fig_p.update_layout(
+                        xaxis_title=f"Plot 1 ({u1})",
+                        yaxis_title=f"Plot 2 ({u2})", height=520)
+                    fig_p = ai_style(fig_p)
+                else:
+                    xyz = ((t_, y1_, y2_, tlabel, f"Plot 1 ({u1})",
+                            f"Plot 2 ({u2})") if "time, Plot 1" in view
+                           else (y1_, y2_, t_, f"Plot 1 ({u1})",
+                                 f"Plot 2 ({u2})", tlabel))
+                    fig_p = go.Figure(go.Scatter3d(
+                        x=xyz[0], y=xyz[1], z=xyz[2], mode="lines",
+                        line=dict(color=t_, colorscale="Viridis", width=4)))
+                    fig_p.update_layout(
+                        height=600, margin=dict(l=0, r=0, t=30, b=0),
+                        scene=dict(xaxis_title=xyz[3], yaxis_title=xyz[4],
+                                   zaxis_title=xyz[5]))
+                    fig_p = ai_style(fig_p, three_d=True)
+                ai_chart(fig_p, f"{base}_P1_vs_P2", key="ai_phase_fig")
+
+    # exports -------------------------------------------------------------
+    st.markdown("**Save the data**")
+    rows = {}
+    for w in sorted(processed):
+        x, y = processed[w]
+        rows[w] = pd.DataFrame({tcol: x, f"Signal_P{w} ({units[w]})": y})
+    if len(rows) == 2 and np.allclose(rows[1][tcol], rows[2][tcol],
+                                      equal_nan=True):
+        sheets = [("TimeSeries", pd.concat(
+            [rows[1], rows[2].iloc[:, 1:]], axis=1))]
+    else:
+        sheets = [(f"P{w}", df) for w, df in rows.items()]
+    info_df = pd.DataFrame({"Info": info.split("\n")})
+    e1, e2 = st.columns(2)
+    with e1:
+        fmt = st.radio("As", ("xlsx", "csv"), key="ai_xfmt", horizontal=True)
+        out_name = name_box("ai_ts_name", f"{base}_timeseries.{fmt}")
+        if not out_name.lower().endswith(f".{fmt}"):
+            out_name = os.path.splitext(out_name)[0] + f".{fmt}"
+        if fmt == "csv":
+            data = sheets[0][1].to_csv(index=False).encode("utf-8")
+            mime = "text/csv"
+        else:
+            data, notes = ai_excel(sheets + [("Info", info_df)])
+            mime = ("application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet")
+            for note in notes:
+                st.caption(f"ℹ️ {note}")
+        st.download_button("💾 Time series", data, file_name=out_name,
+                           mime=mime, key="ai_ts_dl", **STRETCH)
+    with e2:
+        st.caption("The image as X, Y, Z (one row per pixel, as displayed), "
+                   "with the time series and the info, in one workbook.")
+        xyz_name = name_box("ai_xyz_name", f"{base}_xyz_timeseries.xlsx")
+        if st.button("📦 Prepare the XYZ workbook", key="ai_xyz_go",
+                     **STRETCH):
+            ny, nx = img.shape
+            xyz = pd.DataFrame({
+                "Xpix": np.tile(np.arange(nx), ny),
+                "Yline": np.repeat(np.arange(ny), nx),
+                f"Z_display ({unit})": img.reshape(-1)})
+            st.session_state["_ai_xyz"] = ai_excel(
+                [("XYZ_Display", xyz)] + sheets + [("Info", info_df)])[0]
+        if st.session_state.get("_ai_xyz"):
+            st.download_button(
+                "💾 XYZ + time workbook", st.session_state["_ai_xyz"],
+                file_name=xyz_name if xyz_name.endswith(".xlsx")
+                else xyz_name + ".xlsx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet", key="ai_xyz_dl", **STRETCH)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def ai_excel(sheets):
+    """The workbook bytes (cached: rebuilding it on every rerun is slow)."""
+    return ai.write_excel_bytes(sheets)
+
+
+def ai_time_figure(processed, units, tlabel):
+    """Plot 1 on the left axis, Plot 2 on the right, as the desktop draws
+    them: gaps stay gaps unless joined, smoothing overlaid or replacing."""
+    s = st.session_state
+    fig = go.Figure()
+    smooth = s.get("ai_smooth", "Off")
+    any2 = 2 in processed
+    for which in sorted(processed):
+        x, y = processed[which]
+        xp, yp = ai.downsample_for_plot(x, y, ai.MAX_PLOT_POINTS)
+        if s.get(f"ai_connect{which}"):
+            keep = np.isfinite(xp) & np.isfinite(yp)
+            xp, yp = xp[keep], yp[keep]
+        if smooth == "Replace" and xp.size:
+            xp, yp = ai.smooth_xy(xp, yp, s.get("ai_smethod"),
+                                  s.get("ai_swin", 101), s.get("ai_spoly", 3))
+        scale = s.get(f"ai_scale{which}", "linear")
+        zone = None
+        if scale == "symlog":
+            try:
+                zone = ai.ymath_scalar(s.get(f"ai_zone{which}", ""), 0)
+            except ai.YMathError:
+                zone = 0
+            if not (zone and zone > 0):
+                zone = ai.auto_symlog_zone(yp)
+            yp = ai.symlog_transform(yp, zone)
+        colour = s.get(f"ai_col{which}")
+        mode = s.get(f"ai_mode{which}", "line")
+        draw = {"line": "lines", "scatter": "markers",
+                "both": "lines+markers"}[mode]
+        yaxis = "y2" if which == 2 else "y"
+        name = f"Plot {which} ({units[which]})"
+        fig.add_trace(go.Scattergl(
+            x=xp, y=yp, mode=draw, name=name, yaxis=yaxis,
+            line=dict(color=colour, width=float(s.get(f"ai_lw{which}", 1.8))),
+            marker=dict(color=colour, size=4), connectgaps=False))
+        if smooth == "Overlay" and xp.size:
+            xs, ys = ai.smooth_xy(xp, yp if scale != "symlog" else yp,
+                                  s.get("ai_smethod"), s.get("ai_swin", 101),
+                                  s.get("ai_spoly", 3))
+            fig.add_trace(go.Scattergl(
+                x=xs, y=ys, mode="lines", name=f"{name}, smoothed",
+                yaxis=yaxis, line=dict(color=colour, dash="dash",
+                                       width=max(1.5, 0.75 * float(
+                                           s.get(f"ai_lw{which}", 1.8))))))
+        label = s.get(f"ai_ylabel{which}") or f"Signal ({units[which]})"
+        axis = dict(title_text=label)
+        if scale == "log":
+            axis["type"] = "log"
+        if scale == "symlog":
+            finite = y[np.isfinite(y)]
+            if finite.size:
+                pos, labels = ai.symlog_ticks(float(finite.min()),
+                                              float(finite.max()), zone)
+                axis.update(tickvals=pos, ticktext=labels)
+        rng = (s.get("ai_y2min" if which == 2 else "ai_ymin", ""),
+               s.get("ai_y2max" if which == 2 else "ai_ymax", ""))
+        try:
+            if rng[0].strip() and rng[1].strip():
+                axis["range"] = [float(rng[0]), float(rng[1])]
+        except ValueError:
+            pass
+        if any2:
+            axis.update(title_font=dict(color=colour),
+                        tickfont=dict(color=colour))
+        if which == 2:
+            fig.update_layout(yaxis2=dict(overlaying="y", side="right",
+                                          **axis))
+        else:
+            fig.update_layout(yaxis=axis)
+    fig.update_layout(
+        title=s.get("ai_title") or None,
+        xaxis_title=s.get("ai_xlabel") or tlabel,
+        height=int(s.get("ai_height", 480)), hovermode="x",
+        showlegend=bool(s.get("ai_legend")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=70, r=70 if any2 else 30, t=60, b=60))
+    try:
+        if s.get("ai_xmin", "").strip() and s.get("ai_xmax", "").strip():
+            fig.update_xaxes(range=[float(s["ai_xmin"]), float(s["ai_xmax"])])
+    except ValueError:
+        pass
+    fig = ai_style(fig)
+    if any2:
+        # Each y axis in its trace's colour, as on the desktop, so it is
+        # clear which axis belongs to which plot; the right one stays right.
+        for which, axis in ((1, "yaxis"), (2, "yaxis2")):
+            colour = s.get(f"ai_col{which}")
+            fig.update_layout({axis: dict(
+                mirror=False, linecolor=colour, tickcolor=colour,
+                title_font=dict(color=colour), tickfont=dict(color=colour))})
+        fig.update_layout(yaxis2=dict(side="right", showgrid=False))
+    return fig
+
+
+with tab_afm:
+    section("AFM images: 2D, 3D and the signal against time")
+    if ai is None or AFM_IMAGE_ERROR:
+        st.error("This tab needs **afm_images.py** beside app.py"
+                 + (f" ({AFM_IMAGE_ERROR})." if AFM_IMAGE_ERROR else "."),
+                 icon="🚫")
+    else:
+        ai_panel()
 
 
 # ------------------------------------------------ settings kept offstage --
