@@ -241,6 +241,34 @@ def aligned_table(traces) -> pd.DataFrame:
 
 # ------------------------------------------------------------------ figure --
 
+FRAMES = ("Box (all four sides)", "Open (left and bottom only)",
+          "No axis lines")
+
+LEGEND_PLACES = ("Above", "Right, outside", "Inside, top right",
+                 "Inside, top left", "Inside, bottom right",
+                 "Inside, bottom left", "Below", "Hidden")
+
+_INSIDE = dict(bgcolor="rgba(255,255,255,0.75)", bordercolor="#999",
+               borderwidth=0)
+LEGEND_PLACES_SPEC = {
+    "Above": dict(orientation="h", x=0, xanchor="left", y=1.01,
+                  yanchor="bottom"),
+    "Right, outside": dict(orientation="v", x=1.02, xanchor="left", y=1,
+                           yanchor="top"),
+    "Inside, top right": dict(orientation="v", x=0.99, xanchor="right",
+                              y=0.99, yanchor="top", **_INSIDE),
+    "Inside, top left": dict(orientation="v", x=0.01, xanchor="left",
+                             y=0.99, yanchor="top", **_INSIDE),
+    "Inside, bottom right": dict(orientation="v", x=0.99, xanchor="right",
+                                 y=0.01, yanchor="bottom", **_INSIDE),
+    "Inside, bottom left": dict(orientation="v", x=0.01, xanchor="left",
+                                y=0.01, yanchor="bottom", **_INSIDE),
+    "Below": dict(orientation="h", x=0, xanchor="left", y=-0.2,
+                  yanchor="top"),
+    "Hidden": dict(),
+}
+
+
 def _first(items, key):
     for t in items:
         if t.get(key) is not None:
@@ -261,7 +289,9 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    line_width=1.8, axis_width=1.2, font_size=14,
                    x_title="x", zero_line=True, gap=0.04, x_range=None,
                    grid=False, ticks="outside", mirror=True,
-                   clickable=False):
+                   clickable=False, frame=None, legend="Above",
+                   y_titles=None, align_titles=True, title_space=70,
+                   title_size=None, bold_titles=False, legend_size=None):
     """
     The files in panels, one above the other.
 
@@ -275,6 +305,13 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
       x_range  (lo, hi) for its panel's x axis,
       y_range  (lo, hi) for its y axis.
     ``overlay`` puts every file in one panel.
+
+    Style for the whole figure: ``frame`` is one of FRAMES (the axis
+    outline), ``legend`` one of LEGEND_PLACES, ``y_titles`` maps a panel
+    number to the title of its left axis (and ``(panel, "right")`` to its
+    right one) instead of the files' own, ``align_titles`` puts every y
+    title at the same distance from the axis (``title_space`` px), so the
+    panels line up whatever their tick labels.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -324,12 +361,24 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                            "y = %{y:.6g}<extra></extra>")),
             row=r, col=1,
             secondary_y=any(t is u for u in right[r]))
-    axes = dict(showline=True, linewidth=axis_width, linecolor="black",
+    if frame is None:
+        frame = FRAMES[0] if mirror else FRAMES[1]
+    show_line = frame != FRAMES[2]
+    mirror = frame == FRAMES[0]
+    title_size = int(title_size or font_size + 2)
+    y_titles = y_titles or {}
+
+    def styled(text):
+        return f"<b>{text}</b>" if (bold_titles and text) else text
+
+    x_title = styled(x_title)
+    side_titles = []
+    axes = dict(showline=show_line, linewidth=axis_width, linecolor="black",
                 ticks=ticks, tickwidth=axis_width,
                 ticklen=max(4, int(3 * axis_width)), tickcolor="black",
                 showgrid=bool(grid), gridcolor="#e6e6e6", zeroline=False,
                 tickfont=dict(size=font_size, color="black"),
-                title_font_size=font_size + 2, automargin=True,
+                title_font_size=title_size, automargin=True,
                 exponentformat="power")
     fig.update_xaxes(mirror=mirror, **axes)
     for r in range(1, rows + 1):
@@ -339,9 +388,13 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                                  visible=False)
                 continue
             colour = items[0]["colour"] if len(items) == 1 else "black"
-            spec = dict(axes, title_text=_axis_title(items),
-                        title_font=dict(color=colour,
-                                        size=font_size + 2),
+            panel = panels[r - 1]
+            title = y_titles.get((panel, "right") if side else panel)
+            title = styled(title if title else _axis_title(items))
+            if align_titles:
+                side_titles.append((r, side, title, colour))
+            spec = dict(axes, title_text=("" if align_titles else title),
+                        title_font=dict(color=colour, size=title_size),
                         mirror=(mirror if not right[r] else False),
                         showgrid=bool(grid) and not side)
             if right[r]:
@@ -374,15 +427,42 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
             fig.add_vline(x=0, line=dict(color="#888", width=1, dash="dot"),
                           row=r, col=1)
     has_right = any(right.values())
+    height = (int(panel_height * rows / max(0.4, 1 - gap * (rows - 1)) + 90)
+              if rows > 1 else int(panel_height + 90))
+    # the y titles as annotations at one fixed distance from the plot, so
+    # they line up from panel to panel (an axis title sits wherever its
+    # own tick labels end)
+    for r, side, title, colour in side_titles:
+        if not title:
+            continue
+        # a right axis overlays the left one, whose domain is the panel's
+        lo, hi = fig.get_subplot(r, 1, secondary_y=False).yaxis.domain
+        fig.add_annotation(
+            text=title, xref="paper", yref="paper", x=1 if side else 0,
+            y=(lo + hi) / 2, xshift=(title_space if side else -title_space),
+            textangle=90 if side else -90, showarrow=False,
+            xanchor="center", yanchor="middle",
+            font=dict(size=title_size, color=colour))
+    left_m = (title_space + title_size + 6) if align_titles else 80
+    right_m = ((title_space + title_size + 6) if align_titles else 80) \
+        if has_right else 30
+    place = LEGEND_PLACES_SPEC.get(legend, LEGEND_PLACES_SPEC["Above"])
+    legend_spec = dict(place, font=dict(size=int(legend_size or font_size)))
+    if legend == "Right, outside":
+        legend_spec["x"] = 1.0 + (right_m + 10) / 900.0 if has_right \
+            else 1.02
+        right_m += 160
+    if legend == "Below":
+        legend_spec["y"] = -(font_size * 4.5 + 10) / max(height - 110, 100)
     fig.update_layout(
-        height=int(panel_height * rows / max(0.4, 1 - gap * (rows - 1))
-                   + 90) if rows > 1 else int(panel_height + 90),
-        margin=dict(l=80, r=80 if has_right else 30, t=50, b=60),
+        height=height + (40 if legend == "Below" else 0),
+        margin=dict(l=left_m, r=right_m, t=50,
+                    b=60 + (40 if legend == "Below" else 0)),
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(family="Arial, Helvetica, sans-serif", color="black",
                   size=font_size),
-        showlegend=bool(len(traces) > 1),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+        showlegend=bool(len(traces) > 1) and legend != "Hidden",
+        legend=legend_spec,
         hovermode="closest", clickmode="event+select", dragmode="zoom")
     for t in traces:
         t.pop("_panel", None)
