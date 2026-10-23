@@ -1021,6 +1021,8 @@ DEFAULTS = {
     "ai_label_fs": 12,
     "ai_tick_fs": 10,
     "ai_axis_lw": 1.2,
+    "ai_neg1": False,
+    "ai_neg2": False,
     "ai_bold": False,
     "ai_grid": False,
     "ai_height": 480,
@@ -1033,8 +1035,10 @@ DEFAULTS = {
     "vp_on": False,
     "vp_title_size": 20,
     "vp_tick_size": 16,
-    "vp_line": 2.5,
-    "vp_axis": 1.5,
+    "vp_line": 2.0,
+    "vp_axis": 1.0,
+    "vq_neg": False,
+    "vq_connect": False,
     "vp_bold": False,
     "vp_grid": False,
     "vp_legend": True,
@@ -8734,10 +8738,69 @@ def motion_adopt(uploaded, widget_key="mt_upload"):
         return False
     destination = os.path.join(tempfile.gettempdir(),
                                f"afm_video_{uploaded.name}")
-    with open(destination, "wb") as handle:
-        handle.write(uploaded.getvalue())
+    save_upload(uploaded, destination)
+    motion_use_file(destination, uploaded.name)
+    return True
+
+
+def motion_link_panel():
+    """A video by link: Google Drive, Box, or a direct link to the file.
+    It downloads straight to the server in pieces, so it is not limited by
+    the browser upload and a large recording does not have to pass through
+    the page at all."""
+    l1, l2 = st.columns([4, 1])
+    with l1:
+        st.text_input(
+            "…or a link to it", key="mt_link",
+            placeholder="Google Drive / Box share link, or https://…/video.mp4",
+            help="Best for large files (up to 4 GB). Drive and Box links "
+                 "must be shared with anyone who has the link.")
+    with l2:
+        st.markdown("<div style='height:1.7rem'></div>",
+                    unsafe_allow_html=True)
+        go_fetch = st.button("⬇️ Fetch", key="mt_link_go", **STRETCH,
+                             disabled=not st.session_state.get("mt_link"))
+    if not go_fetch:
+        return
+    if va is None or VIDEO_IMPORT_ERROR:
+        st.error("Fetching by link needs video_analysis.py.", icon="🚫")
+        return
+    url = str(st.session_state.get("mt_link", "")).strip()
+    name = re.sub(r"[?#].*$", "", url.rstrip("/").split("/")[-1]) or "video"
+    if not re.search(r"\.(mp4|avi|mov|mkv|m4v|wmv|webm)$", name, re.I):
+        name = "linked_video.mp4"
+    destination = os.path.join(tempfile.gettempdir(), f"afm_video_{name}")
+    bar = st.progress(0.0, text="Downloading…")
+
+    def tick(done, total):
+        if total:
+            bar.progress(min(1.0, done / total),
+                         text=f"Downloading… {done / 1e6:,.0f} of "
+                              f"{total / 1e6:,.0f} MB")
+        else:
+            bar.progress(0.0, text=f"Downloading… {done / 1e6:,.0f} MB")
+
+    token = None
+    try:
+        token = st.secrets.get("box", {}).get("access_token")
+    except Exception:
+        token = None
+    try:
+        va.fetch_video(url, destination, box_token=token, progress=tick)
+    except Exception as exc:
+        bar.empty()
+        st.error(f"Could not fetch that link: {exc}", icon="🚫")
+        return
+    bar.empty()
+    motion_use_file(destination, name)
+    rerun_keeping_settings()
+
+
+def motion_use_file(destination, name):
+    """Make a file on disk *the* video, and forget everything that belonged
+    to the previous one."""
     st.session_state["video_path"] = destination
-    st.session_state["video_name"] = uploaded.name
+    st.session_state["video_name"] = name
     st.session_state["video_track"] = None
     st.session_state["video_saved_frame"] = None
     st.session_state["video_saved_frame_index"] = None
@@ -9120,114 +9183,121 @@ def sphere_paint(view, centre, edge, radius, scale):
     return cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
 
+def sphere_set(cx, cy, r):
+    st.session_state["sp_circle"] = (float(cx), float(cy), float(r))
+    st.session_state["_sp_r_next"] = round(float(r), 1)
+
+
+def sphere_resize():
+    """The size slider moved: keep the centre, change the radius."""
+    circle = sphere_circle()
+    r = float(st.session_state.get("sp_r_adj", 0) or 0)
+    if circle and r >= 2:
+        st.session_state["sp_circle"] = (circle[0], circle[1], r)
+
+
 def sphere_panel(path, details):
-    """The ⚪ sub-tab: where the probe sphere is, and how big."""
-    A = aa.AutoCellAnalysis if aa is not None and not AUTO_ERROR else None
+    """The ⚪ sub-tab: one click on the probe sphere, and its size."""
+    ready = aa is not None and not AUTO_ERROR
     st.caption(
-        "Show the program where the probe sphere is. Click its **centre**, "
-        "then **a point on its edge**, or press **Find it for me**. "
-        "**Snap to its edge** then fits the circle to the sphere's real "
-        "outline. The sphere sets the scale (its diameter in µm over its "
-        "diameter in pixels), and the automatic analysis takes it as the "
-        "probe tip instead of searching for one. Mark it on a frame near "
-        "the start of the stretch you will analyse.")
+        "**Click anywhere on the sphere.** It is found and fitted to its "
+        "edge for you, and its size sets the scale (its diameter in µm over "
+        "its diameter in pixels) for the corner tracking and the automatic "
+        "analysis. If the yellow circle is not right, click again nearer "
+        "the sphere's middle (zoom in above for small spheres), or adjust "
+        "the size with the slider.")
     last = int(details["frame_count"]) - 1
     st.session_state["sp_frame"] = int(clamp_int(
         st.session_state.get("sp_frame", 0), 0, last))
     frame_index = st.slider("Frame to mark it on", 0, max(last, 0),
-                            key="sp_frame")
+                            key="sp_frame",
+                            help="Pick a frame near the start of the stretch "
+                                 "you will analyse.")
     frame = motion_frame(path, video_signature(), int(frame_index))
     if frame is None:
         st.error(f"Could not read frame {frame_index}.")
         return
     circle = sphere_circle()
-    centre = ((circle[0], circle[1]) if circle
-              else st.session_state.get("sp_centre_only"))
-    edge = st.session_state.get("sp_edge")
-    if circle and not edge:
-        edge = (circle[0] + circle[2], circle[1])
-    points = [p for p in (centre, edge) if p is not None]
+    box = view_box(frame.shape)
+    view, scale = view_render(frame, box)
+    if circle:
+        c = to_view([circle[:2]], box, scale)[0]
+        painted = sphere_paint(view, tuple(c), None, circle[2] * scale, scale)
+    else:
+        painted = ct.cv2.cvtColor(view, ct.cv2.COLOR_BGR2RGB)
 
-    def paint(view, shown, scale):
-        c = tuple(shown[0]) if len(shown) >= 1 else None
-        e = tuple(shown[1]) if len(shown) >= 2 else None
-        r = circle[2] * scale if circle else None
-        return sphere_paint(view, c, e, r, scale)
-
+    clicked = None
     if HAS_CANVAS and not st.session_state.get("mt_canvas_error"):
         try:
-            new = place_points_panel(
-                frame, points, "sp", list(SPHERE_LABELS), paint, 2,
-                help_text="Centre first, then any point on the sphere's "
-                          "edge. Either can be clicked again to move it.")
+            clicked = click_on(painted, "sp_canvas", box, scale)
         except Exception as exc:  # pragma: no cover - depends on deploy
             st.session_state["mt_canvas_error"] = f"{type(exc).__name__}: {exc}"
-            new = None
-        if new is not None:
-            c = new[0]
-            e = new[1] if len(new) > 1 else None
-            if e is None and circle:
-                # A new centre keeps the size already found.
-                e = (c[0] + circle[2], c[1])
-            r = float(np.hypot(e[0] - c[0], e[1] - c[1])) if e else 0.0
-            st.session_state["sp_circle"] = (c[0], c[1], r) if r >= 2 else None
-            st.session_state["sp_centre_only"] = c if r < 2 else None
-            st.session_state["sp_edge"] = e
-            rerun_keeping_settings()
     else:
-        st.image(paint(*view_render(frame, view_box(frame.shape))[:1],
-                       [], 1.0), **STRETCH)
-        st.info("Clicking needs the canvas; **Find it for me** still works.",
-                icon="ℹ️")
+        st.image(painted, **STRETCH)
+        st.info("Clicking needs the canvas; **Find it without clicking** "
+                "still works.", icon="ℹ️")
+    if clicked is not None:
+        fit = {"ok": False}
+        if ready:
+            gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
+            fit = aa.sphere_from_click(gray, clicked)
+        if fit.get("ok"):
+            sphere_set(fit["center"][0], fit["center"][1], fit["radius"])
+            st.session_state["_sp_note"] = (
+                f"Fitted to its edge ({100 * fit['confidence']:.0f} % of the "
+                "outline found).")
+        else:
+            r = circle[2] if circle else 15.0
+            sphere_set(clicked[0], clicked[1], r)
+            st.session_state["_sp_note"] = (
+                "No clear edge there, so the circle is put where you "
+                "clicked. Set its size with the slider, or click nearer "
+                "the middle of the sphere.")
+        rerun_keeping_settings()
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        if st.button("🔎 Find it for me", key="sp_find", disabled=A is None,
-                     **STRETCH,
-                     help="Looks for a round dark object over a few frames "
-                          "around this one. If a centre has been clicked, "
-                          "it is trusted and only the size is measured."):
-            hint = centre or st.session_state.get("sp_centre_only")
+    pending = st.session_state.pop("_sp_r_next", None)
+    if pending is not None:
+        st.session_state["sp_r_adj"] = float(pending)
+    elif circle:
+        st.session_state["sp_r_adj"] = round(float(circle[2]), 1)
+    s1, s2, s3 = st.columns([2, 1.2, 1.2])
+    with s1:
+        st.slider("Size (radius in px)", 2.0, 200.0, step=0.1,
+                  key="sp_r_adj", on_change=sphere_resize,
+                  disabled=circle is None,
+                  help="Fine-tune the circle if it is a little too big or "
+                       "small. The centre stays put.")
+    with s2:
+        st.markdown("<div style='height:1.7rem'></div>",
+                    unsafe_allow_html=True)
+        if st.button("🔎 Find it without clicking", key="sp_find",
+                     disabled=not ready, **STRETCH,
+                     help="Looks for a round dark object over a few "
+                          "frames around this one."):
             found = aa.SphereEdgeRefiner.auto_detect_multiframe(
-                path, int(frame_index), hint_xy=hint)
+                path, int(frame_index), hint_xy=None)
             if found is None:
                 st.session_state["_sp_note"] = (
-                    "No sphere found. Click its centre and try again, or "
-                    "click its centre and edge yourself.")
+                    "No sphere found on its own. Click on it instead.")
             else:
+                gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
                 cx, cy = found["center"]
-                r = float(found["radius"])
-                st.session_state["sp_circle"] = (float(cx), float(cy), r)
-                st.session_state["sp_edge"] = (float(cx) + r, float(cy))
-                st.session_state["_sp_note"] = (
-                    f"Found on {found.get('n_frames_agreed', 1)} of "
-                    f"{found.get('n_frames_used', 1)} frames looked at.")
+                fit = aa.snap_sphere(gray, (float(cx), float(cy),
+                                            float(found["radius"])))
+                if fit.get("ok"):
+                    (cx, cy), r = fit["center"], fit["radius"]
+                else:
+                    r = found["radius"]
+                sphere_set(cx, cy, r)
+                st.session_state["_sp_note"] = "Found it. Check the circle."
             rerun_keeping_settings()
-    with b2:
-        if st.button("🧲 Snap to its edge", key="sp_snap",
-                     disabled=(circle is None or A is None), **STRETCH,
-                     help="Fits the circle to the sphere's outline: the "
-                          "strongest edge along 36 rays from the centre."):
-            gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
-            fit = aa.snap_sphere(gray, circle)
-            if fit.get("ok"):
-                cx, cy = fit["center"]
-                r = float(fit["radius"])
-                st.session_state["sp_circle"] = (float(cx), float(cy), r)
-                st.session_state["sp_edge"] = (float(cx) + r, float(cy))
-                st.session_state["_sp_note"] = (
-                    f"Snapped: {100 * fit['confidence']:.0f} % of the rays "
-                    "found the edge.")
-            else:
-                st.session_state["_sp_note"] = (
-                    "Could not find a clear edge near that circle "
-                    f"({100 * fit.get('confidence', 0):.0f} % of rays). Left "
-                    "as marked; zoom in and click the edge more carefully.")
-            rerun_keeping_settings()
-    with b3:
+    with s3:
+        st.markdown("<div style='height:1.7rem'></div>",
+                    unsafe_allow_html=True)
         if st.button("🗑️ Forget it", key="sp_clear",
-                     disabled=circle is None and not points, **STRETCH):
-            for name in ("sp_circle", "sp_edge", "sp_centre_only"):
+                     disabled=circle is None, **STRETCH):
+            for name in ("sp_circle", "sp_edge", "sp_centre_only",
+                         "sp_r_adj"):
                 st.session_state.pop(name, None)
             rerun_keeping_settings()
     note = st.session_state.pop("_sp_note", None)
@@ -9244,16 +9314,15 @@ def sphere_panel(path, details):
     m2.metric("Diameter on screen",
               f"{2 * circle[2]:.1f} px" if circle else "–")
     m3.metric("Scale", f"{scale:.4f} µm/px" if scale else "–")
-    if circle:
-        st.caption(f"Centre at ({circle[0]:.1f}, {circle[1]:.1f}) px on "
-                   f"frame {int(frame_index)}.")
-        current = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
-        if scale and abs(current - scale) > 1e-6:
-            if st.button("🔒 Use this scale for the corner tracking",
-                         key="sp_lock", **STRETCH):
-                rerun_keeping_settings(extra={"mt_um_per_px": float(scale)})
-        elif scale:
-            st.caption("✅ The corner tracking reports in µm with this scale.")
+    if scale:
+        typed = float(st.session_state.get("mt_um_per_px", 0.0) or 0.0)
+        if typed > 0 and abs(typed - scale) > 1e-6:
+            st.caption(f"The corner tracking uses the scale typed under "
+                       f"⚙️ ({typed:.4f} µm/px). Set that to 0 to use the "
+                       "sphere's.")
+        else:
+            st.caption("✅ This scale is used for the corner tracking and "
+                       "the automatic analysis.")
 
 
 # ------------------------------------------------- correcting the tracking --
@@ -9600,14 +9669,25 @@ def name_box(key, default, label="Save as"):
 
 VIDEO_PLOT_DEFAULTS = {
     "vp_on": False, "vp_title_size": 20, "vp_tick_size": 16,
-    "vp_line": 2.5, "vp_axis": 1.5, "vp_bold": False, "vp_grid": False,
+    "vp_line": 2.0, "vp_axis": 1.0, "vp_bold": False, "vp_grid": False,
     "vp_legend": True, "vp_w": 900, "vp_h": 560, "vp_fmt": "svg",
     "vp_scale": 3,
 }
 
 
 def video_plot_controls():
-    """The 📐 switch and its settings, once for the whole video tab."""
+    """The plot row (always there) and the 📐 publication settings, once
+    for the whole video tab."""
+    q1, q2, q3, q4 = st.columns([1.1, 1.2, 1.6, 1.6])
+    q1.toggle("Negative up", key="vq_neg",
+              help="Flips the y axis of every plot on this tab, so "
+                   "negative values (shortening, a push down) are drawn "
+                   "above the baseline. The numbers keep their sign.")
+    q2.toggle("Continuous line", key="vq_connect",
+              help="Joins the line across frames where nothing was "
+                   "measured, instead of leaving a gap.")
+    q3.slider("Line thickness", 0.5, 8.0, step=0.25, key="vp_line")
+    q4.slider("Axis thickness", 0.5, 6.0, step=0.25, key="vp_axis")
     with st.expander("📐 Plots for publication"):
         st.toggle("Publication style for the plots on this tab", key="vp_on",
                   help="White background, black framed axes with outward "
@@ -9622,10 +9702,8 @@ def video_plot_controls():
             st.number_input("Tick label size", 6, 40, key="vp_tick_size",
                             disabled=not on)
         with p2:
-            st.number_input("Line width", 0.5, 8.0, step=0.5, key="vp_line",
-                            disabled=not on)
-            st.number_input("Axis width", 0.5, 6.0, step=0.5, key="vp_axis",
-                            disabled=not on)
+            st.caption("Line and axis thickness are set in the row above "
+                       "and apply with or without this style.")
         with p3:
             st.number_input("Width (px)", 300, 3000, step=50, key="vp_w",
                             disabled=not on)
@@ -9652,6 +9730,19 @@ def video_chart(fig, key=None, stem=None, **_ignored):
     the camera icon set to save it under the video's own name."""
     s = st.session_state
     pub = bool(s.get("vp_on"))
+    line_w = float(s.get("vp_line", 2.0) or 2.0)
+    axis_w = float(s.get("vp_axis", 1.0) or 1.0)
+    for trace in fig.data:
+        if getattr(trace, "type", "") != "scatter":
+            continue
+        dashed = bool(trace.line.dash) and trace.line.dash != "solid"
+        trace.line.width = line_w * (0.7 if dashed else 1.0)
+        if s.get("vq_connect"):
+            trace.connectgaps = True
+    fig.update_xaxes(linewidth=axis_w, tickwidth=axis_w)
+    fig.update_yaxes(linewidth=axis_w, tickwidth=axis_w)
+    if s.get("vq_neg"):
+        fig.update_yaxes(autorange="reversed")
     y_title = ""
     try:
         y_title = fig.layout.yaxis.title.text or ""
@@ -9678,8 +9769,6 @@ def video_chart(fig, key=None, stem=None, **_ignored):
             title = getattr(fig.layout, axis).title.text
             if title and bold and not title.startswith("<b>"):
                 getattr(fig.layout, axis).title.text = f"<b>{title}</b>"
-        fig.update_traces(line=dict(width=float(s.get("vp_line", 2.5))),
-                          selector=dict(type="scatter"))
         fig.update_layout(
             title=None, plot_bgcolor="white", paper_bgcolor="white",
             font=dict(family=family, color="black", size=size_k),
@@ -19668,6 +19757,19 @@ def current_fit_settings():
     }
 
 
+def save_upload(uploaded, destination):
+    """Copy an uploaded file to disk in 16 MB pieces. getvalue() made a
+    second whole copy in memory first, which is what ran a large video out
+    of room."""
+    import shutil
+
+    uploaded.seek(0)
+    with open(destination, "wb") as handle:
+        shutil.copyfileobj(uploaded, handle, 16 * 1024 * 1024)
+    uploaded.seek(0)
+    return destination
+
+
 def adopt_video(uploaded, widget_key):
     """
     Take an uploaded video as *the* video for this cell, from either uploader.
@@ -19694,8 +19796,7 @@ def adopt_video(uploaded, widget_key):
         return False
 
     destination = os.path.join(tempfile.gettempdir(), f"afm_video_{uploaded.name}")
-    with open(destination, "wb") as handle:
-        handle.write(uploaded.getvalue())
+    save_upload(uploaded, destination)
     st.session_state["video_path"] = destination
     st.session_state["video_name"] = uploaded.name
     st.session_state["video_track"] = None
@@ -24092,6 +24193,8 @@ with tab_motion:
                 key="mt_upload",
                 help="The same video the compression-video tab uses: upload "
                      "it in either place and both have it.")
+        with up1:
+            motion_link_panel()
         if motion_adopt(motion_upload):
             rerun_keeping_settings()
         motion_path = st.session_state.get("video_path")
@@ -26242,6 +26345,7 @@ def ai_quick_line_controls(two):
     s["ai_q_replace"] = s.get("ai_smooth", "Off") == "Replace"
     s["ai_qlw1"] = float(s.get("ai_lw1", 1.8))
     s["ai_qlw2"] = float(s.get("ai_lw2", 1.8))
+    s["ai_qaxis"] = float(s.get("ai_axis_lw", 1.2))
 
     def cont():
         s["ai_connect1"] = s["ai_connect2"] = bool(s.get("ai_q_cont"))
@@ -26274,6 +26378,19 @@ def ai_quick_line_controls(two):
               on_change=width, args=(1,))
     q5.slider("Line width · Plot 2", 0.5, 6.0, step=0.1, key="ai_qlw2",
               on_change=width, args=(2,), disabled=not two)
+
+    def axis():
+        s["ai_axis_lw"] = float(s.get("ai_qaxis", 1.2))
+
+    r1, r2, r3 = st.columns([1.5, 1.5, 3])
+    r1.toggle("Negative up · Plot 1", key="ai_neg1",
+              help="Flips Plot 1's y axis so negative values are drawn above "
+                   "the baseline. The numbers keep their sign (to change "
+                   "the sign itself, use Y math: multiply by -1).")
+    r2.toggle("Negative up · Plot 2", key="ai_neg2", disabled=not two,
+              help="The same for Plot 2's axis on the right.")
+    r3.slider("Axis thickness", 0.5, 5.0, step=0.1, key="ai_qaxis",
+              on_change=axis)
 
 
 def ai_time_figure(processed, units, tlabel):
@@ -26343,6 +26460,11 @@ def ai_time_figure(processed, units, tlabel):
                 axis["range"] = [float(rng[0]), float(rng[1])]
         except ValueError:
             pass
+        if s.get(f"ai_neg{which}"):
+            if "range" in axis:
+                axis["range"] = sorted(axis["range"], reverse=True)
+            else:
+                axis["autorange"] = "reversed"
         if any2:
             axis.update(title_font=dict(color=colour),
                         tickfont=dict(color=colour))
