@@ -1048,6 +1048,7 @@ DEFAULTS = {
     "vq_neg": False,
     "vq_connect": False,
     "vq_zmode": "As recorded",
+    "vq_shade": True,
     "vq_zval": 0.0,
     "vp_bold": False,
     "vp_grid": False,
@@ -9709,7 +9710,11 @@ def video_plot_controls():
         s["vq_zval"] = float(pending)
     if s.get("vq_zmode") not in VIDEO_ZERO_MODES:
         s["vq_zmode"] = VIDEO_ZERO_MODES[0]
-    z1, z2, _z3 = st.columns([2.2, 1.4, 2.4])
+    z1, z2, z3 = st.columns([2.2, 1.4, 2.4])
+    z3.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+    z3.toggle("Shade the contractions", key="vq_shade",
+              help="The pink bands over each contraction found by the "
+                   "automatic analysis. Off for a clean plot.")
     z1.selectbox(
         "Zero of the time axis at", VIDEO_ZERO_MODES, key="vq_zmode",
         help="Moves t = 0 on the plots: to a time you type, to the plot's "
@@ -9763,7 +9768,54 @@ def _range_number(text):
     return value if np.isfinite(value) else None
 
 
-def video_axis_ranges(slug):
+def video_chart_table(fig, y_title):
+    """A plot's lines as a table: the time as recorded, then one column per
+    line (the main one first), for the Stack & compare tab."""
+    columns = {}
+    time = None
+    for trace in fig.data:
+        if getattr(trace, "type", "") not in ("scatter", "scattergl"):
+            continue
+        if trace.x is None or trace.y is None:
+            continue
+        x = np.asarray(trace.x, float)
+        if time is None:
+            time = x
+            columns["Time (s)"] = x
+        if len(x) != len(time):
+            continue
+        name = str(trace.name or f"line {len(columns)}")
+        if len(columns) == 1 and y_title:
+            name = f"{name} [{re.sub(r'<[^>]+>', '', y_title)}]"
+        while name in columns:
+            name += " "
+        columns[name] = np.asarray(trace.y, float)
+    return pd.DataFrame(columns) if len(columns) > 1 else None
+
+
+def send_to_stack(name, frame):
+    """Put a table in the first free slot of the Stack & compare tab."""
+    s = st.session_state
+    if frame is None:
+        return
+    free = None
+    for i in range(6):
+        taken = s.get(f"sc_sent{i}") is not None or \
+            s.get(f"sc_file{i}") is not None
+        if not taken:
+            free = i
+            break
+    if free is None:
+        s["_vq_sent_note"] = ("All six slots on Stack & compare are in use. "
+                              "Remove one there first.")
+        return
+    s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy()}
+    s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
+    s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
+                          "Open that tab to see it.")
+
+
+def video_axis_ranges(slug, send=None):
     """
     The 📏 axis-range box above one video plot. Returns (x range or None,
     y range or None); each needs both ends typed, and an empty box means
@@ -9776,7 +9828,18 @@ def video_axis_ranges(slug):
         for name in names:
             s[name] = ""
 
-    _, right = st.columns([5, 1.4])
+    note_col, send_col, right = st.columns([3.6, 1.8, 1.4])
+    if send is not None and send[1] is not None:
+        send_col.button("📚 Send to stacked plot", key=f"vs_{slug}",
+                        on_click=send_to_stack, args=send, **STRETCH,
+                        help="Sends this plot's data (time as recorded and "
+                             "each line) to the Stack & compare tab, to "
+                             "stack and line up with other recordings.")
+        note = s.get("_vq_sent_note")
+        if note and s.get("_vq_sent_from") in (None, slug):
+            note_col.caption("✅ " + note if note.startswith("Sent")
+                             else "⚠️ " + note)
+            s.pop("_vq_sent_note", None)
     with right.popover("📏 Axis ranges", **STRETCH):
         with st.form(f"vr_{slug}_form", border=False):
             st.caption("Leave a box empty for automatic.")
@@ -9812,6 +9875,10 @@ def video_chart(fig, key=None, stem=None, **_ignored):
             trace.connectgaps = True
     fig.update_xaxes(linewidth=axis_w, tickwidth=axis_w)
     fig.update_yaxes(linewidth=axis_w, tickwidth=axis_w)
+    if not s.get("vq_shade", True):
+        # the pink bands over each contraction found
+        fig.layout.shapes = [sh for sh in (fig.layout.shapes or ())
+                             if sh.type != "rect"]
     y_title = ""
     try:
         y_title = fig.layout.yaxis.title.text or ""
@@ -9819,6 +9886,10 @@ def video_chart(fig, key=None, stem=None, **_ignored):
         pass
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(key or re.sub(
         r"<[^>]+>", "", y_title) or "plot")).strip("_").lower()[:40]
+    send_name = ((stem or s.get("_chart_stem") or s.get("video_name")
+                  or "video") + " · " + (re.sub(r"<[^>]+>", "", y_title)
+                                         or "plot"))
+    send_frame = video_chart_table(fig, y_title)
     zero = video_time_zero(fig)
     clicking = s.get("vq_zmode") == "Click a point on a plot"
     if zero:
@@ -9844,7 +9915,7 @@ def video_chart(fig, key=None, stem=None, **_ignored):
                 trace.selected = dict(marker=dict(opacity=0))
                 trace.unselected = dict(marker=dict(opacity=0))
         fig.update_layout(clickmode="event+select")
-    xr, yr = video_axis_ranges(slug)
+    xr, yr = video_axis_ranges(slug, send=(send_name, send_frame))
     if xr is not None:
         fig.update_xaxes(range=list(xr), autorange=False)
     if yr is not None:
@@ -26693,20 +26764,31 @@ def sc_default(key, value):
 def sc_slot(i):
     """One file's controls. Returns the prepared trace or None."""
     s = st.session_state
-    up = st.file_uploader(f"File {i + 1}", key=f"sc_file{i}",
-                          type=["csv", "txt", "tsv", "dat", "xlsx", "xls"],
-                          help="CSV, TSV, TXT or Excel. Lines of notes "
-                               "above the header are skipped, and any "
-                               "separator works.")
-    if up is None:
-        return None
-    try:
-        frame = sc_read(up.getvalue(), up.name)
-    except Exception as exc:
-        st.error(f"Could not read {up.name}: {exc}")
-        return None
+    sent = s.get(f"sc_sent{i}")
+    if sent is not None:
+        # data sent here from the video tab, in place of a file
+        st.markdown(f"**File {i + 1}** · 📥 from the video")
+        st.caption(sent["name"])
+        st.button("✖ Remove", key=f"sc_unsend{i}", on_click=s.pop,
+                  args=(f"sc_sent{i}", None))
+        frame, file_name = sent["frame"], sent["name"]
+    else:
+        up = st.file_uploader(
+            f"File {i + 1}", key=f"sc_file{i}",
+            type=["csv", "txt", "tsv", "dat", "xlsx", "xls"],
+            help="CSV, TSV, TXT or Excel. Lines of notes above the header "
+                 "are skipped, and any separator works. Plots on the video "
+                 "tab can also be sent here with **Send to stacked plot**.")
+        if up is None:
+            return None
+        try:
+            frame = sc_read(up.getvalue(), up.name)
+        except Exception as exc:
+            st.error(f"Could not read {up.name}: {exc}")
+            return None
+        file_name = up.name
     cols = list(frame.columns)
-    stem = re.sub(r"\.[^.]+$", "", up.name)
+    stem = re.sub(r"\.(csv|txt|tsv|dat|xlsx|xls)$", "", file_name)
     sc_default(f"sc_label{i}", stem)
     if s.get(f"sc_x{i}") not in cols:
         s[f"sc_x{i}"] = sc.guess_x(cols)
@@ -26768,7 +26850,7 @@ def sc_slot(i):
             "label": s.get(f"sc_label{i}") or stem,
             "ylabel": s.get(f"sc_ylab{i}") or str(ycol),
             "colour": s.get(f"sc_col{i}"), "neg_up": bool(
-                s.get(f"sc_neg{i}")), "slot": i, "file": up.name,
+                s.get(f"sc_neg{i}")), "slot": i, "file": file_name,
             "xcol": xcol}
 
 
