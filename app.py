@@ -9793,7 +9793,7 @@ def video_chart_table(fig, y_title):
     return pd.DataFrame(columns) if len(columns) > 1 else None
 
 
-def send_to_stack(name, frame):
+def send_to_stack(name, frame, source="the video"):
     """Put a table in the first free slot of the Stack & compare tab."""
     s = st.session_state
     if frame is None:
@@ -9808,11 +9808,13 @@ def send_to_stack(name, frame):
     if free is None:
         s["_vq_sent_note"] = ("All six slots on Stack & compare are in use. "
                               "Remove one there first.")
-        return
-    s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy()}
+        return None
+    s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy(),
+                           "source": source}
     s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
     s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
                           "Open that tab to see it.")
+    return free
 
 
 def video_axis_ranges(slug, send=None):
@@ -26467,6 +26469,7 @@ def ai_panel():
     fig = ai_time_figure(processed, units, tlabel)
     base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
                                 labels=names)
+    ai_send_row(processed, units, tlabel, base)
     ai_chart(fig, base, key="ai_time")
 
     # P1 against P2 -----------------------------------------------------
@@ -26625,6 +26628,50 @@ def ai_quick_line_controls(two):
               on_change=axis)
 
 
+def ai_send_to_stack(tables):
+    """Each plot into its own Stack & compare slot."""
+    s = st.session_state
+    slots = []
+    for name, frame in tables:
+        slot = send_to_stack(name, frame, source="AFM output analysis")
+        if slot is None:
+            break
+        slots.append(slot + 1)
+    if slots:
+        s["_ai_sent_note"] = (
+            "Sent to Stack & compare as file"
+            + ("s " + " and ".join(map(str, slots)) if len(slots) > 1
+               else f" {slots[0]}") + ". Open that tab to see it.")
+    else:
+        s["_ai_sent_note"] = s.get("_vq_sent_note", "")
+    s.pop("_vq_sent_note", None)
+
+
+def ai_send_row(processed, units, tlabel, base):
+    """The 📚 Send to stacked plot button above the time plot: Plot 1 and
+    Plot 2, as processed (baseline, Y math), each as its own file."""
+    s = st.session_state
+    tables = []
+    for which in sorted(processed):
+        x, y = processed[which]
+        label = (s.get(f"ai_ylabel{which}")
+                 or f"Plot {which} ({units[which]})")
+        tables.append((f"{base} · Plot {which}",
+                       pd.DataFrame({tlabel or "Time (s)": np.asarray(x),
+                                     label: np.asarray(y)})))
+    note_col, send_col = st.columns([4, 1.8])
+    send_col.button("📚 Send to stacked plot", key="ai_send_stack",
+                    on_click=ai_send_to_stack, args=(tables,),
+                    disabled=not tables, **STRETCH,
+                    help="Sends the plotted data (each plot as its own "
+                         "file) to the Stack & compare tab, to stack or "
+                         "overlay with videos and other recordings.")
+    note = s.pop("_ai_sent_note", None)
+    if note:
+        note_col.caption(("✅ " if note.startswith("Sent") else "⚠️ ")
+                         + note)
+
+
 def ai_time_figure(processed, units, tlabel):
     """Plot 1 on the left axis, Plot 2 on the right, as the desktop draws
     them: gaps stay gaps unless joined, smoothing overlaid or replacing."""
@@ -26761,13 +26808,43 @@ def sc_default(key, value):
     s[f"_{key}_default"] = value
 
 
-def sc_slot(i):
+def sc_axis_ranges(i):
+    """The 📏 popover of one file: its x range (its panel's x axis) and its
+    y range (its own y axis). Empty means automatic."""
+    s = st.session_state
+    names = [f"sc_r{i}_{end}" for end in ("x0", "x1", "y0", "y1")]
+
+    def clear():
+        for name in names:
+            s[name] = ""
+
+    with st.popover("📏 Axis ranges", **STRETCH):
+        with st.form(f"sc_r{i}_form", border=False):
+            st.caption("For this file: x is its panel's x axis, y is its "
+                       "own y axis. Leave a box empty for automatic.")
+            a, b = st.columns(2)
+            a.text_input("x from", key=names[0], placeholder="auto")
+            b.text_input("x to", key=names[1], placeholder="auto")
+            a.text_input("y from", key=names[2], placeholder="auto")
+            b.text_input("y to", key=names[3], placeholder="auto")
+            st.form_submit_button("✔ Apply", **STRETCH)
+        st.button("↺ Automatic", key=f"sc_r{i}_reset", on_click=clear,
+                  **STRETCH)
+    v = [sc.finite_or_none(str(s.get(n, "")).replace(",", "."))
+         for n in names]
+    xr = (v[0], v[1]) if None not in v[:2] and v[0] != v[1] else None
+    yr = (v[2], v[3]) if None not in v[2:] and v[2] != v[3] else None
+    return xr, yr
+
+
+def sc_slot(i, n=3):
     """One file's controls. Returns the prepared trace or None."""
     s = st.session_state
     sent = s.get(f"sc_sent{i}")
     if sent is not None:
         # data sent here from the video tab, in place of a file
-        st.markdown(f"**File {i + 1}** · 📥 from the video")
+        st.markdown(f"**File {i + 1}** · 📥 from "
+                    f"{sent.get('source', 'the video')}")
         st.caption(sent["name"])
         st.button("✖ Remove", key=f"sc_unsend{i}", on_click=s.pop,
                   args=(f"sc_sent{i}", None))
@@ -26817,9 +26894,21 @@ def sc_slot(i):
         st.number_input("Level (y)", key=f"sc_zlevel{i}", format="%.6g")
     t1, t2 = st.columns(2)
     t1.toggle("Negative up", key=f"sc_neg{i}",
-              help="Flips this panel's y axis so negative values are drawn "
+              help="Flips this file's y axis so negative values are drawn "
                    "above the baseline. The numbers keep their sign.")
     t2.color_picker("Colour", key=f"sc_col{i}")
+    options = list(range(1, max(n, 1) + 1))
+    if s.get(f"sc_panel{i}") not in options:
+        s[f"sc_panel{i}"] = min(i + 1, options[-1])
+    p1, p2 = st.columns(2)
+    p1.selectbox("Panel", options, key=f"sc_panel{i}",
+                 help="Files given the same panel number are overlaid on "
+                      "one plot; different numbers are stacked.")
+    p2.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+    p2.toggle("Own y axis (right)", key=f"sc_right{i}",
+              help="When overlaid on another file, this one gets its own y "
+                   "axis on the right, for different units or sizes.")
+    x_range, y_range = sc_axis_ranges(i)
     with st.expander("More"):
         st.text_input("y axis title", key=f"sc_ylab{i}")
         m1, m2 = st.columns(2)
@@ -26851,7 +26940,9 @@ def sc_slot(i):
             "ylabel": s.get(f"sc_ylab{i}") or str(ycol),
             "colour": s.get(f"sc_col{i}"), "neg_up": bool(
                 s.get(f"sc_neg{i}")), "slot": i, "file": file_name,
-            "xcol": xcol}
+            "xcol": xcol, "panel": int(s.get(f"sc_panel{i}") or (i + 1)),
+            "right": bool(s.get(f"sc_right{i}")), "x_range": x_range,
+            "y_range": y_range}
 
 
 def sc_panel():
@@ -26861,13 +26952,15 @@ def sc_panel():
         s[f"sc_zmode{i}"] = "A value I type"
         s[f"sc_zval{i}"] = float(value)
     st.caption(
-        "Load up to six files (CSV, TSV, TXT or Excel). Each is drawn in its "
-        "own panel, one above the other. Pick its x and y columns and where "
-        "its x should start from (**Zero of x at**), so the recordings line "
-        "up. **Link the x axes** makes the panels share one x axis that "
-        "zooms together; off, each panel keeps its own x axis.")
+        "Load up to six files (CSV, TSV, TXT or Excel), or send plots here "
+        "from the video and AFM output tabs. Each file has its own x and y "
+        "columns, its own time zero (**Zero of x at**), its own axis ranges "
+        "(📏) and a **Panel** number: files with the same number are "
+        "overlaid, the rest are stacked. **Link the x axes** makes the "
+        "panels share one x axis that zooms together; off, each panel "
+        "keeps its own x axis.")
     s.setdefault("sc_n", 3)
-    s.setdefault("sc_link", True)
+    s.setdefault("sc_link", False)
     s.setdefault("sc_zline", True)
     s.setdefault("sc_height", 240)
     s.setdefault("sc_lw", 1.8)
@@ -26879,7 +26972,7 @@ def sc_panel():
         cols = st.columns(min(3, n - start))
         for k, col in enumerate(cols):
             with col, st.container(border=True):
-                t = sc_slot(start + k)
+                t = sc_slot(start + k, n)
                 if t is not None:
                     traces.append(t)
     if not traces:
