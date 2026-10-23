@@ -241,32 +241,67 @@ def aligned_table(traces) -> pd.DataFrame:
 
 # ------------------------------------------------------------------ figure --
 
+def _first(items, key):
+    for t in items:
+        if t.get(key) is not None:
+            return t.get(key)
+    return None
+
+
+def _axis_title(items):
+    names = []
+    for t in items:
+        label = t.get("ylabel") or ""
+        if label and label not in names:
+            names.append(label)
+    return " / ".join(names)
+
+
 def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    line_width=1.8, axis_width=1.2, font_size=14,
                    x_title="x", zero_line=True, gap=0.04, x_range=None,
                    grid=False, ticks="outside", mirror=True,
                    clickable=False):
     """
-    One panel per trace, stacked, or all on one plot (``overlay``).
+    The files in panels, one above the other.
 
     Each trace dict: x, y, label, ylabel, colour, neg_up, slot (its number,
     returned in customdata with the file's own x so a click can set its
-    zero), raw_x (x on the file's own axis, same length as x).
+    zero), raw_x (x on the file's own axis), and optionally
+      panel    which panel it goes in (files with the same number are
+               overlaid; default: one panel each, in order),
+      right    its own y axis on the right of the panel (for a second
+               file overlaid in different units),
+      x_range  (lo, hi) for its panel's x axis,
+      y_range  (lo, hi) for its y axis.
+    ``overlay`` puts every file in one panel.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    n = max(1, len(traces))
-    rows = 1 if overlay else n
+    traces = list(traces)
+    for k, t in enumerate(traces):
+        t["_panel"] = 1 if overlay else int(t.get("panel") or (k + 1))
+    panels = sorted({t["_panel"] for t in traces}) or [1]
+    row_of = {p: r + 1 for r, p in enumerate(panels)}
+    rows = len(panels)
+    # which traces sit on which axis of which row (the first file in a
+    # panel always takes the left axis)
+    left = {r: [] for r in range(1, rows + 1)}
+    right = {r: [] for r in range(1, rows + 1)}
+    for t in traces:
+        r = row_of[t["_panel"]]
+        (right if (t.get("right") and left[r]) else left)[r].append(t)
     if rows > 1:
         # room between panels for each one's own x labels when unlinked
         plot_px = panel_height * rows
         need = (24 if linked else 30 + 2.6 * font_size) / plot_px
         gap = min(0.3, max(gap, need))
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=bool(linked),
-                        vertical_spacing=(gap if rows > 1 else 0.0))
+                        vertical_spacing=(gap if rows > 1 else 0.0),
+                        specs=[[{"secondary_y": True}]] * rows)
     for k, t in enumerate(traces):
-        row = 1 if overlay else k + 1
+        r = row_of[t["_panel"]]
         x_all, y_all = np.asarray(t["x"], float), np.asarray(t["y"], float)
         raw_all = np.asarray(t.get("raw_x", x_all), float)
         if len(raw_all) != len(x_all):
@@ -287,49 +322,70 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                                         raw]),
             hovertemplate=(f"<b>{t['label']}</b><br>x = %{{x:.6g}}<br>"
                            "y = %{y:.6g}<extra></extra>")),
-            row=row, col=1)
-        yaxis = dict(title_text=(t["ylabel"] if not overlay
-                                 else (traces[0]["ylabel"] if n == 1
-                                       else "")),
-                     title_font=dict(color=t["colour"] if not overlay
-                                     else "black"))
-        if t.get("neg_up"):
-            yaxis["autorange"] = "reversed"
-        fig.update_yaxes(row=row, col=1, **yaxis)
+            row=r, col=1,
+            secondary_y=any(t is u for u in right[r]))
     axes = dict(showline=True, linewidth=axis_width, linecolor="black",
-                mirror=mirror, ticks=ticks, tickwidth=axis_width,
+                ticks=ticks, tickwidth=axis_width,
                 ticklen=max(4, int(3 * axis_width)), tickcolor="black",
                 showgrid=bool(grid), gridcolor="#e6e6e6", zeroline=False,
                 tickfont=dict(size=font_size, color="black"),
                 title_font_size=font_size + 2, automargin=True,
                 exponentformat="power")
-    fig.update_xaxes(**axes)
-    fig.update_yaxes(**axes)
-    if overlay:
-        if any(t.get("neg_up") for t in traces):
-            fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(mirror=mirror, **axes)
+    for r in range(1, rows + 1):
+        for side, items in ((False, left[r]), (True, right[r])):
+            if side and not items:
+                fig.update_yaxes(row=r, col=1, secondary_y=True,
+                                 visible=False)
+                continue
+            colour = items[0]["colour"] if len(items) == 1 else "black"
+            spec = dict(axes, title_text=_axis_title(items),
+                        title_font=dict(color=colour,
+                                        size=font_size + 2),
+                        mirror=(mirror if not right[r] else False),
+                        showgrid=bool(grid) and not side)
+            if right[r]:
+                spec.update(linecolor=colour, tickcolor=colour,
+                            tickfont=dict(size=font_size, color=colour))
+            y_range = _first(items, "y_range")
+            neg = any(t.get("neg_up") for t in items)
+            if y_range is not None:
+                lo, hi = sorted(map(float, y_range))
+                spec["range"] = [hi, lo] if neg else [lo, hi]
+                spec["autorange"] = False
+            elif neg:
+                spec["autorange"] = "reversed"
+            fig.update_yaxes(row=r, col=1, secondary_y=side, **spec)
     # every panel gets its own x labels when the axes are free; when they
     # are linked, only the bottom one does (and they zoom together)
+    shared_range = x_range or (_first(traces, "x_range") if linked
+                               else None)
     for r in range(1, rows + 1):
         show = (not linked) or r == rows
-        fig.update_xaxes(row=r, col=1, showticklabels=show or not linked,
+        fig.update_xaxes(row=r, col=1, showticklabels=show,
                          title_text=(x_title if show else None))
-        if x_range is not None:
-            fig.update_xaxes(row=r, col=1, range=list(x_range))
+        rng = shared_range if linked else (
+            x_range or _first(left[r] + right[r], "x_range"))
+        if rng is not None:
+            fig.update_xaxes(row=r, col=1, range=sorted(map(float, rng)),
+                             autorange=False)
     if zero_line:
         for r in range(1, rows + 1):
             fig.add_vline(x=0, line=dict(color="#888", width=1, dash="dot"),
                           row=r, col=1)
+    has_right = any(right.values())
     fig.update_layout(
         height=int(panel_height * rows / max(0.4, 1 - gap * (rows - 1))
                    + 90) if rows > 1 else int(panel_height + 90),
-        margin=dict(l=80, r=30, t=50, b=60),
+        margin=dict(l=80, r=80 if has_right else 30, t=50, b=60),
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(family="Arial, Helvetica, sans-serif", color="black",
                   size=font_size),
-        showlegend=bool(overlay or n > 1),
+        showlegend=bool(len(traces) > 1),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
         hovermode="closest", clickmode="event+select", dragmode="zoom")
+    for t in traces:
+        t.pop("_panel", None)
     return fig
 
 
