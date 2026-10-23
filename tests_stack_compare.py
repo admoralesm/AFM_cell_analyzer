@@ -33,6 +33,19 @@ check("thinning keeps at most the limit", len(idx) <= 1000)
 fig = sc.stacked_figure([dict(x=x, y=y, label="a", ylabel="F", colour="red"),
                          dict(x=x, y=-y, label="b", ylabel="F", colour="blue", neg_up=True)],
                         linked=False)
-check("one panel each, the second flipped", len(fig.data) == 2 and fig.layout.yaxis2.autorange == "reversed")
+second = "yaxis" + fig.data[1].yaxis[1:]
+check("one panel each, the second flipped",
+      len(fig.data) == 2 and fig.layout[second].autorange == "reversed")
+fig = sc.stacked_figure([dict(x=x, y=y, label="a", ylabel="F", colour="red", panel=1),
+                         dict(x=x, y=y * 100, label="b", ylabel="h", colour="blue", panel=1,
+                              right=True, y_range=(0, 600)),
+                         dict(x=x, y=y, label="c", ylabel="L", colour="green", panel=2,
+                              x_range=(0.1, 0.2))], linked=False)
+check("two overlaid in panel 1, the second on its own right axis",
+      fig.data[0].xaxis == fig.data[1].xaxis and fig.data[1].yaxis != fig.data[0].yaxis
+      and fig.layout["yaxis" + fig.data[1].yaxis[1:]].side == "right")
+check("each axis takes its own range",
+      tuple(fig.layout["yaxis" + fig.data[1].yaxis[1:]].range) == (0, 600)
+      and tuple(fig.layout["xaxis" + fig.data[2].xaxis[1:]].range) == (0.1, 0.2))
 print("all passing" if not FAILED else f"{len(FAILED)} failing")
 sys.exit(1 if FAILED else 0)
