@@ -143,6 +143,13 @@ def main():
     check("and a circle already on the tip stays there",
           np.hypot(still["center"][0] - 330, still["center"][1] - 110) < 1.5,
           f"{still['center']} r {still['radius']:.2f}")
+    worst = 0.0
+    for d in ((0, 0), (6, 4), (-10, 8), (0, 15)):
+        one = aa.sphere_from_click(gray, (330 + d[0], 110 + d[1]))
+        worst = max(worst, np.hypot(one["center"][0] - 330,
+                                    one["center"][1] - 110))
+    check("one click anywhere on the tip finds it (within 2 px)",
+          worst < 2.0, f"worst {worst:.1f} px")
     hinted = aa.AutoCellAnalysis.analyze(path, probe_diameter_um=14.5,
                                          probe_hint=(330.0, 110.0, 22.0))
     check("the analysis takes a marked sphere as the probe tip",
