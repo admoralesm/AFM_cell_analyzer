@@ -1047,6 +1047,8 @@ DEFAULTS = {
     "vp_axis": 1.0,
     "vq_neg": False,
     "vq_connect": False,
+    "vq_zmode": "As recorded",
+    "vq_zval": 0.0,
     "vp_bold": False,
     "vp_grid": False,
     "vp_legend": True,
@@ -9683,6 +9685,10 @@ VIDEO_PLOT_DEFAULTS = {
 }
 
 
+VIDEO_ZERO_MODES = ("As recorded", "A time I type", "Highest point",
+                    "Lowest point", "Click a point on a plot")
+
+
 def video_plot_controls():
     """The plot row (always there) and the 📐 publication settings, once
     for the whole video tab."""
@@ -9696,6 +9702,22 @@ def video_plot_controls():
                    "measured, instead of leaving a gap.")
     q3.slider("Line thickness", 0.5, 8.0, step=0.25, key="vp_line")
     q4.slider("Axis thickness", 0.5, 6.0, step=0.25, key="vp_axis")
+    s = st.session_state
+    pending = s.pop("_vq_zero_next", None)
+    if pending is not None:
+        s["vq_zmode"] = "A time I type"
+        s["vq_zval"] = float(pending)
+    if s.get("vq_zmode") not in VIDEO_ZERO_MODES:
+        s["vq_zmode"] = VIDEO_ZERO_MODES[0]
+    z1, z2, _z3 = st.columns([2.2, 1.4, 2.4])
+    z1.selectbox(
+        "Zero of the time axis at", VIDEO_ZERO_MODES, key="vq_zmode",
+        help="Moves t = 0 on the plots: to a time you type, to the plot's "
+             "highest or lowest point (the main line, e.g. the peak of a "
+             "contraction), or to a point you click on a plot. The saved "
+             "CSV files keep the times as recorded.")
+    z2.number_input("t = 0 at (s)", key="vq_zval", format="%.4f",
+                    disabled=s.get("vq_zmode") != "A time I type")
     with st.expander("📐 Plots for publication"):
         st.toggle("Publication style for the plots on this tab", key="vp_on",
                   help="White background, black framed axes with outward "
@@ -9733,6 +9755,47 @@ def video_plot_controls():
                    "corner; it is named after the video and the time range.")
 
 
+def _range_number(text):
+    try:
+        value = float(str(text).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def video_axis_ranges(slug):
+    """
+    The 📏 axis-range box above one video plot. Returns (x range or None,
+    y range or None); each needs both ends typed, and an empty box means
+    automatic. Every plot keeps its own ranges, since their units differ.
+    """
+    s = st.session_state
+    names = [f"vr_{slug}_{end}" for end in ("x0", "x1", "y0", "y1")]
+
+    def clear():
+        for name in names:
+            s[name] = ""
+
+    _, right = st.columns([5, 1.4])
+    with right.popover("📏 Axis ranges", **STRETCH):
+        with st.form(f"vr_{slug}_form", border=False):
+            st.caption("Leave a box empty for automatic.")
+            a, b = st.columns(2)
+            a.text_input("x from", key=names[0], placeholder="auto")
+            b.text_input("x to", key=names[1], placeholder="auto")
+            a.text_input("y from", key=names[2], placeholder="auto")
+            b.text_input("y to", key=names[3], placeholder="auto")
+            st.form_submit_button("✔ Apply", **STRETCH)
+        st.button("↺ Automatic", key=f"vr_{slug}_reset", on_click=clear,
+                  **STRETCH)
+    values = [_range_number(s.get(n, "")) for n in names]
+    xr = (values[0], values[1]) if None not in values[:2] \
+        and values[0] != values[1] else None
+    yr = (values[2], values[3]) if None not in values[2:] \
+        and values[2] != values[3] else None
+    return xr, yr
+
+
 def video_chart(fig, key=None, stem=None, **_ignored):
     """Show a video-tab plot, in publication style when that is on, with
     the camera icon set to save it under the video's own name."""
@@ -9749,13 +9812,46 @@ def video_chart(fig, key=None, stem=None, **_ignored):
             trace.connectgaps = True
     fig.update_xaxes(linewidth=axis_w, tickwidth=axis_w)
     fig.update_yaxes(linewidth=axis_w, tickwidth=axis_w)
-    if s.get("vq_neg"):
-        fig.update_yaxes(autorange="reversed")
     y_title = ""
     try:
         y_title = fig.layout.yaxis.title.text or ""
     except Exception:
         pass
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(key or re.sub(
+        r"<[^>]+>", "", y_title) or "plot")).strip("_").lower()[:40]
+    zero = video_time_zero(fig)
+    clicking = s.get("vq_zmode") == "Click a point on a plot"
+    if zero:
+        for trace in fig.data:
+            if getattr(trace, "x", None) is not None:
+                trace.x = np.asarray(trace.x, float) - zero
+        for shape in fig.layout.shapes or ():
+            if str(shape.xref or "x").startswith("x") and \
+                    "domain" not in str(shape.xref or ""):
+                for end in ("x0", "x1"):
+                    v = getattr(shape, end)
+                    if isinstance(v, (int, float)):
+                        setattr(shape, end, float(v) - zero)
+        title = fig.layout.xaxis.title.text or "Time (s)"
+        if "zero" not in title:
+            fig.update_xaxes(title_text=f"{title}, zero at {zero:.3f} s")
+    if clicking:
+        for trace in fig.data:
+            if getattr(trace, "type", "") == "scatter":
+                trace.mode = "lines+markers"
+                trace.marker = dict(size=8, opacity=0,
+                                    color=trace.line.color)
+                trace.selected = dict(marker=dict(opacity=0))
+                trace.unselected = dict(marker=dict(opacity=0))
+        fig.update_layout(clickmode="event+select")
+    xr, yr = video_axis_ranges(slug)
+    if xr is not None:
+        fig.update_xaxes(range=list(xr), autorange=False)
+    if yr is not None:
+        fig.update_yaxes(range=(sorted(yr, reverse=True) if s.get("vq_neg")
+                                else sorted(yr)), autorange=False)
+    elif s.get("vq_neg"):
+        fig.update_yaxes(autorange="reversed")
     if pub:
         size_t = int(s.get("vp_title_size", 20))
         size_k = int(s.get("vp_tick_size", 16))
@@ -9796,7 +9892,39 @@ def video_chart(fig, key=None, stem=None, **_ignored):
                   "width": int(s.get("vp_w", 900)) if pub else None,
                   "height": int(s.get("vp_h", 560)) if pub else None,
                   "scale": int(s.get("vp_scale", 3))}}
-    st.plotly_chart(fig, key=key, config=config, **STRETCH)
+    if clicking:
+        version = int(s.get("_vq_click_ver", 0))
+        event = st.plotly_chart(fig, key=f"vc_{slug}_v{version}",
+                                config=config, on_select="rerun",
+                                selection_mode="points", **STRETCH)
+        try:
+            points = list(event.selection.points or [])
+        except Exception:
+            points = []
+        if points:
+            s["_vq_zero_next"] = float(points[-1]["x"]) + zero
+            s["_vq_click_ver"] = version + 1
+            rerun_keeping_settings()
+        st.caption("Click a point on the line: that moment becomes t = 0 "
+                   "on every plot.")
+    else:
+        st.plotly_chart(fig, key=key, config=config, **STRETCH)
+
+
+def video_time_zero(fig):
+    """Where t = 0 goes for this plot, in the recorded seconds."""
+    s = st.session_state
+    mode = s.get("vq_zmode", "As recorded")
+    if mode in ("A time I type", "Click a point on a plot"):
+        return float(s.get("vq_zval", 0.0) or 0.0)
+    if mode in ("Highest point", "Lowest point") and fig.data:
+        x = np.asarray(fig.data[0].x, float)
+        y = np.asarray(fig.data[0].y, float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.any():
+            pick = np.argmax if mode == "Highest point" else np.argmin
+            return float(x[ok][int(pick(y[ok]))])
+    return 0.0
 
 
 
