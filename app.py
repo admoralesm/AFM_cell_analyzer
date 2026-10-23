@@ -21189,42 +21189,70 @@ with head_right:
 SHOW_VIDEO_TAB = False
 SHOW_DATABASE_TAB = False
 
-# The two tabs that can be hidden go last. They are hidden by CSS on the
-# n-th tab button, and a tab bar inside a page (the fit's own tabs) has
-# fewer than ten buttons, so its buttons are never the ones hidden.
+# The order of the work: the video, the AFM output, making the force-strain
+# file, then the fitting (everything that belongs to it, as its own tabs
+# inside), then the rest. The two tabs that can be hidden go last; they are
+# hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_analysis, tab_cells, tab_explore, tab_igor, tab_results,
-    tab_export, tab_motion, tab_afm, tab_stack, tab_video, tab_db,
+    tab_motion, tab_afm, tab_igor, tab_fitting, tab_stack, tab_video, tab_db,
 ) = st.tabs(
     [
-        "📊 Force curve analysis",
-        "📚 All cells",
-        "📈 Log curve and boundaries",
-        "🔧 Create curve (Igor)",
-        "📈 Results",
-        "💾 Export",
-        "🎬 Video: track & clip",
-        "🔬 AFM images",
+        "🎬 Video: clip and analyze",
+        "🔬 AFM output analysis",
+        "🔧 Create force-ε file from ibw files",
+        "🧮 Fitting",
         "📚 Stack & compare",
         "🎥 Compression video",
         "📋 Database",
     ]
 )
+FITTING_TAB_NUMBER = 4
+
+with tab_fitting:
+    (
+        tab_analysis, tab_cells, tab_explore, tab_results, tab_export,
+    ) = st.tabs(
+        [
+            "📊 Force curve analysis",
+            "📚 All cells",
+            "📈 Log curve and boundaries",
+            "📈 Results",
+            "💾 Export",
+        ]
+    )
+
+# The top tab bar's n-th button is the one that is not inside any tab's
+# panel: in the DOM of Streamlit before 1.50 a baseweb button, after it a
+# react-aria div numbered from 0 in data-key.
+_NOT_NESTED = ':not([role="tabpanel"] *):not([data-testid="stTabPanel"] *)'
+
+
+def _top_tab(n, selected=False):
+    pick = '[aria-selected="true"]' if selected else ""
+    return [f'button[data-baseweb="tab"]:nth-of-type({n}){pick}{_NOT_NESTED}',
+            f'[data-testid="stTab"][data-key="{n - 1}"]{pick}{_NOT_NESTED}']
+
 
 _hidden = [
-    index for index, wanted in ((10, SHOW_VIDEO_TAB), (11, SHOW_DATABASE_TAB))
+    index for index, wanted in ((6, SHOW_VIDEO_TAB), (7, SHOW_DATABASE_TAB))
     if not wanted
 ]
+_rules = []
 if _hidden:
-    st.markdown(
-        "<style>"
-        + "".join(
-            f'button[data-baseweb="tab"]:nth-of-type({n}) {{display: none;}}'
-            for n in _hidden
-        )
-        + "</style>",
-        unsafe_allow_html=True,
-    )
+    _rules.append(", ".join(sel for n in _hidden for sel in _top_tab(n))
+                  + " {display: none !important;}")
+# The ⚙️ settings in the sidebar are the fitting's: show the sidebar (and
+# its open/close arrow) only while the Fitting tab is open. Done in the
+# browser, so switching tabs stays instant.
+_not_fitting = "body:not(:has(" + ", ".join(
+    _top_tab(FITTING_TAB_NUMBER, selected=True)) + "))"
+_rules.append(", ".join(
+    f"{_not_fitting} [data-testid=\"{part}\"]"
+    for part in ("stSidebar", "stSidebarCollapsedControl",
+                 "stExpandSidebarButton"))
+    + " {display: none !important;}")
+st.markdown("<style>" + "\n".join(_rules) + "</style>",
+            unsafe_allow_html=True)
 
 
 # ================================================ TAB 1: analysis workflow ==
@@ -21442,7 +21470,7 @@ with tab_analysis:
     if not data:
         st.info(
             "Upload a force curve to begin, or build one from Igor files in the "
-            "**Create curve (Igor)** tab."
+            "**Create force-ε file from ibw files** tab."
         )
     else:
         epsilon = data["epsilon"]
@@ -26636,7 +26664,7 @@ def ai_time_figure(processed, units, tlabel):
 
 
 with tab_afm:
-    section("AFM images: 2D, 3D and the signal against time")
+    section("AFM output analysis: 2D, 3D and the signal against time")
     if ai is None or AFM_IMAGE_ERROR:
         st.error("This tab needs **afm_images.py** beside app.py"
                  + (f" ({AFM_IMAGE_ERROR})." if AFM_IMAGE_ERROR else "."),
