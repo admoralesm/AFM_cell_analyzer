@@ -26892,6 +26892,13 @@ def sc_slot(i, n=3):
                         if f"sc_zval{i}" not in s else None)
     elif mode == "Where it first crosses a level":
         st.number_input("Level (y)", key=f"sc_zlevel{i}", format="%.6g")
+    st.number_input(
+        "Then move it along x by", key=f"sc_shift{i}", format="%.6g",
+        value=None if f"sc_shift{i}" in s else 0.0,
+        help="Slides this trace left (negative) or right (positive) after "
+             "its zero is set, so the zero can sit before the trace "
+             "starts. E.g. 'Start of the data' and then 2 makes the trace "
+             "begin at x = 2.")
     t1, t2 = st.columns(2)
     t1.toggle("Negative up", key=f"sc_neg{i}",
               help="Flips this file's y axis so negative values are drawn "
@@ -26928,12 +26935,13 @@ def sc_slot(i, n=3):
     zero = sc.zero_point(x_all, y_all, mode,
                          typed=float(s.get(f"sc_zval{i}") or 0.0),
                          level=float(s.get(f"sc_zlevel{i}") or 0.0))
+    shift = float(s.get(f"sc_shift{i}") or 0.0)
     st.caption(f"{len(x_all):,} points · x from {np.nanmin(x_all):.6g} to "
                f"{np.nanmax(x_all):.6g} · zero at x = {zero:.6g}"
+               + (f", then moved by {shift:+.6g}" if shift else "")
                if len(x_all) else "No numbers in these columns.")
-    lo = sc.finite_or_none(s.get("sc_xmin"))
-    hi = sc.finite_or_none(s.get("sc_xmax"))
-    x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero, lo, hi)
+    zero -= float(s.get(f"sc_shift{i}") or 0.0)
+    x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
             "label": s.get(f"sc_label{i}") or stem,
@@ -26943,6 +26951,25 @@ def sc_slot(i, n=3):
             "xcol": xcol, "panel": int(s.get(f"sc_panel{i}") or (i + 1)),
             "right": bool(s.get(f"sc_right{i}")), "x_range": x_range,
             "y_range": y_range}
+
+
+def sc_global_x_range():
+    lo = sc.finite_or_none(str(st.session_state.get("sc_xmin", "")))
+    hi = sc.finite_or_none(str(st.session_state.get("sc_xmax", "")))
+    return (lo, hi) if lo is not None and hi is not None and lo != hi \
+        else None
+
+
+def sc_y_titles():
+    """{panel: title, (panel, "right"): title} for the titles typed."""
+    out = {}
+    for key, value in st.session_state.items():
+        m = re.fullmatch(r"sc_ytitle(\d+)(r?)", str(key))
+        if m and str(value or "").strip():
+            panel = int(m.group(1))
+            out[(panel, "right") if m.group(2) else panel] = \
+                str(value).strip()
+    return out
 
 
 def sc_panel():
@@ -26966,6 +26993,12 @@ def sc_panel():
     s.setdefault("sc_lw", 1.8)
     s.setdefault("sc_aw", 1.2)
     s.setdefault("sc_fs", 14)
+    s.setdefault("sc_ts", 16)
+    s.setdefault("sc_ls", 13)
+    s.setdefault("sc_align", True)
+    s.setdefault("sc_tspace", 70)
+    s.setdefault("sc_frame", sc.FRAMES[0])
+    s.setdefault("sc_legend", "Above")
     n = st.select_slider("How many files", list(range(1, 7)), key="sc_n")
     traces = []
     for start in range(0, n, 3):
@@ -26990,27 +27023,58 @@ def sc_panel():
                    "x = 0 for that file.")
     g4.toggle("Line at x = 0", key="sc_zline")
     h1, h2, h3 = st.columns([1, 1, 2])
-    h1.text_input("x from", key="sc_xmin", placeholder="all",
-                  help="In the zeroed units. Leave empty for all.")
-    h2.text_input("x to", key="sc_xmax", placeholder="all")
+    h1.text_input("x from (all panels)", key="sc_xmin", placeholder="auto",
+                  help="Sets the x axis of every panel at once, in the "
+                       "zeroed units. Leave empty for automatic (or for "
+                       "each file's own 📏 range).")
+    h2.text_input("x to (all panels)", key="sc_xmax", placeholder="auto")
     sc_default("sc_xtitle", str(traces[0]["xcol"]))
     h3.text_input("x axis title", key="sc_xtitle")
-    with st.expander("📐 Style and saving"):
+    panels_used = sorted({1 if s.get("sc_overlay") else t["panel"]
+                          for t in traces})
+    with st.expander("🎨 Style for all panels", expanded=True):
         p1, p2, p3, p4 = st.columns(4)
-        p1.slider("Panel height (px)", 120, 700, step=10, key="sc_height")
-        p2.slider("Line thickness", 0.5, 6.0, step=0.1, key="sc_lw")
+        p1.selectbox("Axis outline", sc.FRAMES, key="sc_frame",
+                     help="A box round each panel, only the left and "
+                          "bottom axes (open), or no axis lines.")
+        p2.selectbox("Legend", sc.LEGEND_PLACES, key="sc_legend")
         p3.slider("Axis thickness", 0.5, 5.0, step=0.1, key="sc_aw")
-        p4.slider("Font size", 8, 30, key="sc_fs")
+        p4.slider("Line thickness", 0.5, 6.0, step=0.1, key="sc_lw")
         q1, q2, q3, q4 = st.columns(4)
-        q1.selectbox("Ticks", ("outside", "inside"), key="sc_ticks")
-        q2.checkbox("Grid", key="sc_grid")
-        q3.checkbox("Box around each panel", key="sc_box", value=None
-                    if "sc_box" in s else True)
-        q4.selectbox("Save as", ("svg", "png", "jpeg"), key="sc_fmt")
-        r1, r2 = st.columns(2)
-        r1.number_input("Saved width (px)", 300, 4000, step=50,
+        q1.slider("Title size", 8, 36, key="sc_ts")
+        q2.slider("Tick label size", 8, 30, key="sc_fs")
+        q3.slider("Legend text size", 6, 30, key="sc_ls")
+        q4.slider("Panel height (px)", 120, 700, step=10, key="sc_height")
+        u1, u2, u3, u4 = st.columns(4)
+        u1.selectbox("Ticks", ("outside", "inside"), key="sc_ticks")
+        u2.checkbox("Grid", key="sc_grid")
+        u3.checkbox("Bold titles", key="sc_bold")
+        u4.checkbox("Line up the y titles", key="sc_align",
+                    help="Puts every y title the same distance from its "
+                         "axis, so the titles of stacked panels line up "
+                         "whatever their numbers.")
+        st.slider("Space for the y tick labels (px)", 30, 200, step=5,
+                  key="sc_tspace", disabled=not s.get("sc_align"),
+                  help="How far the y titles sit from the axis. Make it "
+                       "wider if long numbers run into the title.")
+        st.markdown("**y axis titles** (empty = the files' own names)")
+        cols = st.columns(min(4, max(1, len(panels_used))))
+        for k, panel in enumerate(panels_used):
+            with cols[k % len(cols)]:
+                st.text_input(f"Panel {panel}", key=f"sc_ytitle{panel}",
+                              placeholder="automatic")
+                if any(t.get("right") and (t["panel"] == panel
+                                           or s.get("sc_overlay"))
+                       for t in traces):
+                    st.text_input(f"Panel {panel}, right axis",
+                                  key=f"sc_ytitle{panel}r",
+                                  placeholder="automatic")
+    with st.expander("💾 Saving the figure"):
+        r1, r2, r3 = st.columns(3)
+        r1.selectbox("Save as", ("svg", "png", "jpeg"), key="sc_fmt")
+        r2.number_input("Saved width (px)", 300, 4000, step=50,
                         key="sc_w", value=None if "sc_w" in s else 900)
-        r2.number_input("Resolution ×", 1, 8, key="sc_scale",
+        r3.number_input("Resolution ×", 1, 8, key="sc_scale",
                         value=None if "sc_scale" in s else 3)
     fig = sc.stacked_figure(
         traces, linked=bool(s.get("sc_link")),
@@ -27022,8 +27086,14 @@ def sc_panel():
         x_title=s.get("sc_xtitle") or "x",
         zero_line=bool(s.get("sc_zline")),
         grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
-        mirror=bool(s.get("sc_box", True)),
-        clickable=bool(s.get("sc_click")))
+        clickable=bool(s.get("sc_click")),
+        x_range=sc_global_x_range(),
+        frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
+        y_titles=sc_y_titles(), align_titles=bool(s.get("sc_align", True)),
+        title_space=int(s.get("sc_tspace", 70)),
+        title_size=int(s.get("sc_ts", 16)),
+        bold_titles=bool(s.get("sc_bold")),
+        legend_size=int(s.get("sc_ls", 13)))
     stem = sc.nice_stem([t["file"] for t in traces])
     config = {"displaylogo": False,
               "toImageButtonOptions": {
