@@ -3453,6 +3453,74 @@ def snap_sphere(gray, circle):
     return fit
 
 
+def _hough_near(gray, click, half):
+    """The best-voted circle around the click that contains it, or None."""
+    g = np.asarray(gray)
+    cx, cy = int(round(click[0])), int(round(click[1]))
+    x0, y0 = max(0, cx - half), max(0, cy - half)
+    roi = g[y0:cy + half, x0:cx + half]
+    if roi.size == 0 or min(roi.shape[:2]) < 12:
+        return None
+    blur = cv2.GaussianBlur(roi, (0, 0), 1.5)
+    for votes in (14, 10, 7):
+        found = cv2.HoughCircles(blur, cv2.HOUGH_GRADIENT, dp=1, minDist=2,
+                                 param1=60, param2=votes, minRadius=4,
+                                 maxRadius=max(8, half - 4))
+        if found is None:
+            continue
+        for x, y, r in found[0]:
+            x, y = float(x) + x0, float(y) + y0
+            if math.hypot(x - click[0], y - click[1]) < 0.8 * float(r):
+                return (x, y, float(r))
+    return None
+
+
+def sphere_from_click(gray, click, r_guess=None):
+    """
+    The probe sphere from one click anywhere on it.
+
+    First a Hough circle search in a window round the click (the circle
+    with the most edge votes that contains the click), snapped to the
+    outline when the snap agrees with it. That holds for a sphere on the
+    end of a rod too, where the top of the circle has no edge. Failing
+    that, a few starting points round the click are each snapped
+    (snap_sphere) and the fit whose edge most rays find wins. Returns
+    snap_sphere's dict (ok, center, radius, confidence) or {"ok": False}.
+    """
+    g0 = np.asarray(gray)
+    cx0, cy0 = float(click[0]), float(click[1])
+    half = int(max(90, 0.2 * max(g0.shape[:2])))
+    if r_guess:
+        half = int(max(half, 2.5 * float(r_guess)))
+    circle = _hough_near(g0, (cx0, cy0), half)
+    if circle is not None:
+        fit = snap_sphere(gray, circle)
+        if (fit.get("ok") and math.hypot(fit["center"][0] - circle[0],
+                                         fit["center"][1] - circle[1])
+                < 0.3 * circle[2]
+                and abs(fit["radius"] - circle[2]) < 0.2 * circle[2]):
+            return fit
+        return {"ok": True, "center": (circle[0], circle[1]),
+                "radius": circle[2],
+                "confidence": float(fit.get("confidence", 0.5) or 0.5)}
+    g = SphereEdgeRefiner._suppress_specular(g0)
+    r0 = r_guess or SphereEdgeRefiner._radius_from_center(g, cx0, cy0) or 15.0
+    step = max(3.0, 0.45 * float(r0))
+    starts = [(cx0, cy0)] + [
+        (cx0 + step * math.cos(a), cy0 + step * math.sin(a))
+        for a in np.linspace(0, 2 * math.pi, 8, endpoint=False)]
+    best = None
+    for sx, sy in starts:
+        r = SphereEdgeRefiner._radius_from_center(g, sx, sy) or r0
+        fit = snap_sphere(gray, (sx, sy, r))
+        if not fit.get("ok"):
+            continue
+        key = (round(float(fit["confidence"]), 2),
+               -math.hypot(fit["center"][0] - cx0, fit["center"][1] - cy0))
+        if best is None or key > best[0]:
+            best = (key, fit)
+    return best[1] if best else {"ok": False}
+
 def available():
     """True when OpenCV is importable."""
     return cv2 is not None
