@@ -795,7 +795,13 @@ def drive_file_id(url):
     return None
 
 
-def download_drive_video(url, dest_path, max_bytes=512 * 1024 * 1024):
+# Links download straight to the server, so they are not held by the
+# browser upload and can be much larger than an upload.
+MAX_LINK_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def download_drive_video(url, dest_path, max_bytes=MAX_LINK_BYTES,
+                         progress=None):
     """
     Best-effort download of a publicly shared Drive video.
 
@@ -819,46 +825,83 @@ def download_drive_video(url, dest_path, max_bytes=512 * 1024 * 1024):
     response = opener.open(f"{base}&id={file_id}", timeout=60)
     payload = response.read(65536)
 
-    # Large files return an interstitial page holding a confirm token.
+    # Large files return an interstitial page ("can't scan for viruses").
+    # Newer pages carry a form posting to drive.usercontent.google.com with
+    # hidden fields (id, export, confirm, uuid); older ones a confirm token
+    # in a link. Either is followed.
     if b"<html" in payload[:2048].lower():
         import re
 
-        text = payload.decode("utf-8", errors="ignore")
-        token = None
-        match = re.search(r"confirm=([0-9A-Za-z_-]+)", text)
-        if match:
-            token = match.group(1)
-        if token is None:
-            raise RuntimeError(
-                "Google Drive returned a web page instead of the file. The video is "
-                "probably not shared with 'anyone with the link'. Upload it directly."
-            )
-        response = opener.open(f"{base}&confirm={token}&id={file_id}", timeout=60)
+        text = payload + response.read()
+        text = text.decode("utf-8", errors="ignore")
+        form = re.search(r'<form[^>]+action="([^"]+)"', text)
+        fields = dict(re.findall(
+            r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', text))
+        if form and fields:
+            target = (form.group(1).replace("&amp;", "&") + "?"
+                      + urllib.parse.urlencode(fields))
+        else:
+            match = re.search(r"confirm=([0-9A-Za-z_-]+)", text)
+            if not match:
+                raise RuntimeError(
+                    "Google Drive returned a web page instead of the file. "
+                    "The video is probably not shared with 'anyone with the "
+                    "link'. Upload it directly.")
+            target = f"{base}&confirm={match.group(1)}&id={file_id}"
+        response = opener.open(target, timeout=60)
         payload = response.read(65536)
         if b"<html" in payload[:2048].lower():
             raise RuntimeError(
                 "Google Drive would not serve the file. Upload it directly instead."
             )
 
+    return _stream_to_file(response, payload, dest_path, max_bytes, progress)
+
+
+def _stream_to_file(response, first, dest_path, max_bytes, progress=None):
+    """Write an HTTP response to disk in 4 MB pieces. ``progress(done,
+    total)`` is told how far it has got (total 0 when unknown)."""
+    try:
+        total = int(response.headers.get("Content-Length") or 0)
+    except Exception:
+        total = 0
     written = 0
     with open(dest_path, "wb") as handle:
-        handle.write(payload)
-        written += len(payload)
+        if first:
+            handle.write(first)
+            written += len(first)
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(4 * 1024 * 1024)
             if not chunk:
                 break
             written += len(chunk)
             if written > max_bytes:
                 raise RuntimeError(
-                    f"Video is larger than the {max_bytes / 1e6:.0f} MB limit; "
-                    f"trim it or upload a shorter clip."
-                )
+                    f"Video is larger than the {max_bytes / 1e9:.1f} GB "
+                    "limit; trim it or use a shorter clip.")
             handle.write(chunk)
-
+            if progress is not None:
+                progress(written, total)
     if written < 10_000:
         raise RuntimeError("Downloaded file is too small to be a video.")
     return dest_path
+
+
+def download_url_video(url, dest_path, max_bytes=MAX_LINK_BYTES,
+                       progress=None):
+    """A direct link to a video file (https://…/name.mp4)."""
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    response = urllib.request.urlopen(request, timeout=60)
+    kind = (response.headers.get("Content-Type") or "").lower()
+    first = response.read(65536)
+    if "text/html" in kind or b"<html" in first[:2048].lower():
+        raise RuntimeError(
+            "That link opens a web page, not the video file itself. Use the "
+            "file's direct download link, or a Google Drive / Box share "
+            "link.")
+    return _stream_to_file(response, first, dest_path, max_bytes, progress)
 
 # --------------------------------------------------------------- enhancement
 
@@ -1036,7 +1079,8 @@ def box_shared_id(url):
     return match.group(1) if match else None
 
 
-def download_box_video(url, dest_path, access_token=None, max_bytes=512 * 1024 * 1024):
+def download_box_video(url, dest_path, access_token=None,
+                       max_bytes=MAX_LINK_BYTES):
     """
     Download a video from Box.
 
@@ -1124,7 +1168,7 @@ def download_box_video(url, dest_path, access_token=None, max_bytes=512 * 1024 *
             written += len(chunk)
             if written > max_bytes:
                 raise RuntimeError(
-                    f"Video is larger than the {max_bytes / 1e6:.0f} MB limit; trim "
+                    f"Video is larger than the {max_bytes / 1e9:.1f} GB limit; trim "
                     f"it or upload a shorter clip."
                 )
             handle.write(chunk)
@@ -1134,15 +1178,18 @@ def download_box_video(url, dest_path, access_token=None, max_bytes=512 * 1024 *
     return dest_path
 
 
-def fetch_video(url, dest_path, box_token=None):
-    """Download from whichever service the URL points at."""
+def fetch_video(url, dest_path, box_token=None, progress=None):
+    """Download from whichever service the URL points at: Box, Google
+    Drive, or a direct link to the file."""
+    url = (url or "").strip()
     if not url:
         raise ValueError("No link given.")
     if "box.com" in url:
         return download_box_video(url, dest_path, access_token=box_token)
     if "drive.google.com" in url or "docs.google.com" in url:
-        return download_drive_video(url, dest_path)
+        return download_drive_video(url, dest_path, progress=progress)
+    if url.lower().startswith(("http://", "https://")):
+        return download_url_video(url, dest_path, progress=progress)
     raise ValueError(
-        "Only Google Drive and Box links are recognised. Upload the file directly "
-        "for anything else."
-    )
+        "Paste a Google Drive or Box share link, or a direct https:// link "
+        "to the video file.")
