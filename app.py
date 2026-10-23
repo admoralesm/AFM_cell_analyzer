@@ -273,7 +273,7 @@ def piecewise_problem_note():
             "4-regime engine: " + PIECEWISE_PROBLEM)
 
 if MISSING_PIECES:
-    st.set_page_config(page_title="AFM Cell Analyzer", layout="wide")
+    st.set_page_config(page_title="Single cell compression tools", layout="wide")
     st.error(
         "**This deploy is half updated, so the app cannot start.**\n\n"
         + "\n".join(
@@ -586,7 +586,7 @@ except Exception as exc:  # pragma: no cover
 # ============================================================== page setup ==
 
 st.set_page_config(
-    page_title="AFM Cell Analyzer",
+    page_title="Single cell compression tools",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -21173,12 +21173,8 @@ with st.sidebar:
 
 head_left, head_right = st.columns([4, 1])
 with head_left:
-    st.markdown('<p class="app-title">🔬 AFM Cell Analyzer</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="app-sub">Lulevich two-term compression model · '
-        "F(ε) = Aₘ·Eₘ·ε³ + Aᵢ·Eᵢ·ε³ᐟ²</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown('<p class="app-title">🔬 Single cell compression tools</p>',
+                unsafe_allow_html=True)
 with head_right:
     st.markdown("<div style='text-align:right;color:#6b7785'>v6.0</div>", unsafe_allow_html=True)
 
@@ -21189,24 +21185,24 @@ with head_right:
 SHOW_VIDEO_TAB = False
 SHOW_DATABASE_TAB = False
 
-# The order of the work: the video, the AFM output, making the force-strain
-# file, then the fitting (everything that belongs to it, as its own tabs
+# The order of the work: the video, the AFM output and comparing traces,
+# making the force-strain file, then the fitting (everything that belongs to it, as its own tabs
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_igor, tab_fitting, tab_stack, tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_igor, tab_fitting, tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
         "🔬 AFM output analysis",
+        "📚 Stack & compare",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
-        "📚 Stack & compare",
         "🎥 Compression video",
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 4
+FITTING_TAB_NUMBER = 5
 
 with tab_fitting:
     (
