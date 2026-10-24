@@ -297,7 +297,10 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    y_titles=None, align_titles=True, title_space=70,
                    title_size=None, bold_titles=False, legend_size=None,
                    legend_line=40, width=None, stats_box="Off",
-                   stats_place="Inside, bottom right", baselines=True):
+                   stats_place="Inside, bottom right", baselines=True,
+                   crosshair=False, crosshair_width=1.0, zero_width=1.0,
+                   bold_ticks=False, legend_title="", legend_box=False,
+                   legend_bold=False):
     """
     The files in panels, one above the other.
 
@@ -383,7 +386,8 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                 ticks=ticks, tickwidth=axis_width,
                 ticklen=max(4, int(3 * axis_width)), tickcolor="black",
                 showgrid=bool(grid), gridcolor="#e6e6e6", zeroline=False,
-                tickfont=dict(size=font_size, color="black"),
+                tickfont=dict(size=font_size, color="black",
+                              weight="bold" if bold_ticks else "normal"),
                 title_font_size=title_size, automargin=True,
                 exponentformat="power")
     fig.update_xaxes(mirror=mirror, **axes)
@@ -405,7 +409,9 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                         showgrid=bool(grid) and not side)
             if right[r]:
                 spec.update(linecolor=colour, tickcolor=colour,
-                            tickfont=dict(size=font_size, color=colour))
+                            tickfont=dict(size=font_size, color=colour,
+                                          weight="bold" if bold_ticks
+                                          else "normal"))
             y_range = _first(items, "y_range")
             neg = any(t.get("neg_up") for t in items)
             if y_range is not None:
@@ -430,7 +436,9 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                              autorange=False)
     if zero_line:
         for r in range(1, rows + 1):
-            fig.add_vline(x=0, line=dict(color="#888", width=1, dash="dot"),
+            fig.add_vline(x=0, line=dict(color="#888",
+                                         width=float(zero_width),
+                                         dash="dot"),
                           row=r, col=1)
     has_right = any(right.values())
     height = (int(panel_height * rows / max(0.4, 1 - gap * (rows - 1)) + 90)
@@ -457,6 +465,31 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                 fig.add_vrect(x0=window[0], x1=window[1], row=r, col=1,
                               fillcolor=t["colour"], opacity=0.07,
                               line_width=0)
+            # the threshold a peak has to clear, dotted either side
+            for band in t.get("threshold_lines") or ():
+                fig.add_trace(go.Scatter(
+                    x=bx, y=band, mode="lines", showlegend=False,
+                    hoverinfo="skip", line=dict(color=t["colour"], width=1,
+                                                dash="dot")),
+                    row=r, col=1,
+                    secondary_y=any(t is u for u in right[r]))
+    # the peaks counted in the statistics, marked on the trace
+    for t in traces:
+        marks = t.get("peak_marks")
+        if not marks:
+            continue
+        r = row_of[1 if overlay else int(t.get("panel") or 1)]
+        for (px, py, symbol, text) in marks:
+            if not len(px):
+                continue
+            fig.add_trace(go.Scatter(
+                x=px, y=py, mode="markers", showlegend=False,
+                name=f"{t['label']} {text}",
+                marker=dict(symbol=symbol, size=10, color=t["colour"],
+                            line=dict(color="black", width=1)),
+                hovertemplate=f"{text}<br>x = %{{x:.6g}}<br>"
+                              "y = %{y:.6g}<extra></extra>"),
+                row=r, col=1, secondary_y=any(t is u for u in right[r]))
 
     # the summary balloons: one per panel (or one per file below the plot)
     extra_bottom = 0
@@ -513,8 +546,17 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     right_m = ((title_space + title_size + 6) if align_titles else 80) \
         if has_right else 30
     place = LEGEND_PLACES_SPEC.get(legend, LEGEND_PLACES_SPEC["Above"])
-    legend_spec = dict(place, font=dict(size=int(legend_size or font_size)),
+    legend_spec = dict(place, font=dict(size=int(legend_size or font_size),
+                                        weight="bold" if legend_bold
+                                        else "normal"),
                        itemwidth=max(30, int(legend_line or 40)))
+    if legend_title:
+        legend_spec["title"] = dict(
+            text=f"<b>{legend_title}</b>",
+            font=dict(size=int(legend_size or font_size) + 1))
+    if legend_box:
+        legend_spec.update(bordercolor="black", borderwidth=1,
+                           bgcolor="rgba(255,255,255,0.85)")
     if legend == "Right, outside":
         legend_spec["x"] = 1.0 + (right_m + 10) / 900.0 if has_right \
             else 1.02
@@ -532,6 +574,15 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
         showlegend=bool(len(traces) > 1) and legend != "Hidden",
         legend=legend_spec,
         hovermode="closest", clickmode="event+select", dragmode="zoom")
+    if crosshair:
+        # a crosshair that follows the cursor: lines across the whole
+        # panel at its x and y, with the nearest point always found
+        spikes = dict(showspikes=True, spikemode="across",
+                      spikesnap="cursor", spikedash="solid",
+                      spikecolor="#444", spikethickness=float(crosshair_width))
+        fig.update_xaxes(**spikes)
+        fig.update_yaxes(**spikes)
+        fig.update_layout(hoverdistance=-1, spikedistance=-1)
     for t in traces:
         t.pop("_panel", None)
     return fig
@@ -560,10 +611,17 @@ def summary_lines(trace, mode):
     """The lines of a file's summary balloon: the analysis summary sent
     with it (none for a file loaded by hand), or descriptive statistics
     of what is plotted."""
-    if mode == "Analysis summary":
+    if trace.get("peak_stats"):
+        stats = trace["peak_stats"]
+    elif mode == "Analysis summary":
         stats = trace.get("stats") or []
     else:
-        stats = describe(trace.get("y", []))
+        factor = float(trace.get("stats_factor", 1.0) or 1.0)
+        unit = trace.get("stats_unit", "")
+        stats = describe(np.asarray(trace.get("y", []), float) * factor)
+        if unit:
+            stats = [(k, v if k == "n" else f"{v} {unit}")
+                     for k, v in stats]
     return [f"{k}: {v}" for k, v in stats]
 
 
@@ -596,8 +654,17 @@ def baseline_departure(x, y, x0, x1, k=3.0, order=1, direction="either",
     coeffs, sd = fit_baseline(x, y, x0, x1, order)
     if coeffs is None:
         return None, None, None
+    return departure_from(x, y, coeffs, sd, max(x0, x1), k, direction, run)
+
+
+def departure_from(x, y, coeffs, sd, after_x, k=3.0, direction="either",
+                   run=5):
+    """baseline_departure for a baseline already known (fitted, or set by
+    hand): the contact after ``after_x``. Returns (x or None, coeffs,
+    sd)."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
+    sd = float(sd) if sd is not None and np.isfinite(sd) else 0.0
     resid = y - np.polyval(coeffs, x)
     limit = float(k) * max(sd, 1e-12)
     if direction == "up":
@@ -606,7 +673,7 @@ def baseline_departure(x, y, x0, x1, k=3.0, order=1, direction="either",
         out = resid < -limit
     else:
         out = np.abs(resid) > limit
-    after = x > max(x0, x1)
+    after = x > float(after_x)
     out &= after & np.isfinite(resid)
     count = 0
     for i in np.flatnonzero(after):
@@ -621,6 +688,94 @@ def baseline_departure(x, y, x0, x1, k=3.0, order=1, direction="either",
                 j -= 1
             return float(x[j]), coeffs, sd
     return None, coeffs, sd
+
+
+PEAK_DIRECTIONS = ("both", "up", "down")
+
+
+def unit_of(name):
+    """The unit in a column name: 'Time (s)' -> 's', else ''."""
+    found = re.search(r"\(([^()]+)\)\s*$", str(name))
+    return found.group(1).strip() if found else ""
+
+
+def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
+                  factor=1.0, unit="", x_unit=""):
+    """
+    Peaks above and dips below a baseline.
+
+    ``base`` is the baseline at every x. A peak counts when it rises at
+    least ``min_height`` above the baseline (a dip: falls that far below)
+    and is at least ``min_sep`` (x units) from the next one counted.
+    Amplitudes are measured from the baseline and reported × ``factor`` in
+    ``unit`` (e.g. a deflection in µm × k → force in nN).
+
+    Returns {"up": indices, "down": indices, "stats": [(label, value)]}.
+    """
+    from scipy.signal import find_peaks
+
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    base = np.asarray(base, float)
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(base)
+    out = {"up": np.array([], int), "down": np.array([], int), "stats": []}
+    if ok.sum() < 3:
+        return out
+    idx = np.flatnonzero(ok)
+    r = (y - base)[ok]
+    xs = x[ok]
+    dx = float(np.median(np.diff(xs))) if xs.size > 1 else 1.0
+    distance = max(1, int(round(float(min_sep) / dx))) if (
+        min_sep and dx > 0) else None
+    height = max(float(min_height), 0.0)
+    kw = dict(height=height, prominence=height or None)
+    if distance:
+        kw["distance"] = distance
+    up = find_peaks(r, **kw)[0] if direction in ("both", "up") else []
+    down = find_peaks(-r, **kw)[0] if direction in ("both", "down") else []
+    out["up"], out["down"] = idx[np.asarray(up, int)], idx[np.asarray(down,
+                                                                       int)]
+    u = f" {unit}" if unit else ""
+    f = float(factor)
+    level = float(np.nanmedian(base[ok])) * f
+    stats = [("Baseline", f"{level:.4g}{u}"),
+             ("Threshold", f"± {height * f:.3g}{u}")]
+    span = float(np.ptp(xs)) if xs.size > 1 else 0.0
+    for name, picks, sign in (("up", up, 1.0), ("down", down, -1.0)):
+        if direction not in ("both", name):
+            continue
+        picks = np.asarray(picks, int)
+        amps = sign * r[picks] * f
+        label = "Peaks up" if name == "up" else "Peaks down"
+        if picks.size == 0:
+            stats.append((label, "none"))
+            continue
+        stats.append((label, f"{picks.size}"))
+        stats.append((f"  amplitude ({name})", _mean_sd(amps) + u))
+        stats.append((f"  largest ({name})", f"{np.max(amps):.4g}{u}"))
+    every = np.sort(np.concatenate([np.asarray(up, int),
+                                    np.asarray(down, int)]))
+    if every.size >= 2 and span > 0:
+        gaps = np.diff(xs[every])
+        per = f" /{x_unit}" if x_unit else " per x unit"
+        stats.append(("Rate", f"{every.size / span:.4g}{per}"))
+        stats.append(("Interval", _mean_sd(gaps)
+                      + (f" {x_unit}" if x_unit else "")))
+    out["stats"] = stats
+    return out
+
+
+def _mean_sd(v, digits=3):
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return "–"
+    if v.size == 1:
+        return f"{v[0]:.{digits + 1}g}"
+    mean, sd = float(np.mean(v)), float(np.std(v, ddof=1))
+    scale = abs(mean) if mean else max(sd, 1e-12)
+    decimals = max(0, digits - 1 - int(math.floor(math.log10(scale))))
+    return f"{mean:.{decimals}f} ± {sd:.{decimals}f}"
 
 
 def nice_stem(names) -> str:
