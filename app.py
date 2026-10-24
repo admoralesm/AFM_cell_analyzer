@@ -8944,7 +8944,7 @@ def motion_rulers(image_rgb, step=None):
 # the page's own record, so there is never a second, disagreeing copy of
 # the points living inside the canvas.
 
-ZOOM_LEVELS = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+ZOOM_LEVELS = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0)
 VIEW_WIDTH_PX = 760
 
 
@@ -9669,6 +9669,466 @@ def video_viewer(path, details):
                 args=("sp_frame", f), **STRETCH)
 
 
+# ------------------------------------------------------ the video stage ----
+#
+# One picture of the video for everything on the tab. The frame slider and
+# the step buttons move through it, the zoom (up to 16×) goes in close, and
+# what a click on it does is chosen beside it: look, zoom in on that spot,
+# place the four corners, correct a tracked corner, or mark the probe
+# sphere. The tracking, once run, is drawn on it at whatever frame is on
+# show, so there is no second picture to keep in step with the first.
+
+STAGE_LOOK, STAGE_ZOOM, STAGE_CORNERS, STAGE_CORRECT, STAGE_SPHERE = (
+    "👁️ Look", "🔍 Zoom in", "🎯 Corners", "✏️ Correct", "⚪ Sphere")
+STAGE_MODES = (STAGE_LOOK, STAGE_ZOOM, STAGE_CORNERS, STAGE_CORRECT,
+               STAGE_SPHERE)
+
+
+def time_tag(frame, fps):
+    """00m04s100: the moment a frame was taken, for file names."""
+    ms = int(round(1000.0 * int(frame) / float(fps or ct.DEFAULT_FPS)))
+    return f"{ms // 60000:02d}m{(ms // 1000) % 60:02d}s{ms % 1000:03d}"
+
+
+def stage_result():
+    """(result, held) of the corner tracking on show, or (None, None)."""
+    result = st.session_state.get("mt_result")
+    if result is None:
+        return None, None
+    held, _ = ct.settle(result, follow_under_probe=bool(
+        st.session_state.get("mt_follow", True)))
+    return result, held
+
+
+def stage_row(result, frame_no):
+    """The row of the tracking for this frame, or None outside it."""
+    if result is None:
+        return None
+    frames = result["frames"]
+    if not (int(frames[0]) <= int(frame_no) <= int(frames[-1])):
+        return None
+    return int(np.argmin(np.abs(frames - int(frame_no))))
+
+
+def stage_edit(frame_no, row, held):
+    """The corners being corrected on this frame (saved, or as tracked)."""
+    edit = st.session_state.get("mt_cedit")
+    if not edit or int(edit.get("frame", -1)) != int(frame_no):
+        source = motion_corrections().get(int(frame_no))
+        if source is None:
+            source = [tuple(map(float, p)) for p in held[row]]
+        edit = {"frame": int(frame_no), "points": source}
+        st.session_state["mt_cedit"] = edit
+    return edit
+
+
+def stage_paint(frame, box, view, scale, frame_no, mode):
+    """The frame on show with everything that belongs on it (RGB out)."""
+    s = st.session_state
+    cv = ct.cv2
+    image = view.copy()
+    circle = sphere_circle()
+    if circle and (mode == STAGE_SPHERE or s.get("vs_show_sphere", True)):
+        c = to_view([circle[:2]], box, scale)[0]
+        image = cv.cvtColor(sphere_paint(image, tuple(c), None,
+                                         circle[2] * scale, scale),
+                            cv.COLOR_RGB2BGR)
+    microns = motion_microns()
+    result, held = stage_result()
+    row = stage_row(result, frame_no)
+    anchored_now = str(s.get("mt_method", "")).startswith("Area")
+    if mode == STAGE_CORRECT and row is not None:
+        points = stage_edit(frame_no, row, held)["points"]
+        radius = result.get("radius")
+        lock = result.get("lock")
+        out = motion_preview(
+            image, to_view(points, box, scale), microns=microns,
+            radius=(radius * scale if radius else None),
+            lock=(lock[row] if lock is not None
+                  and int(frame_no) not in motion_corrections() else None),
+            view_scale=scale)
+        tracked = [tuple(map(float, p)) for p in held[row]]
+        for p, q in zip(points, tracked):
+            if np.hypot(p[0] - q[0], p[1] - q[1]) > 0.05:
+                v = to_view([q], box, scale)[0]
+                c = (int(round(v[0])), int(round(v[1])))
+                cv.drawMarker(out, c, (0, 0, 0), cv.MARKER_TILTED_CROSS,
+                              14, 4, cv.LINE_AA)
+                cv.drawMarker(out, c, (200, 200, 200),
+                              cv.MARKER_TILTED_CROSS, 14, 1, cv.LINE_AA)
+        return out
+    if row is not None and mode != STAGE_CORNERS:
+        trail = held[:row + 1] if s.get("mt_trails", True) else None
+        rings = result.get("method") == "ref" and s.get("mt_rings", True)
+        lock = result.get("lock")
+        return motion_preview(
+            image, to_view(held[row], box, scale),
+            trail=(to_view(trail, box, scale) if trail is not None
+                   else None),
+            microns=microns,
+            radius=(result.get("radius") * scale if rings else None),
+            lock=(lock[row] if rings and lock is not None else None),
+            view_scale=scale)
+    markers = motion_markers()
+    radius = int(s.get("mt_radius", 15)) if anchored_now else None
+    return motion_preview(
+        image, to_view(markers, box, scale) if markers else [],
+        microns=microns, radius=(radius * scale if radius else None),
+        view_scale=scale)
+
+
+def stage_click(clicked, frame, frame_no, mode):
+    """What a click on the picture does, by the mode chosen."""
+    s = st.session_state
+    if mode == STAGE_ZOOM:
+        zoom = float(s.get("vz_zoom", 1.0) or 1.0)
+        bigger = [z for z in ZOOM_LEVELS if z > zoom]
+        s["_vz_zoom_next"] = bigger[0] if bigger else zoom
+        s["_vz_centre_next"] = (int(round(clicked[0])),
+                                int(round(clicked[1])))
+    elif mode == STAGE_CORNERS:
+        markers = [tuple(p) for p in motion_markers()]
+        labels = list(ct.POINT_LABELS)
+        target = s.get("vs_target") or labels[min(len(markers), 3)]
+        index = labels.index(target) if target in labels else len(markers)
+        if index < len(markers):
+            markers[index] = clicked
+        else:
+            markers.append(clicked)
+        motion_set_markers(markers)
+        s["mt_start"] = int(frame_no)
+        s["_vs_target_next"] = (labels[len(markers)] if len(markers) < 4
+                                else target)
+    elif mode == STAGE_CORRECT:
+        result, held = stage_result()
+        row = stage_row(result, frame_no)
+        if row is None:
+            return
+        edit = stage_edit(frame_no, row, held)
+        labels = list(ct.POINT_LABELS)
+        target = s.get("vs_ctarget") or labels[0]
+        points = [tuple(p) for p in edit["points"]]
+        points[labels.index(target)] = clicked
+        s["mt_cedit"] = {"frame": int(frame_no), "points": points}
+    elif mode == STAGE_SPHERE:
+        fit = {"ok": False}
+        if aa is not None and not AUTO_ERROR:
+            gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
+            fit = aa.sphere_from_click(gray, clicked)
+        circle = sphere_circle()
+        if fit.get("ok"):
+            sphere_set(fit["center"][0], fit["center"][1], fit["radius"])
+            s["_sp_note"] = (f"Fitted to its edge ({100 * fit['confidence']:.0f}"
+                             " % of the outline found).")
+        else:
+            sphere_set(clicked[0], clicked[1], circle[2] if circle else 15.0)
+            s["_sp_note"] = ("No clear edge there: the circle is where you "
+                             "clicked. Set its size with the slider.")
+        s["sp_frame"] = int(frame_no)
+
+
+def stage_zoom_row(shape, centre=None):
+    """Zoom, compact: the level, back to the whole frame, and panning."""
+    s = st.session_state
+    height, width = shape[:2]
+    pending = s.pop("_vz_zoom_next", None)
+    if pending is not None:
+        s["vz_zoom"] = float(pending)
+    if float(s.get("vz_zoom", 1.0)) not in ZOOM_LEVELS:
+        s["vz_zoom"] = 1.0
+    moved = s.pop("_vz_centre_next", None)
+    if moved is not None:
+        s["vz_x"], s["vz_y"] = moved
+    s["vz_x"] = clamp_int(s.get("vz_x", width // 2), 0, width - 1)
+    s["vz_y"] = clamp_int(s.get("vz_y", height // 2), 0, height - 1)
+
+    def whole():
+        s["vz_zoom"] = 1.0
+
+    z1, z2, z3 = st.columns([2.2, 1, 1])
+    z1.select_slider("🔍 Zoom", ZOOM_LEVELS, key="vz_zoom",
+                     format_func=zoom_text,
+                     help="Or choose 🔍 Zoom in and click a spot on the "
+                          "picture. Positions are always in the video's "
+                          "own pixels.")
+    z2.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+    z2.button("⤢ All", key="vz_all", on_click=whole, **STRETCH,
+              help="Back to the whole frame.")
+    z3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+    with z3.popover("✥ Pan", **STRETCH):
+        zoomed = float(s.get("vz_zoom", 1.0)) > 1.0
+        st.slider("Centre across (px)", 0, width - 1, key="vz_x",
+                  disabled=not zoomed)
+        st.slider("Centre down (px)", 0, height - 1, key="vz_y",
+                  disabled=not zoomed)
+        if centre is not None and st.button("🎯 On the cell", key="vz_centre"):
+            s["_vz_centre_next"] = (int(round(centre[0])),
+                                    int(round(centre[1])))
+            rerun_keeping_settings()
+
+
+def stage_corner_controls():
+    s = st.session_state
+    markers = motion_markers()
+    labels = list(ct.POINT_LABELS)
+    options = labels[:min(4, len(markers) + 1)]
+    next_target("vs_target", options,
+                wanted=labels[len(markers)] if len(markers) < 4 else None)
+    st.radio("The next click places", options, key="vs_target",
+             horizontal=True)
+    c1, c2 = st.columns(2)
+    if c1.button("↶ Undo", key="vs_undo", disabled=not markers, **STRETCH):
+        motion_set_markers(markers[:-1])
+        rerun_keeping_settings()
+    if c2.button("🗑️ Clear", key="vs_clear", disabled=not markers,
+                 **STRETCH):
+        motion_set_markers([])
+        rerun_keeping_settings()
+    st.caption(f"**{len(markers)} of 4** placed, in order round the cell, "
+               f"on frame {int(s.get('mt_start', 0))} (where tracking "
+               "starts). Zoom in and click again to place one precisely.")
+
+
+def stage_correct_controls(frame_no):
+    s = st.session_state
+    result, held = stage_result()
+    row = stage_row(result, frame_no)
+    if result is None:
+        st.info("Track the corners first (🎯 Track the corners, below).",
+                icon="ℹ️")
+        return
+    if row is None or int(frame_no) <= int(result["frames"][0]):
+        st.info("Go to a tracked frame after the start to correct it.",
+                icon="ℹ️")
+        return
+    labels = list(ct.POINT_LABELS)
+    if s.get("vs_ctarget") not in labels:
+        s["vs_ctarget"] = labels[0]
+    st.radio("The next click moves", labels, key="vs_ctarget",
+             horizontal=True)
+    edit = stage_edit(frame_no, row, held)
+    points = edit["points"]
+    tracked = [tuple(map(float, p)) for p in held[row]]
+    corrections = motion_corrections()
+    moved = [labels[k] for k, (p, q) in enumerate(zip(points, tracked))
+             if np.hypot(p[0] - q[0], p[1] - q[1]) > 0.05]
+    c1, c2, c3 = st.columns(3)
+    if c1.button("✅ Save", key="vs_csave", type="primary", **STRETCH,
+                 help=f"Makes frame {int(frame_no)} a correction."):
+        stored = dict(s.get("mt_corrections") or {})
+        stored[int(frame_no)] = [tuple(map(float, p)) for p in points]
+        s["mt_corrections"] = stored
+        rerun_keeping_settings()
+    if c2.button("↺ Undo", key="vs_creset", disabled=not moved, **STRETCH,
+                 help="Back to where the tracker had them."):
+        s["mt_cedit"] = {"frame": int(frame_no), "points": tracked}
+        rerun_keeping_settings()
+    if c3.button("🗑️", key="vs_cdel", **STRETCH,
+                 disabled=int(frame_no) not in corrections,
+                 help="Remove the correction saved on this frame."):
+        stored = dict(s.get("mt_corrections") or {})
+        stored.pop(int(frame_no), None)
+        s["mt_corrections"] = stored
+        s.pop("mt_cedit", None)
+        rerun_keeping_settings()
+    note = ("Moved: " + ", ".join(moved) + " (grey × = tracker). "
+            if moved else "")
+    if corrections:
+        note += ("Saved on frame" + ("s " if len(corrections) > 1 else " ")
+                 + ", ".join(str(f) for f in sorted(corrections))
+                 + "; press 🔁 Re-track below to apply.")
+    if note:
+        st.caption(note)
+
+
+def stage_sphere_controls(path, frame_no):
+    s = st.session_state
+    ready = aa is not None and not AUTO_ERROR
+    circle = sphere_circle()
+    pending = s.pop("_sp_r_next", None)
+    if pending is not None:
+        s["sp_r_adj"] = float(pending)
+    elif circle:
+        s["sp_r_adj"] = round(float(circle[2]), 1)
+    st.caption("Click anywhere on the sphere: it is found and fitted to "
+               "its edge. Its size sets the scale.")
+    st.slider("Size (radius, px)", 2.0, 200.0, step=0.1, key="sp_r_adj",
+              on_change=sphere_resize, disabled=circle is None)
+    c1, c2 = st.columns(2)
+    if c1.button("🔎 Find it", key="sp_find", disabled=not ready, **STRETCH,
+                 help="Looks for it without a click."):
+        found = aa.SphereEdgeRefiner.auto_detect_multiframe(
+            path, int(frame_no), hint_xy=None)
+        if found is None:
+            s["_sp_note"] = "No sphere found on its own. Click on it."
+        else:
+            frame = motion_frame(path, video_signature(), int(frame_no))
+            gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
+            cx, cy = found["center"]
+            fit = aa.snap_sphere(gray, (float(cx), float(cy),
+                                        float(found["radius"])))
+            if fit.get("ok"):
+                (cx, cy), r = fit["center"], fit["radius"]
+            else:
+                r = found["radius"]
+            sphere_set(cx, cy, r)
+            s["sp_frame"] = int(frame_no)
+            s["_sp_note"] = "Found it. Check the circle."
+        rerun_keeping_settings()
+    if c2.button("🗑️ Forget", key="sp_clear", disabled=circle is None,
+                 **STRETCH):
+        for name in ("sp_circle", "sp_edge", "sp_centre_only", "sp_r_adj"):
+            s.pop(name, None)
+        rerun_keeping_settings()
+    note = s.pop("_sp_note", None)
+    if note:
+        st.caption(note)
+    st.number_input("Sphere diameter (µm)", 0.1, 1000.0, step=1.0,
+                    key="sp_um")
+    circle = sphere_circle()
+    scale = sphere_scale()
+    if circle:
+        st.caption(f"{2 * circle[2]:.1f} px across"
+                   + (f" · **{scale:.4f} µm/px**, used for the tracking and "
+                      "the automatic analysis" if scale else ""))
+
+
+def stage_frame_actions(path, frame, frame_no, fps, last, painted):
+    """Use the frame on show: start/end of things, or save it."""
+    s = st.session_state
+
+    def put(key, value):
+        s[key] = value
+
+    def clip_edge(which):
+        lo, hi = s.get("clip_range") or (0, last)
+        f = int(frame_no)
+        lo, hi = (f, max(int(hi), f)) if which == 0 else (min(int(lo), f), f)
+        s["clip_range"] = (lo, hi)
+
+    f = int(frame_no)
+    with st.popover("⏱️ Use this frame for…", **STRETCH):
+        st.button("🎯 Start the tracking here", key="vw_mt_start",
+                  on_click=put, args=("mt_start", f), **STRETCH)
+        c1, c2 = st.columns(2)
+        c1.button("🤖 Analyse from", key="vw_au_start", on_click=put,
+                  args=("au_start", f), **STRETCH)
+        c2.button("🤖 … to", key="vw_au_end", on_click=put,
+                  args=("au_end", f), **STRETCH)
+        c1.button("✂️ Clip from", key="vw_clip_lo", on_click=clip_edge,
+                  args=(0,), **STRETCH)
+        c2.button("✂️ … to", key="vw_clip_hi", on_click=clip_edge,
+                  args=(1,), **STRETCH)
+    with st.popover("📸 Save this frame", **STRETCH):
+        source = s.get("video_name") or s.get("video_path") or "video"
+        stem = re.sub(r"\.[^.]+$", "", os.path.basename(str(source)))
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem) or "video"
+        marked = st.checkbox("With the markings drawn on", key="vw_marked",
+                             help="Off: the frame exactly as recorded, at "
+                                  "full size.")
+        default = (f"{stem}_frame{f:05d}_t{time_tag(f, fps)}"
+                   + ("_marked" if marked else "") + ".png")
+        name = name_box("vw_frame_name", default, label="File name")
+        if not name.lower().endswith((".png", ".jpg", ".jpeg", ".tif",
+                                      ".tiff")):
+            name += ".png"
+        if marked:
+            image = ct.cv2.cvtColor(painted, ct.cv2.COLOR_RGB2BGR)
+        else:
+            image = frame
+        ext = os.path.splitext(name)[1].lower()
+        ok, data = ct.cv2.imencode(ext if ext != ".jpeg" else ".jpg", image)
+        st.download_button("💾 Download", data=data.tobytes() if ok else b"",
+                           file_name=name, disabled=not ok,
+                           mime="image/png" if ext == ".png" else None,
+                           key="vw_frame_dl", **STRETCH)
+        st.caption(f"Frame {f}, t = {ct.format_time(f / fps)}"
+                   + ("" if marked else
+                      f", {frame.shape[1]}×{frame.shape[0]} px"))
+
+
+def video_stage(path, details):
+    """The one picture of the video, and what a click on it does."""
+    s = st.session_state
+    last = int(details["frame_count"]) - 1
+    fps = float(details["fps"])
+    shape = (int(details["height"]), int(details["width"]))
+    s["vw_frame"] = clamp_int(s.get("vw_frame", 0), 0, last)
+    if s.get("vs_mode") not in STAGE_MODES:
+        s["vs_mode"] = STAGE_LOOK
+
+    def step(n):
+        s["vw_frame"] = clamp_int(int(s.get("vw_frame", 0)) + n, 0, last)
+
+    pic, side = st.columns([2.6, 1], gap="medium")
+    with side:
+        mode = st.radio("A click on the picture", STAGE_MODES,
+                        key="vs_mode", horizontal=True,
+                        help="Look only; zoom in on the spot clicked; place "
+                             "the four corners; correct a tracked corner; "
+                             "or mark the probe sphere.")
+        placed = motion_markers()
+        stage_zoom_row(shape, centre=(tuple(np.mean(np.asarray(placed),
+                                                    axis=0))
+                                      if placed else None))
+    with pic:
+        b1, b2, mid, b3, b4 = st.columns([1, 1, 9, 1, 1])
+        b1.button("⏪", key="vw_back10", on_click=step, args=(-10,),
+                  help="10 frames back", **STRETCH)
+        b2.button("◀", key="vw_back1", on_click=step, args=(-1,),
+                  help="One frame back", **STRETCH)
+        frame_no = mid.slider("Frame", 0, max(last, 1), key="vw_frame",
+                              label_visibility="collapsed")
+        b3.button("▶", key="vw_fwd1", on_click=step, args=(1,),
+                  help="One frame on", **STRETCH)
+        b4.button("⏩", key="vw_fwd10", on_click=step, args=(10,),
+                  help="10 frames on", **STRETCH)
+        frame = motion_frame(path, video_signature(), int(frame_no))
+        if frame is None:
+            st.error(f"Could not read frame {frame_no}.")
+            return
+        box = view_box(frame.shape)
+        view, scale = view_render(frame, box)
+        painted = stage_paint(frame, box, view, scale, int(frame_no), mode)
+        clicked = None
+        if mode != STAGE_LOOK and HAS_CANVAS and not s.get("mt_canvas_error"):
+            try:
+                clicked = click_on(painted, "vs_canvas", box, scale)
+            except Exception as exc:  # pragma: no cover - depends on deploy
+                s["mt_canvas_error"] = f"{type(exc).__name__}: {exc}"
+                st.image(painted, **STRETCH)
+        else:
+            st.image(painted, **STRETCH)
+            if mode != STAGE_LOOK:
+                st.caption("Clicking needs streamlit-drawable-canvas; the "
+                           "corners can be typed on 🎯 Track the corners.")
+        st.caption(f"Frame {int(frame_no)} of {last} · "
+                   f"t = {ct.format_time(int(frame_no) / fps)}"
+                   + ("" if box[2] - box[0] == frame.shape[1]
+                      else f" · zoomed on x {box[0]}–{box[2]}, "
+                           f"y {box[1]}–{box[3]}"))
+    if clicked is not None:
+        stage_click(clicked, frame, int(frame_no), mode)
+        rerun_keeping_settings()
+    with side:
+        if mode == STAGE_CORNERS:
+            stage_corner_controls()
+        elif mode == STAGE_CORRECT:
+            stage_correct_controls(int(frame_no))
+        elif mode == STAGE_SPHERE:
+            stage_sphere_controls(path, int(frame_no))
+        elif mode == STAGE_ZOOM:
+            st.caption("Click a spot on the picture to zoom in on it, one "
+                       "step per click. ⤢ All goes back to the whole frame.")
+        result, _held = stage_result()
+        with st.popover("👁️ Show on the picture", **STRETCH):
+            st.checkbox("The probe sphere", key="vs_show_sphere",
+                        value=None if "vs_show_sphere" in s else True)
+            st.checkbox("The trails of the corners", key="mt_trails")
+            st.checkbox("The tracking areas (rings)", key="mt_rings")
+        stage_frame_actions(path, frame, int(frame_no), fps, last, painted)
+
+
 # --------------------------------------------------------- export names ----
 #
 # Every file that leaves the video tab is named after the video it came
@@ -10294,52 +10754,9 @@ def motion_results_panel(result, held, microns):
             f"**markers_tracked** column in the table says which frames "
             f"those are.")
 
-    # Watch it happen. Four numbers in a table cannot say whether a corner
-    # came off the cell halfway through; one frame with the quadrilateral
-    # drawn on it can, and this is the frame by frame version of the
-    # desktop app's trajectory picture.
-    path = st.session_state.get("video_path")
-    if path and os.path.exists(path):
-        with st.expander("🎞️ Watch the corners move", expanded=True):
-            w1, w2 = st.columns([3, 1])
-            with w1:
-                st.session_state["mt_show"] = clamp_int(
-                    st.session_state.get("mt_show", start),
-                    int(frames[0]), int(frames[-1]))
-                at = st.slider("Frame", int(frames[0]), int(frames[-1]),
-                               key="mt_show", label_visibility="collapsed")
-            with w2:
-                st.checkbox("Show the trails", key="mt_trails")
-                if anchored:
-                    st.checkbox("Show the tracking areas", key="mt_rings")
-            row = int(np.argmin(np.abs(frames - int(at))))
-            shot = motion_frame(path, video_signature(), int(frames[row]))
-            if shot is not None:
-                trail = (held[:row + 1]
-                         if st.session_state.get("mt_trails", True) else None)
-                rings = (anchored and st.session_state.get("mt_rings", True))
-                lock = result.get("lock")
-                box = view_box(shot.shape)
-                view, scale = view_render(shot, box)
-                corrected = int(frames[row]) in set(
-                    result.get("anchors") or [])
-                st.image(
-                    motion_preview(view, to_view(held[row], box, scale),
-                                   trail=(to_view(trail, box, scale)
-                                          if trail is not None else None),
-                                   microns=microns,
-                                   radius=(result.get("radius") * scale
-                                           if rings else None),
-                                   lock=(lock[row] if rings and lock
-                                         is not None else None),
-                                   view_scale=scale),
-                    caption=(f"Frame {int(frames[row])} · "
-                             f"t = {ct.format_time(times[row])} · "
-                             f"{int(tracked[row])} of {held.shape[1]} corners "
-                             f"tracked here"
-                             + (" · ✏️ placed by hand here" if corrected
-                                else "")),
-                    **STRETCH)
+    st.caption("🎞️ The tracked corners are drawn on the picture at the "
+               "top at whatever frame is on show (trails and rings under "
+               "👁️ Show on the picture).")
 
     labels = [ct.POINT_LABELS[i % len(ct.POINT_LABELS)]
               for i in range(held.shape[1])]
@@ -24443,22 +24860,29 @@ with tab_motion:
             + (f" ({TRACKING_ERROR})." if TRACKING_ERROR else "."),
             icon="🚫")
     else:
-        st.markdown(
-            "Select the four corners of the cell and follow them through "
-            "the compression, or let the **automatic analysis** find the "
-            "probe and the cell by itself and list every contraction. Each "
-            "corner owns one small circular area, and on every frame that "
-            "area is found again by matching it, to a fraction of a pixel, "
-            "against how it looked on the first frame, so the corner cannot "
-            "creep off the spot that was picked. When the probe hides a "
-            "corner it is carried by the other three until its area is seen "
-            "again. What comes out is how fast each part of the cell moved, "
-            "how far, and what the quadrilateral they make does as the cell "
-            "is squashed.")
+        with st.popover("ℹ️ What this tab does"):
+            st.markdown(
+                "Select the four corners of the cell and follow them through "
+                "the compression, or let the **automatic analysis** find the "
+                "probe and the cell by itself and list every contraction. Each "
+                "corner owns one small circular area, and on every frame that "
+                "area is found again by matching it, to a fraction of a pixel, "
+                "against how it looked on the first frame, so the corner cannot "
+                "creep off the spot that was picked. When the probe hides a "
+                "corner it is carried by the other three until its area is seen "
+                "again. What comes out is how fast each part of the cell moved, "
+                "how far, and what the quadrilateral they make does as the cell "
+                "is squashed.")
 
         # ---- 1 · the video -------------------------------------------
-        st.markdown("**1 · The video**")
-        up1, up2 = st.columns([2, 1])
+        _loaded = st.session_state.get("video_name") or os.path.basename(
+            str(st.session_state.get("video_path") or ""))
+        _have = bool(st.session_state.get("video_path") and os.path.exists(
+            str(st.session_state.get("video_path"))))
+        _video_box = st.expander(
+            f"📁 Video: {_loaded}" if _have else "📁 The video",
+            expanded=not _have)
+        up1, up2 = _video_box.columns([2, 1])
         with up1:
             motion_upload = st.file_uploader(
                 "Compression video", type=["mp4", "avi", "mov", "mkv", "m4v"],
@@ -24495,76 +24919,49 @@ with tab_motion:
             # Two jobs on one video: following the corners, and cutting the
             # stretch that matters out of the recording. The upload above
             # serves both.
-            placed = motion_markers()
-            zoom_controls(
-                (int(details["height"]), int(details["width"])),
-                centre=(tuple(np.mean(np.asarray(placed), axis=0))
-                        if placed else None))
-            with st.expander("🎞️ Look through the video", expanded=True):
-                video_viewer(motion_path, details)
-            video_plot_controls()
-            (motion_sphere_tab, motion_track_tab, motion_auto_tab,
-             motion_clip_tab) = st.tabs(
-                ["⚪ Probe sphere", "🎯 Track the corners",
-                 "🤖 Automatic analysis", "✂️ Clip the video"])
-            with motion_sphere_tab:
-                sphere_panel(motion_path, details)
+            video_stage(motion_path, details)
+            with st.expander("📈 Plot options (every plot on this tab)"):
+                video_plot_controls()
+            (motion_track_tab, motion_auto_tab, motion_clip_tab) = st.tabs(
+                ["🎯 Track the corners", "🤖 Automatic analysis",
+                 "✂️ Clip the video"])
             with motion_clip_tab:
                 motion_clip_panel(motion_path, details)
             with motion_auto_tab:
                 auto_panel(motion_path, details)
             with motion_track_tab:
 
-                # ---- 2 · the frame the markers are placed on -------------
-                st.markdown("**2 · The frame to start from**")
-                st.caption(
-                    "Tracking runs forward from this frame, so place the markers "
-                    "on a frame where all four are clearly visible — usually just "
-                    "before the probe touches.")
-                st.session_state["mt_start"] = int(clamp_int(
+                # ---- 1 · where it starts, and the corners -----------------
+                start_frame = int(clamp_int(
                     st.session_state.get("mt_start", 0), 0, last))
-                start_frame = st.slider(
-                    "Start frame", 0, max(last, 0), key="mt_start",
-                    help="The markers are placed here and followed from here.")
+                st.session_state["mt_start"] = start_frame
                 frame_bgr = motion_frame(motion_path, video_signature(),
                                          start_frame)
                 if frame_bgr is None:
                     st.error(f"Could not read frame {start_frame}.")
                 else:
-                    st.caption(
-                        f"Frame {start_frame} of {last} · "
-                        f"t = {ct.format_time(start_frame / fps)}")
-
-                    # ---- 3 · the four markers ------------------------------
-                    st.markdown("**3 · Select the four corners**")
-                    # A canvas keyed to the video: a new file gets a new,
-                    # empty one instead of the last video's dots.
-                    pick_microns = motion_microns()
-                    markers = motion_pick_panel(
-                        frame_bgr, microns=pick_microns,
-                        canvas_key="mt_canvas_" + str(
-                            abs(hash((motion_path, video_signature()))) % 10 ** 9))
-                    if not HAS_CANVAS or st.session_state.get(
+                    markers = motion_markers()
+                    if HAS_CANVAS and not st.session_state.get(
                             "mt_canvas_error"):
-                        c1, c2 = st.columns([1, 3])
-                        with c1:
-                            if st.button("🗑️ Clear", key="mt_clear",
-                                         disabled=not markers, **STRETCH):
-                                motion_set_markers([])
-                                for _i in range(4):
-                                    st.session_state.pop(f"mt_x{_i}", None)
-                                    st.session_state.pop(f"mt_y{_i}", None)
-                                rerun_keeping_settings()
-                        with c2:
-                            st.markdown(
-                                f"<div style='padding-top:0.5rem'>"
-                                f"<b>{len(markers)} of 4</b> placed</div>",
-                                unsafe_allow_html=True)
+                        g1, g2 = st.columns([4, 1])
+                        g1.markdown(
+                            f"**1 · Corners:** {len(markers)} of 4, placed "
+                            f"on frame {start_frame} (t = "
+                            f"{ct.format_time(start_frame / fps)}), where "
+                            f"the tracking starts. Place them on the picture "
+                            f"above with **🎯 Corners**; the frame on show "
+                            f"becomes the start.")
+                        g2.button("Go to it", key="mt_goto_start",
+                                  on_click=st.session_state.__setitem__,
+                                  args=("vw_frame", start_frame), **STRETCH)
+                    else:
+                        markers = motion_pick_panel(
+                            frame_bgr, microns=motion_microns())
                     area_anchored = (st.session_state.get("mt_method", "")
                                      .startswith("Area"))
 
-                    # ---- 4 · how far to read -------------------------------
-                    st.markdown("**4 · How far to read**")
+                    # ---- 2 · how far to read -------------------------------
+                    st.markdown("**2 · How far to read**")
                     stored_end = st.session_state.get("mt_end", 0)
                     st.session_state["mt_end"] = int(clamp_int(
                         last if not stored_end else stored_end,
@@ -24618,8 +25015,8 @@ with tab_motion:
                                      "this is set. A sphere of known diameter is "
                                      "the usual way to get it: diameter in µm "
                                      "divided by its diameter in pixels. Left "
-                                     "at 0, the sphere marked on ⚪ Probe "
-                                     "sphere is used if there is one.")
+                                     "at 0, the sphere marked with ⚪ Sphere "
+                                     "on the picture is used if there is one.")
                             if (float(st.session_state.get("mt_um_per_px", 0)
                                       or 0) <= 0 and sphere_scale()):
                                 st.caption(f"Using the probe sphere's "
@@ -24725,8 +25122,12 @@ with tab_motion:
 
                         # ---- 8 · corrections ------------------------------
                         st.markdown("**6 · Correct the tracking**")
-                        corrections_panel(result, held,
-                                          microns if microns > 0 else None)
+                        st.caption(
+                            "Where a corner came off its spot: go to that "
+                            "frame on the picture above, choose **✏️ "
+                            "Correct**, pick the corner and click where it "
+                            "belongs, then **✅ Save**. Re-tracking spreads "
+                            "the difference over the frames before it.")
                         if corrections and ready and st.button(
                                 f"🔁 Re-track with {len(corrections)} "
                                 f"correction{'' if len(corrections) == 1 else 's'}",
@@ -27109,11 +27510,24 @@ def sc_save_controls(traces, stem):
 
 def sc_panel():
     s = st.session_state
-    # a click on the plot asked for a new zero on the previous run
+    # a click on the plot asked for a new zero on the previous run; what it
+    # replaces is kept, so it can be undone
     for i, value in (s.pop("_sc_zero_next", None) or {}).items():
+        history = list(s.get("_sc_zero_hist") or [])
+        history.append((i, s.get(f"sc_zmode{i}"), s.get(f"sc_zval{i}"),
+                        s.get(f"sc_shift{i}")))
+        s["_sc_zero_hist"] = history[-30:]
         s[f"sc_zmode{i}"] = "A value I type"
         s[f"sc_zval{i}"] = float(value)
         s[f"sc_shift{i}"] = 0.0
+    undo = s.pop("_sc_zero_undo", False)
+    if undo and s.get("_sc_zero_hist"):
+        history = list(s["_sc_zero_hist"])
+        i, mode, value, shift = history.pop()
+        s["_sc_zero_hist"] = history
+        s[f"sc_zmode{i}"] = mode or "Start of the data"
+        s[f"sc_zval{i}"] = float(value or 0.0)
+        s[f"sc_shift{i}"] = float(shift or 0.0)
     for key, value in SC_DEFAULTS.items():
         s.setdefault(key, value)
     # Options on the left, grouped in four tabs; the plot on the right, so
@@ -27148,9 +27562,24 @@ def sc_panel():
         sc_save_controls(traces, stem)
 
     with right:
-        st.toggle("Click a point to set zero", key="sc_click",
+        k1, k2, k3, k4 = st.columns([1.5, 1.1, 1.4, 1])
+        k1.toggle("Click a point to set zero", key="sc_click",
                   help="Then a click on any point of a trace makes that "
                        "point x = 0 for that file.")
+        k2.button("↶ Undo zero", key="sc_undo_zero",
+                  disabled=not s.get("_sc_zero_hist"),
+                  on_click=s.__setitem__, args=("_sc_zero_undo", True),
+                  help="Puts back the zero a click replaced, one click at "
+                       "a time.", **STRETCH)
+        k3.radio("Drag to", ("zoom", "pan"), key="sc_drag",
+                 horizontal=True, label_visibility="collapsed",
+                 help="What dragging on the plot does. The mouse wheel "
+                      "zooms too.")
+        k4.button("⤢ Reset view", key="sc_reset_view", **STRETCH,
+                  on_click=lambda: s.__setitem__(
+                      "_sc_view", int(s.get("_sc_view", 0)) + 1),
+                  help="Back to the full plot (double-clicking the plot "
+                       "does the same).")
         fig = sc.stacked_figure(
             traces, linked=bool(s.get("sc_link")),
             overlay=bool(s.get("sc_overlay")),
@@ -27172,7 +27601,12 @@ def sc_panel():
             legend_size=int(s.get("sc_ls", 13)),
             legend_line=int(s.get("sc_legline", 40)),
             width=int(s.get("sc_width") or 0) or None)
-        config = {"displaylogo": False,
+        # the zoom survives restyling, until ⤢ Reset view
+        view = int(s.get("_sc_view", 0))
+        fig.update_layout(uirevision=f"sc{view}",
+                          dragmode=s.get("sc_drag", "zoom"))
+        config = {"displaylogo": False, "scrollZoom": True,
+                  "displayModeBar": True, "doubleClick": "reset",
                   "toImageButtonOptions": {
                       "format": s.get("sc_fmt", "svg"), "filename": stem,
                       "width": int(s.get("sc_w") or 900),
@@ -27182,7 +27616,8 @@ def sc_panel():
         version = int(s.get("_sc_chart_ver", 0))
         if s.get("sc_click"):
             event = st.plotly_chart(
-                fig, key=f"sc_chart_v{version}", config=config, theme=None,
+                fig, key=f"sc_chart_v{version}_{view}", config=config,
+                theme=None,
                 on_select="rerun", selection_mode="points",
                 **(STRETCH if fit else {}))
             points = []
@@ -27202,8 +27637,8 @@ def sc_panel():
             st.caption("Click a point on a trace: it becomes x = 0 for "
                        "that file.")
         else:
-            st.plotly_chart(fig, key="sc_chart", config=config, theme=None,
-                            **(STRETCH if fit else {}))
+            st.plotly_chart(fig, key=f"sc_chart_{view}", config=config,
+                            theme=None, **(STRETCH if fit else {}))
 
 
 with tab_stack:
