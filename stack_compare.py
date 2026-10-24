@@ -23,6 +23,7 @@ ZERO_MODES = (
     "At the highest point",
     "At the lowest point",
     "Where it first crosses a level",
+    "Departure from baseline (contact point)",
 )
 
 DEFAULT_COLOURS = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
@@ -146,6 +147,9 @@ def guess_y(columns: List[str], x: str) -> str:
 
 
 # ----------------------------------------------------------------- zeroing --
+
+CONTACT_MODE = "Departure from baseline (contact point)"
+
 
 def zero_point(x, y, mode: str, typed: float = 0.0,
                level: float = 0.0) -> float:
@@ -292,7 +296,8 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    clickable=False, frame=None, legend="Above",
                    y_titles=None, align_titles=True, title_space=70,
                    title_size=None, bold_titles=False, legend_size=None,
-                   legend_line=40, width=None):
+                   legend_line=40, width=None, stats_box="Off",
+                   stats_place="Inside, bottom right", baselines=True):
     """
     The files in panels, one above the other.
 
@@ -430,6 +435,66 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     has_right = any(right.values())
     height = (int(panel_height * rows / max(0.4, 1 - gap * (rows - 1)) + 90)
               if rows > 1 else int(panel_height + 90))
+
+    # baseline helpers, drawn after every file's own trace so the trace
+    # numbers (what a click reports) stay the files' order
+    if baselines:
+        for t in traces:
+            line = t.get("baseline_line")
+            if line is None:
+                continue
+            r = row_of[1 if overlay else int(t.get("panel") or 1)]
+            bx, by = line
+            fig.add_trace(go.Scatter(
+                x=bx, y=by, mode="lines", showlegend=False,
+                hoverinfo="skip", name=f"{t['label']} baseline",
+                line=dict(color=t["colour"], width=max(1.0, line_width * 0.7),
+                          dash="dash")),
+                row=r, col=1,
+                secondary_y=any(t is u for u in right[r]))
+            window = t.get("baseline_window")
+            if window is not None:
+                fig.add_vrect(x0=window[0], x1=window[1], row=r, col=1,
+                              fillcolor=t["colour"], opacity=0.07,
+                              line_width=0)
+
+    # the summary balloons: one per panel (or one per file below the plot)
+    extra_bottom = 0
+    if stats_box != "Off":
+        size = int(legend_size or max(9, font_size - 2))
+        groups = {}
+        for t in traces:
+            lines = summary_lines(t, stats_box)
+            if not lines:
+                continue
+            r = row_of[1 if overlay else int(t.get("panel") or 1)]
+            head = (f"<span style='color:{t['colour']}'><b>"
+                    f"{t['label']}</b></span>")
+            groups.setdefault(r, []).append(
+                head + "<br>" + "<br>".join(lines))
+        style = dict(showarrow=False, align="left",
+                     bgcolor="rgba(255,255,255,0.88)", bordercolor="#888",
+                     borderwidth=1, borderpad=5,
+                     font=dict(size=size, color="black"))
+        if stats_place == "Below the plot":
+            blocks = [b for r in sorted(groups) for b in groups[r]]
+            n_lines = max([b.count("<br>") + 1 for b in blocks] or [0])
+            extra_bottom = int(n_lines * (size + 5) + 30)
+            for k, block in enumerate(blocks):
+                fig.add_annotation(
+                    text=block, xref="paper", yref="paper",
+                    x=(k + 0.5) / len(blocks), y=0, xanchor="center",
+                    yanchor="top", yshift=-(40 + 2 * font_size), **style)
+        else:
+            right_side = "right" in stats_place
+            for r, blocks in groups.items():
+                lo, _hi = fig.get_subplot(r, 1, secondary_y=False) \
+                    .yaxis.domain
+                fig.add_annotation(
+                    text="<br><br>".join(blocks), xref="paper",
+                    yref="paper", x=0.99 if right_side else 0.01,
+                    xanchor="right" if right_side else "left",
+                    y=lo + 0.01, yanchor="bottom", **style)
     # the y titles as annotations at one fixed distance from the plot, so
     # they line up from panel to panel (an axis title sits wherever its
     # own tick labels end)
@@ -457,10 +522,10 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     if legend == "Below":
         legend_spec["y"] = -(font_size * 4.5 + 10) / max(height - 110, 100)
     fig.update_layout(
-        height=height + (40 if legend == "Below" else 0),
+        height=height + (40 if legend == "Below" else 0) + extra_bottom,
         width=(int(width) if width else None),
         margin=dict(l=left_m, r=right_m, t=50,
-                    b=60 + (40 if legend == "Below" else 0)),
+                    b=60 + (40 if legend == "Below" else 0) + extra_bottom),
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(family="Arial, Helvetica, sans-serif", color="black",
                   size=font_size),
@@ -470,6 +535,92 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     for t in traces:
         t.pop("_panel", None)
     return fig
+
+
+STATS_BOXES = ("Off", "Analysis summary", "Descriptive statistics")
+STATS_PLACES = ("Inside, bottom right", "Inside, bottom left",
+                "Below the plot")
+
+
+def describe(y):
+    """Descriptive statistics of a trace, as (label, value) pairs."""
+    v = np.asarray(y, dtype=float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return []
+    sd = float(np.std(v, ddof=1)) if v.size > 1 else 0.0
+    return [("n", f"{v.size:,}"),
+            ("Mean ± SD", f"{np.mean(v):.4g} ± {sd:.3g}"),
+            ("Median", f"{np.median(v):.4g}"),
+            ("Min / max", f"{np.min(v):.4g} / {np.max(v):.4g}"),
+            ("Range", f"{np.ptp(v):.4g}")]
+
+
+def summary_lines(trace, mode):
+    """The lines of a file's summary balloon: the analysis summary sent
+    with it (none for a file loaded by hand), or descriptive statistics
+    of what is plotted."""
+    if mode == "Analysis summary":
+        stats = trace.get("stats") or []
+    else:
+        stats = describe(trace.get("y", []))
+    return [f"{k}: {v}" for k, v in stats]
+
+
+def fit_baseline(x, y, x0, x1, order=1):
+    """A polynomial (order 0 or 1) through the points with x0 <= x <= x1.
+    Returns the coefficients (highest power first) and the residual SD, or
+    (None, None) when fewer than 3 points fall in the window."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    lo, hi = sorted((float(x0), float(x1)))
+    keep = np.isfinite(x) & np.isfinite(y) & (x >= lo) & (x <= hi)
+    if keep.sum() < 3:
+        return None, None
+    coeffs = np.polyfit(x[keep], y[keep], int(order))
+    resid = y[keep] - np.polyval(coeffs, x[keep])
+    return coeffs, float(np.std(resid, ddof=1)) if keep.sum() > 2 else 0.0
+
+
+def baseline_departure(x, y, x0, x1, k=3.0, order=1, direction="either",
+                       run=5):
+    """
+    The contact point: where the signal first leaves its baseline.
+
+    The baseline is fitted over the window [x0, x1] (before contact); the
+    contact is the first point after the window where the residual
+    exceeds k × the baseline's residual SD for ``run`` points in a row
+    (upwards, downwards or either). Returns (x of contact or None,
+    coefficients, sd).
+    """
+    coeffs, sd = fit_baseline(x, y, x0, x1, order)
+    if coeffs is None:
+        return None, None, None
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    resid = y - np.polyval(coeffs, x)
+    limit = float(k) * max(sd, 1e-12)
+    if direction == "up":
+        out = resid > limit
+    elif direction == "down":
+        out = resid < -limit
+    else:
+        out = np.abs(resid) > limit
+    after = x > max(x0, x1)
+    out &= after & np.isfinite(resid)
+    count = 0
+    for i in np.flatnonzero(after):
+        count = count + 1 if out[i] else 0
+        if count >= int(run):
+            j = i - int(run) + 1
+            # walk back to where it was last within one SD of the
+            # baseline: the k-SD test fires late on a slow rise
+            sign = np.sign(resid[j]) or 1.0
+            calm = smooth(np.nan_to_num(resid), 2 * int(run) + 1)
+            while j > 0 and after[j - 1] and sign * calm[j - 1] > 0.5 * sd:
+                j -= 1
+            return float(x[j]), coeffs, sd
+    return None, coeffs, sd
 
 
 def nice_stem(names) -> str:
