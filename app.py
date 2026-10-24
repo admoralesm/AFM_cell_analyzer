@@ -667,7 +667,51 @@ COMPACT_CSS = """
 """
 
 
-_PLOTLY_CHART = st.plotly_chart
+def _tune_memory():
+    """
+    Hand large blocks back to the system as soon as they are freed.
+
+    Video frames are megabytes each, made and dropped on every rerun, on
+    many threads. By default the C allocator keeps such blocks in its own
+    pools after the first few, so the server's memory only grows until a
+    small host (Streamlit Community Cloud) stops the app. Blocks of 1 MB
+    and up are mapped straight from the system instead, and given back
+    the moment they are freed.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-3, 1 << 20)     # M_MMAP_THRESHOLD: 1 MB
+        libc.mallopt(-8, 2)           # M_ARENA_MAX: 2 pools
+        return libc
+    except Exception:                 # not glibc (macOS, Windows): fine
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _libc():
+    return _tune_memory()
+
+
+def release_memory():
+    """At the end of every run: return freed memory to the system."""
+    libc = _libc()
+    if libc is not None:
+        try:
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
+_libc()
+# The original st.plotly_chart, kept on the streamlit module itself: the
+# script runs again on every interaction, and taking "st.plotly_chart" as
+# the original each time would take the previous run's wrapper instead,
+# chaining every run's variables (video frames and all) together so that
+# none of them could ever be freed.
+if not hasattr(st, "_original_plotly_chart"):
+    st._original_plotly_chart = st.plotly_chart
+_PLOTLY_CHART = st._original_plotly_chart
 
 
 def _plotly_chart_export(figure_or_data, *args, **kwargs):
@@ -3564,7 +3608,7 @@ def _trim_preamble(text):
     return text, True
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=16)
 def excel_sheets(file_bytes: bytes, filename: str):
     """The names of the sheets in a workbook, in order. [] for a text file."""
     if not filename.lower().endswith(EXCEL_SUFFIXES):
@@ -3625,7 +3669,7 @@ def _read_text(file_bytes, header):
     raise ValueError("the file is empty")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=32)
 def load_table(file_bytes: bytes, filename: str, sheet=None,
                curve=False) -> pd.DataFrame:
     """
@@ -3710,13 +3754,13 @@ def cached_thumbnail(root_folder, file_id):
     return store.thumbnail_bytes(file_id)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=24)
 def cached_frame(path, signature, index):
     """`signature` (size + mtime) busts the cache when the file is replaced."""
     return va.read_frame(path, index)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=16)
 def cached_detection(
     path, signature, index, roi, sensitivity, strip_lines,
     enhance=None, cell_side="anywhere", reject_dark=True, find_nucleus=False,
@@ -3741,7 +3785,8 @@ def cached_detection(
     return frame, det, nucleus, probe_box
 
 
-@st.cache_data(show_spinner="Tracking the cell through the video…")
+@st.cache_data(show_spinner="Tracking the cell through the video…",
+               max_entries=4)
 def cached_track(path, signature, n_samples, roi, sensitivity, strip_lines, start, end,
                  enhance=None, cell_side="anywhere", reject_dark=True,
                  find_nucleus=False, appearance="either"):
@@ -8616,13 +8661,13 @@ def motion_forget():
         st.session_state.pop(key, None)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=12)
 def motion_frame(path, signature, index):
     """One frame, kept across reruns. `signature` busts it on a new file."""
     return ct.read_frame(path, int(index))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=8)
 def motion_info(path, signature):
     """fps, frame count and size, read once per file."""
     return ct.video_info(path)
@@ -10359,14 +10404,18 @@ def stage_frame_actions(path, frame, frame_no, fps, last, painted):
         if not name.lower().endswith((".png", ".jpg", ".jpeg", ".tif",
                                       ".tiff")):
             name += ".png"
-        if marked:
-            image = ct.cv2.cvtColor(painted, ct.cv2.COLOR_RGB2BGR)
-        else:
-            image = frame
+        image = (ct.cv2.cvtColor(painted, ct.cv2.COLOR_RGB2BGR) if marked
+                 else frame)
         ext = os.path.splitext(name)[1].lower()
-        ok, data = ct.cv2.imencode(ext if ext != ".jpeg" else ".jpg", image)
-        st.download_button("💾 Download", data=data.tobytes() if ok else b"",
-                           file_name=name, disabled=not ok,
+
+        def encoded(image=image, ext=ext):
+            # made only when the button is pressed: a full-size frame
+            # encoded on every rerun is held in memory by the server
+            ok, data = ct.cv2.imencode(ext if ext != ".jpeg" else ".jpg",
+                                       image)
+            return data.tobytes() if ok else b""
+
+        st.download_button("💾 Download", data=encoded, file_name=name,
                            mime="image/png" if ext == ".png" else None,
                            key="vw_frame_dl", **STRETCH)
         st.caption(f"Frame {f}, t = {ct.format_time(f / fps)}"
@@ -25336,14 +25385,21 @@ with tab_motion:
             expanded=not _have)
         up1, up2 = _video_box.columns([2, 1])
         with up1:
+            # The uploader is renewed once its video is saved to disk, so
+            # the upload itself (held in memory by Streamlit) is let go: a
+            # large video kept twice is what runs a small server out of
+            # memory.
+            upload_key = f"mt_upload_{int(st.session_state.get('_mt_upload_n', 0))}"
             motion_upload = st.file_uploader(
                 "Compression video", type=["mp4", "avi", "mov", "mkv", "m4v"],
-                key="mt_upload",
+                key=upload_key,
                 help="The same video the compression-video tab uses: upload "
                      "it in either place and both have it.")
         with up1:
             motion_link_panel()
-        if motion_adopt(motion_upload):
+        if motion_adopt(motion_upload, widget_key=upload_key):
+            st.session_state["_mt_upload_n"] = int(
+                st.session_state.get("_mt_upload_n", 0)) + 1
             rerun_keeping_settings()
         motion_path = st.session_state.get("video_path")
         motion_ok = bool(motion_path and os.path.exists(motion_path))
@@ -25593,445 +25649,494 @@ with tab_motion:
 
 
 with tab_video:
-    section("Compression video")
+    # Hidden (SHOW_VIDEO_TAB): not run at all, so its frame detection
+    # costs neither time nor memory on every rerun.
+    if SHOW_VIDEO_TAB:
+        section("Compression video")
 
-    if VIDEO_IMPORT_ERROR:
-        st.error(
-            f"Video analysis unavailable: {VIDEO_IMPORT_ERROR}. "
-            f"Add `opencv-python-headless` to requirements.txt."
-        )
-    else:
-        st.markdown(
-            "Load the compression video to put a picture of the cell next to the "
-            "curve, and to derive deformation from the cell's own shape as a check "
-            "on the contact point and cell height."
-        )
-
-        src1, src2 = st.columns([1, 1])
-        with src1:
-            uploaded_video = st.file_uploader(
-                "Upload video", type=["mp4", "avi", "mov", "wmv", "mkv"],
-                key="video_file",
-                help="The same video as the one in section 7 of the analysis "
-                "tab. Uploading in either place loads it for both.",
+        if VIDEO_IMPORT_ERROR:
+            st.error(
+                f"Video analysis unavailable: {VIDEO_IMPORT_ERROR}. "
+                f"Add `opencv-python-headless` to requirements.txt."
             )
-        with src2:
-            st.text_input(
-                "…or a Google Drive / Box link",
-                placeholder="https://app.box.com/s/…  or  https://drive.google.com/file/d/…",
-                key="video_link",
-                help="Box links need either public sharing or an access token in "
-                "secrets under [box]. Drive links must be shared with anyone "
-                "who has the link.",
-            )
-            if st.button("⬇️ Fetch from link", **STRETCH):
-                try:
-                    token = None
-                    try:
-                        token = st.secrets.get("box", {}).get("access_token")
-                    except Exception:
-                        token = None
-                    with st.spinner("Downloading…"):
-                        dest = os.path.join(tempfile.gettempdir(), "afm_linked_video.mp4")
-                        va.fetch_video(st.session_state["video_link"], dest, box_token=token)
-                    st.session_state["video_path"] = dest
-                    st.session_state["video_name"] = "linked video"
-                    st.session_state["video_info"] = va.probe(dest)
-                    st.session_state["video_track"] = None
-                    st.session_state["video_saved_frame"] = None
-                    st.session_state["video_saved_frame_index"] = None
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"{exc}")
-
-        # Two things about the cell that only the video can tell you, and
-        # that the spreadsheet keeps beside the moduli: how tall the cell
-        # actually was, and anything you noticed while watching it. The
-        # height is filled in from the measurement below when the scale is
-        # set, and can be typed over.
-        vh1, vh2 = st.columns([1, 2])
-        with vh1:
-            st.number_input(
-                "Height from the video (µm)",
-                min_value=0.0, max_value=200.0, step=0.1, format="%.2f",
-                key="video_height_um",
-                help="The cell's height measured off the frame, in "
-                "micrometres. 0 means not measured. It is written to the "
-                "spreadsheet as its own column, beside the height that was "
-                "typed into the geometry settings, so the two can be "
-                "compared rather than one quietly replacing the other.",
-            )
-        with vh2:
-            st.text_input(
-                "Video comment",
-                key="video_comment",
-                placeholder="what the video showed: the probe slipped, the "
-                            "cell rolled, nothing unusual…",
-                help="Goes into the spreadsheet with the numbers. This is "
-                "the column somebody reads first when a modulus looks odd.",
-            )
-
-        if adopt_video(uploaded_video, "video_file"):
-            st.rerun()
-
-        info = st.session_state.get("video_info")
-        path = st.session_state.get("video_path")
-
-        if not (info and path and os.path.exists(path)):
-            st.info("No video loaded yet.")
         else:
-            signature = video_signature()
-            n_frames = int(info["n_frames"])
-            last = max(0, n_frames - 1)
-
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Frames", f"{n_frames:,}")
-            v2.metric("FPS", f"{info['fps']:.1f}" if info["fps"] else "n/a")
-            v3.metric("Size", f"{info['width']}×{info['height']}")
-            v4.metric(
-                "Duration",
-                f"{info['duration_s']:.1f} s" if np.isfinite(info["duration_s"]) else "n/a",
+            st.markdown(
+                "Load the compression video to put a picture of the cell next to the "
+                "curve, and to derive deformation from the cell's own shape as a check "
+                "on the contact point and cell height."
             )
 
-            # ------------------------------------------------ detection setup
-            section("Detection")
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                st.markdown("**Image**")
-                st.slider(
-                    "Local contrast (CLAHE)", 0.0, 6.0, step=0.5, key="video_clahe",
-                    help="Brings out a faint cell without blowing out the bright "
-                    "field. 0 leaves the frame alone.",
+            src1, src2 = st.columns([1, 1])
+            with src1:
+                uploaded_video = st.file_uploader(
+                    "Upload video", type=["mp4", "avi", "mov", "wmv", "mkv"],
+                    key="video_file",
+                    help="The same video as the one in section 7 of the analysis "
+                    "tab. Uploading in either place loads it for both.",
                 )
-                st.slider("Gamma", 0.3, 3.0, step=0.05, key="video_gamma",
-                          help="Above 1 lifts the dark end, where a cell in the "
-                          "probe's shadow lives.")
-                st.slider("Brightness", -80, 80, step=2, key="video_brightness")
-                st.slider("Contrast", 0.4, 3.0, step=0.05, key="video_contrast")
-            with d2:
-                st.markdown("**Finding the cell**")
-                st.slider(
-                    "Edge sensitivity", 0.3, 3.0, step=0.1, key="video_sensitivity",
+            with src2:
+                st.text_input(
+                    "…or a Google Drive / Box link",
+                    placeholder="https://app.box.com/s/…  or  https://drive.google.com/file/d/…",
+                    key="video_link",
+                    help="Box links need either public sharing or an access token in "
+                    "secrets under [box]. Drive links must be shared with anyone "
+                    "who has the link.",
                 )
-                st.checkbox(
-                    "Ignore long horizontal structures", key="video_strip_lines",
-                    help="Removes the substrate line and the cantilever body.",
-                )
-                st.checkbox(
-                    "Ignore very dark objects (the probe)", key="video_reject_dark",
-                    help="The cantilever is close to black. This paints it out "
-                    "before segmenting, so it stops being picked as the cell.",
-                )
-                st.selectbox(
-                    "The cell looks …",
-                    ["clear", "dark", "either"],
-                    key="video_appearance",
-                    help="… compared with the background. In phase contrast "
-                    "the cell is usually the clear, bright object, and saying so "
-                    "stops a dark patch of debris of similar shape being picked "
-                    "instead. Choose “either” if the cell matches the background "
-                    "and shows only as an outline.",
-                )
-                st.selectbox(
-                    "The cell sits …",
-                    ["anywhere", "right", "left", "above", "below"],
-                    key="video_cell_side",
-                    help="… relative to the probe. Set this and the probe is "
-                    "located first, then only that side is searched.",
-                )
-                st.checkbox("Also find the nucleus", key="video_find_nucleus")
-            with d3:
-                st.caption("Search region (fraction of the frame)")
-                rx = st.slider("Horizontal", 0.0, 1.0, step=0.01, key="video_roi_x")
-                ry = st.slider("Vertical", 0.0, 1.0, step=0.01, key="video_roi_y")
-                st.session_state["video_roi"] = (rx[0], ry[0], rx[1], ry[1])
+                if st.button("⬇️ Fetch from link", **STRETCH):
+                    try:
+                        token = None
+                        try:
+                            token = st.secrets.get("box", {}).get("access_token")
+                        except Exception:
+                            token = None
+                        with st.spinner("Downloading…"):
+                            dest = os.path.join(tempfile.gettempdir(), "afm_linked_video.mp4")
+                            va.fetch_video(st.session_state["video_link"], dest, box_token=token)
+                        st.session_state["video_path"] = dest
+                        st.session_state["video_name"] = "linked video"
+                        st.session_state["video_info"] = va.probe(dest)
+                        st.session_state["video_track"] = None
+                        st.session_state["video_saved_frame"] = None
+                        st.session_state["video_saved_frame_index"] = None
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"{exc}")
 
-            with st.expander("✍️ Draw the cell yourself, and set the scale"):
-                m1, m2 = st.columns(2)
-                with m1:
+            # Two things about the cell that only the video can tell you, and
+            # that the spreadsheet keeps beside the moduli: how tall the cell
+            # actually was, and anything you noticed while watching it. The
+            # height is filled in from the measurement below when the scale is
+            # set, and can be typed over.
+            vh1, vh2 = st.columns([1, 2])
+            with vh1:
+                st.number_input(
+                    "Height from the video (µm)",
+                    min_value=0.0, max_value=200.0, step=0.1, format="%.2f",
+                    key="video_height_um",
+                    help="The cell's height measured off the frame, in "
+                    "micrometres. 0 means not measured. It is written to the "
+                    "spreadsheet as its own column, beside the height that was "
+                    "typed into the geometry settings, so the two can be "
+                    "compared rather than one quietly replacing the other.",
+                )
+            with vh2:
+                st.text_input(
+                    "Video comment",
+                    key="video_comment",
+                    placeholder="what the video showed: the probe slipped, the "
+                                "cell rolled, nothing unusual…",
+                    help="Goes into the spreadsheet with the numbers. This is "
+                    "the column somebody reads first when a modulus looks odd.",
+                )
+
+            if adopt_video(uploaded_video, "video_file"):
+                st.rerun()
+
+            info = st.session_state.get("video_info")
+            path = st.session_state.get("video_path")
+
+            if not (info and path and os.path.exists(path)):
+                st.info("No video loaded yet.")
+            else:
+                signature = video_signature()
+                n_frames = int(info["n_frames"])
+                last = max(0, n_frames - 1)
+
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric("Frames", f"{n_frames:,}")
+                v2.metric("FPS", f"{info['fps']:.1f}" if info["fps"] else "n/a")
+                v3.metric("Size", f"{info['width']}×{info['height']}")
+                v4.metric(
+                    "Duration",
+                    f"{info['duration_s']:.1f} s" if np.isfinite(info["duration_s"]) else "n/a",
+                )
+
+                # ------------------------------------------------ detection setup
+                section("Detection")
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    st.markdown("**Image**")
+                    st.slider(
+                        "Local contrast (CLAHE)", 0.0, 6.0, step=0.5, key="video_clahe",
+                        help="Brings out a faint cell without blowing out the bright "
+                        "field. 0 leaves the frame alone.",
+                    )
+                    st.slider("Gamma", 0.3, 3.0, step=0.05, key="video_gamma",
+                              help="Above 1 lifts the dark end, where a cell in the "
+                              "probe's shadow lives.")
+                    st.slider("Brightness", -80, 80, step=2, key="video_brightness")
+                    st.slider("Contrast", 0.4, 3.0, step=0.05, key="video_contrast")
+                with d2:
+                    st.markdown("**Finding the cell**")
+                    st.slider(
+                        "Edge sensitivity", 0.3, 3.0, step=0.1, key="video_sensitivity",
+                    )
                     st.checkbox(
-                        "Select the cell by hand", key="video_manual_cell",
-                        help="Use this whenever the outline below is on the "
-                        "wrong object. Your box is used exactly as drawn, and "
-                        "the detector is not consulted at all.",
+                        "Ignore long horizontal structures", key="video_strip_lines",
+                        help="Removes the substrate line and the cantilever body.",
                     )
-                    st.slider("Cell: left and right", 0.0, 1.0, step=0.01,
-                              key="video_cell_box_x",
-                              disabled=not st.session_state["video_manual_cell"])
-                    st.slider("Cell: top and bottom", 0.0, 1.0, step=0.01,
-                              key="video_cell_box_y",
-                              disabled=not st.session_state["video_manual_cell"])
-                with m2:
                     st.checkbox(
-                        "Measure the probe to set the scale",
-                        key="video_use_probe_scale",
-                        help="The cantilever is the one object whose size is "
-                        "known exactly, so measuring it across the image "
-                        "turns every pixel into micrometres.",
+                        "Ignore very dark objects (the probe)", key="video_reject_dark",
+                        help="The cantilever is close to black. This paints it out "
+                        "before segmenting, so it stops being picked as the cell.",
                     )
-                    st.slider("Probe: left and right edge", 0.0, 1.0, step=0.01,
-                              key="video_probe_box_x",
-                              disabled=not st.session_state["video_use_probe_scale"])
-                    st.number_input(
-                        "Probe width (µm)", min_value=1.0, max_value=500.0,
-                        step=5.0, key="video_probe_width_um",
-                        disabled=not st.session_state["video_use_probe_scale"],
-                        help="A tipless cantilever is usually 40 or 60 µm wide.",
+                    st.selectbox(
+                        "The cell looks …",
+                        ["clear", "dark", "either"],
+                        key="video_appearance",
+                        help="… compared with the background. In phase contrast "
+                        "the cell is usually the clear, bright object, and saying so "
+                        "stops a dark patch of debris of similar shape being picked "
+                        "instead. Choose “either” if the cell matches the background "
+                        "and shows only as an outline.",
                     )
-                st.slider(
-                    "How much room around the cell in the saved frame",
-                    0.0, 2.0, step=0.05, key="video_crop_pad",
-                    help="0 crops tight to the outline, which is what made the "
-                    "stored frame look zoomed in. Higher shows more of the "
-                    "field around it.",
+                    st.selectbox(
+                        "The cell sits …",
+                        ["anywhere", "right", "left", "above", "below"],
+                        key="video_cell_side",
+                        help="… relative to the probe. Set this and the probe is "
+                        "located first, then only that side is searched.",
+                    )
+                    st.checkbox("Also find the nucleus", key="video_find_nucleus")
+                with d3:
+                    st.caption("Search region (fraction of the frame)")
+                    rx = st.slider("Horizontal", 0.0, 1.0, step=0.01, key="video_roi_x")
+                    ry = st.slider("Vertical", 0.0, 1.0, step=0.01, key="video_roi_y")
+                    st.session_state["video_roi"] = (rx[0], ry[0], rx[1], ry[1])
+
+                with st.expander("✍️ Draw the cell yourself, and set the scale"):
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        st.checkbox(
+                            "Select the cell by hand", key="video_manual_cell",
+                            help="Use this whenever the outline below is on the "
+                            "wrong object. Your box is used exactly as drawn, and "
+                            "the detector is not consulted at all.",
+                        )
+                        st.slider("Cell: left and right", 0.0, 1.0, step=0.01,
+                                  key="video_cell_box_x",
+                                  disabled=not st.session_state["video_manual_cell"])
+                        st.slider("Cell: top and bottom", 0.0, 1.0, step=0.01,
+                                  key="video_cell_box_y",
+                                  disabled=not st.session_state["video_manual_cell"])
+                    with m2:
+                        st.checkbox(
+                            "Measure the probe to set the scale",
+                            key="video_use_probe_scale",
+                            help="The cantilever is the one object whose size is "
+                            "known exactly, so measuring it across the image "
+                            "turns every pixel into micrometres.",
+                        )
+                        st.slider("Probe: left and right edge", 0.0, 1.0, step=0.01,
+                                  key="video_probe_box_x",
+                                  disabled=not st.session_state["video_use_probe_scale"])
+                        st.number_input(
+                            "Probe width (µm)", min_value=1.0, max_value=500.0,
+                            step=5.0, key="video_probe_width_um",
+                            disabled=not st.session_state["video_use_probe_scale"],
+                            help="A tipless cantilever is usually 40 or 60 µm wide.",
+                        )
+                    st.slider(
+                        "How much room around the cell in the saved frame",
+                        0.0, 2.0, step=0.05, key="video_crop_pad",
+                        help="0 crops tight to the outline, which is what made the "
+                        "stored frame look zoomed in. Higher shows more of the "
+                        "field around it.",
+                    )
+
+                roi = st.session_state["video_roi"]
+                # Widget state must be clamped to this video before the widgets are
+                # built, or a shorter clip than the previous one raises.
+                st.session_state.setdefault("video_preview_frame", last // 2)
+                st.session_state["video_preview_frame"] = int(
+                    np.clip(st.session_state["video_preview_frame"], 0, last)
+                )
+                st.session_state["video_contact_frame"] = int(
+                    np.clip(st.session_state["video_contact_frame"], 0, last)
+                )
+                if not st.session_state["video_end_frame"]:
+                    st.session_state["video_end_frame"] = last
+                st.session_state["video_end_frame"] = int(
+                    np.clip(st.session_state["video_end_frame"], 0, last)
                 )
 
-            roi = st.session_state["video_roi"]
-            # Widget state must be clamped to this video before the widgets are
-            # built, or a shorter clip than the previous one raises.
-            st.session_state.setdefault("video_preview_frame", last // 2)
-            st.session_state["video_preview_frame"] = int(
-                np.clip(st.session_state["video_preview_frame"], 0, last)
-            )
-            st.session_state["video_contact_frame"] = int(
-                np.clip(st.session_state["video_contact_frame"], 0, last)
-            )
-            if not st.session_state["video_end_frame"]:
-                st.session_state["video_end_frame"] = last
-            st.session_state["video_end_frame"] = int(
-                np.clip(st.session_state["video_end_frame"], 0, last)
-            )
-
-            preview_frame = st.slider("Preview frame", 0, last, key="video_preview_frame")
-            # One reader for the whole app, so what is set here is what every
-            # other part of the app sees.
-            frame, det, nucleus, probe_box, scale_um_px = detection_at(preview_frame)
-            scale_detail = ""
-            if st.session_state["video_use_probe_scale"] and frame is not None:
-                px = st.session_state["video_probe_box_x"]
-                _, scale_detail = va.scale_from_probe(
-                    (px[0], 0.0, px[1], 0.0), frame.shape,
-                    float(st.session_state["video_probe_width_um"]),
-                )
-
-            p1, p2 = st.columns([2, 1])
-            with p1:
-                if frame is None:
-                    st.error("Could not read that frame.")
-                else:
-                    label = (
-                        f"h = {det['height_px']:.0f} px"
-                        if det and det.get("found")
-                        else "cell not found"
+                preview_frame = st.slider("Preview frame", 0, last, key="video_preview_frame")
+                # One reader for the whole app, so what is set here is what every
+                # other part of the app sees.
+                frame, det, nucleus, probe_box, scale_um_px = detection_at(preview_frame)
+                scale_detail = ""
+                if st.session_state["video_use_probe_scale"] and frame is not None:
+                    px = st.session_state["video_probe_box_x"]
+                    _, scale_detail = va.scale_from_probe(
+                        (px[0], 0.0, px[1], 0.0), frame.shape,
+                        float(st.session_state["video_probe_width_um"]),
                     )
-                    st.image(
-                        va.annotate(frame, det, label=label, nucleus=nucleus,
-                                    probe=probe_box),
-                        caption=f"Frame {preview_frame} · red = cell, purple = "
-                        f"nucleus, grey = probe",
-                        **STRETCH,
-                    )
-            with p2:
-                if scale_um_px:
-                    st.caption(f"Scale: {scale_detail}")
-                elif st.session_state["video_use_probe_scale"]:
-                    st.caption(scale_detail or "Scale not set.")
 
-                if det and det.get("found"):
-                    st.success("Cell drawn by hand" if det.get("manual")
-                               else "Cell detected")
-                    if scale_um_px:
-                        st.metric(
-                            "Cell height",
-                            f"{det['height_px'] * scale_um_px:.2f} µm",
-                            delta=f"{det['height_px']:.0f} px", delta_color="off",
-                        )
-                        st.metric(
-                            "Cell width",
-                            f"{det['width_px'] * scale_um_px:.2f} µm",
-                            delta=f"{det['width_px']:.0f} px", delta_color="off",
-                        )
-                        st.caption(
-                            "Compare the height against the cell height in "
-                            "section 1: they should agree, and the moduli are "
-                            "sensitive to that number."
-                        )
-                        if st.button("Use this as the video height",
-                                     key="adopt_video_height", **STRETCH):
-                            # Staged rather than written: the number input
-                            # for it was built earlier this pass, and
-                            # Streamlit refuses a write to a widget's key
-                            # once its widget exists.
-                            st.session_state["_pending_settings"] = {
-                                "video_height_um": round(
-                                    float(det["height_px"] * scale_um_px), 3
-                                )
-                            }
-                            st.rerun()
-                        st.caption(
-                            "It goes into the spreadsheet as **Height (um)**, "
-                            "beside the height typed into the geometry "
-                            "settings rather than instead of it."
-                        )
+                p1, p2 = st.columns([2, 1])
+                with p1:
+                    if frame is None:
+                        st.error("Could not read that frame.")
                     else:
-                        st.metric("Cell height", f"{det['height_px']:.0f} px")
-                        st.metric("Cell width", f"{det['width_px']:.0f} px")
-                    st.caption(
-                        f"circularity {det['circularity']:.2f} · "
-                        f"solidity {det['solidity']:.2f}"
-                    )
-                    if det.get("rejected_dark") or det.get("rejected_side"):
-                        st.caption(
-                            f"rejected {det.get('rejected_dark', 0)} dark and "
-                            f"{det.get('rejected_side', 0)} wrong-side candidates"
+                        label = (
+                            f"h = {det['height_px']:.0f} px"
+                            if det and det.get("found")
+                            else "cell not found"
                         )
-                    if nucleus and nucleus.get("found"):
-                        st.metric("Nucleus height", f"{nucleus['height_px']:.0f} px")
-                        st.caption(
-                            f"{100 * nucleus['area_fraction_of_cell']:.0f} % of the "
-                            f"cell box · circularity {nucleus['circularity']:.2f}"
+                        st.image(
+                            va.annotate(frame, det, label=label, nucleus=nucleus,
+                                        probe=probe_box),
+                            caption=f"Frame {preview_frame} · red = cell, purple = "
+                            f"nucleus, grey = probe",
+                            **STRETCH,
                         )
-                    elif st.session_state["video_find_nucleus"]:
-                        st.caption(f"Nucleus: {nucleus.get('reason', 'not found')}")
-                    annotated = va.annotate(frame, det, label=label,
-                                            nucleus=nucleus, probe=probe_box)
-                    cropped = va.crop(
-                        annotated, det,
-                        pad_frac=float(st.session_state["video_crop_pad"]),
-                    )
-                    if st.button("📸 Use this frame for the cell", type="primary",
-                                 **STRETCH):
-                        # Pinned rather than recomputed: the frame you looked
-                        # at and approved is the one that gets stored, not
-                        # whatever the detector produces later from settings
-                        # that have since moved.
-                        st.session_state["video_saved_frame"] = png_bytes(cropped)
-                        st.session_state["video_saved_frame_index"] = int(preview_frame)
-                        st.success(
-                            f"Frame {preview_frame} is now the picture stored "
-                            f"with this cell. It appears in section 7."
-                        )
-                    st.download_button(
-                        "📷 Save this frame to a file",
-                        data=png_bytes(annotated),
-                        file_name=f"frame_{preview_frame}.png",
-                        mime="image/png",
-                        **STRETCH,
-                    )
-                elif det:
-                    st.warning(f"No cell found: {det.get('reason', 'unknown')}")
-                    st.caption(
-                        "Try raising the local contrast, narrowing the search "
-                        "region, or setting which side of the probe the cell is on."
-                    )
-                if probe_box and probe_box.get("found"):
-                    st.caption(f"Probe found at x = {probe_box['bbox'][0]}")
+                with p2:
+                    if scale_um_px:
+                        st.caption(f"Scale: {scale_detail}")
+                    elif st.session_state["video_use_probe_scale"]:
+                        st.caption(scale_detail or "Scale not set.")
 
-            # ------------------------------------------------ curve alignment
-            section("Line the video up with the curve")
-            st.caption(
-                "Mark the frame where the cantilever first touches the cell and the "
-                "frame at the end of the ramp. Deformation is then assumed to grow "
-                "linearly with frame number between them, which holds for a "
-                "constant-speed approach."
-            )
-            a1, a2 = st.columns(2)
-            with a1:
-                contact_frame = st.number_input(
-                    "Contact frame (ε = 0)", 0, last, key="video_contact_frame"
-                )
-            with a2:
-                end_frame = st.number_input(
-                    "End-of-ramp frame", 0, last, key="video_end_frame"
-                )
-
-            if st.button("🔬 Track the cell through the video", type="primary", **STRETCH):
-                try:
-                    st.session_state["video_track"] = cached_track(
-                        path,
-                        signature,
-                        60,
-                        roi,
-                        float(st.session_state["video_sensitivity"]),
-                        bool(st.session_state["video_strip_lines"]),
-                        int(contact_frame),
-                        int(end_frame),
-                        enhancement(),
-                        st.session_state["video_cell_side"],
-                        bool(st.session_state["video_reject_dark"]),
-                        bool(st.session_state["video_find_nucleus"]),
-                        st.session_state["video_appearance"],
-                    )
-                except Exception as exc:
-                    st.error(f"Tracking failed: {exc}")
-
-            track = st.session_state.get("video_track")
-            if track:
-                found = int(np.sum(track["found"]))
-                total = len(track["frames"])
-                eps_video, h_ref = va.deformation_from_track(track, reference="max")
-
-                t1, t2, t3 = st.columns(3)
-                t1.metric("Frames with a cell", f"{found}/{total}")
-                t2.metric("Reference height", f"{h_ref:.0f} px" if np.isfinite(h_ref) else "n/a")
-                t3.metric(
-                    "Max deformation seen",
-                    f"{np.nanmax(eps_video):.3f}" if np.isfinite(eps_video).any() else "n/a",
-                )
-
-                if found < total * 0.5:
-                    st.warning(
-                        "The cell was found in fewer than half the sampled frames. "
-                        "Narrow the search region or adjust the sensitivity before "
-                        "trusting the comparison below."
-                    )
-
-                data_now = st.session_state.get("data")
-                if data_now is not None and np.isfinite(eps_video).any():
-                    eps_curve_at_frames = np.array(
-                        [
-                            va.epsilon_for_frame(
-                                f, contact_frame, end_frame, float(np.nanmax(data_now["epsilon"]))
+                    if det and det.get("found"):
+                        st.success("Cell drawn by hand" if det.get("manual")
+                                   else "Cell detected")
+                        if scale_um_px:
+                            st.metric(
+                                "Cell height",
+                                f"{det['height_px'] * scale_um_px:.2f} µm",
+                                delta=f"{det['height_px']:.0f} px", delta_color="off",
                             )
-                            for f in track["frames"]
-                        ]
+                            st.metric(
+                                "Cell width",
+                                f"{det['width_px'] * scale_um_px:.2f} µm",
+                                delta=f"{det['width_px']:.0f} px", delta_color="off",
+                            )
+                            st.caption(
+                                "Compare the height against the cell height in "
+                                "section 1: they should agree, and the moduli are "
+                                "sensitive to that number."
+                            )
+                            if st.button("Use this as the video height",
+                                         key="adopt_video_height", **STRETCH):
+                                # Staged rather than written: the number input
+                                # for it was built earlier this pass, and
+                                # Streamlit refuses a write to a widget's key
+                                # once its widget exists.
+                                st.session_state["_pending_settings"] = {
+                                    "video_height_um": round(
+                                        float(det["height_px"] * scale_um_px), 3
+                                    )
+                                }
+                                st.rerun()
+                            st.caption(
+                                "It goes into the spreadsheet as **Height (um)**, "
+                                "beside the height typed into the geometry "
+                                "settings rather than instead of it."
+                            )
+                        else:
+                            st.metric("Cell height", f"{det['height_px']:.0f} px")
+                            st.metric("Cell width", f"{det['width_px']:.0f} px")
+                        st.caption(
+                            f"circularity {det['circularity']:.2f} · "
+                            f"solidity {det['solidity']:.2f}"
+                        )
+                        if det.get("rejected_dark") or det.get("rejected_side"):
+                            st.caption(
+                                f"rejected {det.get('rejected_dark', 0)} dark and "
+                                f"{det.get('rejected_side', 0)} wrong-side candidates"
+                            )
+                        if nucleus and nucleus.get("found"):
+                            st.metric("Nucleus height", f"{nucleus['height_px']:.0f} px")
+                            st.caption(
+                                f"{100 * nucleus['area_fraction_of_cell']:.0f} % of the "
+                                f"cell box · circularity {nucleus['circularity']:.2f}"
+                            )
+                        elif st.session_state["video_find_nucleus"]:
+                            st.caption(f"Nucleus: {nucleus.get('reason', 'not found')}")
+                        annotated = va.annotate(frame, det, label=label,
+                                                nucleus=nucleus, probe=probe_box)
+                        cropped = va.crop(
+                            annotated, det,
+                            pad_frac=float(st.session_state["video_crop_pad"]),
+                        )
+                        if st.button("📸 Use this frame for the cell", type="primary",
+                                     **STRETCH):
+                            # Pinned rather than recomputed: the frame you looked
+                            # at and approved is the one that gets stored, not
+                            # whatever the detector produces later from settings
+                            # that have since moved.
+                            st.session_state["video_saved_frame"] = png_bytes(cropped)
+                            st.session_state["video_saved_frame_index"] = int(preview_frame)
+                            st.success(
+                                f"Frame {preview_frame} is now the picture stored "
+                                f"with this cell. It appears in section 7."
+                            )
+                        st.download_button(
+                            "📷 Save this frame to a file",
+                            data=png_bytes(annotated),
+                            file_name=f"frame_{preview_frame}.png",
+                            mime="image/png",
+                            **STRETCH,
+                        )
+                    elif det:
+                        st.warning(f"No cell found: {det.get('reason', 'unknown')}")
+                        st.caption(
+                            "Try raising the local contrast, narrowing the search "
+                            "region, or setting which side of the probe the cell is on."
+                        )
+                    if probe_box and probe_box.get("found"):
+                        st.caption(f"Probe found at x = {probe_box['bbox'][0]}")
+
+                # ------------------------------------------------ curve alignment
+                section("Line the video up with the curve")
+                st.caption(
+                    "Mark the frame where the cantilever first touches the cell and the "
+                    "frame at the end of the ramp. Deformation is then assumed to grow "
+                    "linearly with frame number between them, which holds for a "
+                    "constant-speed approach."
+                )
+                a1, a2 = st.columns(2)
+                with a1:
+                    contact_frame = st.number_input(
+                        "Contact frame (ε = 0)", 0, last, key="video_contact_frame"
                     )
-                    scale, r2 = va.align_scale(eps_video, eps_curve_at_frames)
-
-                    st.markdown("**Video deformation vs the curve's deformation axis**")
-                    comparison = pd.DataFrame(
-                        {
-                            "frame": track["frames"],
-                            "ε from video": eps_video,
-                            "ε from curve": eps_curve_at_frames,
-                        }
-                    ).dropna()
-                    st.line_chart(comparison.set_index("frame"), height=280)
-
-                    c1, c2 = st.columns(2)
-                    c1.metric(
-                        "Scale factor",
-                        f"{scale:.3f}" if np.isfinite(scale) else "n/a",
-                        help="Video deformation divided by curve deformation. 1.0 means "
-                        "they agree.",
+                with a2:
+                    end_frame = st.number_input(
+                        "End-of-ramp frame", 0, last, key="video_end_frame"
                     )
-                    c2.metric("Agreement R²", f"{r2:.3f}" if np.isfinite(r2) else "n/a")
 
-                    if np.isfinite(scale) and abs(scale - 1.0) > 0.15:
-                        suggested = st.session_state["cell_height_um"] * scale
+                if st.button("🔬 Track the cell through the video", type="primary", **STRETCH):
+                    try:
+                        st.session_state["video_track"] = cached_track(
+                            path,
+                            signature,
+                            60,
+                            roi,
+                            float(st.session_state["video_sensitivity"]),
+                            bool(st.session_state["video_strip_lines"]),
+                            int(contact_frame),
+                            int(end_frame),
+                            enhancement(),
+                            st.session_state["video_cell_side"],
+                            bool(st.session_state["video_reject_dark"]),
+                            bool(st.session_state["video_find_nucleus"]),
+                            st.session_state["video_appearance"],
+                        )
+                    except Exception as exc:
+                        st.error(f"Tracking failed: {exc}")
+
+                track = st.session_state.get("video_track")
+                if track:
+                    found = int(np.sum(track["found"]))
+                    total = len(track["frames"])
+                    eps_video, h_ref = va.deformation_from_track(track, reference="max")
+
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("Frames with a cell", f"{found}/{total}")
+                    t2.metric("Reference height", f"{h_ref:.0f} px" if np.isfinite(h_ref) else "n/a")
+                    t3.metric(
+                        "Max deformation seen",
+                        f"{np.nanmax(eps_video):.3f}" if np.isfinite(eps_video).any() else "n/a",
+                    )
+
+                    if found < total * 0.5:
                         st.warning(
-                            f"The video says the cell deformed {scale:.2f}× as much as the "
-                            f"curve's ε axis claims. The usual cause is the cell height: "
-                            f"{st.session_state['cell_height_um']:.2f} μm would need to be "
-                            f"about {suggested:.2f} μm for the two to agree. A wrong contact "
-                            f"point does the same thing."
+                            "The cell was found in fewer than half the sampled frames. "
+                            "Narrow the search region or adjust the sensitivity before "
+                            "trusting the comparison below."
                         )
-                    elif np.isfinite(scale):
-                        st.success(
-                            "Video and force curve agree on how much the cell deformed."
+
+                    data_now = st.session_state.get("data")
+                    if data_now is not None and np.isfinite(eps_video).any():
+                        eps_curve_at_frames = np.array(
+                            [
+                                va.epsilon_for_frame(
+                                    f, contact_frame, end_frame, float(np.nanmax(data_now["epsilon"]))
+                                )
+                                for f in track["frames"]
+                            ]
                         )
+                        scale, r2 = va.align_scale(eps_video, eps_curve_at_frames)
+
+                        st.markdown("**Video deformation vs the curve's deformation axis**")
+                        comparison = pd.DataFrame(
+                            {
+                                "frame": track["frames"],
+                                "ε from video": eps_video,
+                                "ε from curve": eps_curve_at_frames,
+                            }
+                        ).dropna()
+                        st.line_chart(comparison.set_index("frame"), height=280)
+
+                        c1, c2 = st.columns(2)
+                        c1.metric(
+                            "Scale factor",
+                            f"{scale:.3f}" if np.isfinite(scale) else "n/a",
+                            help="Video deformation divided by curve deformation. 1.0 means "
+                            "they agree.",
+                        )
+                        c2.metric("Agreement R²", f"{r2:.3f}" if np.isfinite(r2) else "n/a")
+
+                        if np.isfinite(scale) and abs(scale - 1.0) > 0.15:
+                            suggested = st.session_state["cell_height_um"] * scale
+                            st.warning(
+                                f"The video says the cell deformed {scale:.2f}× as much as the "
+                                f"curve's ε axis claims. The usual cause is the cell height: "
+                                f"{st.session_state['cell_height_um']:.2f} μm would need to be "
+                                f"about {suggested:.2f} μm for the two to agree. A wrong contact "
+                                f"point does the same thing."
+                            )
+                        elif np.isfinite(scale):
+                            st.success(
+                                "Video and force curve agree on how much the cell deformed."
+                            )
 
 # =================================================== TAB 3: Igor generator ==
+
+def igor_result_panel():
+    """The generated force curve, kept until the next one is made: plot,
+    summary, downloads, and the buttons that take it further."""
+    gen = st.session_state.get("igor_generated")
+    if not gen:
+        return
+    out, eps_gen, force_N_gen = gen["out"], gen["eps"], gen["force"]
+    st.success(
+        f"Generated {len(out):,} points · contact at index {gen['contact']} "
+        f"· peak force {force_N_gen.max() * 1e9:.3g} nN "
+        f"· ε up to {eps_gen.max():.3f}")
+    cols = st.columns(len(gen["stats"]))
+    for col, (label, value) in zip(cols, gen["stats"]):
+        col.metric(label, value)
+    gen_style = current_style(force_N_gen)
+    st.plotly_chart(
+        force_curve_figure(eps_gen, force_N_gen, gen_style,
+                           title="Generated force curve"),
+        **STRETCH, key="igor_plot")
+    st.dataframe(safe_frame(out.head(25)), hide_index=True, **STRETCH)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button(
+            "📥 Download CSV", data=safe_frame(out).to_csv(index=False),
+            file_name=f"{gen['name']}_force_curve.csv", mime="text/csv",
+            **STRETCH)
+    with c2:
+        if st.button("➡️ Use this curve now", key="igor_use", **STRETCH):
+            st.session_state["data"] = {
+                "epsilon": eps_gen, "force_N": force_N_gen,
+                "source": "Igor-generated", "n_dropped": 0}
+            st.success("Loaded into the Fitting tab.")
+    with c3:
+        frame = pd.DataFrame({"Relative Deformation": eps_gen,
+                              "Force (nN)": force_N_gen * 1e9})
+        st.button("📚 Send to stacked plot", key="igor_send", **STRETCH,
+                  on_click=send_to_stack,
+                  args=(f"{gen['name']} · force curve", frame,
+                        "Create force-ε file", gen["stats"]),
+                  help="Sends force against ε, with this summary, to the "
+                       "Stack & compare tab.")
+    note = st.session_state.pop("_vq_sent_note", None)
+    if note:
+        st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
+
 
 with tab_igor:
     section("Build a force curve from Igor .ibw files")
@@ -26166,46 +26271,27 @@ with tab_igor:
                             }
                         )
 
-                        st.success(
-                            f"Generated {len(out):,} points · contact at index {contact_idx} "
-                            f"· peak force {force_N_gen.max() * 1e9:.3g} nN "
-                            f"· ε up to {eps_gen.max():.3f}"
-                        )
-
-                        gen_style = current_style(force_N_gen)
-                        st.plotly_chart(
-                            force_curve_figure(
-                                eps_gen,
-                                force_N_gen,
-                                gen_style,
-                                title="Generated force curve",
-                            ),
-                            **STRETCH,
-                            key="igor_plot",
-                        )
-                        st.dataframe(safe_frame(out.head(25)),
-                                     hide_index=True, **STRETCH)
-
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.download_button(
-                                "📥 Download CSV",
-                                data=safe_frame(out).to_csv(index=False),
-                                file_name="force_curve_generated.csv",
-                                mime="text/csv",
-                                **STRETCH,
-                            )
-                        with c2:
-                            if st.button("➡️ Use this curve now", **STRETCH):
-                                st.session_state["data"] = {
-                                    "epsilon": eps_gen,
-                                    "force_N": force_N_gen,
-                                    "source": "Igor-generated",
-                                    "n_dropped": 0,
-                                }
-                                st.success("Loaded into the analysis tab.")
+                        st.session_state["igor_generated"] = {
+                            "out": out, "eps": eps_gen, "force": force_N_gen,
+                            "contact": contact_idx,
+                            "name": re.sub(r"\.ibw$", "", str(
+                                getattr(igor_cell, "name", "cell")),
+                                flags=re.I),
+                            "stats": [
+                                ("Points", f"{len(out):,}"),
+                                ("Contact at index", f"{contact_idx}"),
+                                ("Peak force",
+                                 f"{force_N_gen.max() * 1e9:.4g} nN"),
+                                ("Max ε", f"{eps_gen.max():.4f}"),
+                                ("Max indentation",
+                                 f"{delta.max() * 1e6:.4g} µm"),
+                                ("Spring constant", f"{k_cantilever:g} N/m"),
+                                ("Cell height h₀", f"{height_igor_um:g} µm"),
+                            ]}
                     except Exception as exc:
                         st.error(f"Generation failed: {exc}")
+
+                igor_result_panel()
 
 
 # ======================================================== TAB 3: database ==
@@ -27361,7 +27447,8 @@ def ai_panel():
     fig = ai_time_figure(processed, units, tlabel)
     base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
                                 labels=names)
-    ai_send_row(processed, units, tlabel, base)
+    ai_send_row(processed, units, tlabel, base,
+                channels={1: (a1, b1), 2: (a2, b2)}, names=names)
     ai_chart(fig, base, key="ai_time")
 
     # P1 against P2 -----------------------------------------------------
@@ -27524,8 +27611,9 @@ def ai_send_to_stack(tables):
     """Each plot into its own Stack & compare slot."""
     s = st.session_state
     slots = []
-    for name, frame in tables:
-        slot = send_to_stack(name, frame, source="AFM output analysis")
+    for name, frame, stats in tables:
+        slot = send_to_stack(name, frame, source="AFM output analysis",
+                             stats=stats)
         if slot is None:
             break
         slots.append(slot + 1)
@@ -27539,18 +27627,54 @@ def ai_send_to_stack(tables):
     s.pop("_vq_sent_note", None)
 
 
-def ai_send_row(processed, units, tlabel, base):
+def ai_trace_stats(x, y, unit, channel=None):
+    """A time trace's summary, as (label, value) pairs: what goes with an
+    AFM plot sent to Stack & compare."""
+    s = st.session_state
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    stats = []
+    if channel:
+        stats.append(("Channel", channel))
+    if not ok.any():
+        return stats
+    xs, ys = x[ok], y[ok]
+    u = f" {unit}" if unit and unit != "raw" else ""
+    stats += [
+        ("Duration", f"{np.ptp(xs):.4g} s ({ys.size:,} points)"),
+        ("Mean ± SD", mean_sd(ys, 4) + u),
+        ("Median", f"{np.median(ys):.4g}{u}"),
+        ("Min / max", f"{ys.min():.4g} / {ys.max():.4g}{u}"),
+        ("Peak-to-peak", f"{np.ptp(ys):.4g}{u}"),
+    ]
+    rate = float(s.get("ai_rate", 0) or 0)
+    if rate > 0:
+        stats.append(("Line rate", f"{rate:.4g} Hz"))
+    if s.get("ai_smooth", "Off") != "Off":
+        stats.append(("Smoothing", f"{s.get('ai_smethod', '')}, "
+                                   f"{s.get('ai_swin', '')} points"))
+    return stats
+
+
+def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
     """The 📚 Send to stacked plot button above the time plot: Plot 1 and
-    Plot 2, as processed (baseline, Y math), each as its own file."""
+    Plot 2, as processed (baseline, Y math), each as its own file, with
+    its summary statistics."""
     s = st.session_state
     tables = []
     for which in sorted(processed):
         x, y = processed[which]
         label = (s.get(f"ai_ylabel{which}")
                  or f"Plot {which} ({units[which]})")
+        picked = [c for c in ((channels or {}).get(which) or ())
+                  if c is not None]
+        channel = " / ".join(str(names[c]) for c in picked
+                             if names is not None and c < len(names))
         tables.append((f"{base} · Plot {which}",
                        pd.DataFrame({tlabel or "Time (s)": np.asarray(x),
-                                     label: np.asarray(y)})))
+                                     label: np.asarray(y)}),
+                       ai_trace_stats(x, y, units[which], channel)))
     note_col, send_col = st.columns([4, 1.8])
     send_col.button("📚 Send to stacked plot", key="ai_send_stack",
                     on_click=ai_send_to_stack, args=(tables,),
@@ -28133,7 +28257,11 @@ def sc_panel():
         sc_save_controls(traces, stem)
 
     with right:
-        k1, k2, k3, k4 = st.columns([1.5, 1.1, 1.4, 1])
+        k0, k1, k2, k3, k4 = st.columns([1.15, 1.5, 1.1, 1.4, 1])
+        k0.toggle("💬 Stats", key="sc_balloons",
+                  value=None if "sc_balloons" in s else True,
+                  help="Show or hide every summary balloon on the plot "
+                       "at once. What they show is set under 🎨 Look.")
         k1.toggle("Click a point to set zero", key="sc_click",
                   help="Then a click on any point of a trace makes that "
                        "point x = 0 for that file.")
@@ -28172,7 +28300,8 @@ def sc_panel():
             legend_size=int(s.get("sc_ls", 13)),
             legend_line=int(s.get("sc_legline", 40)),
             width=int(s.get("sc_width") or 0) or None,
-            stats_box=s.get("sc_stats", "Analysis summary"),
+            stats_box=(s.get("sc_stats", "Analysis summary")
+                       if s.get("sc_balloons", True) else "Off"),
             stats_place=s.get("sc_stats_at", "Inside, bottom right"))
         # the zoom survives restyling, until ⤢ Reset view
         view = int(s.get("_sc_view", 0))
@@ -28230,3 +28359,4 @@ with tab_stack:
 # run, whichever way the load is shared, so switching the sharing back finds
 # the other way's settings (its ε, its ranges) as they were left.
 keep_unrendered_settings()
+release_memory()
