@@ -291,7 +291,8 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    grid=False, ticks="outside", mirror=True,
                    clickable=False, frame=None, legend="Above",
                    y_titles=None, align_titles=True, title_space=70,
-                   title_size=None, bold_titles=False, legend_size=None):
+                   title_size=None, bold_titles=False, legend_size=None,
+                   legend_line=40, width=None):
     """
     The files in panels, one above the other.
 
@@ -447,7 +448,8 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     right_m = ((title_space + title_size + 6) if align_titles else 80) \
         if has_right else 30
     place = LEGEND_PLACES_SPEC.get(legend, LEGEND_PLACES_SPEC["Above"])
-    legend_spec = dict(place, font=dict(size=int(legend_size or font_size)))
+    legend_spec = dict(place, font=dict(size=int(legend_size or font_size)),
+                       itemwidth=max(30, int(legend_line or 40)))
     if legend == "Right, outside":
         legend_spec["x"] = 1.0 + (right_m + 10) / 900.0 if has_right \
             else 1.02
@@ -456,6 +458,7 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
         legend_spec["y"] = -(font_size * 4.5 + 10) / max(height - 110, 100)
     fig.update_layout(
         height=height + (40 if legend == "Below" else 0),
+        width=(int(width) if width else None),
         margin=dict(l=left_m, r=right_m, t=50,
                     b=60 + (40 if legend == "Below" else 0)),
         plot_bgcolor="white", paper_bgcolor="white",
