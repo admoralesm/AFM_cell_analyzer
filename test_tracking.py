@@ -70,6 +70,36 @@ def make_video(path, n=360, fps=30, beat=0.06, probe_from=6.0, seed=3):
     return np.array(truth)
 
 
+def sphere_scene(kind, seed=1, w=640, h=480):
+    """Bright-field look: the probe sphere a dark rim with a greyer inside,
+    hanging from a cantilever (narrower, wider or tapered), a round cell
+    with a dark outline right under it, and dark debris close by."""
+    rng = np.random.default_rng(seed)
+    img = 150 + cv2.GaussianBlur(rng.normal(0, 10, (h, w)).astype(np.float32),
+                                 (0, 0), 2)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    d = np.sqrt(((xx - 330) / 120) ** 2 + ((yy - 300) / 95) ** 2)
+    img[(d > 0.97) & (d < 1.03)] -= 60
+    img[d < 0.97] += 12
+    cx, cy, r = 380.0, 230.0, 30.0
+    if kind == "narrow":
+        beam = (np.abs(xx - cx) <= 16) & (yy <= cy)
+    elif kind == "wide":
+        beam = (np.abs(xx - cx) <= 50) & (yy <= cy - 5)
+    else:
+        beam = (yy <= cy - 5) & (np.abs(xx - cx) <= 0.4 * (cy - 5 - yy) + 22)
+    img[beam] = 55
+    rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    img[rr <= r] = 105
+    img[(rr <= r) & (rr >= r - 7)] = 40
+    img = cv2.GaussianBlur(img, (0, 0), 2.0)
+    img[(xx - cx + 5) ** 2 + (yy - cy + 7) ** 2 <= 12] = 245
+    for (dx, dy, rad) in ((480, 330, 16), (300, 160, 11)):
+        img[(xx - dx) ** 2 + (yy - dy) ** 2 <= rad * rad] = 60
+    img = np.clip(img + rng.normal(0, 4, img.shape), 0, 255).astype(np.uint8)
+    return img, (cx, cy, r)
+
+
 def main():
     folder = tempfile.mkdtemp(prefix="afm_tracking_test_")
     path = os.path.join(folder, "beats.mp4")
@@ -144,12 +174,17 @@ def main():
           np.hypot(still["center"][0] - 330, still["center"][1] - 110) < 1.5,
           f"{still['center']} r {still['radius']:.2f}")
     worst = 0.0
-    for d in ((0, 0), (6, 4), (-10, 8), (0, 15)):
-        one = aa.sphere_from_click(gray, (330 + d[0], 110 + d[1]))
-        worst = max(worst, np.hypot(one["center"][0] - 330,
-                                    one["center"][1] - 110))
-    check("one click anywhere on the tip finds it (within 2 px)",
-          worst < 2.0, f"worst {worst:.1f} px")
+    for kind in ("narrow", "wide", "tapered"):
+        img, true = sphere_scene(kind)
+        for d in ((0, 0), (6, -5), (-8, 6), (10, 0), (0, 11)):
+            one = aa.sphere_from_click(img, (true[0] + d[0], true[1] + d[1]))
+            err = (np.hypot(one["center"][0] - true[0],
+                            one["center"][1] - true[1])
+                   + abs(one["radius"] - true[2]))
+            worst = max(worst, float(err))
+    check("a click inside a sphere hanging from a cantilever finds that "
+          "sphere, not the cell or the beam (centre + radius within 3 px)",
+          worst < 3.0, f"worst {worst:.1f} px")
     hinted = aa.AutoCellAnalysis.analyze(path, probe_diameter_um=14.5,
                                          probe_hint=(330.0, 110.0, 22.0))
     check("the analysis takes a marked sphere as the probe tip",
