@@ -634,6 +634,39 @@ st.markdown(
 )
 
 
+# Tighter spacing and smaller text everywhere, so options and plots fit on
+# one screen. Switched with "Compact layout" at the top right.
+COMPACT_CSS = """
+<style>
+    .block-container {padding-top: 2.9rem; padding-left: 1.6rem;
+                      padding-right: 1.6rem; max-width: 100%;}
+    .app-title {font-size: 1.3rem;}
+    .section {margin: 0.5rem 0 0.45rem 0; font-size: 0.98rem;}
+    [data-testid="stVerticalBlock"] {gap: 0.45rem;}
+    [data-testid="stHorizontalBlock"] {gap: 0.6rem;}
+    [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label
+        {font-size: 0.8rem;}
+    [data-testid="stWidgetLabel"] {min-height: 1.1rem; margin-bottom: 0.1rem;}
+    [data-testid="stMarkdownContainer"] p {font-size: 0.9rem;}
+    [data-testid="stCaptionContainer"] {font-size: 0.78rem;}
+    [data-baseweb="select"] > div {min-height: 2.05rem;}
+    [data-baseweb="select"] div, [data-baseweb="input"] input,
+    [data-testid="stNumberInputField"] {font-size: 0.86rem;}
+    [data-baseweb="input"] input {padding-top: 0.3rem; padding-bottom: 0.3rem;}
+    [data-baseweb="input"], [data-testid="stNumberInputContainer"]
+        {min-height: 2.05rem; height: 2.05rem;}
+    .stButton button, .stDownloadButton button, [data-testid="stPopover"] button
+        {min-height: 2.05rem; padding: 0.15rem 0.6rem; font-size: 0.86rem;}
+    [data-testid="stExpander"] summary {padding: 0.35rem 0.7rem;}
+    [data-testid="stExpander"] summary p {font-size: 0.88rem;}
+    [data-testid="stTab"] p {font-size: 0.9rem;}
+    [data-testid="stFileUploaderDropzone"] {padding: 0.45rem 0.7rem;}
+    [data-testid="stSlider"] {padding-bottom: 0.1rem;}
+    div[data-testid="stMetricValue"] {font-size: 1.2rem;}
+</style>
+"""
+
+
 def _stretch_kwargs():
     """`use_container_width` is deprecated in new Streamlit and absent in old.
 
@@ -21249,7 +21282,12 @@ with head_left:
     st.markdown('<p class="app-title">🔬 Single cell compression tools</p>',
                 unsafe_allow_html=True)
 with head_right:
-    st.markdown("<div style='text-align:right;color:#6b7785'>v6.0</div>", unsafe_allow_html=True)
+    st.toggle("Compact layout", key="ui_compact", value=True
+              if "ui_compact" not in st.session_state else None,
+              help="Smaller text, tighter spacing and the full width of "
+                   "the screen, so more fits without scrolling.")
+if st.session_state.get("ui_compact", True):
+    st.markdown(COMPACT_CSS, unsafe_allow_html=True)
 
 # Every tab is still built and still filled, so none of that code can rot.
 # The two that are not wanted on the bar for now are hidden by hiding their
@@ -26818,7 +26856,7 @@ def sc_axis_ranges(i):
         for name in names:
             s[name] = ""
 
-    with st.popover("📏 Axis ranges", **STRETCH):
+    with st.popover("📏 Ranges", **STRETCH):
         with st.form(f"sc_r{i}_form", border=False):
             st.caption("For this file: x is its panel's x axis, y is its "
                        "own y axis. Leave a box empty for automatic.")
@@ -26837,25 +26875,34 @@ def sc_axis_ranges(i):
     return xr, yr
 
 
-def sc_slot(i, n=3):
-    """One file's controls. Returns the prepared trace or None."""
+def sc_slot_name(i):
+    """What the file slot holds, for its heading."""
     s = st.session_state
     sent = s.get(f"sc_sent{i}")
     if sent is not None:
-        # data sent here from the video tab, in place of a file
-        st.markdown(f"**File {i + 1}** · 📥 from "
-                    f"{sent.get('source', 'the video')}")
-        st.caption(sent["name"])
-        st.button("✖ Remove", key=f"sc_unsend{i}", on_click=s.pop,
-                  args=(f"sc_sent{i}", None))
+        return "📥 " + str(sent["name"])
+    up = s.get(f"sc_file{i}")
+    return str(getattr(up, "name", "") or "empty")
+
+
+def sc_slot(i, n=3):
+    """One file's controls, compact. Returns the prepared trace or None."""
+    s = st.session_state
+    sent = s.get(f"sc_sent{i}")
+    if sent is not None:
+        # data sent here from another tab, in place of a file
+        a, b = st.columns([3, 1])
+        a.caption(f"From {sent.get('source', 'the video')}: "
+                  f"{sent['name']}")
+        b.button("✖", key=f"sc_unsend{i}", on_click=s.pop,
+                 args=(f"sc_sent{i}", None), help="Remove it", **STRETCH)
         frame, file_name = sent["frame"], sent["name"]
     else:
         up = st.file_uploader(
-            f"File {i + 1}", key=f"sc_file{i}",
+            f"File {i + 1}", key=f"sc_file{i}", label_visibility="collapsed",
             type=["csv", "txt", "tsv", "dat", "xlsx", "xls"],
-            help="CSV, TSV, TXT or Excel. Lines of notes above the header "
-                 "are skipped, and any separator works. Plots on the video "
-                 "tab can also be sent here with **Send to stacked plot**.")
+            help="CSV, TSV, TXT or Excel. Plots on the video and AFM tabs "
+                 "can also be sent here with **Send to stacked plot**.")
         if up is None:
             return None
         try:
@@ -26874,55 +26921,57 @@ def sc_slot(i, n=3):
     s.setdefault(f"sc_col{i}", sc.DEFAULT_COLOURS[i % len(
         sc.DEFAULT_COLOURS)])
     s.setdefault(f"sc_zmode{i}", "Start of the data")
-    st.text_input("Name on the plot", key=f"sc_label{i}")
-    c1, c2 = st.columns(2)
-    xcol = c1.selectbox("x", cols, key=f"sc_x{i}")
-    ycol = c2.selectbox("y", cols, key=f"sc_y{i}")
-    sc_default(f"sc_ylab{i}", str(ycol))
-    mode = st.selectbox("Zero of x at", sc.ZERO_MODES, key=f"sc_zmode{i}",
-                        help="Moves this file along x so its zero is where "
-                             "you want it: the first point, a time you "
-                             "type, the peak, the lowest point, or where the "
-                             "signal first crosses a level. With **Click a "
-                             "point to set zero** on, a click on the plot "
-                             "sets it too.")
-    if mode == "A value I type":
-        st.number_input("Zero at x =", key=f"sc_zval{i}", format="%.6g",
-                        value=float(s.get(f"sc_zval{i}", 0.0) or 0.0)
-                        if f"sc_zval{i}" not in s else None)
-    elif mode == "Where it first crosses a level":
-        st.number_input("Level (y)", key=f"sc_zlevel{i}", format="%.6g")
-    st.number_input(
-        "Then move it along x by", key=f"sc_shift{i}", format="%.6g",
-        value=None if f"sc_shift{i}" in s else 0.0,
-        help="Slides this trace left (negative) or right (positive) after "
-             "its zero is set, so the zero can sit before the trace "
-             "starts. E.g. 'Start of the data' and then 2 makes the trace "
-             "begin at x = 2.")
-    t1, t2 = st.columns(2)
-    t1.toggle("Negative up", key=f"sc_neg{i}",
-              help="Flips this file's y axis so negative values are drawn "
-                   "above the baseline. The numbers keep their sign.")
-    t2.color_picker("Colour", key=f"sc_col{i}")
     options = list(range(1, max(n, 1) + 1))
     if s.get(f"sc_panel{i}") not in options:
         s[f"sc_panel{i}"] = min(i + 1, options[-1])
-    p1, p2 = st.columns(2)
-    p1.selectbox("Panel", options, key=f"sc_panel{i}",
-                 help="Files given the same panel number are overlaid on "
-                      "one plot; different numbers are stacked.")
-    p2.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
-    p2.toggle("Own y axis (right)", key=f"sc_right{i}",
-              help="When overlaid on another file, this one gets its own y "
-                   "axis on the right, for different units or sizes.")
-    x_range, y_range = sc_axis_ranges(i)
-    with st.expander("More"):
-        st.text_input("y axis title", key=f"sc_ylab{i}")
+
+    # what to draw, and where
+    c1, c2, c3 = st.columns([1.3, 1.3, 0.8])
+    xcol = c1.selectbox("x", cols, key=f"sc_x{i}")
+    ycol = c2.selectbox("y", cols, key=f"sc_y{i}")
+    c3.selectbox("Panel", options, key=f"sc_panel{i}",
+                 help="Same number = overlaid; different = stacked.")
+    sc_default(f"sc_ylab{i}", str(ycol))
+    # where it starts
+    z1, z2, z3 = st.columns([1.6, 1, 1])
+    mode = z1.selectbox(
+        "Zero of x at", sc.ZERO_MODES, key=f"sc_zmode{i}",
+        help="Where this file's x = 0 is: the first point, a value you "
+             "type, the peak, the lowest point, or a level crossing. With "
+             "**Click a point to set zero** on, a click on the plot sets "
+             "it too.")
+    if mode == "A value I type":
+        z2.number_input("at x =", key=f"sc_zval{i}", format="%.6g",
+                        value=float(s.get(f"sc_zval{i}", 0.0) or 0.0)
+                        if f"sc_zval{i}" not in s else None)
+    elif mode == "Where it first crosses a level":
+        z2.number_input("level y =", key=f"sc_zlevel{i}", format="%.6g")
+    else:
+        z2.empty()
+    z3.number_input(
+        "then move by", key=f"sc_shift{i}", format="%.6g",
+        value=None if f"sc_shift{i}" in s else 0.0,
+        help="Slides the trace along x after its zero is set (negative = "
+             "left), so the zero can sit before the trace starts.")
+    # how it looks
+    t1, t2 = st.columns(2)
+    t1.toggle("Negative up", key=f"sc_neg{i}",
+              help="Flips this file's y axis. The numbers keep their sign.")
+    t2.toggle("Own right axis", key=f"sc_right{i}",
+              help="When overlaid, this file gets its own y axis on the "
+                   "right, for other units or sizes.")
+    u1, u2, u3 = st.columns([0.5, 1.2, 1.2])
+    u1.color_picker("Colour", key=f"sc_col{i}",
+                    label_visibility="collapsed")
+    with u2:
+        x_range, y_range = sc_axis_ranges(i)
+    with u3.popover("⋯ More", **STRETCH):
+        st.text_input("Name in the legend", key=f"sc_label{i}")
+        st.text_input("Its y axis title", key=f"sc_ylab{i}")
         m1, m2 = st.columns(2)
         m1.number_input("x ×", key=f"sc_xf{i}", value=None
                         if f"sc_xf{i}" in s else 1.0, format="%.6g",
-                        help="Multiplies this file's x, e.g. 0.001 for ms "
-                             "to s, so files in different units line up.")
+                        help="E.g. 0.001 for ms to s.")
         m2.number_input("y ×", key=f"sc_yf{i}", value=None
                         if f"sc_yf{i}" in s else 1.0, format="%.6g",
                         help="-1 changes the sign of the values.")
@@ -26936,11 +26985,11 @@ def sc_slot(i, n=3):
                          typed=float(s.get(f"sc_zval{i}") or 0.0),
                          level=float(s.get(f"sc_zlevel{i}") or 0.0))
     shift = float(s.get(f"sc_shift{i}") or 0.0)
-    st.caption(f"{len(x_all):,} points · x from {np.nanmin(x_all):.6g} to "
-               f"{np.nanmax(x_all):.6g} · zero at x = {zero:.6g}"
-               + (f", then moved by {shift:+.6g}" if shift else "")
+    st.caption(f"{len(x_all):,} pts · x {np.nanmin(x_all):.4g} to "
+               f"{np.nanmax(x_all):.4g} · zero at {zero:.4g}"
+               + (f", moved {shift:+.4g}" if shift else "")
                if len(x_all) else "No numbers in these columns.")
-    zero -= float(s.get(f"sc_shift{i}") or 0.0)
+    zero -= shift
     x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
@@ -26972,164 +27021,189 @@ def sc_y_titles():
     return out
 
 
+SC_DEFAULTS = {
+    "sc_n": 3, "sc_link": False, "sc_zline": True, "sc_height": 240,
+    "sc_lw": 1.8, "sc_aw": 1.2, "sc_fs": 14, "sc_ts": 16, "sc_ls": 13,
+    "sc_align": True, "sc_tspace": 70, "sc_legend": "Above",
+    "sc_legline": 40, "sc_width": 0, "sc_ticks": "outside",
+}
+
+
+def sc_axes_controls(traces):
+    """The 📐 Axes group: x for all panels, titles, outline, ticks."""
+    s = st.session_state
+    s.setdefault("sc_frame", sc.FRAMES[0])
+    a1, a2 = st.columns(2)
+    a1.toggle("Link the x axes", key="sc_link",
+              help="On: the panels share one x axis and zoom together.")
+    a2.toggle("Line at x = 0", key="sc_zline")
+    b1, b2 = st.columns(2)
+    b1.text_input("x from (all)", key="sc_xmin", placeholder="auto",
+                  help="Sets the x axis of every panel at once.")
+    b2.text_input("x to (all)", key="sc_xmax", placeholder="auto")
+    sc_default("sc_xtitle", str(traces[0]["xcol"]))
+    st.text_input("x axis title", key="sc_xtitle")
+    panels_used = sorted({1 if s.get("sc_overlay") else t["panel"]
+                          for t in traces})
+    st.caption("y axis titles (empty = the files' own)")
+    boxes = []
+    for panel in panels_used:
+        boxes.append((f"Panel {panel}", f"sc_ytitle{panel}"))
+        if any(t.get("right") and (t["panel"] == panel
+                                   or s.get("sc_overlay")) for t in traces):
+            boxes.append((f"Panel {panel} right", f"sc_ytitle{panel}r"))
+    for start in range(0, len(boxes), 2):
+        cols = st.columns(2)
+        for col, (label, key) in zip(cols, boxes[start:start + 2]):
+            col.text_input(label, key=key, placeholder="automatic")
+    st.selectbox("Axis outline", sc.FRAMES, key="sc_frame")
+    c1, c2 = st.columns(2)
+    c1.selectbox("Ticks", ("outside", "inside"), key="sc_ticks")
+    c2.slider("Axis thickness", 0.5, 5.0, step=0.1, key="sc_aw")
+    c1, c2 = st.columns(2)
+    c1.checkbox("Line up the y titles", key="sc_align",
+                help="Every y title the same distance from its axis, so "
+                     "stacked panels line up.")
+    c2.checkbox("Grid", key="sc_grid")
+    st.slider("Room for the y numbers (px)", 30, 200, step=5,
+              key="sc_tspace", disabled=not s.get("sc_align"))
+
+
+def sc_style_controls():
+    """The 🎨 Look group: lines, legend, text, size."""
+    c1, c2 = st.columns(2)
+    c1.slider("Line thickness", 0.5, 6.0, step=0.1, key="sc_lw")
+    c2.slider("Panel height", 120, 700, step=10, key="sc_height")
+    c1, c2 = st.columns(2)
+    c1.selectbox("Legend", sc.LEGEND_PLACES, key="sc_legend")
+    c2.slider("Legend line length", 30, 120, step=5, key="sc_legline",
+              help="How long the coloured line is beside each name.")
+    c1, c2, c3 = st.columns(3)
+    c1.number_input("Titles", 8, 36, key="sc_ts")
+    c2.number_input("Numbers", 8, 30, key="sc_fs")
+    c3.number_input("Legend", 6, 30, key="sc_ls")
+    c1, c2 = st.columns(2)
+    c1.checkbox("Bold titles", key="sc_bold")
+    c2.toggle("All on one plot", key="sc_overlay",
+              help="Every file in one panel, whatever its panel number.")
+    st.slider("Plot width (px, 0 = fit the page)", 0, 2000, step=50,
+              key="sc_width",
+              help="Narrower makes the lines (and x axis) shorter.")
+
+
+def sc_save_controls(traces, stem):
+    s = st.session_state
+    st.selectbox("Format", ("svg", "png", "jpeg"), key="sc_fmt")
+    c1, c2 = st.columns(2)
+    c1.number_input("Width (px)", 300, 4000, step=50, key="sc_w",
+                    value=None if "sc_w" in s else 900)
+    c2.number_input("Resolution ×", 1, 8, key="sc_scale",
+                    value=None if "sc_scale" in s else 3)
+    st.caption("Then press the 📷 camera icon on the plot.")
+    table = sc.aligned_table(traces)
+    st.download_button("💾 Aligned data (CSV)",
+                       data=table.to_csv(index=False).encode("utf-8"),
+                       file_name=stem + "_aligned.csv", mime="text/csv",
+                       key="sc_csv", **STRETCH)
+
+
 def sc_panel():
     s = st.session_state
     # a click on the plot asked for a new zero on the previous run
     for i, value in (s.pop("_sc_zero_next", None) or {}).items():
         s[f"sc_zmode{i}"] = "A value I type"
         s[f"sc_zval{i}"] = float(value)
-    st.caption(
-        "Load up to six files (CSV, TSV, TXT or Excel), or send plots here "
-        "from the video and AFM output tabs. Each file has its own x and y "
-        "columns, its own time zero (**Zero of x at**), its own axis ranges "
-        "(📏) and a **Panel** number: files with the same number are "
-        "overlaid, the rest are stacked. **Link the x axes** makes the "
-        "panels share one x axis that zooms together; off, each panel "
-        "keeps its own x axis.")
-    s.setdefault("sc_n", 3)
-    s.setdefault("sc_link", False)
-    s.setdefault("sc_zline", True)
-    s.setdefault("sc_height", 240)
-    s.setdefault("sc_lw", 1.8)
-    s.setdefault("sc_aw", 1.2)
-    s.setdefault("sc_fs", 14)
-    s.setdefault("sc_ts", 16)
-    s.setdefault("sc_ls", 13)
-    s.setdefault("sc_align", True)
-    s.setdefault("sc_tspace", 70)
-    s.setdefault("sc_frame", sc.FRAMES[0])
-    s.setdefault("sc_legend", "Above")
-    n = st.select_slider("How many files", list(range(1, 7)), key="sc_n")
-    traces = []
-    for start in range(0, n, 3):
-        cols = st.columns(min(3, n - start))
-        for k, col in enumerate(cols):
-            with col, st.container(border=True):
-                t = sc_slot(start + k, n)
-                if t is not None:
-                    traces.append(t)
+        s[f"sc_shift{i}"] = 0.0
+    for key, value in SC_DEFAULTS.items():
+        s.setdefault(key, value)
+    # Options on the left, grouped in four tabs; the plot on the right, so
+    # every change is seen next to the control that made it.
+    left, right = st.columns([1.05, 2.2], gap="medium")
+    with left:
+        t_files, t_axes, t_look, t_save = st.tabs(
+            ["📂 Files", "📐 Axes", "🎨 Look", "💾 Save"])
+        with t_files:
+            n = st.select_slider("Files", list(range(1, 7)), key="sc_n")
+            traces = []
+            for i in range(n):
+                with st.expander(f"{i + 1} · {sc_slot_name(i)}",
+                                 expanded=(i == 0 or s.get(f"sc_sent{i}")
+                                           is not None
+                                           or s.get(f"sc_file{i}")
+                                           is not None)):
+                    t = sc_slot(i, n)
+                    if t is not None:
+                        traces.append(t)
     if not traces:
-        st.info("Load a file above to start.", icon="📂")
+        with right:
+            st.info("Load a file on the left (📂 Files), or send a plot "
+                    "here from the video or AFM output tab.", icon="📂")
         return
-
-    g1, g2, g3, g4 = st.columns(4)
-    g1.toggle("Link the x axes", key="sc_link",
-              help="On: one x axis for all panels, zooming together. Off: "
-                   "each panel has its own x axis and zoom.")
-    g2.toggle("All on one plot", key="sc_overlay",
-              help="Draws every file on the same axes instead of stacking.")
-    g3.toggle("Click a point to set zero", key="sc_click",
-              help="Then a click on any point of a trace makes that point "
-                   "x = 0 for that file.")
-    g4.toggle("Line at x = 0", key="sc_zline")
-    h1, h2, h3 = st.columns([1, 1, 2])
-    h1.text_input("x from (all panels)", key="sc_xmin", placeholder="auto",
-                  help="Sets the x axis of every panel at once, in the "
-                       "zeroed units. Leave empty for automatic (or for "
-                       "each file's own 📏 range).")
-    h2.text_input("x to (all panels)", key="sc_xmax", placeholder="auto")
-    sc_default("sc_xtitle", str(traces[0]["xcol"]))
-    h3.text_input("x axis title", key="sc_xtitle")
-    panels_used = sorted({1 if s.get("sc_overlay") else t["panel"]
-                          for t in traces})
-    with st.expander("🎨 Style for all panels", expanded=True):
-        p1, p2, p3, p4 = st.columns(4)
-        p1.selectbox("Axis outline", sc.FRAMES, key="sc_frame",
-                     help="A box round each panel, only the left and "
-                          "bottom axes (open), or no axis lines.")
-        p2.selectbox("Legend", sc.LEGEND_PLACES, key="sc_legend")
-        p3.slider("Axis thickness", 0.5, 5.0, step=0.1, key="sc_aw")
-        p4.slider("Line thickness", 0.5, 6.0, step=0.1, key="sc_lw")
-        q1, q2, q3, q4 = st.columns(4)
-        q1.slider("Title size", 8, 36, key="sc_ts")
-        q2.slider("Tick label size", 8, 30, key="sc_fs")
-        q3.slider("Legend text size", 6, 30, key="sc_ls")
-        q4.slider("Panel height (px)", 120, 700, step=10, key="sc_height")
-        u1, u2, u3, u4 = st.columns(4)
-        u1.selectbox("Ticks", ("outside", "inside"), key="sc_ticks")
-        u2.checkbox("Grid", key="sc_grid")
-        u3.checkbox("Bold titles", key="sc_bold")
-        u4.checkbox("Line up the y titles", key="sc_align",
-                    help="Puts every y title the same distance from its "
-                         "axis, so the titles of stacked panels line up "
-                         "whatever their numbers.")
-        st.slider("Space for the y tick labels (px)", 30, 200, step=5,
-                  key="sc_tspace", disabled=not s.get("sc_align"),
-                  help="How far the y titles sit from the axis. Make it "
-                       "wider if long numbers run into the title.")
-        st.markdown("**y axis titles** (empty = the files' own names)")
-        cols = st.columns(min(4, max(1, len(panels_used))))
-        for k, panel in enumerate(panels_used):
-            with cols[k % len(cols)]:
-                st.text_input(f"Panel {panel}", key=f"sc_ytitle{panel}",
-                              placeholder="automatic")
-                if any(t.get("right") and (t["panel"] == panel
-                                           or s.get("sc_overlay"))
-                       for t in traces):
-                    st.text_input(f"Panel {panel}, right axis",
-                                  key=f"sc_ytitle{panel}r",
-                                  placeholder="automatic")
-    with st.expander("💾 Saving the figure"):
-        r1, r2, r3 = st.columns(3)
-        r1.selectbox("Save as", ("svg", "png", "jpeg"), key="sc_fmt")
-        r2.number_input("Saved width (px)", 300, 4000, step=50,
-                        key="sc_w", value=None if "sc_w" in s else 900)
-        r3.number_input("Resolution ×", 1, 8, key="sc_scale",
-                        value=None if "sc_scale" in s else 3)
-    fig = sc.stacked_figure(
-        traces, linked=bool(s.get("sc_link")),
-        overlay=bool(s.get("sc_overlay")),
-        panel_height=int(s.get("sc_height", 240)),
-        line_width=float(s.get("sc_lw", 1.8)),
-        axis_width=float(s.get("sc_aw", 1.2)),
-        font_size=int(s.get("sc_fs", 14)),
-        x_title=s.get("sc_xtitle") or "x",
-        zero_line=bool(s.get("sc_zline")),
-        grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
-        clickable=bool(s.get("sc_click")),
-        x_range=sc_global_x_range(),
-        frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
-        y_titles=sc_y_titles(), align_titles=bool(s.get("sc_align", True)),
-        title_space=int(s.get("sc_tspace", 70)),
-        title_size=int(s.get("sc_ts", 16)),
-        bold_titles=bool(s.get("sc_bold")),
-        legend_size=int(s.get("sc_ls", 13)))
+    with t_axes:
+        sc_axes_controls(traces)
+    with t_look:
+        sc_style_controls()
     stem = sc.nice_stem([t["file"] for t in traces])
-    config = {"displaylogo": False,
-              "toImageButtonOptions": {
-                  "format": s.get("sc_fmt", "svg"), "filename": stem,
-                  "width": int(s.get("sc_w") or 900),
-                  "height": int(fig.layout.height),
-                  "scale": int(s.get("sc_scale") or 3)}}
-    version = int(s.get("_sc_chart_ver", 0))
-    if s.get("sc_click"):
-        event = st.plotly_chart(fig, key=f"sc_chart_v{version}",
-                                config=config, theme=None, on_select="rerun",
-                                selection_mode="points", **STRETCH)
-        points = []
-        try:
-            points = list(event.selection.points or [])
-        except Exception:
+    with t_save:
+        sc_save_controls(traces, stem)
+
+    with right:
+        st.toggle("Click a point to set zero", key="sc_click",
+                  help="Then a click on any point of a trace makes that "
+                       "point x = 0 for that file.")
+        fig = sc.stacked_figure(
+            traces, linked=bool(s.get("sc_link")),
+            overlay=bool(s.get("sc_overlay")),
+            panel_height=int(s.get("sc_height", 240)),
+            line_width=float(s.get("sc_lw", 1.8)),
+            axis_width=float(s.get("sc_aw", 1.2)),
+            font_size=int(s.get("sc_fs", 14)),
+            x_title=s.get("sc_xtitle") or "x",
+            zero_line=bool(s.get("sc_zline")),
+            grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
+            clickable=bool(s.get("sc_click")),
+            x_range=sc_global_x_range(),
+            frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
+            y_titles=sc_y_titles(),
+            align_titles=bool(s.get("sc_align", True)),
+            title_space=int(s.get("sc_tspace", 70)),
+            title_size=int(s.get("sc_ts", 16)),
+            bold_titles=bool(s.get("sc_bold")),
+            legend_size=int(s.get("sc_ls", 13)),
+            legend_line=int(s.get("sc_legline", 40)),
+            width=int(s.get("sc_width") or 0) or None)
+        config = {"displaylogo": False,
+                  "toImageButtonOptions": {
+                      "format": s.get("sc_fmt", "svg"), "filename": stem,
+                      "width": int(s.get("sc_w") or 900),
+                      "height": int(fig.layout.height),
+                      "scale": int(s.get("sc_scale") or 3)}}
+        fit = not s.get("sc_width")
+        version = int(s.get("_sc_chart_ver", 0))
+        if s.get("sc_click"):
+            event = st.plotly_chart(
+                fig, key=f"sc_chart_v{version}", config=config, theme=None,
+                on_select="rerun", selection_mode="points",
+                **(STRETCH if fit else {}))
             points = []
-        if points:
-            p = points[-1]
-            curve = int(p.get("curve_number", 0))
-            if 0 <= curve < len(traces):
-                t = traces[curve]
-                s["_sc_zero_next"] = {t["slot"]: float(p["x"]) + t["zero"]}
-                s["_sc_chart_ver"] = version + 1
-                st.rerun()
-        st.caption("Click a point on a trace: it becomes x = 0 for that "
-                   "file.")
-    else:
-        st.plotly_chart(fig, key="sc_chart", config=config, theme=None,
-                        **STRETCH)
-    st.caption("Save the figure with the 📷 camera icon on the plot.")
-    table = sc.aligned_table(traces)
-    st.download_button("💾 Download the aligned data (CSV)",
-                       data=table.to_csv(index=False).encode("utf-8"),
-                       file_name=stem + "_aligned.csv", mime="text/csv",
-                       key="sc_csv")
+            try:
+                points = list(event.selection.points or [])
+            except Exception:
+                points = []
+            if points:
+                p = points[-1]
+                curve = int(p.get("curve_number", 0))
+                if 0 <= curve < len(traces):
+                    t = traces[curve]
+                    s["_sc_zero_next"] = {
+                        t["slot"]: float(p["x"]) + t["zero"]}
+                    s["_sc_chart_ver"] = version + 1
+                    st.rerun()
+            st.caption("Click a point on a trace: it becomes x = 0 for "
+                       "that file.")
+        else:
+            st.plotly_chart(fig, key="sc_chart", config=config, theme=None,
+                            **(STRETCH if fit else {}))
 
 
 with tab_stack:
