@@ -9678,15 +9678,46 @@ def video_viewer(path, details):
 # sphere. The tracking, once run, is drawn on it at whatever frame is on
 # show, so there is no second picture to keep in step with the first.
 
-STAGE_LOOK = "👁️ Just look"
-STAGE_ZOOM = "🔍 Zoom in on that spot"
-STAGE_MOVE = "✥ Move the view there"
-STAGE_CORNERS = "🎯 Place the cell's 4 corners (tracking)"
-STAGE_OUTLINE = "🧬 Draw the cell's outline (automatic analysis)"
-STAGE_SPHERE = "⚪ Mark the probe sphere"
-STAGE_CORRECT = "✏️ Correct a tracked corner"
-STAGE_MODES = (STAGE_LOOK, STAGE_ZOOM, STAGE_MOVE, STAGE_CORNERS,
-               STAGE_OUTLINE, STAGE_SPHERE, STAGE_CORRECT)
+# What a click does (internal actions)...
+STAGE_LOOK, STAGE_ZOOM, STAGE_MOVE = "inspect", "magnify", "recentre"
+STAGE_CORNERS, STAGE_OUTLINE = "fiducials", "contour"
+STAGE_SPHERE, STAGE_CORRECT = "calibration", "correction"
+
+# ...and the menu they are chosen from: five groups, two with a choice
+# inside, so cell definition (fiducial markers and boundary contour) and
+# field-of-view navigation each sit in one place.
+MENU_INSPECT = "👁️ Inspect"
+MENU_VIEW = "🔍 Field of view"
+MENU_CELL = "🧫 Cell definition"
+MENU_PROBE = "⚪ Scale calibration"
+MENU_CORRECT = "✏️ Trajectory correction"
+STAGE_MODES = (MENU_INSPECT, MENU_VIEW, MENU_CELL, MENU_PROBE, MENU_CORRECT)
+STAGE_MENU_HELP = {
+    MENU_INSPECT: "No action on click.",
+    MENU_VIEW: "Magnify at, or re-centre on, the point clicked.",
+    MENU_CELL: "Fiducial markers P1–P4 for tracking, and the boundary "
+               "contour for the automatic analysis.",
+    MENU_PROBE: "Fit the probe sphere; its known diameter gives µm/px.",
+    MENU_CORRECT: "Reposition a tracked fiducial on any frame (keyframe).",
+}
+VIEW_ACTIONS = {"Magnify at point": STAGE_ZOOM,
+                "Re-centre on point": STAGE_MOVE}
+CELL_FIDUCIALS = "Fiducial markers P1–P4 (tracking)"
+CELL_CONTOUR = "Boundary contour (automatic analysis)"
+CELL_ACTIONS = {CELL_FIDUCIALS: STAGE_CORNERS, CELL_CONTOUR: STAGE_OUTLINE}
+
+
+def stage_action(menu):
+    """The action behind the menu entry and its sub-choice."""
+    s = st.session_state
+    if menu == MENU_VIEW:
+        return VIEW_ACTIONS.get(s.get("vs_view"), STAGE_ZOOM)
+    if menu == MENU_CELL:
+        return CELL_ACTIONS.get(s.get("vs_cell"), STAGE_CORNERS)
+    return {MENU_PROBE: STAGE_SPHERE,
+            MENU_CORRECT: STAGE_CORRECT}.get(menu, STAGE_LOOK)
+
+
 OUTLINE_MODES = ("Add", "Insert", "Move", "Delete")
 
 
@@ -9767,7 +9798,7 @@ def stage_paint(frame, box, view, scale, frame_no, mode):
                             cv.COLOR_RGB2BGR)
     outline = [tuple(p) for p in (s.get("au_outline") or [])]
     if outline and (mode == STAGE_OUTLINE
-                    or s.get("au_cell_mode") == "outline"):
+                    or s.get("vs_show_contour", True)):
         picked = s.get("au_outline_pick") if mode == STAGE_OUTLINE else None
         draw_outline(image, outline, box, scale, picked)
     microns = motion_microns()
@@ -9869,12 +9900,12 @@ def stage_click(clicked, frame, frame_no, mode):
         circle = sphere_circle()
         if fit.get("ok"):
             sphere_set(fit["center"][0], fit["center"][1], fit["radius"])
-            s["_sp_note"] = (f"Fitted to its edge ({100 * fit['confidence']:.0f}"
-                             " % of the outline found).")
+            s["_sp_note"] = (f"Edge fit: {100 * fit['confidence']:.0f} % "
+                             "of radial profiles found the boundary.")
         else:
             sphere_set(clicked[0], clicked[1], circle[2] if circle else 15.0)
-            s["_sp_note"] = ("No clear edge there: the circle is where you "
-                             "clicked. Set its size with the slider.")
+            s["_sp_note"] = ("No boundary detected: circle placed at the "
+                             "point clicked. Adjust the radius manually.")
         s["sp_frame"] = int(frame_no)
 
 
@@ -9906,46 +9937,46 @@ def stage_zoom_row(shape, centre=None):
                                   + dy * step_y), 0, height - 1)
 
     z1, z2, z3 = st.columns([2.2, 1, 1])
-    z1.select_slider("🔍 Zoom", ZOOM_LEVELS, key="vz_zoom",
+    z1.select_slider("🔍 Magnification", ZOOM_LEVELS, key="vz_zoom",
                      format_func=zoom_text,
-                     help="Or choose 🔍 Zoom in and click a spot on the "
-                          "picture. Positions are always in the video's "
-                          "own pixels.")
+                     help="Or 🔍 Field of view → Magnify at point, and click. "
+                          "Coordinates are always in the video's native "
+                          "pixels.")
     z2.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-    z2.button("⤢ All", key="vz_all", on_click=whole, **STRETCH,
-              help="Back to the whole frame.")
+    z2.button("⤢ Full", key="vz_all", on_click=whole, **STRETCH,
+              help="Back to the full frame (1×).")
     zoomed = float(s.get("vz_zoom", 1.0)) > 1.0
     p0, p1, p2, p3, p4 = st.columns([1.3, 1, 1, 1, 1])
-    p0.markdown("<div style='padding-top:0.45rem;font-size:0.8rem'>Move "
-                "the view</div>", unsafe_allow_html=True)
+    p0.markdown("<div style='padding-top:0.45rem;font-size:0.8rem'>Pan"
+                "</div>", unsafe_allow_html=True)
     for col, label, d, tip in ((p1, "◀", (-1, 0), "left"),
                                (p2, "▲", (0, -1), "up"),
                                (p3, "▼", (0, 1), "down"),
                                (p4, "▶", (1, 0), "right")):
         col.button(label, key=f"vz_pan_{tip}", on_click=pan, args=d,
-                   disabled=not zoomed, help=f"Move the view {tip}",
+                   disabled=not zoomed, help=f"Pan the field of view {tip}",
                    **STRETCH)
     z3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
     with z3.popover("✥ Exact", **STRETCH):
         zoomed = float(s.get("vz_zoom", 1.0)) > 1.0
-        st.slider("Centre across (px)", 0, width - 1, key="vz_x",
+        st.slider("Centre x (px)", 0, width - 1, key="vz_x",
                   disabled=not zoomed)
-        st.slider("Centre down (px)", 0, height - 1, key="vz_y",
+        st.slider("Centre y (px)", 0, height - 1, key="vz_y",
                   disabled=not zoomed)
-        if centre is not None and st.button("🎯 On the cell", key="vz_centre"):
+        if centre is not None and st.button("🎯 Centre on the fiducials",
+                                            key="vz_centre"):
             s["_vz_centre_next"] = (int(round(centre[0])),
                                     int(round(centre[1])))
             rerun_keeping_settings()
 
 
-def stage_corner_controls():
-    s = st.session_state
+def stage_fiducial_controls():
     markers = motion_markers()
     labels = list(ct.POINT_LABELS)
     options = labels[:min(4, len(markers) + 1)]
     next_target("vs_target", options,
                 wanted=labels[len(markers)] if len(markers) < 4 else None)
-    st.radio("The next click places", options, key="vs_target",
+    st.radio("Assign the next click to", options, key="vs_target",
              horizontal=True)
     c1, c2 = st.columns(2)
     if c1.button("↶ Undo", key="vs_undo", disabled=not markers, **STRETCH):
@@ -9955,9 +9986,23 @@ def stage_corner_controls():
                  **STRETCH):
         motion_set_markers([])
         rerun_keeping_settings()
-    st.caption(f"**{len(markers)} of 4** placed, in order round the cell, "
-               f"on frame {int(s.get('mt_start', 0))} (where tracking "
-               "starts). Zoom in and click again to place one precisely.")
+    st.caption("Place P1–P4 in sequence around the cell perimeter, on "
+               "features with texture in two directions and clear of the "
+               "probe. Magnify for sub-pixel placement; a further click "
+               "repositions the selected marker.")
+
+
+def stage_cell_status():
+    """One line: what defines the cell so far."""
+    s = st.session_state
+    markers = motion_markers()
+    contour = s.get("au_outline") or []
+    st.caption(
+        f"Fiducials **{len(markers)}/4** (reference frame "
+        f"{int(s.get('mt_start', 0))}) · Contour **{len(contour)}** "
+        f"vert{'ex' if len(contour) == 1 else 'ices'}"
+        + ("" if len(contour) >= 3 or not contour else " (≥ 3 required)")
+        + f" (analysis start, frame {int(s.get('au_start', 0))})")
 
 
 def stage_correct_controls(frame_no):
@@ -9965,17 +10010,17 @@ def stage_correct_controls(frame_no):
     result, held = stage_result()
     row = stage_row(result, frame_no)
     if result is None:
-        st.info("Track the corners first (🎯 Track the corners, below).",
+        st.info("Run the tracking first (🎯 Fiducial tracking, below).",
                 icon="ℹ️")
         return
     if row is None or int(frame_no) <= int(result["frames"][0]):
-        st.info("Go to a tracked frame after the start to correct it.",
+        st.info("Select a tracked frame after the reference frame.",
                 icon="ℹ️")
         return
     labels = list(ct.POINT_LABELS)
     if s.get("vs_ctarget") not in labels:
         s["vs_ctarget"] = labels[0]
-    st.radio("The next click moves", labels, key="vs_ctarget",
+    st.radio("Fiducial to reposition", labels, key="vs_ctarget",
              horizontal=True)
     edit = stage_edit(frame_no, row, held)
     points = edit["points"]
@@ -9984,30 +10029,33 @@ def stage_correct_controls(frame_no):
     moved = [labels[k] for k, (p, q) in enumerate(zip(points, tracked))
              if np.hypot(p[0] - q[0], p[1] - q[1]) > 0.05]
     c1, c2, c3 = st.columns(3)
-    if c1.button("✅ Save", key="vs_csave", type="primary", **STRETCH,
-                 help=f"Makes frame {int(frame_no)} a correction."):
+    if c1.button("✅ Keyframe", key="vs_csave", type="primary", **STRETCH,
+                 help=f"Saves frame {int(frame_no)} as a correction "
+                      "keyframe."):
         stored = dict(s.get("mt_corrections") or {})
         stored[int(frame_no)] = [tuple(map(float, p)) for p in points]
         s["mt_corrections"] = stored
         rerun_keeping_settings()
-    if c2.button("↺ Undo", key="vs_creset", disabled=not moved, **STRETCH,
-                 help="Back to where the tracker had them."):
+    if c2.button("↺ Revert", key="vs_creset", disabled=not moved,
+                 **STRETCH, help="Back to the tracked positions."):
         s["mt_cedit"] = {"frame": int(frame_no), "points": tracked}
         rerun_keeping_settings()
     if c3.button("🗑️", key="vs_cdel", **STRETCH,
                  disabled=int(frame_no) not in corrections,
-                 help="Remove the correction saved on this frame."):
+                 help="Delete the keyframe on this frame."):
         stored = dict(s.get("mt_corrections") or {})
         stored.pop(int(frame_no), None)
         s["mt_corrections"] = stored
         s.pop("mt_cedit", None)
         rerun_keeping_settings()
-    note = ("Moved: " + ", ".join(moved) + " (grey × = tracker). "
-            if moved else "")
+    note = ("Repositioned: " + ", ".join(moved)
+            + " (grey × = tracked position). " if moved else "")
     if corrections:
-        note += ("Saved on frame" + ("s " if len(corrections) > 1 else " ")
+        note += ("Keyframe" + ("s at frames " if len(corrections) > 1
+                               else " at frame ")
                  + ", ".join(str(f) for f in sorted(corrections))
-                 + "; press 🔁 Re-track below to apply.")
+                 + ". 🔁 Re-track below to propagate: each offset is "
+                   "distributed linearly over the preceding interval.")
     if note:
         st.caption(note)
 
@@ -10017,7 +10065,7 @@ def stage_outline_controls(frame_no):
     points = [tuple(p) for p in (s.get("au_outline") or [])]
     if s.get("au_outline_mode") not in OUTLINE_MODES:
         s["au_outline_mode"] = "Add"
-    how = st.radio("Each click", OUTLINE_MODES, horizontal=True,
+    how = st.radio("Vertex operation", OUTLINE_MODES, horizontal=True,
                    key="au_outline_mode",
                    format_func=lambda m: {"Add": "➕ Add",
                                           "Insert": "➰ Insert",
@@ -10035,12 +10083,10 @@ def stage_outline_controls(frame_no):
         s["au_outline"] = []
         rerun_keeping_settings()
     start = int(s.get("au_start", 0))
-    st.caption(f"**{len(points)}** point{'' if len(points) == 1 else 's'}"
-               + ("" if len(points) >= 3 else " (3 or more needed)")
-               + f". Click round the cell, including the part under the "
-                 f"probe; it closes itself and is pulled onto the real edge. "
-                 f"Draw it on the first frame of the analysis (frame "
-                 f"{start}).")
+    st.caption("Trace the cell boundary, including the region occluded by "
+               "the probe. The polygon closes automatically and is refined "
+               "to the detected membrane edge where it is visible. Trace it "
+               f"on the first frame of the analysis window (frame {start}).")
     if int(frame_no) != start:
         st.button(f"Go to frame {start}", key="au_outline_goto",
                   on_click=s.__setitem__, args=("vw_frame", start))
@@ -10055,17 +10101,18 @@ def stage_sphere_controls(path, frame_no):
         s["sp_r_adj"] = float(pending)
     elif circle:
         s["sp_r_adj"] = round(float(circle[2]), 1)
-    st.caption("Click anywhere on the sphere: it is found and fitted to "
-               "its edge. Its size sets the scale.")
-    st.slider("Size (radius, px)", 2.0, 200.0, step=0.1, key="sp_r_adj",
+    st.caption("Click on the probe sphere: its centre and radius are fitted "
+               "to the edge. Known diameter (µm) ÷ fitted diameter (px) "
+               "gives the spatial calibration.")
+    st.slider("Radius (px)", 2.0, 200.0, step=0.1, key="sp_r_adj",
               on_change=sphere_resize, disabled=circle is None)
     c1, c2 = st.columns(2)
-    if c1.button("🔎 Find it", key="sp_find", disabled=not ready, **STRETCH,
-                 help="Looks for it without a click."):
+    if c1.button("🔎 Auto-detect", key="sp_find", disabled=not ready,
+                 **STRETCH, help="Detects the sphere without a click."):
         found = aa.SphereEdgeRefiner.auto_detect_multiframe(
             path, int(frame_no), hint_xy=None)
         if found is None:
-            s["_sp_note"] = "No sphere found on its own. Click on it."
+            s["_sp_note"] = "No sphere detected. Select it by clicking."
         else:
             frame = motion_frame(path, video_signature(), int(frame_no))
             gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
@@ -10078,9 +10125,9 @@ def stage_sphere_controls(path, frame_no):
                 r = found["radius"]
             sphere_set(cx, cy, r)
             s["sp_frame"] = int(frame_no)
-            s["_sp_note"] = "Found it. Check the circle."
+            s["_sp_note"] = "Detected. Verify the fitted circle."
         rerun_keeping_settings()
-    if c2.button("🗑️ Forget", key="sp_clear", disabled=circle is None,
+    if c2.button("🗑️ Reset", key="sp_clear", disabled=circle is None,
                  **STRETCH):
         for name in ("sp_circle", "sp_edge", "sp_centre_only", "sp_r_adj"):
             s.pop(name, None)
@@ -10093,9 +10140,9 @@ def stage_sphere_controls(path, frame_no):
     circle = sphere_circle()
     scale = sphere_scale()
     if circle:
-        st.caption(f"{2 * circle[2]:.1f} px across"
-                   + (f" · **{scale:.4f} µm/px**, used for the tracking and "
-                      "the automatic analysis" if scale else ""))
+        st.caption(f"Fitted diameter {2 * circle[2]:.1f} px"
+                   + (f" · calibration **{scale:.4f} µm/px** (applied to "
+                      "tracking and automatic analysis)" if scale else ""))
 
 
 def stage_frame_actions(path, frame, frame_no, fps, last, painted):
@@ -10112,25 +10159,25 @@ def stage_frame_actions(path, frame, frame_no, fps, last, painted):
         s["clip_range"] = (lo, hi)
 
     f = int(frame_no)
-    with st.popover("⏱️ Use this frame for…", **STRETCH):
-        st.button("🎯 Start the tracking here", key="vw_mt_start",
+    with st.popover("⏱️ Set this frame as…", **STRETCH):
+        st.button("🎯 Tracking reference frame", key="vw_mt_start",
                   on_click=put, args=("mt_start", f), **STRETCH)
         c1, c2 = st.columns(2)
-        c1.button("🤖 Analyse from", key="vw_au_start", on_click=put,
+        c1.button("🤖 Analysis start", key="vw_au_start", on_click=put,
                   args=("au_start", f), **STRETCH)
-        c2.button("🤖 … to", key="vw_au_end", on_click=put,
+        c2.button("🤖 Analysis end", key="vw_au_end", on_click=put,
                   args=("au_end", f), **STRETCH)
-        c1.button("✂️ Clip from", key="vw_clip_lo", on_click=clip_edge,
+        c1.button("✂️ Clip start", key="vw_clip_lo", on_click=clip_edge,
                   args=(0,), **STRETCH)
-        c2.button("✂️ … to", key="vw_clip_hi", on_click=clip_edge,
+        c2.button("✂️ Clip end", key="vw_clip_hi", on_click=clip_edge,
                   args=(1,), **STRETCH)
-    with st.popover("📸 Save this frame", **STRETCH):
+    with st.popover("📸 Export frame", **STRETCH):
         source = s.get("video_name") or s.get("video_path") or "video"
         stem = re.sub(r"\.[^.]+$", "", os.path.basename(str(source)))
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem) or "video"
-        marked = st.checkbox("With the markings drawn on", key="vw_marked",
-                             help="Off: the frame exactly as recorded, at "
-                                  "full size.")
+        marked = st.checkbox("Include overlays", key="vw_marked",
+                             help="Off: the raw frame as recorded, at "
+                                  "native resolution.")
         default = (f"{stem}_frame{f:05d}_t{time_tag(f, fps)}"
                    + ("_marked" if marked else "") + ".png")
         name = name_box("vw_frame_name", default, label="File name")
@@ -10160,7 +10207,11 @@ def video_stage(path, details):
     shape = (int(details["height"]), int(details["width"]))
     s["vw_frame"] = clamp_int(s.get("vw_frame", 0), 0, last)
     if s.get("vs_mode") not in STAGE_MODES:
-        s["vs_mode"] = STAGE_LOOK
+        s["vs_mode"] = MENU_INSPECT
+    if s.get("vs_view") not in VIEW_ACTIONS:
+        s["vs_view"] = list(VIEW_ACTIONS)[0]
+    if s.get("vs_cell") not in CELL_ACTIONS:
+        s["vs_cell"] = CELL_FIDUCIALS
 
     def step(n):
         s["vw_frame"] = clamp_int(int(s.get("vw_frame", 0)) + n, 0, last)
@@ -10168,11 +10219,36 @@ def video_stage(path, details):
     pic, side = st.columns([2.4, 1.2], gap="medium")
     with side:
         box_mode = st.container(border=True)
-        mode = box_mode.radio(
-            "🖱️ **What a click on the picture does**", STAGE_MODES,
-            key="vs_mode",
-            help="Everything is marked on this one picture: choose what "
-                 "the next click is for.")
+        menu = box_mode.radio(
+            "🖱️ **Click function**", STAGE_MODES, key="vs_mode",
+            captions=[STAGE_MENU_HELP[m] for m in STAGE_MODES],
+            help="Everything is marked on this one image: choose what "
+                 "the next click does.")
+        if menu == MENU_VIEW:
+            box_mode.radio("Action", list(VIEW_ACTIONS), key="vs_view",
+                           horizontal=True)
+        elif menu == MENU_CELL:
+            box_mode.radio("Element", list(CELL_ACTIONS), key="vs_cell")
+        mode = stage_action(menu)
+        # the controls for what the click does, in the same box
+        shown_frame = int(s.get("vw_frame", 0))
+        with box_mode:
+            if menu == MENU_CELL:
+                if mode == STAGE_CORNERS:
+                    stage_fiducial_controls()
+                else:
+                    stage_outline_controls(shown_frame)
+                stage_cell_status()
+            elif mode == STAGE_CORRECT:
+                stage_correct_controls(shown_frame)
+            elif mode == STAGE_SPHERE:
+                stage_sphere_controls(path, shown_frame)
+            elif mode == STAGE_ZOOM:
+                st.caption("Each click magnifies one step about the point "
+                           "clicked. ⤢ Full returns to the full frame.")
+            elif mode == STAGE_MOVE:
+                st.caption("Each click re-centres the field of view on "
+                           "that point at the same magnification.")
         placed = motion_markers()
         stage_zoom_row(shape, centre=(tuple(np.mean(np.asarray(placed),
                                                     axis=0))
@@ -10207,36 +10283,23 @@ def video_stage(path, details):
             st.image(painted, **STRETCH)
             if mode != STAGE_LOOK:
                 st.caption("Clicking needs streamlit-drawable-canvas; the "
-                           "corners can be typed on 🎯 Track the corners.")
+                           "fiducials can be typed on 🎯 Fiducial tracking.")
         st.caption(f"Frame {int(frame_no)} of {last} · "
                    f"t = {ct.format_time(int(frame_no) / fps)}"
                    + ("" if box[2] - box[0] == frame.shape[1]
-                      else f" · zoomed on x {box[0]}–{box[2]}, "
-                           f"y {box[1]}–{box[3]}"))
+                      else f" · field of view x {box[0]}–{box[2]}, "
+                           f"y {box[1]}–{box[3]} px"))
     if clicked is not None:
         stage_click(clicked, frame, int(frame_no), mode)
         rerun_keeping_settings()
     with side:
-        if mode == STAGE_CORNERS:
-            stage_corner_controls()
-        elif mode == STAGE_CORRECT:
-            stage_correct_controls(int(frame_no))
-        elif mode == STAGE_SPHERE:
-            stage_sphere_controls(path, int(frame_no))
-        elif mode == STAGE_OUTLINE:
-            stage_outline_controls(int(frame_no))
-        elif mode == STAGE_ZOOM:
-            st.caption("Click a spot on the picture to zoom in on it, one "
-                       "step per click. ⤢ All goes back to the whole frame.")
-        elif mode == STAGE_MOVE:
-            st.caption("Click a spot: the view is centred there, at the "
-                       "same zoom. The arrows move it too.")
-        result, _held = stage_result()
-        with st.popover("👁️ Show on the picture", **STRETCH):
-            st.checkbox("The probe sphere", key="vs_show_sphere",
+        with st.popover("👁️ Overlays", **STRETCH):
+            st.checkbox("Probe sphere", key="vs_show_sphere",
                         value=None if "vs_show_sphere" in s else True)
-            st.checkbox("The trails of the corners", key="mt_trails")
-            st.checkbox("The tracking areas (rings)", key="mt_rings")
+            st.checkbox("Cell boundary contour", key="vs_show_contour",
+                        value=None if "vs_show_contour" in s else True)
+            st.checkbox("Fiducial trajectories", key="mt_trails")
+            st.checkbox("Tracking regions (ROI rings)", key="mt_rings")
         stage_frame_actions(path, frame, int(frame_no), fps, last, painted)
 
 
@@ -10865,9 +10928,9 @@ def motion_results_panel(result, held, microns):
             f"**markers_tracked** column in the table says which frames "
             f"those are.")
 
-    st.caption("🎞️ The tracked corners are drawn on the picture at the "
-               "top at whatever frame is on show (trails and rings under "
-               "👁️ Show on the picture).")
+    st.caption("🎞️ The tracked fiducials are overlaid on the image above "
+               "at the frame displayed (trajectories and ROI rings under "
+               "👁️ Overlays).")
 
     labels = [ct.POINT_LABELS[i % len(ct.POINT_LABELS)]
               for i in range(held.shape[1])]
@@ -11470,12 +11533,12 @@ def auto_panel(path, details):
     probe_hint = circle if use_sphere else None
 
     # ---- the cell
-    st.markdown("**The cell**")
+    st.markdown("**Cell segmentation**")
     markers = motion_markers()
     modes = ["auto"] + (["corners"] if len(markers) >= 3 else []) + ["outline"]
-    mode_names = {"auto": "Find it automatically",
-                  "corners": "The one my tracking corners are on",
-                  "outline": "Draw its outline"}
+    mode_names = {"auto": "Automatic segmentation",
+                  "corners": "Seeded by the fiducial markers",
+                  "outline": "Manual boundary contour"}
     if st.session_state.get("au_cell_mode") not in modes:
         st.session_state["au_cell_mode"] = modes[0]
     cell_mode = st.radio("Which cell", modes, format_func=mode_names.get,
@@ -11491,12 +11554,12 @@ def auto_panel(path, details):
                                     or [])]
         outline = drawn if len(drawn) >= 3 else None
         o1, o2 = st.columns([3, 1.2])
-        o1.caption(f"{len(drawn)} point{'' if len(drawn) == 1 else 's'} "
-                   "drawn. The outline is drawn on the picture at the top: "
-                   "choose **🧬 Draw the cell's outline** there.")
-        o2.button("🧬 Draw it there", key="au_outline_go", **STRETCH,
+        o1.caption(f"{len(drawn)} vert{'ex' if len(drawn) == 1 else 'ices'} "
+                   "defined. The contour is traced on the image above: "
+                   "**🧫 Cell definition → Boundary contour**.")
+        o2.button("🧫 Trace it", key="au_outline_go", **STRETCH,
                   on_click=lambda: st.session_state.update(
-                      {"vs_mode": STAGE_OUTLINE,
+                      {"vs_mode": MENU_CELL, "vs_cell": CELL_CONTOUR,
                        "vw_frame": int(start)}))
 
     signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
@@ -25046,7 +25109,7 @@ with tab_motion:
             with st.expander("📈 Plot options (every plot on this tab)"):
                 video_plot_controls()
             (motion_track_tab, motion_auto_tab, motion_clip_tab) = st.tabs(
-                ["🎯 Track the corners", "🤖 Automatic analysis",
+                ["🎯 Fiducial tracking", "🤖 Automatic analysis",
                  "✂️ Clip the video"])
             with motion_clip_tab:
                 motion_clip_panel(motion_path, details)
@@ -25068,13 +25131,13 @@ with tab_motion:
                             "mt_canvas_error"):
                         g1, g2 = st.columns([4, 1])
                         g1.markdown(
-                            f"**1 · Corners:** {len(markers)} of 4, placed "
-                            f"on frame {start_frame} (t = "
-                            f"{ct.format_time(start_frame / fps)}), where "
-                            f"the tracking starts. Place them on the picture "
-                            f"above (🖱️ **🎯 Place the cell's 4 corners**); the frame on show "
-                            f"becomes the start.")
-                        g2.button("Go to it", key="mt_goto_start",
+                            f"**1 · Fiducial markers:** {len(markers)}/4 on "
+                            f"the reference frame {start_frame} (t = "
+                            f"{ct.format_time(start_frame / fps)}). Placed "
+                            f"on the image above with **🧫 Cell definition "
+                            f"→ Fiducial markers**; the frame displayed "
+                            f"becomes the reference frame.")
+                        g2.button("Show frame", key="mt_goto_start",
                                   on_click=st.session_state.__setitem__,
                                   args=("vw_frame", start_frame), **STRETCH)
                     else:
@@ -25244,13 +25307,14 @@ with tab_motion:
                                              microns if microns > 0 else None)
 
                         # ---- 8 · corrections ------------------------------
-                        st.markdown("**6 · Correct the tracking**")
+                        st.markdown("**6 · Trajectory correction**")
                         st.caption(
-                            "Where a corner came off its spot: go to that "
-                            "frame on the picture above, choose **✏️ "
-                            "Correct**, pick the corner and click where it "
-                            "belongs, then **✅ Save**. Re-tracking spreads "
-                            "the difference over the frames before it.")
+                            "Where a fiducial drifted off its feature: "
+                            "display that frame above, choose **✏️ "
+                            "Trajectory correction**, select the fiducial, "
+                            "click its true position and save it as a "
+                            "**✅ Keyframe**. Re-tracking distributes each "
+                            "offset linearly over the preceding interval.")
                         if corrections and ready and st.button(
                                 f"🔁 Re-track with {len(corrections)} "
                                 f"correction{'' if len(corrections) == 1 else 's'}",
