@@ -9728,16 +9728,19 @@ STAGE_MODES = (MENU_INSPECT, MENU_VIEW, MENU_CELL, MENU_PROBE, MENU_CORRECT)
 STAGE_MENU_HELP = {
     MENU_INSPECT: "No action on click.",
     MENU_VIEW: "Magnify at, or re-centre on, the point clicked.",
-    MENU_CELL: "Fiducial markers P1–P4 for tracking, and the boundary "
-               "contour for the automatic analysis.",
+    MENU_CELL: "① auto-detect the boundary, ② draw or edit the "
+               "contour, ③ four tracking points.",
     MENU_PROBE: "Fit the probe sphere; its known diameter gives µm/px.",
     MENU_CORRECT: "Reposition a tracked fiducial on any frame (keyframe).",
 }
 VIEW_ACTIONS = {"Magnify at point": STAGE_ZOOM,
                 "Re-centre on point": STAGE_MOVE}
-CELL_FIDUCIALS = "Fiducial markers P1–P4 (tracking)"
-CELL_CONTOUR = "Boundary contour (automatic analysis)"
-CELL_ACTIONS = {CELL_FIDUCIALS: STAGE_CORNERS, CELL_CONTOUR: STAGE_OUTLINE}
+STAGE_DETECT = "detect"
+CELL_DETECT = "① Auto-detect the cell"
+CELL_CONTOUR = "② Draw / edit the contour"
+CELL_FIDUCIALS = "③ Four points P1–P4 (tracking)"
+CELL_ACTIONS = {CELL_DETECT: STAGE_DETECT, CELL_CONTOUR: STAGE_OUTLINE,
+                CELL_FIDUCIALS: STAGE_CORNERS}
 SPH_AUTO = "Auto-fit at click"
 SPH_MANUAL = "Manual: centre, then edge"
 SPH_PLACEMENTS = (SPH_AUTO, SPH_MANUAL)
@@ -9749,7 +9752,7 @@ def stage_action(menu):
     if menu == MENU_VIEW:
         return VIEW_ACTIONS.get(s.get("vs_view"), STAGE_ZOOM)
     if menu == MENU_CELL:
-        return CELL_ACTIONS.get(s.get("vs_cell"), STAGE_CORNERS)
+        return CELL_ACTIONS.get(s.get("vs_cell"), STAGE_DETECT)
     return {MENU_PROBE: STAGE_SPHERE,
             MENU_CORRECT: STAGE_CORRECT}.get(menu, STAGE_LOOK)
 
@@ -9903,9 +9906,11 @@ def stage_click(clicked, frame, frame_no, mode):
             picked = None
         before = len(points)
         s["au_outline"] = outline_edit(points, clicked, how, picked)
-        s["au_cell_mode"] = "outline"
+        s["au_outline_src"] = "drawn"
         if before == 0:
             s["au_start"] = int(frame_no)
+    elif mode == STAGE_DETECT:
+        stage_detect_cell(s.get("video_path"), int(frame_no), hint=clicked)
     elif mode == STAGE_ZOOM:
         zoom = float(s.get("vz_zoom", 1.0) or 1.0)
         bigger = [z for z in ZOOM_LEVELS if z > zoom]
@@ -10066,12 +10071,82 @@ def stage_cell_status():
     s = st.session_state
     markers = motion_markers()
     contour = s.get("au_outline") or []
+    source = {"auto": "auto-detected", "drawn": "drawn"}.get(
+        s.get("au_outline_src"), "")
     st.caption(
-        f"Fiducials **{len(markers)}/4** (reference frame "
-        f"{int(s.get('mt_start', 0))}) · Contour **{len(contour)}** "
-        f"vert{'ex' if len(contour) == 1 else 'ices'}"
+        f"Contour **{len(contour)}** vert{'ex' if len(contour) == 1 else 'ices'}"
+        + (f", {source}" if contour and source else "")
         + ("" if len(contour) >= 3 or not contour else " (≥ 3 required)")
-        + f" (analysis start, frame {int(s.get('au_start', 0))})")
+        + f" (analysis start, frame {int(s.get('au_start', 0))}) · "
+          f"Points **{len(markers)}/4** (tracking reference frame "
+          f"{int(s.get('mt_start', 0))})")
+
+
+def stage_detect_cell(path, frame_no, hint=None):
+    """
+    Find the cell on the frame on show (and the next second of video, for
+    a steadier picture), the way the automatic analysis does, and keep its
+    boundary as the contour, where step ② can correct it. A click on the
+    cell (``hint``) picks that cell when there are several.
+    """
+    s = st.session_state
+    A = aa.AutoCellAnalysis if aa is not None and not AUTO_ERROR else None
+    if A is None or not path:
+        s["_cell_note"] = "Automatic detection needs auto_analysis.py."
+        return False
+    details = motion_info(path, video_signature())
+    fps = float(details["fps"] or ct.DEFAULT_FPS)
+    last = int(details["frame_count"]) - 1
+    picks = sorted({min(last, int(frame_no) + int(round(k * fps / 8)))
+                    for k in range(9)})
+    frames = [motion_frame(path, video_signature(), f) for f in picks]
+    norms = [A.norm_gray(f)[0] for f in frames if f is not None]
+    if not norms:
+        s["_cell_note"] = f"Could not read frame {frame_no}."
+        return False
+    ref = (np.median(np.stack(norms), axis=0).astype(np.float32)
+           if len(norms) > 1 else norms[0])
+    probe = A.find_probe(ref)
+    circle = sphere_circle()
+    if circle:
+        probe = A.probe_from_hint(ref, probe, *circle)
+    cell = A.find_cell(ref, probe, hint)
+    if cell is None:
+        s["_cell_note"] = ("No cell found here. Click on the cell to point "
+                           "at it, or draw its contour in step ②.")
+        return False
+    contour = np.asarray(cell["contour"], dtype=np.float32).reshape(-1, 1, 2)
+    eps = max(1.0, 0.006 * float(ct.cv2.arcLength(contour, True)))
+    simple = ct.cv2.approxPolyDP(contour, eps, True).reshape(-1, 2)
+    s["au_outline"] = [(float(x), float(y)) for x, y in simple]
+    s["au_outline_src"] = "auto"
+    s["au_start"] = int(frame_no)
+    s["_cell_note"] = (
+        f"Cell found: {len(simple)} vertices, area {cell['area_px']:.0f} px², "
+        f"length {cell['length_px']:.0f} px. Check it on the image; correct "
+        "it in step ② if part of it (under the probe, say) is missing.")
+    return True
+
+
+def stage_detect_controls(path, frame_no):
+    s = st.session_state
+    st.caption("Finds the cell's boundary on this frame, the way the "
+               "automatic analysis does. **Click on the cell** to point at "
+               "it (when there are several), or press Detect. The boundary "
+               "becomes the contour; step ② corrects it.")
+    c1, c2 = st.columns(2)
+    if c1.button("🔎 Detect", key="cell_detect", type="primary", **STRETCH):
+        stage_detect_cell(path, int(frame_no))
+        rerun_keeping_settings()
+    if c2.button("🗑️ Clear contour", key="cell_detect_clear",
+                 disabled=not s.get("au_outline"), **STRETCH):
+        s["au_outline"] = []
+        s.pop("au_outline_src", None)
+        s.pop("_cell_note", None)
+        rerun_keeping_settings()
+    note = s.get("_cell_note")
+    if note:
+        st.caption(note)
 
 
 def stage_correct_controls(frame_no):
@@ -10210,7 +10285,7 @@ def stage_sphere_controls(path, frame_no):
     if c2.button("🗑️ Reset", key="sp_clear", disabled=circle is None,
                  **STRETCH):
         for name in ("sp_circle", "sp_edge", "sp_centre_only", "sp_r_adj",
-                     "_sp_click", "_sp_manual_next"):
+                     "_sp_click", "_sp_manual_next", "_sp_note"):
             s.pop(name, None)
         rerun_keeping_settings()
 
@@ -10232,7 +10307,7 @@ def stage_sphere_controls(path, frame_no):
         col.button(label, key=f"sp_nudge_{tip.replace(' ', '_')}",
                    on_click=nudge, args=args, disabled=circle is None,
                    help=f"{tip.capitalize()}, 0.5 px", **STRETCH)
-    note = s.pop("_sp_note", None)
+    note = s.get("_sp_note")
     if note:
         st.caption(note)
     st.number_input("Sphere diameter (µm)", 0.1, 1000.0, step=1.0,
@@ -10311,7 +10386,7 @@ def video_stage(path, details):
     if s.get("vs_view") not in VIEW_ACTIONS:
         s["vs_view"] = list(VIEW_ACTIONS)[0]
     if s.get("vs_cell") not in CELL_ACTIONS:
-        s["vs_cell"] = CELL_FIDUCIALS
+        s["vs_cell"] = CELL_DETECT
     if s.get("vs_sph") not in SPH_PLACEMENTS:
         s["vs_sph"] = SPH_AUTO
 
@@ -10330,7 +10405,11 @@ def video_stage(path, details):
             box_mode.radio("Action", list(VIEW_ACTIONS), key="vs_view",
                            horizontal=True)
         elif menu == MENU_CELL:
-            box_mode.radio("Element", list(CELL_ACTIONS), key="vs_cell")
+            box_mode.radio("Step", list(CELL_ACTIONS), key="vs_cell",
+                           help="① finds the cell's boundary by itself; ② "
+                                "draws or corrects that boundary by hand; ③ "
+                                "places the four fiducial points the "
+                                "tracking follows.")
         elif menu == MENU_PROBE:
             box_mode.radio("Placement", SPH_PLACEMENTS, key="vs_sph",
                            horizontal=True,
@@ -10345,8 +10424,10 @@ def video_stage(path, details):
             if menu == MENU_CELL:
                 if mode == STAGE_CORNERS:
                     stage_fiducial_controls()
-                else:
+                elif mode == STAGE_OUTLINE:
                     stage_outline_controls(shown_frame)
+                else:
+                    stage_detect_controls(path, shown_frame)
                 stage_cell_status()
             elif mode == STAGE_CORRECT:
                 stage_correct_controls(shown_frame)
@@ -11716,35 +11797,32 @@ def auto_panel(path, details):
         use_sphere = bool(st.session_state.get("au_use_sphere", True))
     probe_hint = circle if use_sphere else None
 
-    # ---- the cell
-    st.markdown("**Cell segmentation**")
+    # ---- the cell: whatever 🧫 Cell definition holds
     markers = motion_markers()
-    modes = ["auto"] + (["corners"] if len(markers) >= 3 else []) + ["outline"]
-    mode_names = {"auto": "Automatic segmentation",
-                  "corners": "Seeded by the fiducial markers",
-                  "outline": "Manual boundary contour"}
-    if st.session_state.get("au_cell_mode") not in modes:
-        st.session_state["au_cell_mode"] = modes[0]
-    cell_mode = st.radio("Which cell", modes, format_func=mode_names.get,
-                         key="au_cell_mode", horizontal=True,
-                         label_visibility="collapsed")
+    drawn = [tuple(p) for p in (st.session_state.get("au_outline") or [])]
     hint = None
-    outline = None
-    if cell_mode == "corners":
+    outline = drawn if len(drawn) >= 3 else None
+    if outline is None and len(markers) >= 3:
         hint = (float(np.mean([p[0] for p in markers])),
                 float(np.mean([p[1] for p in markers])))
-    elif cell_mode == "outline":
-        drawn = [tuple(p) for p in (st.session_state.get("au_outline")
-                                    or [])]
-        outline = drawn if len(drawn) >= 3 else None
-        o1, o2 = st.columns([3, 1.2])
-        o1.caption(f"{len(drawn)} vert{'ex' if len(drawn) == 1 else 'ices'} "
-                   "defined. The contour is traced on the image above: "
-                   "**🧫 Cell definition → Boundary contour**.")
-        o2.button("🧫 Trace it", key="au_outline_go", **STRETCH,
-                  on_click=lambda: st.session_state.update(
-                      {"vs_mode": MENU_CELL, "vs_cell": CELL_CONTOUR,
-                       "vw_frame": int(start)}))
+    if outline is not None:
+        source = {"auto": "auto-detected", "drawn": "drawn"}.get(
+            st.session_state.get("au_outline_src"), "defined")
+        described = (f"the {source} contour from 🧫 Cell definition "
+                     f"({len(outline)} vertices)")
+    elif hint is not None:
+        described = ("found automatically near the four points from 🧫 "
+                     "Cell definition")
+    else:
+        described = "found automatically"
+    o1, o2 = st.columns([3, 1.2])
+    o1.markdown(f"**Cell:** {described}.")
+    o2.button("🧫 Define it", key="au_outline_go", **STRETCH,
+              help="Opens 🧫 Cell definition on the image above: ① auto-"
+                   "detect, ② draw / edit the contour, ③ four points.",
+              on_click=lambda: st.session_state.update(
+                  {"vs_mode": MENU_CELL, "vs_cell": CELL_DETECT,
+                   "vw_frame": int(start)}))
 
     signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
     signature += repr(probe_hint and tuple(np.round(probe_hint, 2)))
@@ -25323,7 +25401,7 @@ with tab_motion:
                             f"the reference frame {start_frame} (t = "
                             f"{ct.format_time(start_frame / fps)}). Placed "
                             f"on the image above with **🧫 Cell definition "
-                            f"→ Fiducial markers**; the frame displayed "
+                            f"→ ③ Four points**; the frame displayed "
                             f"becomes the reference frame.")
                         g2.button("Show frame", key="mt_goto_start",
                                   on_click=st.session_state.__setitem__,
@@ -27651,10 +27729,15 @@ def sc_axis_ranges(i):
     return xr, yr
 
 
+BASELINE_MODES = ("Off", "Show", "Correct")
+
+
 def sc_baseline_controls(i, x_all, mode):
-    """The 〰 Baseline popover of one file. Returns the settings when the
-    baseline is in use (shown, subtracted, or the zero is the contact
-    point), else None."""
+    """
+    One file's baseline row: a horizontal (or sloped) baseline fitted over
+    a window before contact, shown dashed over the trace, or subtracted
+    from it (baseline correction). Returns the settings in use, else None.
+    """
     s = st.session_state
     finite = np.asarray(x_all, float)
     finite = finite[np.isfinite(finite)]
@@ -27666,43 +27749,56 @@ def sc_baseline_controls(i, x_all, mode):
     if s.get(f"sc_bl1{i}") is None or not (lo <= s.get(f"sc_bl1{i}") <= hi):
         s[f"sc_bl1{i}"] = lo + 0.1 * (hi - lo)
     s.setdefault(f"sc_blk{i}", 3.0)
-    s.setdefault(f"sc_blo{i}", "Linear")
+    s.setdefault(f"sc_blo{i}", "Horizontal")
     s.setdefault(f"sc_bld{i}", "either")
+    if s.get(f"sc_blmode{i}") not in BASELINE_MODES:
+        s[f"sc_blmode{i}"] = "Off"
     contact_mode = mode == sc.CONTACT_MODE
-    with st.popover("〰 Baseline", **STRETCH):
-        st.caption("A line fitted to the stretch before contact. Shown "
-                   "dashed over the trace (the window shaded), so the "
-                   "point where the signal leaves it, the contact point, "
-                   "is plain to see. **Zero of x at → Departure from "
-                   "baseline** puts x = 0 there.")
-        st.checkbox("Show the baseline", key=f"sc_bls{i}",
-                    help="Always shown when the zero is the contact point.")
+
+    def first(fraction):
+        s[f"sc_bl0{i}"] = lo
+        s[f"sc_bl1{i}"] = lo + fraction * (hi - lo)
+
+    b1, b2 = st.columns([2.2, 1])
+    b1.radio("〰 Baseline", BASELINE_MODES, key=f"sc_blmode{i}",
+             horizontal=True,
+             format_func={"Off": "Off", "Show": "Show",
+                          "Correct": "Correct (subtract)"}.get,
+             help="A baseline fitted over a window before contact. Show: "
+                  "drawn dashed across the trace, the window shaded. "
+                  "Correct: subtracted from the signal, so the trace sits "
+                  "on y = 0 (baseline correction).")
+    with b2.popover("⚙ Window", **STRETCH):
+        st.radio("Baseline", ("Horizontal", "Sloped (linear)"),
+                 key=f"sc_blo{i}", horizontal=True,
+                 help="Horizontal: the mean level over the window. Sloped: "
+                      "a straight line through it, for a drifting signal.")
         a, b = st.columns(2)
         a.number_input("Window from x", key=f"sc_bl0{i}", format="%.6g")
         b.number_input("to x", key=f"sc_bl1{i}", format="%.6g")
-        a.radio("Baseline", ("Flat", "Linear"), key=f"sc_blo{i}",
-                horizontal=True)
-        b.number_input("Contact at k × SD", 1.0, 50.0, step=0.5,
-                       key=f"sc_blk{i}",
-                       help="The signal has left the baseline when it is "
-                            "k residual SDs away from it for 5 points in "
-                            "a row.")
-        st.radio("Departure", ("either", "up", "down"), key=f"sc_bld{i}",
-                 horizontal=True,
-                 format_func={"either": "Either way", "up": "Upwards",
-                              "down": "Downwards"}.get)
-        st.checkbox("Subtract it from y", key=f"sc_blsub{i}",
-                    help="Plots the signal relative to the baseline, so "
-                         "every file starts at y = 0.")
-    show = bool(s.get(f"sc_bls{i}"))
-    subtract = bool(s.get(f"sc_blsub{i}"))
-    if not (contact_mode or subtract or show):
+        q1, q2, q3 = st.columns(3)
+        q1.button("First 5 %", key=f"sc_blq5{i}", on_click=first,
+                  args=(0.05,), **STRETCH)
+        q2.button("10 %", key=f"sc_blq10{i}", on_click=first,
+                  args=(0.10,), **STRETCH)
+        q3.button("25 %", key=f"sc_blq25{i}", on_click=first,
+                  args=(0.25,), **STRETCH)
+        st.caption("For **Zero of x at → Departure from baseline**: the "
+                   "contact is where the signal stays k × SD from the "
+                   "baseline.")
+        c1, c2 = st.columns(2)
+        c1.number_input("k × SD", 1.0, 50.0, step=0.5, key=f"sc_blk{i}")
+        c2.selectbox("Direction", ("either", "up", "down"), key=f"sc_bld{i}",
+                     format_func={"either": "Either way", "up": "Upwards",
+                                  "down": "Downwards"}.get)
+    chosen = s.get(f"sc_blmode{i}", "Off")
+    if chosen == "Off" and not contact_mode:
         return None
     return {"x0": float(s.get(f"sc_bl0{i}")), "x1": float(s.get(f"sc_bl1{i}")),
             "k": float(s.get(f"sc_blk{i}", 3.0)),
-            "order": 0 if s.get(f"sc_blo{i}") == "Flat" else 1,
+            "order": 0 if s.get(f"sc_blo{i}") == "Horizontal" else 1,
             "direction": s.get(f"sc_bld{i}", "either"),
-            "show": show or contact_mode, "subtract": subtract}
+            "show": True, "subtract": chosen == "Correct"}
 
 
 def sc_slot_name(i):
@@ -27795,14 +27891,13 @@ def sc_slot(i, n=3):
     yf = float(s.get(f"sc_yf{i}") if s.get(f"sc_yf{i}") is not None
                else 1.0)
     x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
-    u1, u2, u3, u4 = st.columns([0.45, 1.05, 1.15, 1])
+    baseline = sc_baseline_controls(i, x_all, mode)
+    u1, u2, u3 = st.columns([0.5, 1.2, 1.2])
     u1.color_picker("Colour", key=f"sc_col{i}",
                     label_visibility="collapsed")
     with u2:
         x_range, y_range = sc_axis_ranges(i)
-    with u3:
-        baseline = sc_baseline_controls(i, x_all, mode)
-    with u4.popover("⋯ More", **STRETCH):
+    with u3.popover("⋯ More", **STRETCH):
         st.text_input("Name in the legend", key=f"sc_label{i}")
         st.text_input("Its y axis title", key=f"sc_ylab{i}")
         m1, m2 = st.columns(2)
@@ -27829,6 +27924,11 @@ def sc_slot(i, n=3):
                              level=float(s.get(f"sc_zlevel{i}") or 0.0))
     shift = float(s.get(f"sc_shift{i}") or 0.0)
     note = ""
+    if coeffs is not None:
+        level = float(np.polyval(coeffs, baseline["x0"]))
+        note += (f" · baseline {level:.4g}" + (f" ± {sd:.2g} (SD)" if sd
+                                               else "")
+                 + (", corrected" if baseline["subtract"] else ""))
     if mode == sc.CONTACT_MODE:
         note = (f" · contact at {contact:.4g} (baseline SD {sd:.3g})"
                 if contact is not None else
