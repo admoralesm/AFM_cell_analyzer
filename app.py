@@ -667,6 +667,39 @@ COMPACT_CSS = """
 """
 
 
+_PLOTLY_CHART = st.plotly_chart
+
+
+def _plotly_chart_export(figure_or_data, *args, **kwargs):
+    """
+    st.plotly_chart, saving PNG by default, with a transparent background
+    while "Transparent PNG" (top right) is on.
+
+    Every plot in the app goes through here: the camera icon on any of
+    them saves a PNG unless that plot asks for another format, and with
+    the switch on the paper and plot area are see-through, so the figure
+    drops onto a slide or poster of any colour.
+    """
+    config = dict(kwargs.get("config") or {})
+    options = dict(config.get("toImageButtonOptions") or {})
+    if not options.get("format"):
+        options["format"] = "png"
+    config["toImageButtonOptions"] = options
+    config.setdefault("displaylogo", False)
+    kwargs["config"] = config
+    if st.session_state.get("ui_transparent", True) \
+            and hasattr(figure_or_data, "update_layout"):
+        try:
+            figure_or_data.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                                         plot_bgcolor="rgba(0,0,0,0)")
+        except Exception:
+            pass
+    return _PLOTLY_CHART(figure_or_data, *args, **kwargs)
+
+
+st.plotly_chart = _plotly_chart_export
+
+
 def _stretch_kwargs():
     """`use_container_width` is deprecated in new Streamlit and absent in old.
 
@@ -1067,7 +1100,7 @@ DEFAULTS = {
     "ai_bold": False,
     "ai_grid": False,
     "ai_height": 480,
-    "ai_fmt": "svg",
+    "ai_fmt": "png",
     "ai_w_in": 7.0,
     "ai_h_in": 4.0,
     "ai_dpi": 600,
@@ -1088,7 +1121,7 @@ DEFAULTS = {
     "vp_legend": True,
     "vp_w": 900,
     "vp_h": 560,
-    "vp_fmt": "svg",
+    "vp_fmt": "png",
     "vp_scale": 3,
     # Where the cytoskeleton is allowed to join in the two-term reading.
     # The low edge is a floor, not only a search range: nothing on the
@@ -9705,6 +9738,9 @@ VIEW_ACTIONS = {"Magnify at point": STAGE_ZOOM,
 CELL_FIDUCIALS = "Fiducial markers P1–P4 (tracking)"
 CELL_CONTOUR = "Boundary contour (automatic analysis)"
 CELL_ACTIONS = {CELL_FIDUCIALS: STAGE_CORNERS, CELL_CONTOUR: STAGE_OUTLINE}
+SPH_AUTO = "Auto-fit at click"
+SPH_MANUAL = "Manual: centre, then edge"
+SPH_PLACEMENTS = (SPH_AUTO, SPH_MANUAL)
 
 
 def stage_action(menu):
@@ -9796,6 +9832,14 @@ def stage_paint(frame, box, view, scale, frame_no, mode):
         image = cv.cvtColor(sphere_paint(image, tuple(c), None,
                                          circle[2] * scale, scale),
                             cv.COLOR_RGB2BGR)
+    click = s.get("_sp_click")
+    if mode == STAGE_SPHERE and click:
+        v = to_view([click], box, scale)[0]
+        p = (int(round(v[0])), int(round(v[1])))
+        cv.drawMarker(image, p, (0, 0, 0), cv.MARKER_CROSS, 12, 3,
+                      cv.LINE_AA)
+        cv.drawMarker(image, p, (255, 255, 255), cv.MARKER_CROSS, 12, 1,
+                      cv.LINE_AA)
     outline = [tuple(p) for p in (s.get("au_outline") or [])]
     if outline and (mode == STAGE_OUTLINE
                     or s.get("vs_show_contour", True)):
@@ -9892,16 +9936,41 @@ def stage_click(clicked, frame, frame_no, mode):
         points = [tuple(p) for p in edit["points"]]
         points[labels.index(target)] = clicked
         s["mt_cedit"] = {"frame": int(frame_no), "points": points}
+    elif mode == STAGE_SPHERE and s.get("vs_sph") == SPH_MANUAL:
+        circle = sphere_circle()
+        if s.get("_sp_manual_next") == "edge" and circle:
+            radius = float(np.hypot(clicked[0] - circle[0],
+                                    clicked[1] - circle[1]))
+            if radius >= 2.0:
+                sphere_set(circle[0], circle[1], radius)
+            s["_sp_manual_next"] = "centre"
+            s["_sp_note"] = (f"Radius set to {radius:.1f} px. Next click "
+                             "sets the centre again.")
+        else:
+            sphere_set(clicked[0], clicked[1], circle[2] if circle else 15.0)
+            s["_sp_manual_next"] = "edge"
+            s["_sp_note"] = ("Centre placed. Now click on the sphere's edge "
+                             "to set the radius.")
+        s["_sp_click"] = (float(clicked[0]), float(clicked[1]))
+        s["sp_frame"] = int(frame_no)
     elif mode == STAGE_SPHERE:
         fit = {"ok": False}
+        s["_sp_click"] = (float(clicked[0]), float(clicked[1]))
         if aa is not None and not AUTO_ERROR:
             gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
-            fit = aa.sphere_from_click(gray, clicked)
+            previous = sphere_circle()
+            fit = aa.sphere_from_click(
+                gray, clicked, r_guess=previous[2] if previous else None)
         circle = sphere_circle()
         if fit.get("ok"):
             sphere_set(fit["center"][0], fit["center"][1], fit["radius"])
-            s["_sp_note"] = (f"Edge fit: {100 * fit['confidence']:.0f} % "
-                             "of radial profiles found the boundary.")
+            moved = float(fit.get("offset_px", 0.0))
+            s["_sp_note"] = (
+                f"Edge fit: {100 * fit['confidence']:.0f} % edge support; "
+                f"centre {moved:.1f} px from the click (+)."
+                + (" If this is not the sphere, click nearer its centre or "
+                   "use Manual placement." if moved > 0.5 * fit["radius"]
+                   else ""))
         else:
             sphere_set(clicked[0], clicked[1], circle[2] if circle else 15.0)
             s["_sp_note"] = ("No boundary detected: circle placed at the "
@@ -10101,9 +10170,18 @@ def stage_sphere_controls(path, frame_no):
         s["sp_r_adj"] = float(pending)
     elif circle:
         s["sp_r_adj"] = round(float(circle[2]), 1)
-    st.caption("Click on the probe sphere: its centre and radius are fitted "
-               "to the edge. Known diameter (µm) ÷ fitted diameter (px) "
-               "gives the spatial calibration.")
+    if s.get("vs_sph") == SPH_MANUAL:
+        step_name = ("a point on its edge (radius)"
+                     if s.get("_sp_manual_next") == "edge" and circle
+                     else "the centre of the sphere")
+        st.caption(f"**Next click: {step_name}.** Known diameter (µm) ÷ "
+                   "diameter (px) gives the spatial calibration.")
+    else:
+        st.caption("Click **inside the dark circle, near its centre**: the "
+                   "circle is fitted to the sphere's edge, never to an "
+                   "object whose centre is far from the click. Known "
+                   "diameter (µm) ÷ fitted diameter (px) gives the spatial "
+                   "calibration.")
     st.slider("Radius (px)", 2.0, 200.0, step=0.1, key="sp_r_adj",
               on_change=sphere_resize, disabled=circle is None)
     c1, c2 = st.columns(2)
@@ -10117,8 +10195,10 @@ def stage_sphere_controls(path, frame_no):
             frame = motion_frame(path, video_signature(), int(frame_no))
             gray = ct.cv2.cvtColor(frame, ct.cv2.COLOR_BGR2GRAY)
             cx, cy = found["center"]
-            fit = aa.snap_sphere(gray, (float(cx), float(cy),
-                                        float(found["radius"])))
+            # the detector's circle, re-fitted the way a click is: to the
+            # dark-inside edge nearest it, by edge support and circularity
+            fit = aa.sphere_from_click(gray, (float(cx), float(cy)),
+                                       r_guess=float(found["radius"]))
             if fit.get("ok"):
                 (cx, cy), r = fit["center"], fit["radius"]
             else:
@@ -10129,9 +10209,29 @@ def stage_sphere_controls(path, frame_no):
         rerun_keeping_settings()
     if c2.button("🗑️ Reset", key="sp_clear", disabled=circle is None,
                  **STRETCH):
-        for name in ("sp_circle", "sp_edge", "sp_centre_only", "sp_r_adj"):
+        for name in ("sp_circle", "sp_edge", "sp_centre_only", "sp_r_adj",
+                     "_sp_click", "_sp_manual_next"):
             s.pop(name, None)
         rerun_keeping_settings()
+
+    def nudge(dx, dy, dr):
+        here = sphere_circle()
+        if here:
+            sphere_set(here[0] + dx, here[1] + dy, max(2.0, here[2] + dr))
+
+    st.markdown("<div style='font-size:0.8rem'>Fine adjustment "
+                "(0.5 px)</div>", unsafe_allow_html=True)
+    n = st.columns(6)
+    for col, label, args, tip in (
+            (n[0], "◀", (-0.5, 0, 0), "centre left"),
+            (n[1], "▶", (0.5, 0, 0), "centre right"),
+            (n[2], "▲", (0, -0.5, 0), "centre up"),
+            (n[3], "▼", (0, 0.5, 0), "centre down"),
+            (n[4], "−", (0, 0, -0.5), "radius smaller"),
+            (n[5], "+", (0, 0, 0.5), "radius larger")):
+        col.button(label, key=f"sp_nudge_{tip.replace(' ', '_')}",
+                   on_click=nudge, args=args, disabled=circle is None,
+                   help=f"{tip.capitalize()}, 0.5 px", **STRETCH)
     note = s.pop("_sp_note", None)
     if note:
         st.caption(note)
@@ -10212,6 +10312,8 @@ def video_stage(path, details):
         s["vs_view"] = list(VIEW_ACTIONS)[0]
     if s.get("vs_cell") not in CELL_ACTIONS:
         s["vs_cell"] = CELL_FIDUCIALS
+    if s.get("vs_sph") not in SPH_PLACEMENTS:
+        s["vs_sph"] = SPH_AUTO
 
     def step(n):
         s["vw_frame"] = clamp_int(int(s.get("vw_frame", 0)) + n, 0, last)
@@ -10229,6 +10331,13 @@ def video_stage(path, details):
                            horizontal=True)
         elif menu == MENU_CELL:
             box_mode.radio("Element", list(CELL_ACTIONS), key="vs_cell")
+        elif menu == MENU_PROBE:
+            box_mode.radio("Placement", SPH_PLACEMENTS, key="vs_sph",
+                           horizontal=True,
+                           help="Auto-fit: click inside the sphere, near its "
+                                "centre, and the circle is fitted to its "
+                                "edge. Manual: the first click is the "
+                                "centre, the second a point on the edge.")
         mode = stage_action(menu)
         # the controls for what the click does, in the same box
         shown_frame = int(s.get("vw_frame", 0))
@@ -10348,7 +10457,7 @@ def name_box(key, default, label="Save as"):
 VIDEO_PLOT_DEFAULTS = {
     "vp_on": False, "vp_title_size": 20, "vp_tick_size": 16,
     "vp_line": 2.0, "vp_axis": 1.0, "vp_bold": False, "vp_grid": False,
-    "vp_legend": True, "vp_w": 900, "vp_h": 560, "vp_fmt": "svg",
+    "vp_legend": True, "vp_w": 900, "vp_h": 560, "vp_fmt": "png",
     "vp_scale": 3,
 }
 
@@ -10412,7 +10521,7 @@ def video_plot_controls():
             st.number_input("Height (px)", 200, 2400, step=50, key="vp_h",
                             disabled=not on)
         with p4:
-            st.selectbox("Save as", ("svg", "png", "jpeg", "webp"),
+            st.selectbox("Save as", ("png", "svg", "jpeg", "webp"),
                          key="vp_fmt",
                          help="SVG stays sharp at any size and opens in "
                               "Illustrator / Inkscape. PNG for slides.")
@@ -10453,14 +10562,15 @@ def video_chart_table(fig, y_title):
             continue
         name = str(trace.name or f"line {len(columns)}")
         if len(columns) == 1 and y_title:
-            name = f"{name} [{re.sub(r'<[^>]+>', '', y_title)}]"
+            # the main line goes by the plot's own y title (with units)
+            name = re.sub(r"<[^>]+>", "", y_title)
         while name in columns:
             name += " "
         columns[name] = np.asarray(trace.y, float)
     return pd.DataFrame(columns) if len(columns) > 1 else None
 
 
-def send_to_stack(name, frame, source="the video"):
+def send_to_stack(name, frame, source="the video", stats=None):
     """Put a table in the first free slot of the Stack & compare tab."""
     s = st.session_state
     if frame is None:
@@ -10477,7 +10587,8 @@ def send_to_stack(name, frame, source="the video"):
                               "Remove one there first.")
         return None
     s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy(),
-                           "source": source}
+                           "source": source,
+                           "stats": list(stats or [])}
     s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
     s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
                           "Open that tab to see it.")
@@ -10584,7 +10695,9 @@ def video_chart(fig, key=None, stem=None, **_ignored):
                 trace.selected = dict(marker=dict(opacity=0))
                 trace.unselected = dict(marker=dict(opacity=0))
         fig.update_layout(clickmode="event+select")
-    xr, yr = video_axis_ranges(slug, send=(send_name, send_frame))
+    xr, yr = video_axis_ranges(
+        slug, send=(send_name, send_frame, "the video",
+                    s.get("_chart_stats")))
     if xr is not None:
         fig.update_xaxes(range=list(xr), autorange=False)
     if yr is not None:
@@ -10628,7 +10741,7 @@ def video_chart(fig, key=None, stem=None, **_ignored):
         .strip("_").lower() or "plot")
     config = {"displaylogo": False,
               "toImageButtonOptions": {
-                  "format": s.get("vp_fmt", "svg"), "filename": name,
+                  "format": s.get("vp_fmt", "png"), "filename": name,
                   "width": int(s.get("vp_w", 900)) if pub else None,
                   "height": int(s.get("vp_h", 560)) if pub else None,
                   "scale": int(s.get("vp_scale", 3))}}
@@ -10876,6 +10989,74 @@ def motion_frame_table(result, held, microns):
     return pd.DataFrame(table)
 
 
+def mean_sd(values, digits=3):
+    """'m ± sd' of the finite values, or '–'."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return "–"
+    if v.size == 1:
+        return f"{v[0]:.{digits}g}"
+    mean, sd = float(np.mean(v)), float(np.std(v, ddof=1))
+    # the SD to the same decimal place as the mean
+    scale = abs(mean) if mean else max(sd, 1e-12)
+    decimals = max(0, digits - 1 - int(math.floor(math.log10(scale))))
+    return f"{mean:.{decimals}f} ± {sd:.{decimals}f}"
+
+
+def motion_summary_stats(result, held, centre_speed, middle, scale, unit,
+                         times, lost, total):
+    """The corner tracking's summary, as (label, value) pairs: what goes
+    with a plot sent to Stack & compare."""
+    stats = [("Duration", f"{times[-1]:.3g} s ({len(times):,} frames)")]
+    speed = np.asarray(centre_speed, float) * scale
+    if np.isfinite(speed).any():
+        stats.append(("Centroid speed, peak", f"{np.nanmax(speed):.3g} {unit}/s"))
+        stats.append(("Centroid speed, mean ± SD", f"{mean_sd(speed)} {unit}/s"))
+    shift = ct.displacement(middle) * scale
+    if np.isfinite(shift).any():
+        stats.append(("Centroid displacement, max",
+                      f"{np.nanmax(shift):.3g} {unit}"))
+    area = ct.quad_area(held) * scale * scale
+    ok = np.isfinite(area)
+    if ok.any() and area[ok][0] > 0:
+        change = 100.0 * (np.nanmin(area) - area[ok][0]) / area[ok][0]
+        stats.append(("Marker area, start", f"{area[ok][0]:.4g} {unit}²"))
+        stats.append(("Marker area, max change", f"{change:+.2f} %"))
+    stats.append(("Markers measured",
+                  f"{100.0 * (total - lost) / max(total, 1):.0f} %"))
+    return stats
+
+
+def auto_summary_stats(res, sp, unit, k):
+    """The automatic analysis' summary, as (label, value) pairs."""
+    events = res.get("events") or []
+    stats = [("Contractions", f"{res['n_events']}")]
+    if np.isfinite(res.get("rate_per_min", np.nan)):
+        stats.append(("Rate", f"{res['rate_per_min']:.3g} /min"))
+    if events:
+        stats.append(("Shortening (mean ± SD)",
+                      mean_sd([e["amp_pct"] for e in events]) + " %"))
+        stats.append(("Time to peak",
+                      mean_sd([e["time_to_peak"] for e in events]) + " s"))
+        stats.append(("Duration at 50 %",
+                      mean_sd([e["dur50"] for e in events]) + " s"))
+        stats.append(("Relaxation (90 %)",
+                      mean_sd([e["relax90"] for e in events]) + " s"))
+        stats.append(("Shortening speed",
+                      mean_sd(sp["ev_vshort"]) + f" {unit}/s"))
+        stats.append(("Relaxation speed",
+                      mean_sd(sp["ev_vrelax"]) + f" {unit}/s"))
+    sl = np.asarray(res.get("sl_px", []), dtype=float)
+    sl = sl[np.isfinite(sl)]
+    if res.get("sl_found") and sl.size:
+        stats.append(("Sarcomere length (median)",
+                      f"{np.median(sl) * k:.3f} {unit}"))
+    if res.get("um_per_px"):
+        stats.append(("Scale", f"{res['um_per_px']:.4f} µm/px"))
+    return stats
+
+
 def motion_results_panel(result, held, microns):
     """The readings: what moved, how fast, and how much of it was measured."""
     fps = float(result["fps"])
@@ -10895,6 +11076,8 @@ def motion_results_panel(result, held, microns):
 
     lost = int(np.sum(result["status"] == 0))
     total = int(result["status"].size)
+    st.session_state["_chart_stats"] = motion_summary_stats(
+        result, held, centre_speed, middle, scale, unit, times, lost, total)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Frames read", f"{len(frames):,}")
     m2.metric("Over", f"{times[-1]:.2f} s")
@@ -11207,6 +11390,7 @@ def auto_results_panel(res):
              "with: 4th order from 5 frames up, so the peak of a fast "
              "upstroke is kept. 1 is a plain difference between frames.")
     sp = A.speed_series(res, int(st.session_state.get("au_smooth", 5)))
+    st.session_state["_chart_stats"] = auto_summary_stats(res, sp, unit, k)
     t = sp["t"]
     events = res["events"]
     view = st.radio("What to draw", AUTO_VIEWS, horizontal=True,
@@ -21889,6 +22073,10 @@ with head_right:
               if "ui_compact" not in st.session_state else None,
               help="Smaller text, tighter spacing and the full width of "
                    "the screen, so more fits without scrolling.")
+    st.toggle("Transparent PNG", key="ui_transparent", value=True
+              if "ui_transparent" not in st.session_state else None,
+              help="Plots are saved (📷 on each plot) as PNG with a "
+                   "transparent background. Off: white background.")
 if st.session_state.get("ui_compact", True):
     st.markdown(COMPACT_CSS, unsafe_allow_html=True)
 
@@ -26521,7 +26709,7 @@ def ai_pub_controls():
             st.checkbox("Grid", key="ai_grid")
         q1, q2, q3, q4 = st.columns(4)
         with q1:
-            st.selectbox("Save as", ("svg", "png", "jpeg", "webp"),
+            st.selectbox("Save as", ("png", "svg", "jpeg", "webp"),
                          key="ai_fmt")
         with q2:
             st.number_input("Width (in)", 1.0, 20.0, step=0.5, key="ai_w_in")
@@ -26581,7 +26769,7 @@ def ai_chart(fig, name, key=None):
     px_h = int(round(float(s.get("ai_h_in", 4.0)) * 96))
     config = {"displaylogo": False,
               "toImageButtonOptions": {
-                  "format": s.get("ai_fmt", "svg"),
+                  "format": s.get("ai_fmt", "png"),
                   "filename": re.sub(r"[^A-Za-z0-9._-]+", "_", name),
                   "width": px_w, "height": px_h,
                   "scale": max(1.0, float(s.get("ai_dpi", 600)) / 96.0)}}
@@ -27463,6 +27651,60 @@ def sc_axis_ranges(i):
     return xr, yr
 
 
+def sc_baseline_controls(i, x_all, mode):
+    """The 〰 Baseline popover of one file. Returns the settings when the
+    baseline is in use (shown, subtracted, or the zero is the contact
+    point), else None."""
+    s = st.session_state
+    finite = np.asarray(x_all, float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return None
+    lo, hi = float(finite.min()), float(finite.max())
+    if s.get(f"sc_bl0{i}") is None or not (lo <= s.get(f"sc_bl0{i}") <= hi):
+        s[f"sc_bl0{i}"] = lo
+    if s.get(f"sc_bl1{i}") is None or not (lo <= s.get(f"sc_bl1{i}") <= hi):
+        s[f"sc_bl1{i}"] = lo + 0.1 * (hi - lo)
+    s.setdefault(f"sc_blk{i}", 3.0)
+    s.setdefault(f"sc_blo{i}", "Linear")
+    s.setdefault(f"sc_bld{i}", "either")
+    contact_mode = mode == sc.CONTACT_MODE
+    with st.popover("〰 Baseline", **STRETCH):
+        st.caption("A line fitted to the stretch before contact. Shown "
+                   "dashed over the trace (the window shaded), so the "
+                   "point where the signal leaves it, the contact point, "
+                   "is plain to see. **Zero of x at → Departure from "
+                   "baseline** puts x = 0 there.")
+        st.checkbox("Show the baseline", key=f"sc_bls{i}",
+                    help="Always shown when the zero is the contact point.")
+        a, b = st.columns(2)
+        a.number_input("Window from x", key=f"sc_bl0{i}", format="%.6g")
+        b.number_input("to x", key=f"sc_bl1{i}", format="%.6g")
+        a.radio("Baseline", ("Flat", "Linear"), key=f"sc_blo{i}",
+                horizontal=True)
+        b.number_input("Contact at k × SD", 1.0, 50.0, step=0.5,
+                       key=f"sc_blk{i}",
+                       help="The signal has left the baseline when it is "
+                            "k residual SDs away from it for 5 points in "
+                            "a row.")
+        st.radio("Departure", ("either", "up", "down"), key=f"sc_bld{i}",
+                 horizontal=True,
+                 format_func={"either": "Either way", "up": "Upwards",
+                              "down": "Downwards"}.get)
+        st.checkbox("Subtract it from y", key=f"sc_blsub{i}",
+                    help="Plots the signal relative to the baseline, so "
+                         "every file starts at y = 0.")
+    show = bool(s.get(f"sc_bls{i}"))
+    subtract = bool(s.get(f"sc_blsub{i}"))
+    if not (contact_mode or subtract or show):
+        return None
+    return {"x0": float(s.get(f"sc_bl0{i}")), "x1": float(s.get(f"sc_bl1{i}")),
+            "k": float(s.get(f"sc_blk{i}", 3.0)),
+            "order": 0 if s.get(f"sc_blo{i}") == "Flat" else 1,
+            "direction": s.get(f"sc_bld{i}", "either"),
+            "show": show or contact_mode, "subtract": subtract}
+
+
 def sc_slot_name(i):
     """What the file slot holds, for its heading."""
     s = st.session_state
@@ -27525,9 +27767,10 @@ def sc_slot(i, n=3):
     mode = z1.selectbox(
         "Zero of x at", sc.ZERO_MODES, key=f"sc_zmode{i}",
         help="Where this file's x = 0 is: the first point, a value you "
-             "type, the peak, the lowest point, or a level crossing. With "
-             "**Click a point to set zero** on, a click on the plot sets "
-             "it too.")
+             "type, the peak, the lowest point, a level crossing, or the "
+             "contact point (where the signal leaves the baseline set "
+             "under 〰 Baseline). With **Click a point to set zero** on, a "
+             "click on the plot sets it too.")
     if mode == "A value I type":
         z2.number_input("at x =", key=f"sc_zval{i}", format="%.6g",
                         value=float(s.get(f"sc_zval{i}", 0.0) or 0.0)
@@ -27548,12 +27791,18 @@ def sc_slot(i, n=3):
     t2.toggle("Own right axis", key=f"sc_right{i}",
               help="When overlaid, this file gets its own y axis on the "
                    "right, for other units or sizes.")
-    u1, u2, u3 = st.columns([0.5, 1.2, 1.2])
+    xf = float(s.get(f"sc_xf{i}") or 1.0)
+    yf = float(s.get(f"sc_yf{i}") if s.get(f"sc_yf{i}") is not None
+               else 1.0)
+    x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
+    u1, u2, u3, u4 = st.columns([0.45, 1.05, 1.15, 1])
     u1.color_picker("Colour", key=f"sc_col{i}",
                     label_visibility="collapsed")
     with u2:
         x_range, y_range = sc_axis_ranges(i)
-    with u3.popover("⋯ More", **STRETCH):
+    with u3:
+        baseline = sc_baseline_controls(i, x_all, mode)
+    with u4.popover("⋯ More", **STRETCH):
         st.text_input("Name in the legend", key=f"sc_label{i}")
         st.text_input("Its y axis title", key=f"sc_ylab{i}")
         m1, m2 = st.columns(2)
@@ -27565,22 +27814,47 @@ def sc_slot(i, n=3):
                         help="-1 changes the sign of the values.")
         st.slider("Smoothing (points)", 1, 501, step=2, key=f"sc_sm{i}",
                   value=None if f"sc_sm{i}" in s else 1)
-    xf = float(s.get(f"sc_xf{i}") or 1.0)
-    yf = float(s.get(f"sc_yf{i}") if s.get(f"sc_yf{i}") is not None
-               else 1.0)
-    x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
-    zero = sc.zero_point(x_all, y_all, mode,
-                         typed=float(s.get(f"sc_zval{i}") or 0.0),
-                         level=float(s.get(f"sc_zlevel{i}") or 0.0))
+    coeffs, contact, sd = None, None, None
+    if baseline is not None:
+        contact, coeffs, sd = sc.baseline_departure(
+            x_all, y_all, baseline["x0"], baseline["x1"],
+            k=baseline["k"], order=baseline["order"],
+            direction=baseline["direction"])
+    if mode == sc.CONTACT_MODE:
+        zero = contact if contact is not None else float(
+            max(baseline["x0"], baseline["x1"]) if baseline else 0.0)
+    else:
+        zero = sc.zero_point(x_all, y_all, mode,
+                             typed=float(s.get(f"sc_zval{i}") or 0.0),
+                             level=float(s.get(f"sc_zlevel{i}") or 0.0))
     shift = float(s.get(f"sc_shift{i}") or 0.0)
+    note = ""
+    if mode == sc.CONTACT_MODE:
+        note = (f" · contact at {contact:.4g} (baseline SD {sd:.3g})"
+                if contact is not None else
+                " · ⚠️ no departure found: widen the baseline window or "
+                "lower k")
     st.caption(f"{len(x_all):,} pts · x {np.nanmin(x_all):.4g} to "
                f"{np.nanmax(x_all):.4g} · zero at {zero:.4g}"
-               + (f", moved {shift:+.4g}" if shift else "")
+               + (f", moved {shift:+.4g}" if shift else "") + note
                if len(x_all) else "No numbers in these columns.")
     zero -= shift
     x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero)
+    baseline_line = baseline_window = None
+    if coeffs is not None:
+        fit_y = np.polyval(coeffs, x + zero)
+        if baseline["subtract"]:
+            y = y - fit_y
+            fit_y = np.zeros_like(fit_y)
+        if baseline["show"] and len(x):
+            order = np.argsort(x)
+            baseline_line = (x[order], fit_y[order])
+            baseline_window = (baseline["x0"] - zero, baseline["x1"] - zero)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
+            "stats": (sent or {}).get("stats") if sent is not None else None,
+            "baseline_line": baseline_line,
+            "baseline_window": baseline_window,
             "label": s.get(f"sc_label{i}") or stem,
             "ylabel": s.get(f"sc_ylab{i}") or str(ycol),
             "colour": s.get(f"sc_col{i}"), "neg_up": bool(
@@ -27614,6 +27888,8 @@ SC_DEFAULTS = {
     "sc_lw": 1.8, "sc_aw": 1.2, "sc_fs": 14, "sc_ts": 16, "sc_ls": 13,
     "sc_align": True, "sc_tspace": 70, "sc_legend": "Above",
     "sc_legline": 40, "sc_width": 0, "sc_ticks": "outside",
+    "sc_stats": "Analysis summary", "sc_stats_at": "Inside, bottom right",
+    "sc_fmt": "png",
 }
 
 
@@ -27677,11 +27953,19 @@ def sc_style_controls():
     st.slider("Plot width (px, 0 = fit the page)", 0, 2000, step=50,
               key="sc_width",
               help="Narrower makes the lines (and x axis) shorter.")
+    c1, c2 = st.columns(2)
+    c1.selectbox("Summary balloon", sc.STATS_BOXES, key="sc_stats",
+                 help="Analysis summary: the statistics sent with a plot "
+                      "from the video tab (contractions, shortening, "
+                      "speeds…). Descriptive statistics: n, mean ± SD, "
+                      "median, min/max of every trace as plotted. The "
+                      "balloon can be dragged on the plot.")
+    c2.selectbox("Balloon position", sc.STATS_PLACES, key="sc_stats_at")
 
 
 def sc_save_controls(traces, stem):
     s = st.session_state
-    st.selectbox("Format", ("svg", "png", "jpeg"), key="sc_fmt")
+    st.selectbox("Format", ("png", "svg", "jpeg"), key="sc_fmt")
     c1, c2 = st.columns(2)
     c1.number_input("Width (px)", 300, 4000, step=50, key="sc_w",
                     value=None if "sc_w" in s else 900)
@@ -27787,15 +28071,19 @@ def sc_panel():
             bold_titles=bool(s.get("sc_bold")),
             legend_size=int(s.get("sc_ls", 13)),
             legend_line=int(s.get("sc_legline", 40)),
-            width=int(s.get("sc_width") or 0) or None)
+            width=int(s.get("sc_width") or 0) or None,
+            stats_box=s.get("sc_stats", "Analysis summary"),
+            stats_place=s.get("sc_stats_at", "Inside, bottom right"))
         # the zoom survives restyling, until ⤢ Reset view
         view = int(s.get("_sc_view", 0))
-        fig.update_layout(uirevision=f"sc{view}",
+        fig.update_layout(uirevision=f"sc{view}", editrevision=f"sc{view}",
                           dragmode=s.get("sc_drag", "zoom"))
         config = {"displaylogo": False, "scrollZoom": True,
                   "displayModeBar": True, "doubleClick": "reset",
+                  # the summary balloons can be dragged where they fit
+                  "edits": {"annotationPosition": True},
                   "toImageButtonOptions": {
-                      "format": s.get("sc_fmt", "svg"), "filename": stem,
+                      "format": s.get("sc_fmt", "png"), "filename": stem,
                       "width": int(s.get("sc_w") or 900),
                       "height": int(fig.layout.height),
                       "scale": int(s.get("sc_scale") or 3)}}
