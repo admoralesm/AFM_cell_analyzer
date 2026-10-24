@@ -9678,10 +9678,42 @@ def video_viewer(path, details):
 # sphere. The tracking, once run, is drawn on it at whatever frame is on
 # show, so there is no second picture to keep in step with the first.
 
-STAGE_LOOK, STAGE_ZOOM, STAGE_CORNERS, STAGE_CORRECT, STAGE_SPHERE = (
-    "👁️ Look", "🔍 Zoom in", "🎯 Corners", "✏️ Correct", "⚪ Sphere")
-STAGE_MODES = (STAGE_LOOK, STAGE_ZOOM, STAGE_CORNERS, STAGE_CORRECT,
-               STAGE_SPHERE)
+STAGE_LOOK = "👁️ Just look"
+STAGE_ZOOM = "🔍 Zoom in on that spot"
+STAGE_MOVE = "✥ Move the view there"
+STAGE_CORNERS = "🎯 Place the cell's 4 corners (tracking)"
+STAGE_OUTLINE = "🧬 Draw the cell's outline (automatic analysis)"
+STAGE_SPHERE = "⚪ Mark the probe sphere"
+STAGE_CORRECT = "✏️ Correct a tracked corner"
+STAGE_MODES = (STAGE_LOOK, STAGE_ZOOM, STAGE_MOVE, STAGE_CORNERS,
+               STAGE_OUTLINE, STAGE_SPHERE, STAGE_CORRECT)
+OUTLINE_MODES = ("Add", "Insert", "Move", "Delete")
+
+
+def draw_outline(image, points, box, scale, picked=None):
+    """The hand-drawn cell outline on a display image (BGR, in place)."""
+    cv = ct.cv2
+    line = cv.LINE_AA
+    shown = to_view(points, box, scale) if points else np.zeros((0, 2))
+    if not len(shown):
+        return image
+    poly = np.round(shown).astype(np.int32).reshape(-1, 1, 2)
+    if len(shown) >= 3:
+        fill = image.copy()
+        cv.fillPoly(fill, [poly], (80, 220, 80))
+        image[:] = cv.addWeighted(fill, 0.18, image, 0.82, 0)
+    cv.polylines(image, [poly], len(shown) >= 3, (0, 0, 0), 4, line)
+    cv.polylines(image, [poly], len(shown) >= 3, (80, 220, 80), 2, line)
+    for k, (x, y) in enumerate(shown):
+        spot = (int(round(x)), int(round(y)))
+        if k == picked:
+            cv.circle(image, spot, 9, (0, 0, 0), -1, line)
+            cv.circle(image, spot, 7, (0, 215, 255), -1, line)
+            continue
+        cv.circle(image, spot, 5, (0, 0, 0), -1, line)
+        cv.circle(image, spot, 3, (255, 255, 255) if k else (0, 0, 255),
+                  -1, line)
+    return image
 
 
 def time_tag(frame, fps):
@@ -9733,6 +9765,11 @@ def stage_paint(frame, box, view, scale, frame_no, mode):
         image = cv.cvtColor(sphere_paint(image, tuple(c), None,
                                          circle[2] * scale, scale),
                             cv.COLOR_RGB2BGR)
+    outline = [tuple(p) for p in (s.get("au_outline") or [])]
+    if outline and (mode == STAGE_OUTLINE
+                    or s.get("au_cell_mode") == "outline"):
+        picked = s.get("au_outline_pick") if mode == STAGE_OUTLINE else None
+        draw_outline(image, outline, box, scale, picked)
     microns = motion_microns()
     result, held = stage_result()
     row = stage_row(result, frame_no)
@@ -9780,7 +9817,21 @@ def stage_paint(frame, box, view, scale, frame_no, mode):
 def stage_click(clicked, frame, frame_no, mode):
     """What a click on the picture does, by the mode chosen."""
     s = st.session_state
-    if mode == STAGE_ZOOM:
+    if mode == STAGE_MOVE:
+        s["_vz_centre_next"] = (int(round(clicked[0])),
+                                int(round(clicked[1])))
+    elif mode == STAGE_OUTLINE:
+        points = [tuple(p) for p in (s.get("au_outline") or [])]
+        how = s.get("au_outline_mode", "Add")
+        picked = s.get("au_outline_pick")
+        if how != "Move" or picked is None or picked >= len(points):
+            picked = None
+        before = len(points)
+        s["au_outline"] = outline_edit(points, clicked, how, picked)
+        s["au_cell_mode"] = "outline"
+        if before == 0:
+            s["au_start"] = int(frame_no)
+    elif mode == STAGE_ZOOM:
         zoom = float(s.get("vz_zoom", 1.0) or 1.0)
         bigger = [z for z in ZOOM_LEVELS if z > zoom]
         s["_vz_zoom_next"] = bigger[0] if bigger else zoom
@@ -9845,6 +9896,15 @@ def stage_zoom_row(shape, centre=None):
     def whole():
         s["vz_zoom"] = 1.0
 
+    def pan(dx, dy):
+        zoom = float(s.get("vz_zoom", 1.0) or 1.0)
+        step_x = width / zoom / 3.0
+        step_y = height / zoom / 3.0
+        s["vz_x"] = clamp_int(int(s.get("vz_x", width // 2)
+                                  + dx * step_x), 0, width - 1)
+        s["vz_y"] = clamp_int(int(s.get("vz_y", height // 2)
+                                  + dy * step_y), 0, height - 1)
+
     z1, z2, z3 = st.columns([2.2, 1, 1])
     z1.select_slider("🔍 Zoom", ZOOM_LEVELS, key="vz_zoom",
                      format_func=zoom_text,
@@ -9854,8 +9914,19 @@ def stage_zoom_row(shape, centre=None):
     z2.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
     z2.button("⤢ All", key="vz_all", on_click=whole, **STRETCH,
               help="Back to the whole frame.")
+    zoomed = float(s.get("vz_zoom", 1.0)) > 1.0
+    p0, p1, p2, p3, p4 = st.columns([1.3, 1, 1, 1, 1])
+    p0.markdown("<div style='padding-top:0.45rem;font-size:0.8rem'>Move "
+                "the view</div>", unsafe_allow_html=True)
+    for col, label, d, tip in ((p1, "◀", (-1, 0), "left"),
+                               (p2, "▲", (0, -1), "up"),
+                               (p3, "▼", (0, 1), "down"),
+                               (p4, "▶", (1, 0), "right")):
+        col.button(label, key=f"vz_pan_{tip}", on_click=pan, args=d,
+                   disabled=not zoomed, help=f"Move the view {tip}",
+                   **STRETCH)
     z3.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-    with z3.popover("✥ Pan", **STRETCH):
+    with z3.popover("✥ Exact", **STRETCH):
         zoomed = float(s.get("vz_zoom", 1.0)) > 1.0
         st.slider("Centre across (px)", 0, width - 1, key="vz_x",
                   disabled=not zoomed)
@@ -9939,6 +10010,40 @@ def stage_correct_controls(frame_no):
                  + "; press 🔁 Re-track below to apply.")
     if note:
         st.caption(note)
+
+
+def stage_outline_controls(frame_no):
+    s = st.session_state
+    points = [tuple(p) for p in (s.get("au_outline") or [])]
+    if s.get("au_outline_mode") not in OUTLINE_MODES:
+        s["au_outline_mode"] = "Add"
+    how = st.radio("Each click", OUTLINE_MODES, horizontal=True,
+                   key="au_outline_mode",
+                   format_func=lambda m: {"Add": "➕ Add",
+                                          "Insert": "➰ Insert",
+                                          "Move": "✋ Move",
+                                          "Delete": "✖ Delete"}[m])
+    if how != "Move":
+        s["au_outline_pick"] = None
+    c1, c2 = st.columns(2)
+    if c1.button("↶ Undo", key="au_outline_undo", disabled=not points,
+                 **STRETCH):
+        s["au_outline"] = points[:-1]
+        rerun_keeping_settings()
+    if c2.button("🗑️ Clear", key="au_outline_clear", disabled=not points,
+                 **STRETCH):
+        s["au_outline"] = []
+        rerun_keeping_settings()
+    start = int(s.get("au_start", 0))
+    st.caption(f"**{len(points)}** point{'' if len(points) == 1 else 's'}"
+               + ("" if len(points) >= 3 else " (3 or more needed)")
+               + f". Click round the cell, including the part under the "
+                 f"probe; it closes itself and is pulled onto the real edge. "
+                 f"Draw it on the first frame of the analysis (frame "
+                 f"{start}).")
+    if int(frame_no) != start:
+        st.button(f"Go to frame {start}", key="au_outline_goto",
+                  on_click=s.__setitem__, args=("vw_frame", start))
 
 
 def stage_sphere_controls(path, frame_no):
@@ -10060,13 +10165,14 @@ def video_stage(path, details):
     def step(n):
         s["vw_frame"] = clamp_int(int(s.get("vw_frame", 0)) + n, 0, last)
 
-    pic, side = st.columns([2.6, 1], gap="medium")
+    pic, side = st.columns([2.4, 1.2], gap="medium")
     with side:
-        mode = st.radio("A click on the picture", STAGE_MODES,
-                        key="vs_mode", horizontal=True,
-                        help="Look only; zoom in on the spot clicked; place "
-                             "the four corners; correct a tracked corner; "
-                             "or mark the probe sphere.")
+        box_mode = st.container(border=True)
+        mode = box_mode.radio(
+            "🖱️ **What a click on the picture does**", STAGE_MODES,
+            key="vs_mode",
+            help="Everything is marked on this one picture: choose what "
+                 "the next click is for.")
         placed = motion_markers()
         stage_zoom_row(shape, centre=(tuple(np.mean(np.asarray(placed),
                                                     axis=0))
@@ -10117,9 +10223,14 @@ def video_stage(path, details):
             stage_correct_controls(int(frame_no))
         elif mode == STAGE_SPHERE:
             stage_sphere_controls(path, int(frame_no))
+        elif mode == STAGE_OUTLINE:
+            stage_outline_controls(int(frame_no))
         elif mode == STAGE_ZOOM:
             st.caption("Click a spot on the picture to zoom in on it, one "
                        "step per click. ⤢ All goes back to the whole frame.")
+        elif mode == STAGE_MOVE:
+            st.caption("Click a spot: the view is centred there, at the "
+                       "same zoom. The arrows move it too.")
         result, _held = stage_result()
         with st.popover("👁️ Show on the picture", **STRETCH):
             st.checkbox("The probe sphere", key="vs_show_sphere",
@@ -10998,32 +11109,34 @@ def auto_results_panel(res):
 
     # Where it looked. The first thing to check: if the green outline is on
     # the wrong object, every number above is about the wrong object.
-    p1, p2 = st.columns(2)
-    with p1:
-        st.image(auto_overlay(res),
-                 caption="Reference picture: the cell (green), the part "
-                         "rebuilt under the probe (dashed orange), the long "
-                         "axis and the probe tip (yellow).", **STRETCH)
-    with p2:
-        if res.get("peak_u8") is not None:
-            row = A.index_of_frame(res, res["peak_frame"])
-            st.image(auto_overlay(res, row=row, picture=res["peak_u8"]),
-                     caption=f"The largest contraction, frame "
-                             f"{res['peak_frame']}.", **STRETCH)
-        else:
-            frames = res["frames"]
-            st.session_state["au_show"] = clamp_int(
-                st.session_state.get("au_show", int(frames[0])),
-                int(frames[0]), int(frames[-1]))
-            at = st.slider("Frame", int(frames[0]), int(frames[-1]),
-                           key="au_show")
-            row = A.index_of_frame(res, int(at))
-            shot = motion_frame(res["video_path"], video_signature(),
-                                int(frames[row]))
-            if shot is not None:
-                gray = ct.cv2.cvtColor(shot, ct.cv2.COLOR_BGR2GRAY)
-                st.image(auto_overlay(res, row=row, picture=gray),
-                         caption=f"Frame {int(frames[row])}.", **STRETCH)
+    with st.expander("🖼️ Where it looked (pictures of the result)",
+                     expanded=False):
+        p1, p2 = st.columns(2)
+        with p1:
+            st.image(auto_overlay(res),
+                     caption="Reference picture: the cell (green), the part "
+                             "rebuilt under the probe (dashed orange), the long "
+                             "axis and the probe tip (yellow).", **STRETCH)
+        with p2:
+            if res.get("peak_u8") is not None:
+                row = A.index_of_frame(res, res["peak_frame"])
+                st.image(auto_overlay(res, row=row, picture=res["peak_u8"]),
+                         caption=f"The largest contraction, frame "
+                                 f"{res['peak_frame']}.", **STRETCH)
+            else:
+                frames = res["frames"]
+                st.session_state["au_show"] = clamp_int(
+                    st.session_state.get("au_show", int(frames[0])),
+                    int(frames[0]), int(frames[-1]))
+                at = st.slider("Frame", int(frames[0]), int(frames[-1]),
+                               key="au_show")
+                row = A.index_of_frame(res, int(at))
+                shot = motion_frame(res["video_path"], video_signature(),
+                                    int(frames[row]))
+                if shot is not None:
+                    gray = ct.cv2.cvtColor(shot, ct.cv2.COLOR_BGR2GRAY)
+                    st.image(auto_overlay(res, row=row, picture=gray),
+                             caption=f"Frame {int(frames[row])}.", **STRETCH)
 
     st.slider(
         "Speed smoothing (frames)", 1, 15, step=2, key="au_smooth",
@@ -11374,7 +11487,17 @@ def auto_panel(path, details):
         hint = (float(np.mean([p[0] for p in markers])),
                 float(np.mean([p[1] for p in markers])))
     elif cell_mode == "outline":
-        outline = auto_outline_panel(path, int(start), circle)
+        drawn = [tuple(p) for p in (st.session_state.get("au_outline")
+                                    or [])]
+        outline = drawn if len(drawn) >= 3 else None
+        o1, o2 = st.columns([3, 1.2])
+        o1.caption(f"{len(drawn)} point{'' if len(drawn) == 1 else 's'} "
+                   "drawn. The outline is drawn on the picture at the top: "
+                   "choose **🧬 Draw the cell's outline** there.")
+        o2.button("🧬 Draw it there", key="au_outline_go", **STRETCH,
+                  on_click=lambda: st.session_state.update(
+                      {"vs_mode": STAGE_OUTLINE,
+                       "vw_frame": int(start)}))
 
     signature = auto_signature(path, start, end, probe_um, um_per_px, hint)
     signature += repr(probe_hint and tuple(np.round(probe_hint, 2)))
@@ -24949,7 +25072,7 @@ with tab_motion:
                             f"on frame {start_frame} (t = "
                             f"{ct.format_time(start_frame / fps)}), where "
                             f"the tracking starts. Place them on the picture "
-                            f"above with **🎯 Corners**; the frame on show "
+                            f"above (🖱️ **🎯 Place the cell's 4 corners**); the frame on show "
                             f"becomes the start.")
                         g2.button("Go to it", key="mt_goto_start",
                                   on_click=st.session_state.__setitem__,
