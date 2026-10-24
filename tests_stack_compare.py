@@ -47,5 +47,14 @@ check("two overlaid in panel 1, the second on its own right axis",
 check("each axis takes its own range",
       tuple(fig.layout["yaxis" + fig.data[1].yaxis[1:]].range) == (0, 600)
       and tuple(fig.layout["xaxis" + fig.data[2].xaxis[1:]].range) == (0.1, 0.2))
+rng = np.random.default_rng(0)
+xc = np.linspace(0, 10, 2001)
+yc = 0.2 * xc + rng.normal(0, 0.05, xc.size)
+yc[xc > 4] += 3 * (xc[xc > 4] - 4) ** 1.5
+contact, coeffs, sd = sc.baseline_departure(xc, yc, 0, 3, k=3, order=1)
+check("the contact point is where the signal leaves its baseline (true 4)",
+      contact is not None and abs(contact - 4.0) < 0.1, str(contact))
+check("descriptive statistics for the balloon",
+      dict(sc.describe([1, 2, 3, 4]))["n"] == "4")
 print("all passing" if not FAILED else f"{len(FAILED)} failing")
 sys.exit(1 if FAILED else 0)
