@@ -7,7 +7,6 @@ font = "sans serif"
 
 [client]
 showErrorDetails = true
-maxMessageSize = 200
 
 [logger]
 level = "info"
@@ -17,6 +16,7 @@ port = 8501
 headless = true
 runOnSave = true
 maxUploadSize = 2000
+maxMessageSize = 200
 
 [browser]
 gatherUsageStats = false
