@@ -3453,73 +3453,301 @@ def snap_sphere(gray, circle):
     return fit
 
 
-def _hough_near(gray, click, half):
-    """The best-voted circle around the click that contains it, or None."""
+def _edge_support(blur, cx, cy, r, threshold, n=72, off=None):
+    """
+    How much of a circle sits on a dark-inside, bright-outside edge: the
+    fraction of n radial pairs (just inside, just outside the circle) whose
+    outside is brighter by more than ``threshold``. The sphere's own edge
+    scores high everywhere the cantilever does not cover it; a circle
+    through a cell outline, debris or the beam does not.
+    """
+    h, w = blur.shape[:2]
+    off = max(2.0, 0.1 * float(r)) if off is None else float(off)
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    c, s = np.cos(t), np.sin(t)
+
+    def ring(radius):
+        xs = (cx + radius * c).astype(np.float32).reshape(1, -1)
+        ys = (cy + radius * s).astype(np.float32).reshape(1, -1)
+        vals = cv2.remap(blur, xs, ys, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REFLECT)
+        return vals.reshape(-1).astype(np.float32)
+
+    inner, outer = ring(max(1.0, r - off)), ring(r + off)
+    inside = (cx + (r + off) * c >= 0) & (cx + (r + off) * c < w) \
+        & (cy + (r + off) * s >= 0) & (cy + (r + off) * s < h)
+    if not inside.any():
+        return 0.0
+    diff = (outer - inner)[inside]
+    return float(0.6 * np.mean(diff > threshold)
+                 + 0.4 * np.mean(np.clip(diff, 0.0, 4.0 * threshold))
+                 / (4.0 * threshold))
+
+
+def _edge_agreement(blur, cx, cy, r, threshold, n=72):
+    """
+    The fraction of n rays from the centre whose own strongest dark-to-
+    bright edge (searched from 0.6 r to 1.4 r) lies on the circle, within
+    max(1.5 px, 5 % of r). A circle that merely runs alongside straight
+    edges (a beam as wide as the sphere) scores low here even where its
+    edge support is high: its rays meet those edges off the circle.
+    """
+    h, w = blur.shape[:2]
+    radii = np.arange(max(1.0, 0.6 * r), 1.4 * r + 0.5, 0.5,
+                      dtype=np.float32)
+    if radii.size < 4:
+        return 0.0
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    xs = (cx + radii[None, :] * np.cos(t)[:, None]).astype(np.float32)
+    ys = (cy + radii[None, :] * np.sin(t)[:, None]).astype(np.float32)
+    prof = cv2.remap(blur, xs, ys, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
+    # rise over ~2 px: dark inside to bright outside
+    rise = prof[:, 4:] - prof[:, :-4]
+    k = np.argmax(rise, axis=1)
+    strong = rise[np.arange(n), k] > threshold
+    edge_r = radii[k + 2]
+    tol = max(1.5, 0.05 * float(r))
+    return float(np.mean(strong & (np.abs(edge_r - float(r)) <= tol)))
+
+
+def _agreement_by_radius(blur, cx, cy, radii, threshold, n=72):
+    """_edge_agreement for one centre and many radii: each ray's strongest
+    dark-to-bright edge is found once, in a window spanning all of them."""
+    lo = max(1.0, 0.6 * float(np.min(radii)))
+    hi = 1.4 * float(np.max(radii)) + 0.5
+    steps = np.arange(lo, hi, 0.5, dtype=np.float32)
+    if steps.size < 6:
+        return np.zeros_like(radii, dtype=np.float32)
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    xs = (cx + steps[None, :] * np.cos(t)[:, None]).astype(np.float32)
+    ys = (cy + steps[None, :] * np.sin(t)[:, None]).astype(np.float32)
+    prof = cv2.remap(blur, xs, ys, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
+    rise = prof[:, 4:] - prof[:, :-4]
+    k = np.argmax(rise, axis=1)
+    strong = rise[np.arange(n), k] > threshold
+    edge_r = steps[k + 2]
+    tol = np.maximum(1.5, 0.05 * radii)
+    near = np.abs(edge_r[None, :] - radii[:, None]) <= tol[:, None]
+    return (near & strong[None, :]).mean(axis=1)
+
+
+def _support_by_radius(blur, cx, cy, radii, threshold, n=64, off=None):
+    """_edge_support for one centre and many radii at once. ``off`` (px)
+    is how far inside and outside the circle the pairs are taken; narrow
+    pairs place the radius on the edge itself."""
+    h, w = blur.shape[:2]
+    t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    c, s = np.cos(t)[None, :], np.sin(t)[None, :]
+    off = (np.maximum(2.0, 0.1 * radii) if off is None
+           else np.full_like(radii, float(off)))[:, None]
+    rin = np.maximum(1.0, radii[:, None] - off)
+    rout = radii[:, None] + off
+    xi, yi = (cx + rin * c).astype(np.float32), (cy + rin * s).astype(np.float32)
+    xo, yo = (cx + rout * c).astype(np.float32), (cy + rout * s).astype(np.float32)
+    inner = cv2.remap(blur, xi, yi, cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REFLECT)
+    outer = cv2.remap(blur, xo, yo, cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REFLECT)
+    valid = (xo >= 0) & (xo < w) & (yo >= 0) & (yo < h)
+    diff = outer - inner
+    count = np.maximum(valid.sum(axis=1), 1)
+    hit = ((diff > threshold) & valid).sum(axis=1) / count
+    # and how strong the edge is there, so the score peaks ON the edge
+    # rather than anywhere on the plateau where the fraction saturates
+    strength = (np.clip(diff, 0.0, 4.0 * threshold) * valid).sum(axis=1) \
+        / count / (4.0 * threshold)
+    return 0.6 * hit + 0.4 * strength
+
+
+def _circle_search(blur, click, r_lo, r_hi, reach, threshold, penalty):
+    """
+    Brute-force circle search round the click: every centre on a grid
+    within ``reach`` px of it and every radius from r_lo to r_hi, scored by
+    edge support less ``penalty`` × offset / radius. Coarse grid, then a
+    1-px refinement round the best. Returns [(score, (x, y, r))] best first.
+    """
+    radii = np.arange(float(r_lo), float(r_hi), 1.0, dtype=np.float32)
+    if radii.size == 0:
+        return []
+    cx0, cy0 = float(click[0]), float(click[1])
+
+    def scan(centres):
+        out = []
+        for x, y in centres:
+            sup = _support_by_radius(blur, x, y, radii, threshold)
+            off = math.hypot(x - cx0, y - cy0)
+            score = sup - penalty * off / np.maximum(radii, 6.0)
+            k = int(np.argmax(score))
+            out.append((float(score[k]), (float(x), float(y),
+                                          float(radii[k]))))
+        return out
+
+    step = max(1.5, reach / 10.0)
+    grid = [(cx0 + dx, cy0 + dy)
+            for dx in np.arange(-reach, reach + 0.1, step)
+            for dy in np.arange(-reach, reach + 0.1, step)
+            if dx * dx + dy * dy <= reach * reach + 1e-6]
+    coarse = sorted(scan(grid), key=lambda item: -item[0])
+    if not coarse:
+        return []
+    bx, by, _ = coarse[0][1]
+    fine = [(bx + dx, by + dy)
+            for dx in np.arange(-step, step + 0.1, 1.0)
+            for dy in np.arange(-step, step + 0.1, 1.0)]
+    return sorted(coarse[:5] + scan(fine), key=lambda item: -item[0])
+
+
+def _disk_darkness(blur, cx, cy, r, span):
+    """How much darker the disk is than a band just outside it, as a
+    fraction of the picture's contrast ``span``: the median of the disk
+    against the median of the band from 1.15 r to 1.5 r."""
+    h, w = blur.shape[:2]
+    pad = int(math.ceil(1.5 * r)) + 2
+    x0, x1 = max(0, int(cx) - pad), min(w, int(cx) + pad + 1)
+    y0, y1 = max(0, int(cy) - pad), min(h, int(cy) + pad + 1)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return 0.0
+    patch = blur[y0:y1, x0:x1]
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    d = np.hypot(xx - cx, yy - cy)
+    disk = patch[d <= 0.92 * r]
+    band = patch[(d >= 1.15 * r) & (d <= 1.5 * r)]
+    if disk.size < 5 or band.size < 5:
+        return 0.0
+    return float((np.median(band) - np.median(disk)) / max(span, 1.0))
+
+
+def _hough_candidates(gray, click, half, r_max):
+    """Every Hough circle round the click that contains it."""
     g = np.asarray(gray)
     cx, cy = int(round(click[0])), int(round(click[1]))
     x0, y0 = max(0, cx - half), max(0, cy - half)
     roi = g[y0:cy + half, x0:cx + half]
     if roi.size == 0 or min(roi.shape[:2]) < 12:
-        return None
+        return []
     blur = cv2.GaussianBlur(roi, (0, 0), 1.5)
-    for votes in (14, 10, 7):
+    out = []
+    for votes in (18, 12, 8):
         found = cv2.HoughCircles(blur, cv2.HOUGH_GRADIENT, dp=1, minDist=2,
                                  param1=60, param2=votes, minRadius=4,
-                                 maxRadius=max(8, half - 4))
+                                 maxRadius=int(max(8, min(half - 4, r_max))))
         if found is None:
             continue
-        for x, y, r in found[0]:
+        for x, y, r in found[0][:60]:
             x, y = float(x) + x0, float(y) + y0
-            if math.hypot(x - click[0], y - click[1]) < 0.8 * float(r):
-                return (x, y, float(r))
-    return None
+            if math.hypot(x - click[0], y - click[1]) < 0.9 * float(r):
+                out.append((x, y, float(r)))
+    return out
 
 
-def sphere_from_click(gray, click, r_guess=None):
+def _hough_near(gray, click, half):
+    """The best-voted circle around the click that contains it, or None."""
+    found = _hough_candidates(gray, click, half, half)
+    return found[0] if found else None
+
+
+def sphere_from_click(gray, click, r_guess=None, max_offset=0.75):
     """
-    The probe sphere from one click anywhere on it.
+    The probe sphere from a click inside it (best near its centre).
 
-    First a Hough circle search in a window round the click (the circle
-    with the most edge votes that contains the click), snapped to the
-    outline when the snap agrees with it. That holds for a sphere on the
-    end of a rod too, where the top of the circle has no edge. Failing
-    that, a few starting points round the click are each snapped
-    (snap_sphere) and the fit whose edge most rays find wins. Returns
-    snap_sphere's dict (ok, center, radius, confidence) or {"ok": False}.
+    Candidates come from three places: Hough circles round the click, the
+    ray-cast radius with the click as the centre, and snap_sphere started
+    from the click and from a ring round it. Each is scored by how much of
+    its circumference is a dark-inside / bright-outside edge (the sphere's
+    edge, wherever the cantilever does not hide it), less a penalty for how
+    far its centre is from the click. A candidate whose centre is further
+    than ``max_offset`` × its radius from the click is not considered at
+    all, so the fit stays on the object clicked instead of jumping to a
+    larger circle (the cell, the beam) that merely contains the click.
+    Returns snap_sphere's dict (ok, center, radius, confidence) plus
+    "support" and "offset_px", or {"ok": False}.
     """
     g0 = np.asarray(gray)
+    if g0.ndim == 3:
+        g0 = cv2.cvtColor(g0, cv2.COLOR_BGR2GRAY)
     cx0, cy0 = float(click[0]), float(click[1])
-    half = int(max(90, 0.2 * max(g0.shape[:2])))
+    h, w = g0.shape[:2]
+    r_max = float(max(20.0, 0.25 * min(h, w)))
     if r_guess:
-        half = int(max(half, 2.5 * float(r_guess)))
-    circle = _hough_near(g0, (cx0, cy0), half)
-    if circle is not None:
-        fit = snap_sphere(gray, circle)
-        if (fit.get("ok") and math.hypot(fit["center"][0] - circle[0],
-                                         fit["center"][1] - circle[1])
-                < 0.3 * circle[2]
-                and abs(fit["radius"] - circle[2]) < 0.2 * circle[2]):
-            return fit
-        return {"ok": True, "center": (circle[0], circle[1]),
-                "radius": circle[2],
-                "confidence": float(fit.get("confidence", 0.5) or 0.5)}
+        r_max = max(r_max, 1.8 * float(r_guess))
+    half = int(max(60, min(1.6 * r_max, 0.35 * max(h, w))))
     g = SphereEdgeRefiner._suppress_specular(g0)
-    r0 = r_guess or SphereEdgeRefiner._radius_from_center(g, cx0, cy0) or 15.0
-    step = max(3.0, 0.45 * float(r0))
+    blur = cv2.GaussianBlur(g, (0, 0), 1.2).astype(np.float32)
+    lo, hi = np.percentile(blur, [5, 95])
+    threshold = max(6.0, 0.15 * float(hi - lo))
+
+    candidates = list(_hough_candidates(g, (cx0, cy0), half, r_max))
+    r0 = r_guess or SphereEdgeRefiner._radius_from_center(g, cx0, cy0)
+    if r0:
+        candidates.append((cx0, cy0, float(r0)))
+    step = max(3.0, 0.4 * float(r0 or 15.0))
     starts = [(cx0, cy0)] + [
         (cx0 + step * math.cos(a), cy0 + step * math.sin(a))
-        for a in np.linspace(0, 2 * math.pi, 8, endpoint=False)]
-    best = None
+        for a in np.linspace(0, 2 * math.pi, 6, endpoint=False)]
     for sx, sy in starts:
-        r = SphereEdgeRefiner._radius_from_center(g, sx, sy) or r0
-        fit = snap_sphere(gray, (sx, sy, r))
-        if not fit.get("ok"):
+        r = SphereEdgeRefiner._radius_from_center(g, sx, sy) or r0 or 15.0
+        fit = snap_sphere(g, (sx, sy, r))
+        if fit.get("ok"):
+            candidates.append((float(fit["center"][0]),
+                               float(fit["center"][1]),
+                               float(fit["radius"])))
+
+    reach = float(min(30.0, max(10.0, 0.05 * min(h, w))))
+    for _score, circle in _circle_search(blur, (cx0, cy0), 5.0, r_max,
+                                         reach, threshold, 0.3)[:8]:
+        candidates.append(circle)
+
+    best = None
+    for x, y, r in candidates:
+        if not (3.0 <= r <= r_max):
             continue
-        key = (round(float(fit["confidence"]), 2),
-               -math.hypot(fit["center"][0] - cx0, fit["center"][1] - cy0))
-        if best is None or key > best[0]:
-            best = (key, fit)
-    return best[1] if best else {"ok": False}
+        offset = math.hypot(x - cx0, y - cy0)
+        if offset > max_offset * r + 2.0:
+            continue
+        support = _edge_support(blur, x, y, r, 0.5 * threshold,
+                                off=max(1.0, 0.05 * r))
+        if _disk_darkness(blur, x, y, r, float(hi - lo)) <= 0.03:
+            continue        # not darker than round it: not the sphere
+        agree = _edge_agreement(blur, x, y, r, threshold)
+        score = 0.5 * support + 0.5 * agree - 0.3 * offset / max(r, 6.0)
+        if best is None or score > best[0]:
+            best = (score, (x, y, r), support, offset)
+    if best is None:
+        return {"ok": False}
+    _, (x, y, r), support, offset = best
+    # polish without the pull towards the click: the best edge (support
+    # and circularity) within a few px of the circle chosen
+    radii = np.arange(max(3.0, r - 6.0), r + 6.5, 0.5, dtype=np.float32)
+    top = (-1.0, x, y, r)
+    narrow = max(1.0, 0.05 * r)
+    for dx in np.arange(-6.0, 6.01, 1.0):
+        for dy in np.arange(-6.0, 6.01, 1.0):
+            sup = _support_by_radius(blur, x + dx, y + dy, radii,
+                                     0.5 * threshold, off=narrow)
+            agree = _agreement_by_radius(blur, x + dx, y + dy, radii,
+                                         threshold)
+            both = 0.5 * sup + 0.5 * agree
+            k = int(np.argmax(both))
+            if both[k] > top[0] + 1e-9:
+                top = (float(both[k]), x + dx, y + dy, float(radii[k]))
+    _, x, y, r = top
+    support = _edge_support(blur, x, y, r, threshold)
+    # a last snap onto the edge, kept only if it agrees and holds the edge
+    fit = snap_sphere(g, (x, y, r))
+    if fit.get("ok"):
+        fx, fy = (float(v) for v in fit["center"])
+        fr = float(fit["radius"])
+        if (math.hypot(fx - x, fy - y) < 0.3 * r and abs(fr - r) < 0.2 * r
+                and math.hypot(fx - cx0, fy - cy0) <= max_offset * fr + 2.0):
+            snapped = _edge_support(blur, fx, fy, fr, threshold)
+            if snapped >= support - 0.02:
+                x, y, r, support = fx, fy, fr, snapped
+    return {"ok": True, "center": (x, y), "radius": r,
+            "confidence": float(support), "support": float(support),
+            "offset_px": float(math.hypot(x - cx0, y - cy0))}
+
 
 def available():
     """True when OpenCV is importable."""
