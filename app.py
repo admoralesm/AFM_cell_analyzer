@@ -27856,7 +27856,7 @@ def sc_axis_ranges(i):
 BASELINE_MODES = ("Off", "Show", "Correct")
 
 
-def sc_baseline_controls(i, x_all, mode):
+def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
     """
     One file's baseline row: a horizontal (or sloped) baseline fitted over
     a window before contact, shown dashed over the trace, or subtracted
@@ -27892,9 +27892,31 @@ def sc_baseline_controls(i, x_all, mode):
                   "drawn dashed across the trace, the window shaded. "
                   "Correct: subtracted from the signal, so the trace sits "
                   "on y = 0 (baseline correction).")
-    with b2.popover("⚙ Window", **STRETCH):
+    ys = np.asarray(y_all if y_all is not None else [], float)
+    ys = ys[np.isfinite(ys)]
+    y_lo, y_hi = (float(ys.min()), float(ys.max())) if ys.size else (0.0,
+                                                                     1.0)
+    if y_hi <= y_lo:
+        y_hi = y_lo + 1.0
+    if s.get(f"sc_bllvl{i}") not in ("Fitted", "By hand"):
+        s[f"sc_bllvl{i}"] = "Fitted"
+    if not (y_lo <= float(s.get(f"sc_blval{i}", y_lo - 1)) <= y_hi):
+        s[f"sc_blval{i}"] = float(np.median(ys)) if ys.size else 0.0
+    with b2.popover("⚙ Baseline", **STRETCH):
+        st.radio("Level", ("Fitted", "By hand"), key=f"sc_bllvl{i}",
+                 horizontal=True,
+                 format_func={"Fitted": "Fitted over the window",
+                              "By hand": "Set by hand"}.get,
+                 help="By hand: move the horizontal baseline with the "
+                      "slider and watch it, the threshold and the peaks "
+                      "counted follow on the plot.")
+        if s.get(f"sc_bllvl{i}") == "By hand":
+            st.slider("Baseline level (y)", y_lo, y_hi,
+                      step=(y_hi - y_lo) / 1000.0, key=f"sc_blval{i}",
+                      format="%.4g")
         st.radio("Baseline", ("Horizontal", "Sloped (linear)"),
                  key=f"sc_blo{i}", horizontal=True,
+                 disabled=s.get(f"sc_bllvl{i}") == "By hand",
                  help="Horizontal: the mean level over the window. Sloped: "
                       "a straight line through it, for a drifting signal.")
         a, b = st.columns(2)
@@ -27916,13 +27938,72 @@ def sc_baseline_controls(i, x_all, mode):
                      format_func={"either": "Either way", "up": "Upwards",
                                   "down": "Downwards"}.get)
     chosen = s.get(f"sc_blmode{i}", "Off")
-    if chosen == "Off" and not contact_mode:
+    if chosen == "Off" and not (contact_mode or needed):
         return None
     return {"x0": float(s.get(f"sc_bl0{i}")), "x1": float(s.get(f"sc_bl1{i}")),
             "k": float(s.get(f"sc_blk{i}", 3.0)),
             "order": 0 if s.get(f"sc_blo{i}") == "Horizontal" else 1,
             "direction": s.get(f"sc_bld{i}", "either"),
+            "manual": (float(s.get(f"sc_blval{i}"))
+                       if s.get(f"sc_bllvl{i}") == "By hand" else None),
             "show": True, "subtract": chosen == "Correct"}
+
+
+DEFLECTION_UNITS = {"nm": 1.0, "µm": 1e3, "m": 1e9}
+
+
+def sc_peak_controls(i, y_all):
+    """The ⛰ Peaks popover of one file: peak analysis against the
+    baseline, and the units its statistics are given in."""
+    s = st.session_state
+    ys = np.asarray(y_all, float)
+    ys = ys[np.isfinite(ys)]
+    span = float(np.ptp(ys)) if ys.size else 1.0
+    s.setdefault(f"sc_pkh{i}", float(f"{0.1 * span:.3g}") if span else 0.0)
+    s.setdefault(f"sc_pkd{i}", "both")
+    s.setdefault(f"sc_pksep{i}", 0.0)
+    s.setdefault(f"sc_pku{i}", "As plotted")
+    s.setdefault(f"sc_pkk{i}", float(s.get("ai_k", 0.1) or 0.1))
+    s.setdefault(f"sc_pkdu{i}", "µm")
+    with st.popover("⛰ Peaks", **STRETCH):
+        st.toggle("Peak analysis", key=f"sc_pk{i}",
+                  help="Counts the peaks above and the dips below the "
+                       "baseline (set under ⚙ Baseline), marks each one "
+                       "counted on the plot (▲ ▼), and puts their "
+                       "statistics in the balloon.")
+        a, b = st.columns(2)
+        a.radio("Count", sc.PEAK_DIRECTIONS, key=f"sc_pkd{i}",
+                format_func={"both": "Up and down", "up": "Up only",
+                             "down": "Down only"}.get)
+        b.number_input("Min. height from baseline (y)", 0.0, None,
+                       key=f"sc_pkh{i}", format="%.4g",
+                       help="A peak counts when it clears the baseline by "
+                            "this much: the dotted lines on the plot.")
+        b.number_input("Min. spacing (x)", 0.0, None, key=f"sc_pksep{i}",
+                       format="%.4g",
+                       help="Peaks closer than this count as one.")
+        st.radio("Statistics in", ("As plotted", "Force (nN)"),
+                 key=f"sc_pku{i}", horizontal=True,
+                 help="Force: the plotted deflection × the cantilever's "
+                      "spring constant, so peak heights read in nN while "
+                      "the plot stays in its own units.")
+        if s.get(f"sc_pku{i}") == "Force (nN)":
+            c, d = st.columns(2)
+            c.number_input("Spring constant k (N/m)", 0.0001, 1000.0,
+                           key=f"sc_pkk{i}", format="%.4g")
+            d.selectbox("Deflection plotted in", list(DEFLECTION_UNITS),
+                        key=f"sc_pkdu{i}")
+    if s.get(f"sc_pku{i}") == "Force (nN)":
+        factor = float(s.get(f"sc_pkk{i}", 0.1)) * DEFLECTION_UNITS.get(
+            s.get(f"sc_pkdu{i}", "µm"), 1.0)
+        unit = "nN"
+    else:
+        factor, unit = 1.0, ""
+    return {"on": bool(s.get(f"sc_pk{i}")),
+            "height": float(s.get(f"sc_pkh{i}") or 0.0),
+            "direction": s.get(f"sc_pkd{i}", "both"),
+            "sep": float(s.get(f"sc_pksep{i}") or 0.0),
+            "factor": factor, "unit": unit}
 
 
 def sc_slot_name(i):
@@ -27982,6 +28063,12 @@ def sc_slot(i, n=3):
     c3.selectbox("Panel", options, key=f"sc_panel{i}",
                  help="Same number = overlaid; different = stacked.")
     sc_default(f"sc_ylab{i}", str(ycol))
+    n1, n2 = st.columns(2)
+    n1.text_input("Name in the legend", key=f"sc_label{i}")
+    n2.text_input("y axis title", key=f"sc_ylab{i}",
+                  help="This file's y axis title on the plot. Where files "
+                       "share a panel their titles are joined, unless one "
+                       "title for the whole panel is set under 📐 Axes.")
     # where it starts
     z1, z2, z3 = st.columns([1.6, 1, 1])
     mode = z1.selectbox(
@@ -28015,15 +28102,16 @@ def sc_slot(i, n=3):
     yf = float(s.get(f"sc_yf{i}") if s.get(f"sc_yf{i}") is not None
                else 1.0)
     x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
-    baseline = sc_baseline_controls(i, x_all, mode)
-    u1, u2, u3 = st.columns([0.5, 1.2, 1.2])
+    peaks_on = bool(s.get(f"sc_pk{i}"))
+    baseline = sc_baseline_controls(i, x_all, mode, y_all, needed=peaks_on)
+    u1, u2, u3, u4 = st.columns([0.45, 1.05, 1.05, 1])
     u1.color_picker("Colour", key=f"sc_col{i}",
                     label_visibility="collapsed")
     with u2:
         x_range, y_range = sc_axis_ranges(i)
-    with u3.popover("⋯ More", **STRETCH):
-        st.text_input("Name in the legend", key=f"sc_label{i}")
-        st.text_input("Its y axis title", key=f"sc_ylab{i}")
+    with u3:
+        peaks = sc_peak_controls(i, y_all)
+    with u4.popover("⋯ More", **STRETCH):
         m1, m2 = st.columns(2)
         m1.number_input("x ×", key=f"sc_xf{i}", value=None
                         if f"sc_xf{i}" in s else 1.0, format="%.6g",
@@ -28034,7 +28122,16 @@ def sc_slot(i, n=3):
         st.slider("Smoothing (points)", 1, 501, step=2, key=f"sc_sm{i}",
                   value=None if f"sc_sm{i}" in s else 1)
     coeffs, contact, sd = None, None, None
-    if baseline is not None:
+    if baseline is not None and baseline["manual"] is not None:
+        coeffs = np.array([baseline["manual"]])
+        lo_w, hi_w = sorted((baseline["x0"], baseline["x1"]))
+        inside = (x_all >= lo_w) & (x_all <= hi_w) & np.isfinite(y_all)
+        sd = (float(np.std(y_all[inside] - baseline["manual"]))
+              if inside.sum() > 2 else 0.0)
+        contact, coeffs, sd = sc.departure_from(
+            x_all, y_all, coeffs, sd, hi_w, baseline["k"],
+            baseline["direction"])
+    elif baseline is not None:
         contact, coeffs, sd = sc.baseline_departure(
             x_all, y_all, baseline["x0"], baseline["x1"],
             k=baseline["k"], order=baseline["order"],
@@ -28065,6 +28162,7 @@ def sc_slot(i, n=3):
     zero -= shift
     x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero)
     baseline_line = baseline_window = None
+    fit_y = None
     if coeffs is not None:
         fit_y = np.polyval(coeffs, x + zero)
         if baseline["subtract"]:
@@ -28075,10 +28173,32 @@ def sc_slot(i, n=3):
             baseline_line = (x[order], fit_y[order])
             baseline_window = (baseline["x0"] - zero, baseline["x1"] - zero)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
+    peak_marks = peak_stats = threshold_lines = None
+    if peaks["on"] and fit_y is not None and len(x):
+        found = sc.peak_analysis(
+            x, y, fit_y, peaks["height"], peaks["direction"], peaks["sep"],
+            factor=peaks["factor"], unit=peaks["unit"],
+            x_unit=sc.unit_of(str(xcol)) if not xf or xf == 1.0 else "")
+        peak_marks = [(x[found["up"]], y[found["up"]], "triangle-up",
+                       "peak"),
+                      (x[found["down"]], y[found["down"]], "triangle-down",
+                       "dip")]
+        peak_stats = found["stats"]
+        order = np.argsort(x)
+        threshold_lines = []
+        if peaks["direction"] in ("both", "up"):
+            threshold_lines.append(fit_y[order] + peaks["height"])
+        if peaks["direction"] in ("both", "down"):
+            threshold_lines.append(fit_y[order] - peaks["height"])
+        st.caption(f"⛰ {len(found['up'])} peaks up, {len(found['down'])} "
+                   "down counted (▲ ▼ on the plot)")
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
             "stats": (sent or {}).get("stats") if sent is not None else None,
             "baseline_line": baseline_line,
             "baseline_window": baseline_window,
+            "peak_marks": peak_marks, "peak_stats": peak_stats,
+            "threshold_lines": threshold_lines,
+            "stats_factor": peaks["factor"], "stats_unit": peaks["unit"],
             "label": s.get(f"sc_label{i}") or stem,
             "ylabel": s.get(f"sc_ylab{i}") or str(ycol),
             "colour": s.get(f"sc_col{i}"), "neg_up": bool(
@@ -28113,7 +28233,7 @@ SC_DEFAULTS = {
     "sc_align": True, "sc_tspace": 70, "sc_legend": "Above",
     "sc_legline": 40, "sc_width": 0, "sc_ticks": "outside",
     "sc_stats": "Analysis summary", "sc_stats_at": "Inside, bottom right",
-    "sc_fmt": "png",
+    "sc_fmt": "png", "sc_zw": 1.0, "sc_crossw": 1.0, "sc_cross": False,
 }
 
 
@@ -28125,6 +28245,14 @@ def sc_axes_controls(traces):
     a1.toggle("Link the x axes", key="sc_link",
               help="On: the panels share one x axis and zoom together.")
     a2.toggle("Line at x = 0", key="sc_zline")
+    a1.toggle("Crosshair cursor", key="sc_cross",
+              help="Lines across the plot at the cursor, to place a zero or "
+                   "read a value. Always on while Click a point to set "
+                   "zero is on.")
+    a3, a4 = st.columns(2)
+    a3.slider("Crosshair thickness", 0.5, 4.0, step=0.25, key="sc_crossw")
+    a4.slider("x = 0 line thickness", 0.5, 5.0, step=0.25, key="sc_zw",
+              disabled=not s.get("sc_zline"))
     b1, b2 = st.columns(2)
     b1.text_input("x from (all)", key="sc_xmin", placeholder="auto",
                   help="Sets the x axis of every panel at once.")
@@ -28166,13 +28294,22 @@ def sc_style_controls():
     c1.selectbox("Legend", sc.LEGEND_PLACES, key="sc_legend")
     c2.slider("Legend line length", 30, 120, step=5, key="sc_legline",
               help="How long the coloured line is beside each name.")
+    c1, c2 = st.columns(2)
+    c1.text_input("Legend title", key="sc_legtitle", placeholder="none",
+                  help="A heading over the legend's entries. The entries "
+                       "themselves are each file's Name in the legend.")
+    c2.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+    c2.checkbox("Box round the legend", key="sc_legbox")
     c1, c2, c3 = st.columns(3)
     c1.number_input("Titles", 8, 36, key="sc_ts")
     c2.number_input("Numbers", 8, 30, key="sc_fs")
     c3.number_input("Legend", 6, 30, key="sc_ls")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.checkbox("Bold titles", key="sc_bold")
-    c2.toggle("All on one plot", key="sc_overlay",
+    c2.checkbox("Bold numbers", key="sc_boldticks",
+                help="The tick labels on every axis.")
+    c3.checkbox("Bold legend", key="sc_legbold")
+    st.toggle("All on one plot", key="sc_overlay",
               help="Every file in one panel, whatever its panel number.")
     st.slider("Plot width (px, 0 = fit the page)", 0, 2000, step=50,
               key="sc_width",
@@ -28302,7 +28439,14 @@ def sc_panel():
             width=int(s.get("sc_width") or 0) or None,
             stats_box=(s.get("sc_stats", "Analysis summary")
                        if s.get("sc_balloons", True) else "Off"),
-            stats_place=s.get("sc_stats_at", "Inside, bottom right"))
+            stats_place=s.get("sc_stats_at", "Inside, bottom right"),
+            crosshair=bool(s.get("sc_click") or s.get("sc_cross")),
+            crosshair_width=float(s.get("sc_crossw", 1.0)),
+            zero_width=float(s.get("sc_zw", 1.0)),
+            bold_ticks=bool(s.get("sc_boldticks")),
+            legend_title=str(s.get("sc_legtitle") or "").strip(),
+            legend_box=bool(s.get("sc_legbox")),
+            legend_bold=bool(s.get("sc_legbold")))
         # the zoom survives restyling, until ⤢ Reset view
         view = int(s.get("_sc_view", 0))
         fig.update_layout(uirevision=f"sc{view}", editrevision=f"sc{view}",
@@ -28338,8 +28482,9 @@ def sc_panel():
                         t["slot"]: float(p["x"]) + t["zero"]}
                     s["_sc_chart_ver"] = version + 1
                     st.rerun()
-            st.caption("Click a point on a trace: it becomes x = 0 for "
-                       "that file.")
+            st.caption("Move the crosshair to the moment you want and click: "
+                       "that point becomes x = 0 for its file (↶ Undo zero "
+                       "puts it back).")
         else:
             st.plotly_chart(fig, key=f"sc_chart_{view}", config=config,
                             theme=None, **(STRETCH if fit else {}))
