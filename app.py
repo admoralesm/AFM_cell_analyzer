@@ -744,6 +744,84 @@ def _plotly_chart_export(figure_or_data, *args, **kwargs):
 st.plotly_chart = _plotly_chart_export
 
 
+# Sliders and number boxes whose remembered value has fallen outside their
+# range raise StreamlitValueAboveMaxError / BelowMin. That happens whenever
+# the range depends on the data (a second, shorter or smaller video, a
+# sphere bigger than the old slider allowed): the value is brought back
+# inside the range before the widget is drawn, instead of the page failing.
+from streamlit.delta_generator import DeltaGenerator as _DG
+
+if not hasattr(_DG, "_original_slider"):
+    _DG._original_slider = _DG.slider
+    _DG._original_number_input = _DG.number_input
+if not hasattr(st, "_original_slider"):
+    st._original_slider = st.slider
+    st._original_number_input = st.number_input
+
+
+def _clamp_widget_value(key, low, high):
+    if key is None or key not in st.session_state:
+        return
+    try:
+        value = st.session_state[key]
+        def fit(v):
+            if v is None:
+                return v
+            out = v
+            if low is not None and v < low:
+                out = low
+            if high is not None and v > high:
+                out = high
+            return type(v)(out) if not isinstance(v, bool) else out
+        if isinstance(value, (tuple, list)):
+            fitted = type(value)(fit(v) for v in value)
+        else:
+            fitted = fit(value)
+        if fitted != value:
+            st.session_state[key] = fitted
+    except Exception:
+        pass
+
+
+def _range_args(args, kwargs):
+    low = kwargs.get("min_value", args[0] if len(args) > 0 else None)
+    high = kwargs.get("max_value", args[1] if len(args) > 1 else None)
+    numeric = (int, float, np.integer, np.floating)
+    low = low if isinstance(low, numeric) else None
+    high = high if isinstance(high, numeric) else None
+    return low, high
+
+
+def _safe_slider(label, *args, **kwargs):
+    low, high = _range_args(args, kwargs)
+    _clamp_widget_value(kwargs.get("key"), low, high)
+    return st._original_slider(label, *args, **kwargs)
+
+
+def _safe_number_input(label, *args, **kwargs):
+    low, high = _range_args(args, kwargs)
+    _clamp_widget_value(kwargs.get("key"), low, high)
+    return st._original_number_input(label, *args, **kwargs)
+
+
+def _dg_safe_slider(self, label, *args, **kwargs):
+    low, high = _range_args(args, kwargs)
+    _clamp_widget_value(kwargs.get("key"), low, high)
+    return _DG._original_slider(self, label, *args, **kwargs)
+
+
+def _dg_safe_number_input(self, label, *args, **kwargs):
+    low, high = _range_args(args, kwargs)
+    _clamp_widget_value(kwargs.get("key"), low, high)
+    return _DG._original_number_input(self, label, *args, **kwargs)
+
+
+_DG.slider = _dg_safe_slider
+_DG.number_input = _dg_safe_number_input
+st.slider = _safe_slider
+st.number_input = _safe_number_input
+
+
 def _stretch_kwargs():
     """`use_container_width` is deprecated in new Streamlit and absent in old.
 
