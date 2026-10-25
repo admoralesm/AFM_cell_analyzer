@@ -28181,7 +28181,7 @@ def sc_slot(i, n=3):
         help="Where this file's x = 0 is: the first point, a value you "
              "type, the peak, the lowest point, a level crossing, or the "
              "contact point (where the signal leaves the baseline set "
-             "under 〰 Baseline). With **Click a point to set zero** on, a "
+             "under 〰 Baseline). With **🎯 Click to set zero** on, a "
              "click on the plot sets it too.")
     if mode == "A value I type":
         z2.number_input("at x =", key=f"sc_zval{i}", format="%.6g",
@@ -28338,7 +28338,7 @@ SC_DEFAULTS = {
     "sc_align": True, "sc_tspace": 70, "sc_legend": "Above",
     "sc_legline": 40, "sc_width": 0, "sc_ticks": "outside",
     "sc_stats": "Analysis summary", "sc_stats_at": "Inside, bottom right",
-    "sc_fmt": "png", "sc_zw": 1.0, "sc_crossw": 1.0, "sc_cross": False,
+    "sc_fmt": "png", "sc_zw": 1.0, "sc_crossw": 1.0, "sc_cross": True,
 }
 
 
@@ -28350,12 +28350,9 @@ def sc_axes_controls(traces):
     a1.toggle("Link the x axes", key="sc_link",
               help="On: the panels share one x axis and zoom together.")
     a2.toggle("Line at x = 0", key="sc_zline")
-    a1.toggle("Crosshair cursor", key="sc_cross",
-              help="Lines across the plot at the cursor, to place a zero or "
-                   "read a value. Always on while Click a point to set "
-                   "zero is on.")
     a3, a4 = st.columns(2)
-    a3.slider("Crosshair thickness", 0.5, 4.0, step=0.25, key="sc_crossw")
+    a3.slider("Crosshair thickness", 0.5, 4.0, step=0.25, key="sc_crossw",
+              help="The ✛ Crosshair switch sits above the plot.")
     a4.slider("x = 0 line thickness", 0.5, 5.0, step=0.25, key="sc_zw",
               disabled=not s.get("sc_zline"))
     b1, b2 = st.columns(2)
@@ -28445,6 +28442,29 @@ def sc_save_controls(traces, stem):
                        key="sc_csv", **STRETCH)
 
 
+def sc_zero_from_click(point, traces):
+    """{slot: x on the file's own axis} for a clicked point, or None.
+
+    Every trace a click can land on (the file's line, its ▲ ▼ peaks)
+    carries [slot, own x] as customdata; the trace order is the fallback.
+    """
+    data = point.get("customdata")
+    if isinstance(data, dict):  # Streamlit sends the pair as {"0": .., "1": ..}
+        data = [data.get("0", data.get(0)), data.get("1", data.get(1))]
+    try:
+        if data is not None and len(data) >= 2 and None not in data[:2]:
+            slot = int(round(float(data[0])))
+            if any(t["slot"] == slot for t in traces):
+                return {slot: float(data[1])}
+    except (TypeError, ValueError):
+        pass
+    curve = int(point.get("curve_number", -1))
+    if 0 <= curve < len(traces):
+        t = traces[curve]
+        return {t["slot"]: float(point["x"]) + t["zero"]}
+    return None
+
+
 def sc_panel():
     s = st.session_state
     # a click on the plot asked for a new zero on the previous run; what it
@@ -28499,14 +28519,18 @@ def sc_panel():
         sc_save_controls(traces, stem)
 
     with right:
-        k0, k1, k2, k3, k4 = st.columns([1.15, 1.5, 1.1, 1.4, 1])
+        k0, kc, k1, k2, k3, k4 = st.columns([1.05, 1.25, 1.5, 1.1, 1.4, 1])
         k0.toggle("💬 Stats", key="sc_balloons",
                   value=None if "sc_balloons" in s else True,
                   help="Show or hide every summary balloon on the plot "
                        "at once. What they show is set under 🎨 Look.")
-        k1.toggle("Click a point to set zero", key="sc_click",
-                  help="Then a click on any point of a trace makes that "
-                       "point x = 0 for that file.")
+        kc.toggle("✛ Crosshair", key="sc_cross",
+                  help="Lines across the plot at the cursor, to read a "
+                       "value or aim a zero. Its thickness is under "
+                       "📐 Axes.")
+        k1.toggle("🎯 Click to set zero", key="sc_click",
+                  help="Then a click on any point of a trace, or on a ▲ ▼ "
+                       "peak, makes that point x = 0 for that file.")
         k2.button("↶ Undo zero", key="sc_undo_zero",
                   disabled=not s.get("_sc_zero_hist"),
                   on_click=s.__setitem__, args=("_sc_zero_undo", True),
@@ -28545,7 +28569,7 @@ def sc_panel():
             stats_box=(s.get("sc_stats", "Analysis summary")
                        if s.get("sc_balloons", True) else "Off"),
             stats_place=s.get("sc_stats_at", "Inside, bottom right"),
-            crosshair=bool(s.get("sc_click") or s.get("sc_cross")),
+            crosshair=bool(s.get("sc_cross")),
             crosshair_width=float(s.get("sc_crossw", 1.0)),
             zero_width=float(s.get("sc_zw", 1.0)),
             bold_ticks=bool(s.get("sc_boldticks")),
@@ -28579,17 +28603,15 @@ def sc_panel():
             except Exception:
                 points = []
             if points:
-                p = points[-1]
-                curve = int(p.get("curve_number", 0))
-                if 0 <= curve < len(traces):
-                    t = traces[curve]
-                    s["_sc_zero_next"] = {
-                        t["slot"]: float(p["x"]) + t["zero"]}
-                    s["_sc_chart_ver"] = version + 1
-                    st.rerun()
-            st.caption("Move the crosshair to the moment you want and click: "
-                       "that point becomes x = 0 for its file (↶ Undo zero "
-                       "puts it back).")
+                zero_next = sc_zero_from_click(points[-1], traces)
+                s["_sc_chart_ver"] = version + 1
+                if zero_next:
+                    s["_sc_zero_next"] = zero_next
+                st.rerun()
+            st.caption("Point at the moment you want (a ▲ ▼ peak works "
+                       "too) and click: that point becomes x = 0 for its "
+                       "file. The crosshair snaps to the point a click will "
+                       "take. ↶ Undo zero puts the old zero back.")
         else:
             st.plotly_chart(fig, key=f"sc_chart_{view}", config=config,
                             theme=None, **(STRETCH if fit else {}))
