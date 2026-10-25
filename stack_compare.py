@@ -482,9 +482,15 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
         for (px, py, symbol, text) in marks:
             if not len(px):
                 continue
+            px = np.asarray(px, float)
             fig.add_trace(go.Scatter(
                 x=px, y=py, mode="markers", showlegend=False,
                 name=f"{t['label']} {text}",
+                # which file, and where on its own x: a click on a peak
+                # sets that file's zero there
+                customdata=np.column_stack([
+                    np.full(len(px), t.get("slot", 0)),
+                    px + float(t.get("zero", 0.0))]),
                 marker=dict(symbol=symbol, size=10, color=t["colour"],
                             line=dict(color="black", width=1)),
                 hovertemplate=f"{text}<br>x = %{{x:.6g}}<br>"
@@ -577,12 +583,16 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     if crosshair:
         # a crosshair that follows the cursor: lines across the whole
         # panel at its x and y, with the nearest point always found
+        # while clicks set the zero it snaps to the point a click takes
         spikes = dict(showspikes=True, spikemode="across",
-                      spikesnap="cursor", spikedash="solid",
+                      spikesnap="hovered data" if clickable else "cursor",
+                      spikedash="solid",
                       spikecolor="#444", spikethickness=float(crosshair_width))
         fig.update_xaxes(**spikes)
         fig.update_yaxes(**spikes)
-        fig.update_layout(hoverdistance=-1, spikedistance=-1)
+        # a long but finite reach: WebGL traces (big files) find no point
+        # at all when the reach is unlimited (-1), so a click did nothing
+        fig.update_layout(hoverdistance=2000, spikedistance=2000)
     for t in traces:
         t.pop("_panel", None)
     return fig
