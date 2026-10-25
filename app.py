@@ -9382,9 +9382,13 @@ def sphere_panel(path, details):
         st.session_state["sp_r_adj"] = float(pending)
     elif circle:
         st.session_state["sp_r_adj"] = round(float(circle[2]), 1)
+    r_max = sphere_radius_limit(path)
+    if st.session_state.get("sp_r_adj") is not None:
+        st.session_state["sp_r_adj"] = float(min(max(
+            float(st.session_state["sp_r_adj"]), 2.0), r_max))
     s1, s2, s3 = st.columns([2, 1.2, 1.2])
     with s1:
-        st.slider("Size (radius in px)", 2.0, 200.0, step=0.1,
+        st.slider("Size (radius in px)", 2.0, r_max, step=0.1,
                   key="sp_r_adj", on_change=sphere_resize,
                   disabled=circle is None,
                   help="Fine-tune the circle if it is a little too big or "
@@ -10281,15 +10285,36 @@ def stage_outline_controls(frame_no):
                   on_click=s.__setitem__, args=("vw_frame", start))
 
 
+def sphere_radius_limit(path=None):
+    """The largest radius the size slider offers: half the frame's shorter
+    side (a sphere cannot be bigger than the picture), at least 50 px,
+    and never less than the circle already marked."""
+    limit = 200.0
+    try:
+        info = motion_info(path or st.session_state.get("video_path"),
+                           video_signature())
+        limit = 0.5 * min(float(info["width"]), float(info["height"]))
+    except Exception:
+        pass
+    circle = sphere_circle()
+    if circle:
+        limit = max(limit, float(circle[2]) * 1.2)
+    return float(max(50.0, math.ceil(limit)))
+
+
 def stage_sphere_controls(path, frame_no):
     s = st.session_state
     ready = aa is not None and not AUTO_ERROR
     circle = sphere_circle()
+    r_max = sphere_radius_limit(path)
     pending = s.pop("_sp_r_next", None)
     if pending is not None:
         s["sp_r_adj"] = float(pending)
     elif circle:
         s["sp_r_adj"] = round(float(circle[2]), 1)
+    # a value outside the slider is an error in Streamlit: keep it inside
+    if s.get("sp_r_adj") is not None:
+        s["sp_r_adj"] = float(min(max(float(s["sp_r_adj"]), 2.0), r_max))
     if s.get("vs_sph") == SPH_MANUAL:
         step_name = ("a point on its edge (radius)"
                      if s.get("_sp_manual_next") == "edge" and circle
@@ -10302,7 +10327,7 @@ def stage_sphere_controls(path, frame_no):
                    "object whose centre is far from the click. Known "
                    "diameter (µm) ÷ fitted diameter (px) gives the spatial "
                    "calibration.")
-    st.slider("Radius (px)", 2.0, 200.0, step=0.1, key="sp_r_adj",
+    st.slider("Radius (px)", 2.0, r_max, step=0.1, key="sp_r_adj",
               on_change=sphere_resize, disabled=circle is None)
     c1, c2 = st.columns(2)
     if c1.button("🔎 Auto-detect", key="sp_find", disabled=not ready,
@@ -27557,9 +27582,11 @@ def ai_quick_line_controls(two):
         bool(s.get("ai_connect2")) or not two)
     s["ai_q_smooth"] = s.get("ai_smooth", "Off") != "Off"
     s["ai_q_replace"] = s.get("ai_smooth", "Off") == "Replace"
-    s["ai_qlw1"] = float(s.get("ai_lw1", 1.8))
-    s["ai_qlw2"] = float(s.get("ai_lw2", 1.8))
-    s["ai_qaxis"] = float(s.get("ai_axis_lw", 1.2))
+    # the quick sliders stop at 6 (and the axis one at 5); a width typed
+    # higher in the detailed panel must not push them out of range
+    s["ai_qlw1"] = min(6.0, max(0.5, float(s.get("ai_lw1", 1.8))))
+    s["ai_qlw2"] = min(6.0, max(0.5, float(s.get("ai_lw2", 1.8))))
+    s["ai_qaxis"] = min(5.0, max(0.5, float(s.get("ai_axis_lw", 1.2))))
 
     def cont():
         s["ai_connect1"] = s["ai_connect2"] = bool(s.get("ai_q_cont"))
