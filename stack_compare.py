@@ -359,8 +359,10 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
             x=x, y=y, mode="lines+markers" if clickable else "lines",
             name=t["label"],
             # invisible markers: only points can be clicked (selected),
-            # not a bare line
-            marker=dict(size=8, opacity=0, color=t["colour"]),
+            # not a bare line. Bigger than the ▲ ▼ on purpose: Plotly
+            # gives a click to the smaller of two markers under the
+            # cursor, so a click on a peak's mark reaches the mark
+            marker=dict(size=14, opacity=0, color=t["colour"]),
             selected=dict(marker=dict(opacity=0)),
             unselected=dict(marker=dict(opacity=0)),
             line=dict(color=t["colour"], width=line_width),
@@ -479,20 +481,27 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
         if not marks:
             continue
         r = row_of[1 if overlay else int(t.get("panel") or 1)]
-        for (px, py, symbol, text) in marks:
+        for mark in marks:
+            px, py, symbol, text = mark[:4]
+            flag = int(mark[4]) if len(mark) > 4 else 1
             if not len(px):
                 continue
             px = np.asarray(px, float)
             fig.add_trace(go.Scatter(
                 x=px, y=py, mode="markers", showlegend=False,
                 name=f"{t['label']} {text}",
-                # which file, and where on its own x: a click on a peak
-                # sets that file's zero there
+                # which file, where on its own x, and found (1) or added by
+                # hand (2): a click on a peak sets the zero there, or takes
+                # the peak out while peaks are being edited
                 customdata=np.column_stack([
                     np.full(len(px), t.get("slot", 0)),
-                    px + float(t.get("zero", 0.0))]),
-                marker=dict(symbol=symbol, size=10, color=t["colour"],
-                            line=dict(color="black", width=1)),
+                    px + float(t.get("zero", 0.0)),
+                    np.full(len(px), flag)]),
+                marker=(dict(symbol=symbol, size=10, color=t["colour"],
+                             line=dict(color="black", width=1))
+                        if flag == 1 else
+                        dict(symbol=symbol, size=12, color=t["colour"],
+                             line=dict(color=t["colour"], width=2.5))),
                 hovertemplate=f"{text}<br>x = %{{x:.6g}}<br>"
                               "y = %{y:.6g}<extra></extra>"),
                 row=r, col=1, secondary_y=any(t is u for u in right[r]))
@@ -709,8 +718,21 @@ def unit_of(name):
     return found.group(1).strip() if found else ""
 
 
+def _extreme_near(r, j, reach):
+    """The top of the peak (or bottom of the dip) a point ``j`` sits on:
+    the extreme of the stretch around it that stays on the same side of
+    the baseline, at most ``reach`` samples each way. (index, +1 or -1)."""
+    sign = 1.0 if r[j] >= 0 else -1.0
+    lo = hi = j
+    while lo > 0 and j - lo < reach and sign * r[lo - 1] > 0:
+        lo -= 1
+    while hi < r.size - 1 and hi - j < reach and sign * r[hi + 1] > 0:
+        hi += 1
+    return lo + int(np.argmax(sign * r[lo:hi + 1])), sign
+
+
 def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
-                  factor=1.0, unit="", x_unit=""):
+                  factor=1.0, unit="", x_unit="", removed=(), added=()):
     """
     Peaks above and dips below a baseline.
 
@@ -720,7 +742,14 @@ def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
     Amplitudes are measured from the baseline and reported × ``factor`` in
     ``unit`` (e.g. a deflection in µm × k → force in nN).
 
-    Returns {"up": indices, "down": indices, "stats": [(label, value)]}.
+    Edited by hand: ``removed`` are x positions of found peaks to leave
+    out (the nearest found one goes); ``added`` are x positions clicked
+    on, each counted at the top of the peak (or the bottom of the dip) it
+    sits on, whatever its height.
+
+    Returns {"up": indices, "down": indices, "added": indices added by
+    hand, "n_removed": how many found ones were left out,
+    "stats": [(label, value)]}.
     """
     from scipy.signal import find_peaks
 
@@ -728,7 +757,8 @@ def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
     y = np.asarray(y, float)
     base = np.asarray(base, float)
     ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(base)
-    out = {"up": np.array([], int), "down": np.array([], int), "stats": []}
+    out = {"up": np.array([], int), "down": np.array([], int),
+           "added": np.array([], int), "n_removed": 0, "stats": []}
     if ok.sum() < 3:
         return out
     idx = np.flatnonzero(ok)
@@ -743,8 +773,33 @@ def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
         kw["distance"] = distance
     up = find_peaks(r, **kw)[0] if direction in ("both", "up") else []
     down = find_peaks(-r, **kw)[0] if direction in ("both", "down") else []
+    up, down = [int(v) for v in up], [int(v) for v in down]
+    # by hand: found ones left out, then clicked ones put in
+    tol = max(5.0 * abs(dx), 0.5 * float(min_sep or 0.0))
+    n_removed = 0
+    for value in removed or ():
+        found = [(abs(xs[k] - float(value)), k, side)
+                 for side in (up, down) for k in side]
+        if not found:
+            continue
+        gap, k, side = min(found, key=lambda f: f[0])
+        if gap <= tol:
+            side.remove(k)
+            n_removed += 1
+    hand = []
+    reach = max(10, xs.size // 20)
+    for value in added or ():
+        j = int(np.argmin(np.abs(xs - float(value))))
+        k, sign = _extreme_near(r, j, reach)
+        if k in up or k in down:
+            continue
+        (up if sign > 0 else down).append(k)
+        hand.append(k)
+    up, down = sorted(up), sorted(down)
     out["up"], out["down"] = idx[np.asarray(up, int)], idx[np.asarray(down,
                                                                        int)]
+    out["added"] = idx[np.asarray(hand, int)]
+    out["n_removed"] = n_removed
     u = f" {unit}" if unit else ""
     f = float(factor)
     level = float(np.nanmedian(base[ok])) * f
@@ -752,7 +807,7 @@ def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
              ("Threshold", f"± {height * f:.3g}{u}")]
     span = float(np.ptp(xs)) if xs.size > 1 else 0.0
     for name, picks, sign in (("up", up, 1.0), ("down", down, -1.0)):
-        if direction not in ("both", name):
+        if direction not in ("both", name) and not len(picks):
             continue
         picks = np.asarray(picks, int)
         amps = sign * r[picks] * f
