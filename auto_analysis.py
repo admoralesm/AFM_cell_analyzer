@@ -836,6 +836,28 @@ class AutoCellAnalysis:
             else:
                 merged.append(r)
 
+        vel = np.gradient(y, t) if n > 2 else np.zeros(n)
+        events = []
+        for i0, i1 in merged:
+            ip = i0 + int(np.argmin(d[i0:i1 + 1]))
+            if float(-d[ip]) < thr:
+                continue
+            events.append(AutoCellAnalysis._event_at(t, d, vel, ip))
+        for k, ev in enumerate(events):
+            ev["interval"] = (ev["t_peak"] - events[k - 1]["t_peak"]
+                              if k > 0 else float("nan"))
+        out["events"] = events
+        return out
+
+    @staticmethod
+    def _event_at(t, d, vel, ip) -> dict:
+        """One contraction with its bottom at sample ``ip`` of ``d`` (the
+        length minus its running baseline, in %): onset and end where it is
+        back within 10 %, the half-width, the fastest shortening and
+        relaxation (``vel``: the length's rate of change)."""
+        n = d.shape[0]
+        amp = float(-d[ip])
+
         def _cross(i_from, step, level):
             """Walk from i_from in direction step until d rises above
             `level`; return the interpolated time (or None at the end)."""
@@ -850,42 +872,186 @@ class AutoCellAnalysis:
                 i += step
             return None
 
-        vel = np.gradient(y, t) if n > 2 else np.zeros(n)
-        events = []
-        for i0, i1 in merged:
-            ip = i0 + int(np.argmin(d[i0:i1 + 1]))
-            amp = float(-d[ip])
-            if amp < thr:
+        t_on = _cross(ip, -1, -0.1 * amp)
+        t_off = _cross(ip, +1, -0.1 * amp)
+        t_h0 = _cross(ip, -1, -0.5 * amp)
+        t_h1 = _cross(ip, +1, -0.5 * amp)
+        partial = (t_on is None) or (t_off is None)
+        a_idx = int(np.searchsorted(t, t_on)) if t_on is not None else 0
+        b_idx = (int(np.searchsorted(t, t_off)) if t_off is not None
+                 else n - 1)
+        a_idx = int(np.clip(a_idx - 1, 0, ip))
+        b_idx = int(np.clip(b_idx, ip, n - 1))
+        return {
+            "index": int(ip), "t_peak": float(t[ip]), "amp_pct": amp,
+            "t_onset": t_on, "t_end": t_off,
+            "time_to_peak": (float(t[ip]) - t_on
+                             if t_on is not None else float("nan")),
+            "relax90": (t_off - float(t[ip])
+                        if t_off is not None else float("nan")),
+            "dur50": (t_h1 - t_h0 if (t_h0 is not None
+                                      and t_h1 is not None)
+                      else float("nan")),
+            "v_short_pct_s": float(np.min(vel[a_idx:ip + 1])),
+            "v_relax_pct_s": float(np.max(vel[ip:b_idx + 1])),
+            "partial": bool(partial),
+        }
+
+    # --------------------------- edited by hand ---------------------------
+
+    @staticmethod
+    def event_span(e, pad=None):
+        """(start, end) of a contraction in seconds: its shaded band, or a
+        short stretch around its bottom when an end was cut off."""
+        pad = 0.15 if pad is None else float(pad)
+        a = e.get("t_onset")
+        b = e.get("t_end")
+        a = float(e["t_peak"]) - pad if a is None else float(a)
+        b = float(e["t_peak"]) + pad if b is None else float(b)
+        return a, b
+
+    @staticmethod
+    def event_under(res, when):
+        """The contraction whose band holds the time ``when`` (s), or None;
+        the nearest bottom wins where bands touch."""
+        hits = []
+        for k, e in enumerate(res.get("events") or []):
+            a, b = AutoCellAnalysis.event_span(e)
+            if a <= float(when) <= b:
+                hits.append((abs(float(e["t_peak"]) - float(when)), k))
+        return min(hits)[1] if hits else None
+
+    @staticmethod
+    def dip_near(res, when, reach_s=None):
+        """
+        The bottom of the dip nearest a time clicked on (s): the lowest
+        point of length minus baseline within ``reach_s`` of it. Returns
+        (sample, depth in %) or (None, 0) where there is no dip at all.
+        """
+        t = np.asarray(res["t"], dtype=np.float64)
+        pct = np.asarray(res["length_pct"], dtype=np.float64)
+        base = np.asarray(res["baseline_pct"], dtype=np.float64)
+        valid = np.isfinite(pct) & np.isfinite(base)
+        if t.size < 3 or int(valid.sum()) < 3:
+            return None, 0.0
+        y = np.where(valid, pct, np.interp(t, t[valid], pct[valid]))
+        d = np.where(np.isfinite(base), y - base, np.nan)
+        reach = (float(reach_s) if reach_s is not None
+                 else max(0.3, 2.0 * float(Config.AUTO_EVENT_MERGE_S)))
+        near = (np.abs(t - float(when)) <= reach) & np.isfinite(d)
+        if not near.any():
+            return None, 0.0
+        idx = np.flatnonzero(near)
+        ip = int(idx[int(np.argmin(d[idx]))])
+        depth = float(-d[ip])
+        return (ip, depth) if depth > 0 else (None, depth)
+
+    @staticmethod
+    def edit_events(res, removed=(), added=()):
+        """
+        The result with contractions taken out or put in by hand.
+
+        ``removed``: the bottom times (s) of found contractions to drop.
+        ``added``: times clicked on (s); each becomes a contraction at the
+        bottom of the dip nearest it, measured exactly as a found one is
+        (marked ``manual``). Every count, mean, rate and file made from
+        the result then follows the edited list. Returns (result, notes),
+        notes saying what could not be added.
+        """
+        A = AutoCellAnalysis
+        removed = [float(v) for v in (removed or ())]
+        added = [float(v) for v in (added or ())]
+        if not removed and not added:
+            return res, []
+        t = np.asarray(res["t"], dtype=np.float64)
+        n = t.shape[0]
+        dt = float(np.median(np.diff(t))) if n > 1 else 1.0
+        dt = dt if dt > 1e-9 else 1.0
+        keep = []
+        for e in res.get("events") or []:
+            gone = any(abs(float(e["t_peak"]) - v) <= 0.51 * dt
+                       for v in removed)
+            if not gone:
+                keep.append(dict(e))
+        notes = []
+        if added:
+            pct = np.asarray(res["length_pct"], dtype=np.float64)
+            base = np.asarray(res["baseline_pct"], dtype=np.float64)
+            valid = np.isfinite(pct)
+            y = (np.where(valid, pct, np.interp(t, t[valid], pct[valid]))
+                 if valid.sum() >= 2 else pct)
+            d = y - base
+            vel = np.gradient(y, t) if n > 2 else np.zeros(n)
+            taken = {int(e["index"]) for e in keep}
+            for when in added:
+                ip, depth = A.dip_near(res, when)
+                if ip is None:
+                    notes.append(f"{when:.2f} s: the length is not below "
+                                 f"its baseline there, so there is no "
+                                 f"contraction to add")
+                    continue
+                if ip in taken:
+                    continue
+                e = A._event_at(t, d, vel, ip)
+                e["manual"] = True
+                e["t_click"] = float(when)
+                # how far each end moved, as for a found contraction
+                for end, key in (("end_a_px", "end_a_move_px"),
+                                 ("end_b_px", "end_b_move_px")):
+                    if res.get(end) is None:
+                        continue
+                    v = np.asarray(res[end], dtype=np.float64)
+                    f = np.where(np.isfinite(v), v, 0.0)
+                    b = A._rolling_median(
+                        f, float(Config.AUTO_EVENT_BASELINE_S) / dt)
+                    e[key] = float(f[ip] - b[ip])
+                keep.append(e)
+                taken.add(ip)
+        keep.sort(key=lambda e: float(e["t_peak"]))
+        # intervals again, left empty across a stretch the cell was hidden
+        okf = np.isfinite(np.asarray(res["length_pct"], dtype=np.float64))
+        dts = np.diff(t, prepend=t[0])
+        gap_lim = 0.5 * float(Config.AUTO_EVENT_BASELINE_S)
+        for k, e in enumerate(keep):
+            if k == 0:
+                e["interval"] = float("nan")
                 continue
-            t_on = _cross(ip, -1, -0.1 * amp)
-            t_off = _cross(ip, +1, -0.1 * amp)
-            t_h0 = _cross(ip, -1, -0.5 * amp)
-            t_h1 = _cross(ip, +1, -0.5 * amp)
-            partial = (t_on is None) or (t_off is None)
-            a_idx = int(np.searchsorted(t, t_on)) if t_on is not None else 0
-            b_idx = (int(np.searchsorted(t, t_off)) if t_off is not None
-                     else n - 1)
-            a_idx = int(np.clip(a_idx - 1, 0, ip))
-            b_idx = int(np.clip(b_idx, ip, n - 1))
-            events.append({
-                "index": ip, "t_peak": float(t[ip]), "amp_pct": amp,
-                "t_onset": t_on, "t_end": t_off,
-                "time_to_peak": (float(t[ip]) - t_on
-                                 if t_on is not None else float("nan")),
-                "relax90": (t_off - float(t[ip])
-                            if t_off is not None else float("nan")),
-                "dur50": (t_h1 - t_h0 if (t_h0 is not None
-                                          and t_h1 is not None)
-                          else float("nan")),
-                "v_short_pct_s": float(np.min(vel[a_idx:ip + 1])),
-                "v_relax_pct_s": float(np.max(vel[ip:b_idx + 1])),
-                "partial": bool(partial),
-            })
-        for k, ev in enumerate(events):
-            ev["interval"] = (ev["t_peak"] - events[k - 1]["t_peak"]
-                              if k > 0 else float("nan"))
-        out["events"] = events
-        return out
+            i_a, i_b = int(keep[k - 1]["index"]), int(e["index"])
+            hidden = float(dts[i_a:i_b + 1][~okf[i_a:i_b + 1]].sum())
+            e["interval"] = (float(e["t_peak"] - keep[k - 1]["t_peak"])
+                             if hidden <= gap_lim else float("nan"))
+        out = dict(res)
+        out["events"] = keep
+        out["n_events"] = len(keep)
+        amps = np.array([e["amp_pct"] for e in keep], dtype=float)
+        ivals = np.array([e["interval"] for e in keep[1:]], dtype=float)
+        ivals = ivals[np.isfinite(ivals)]
+        measured = float(res.get("measured_s") or 0.0)
+        out["rate_per_min"] = (60.0 * len(keep) / measured if measured > 0
+                               else float("nan"))
+        out["amp_mean_pct"] = float(amps.mean()) if amps.size else float("nan")
+        out["amp_sd_pct"] = (float(amps.std(ddof=1)) if amps.size > 1
+                             else float("nan"))
+        out["amp_max_pct"] = float(amps.max()) if amps.size else float("nan")
+        out["interval_mean_s"] = (float(ivals.mean()) if ivals.size
+                                  else float("nan"))
+        out["interval_sd_s"] = (float(ivals.std(ddof=1)) if ivals.size > 1
+                                else float("nan"))
+        out["n_removed"] = sum(1 for e in res.get("events") or []
+                               if any(abs(float(e["t_peak"]) - v) <= 0.51 * dt
+                                      for v in removed))
+        out["n_added"] = sum(1 for e in keep if e.get("manual"))
+        frames = np.asarray(res["frames"])
+        if keep:
+            big = max(keep, key=lambda e: e["amp_pct"])
+            frame = int(frames[int(big["index"])])
+            if frame != res.get("peak_frame"):
+                out["peak_frame"] = frame
+                out["peak_u8"] = None   # the caller reads the new picture
+        else:
+            out["peak_frame"] = None
+            out["peak_u8"] = None
+        return out, notes
 
     # ------------------------------ main ------------------------------
 
