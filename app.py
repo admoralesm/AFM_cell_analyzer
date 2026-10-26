@@ -10872,10 +10872,15 @@ def video_axis_ranges(slug, send=None):
     return xr, yr
 
 
-def video_chart(fig, key=None, stem=None, **_ignored):
+def video_chart(fig, key=None, stem=None, on_pick=None, **_ignored):
     """Show a video-tab plot, in publication style when that is on, with
-    the camera icon set to save it under the video's own name."""
+    the camera icon set to save it under the video's own name.
+
+    ``on_pick(t)``: while ✎ Edit contractions is on, a click on the plot
+    hands it the time clicked (recorded seconds) instead of setting t = 0.
+    """
     s = st.session_state
+    editing = on_pick is not None and bool(s.get("au_edit"))
     pub = bool(s.get("vp_on"))
     line_w = float(s.get("vp_line", 2.0) or 2.0)
     axis_w = float(s.get("vp_axis", 1.0) or 1.0)
@@ -10904,7 +10909,8 @@ def video_chart(fig, key=None, stem=None, **_ignored):
                                          or "plot"))
     send_frame = video_chart_table(fig, y_title)
     zero = video_time_zero(fig)
-    clicking = s.get("vq_zmode") == "Click a point on a plot"
+    clicking = (s.get("vq_zmode") == "Click a point on a plot"
+                or editing)
     if zero:
         for trace in fig.data:
             if getattr(trace, "x", None) is not None:
@@ -10988,11 +10994,20 @@ def video_chart(fig, key=None, stem=None, **_ignored):
         except Exception:
             points = []
         if points:
-            s["_vq_zero_next"] = float(points[-1]["x"]) + zero
+            when = float(points[-1]["x"]) + zero
             s["_vq_click_ver"] = version + 1
+            if editing:
+                on_pick(when)
+            else:
+                s["_vq_zero_next"] = when
             rerun_keeping_settings()
-        st.caption("Click a point on the line: that moment becomes t = 0 "
-                   "on every plot.")
+        if editing:
+            st.caption("✎ Click inside a pink band to take that contraction "
+                       "out; click on a dip with no band (or a grey one) to "
+                       "add it. Green bands are the ones added by hand.")
+        else:
+            st.caption("Click a point on the line: that moment becomes "
+                       "t = 0 on every plot.")
     else:
         st.plotly_chart(fig, key=key, config=config, **STRETCH)
 
@@ -11471,19 +11486,29 @@ def auto_overlay(res, row=None, picture=None):
     return cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
 
-def auto_trace_figure(t, series, y_title, events=None, zero=False):
-    """One or more traces over time, contractions shaded."""
+def auto_trace_figure(t, series, y_title, events=None, zero=False,
+                      removed=()):
+    """One or more traces over time, contractions shaded: pink as found,
+    green where added by hand, a faint grey where taken out by hand."""
     figure = go.Figure()
     for values, name, colour, dash in series:
         figure.add_trace(go.Scatter(
             x=t, y=values, mode="lines", name=name,
             line=dict(color=colour, width=2 if dash is None else 1.5,
                       dash=dash)))
+    for e in (removed or []):
+        a, b = aa.AutoCellAnalysis.event_span(e)
+        figure.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.07,
+                         line=dict(color="#888888", width=1, dash="dot"))
     for e in (events or []):
         a, b = e.get("t_onset"), e.get("t_end")
+        if e.get("manual"):
+            a, b = aa.AutoCellAnalysis.event_span(e)
         if a is not None and b is not None:
-            figure.add_vrect(x0=a, x1=b, fillcolor="#E6194B", opacity=0.08,
-                             line_width=0)
+            figure.add_vrect(x0=a, x1=b, opacity=0.12 if e.get("manual")
+                             else 0.08, line_width=0,
+                             fillcolor="#3CB44B" if e.get("manual")
+                             else "#E6194B")
     if zero:
         figure.add_hline(y=0, line=dict(color="#999", width=1))
     figure.update_layout(
@@ -11530,6 +11555,7 @@ def auto_events_table(res, sp):
                 sp["ev_sl_rest"][j] - sp["ev_sl_min"][j], 4),
             "sarcomere_shortening_pct": round(sp["ev_sl_short"][j], 3),
             "cut_off_by_range": bool(e["partial"]),
+            "added_by_hand": bool(e.get("manual")),
         })
     return pd.DataFrame(rows)
 
@@ -11546,9 +11572,110 @@ def auto_files(res, base):
     return out
 
 
+def auto_edit_sig(res):
+    """Which analysis hand edits belong to: a new run starts clean."""
+    return repr((res.get("video_path"), int(res["start_frame"]),
+                 int(res["end_frame"]), int(res["n_frames"])))
+
+
+def auto_edits(res):
+    """(taken out, added) for this result: bottom times and click times."""
+    box = st.session_state.get("au_ev_edits") or {}
+    if box.get("sig") != auto_edit_sig(res):
+        return [], []
+    return list(box.get("removed") or []), list(box.get("added") or [])
+
+
+def auto_store_edits(res, removed, added):
+    s = st.session_state
+    history = list(s.get("_au_ev_hist") or [])
+    history.append((auto_edit_sig(res),) + auto_edits(res))
+    s["_au_ev_hist"] = history[-40:]
+    s["au_ev_edits"] = {"sig": auto_edit_sig(res), "removed": removed,
+                        "added": added}
+
+
+def auto_pick(res):
+    """What a click at time ``when`` does to the contractions shown in
+    ``res`` (already edited): inside a band it takes that one out, on a
+    bare dip it adds one."""
+    def pick(when):
+        removed, added = auto_edits(res)
+        k = aa.AutoCellAnalysis.event_under(res, when)
+        if k is not None:
+            e = res["events"][k]
+            if e.get("manual"):
+                added = [v for v in added
+                         if abs(v - float(e.get("t_click", np.nan))) > 1e-9]
+            else:
+                removed.append(float(e["t_peak"]))
+        else:
+            added.append(float(when))
+        auto_store_edits(res, removed, added)
+    return pick
+
+
+def auto_undo_edit(sig):
+    s = st.session_state
+    history = list(s.get("_au_ev_hist") or [])
+    while history:
+        old_sig, removed, added = history.pop()
+        if old_sig == sig:
+            s["au_ev_edits"] = {"sig": sig, "removed": removed,
+                                "added": added}
+            break
+    s["_au_ev_hist"] = history
+
+
+def auto_reset_edits(res):
+    auto_store_edits(res, [], [])
+
+
+def auto_edit_row(found, res, notes):
+    """The ✎ switch, undo, back to what was found, and what has changed."""
+    s = st.session_state
+    sig = auto_edit_sig(found)
+    removed, added = auto_edits(found)
+    e1, e2, e3, e4 = st.columns([1.5, 0.8, 1.0, 2.2])
+    e1.toggle("✎ Edit contractions", key="au_edit",
+              help="When the detection missed a contraction or counted "
+                   "noise: with this on, a click inside a pink band takes "
+                   "that contraction out, and a click on a dip with no "
+                   "band adds one at its bottom, measured exactly like the "
+                   "others. Every number, table, balloon and file follows.")
+    e2.button("↶ Undo", key="au_ev_undo", on_click=auto_undo_edit,
+              args=(sig,), **STRETCH,
+              disabled=not any(h[0] == sig
+                               for h in s.get("_au_ev_hist") or ()))
+    e3.button("↺ As found", key="au_ev_reset", on_click=auto_reset_edits,
+              args=(found,), disabled=not (removed or added), **STRETCH,
+              help="Back to the contractions the detection found.")
+    n_out = int(res.get("n_removed", 0) or 0)
+    n_in = int(res.get("n_added", 0) or 0)
+    e4.caption(f"Found {found['n_events']}; {n_out} taken out and {n_in} "
+               f"added by hand, so {res['n_events']} counted."
+               if (n_out or n_in) else
+               f"{found['n_events']} found by the detection, none edited.")
+    for note in notes:
+        st.caption(f"⚠️ {note}")
+
+
 def auto_results_panel(res):
     """What the automatic analysis found, and the files to take away."""
     A = aa.AutoCellAnalysis
+    # contractions taken out or added by hand: everything below, from the
+    # numbers to the files, uses the edited list
+    found = res
+    res, edit_notes = A.edit_events(found, *auto_edits(found))
+    gone = [e for e in found["events"]
+            if not any(abs(e["t_peak"] - f["t_peak"]) < 1e-9
+                       for f in res["events"])]
+    if res is not found and res.get("peak_u8") is None \
+            and res.get("peak_frame") is not None:
+        shot = motion_frame(res["video_path"], video_signature(),
+                            int(res["peak_frame"]))
+        if shot is not None:
+            res["peak_u8"] = ct.cv2.cvtColor(shot, ct.cv2.COLOR_BGR2GRAY)
     um = res.get("um_per_px")
     unit = "µm" if um is not None else "px"
     k = um if um is not None else 1.0
@@ -11558,6 +11685,10 @@ def auto_results_panel(res):
     lines = A.summary_lines(res)
     if lines and lines[0].startswith("File:"):
         lines[0] = f"File: {st.session_state.get('video_name') or lines[0][6:]}"
+    if res is not found:
+        lines.append(f"Edited by hand: {res.get('n_removed', 0)} of the "
+                     f"{found['n_events']} contractions found taken out, "
+                     f"{res.get('n_added', 0)} added.")
     verdict_kind = {"probe_over_cell": st.success,
                     "probe_on_cell": st.info}.get(res["verdict_code"],
                                                   st.info)
@@ -11626,13 +11757,16 @@ def auto_results_panel(res):
     st.session_state["_chart_stats"] = auto_summary_stats(res, sp, unit, k)
     t = sp["t"]
     events = res["events"]
+    auto_edit_row(found, res, edit_notes)
+    pick = auto_pick(res)
     view = st.radio("What to draw", AUTO_VIEWS, horizontal=True,
                     key="au_view", label_visibility="collapsed")
     if view == "Length change":
         video_chart(auto_trace_figure(
             t, [(res["length_pct"], "length change", "#4363D8", None),
                 (res["baseline_pct"], "running baseline", "#999999", "dot")],
-            "Cell length change (%)", events), **STRETCH)
+            "Cell length change (%)", events, removed=gone),
+            on_pick=pick, **STRETCH)
         st.caption(
             f"Each end of the cell is followed on its own and the length "
             f"change is how far the two moved towards each other. A "
@@ -11646,7 +11780,8 @@ def auto_results_panel(res):
             t, [(sp["rate_u"], "length", "#4363D8", None),
                 (sp["end_a_speed"], f"{na} end", "#E6194B", "dot"),
                 (sp["end_b_speed"], f"{nb} end", "#3CB44B", "dot")],
-            f"Rate of change ({unit}/s)", events, zero=True), **STRETCH)
+            f"Rate of change ({unit}/s)", events, zero=True,
+            removed=gone), on_pick=pick, **STRETCH)
         st.caption("Below zero the cell is shortening, above zero it is "
                    "lengthening again. Frames where the length could not "
                    "be measured stay empty: the derivative is never taken "
@@ -11656,7 +11791,8 @@ def auto_results_panel(res):
             video_chart(auto_trace_figure(
                 t, [(sp["sl_u"], "sarcomere length", "#911EB4", None),
                     (sp["sl_base"], "running baseline", "#999999", "dot")],
-                f"Sarcomere length ({unit})", events), **STRETCH)
+                f"Sarcomere length ({unit})", events, removed=gone),
+                on_pick=pick, **STRETCH)
             if um is None:
                 st.caption("No scale: the period is in pixels. Set the probe "
                            "tip diameter or a µm-per-pixel scale for µm.")
@@ -11669,7 +11805,8 @@ def auto_results_panel(res):
                 (sp["probe_u"], "probe movement", "#4363D8", "dot"),
                 (100.0 * np.asarray(res["overlap"]), "cell covered (%)",
                  "#E6194B", "dash")],
-            f"{unit} (covered: %)", events, zero=True), **STRETCH)
+            f"{unit} (covered: %)", events, zero=True,
+            removed=gone), on_pick=pick, **STRETCH)
         if res.get("probe") is None:
             st.caption("No probe was found in the picture.")
 
@@ -28057,6 +28194,32 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
 DEFLECTION_UNITS = {"nm": 1.0, "µm": 1e3, "m": 1e9}
 
 
+def sc_peak_edit(i, raw, flag):
+    """
+    One click's change to file ``i``'s peaks, undoable: ``flag`` 1 is a
+    found peak (taken out), 2 one added by hand (taken out again), 0 a
+    point on the line (the peak or dip it sits on is added). ``raw`` is
+    the file's own x. ``flag`` None drops every hand edit.
+    """
+    s = st.session_state
+    removed = list(s.get(f"sc_pkrm{i}") or [])
+    added = list(s.get(f"sc_pkadd{i}") or [])
+    history = list(s.get("_sc_zero_hist") or [])
+    history.append(("peaks", i, list(removed), list(added)))
+    s["_sc_zero_hist"] = history[-40:]
+    if flag is None:
+        removed, added = [], []
+    elif int(flag) == 2 and added:
+        # the click that added it was near the top it was counted at
+        added.pop(int(np.argmin([abs(v - raw) for v in added])))
+    elif int(flag) == 1:
+        removed.append(float(raw))
+    else:
+        added.append(float(raw))
+    s[f"sc_pkrm{i}"] = removed
+    s[f"sc_pkadd{i}"] = added
+
+
 def sc_peak_controls(i, y_all):
     """The ⛰ Peaks popover of one file: peak analysis against the
     baseline, and the units its statistics are given in."""
@@ -28098,6 +28261,12 @@ def sc_peak_controls(i, y_all):
                            key=f"sc_pkk{i}", format="%.4g")
             d.selectbox("Deflection plotted in", list(DEFLECTION_UNITS),
                         key=f"sc_pkdu{i}")
+        edited = bool(s.get(f"sc_pkrm{i}") or s.get(f"sc_pkadd{i}"))
+        st.button("↺ Peaks as found (drop the hand edits)",
+                  key=f"sc_pkreset{i}", disabled=not edited,
+                  on_click=sc_peak_edit, args=(i, None, None), **STRETCH,
+                  help="Peaks are taken out or added by clicking them on "
+                       "the plot with ✎ Edit peaks chosen above it.")
     if s.get(f"sc_pku{i}") == "Force (nN)":
         factor = float(s.get(f"sc_pkk{i}", 0.1)) * DEFLECTION_UNITS.get(
             s.get(f"sc_pkdu{i}", "µm"), 1.0)
@@ -28181,8 +28350,8 @@ def sc_slot(i, n=3):
         help="Where this file's x = 0 is: the first point, a value you "
              "type, the peak, the lowest point, a level crossing, or the "
              "contact point (where the signal leaves the baseline set "
-             "under 〰 Baseline). With **🎯 Click to set zero** on, a "
-             "click on the plot sets it too.")
+             "under 〰 Baseline). With **🎯 Set zero** chosen above the "
+             "plot, a click on the plot sets it too.")
     if mode == "A value I type":
         z2.number_input("at x =", key=f"sc_zval{i}", format="%.6g",
                         value=float(s.get(f"sc_zval{i}", 0.0) or 0.0)
@@ -28280,14 +28449,24 @@ def sc_slot(i, n=3):
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
     peak_marks = peak_stats = threshold_lines = None
     if peaks["on"] and fit_y is not None and len(x):
+        # peaks taken out or added by clicks are kept on the file's own x,
+        # so they stay put when its zero moves
         found = sc.peak_analysis(
             x, y, fit_y, peaks["height"], peaks["direction"], peaks["sep"],
             factor=peaks["factor"], unit=peaks["unit"],
-            x_unit=sc.unit_of(str(xcol)) if not xf or xf == 1.0 else "")
-        peak_marks = [(x[found["up"]], y[found["up"]], "triangle-up",
-                       "peak"),
-                      (x[found["down"]], y[found["down"]], "triangle-down",
-                       "dip")]
+            x_unit=sc.unit_of(str(xcol)) if not xf or xf == 1.0 else "",
+            removed=[v - zero for v in s.get(f"sc_pkrm{i}") or ()],
+            added=[v - zero for v in s.get(f"sc_pkadd{i}") or ()])
+        hand = set(int(v) for v in found["added"])
+        peak_marks = []
+        for side, symbol, text in (("up", "triangle-up", "peak"),
+                                   ("down", "triangle-down", "dip")):
+            picks = np.asarray(found[side], int)
+            mine = np.array([k in hand for k in picks], bool)
+            peak_marks.append((x[picks[~mine]], y[picks[~mine]], symbol,
+                               text, 1))
+            peak_marks.append((x[picks[mine]], y[picks[mine]],
+                               symbol + "-open", f"{text}, added by hand", 2))
         peak_stats = found["stats"]
         order = np.argsort(x)
         threshold_lines = []
@@ -28295,8 +28474,12 @@ def sc_slot(i, n=3):
             threshold_lines.append(fit_y[order] + peaks["height"])
         if peaks["direction"] in ("both", "down"):
             threshold_lines.append(fit_y[order] - peaks["height"])
+        edits = ""
+        if found["n_removed"] or len(hand):
+            edits = (f" · by hand: {found['n_removed']} taken out, "
+                     f"{len(hand)} added (hollow)")
         st.caption(f"⛰ {len(found['up'])} peaks up, {len(found['down'])} "
-                   "down counted (▲ ▼ on the plot)")
+                   "down counted (▲ ▼ on the plot)" + edits)
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
             "stats": (sent or {}).get("stats") if sent is not None else None,
             "baseline_line": baseline_line,
@@ -28331,6 +28514,8 @@ def sc_y_titles():
                 str(value).strip()
     return out
 
+
+SC_CLICKS = ("🎯 Set zero", "✎ Edit peaks")
 
 SC_DEFAULTS = {
     "sc_n": 3, "sc_link": False, "sc_zline": True, "sc_height": 240,
@@ -28442,26 +28627,29 @@ def sc_save_controls(traces, stem):
                        key="sc_csv", **STRETCH)
 
 
-def sc_zero_from_click(point, traces):
-    """{slot: x on the file's own axis} for a clicked point, or None.
+def sc_click_target(point, traces):
+    """(slot, x on the file's own axis, kind) for a clicked point, or None.
+    kind: 0 the file's line, 1 a found ▲ ▼ peak, 2 one added by hand.
 
-    Every trace a click can land on (the file's line, its ▲ ▼ peaks)
-    carries [slot, own x] as customdata; the trace order is the fallback.
+    Every trace a click can land on carries [slot, own x(, kind)] as
+    customdata; the trace order is the fallback.
     """
     data = point.get("customdata")
-    if isinstance(data, dict):  # Streamlit sends the pair as {"0": .., "1": ..}
-        data = [data.get("0", data.get(0)), data.get("1", data.get(1))]
+    if isinstance(data, dict):  # Streamlit sends it as {"0": .., "1": ..}
+        data = [data.get(str(k), data.get(k)) for k in range(3)]
     try:
         if data is not None and len(data) >= 2 and None not in data[:2]:
             slot = int(round(float(data[0])))
+            kind = (int(round(float(data[2])))
+                    if len(data) > 2 and data[2] is not None else 0)
             if any(t["slot"] == slot for t in traces):
-                return {slot: float(data[1])}
+                return slot, float(data[1]), kind
     except (TypeError, ValueError):
         pass
     curve = int(point.get("curve_number", -1))
     if 0 <= curve < len(traces):
         t = traces[curve]
-        return {t["slot"]: float(point["x"]) + t["zero"]}
+        return t["slot"], float(point["x"]) + t["zero"], 0
     return None
 
 
@@ -28480,11 +28668,17 @@ def sc_panel():
     undo = s.pop("_sc_zero_undo", False)
     if undo and s.get("_sc_zero_hist"):
         history = list(s["_sc_zero_hist"])
-        i, mode, value, shift = history.pop()
+        last = history.pop()
         s["_sc_zero_hist"] = history
-        s[f"sc_zmode{i}"] = mode or "Start of the data"
-        s[f"sc_zval{i}"] = float(value or 0.0)
-        s[f"sc_shift{i}"] = float(shift or 0.0)
+        if last[0] == "peaks":
+            _, i, removed, added = last
+            s[f"sc_pkrm{i}"] = list(removed)
+            s[f"sc_pkadd{i}"] = list(added)
+        else:
+            i, mode, value, shift = last
+            s[f"sc_zmode{i}"] = mode or "Start of the data"
+            s[f"sc_zval{i}"] = float(value or 0.0)
+            s[f"sc_shift{i}"] = float(shift or 0.0)
     for key, value in SC_DEFAULTS.items():
         s.setdefault(key, value)
     # Options on the left, grouped in four tabs; the plot on the right, so
@@ -28519,7 +28713,8 @@ def sc_panel():
         sc_save_controls(traces, stem)
 
     with right:
-        k0, kc, k1, k2, k3, k4 = st.columns([1.05, 1.25, 1.5, 1.1, 1.4, 1])
+        k0, kc, k1, k2, k3, k4 = st.columns([1.0, 1.2, 2.1, 0.8, 1.3, 1])
+        click_do = s.get("sc_clickdo")
         k0.toggle("💬 Stats", key="sc_balloons",
                   value=None if "sc_balloons" in s else True,
                   help="Show or hide every summary balloon on the plot "
@@ -28528,14 +28723,18 @@ def sc_panel():
                   help="Lines across the plot at the cursor, to read a "
                        "value or aim a zero. Its thickness is under "
                        "📐 Axes.")
-        k1.toggle("🎯 Click to set zero", key="sc_click",
-                  help="Then a click on any point of a trace, or on a ▲ ▼ "
-                       "peak, makes that point x = 0 for that file.")
-        k2.button("↶ Undo zero", key="sc_undo_zero",
+        k1.segmented_control(
+            "What a click on the plot does", SC_CLICKS, key="sc_clickdo",
+            label_visibility="collapsed",
+            help="🎯 Set zero: the point clicked becomes x = 0 for its "
+                 "file. ✎ Edit peaks: a click on a ▲ ▼ takes that peak "
+                 "out, a click on the line adds the peak or dip it sits "
+                 "on. Click the chosen one again for neither.")
+        k2.button("↶ Undo", key="sc_undo_zero",
                   disabled=not s.get("_sc_zero_hist"),
                   on_click=s.__setitem__, args=("_sc_zero_undo", True),
-                  help="Puts back the zero a click replaced, one click at "
-                       "a time.", **STRETCH)
+                  help="Puts back what the last click changed (a zero or "
+                       "a peak), one click at a time.", **STRETCH)
         k3.radio("Drag to", ("zoom", "pan"), key="sc_drag",
                  horizontal=True, label_visibility="collapsed",
                  help="What dragging on the plot does. The mouse wheel "
@@ -28555,7 +28754,7 @@ def sc_panel():
             x_title=s.get("sc_xtitle") or "x",
             zero_line=bool(s.get("sc_zline")),
             grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
-            clickable=bool(s.get("sc_click")),
+            clickable=bool(s.get("sc_clickdo")),
             x_range=sc_global_x_range(),
             frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
             y_titles=sc_y_titles(),
@@ -28591,7 +28790,8 @@ def sc_panel():
                       "scale": int(s.get("sc_scale") or 3)}}
         fit = not s.get("sc_width")
         version = int(s.get("_sc_chart_ver", 0))
-        if s.get("sc_click"):
+        click_do = s.get("sc_clickdo")
+        if click_do:
             event = st.plotly_chart(
                 fig, key=f"sc_chart_v{version}_{view}", config=config,
                 theme=None,
@@ -28603,15 +28803,34 @@ def sc_panel():
             except Exception:
                 points = []
             if points:
-                zero_next = sc_zero_from_click(points[-1], traces)
+                hit = sc_click_target(points[-1], traces)
                 s["_sc_chart_ver"] = version + 1
-                if zero_next:
-                    s["_sc_zero_next"] = zero_next
+                if hit and click_do == SC_CLICKS[0]:
+                    s["_sc_zero_next"] = {hit[0]: hit[1]}
+                elif hit:
+                    slot, raw, kind = hit
+                    on = next((t for t in traces if t["slot"] == slot), None)
+                    if on is not None and on.get("peak_marks") is not None:
+                        sc_peak_edit(slot, raw, kind)
+                    else:
+                        s["_sc_click_note"] = (
+                            f"File {slot + 1} has no peak analysis: turn it "
+                            f"on under its ⛰ Peaks first.")
                 st.rerun()
-            st.caption("Point at the moment you want (a ▲ ▼ peak works "
-                       "too) and click: that point becomes x = 0 for its "
-                       "file. The crosshair snaps to the point a click will "
-                       "take. ↶ Undo zero puts the old zero back.")
+            note = s.pop("_sc_click_note", None)
+            if note:
+                st.warning(note, icon="⛰")
+            if click_do == SC_CLICKS[0]:
+                st.caption("Point at the moment you want (a ▲ ▼ peak works "
+                           "too) and click: that point becomes x = 0 for its "
+                           "file. The crosshair snaps to the point a click "
+                           "will take. ↶ Undo puts the old zero back.")
+            else:
+                st.caption("✎ Click a ▲ ▼ to take that peak out of the count "
+                           "and the statistics; click on the line to add the "
+                           "peak or dip it sits on (drawn hollow). ↶ Undo "
+                           "takes back one click; ⛰ Peaks › ↺ drops them "
+                           "all.")
         else:
             st.plotly_chart(fig, key=f"sc_chart_{view}", config=config,
                             theme=None, **(STRETCH if fit else {}))
