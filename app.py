@@ -560,6 +560,56 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     sc = None
     STACK_ERROR = str(exc)
 
+
+def _has_name(module, dotted):
+    obj = module
+    for part in dotted.split("."):
+        if not hasattr(obj, part):
+            return False
+        obj = getattr(obj, part)
+    return True
+
+
+def _current(module, *needed):
+    """
+    The companion module as its file is now.
+
+    After an update the server can go on running a copy of a companion file
+    it imported before the new file arrived: app.py is new, auto_analysis.py
+    in memory is old, and the page stops at the first new name it uses
+    (AttributeError: ... has no attribute 'edit_events'). So the module is
+    loaded again from its file when it lacks a name this app needs, or when
+    its file has changed since it was loaded.
+    """
+    if module is None:
+        return module
+    path = getattr(module, "__file__", None)
+    try:
+        stamp = os.path.getmtime(path) if path else None
+    except OSError:
+        stamp = None
+    seen = getattr(module, "_app_file_stamp", None)
+    stale = (any(not _has_name(module, n) for n in needed)
+             or (seen is not None and stamp is not None and stamp != seen))
+    if stale:
+        try:
+            module = importlib.reload(module)
+        except Exception:  # pragma: no cover - a broken file stays as it was
+            return module
+    try:
+        module._app_file_stamp = stamp
+    except Exception:  # pragma: no cover
+        pass
+    return module
+
+
+aa = _current(aa, "AutoCellAnalysis.edit_events",
+              "AutoCellAnalysis.event_under", "AutoCellAnalysis.event_span")
+sc = _current(sc, "_extreme_near", "peak_analysis")
+ct = _current(ct)
+va = _current(va)
+ai = _current(ai)
+
 # Clicking the markers straight onto the frame needs one small component.
 # Without it the tab still works, from typed coordinates and a preview with
 # a ruler on it, which is slower but takes no extra package.
@@ -10880,7 +10930,9 @@ def video_chart(fig, key=None, stem=None, on_pick=None, **_ignored):
     hands it the time clicked (recorded seconds) instead of setting t = 0.
     """
     s = st.session_state
-    editing = on_pick is not None and bool(s.get("au_edit"))
+    editing = (on_pick is not None and bool(s.get("au_edit"))
+               and aa is not None
+               and hasattr(aa.AutoCellAnalysis, "event_under"))
     pub = bool(s.get("vp_on"))
     line_w = float(s.get("vp_line", 2.0) or 2.0)
     axis_w = float(s.get("vp_axis", 1.0) or 1.0)
@@ -11638,6 +11690,7 @@ def auto_edit_row(found, res, notes):
     removed, added = auto_edits(found)
     e1, e2, e3, e4 = st.columns([1.5, 0.8, 1.0, 2.2])
     e1.toggle("✎ Edit contractions", key="au_edit",
+              disabled=not hasattr(aa.AutoCellAnalysis, "edit_events"),
               help="When the detection missed a contraction or counted "
                    "noise: with this on, a click inside a pink band takes "
                    "that contraction out, and a click on a dip with no "
@@ -11666,7 +11719,12 @@ def auto_results_panel(res):
     # contractions taken out or added by hand: everything below, from the
     # numbers to the files, uses the edited list
     found = res
-    res, edit_notes = A.edit_events(found, *auto_edits(found))
+    if hasattr(A, "edit_events"):
+        res, edit_notes = A.edit_events(found, *auto_edits(found))
+    else:
+        edit_notes = ["auto_analysis.py on the server is older than app.py, "
+                      "so contractions cannot be edited by hand. Upload the "
+                      "new auto_analysis.py and reboot the app."]
     gone = [e for e in found["events"]
             if not any(abs(e["t_peak"] - f["t_peak"]) < 1e-9
                        for f in res["events"])]
