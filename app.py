@@ -28830,6 +28830,64 @@ def sc_peak_controls(i, y_all):
             "factor": factor, "unit": unit}
 
 
+SC_SAT_SIDES = ("Highest values", "Lowest values")
+
+
+def sc_extend_controls(i):
+    """↦ Extend: carry the file on at a level past its ends, and carry a
+    saturated (flat) top on along its rise and fall. Returns the
+    settings."""
+    s = st.session_state
+    s.setdefault(f"sc_extdash{i}", "Dashed")
+    s.setdefault(f"sc_extlev{i}", 0.0)
+    s.setdefault(f"sc_sattol{i}", 1.0)
+    s.setdefault(f"sc_satband{i}", (50, 97))
+    if f"sc_satside{i}" not in s:
+        s[f"sc_satside{i}"] = SC_SAT_SIDES[1 if s.get(f"sc_neg{i}") else 0]
+    with st.popover("↦ Extend", **STRETCH):
+        st.caption("**Carry on at a level** past the data, to the plot's "
+                   "edge: to set a short recording beside longer ones.")
+        e1, e2 = st.columns(2)
+        e1.toggle("After the end", key=f"sc_extA{i}")
+        e2.toggle("Before the start", key=f"sc_extB{i}")
+        e3, e4 = st.columns(2)
+        e3.number_input("at y =", key=f"sc_extlev{i}", format="%.6g",
+                        help="0 is zero; with the baseline corrected it "
+                             "is the baseline.")
+        e4.selectbox("Line", list(sc.EXTEND_DASHES), key=f"sc_extdash{i}")
+        st.divider()
+        st.toggle("Saturated top: carry the rise and fall on", key=f"sc_sat{i}",
+                  help="Where the signal goes flat because the sensor "
+                       "saturated, dashed lines carry the rise into the flat "
+                       "part and the fall out of it on to where they meet: "
+                       "the curve went on, it did not level off.")
+        if s.get(f"sc_sat{i}"):
+            f1, f2 = st.columns(2)
+            f1.selectbox("Flat at the", SC_SAT_SIDES, key=f"sc_satside{i}",
+                         help="Lowest values for a signal saturated "
+                              "downwards (or drawn negative up).")
+            f2.number_input("Flat within (% of height)", 0.05, 20.0,
+                            step=0.25, key=f"sc_sattol{i}", format="%.3g",
+                            help="How close to the limit a point must be to "
+                                 "count as part of the flat top.")
+            st.slider("Part of the rise and fall used (% of height)", 5, 99,
+                      key=f"sc_satband{i}",
+                      help="The straight lines are fitted to the rise and "
+                           "fall between these heights (0 at the base, 100 "
+                           "at the flat top).")
+    band = s.get(f"sc_satband{i}") or (50, 97)
+    return {"carry": {"after": bool(s.get(f"sc_extA{i}")),
+                      "before": bool(s.get(f"sc_extB{i}")),
+                      "level": float(s.get(f"sc_extlev{i}") or 0.0),
+                      "dash": sc.EXTEND_DASHES.get(
+                          s.get(f"sc_extdash{i}"), "dash")},
+            "saturation": bool(s.get(f"sc_sat{i}")),
+            "side": "low" if s.get(f"sc_satside{i}") == SC_SAT_SIDES[1]
+            else "high",
+            "tolerance": float(s.get(f"sc_sattol{i}") or 1.0) / 100.0,
+            "band": (band[0] / 100.0, band[1] / 100.0)}
+
+
 def sc_slot_name(i):
     """What the file slot holds, for its heading."""
     s = st.session_state
@@ -28928,13 +28986,16 @@ def sc_slot(i, n=3):
     x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
     peaks_on = bool(s.get(f"sc_pk{i}"))
     baseline = sc_baseline_controls(i, x_all, mode, y_all, needed=peaks_on)
-    u1, u2, u3, u4 = st.columns([0.45, 1.05, 1.05, 1])
+    u1, u2, u3 = st.columns([0.45, 1.05, 1.05])
     u1.color_picker("Colour", key=f"sc_col{i}",
                     label_visibility="collapsed")
     with u2:
         x_range, y_range = sc_axis_ranges(i)
     with u3:
         peaks = sc_peak_controls(i, y_all)
+    u5, u4 = st.columns(2)
+    with u5:
+        extend = sc_extend_controls(i)
     with u4.popover("⋯ More", **STRETCH):
         m1, m2 = st.columns(2)
         m1.number_input("x ×", key=f"sc_xf{i}", value=None
@@ -28997,6 +29058,31 @@ def sc_slot(i, n=3):
             baseline_line = (x[order], fit_y[order])
             baseline_window = (baseline["x0"] - zero, baseline["x1"] - zero)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
+    sat_line = None
+    if extend["saturation"] and len(x) > 10:
+        order = np.argsort(x, kind="stable")
+        xs, ys = x[order], y[order]
+        top = sc.flat_top(xs, ys, extend["side"], extend["tolerance"])
+        sat_line = (sc.flat_top_continuation(xs, ys, top, extend["band"])
+                    if top is not None else None)
+        if top is None:
+            st.caption("⤴ No flat top found: raise “Flat within” or check "
+                       "“Flat at the” in ↦ Extend.")
+        elif sat_line is None:
+            st.caption(f"⤴ Flat from {xs[top['i0']]:.4g} to "
+                       f"{xs[top['i1']]:.4g} at {top['level']:.4g}, but "
+                       "there is no clean rise or fall beside it to carry "
+                       "on: widen the part used in ↦ Extend.")
+        elif sat_line["peak"] is not None:
+            st.caption(f"⤴ Flat (saturated) from {sat_line['flat'][0]:.4g} "
+                       f"to {sat_line['flat'][1]:.4g} at "
+                       f"{top['level']:.4g}; the rise and fall carried on "
+                       f"meet at {sat_line['peak'][1]:.4g} "
+                       f"(x = {sat_line['peak'][0]:.4g}).")
+        else:
+            st.caption(f"⤴ Flat (saturated) from {sat_line['flat'][0]:.4g} "
+                       f"to {sat_line['flat'][1]:.4g} at "
+                       f"{top['level']:.4g}; only one side to carry on.")
     peak_marks = peak_stats = threshold_lines = None
     if peaks["on"] and fit_y is not None and len(x):
         # peaks taken out or added by clicks are kept on the file's own x,
@@ -29043,7 +29129,8 @@ def sc_slot(i, n=3):
                 s.get(f"sc_neg{i}")), "slot": i, "file": file_name,
             "xcol": xcol, "panel": int(s.get(f"sc_panel{i}") or (i + 1)),
             "right": bool(s.get(f"sc_right{i}")), "x_range": x_range,
-            "y_range": y_range}
+            "y_range": y_range, "extend": extend["carry"],
+            "sat_line": sat_line}
 
 
 def sc_global_x_range():
