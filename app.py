@@ -560,6 +560,15 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     sc = None
     STACK_ERROR = str(exc)
 
+# The Single force curve tab: one force recording against time.
+try:
+    import force_curve as fcv
+
+    FORCE_CURVE_ERROR = ""
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    fcv = None
+    FORCE_CURVE_ERROR = str(exc)
+
 
 def _has_name(module, dotted):
     obj = module
@@ -606,6 +615,7 @@ def _current(module, *needed):
 aa = _current(aa, "AutoCellAnalysis.edit_events",
               "AutoCellAnalysis.event_under", "AutoCellAnalysis.event_span")
 sc = _current(sc, "_extreme_near", "peak_analysis")
+fcv = _current(fcv, "baseline_after", "curve_stats")
 ct = _current(ct)
 va = _current(va)
 ai = _current(ai)
@@ -10853,8 +10863,12 @@ def video_chart_table(fig, y_title):
     return pd.DataFrame(columns) if len(columns) > 1 else None
 
 
-def send_to_stack(name, frame, source="the video", stats=None):
-    """Put a table in the first free slot of the Stack & compare tab."""
+def send_to_stack(name, frame, source="the video", stats=None,
+                  zero_mode=None):
+    """Put a table in the first free slot of the Stack & compare tab.
+    ``zero_mode``: where that file's x = 0 starts out (one of the stack's
+    zero options), e.g. "As in the file" for time already counted from a
+    chosen moment."""
     s = st.session_state
     if frame is None:
         return
@@ -10872,6 +10886,8 @@ def send_to_stack(name, frame, source="the video", stats=None):
     s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy(),
                            "source": source,
                            "stats": list(stats or [])}
+    if sc is not None and zero_mode in sc.ZERO_MODES:
+        s[f"sc_zmode{free}"] = zero_mode
     s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
     s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
                           "Open that tab to see it.")
@@ -22513,23 +22529,26 @@ SHOW_VIDEO_TAB = False
 SHOW_DATABASE_TAB = False
 
 # The order of the work: the video, the AFM output and comparing traces,
-# making the force-strain file, then the fitting (everything that belongs to it, as its own tabs
+# one force curve against time, making the force-strain file, then the
+# fitting (everything that belongs to it, as its own tabs
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_stack, tab_igor, tab_fitting, tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_force, tab_igor, tab_fitting,
+    tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
         "🔬 AFM output analysis",
         "📚 Stack & compare",
+        "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
         "🎥 Compression video",
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 5
+FITTING_TAB_NUMBER = 6
 
 with tab_fitting:
     (
@@ -22557,7 +22576,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((6, SHOW_VIDEO_TAB), (7, SHOW_DATABASE_TAB))
+    index for index, wanted in ((7, SHOW_VIDEO_TAB), (8, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -26434,6 +26453,479 @@ def igor_result_panel():
     note = st.session_state.pop("_vq_sent_note", None)
     if note:
         st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
+
+
+# ==================================================== single force curve ==
+
+FC_ZEROS = ("As recorded", "End of the curve", "Start of the curve")
+FC_UNITS = ("N", "nN", "pN", "m", "µm", "nm", "V", "as stored")
+FC_DIRECTIONS = {"Either way": "either", "Above only": "up",
+                 "Below only": "down"}
+FC_CLICKS = ("🎯 Set the end", "🎯 Set the start")
+FC_NO_TIME = "(none: use a sampling rate)"
+FC_DEFAULTS = {"fc_base": True, "fc_shape": "Flat", "fc_dir": "Either way",
+               "fc_ksd": 3.0, "fc_run": 5, "fc_findstart": False,
+               "fc_lw": 1.5, "fc_height": 420, "fc_zero": "As recorded",
+               "fc_frac": 15}
+
+
+@st.cache_data(max_entries=6, show_spinner=False)
+def fc_read(data, name):
+    return fcv.read_force_file(data, name)
+
+
+def fc_unit_guess(name, values):
+    """How a channel or column is stored, from its name and its numbers."""
+    unit = sc.unit_of(str(name)).replace("um", "µm") if sc else ""
+    if unit in FC_UNITS:
+        return unit
+    if fcv.is_force(name):
+        v = np.asarray(values, float)
+        v = v[np.isfinite(v)]
+        return "N" if v.size and np.nanmax(np.abs(v)) < 1e-6 else "nN"
+    if fcv.is_deflection(name):
+        return fcv.deflection_unit(values)
+    return "as stored"
+
+
+def fc_reset(sig):
+    """A new file: its own windows, end and signal choices."""
+    s = st.session_state
+    if s.get("_fc_sig") == sig:
+        return
+    for key in ("fc_win", "fc_win0", "fc_end_hand", "fc_start_hand",
+                "fc_ch", "fc_tcol", "fc_fcol", "fc_unit", "fc_xr",
+                "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate"):
+        s.pop(key, None)
+    s["_fc_sig"] = sig
+
+
+def fc_signal(item):
+    """(time in s, values, y title, name for files) from the file and the
+    choices above the plot, or None with the problem shown."""
+    s = st.session_state
+    c1, c2, c3, c4 = st.columns([1.3, 1.0, 1.0, 1.0])
+    if item["kind"] == "ibw":
+        names = list(item["channels"])
+        if s.get("fc_ch") not in names:
+            s["fc_ch"] = next((n for n in names if fcv.is_force(n)),
+                              next((n for n in names
+                                    if fcv.is_deflection(n)), names[0]))
+        ch = c1.selectbox("Signal", names, key="fc_ch",
+                          help="The file's own channels. Force is "
+                               "deflection × spring constant.")
+        values = np.asarray(item["channels"][ch], float)
+        n = values.size
+        if item.get("dt"):
+            t = item["t0"] + item["dt"] * np.arange(n)
+            time_note = (f"{1 / item['dt']:,.6g} Hz, from "
+                         f"{item['time_from']}")
+        else:
+            rate = c4.number_input(
+                "Sampling rate (Hz)", 0.001, 1e9, value=None
+                if "fc_rate" in s else 1000.0, key="fc_rate",
+                help="The file does not say how fast it was sampled.")
+            t = np.arange(n) / float(rate)
+            time_note = f"{rate:,.6g} Hz, as typed (the file does not say)"
+    else:
+        frame = item["frame"]
+        cols = list(frame.columns)
+        if s.get("fc_tcol") not in [FC_NO_TIME] + cols:
+            s["fc_tcol"] = fcv.guess_time(cols) or FC_NO_TIME
+        tcol = c1.selectbox("Time column", [FC_NO_TIME] + cols,
+                            key="fc_tcol")
+        rest = [c for c in cols if c != tcol] or cols
+        if s.get("fc_fcol") not in rest:
+            s["fc_fcol"] = fcv.guess_force(
+                cols, None if tcol == FC_NO_TIME else tcol) or rest[0]
+            if s["fc_fcol"] not in rest:
+                s["fc_fcol"] = rest[0]
+        ch = c2.selectbox("Force column", rest, key="fc_fcol")
+        values = pd.to_numeric(frame[ch], errors="coerce").to_numpy(float)
+        if tcol == FC_NO_TIME:
+            rate = c4.number_input("Sampling rate (Hz)", 0.001, 1e9,
+                                   value=None if "fc_rate" in s else 1000.0,
+                                   key="fc_rate")
+            t = np.arange(values.size) / float(rate)
+            time_note = f"{rate:,.6g} Hz, as typed"
+        else:
+            t = pd.to_numeric(frame[tcol], errors="coerce").to_numpy(float)
+            factor = {"ms": 1e-3, "min": 60.0, "µs": 1e-6}.get(
+                sc.unit_of(str(tcol)), 1.0)
+            t = t * factor
+            time_note = f"from the column {tcol}"
+    if s.get("fc_unit") not in FC_UNITS:
+        s["fc_unit"] = fc_unit_guess(ch, values)
+    target = c2 if item["kind"] == "ibw" else c3
+    unit = target.selectbox(
+        "Stored as", FC_UNITS, key="fc_unit",
+        help="What the numbers are: a force (N, nN, pN), a deflection "
+             "(m, µm, nm, or V with InvOLS), or something else to plot as "
+             "it is.")
+    try:
+        if unit in ("m", "µm", "nm", "V"):
+            spot = c3 if item["kind"] == "ibw" else c4
+            k_file = item.get("k")
+            if "fc_kspring" not in s:
+                s["fc_kspring"] = float(k_file or 0.05)
+            k = spot.number_input(
+                "k (N/m)", 0.00001, 1000.0, key="fc_kspring",
+                format="%.5g",
+                help=("From the file's note." if k_file else
+                      "The file does not say; type the spring constant."))
+            invols = None
+            if unit == "V":
+                if "fc_invols" not in s:
+                    s["fc_invols"] = float(item.get("invols") or 50.0)
+                invols = st.number_input("InvOLS (nm/V)", 0.001, 1e6,
+                                         key="fc_invols")
+            y = fcv.to_nanonewton(values, unit, k, invols)
+            ylab = "Force (nN)"
+        elif unit == "as stored":
+            y, ylab = values, str(ch)
+        else:
+            y, ylab = fcv.to_nanonewton(values, unit), "Force (nN)"
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
+    keep = np.isfinite(t) & np.isfinite(y)
+    if keep.sum() < 10:
+        st.error("Fewer than 10 points with both a time and a value.")
+        return None
+    order = np.argsort(t[keep], kind="stable")
+    t, y = t[keep][order], y[keep][order]
+    st.caption(f"{item['name']} · {t.size:,} points over "
+               f"{t[-1] - t[0]:.4g} s · time: {time_note}"
+               + (f" · k = {item['k']:g} N/m in the file"
+                  if item.get("k") else ""))
+    stem = re.sub(r"\.[^.]+$", "", str(item["name"]))
+    return t, y, ylab, stem
+
+
+def fc_baseline_controls(t):
+    """The 〰 baseline after the end (and, if wanted, before the start).
+    Returns the settings."""
+    s = st.session_state
+    lo, hi = float(t[0]), float(t[-1])
+    step = max((hi - lo) / 2000.0, 1e-9)
+    # another channel or time column can change the time span: the windows
+    # and the view start again from their defaults then
+    span = (round(lo, 9), round(hi, 9))
+    if s.get("_fc_span") != span:
+        for key in ("fc_win", "fc_win0", "fc_xr", "fc_end_hand",
+                    "fc_start_hand"):
+            s.pop(key, None)
+        s["_fc_span"] = span
+    with st.container(border=True):
+        b1, b2, b3, b4 = st.columns([1.5, 1.0, 1.1, 0.9])
+        on = b1.toggle("〰 Baseline after the end", key="fc_base",
+                       help="A baseline is fitted to the quiet stretch after "
+                            "the curve (the shaded window); the curve ends "
+                            "the last moment the force is away from it.")
+        b2.radio("Shape", ("Flat", "Sloped"), key="fc_shape",
+                 horizontal=True, label_visibility="collapsed",
+                 disabled=not on)
+        b3.toggle("Also find the start", key="fc_findstart", disabled=not on,
+                  help="A second baseline before the curve gives where it "
+                       "starts, so the duration and area too.")
+        with b4.popover("⚙ Detection", disabled=not on, **STRETCH):
+            st.selectbox("Counts as part of the curve", list(FC_DIRECTIONS),
+                         key="fc_dir",
+                         help="Above only: an adhesion dip at the end is not "
+                              "counted.")
+            st.number_input("Away from the baseline by (× its SD)", 1.0, 50.0,
+                            step=0.5, key="fc_ksd")
+            st.number_input("For at least (points in a row)", 1, 1000,
+                            key="fc_run")
+        if on:
+            if "fc_win" not in s:
+                s["fc_win"] = tuple(fcv.default_window(t, after=True))
+            st.slider("Baseline window after the end (s)", lo, hi,
+                      key="fc_win", step=step, format="%.4g",
+                      help="Drag both ends onto a flat stretch after the "
+                           "curve.")
+            if s.get("fc_findstart"):
+                if "fc_win0" not in s:
+                    s["fc_win0"] = tuple(fcv.default_window(t, after=False))
+                st.slider("Baseline window before the start (s)", lo, hi,
+                          key="fc_win0", step=step, format="%.4g")
+    return {"on": on, "order": 1 if s.get("fc_shape") == "Sloped" else 0,
+            "direction": FC_DIRECTIONS.get(s.get("fc_dir"), "either"),
+            "k": float(s.get("fc_ksd") or 3.0),
+            "run": int(s.get("fc_run") or 5),
+            "start": bool(on and s.get("fc_findstart"))}
+
+
+def fc_analyse(t, y, opts):
+    """(end info, start info): found, or set by a click."""
+    s = st.session_state
+    if not opts["on"]:
+        return None, None
+    end = fcv.baseline_after(t, y, s["fc_win"], opts["order"], opts["k"],
+                             opts["run"], opts["direction"])
+    end["by_hand"] = False
+    if s.get("fc_end_hand") is not None:
+        end["end"] = float(s["fc_end_hand"])
+        end["by_hand"] = True
+        if end["coeffs"] is not None:
+            end["level"] = float(np.polyval(end["coeffs"], end["end"]))
+    start = None
+    if opts["start"]:
+        start = fcv.baseline_before(t, y, s["fc_win0"], opts["order"],
+                                    opts["k"], opts["run"],
+                                    opts["direction"])
+        start["by_hand"] = False
+        if s.get("fc_start_hand") is not None:
+            start["start"] = float(s["fc_start_hand"])
+            start["by_hand"] = True
+    return end, start
+
+
+def fc_figure(t, y, ylab, end, start, segments, clickable):
+    s = st.session_state
+    colour, base_colour = "#1f77b4", "#F58231"
+    keep = sc.thin_index(y) if sc else np.arange(y.size)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=t[keep], y=y[keep], mode="lines+markers" if clickable else "lines",
+        name=ylab, line=dict(color=colour, width=float(s.get("fc_lw", 1.5))),
+        marker=dict(size=12, opacity=0) if clickable else None,
+        hovertemplate="%{x:.5g} s<br>%{y:.4g}<extra></extra>"))
+    for i in segments or ():
+        if 0 <= i < t.size:
+            fig.add_vline(x=float(t[i]), line=dict(color="#999", width=1,
+                                                   dash="dot"))
+    if end and end.get("coeffs") is not None:
+        a, b = end["window"]
+        fig.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.10,
+                      line_width=0)
+        from_t = end["end"] if end.get("end") is not None else a
+        xs = np.linspace(from_t, t[-1], 50)
+        fig.add_trace(go.Scatter(
+            x=xs, y=np.polyval(end["coeffs"], xs), mode="lines",
+            name="Baseline after the end", hoverinfo="skip",
+            line=dict(color=base_colour, width=3)))
+        if end.get("end") is not None:
+            fig.add_vline(x=end["end"], line=dict(color=base_colour,
+                                                  width=2, dash="dash"))
+            fig.add_annotation(
+                x=end["end"], y=1.0, yref="paper", yanchor="bottom",
+                yshift=3, showarrow=False, font=dict(color=base_colour, size=13),
+                text=f"<b>End {end['end']:.4g} s</b>"
+                     + (" (by hand)" if end.get("by_hand") else ""))
+    if start and start.get("coeffs") is not None:
+        a, b = start["window"]
+        fig.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.10,
+                      line_width=0)
+        to_t = start["start"] if start.get("start") is not None else b
+        xs = np.linspace(t[0], to_t, 50)
+        fig.add_trace(go.Scatter(
+            x=xs, y=np.polyval(start["coeffs"], xs), mode="lines",
+            name="Baseline before the start", hoverinfo="skip",
+            line=dict(color="#3CB44B", width=3)))
+        if start.get("start") is not None:
+            fig.add_vline(x=start["start"], line=dict(color="#3CB44B",
+                                                      width=2, dash="dash"))
+            fig.add_annotation(
+                x=start["start"], y=1.0, yref="paper", yanchor="bottom",
+                yshift=3, showarrow=False, font=dict(color="#3CB44B", size=13),
+                text=f"<b>Start {start['start']:.4g} s</b>"
+                     + (" (by hand)" if start.get("by_hand") else ""))
+            if end and end.get("end") is not None \
+                    and end["end"] > start["start"]:
+                mid = 0.5 * (start["start"] + end["end"])
+                fig.add_annotation(
+                    x=mid, y=0.93, yref="paper", showarrow=False,
+                    text=f"↔ {end['end'] - start['start']:.4g} s",
+                    font=dict(size=13))
+    xr = s.get("fc_xr")
+    fig.update_layout(
+        height=int(s.get("fc_height", 420)), template="plotly_white",
+        margin=dict(l=70, r=20, t=64, b=55), showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.09, x=0),
+        xaxis=dict(title="Time (s)", showline=True, linecolor="black",
+                   mirror=True, ticks="outside",
+                   range=list(xr) if xr else None),
+        yaxis=dict(title=ylab, showline=True, linecolor="black",
+                   mirror=True, ticks="outside"),
+        hovermode="closest", dragmode="zoom",
+        # a zoom survives other changes; moving "Time shown" resets it
+        uirevision=f"fc-{xr}")
+    if clickable:
+        spikes = dict(showspikes=True, spikemode="across",
+                      spikesnap="hovered data", spikedash="solid",
+                      spikecolor="#555", spikethickness=1)
+        fig.update_xaxes(**spikes)
+        fig.update_yaxes(**spikes)
+        fig.update_layout(hoverdistance=2000, spikedistance=2000)
+    return fig
+
+
+def fc_plot(t, y, ylab, stem, end, start, segments):
+    """The plot, with a click setting the end (or start) by hand."""
+    s = st.session_state
+    p1, p2, p3, p4 = st.columns([2.2, 1.0, 1.0, 1.2])
+    clicks = FC_CLICKS if start is not None else FC_CLICKS[:1]
+    if s.get("fc_clickdo") not in clicks:
+        s["fc_clickdo"] = None
+    p1.segmented_control("What a click on the plot does", clicks,
+                         key="fc_clickdo", label_visibility="collapsed",
+                         disabled=end is None,
+                         help="Click the moment the curve really ends (or "
+                              "starts) to set it by hand. Click the chosen "
+                              "button again to stop.")
+    hand = s.get("fc_end_hand") is not None or \
+        s.get("fc_start_hand") is not None
+    p2.button("↺ Automatic", key="fc_auto", disabled=not hand, **STRETCH,
+              on_click=lambda: [s.pop("fc_end_hand", None),
+                                s.pop("fc_start_hand", None)],
+              help="Back to the end (and start) found from the baseline.")
+    with p3.popover("🎨 Plot", **STRETCH):
+        st.slider("Line thickness", 0.5, 6.0, step=0.25, key="fc_lw")
+        st.slider("Plot height", 250, 900, step=10, key="fc_height")
+        lo, hi = float(t[0]), float(t[-1])
+        if "fc_xr" not in s:
+            s["fc_xr"] = (lo, hi)
+        st.slider("Time shown (s)", lo, hi, key="fc_xr",
+                  step=max((hi - lo) / 2000.0, 1e-9), format="%.4g")
+    p4.caption("Drag to zoom · double-click to reset")
+    click_do = s.get("fc_clickdo")
+    fig = fc_figure(t, y, ylab, end, start, segments, bool(click_do))
+    config = {"scrollZoom": True, "doubleClick": "reset",
+              "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
+    if click_do:
+        version = int(s.get("_fc_chart_ver", 0))
+        event = st.plotly_chart(fig, key=f"fc_chart_v{version}",
+                                config=config, on_select="rerun",
+                                selection_mode="points", **STRETCH)
+        points = []
+        try:
+            points = list(event.selection.points or [])
+        except Exception:
+            points = []
+        if points:
+            when = float(points[-1]["x"])
+            s["_fc_chart_ver"] = version + 1
+            s["fc_end_hand" if click_do == FC_CLICKS[0]
+              else "fc_start_hand"] = when
+            st.rerun()
+        st.caption("Point at the moment and click; the crosshair snaps to "
+                   "the point a click takes. ↺ Automatic undoes it.")
+    else:
+        st.plotly_chart(fig, key="fc_chart", config=config, **STRETCH)
+
+
+def fc_results(t, y, ylab, stem, end, start):
+    """The numbers, the file to take away and the trip to the stack."""
+    s = st.session_state
+    unit = "nN" if ylab == "Force (nN)" else ""
+    lines, nums = fcv.curve_stats(t, y, end or {}, start, unit=unit)
+    m = st.columns(4)
+    m[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
+                if "end_s" in nums else "not found",
+                help="Where the force is back on the baseline after the "
+                     "curve." if end else "Turn on the baseline after the "
+                                          "end to find it.")
+    m[1].metric("Baseline after the end",
+                f"{nums['baseline']:.3g} {unit}" if "baseline" in nums
+                else "-",
+                help=(f"± {nums['baseline_sd']:.2g} {unit} (SD in the window)"
+                      if "baseline_sd" in nums else None))
+    m[2].metric("Peak force (from the baseline)",
+                f"{nums['peak']:.4g} {unit}" if "peak" in nums else "-",
+                help=(f"at {nums['peak_t']:.4g} s" if "peak_t" in nums
+                      else None))
+    m[3].metric("Duration", f"{nums['duration_s']:.4g} s"
+                if "duration_s" in nums else "-",
+                help="Start to end; turn on Also find the start."
+                if "duration_s" not in nums else None)
+    if end is not None and end.get("end") is None:
+        st.warning("The force never comes back to the baseline: move the "
+                   "window onto a flat stretch after the curve, or click "
+                   "the end on the plot.", icon="〰")
+    if lines:
+        st.caption(" · ".join(f"{a}: {b}" for a, b in lines))
+    zero_options = [z for z in FC_ZEROS
+                    if z == "As recorded"
+                    or (z == "End of the curve" and "end_s" in nums)
+                    or (z == "Start of the curve" and "start_s" in nums)]
+    if s.get("fc_zero") not in zero_options:
+        s["fc_zero"] = "As recorded"
+    r1, r2, r3 = st.columns([1.3, 1.4, 1.2])
+    zero_at = r1.selectbox(
+        "Time zero at", zero_options, key="fc_zero",
+        help="Time in the table sent on (and saved) counts from here, so "
+             "curves line up by their end (or start) on the stack.")
+    zero = {"End of the curve": nums.get("end_s"),
+            "Start of the curve": nums.get("start_s")}.get(zero_at) or 0.0
+    table = fcv.table_to_send(t, y, end, zero)
+    if ylab != "Force (nN)":
+        table = table.rename(columns={
+            fcv.FORCE: ylab,
+            fcv.FORCE_LESS_BASE: f"{ylab} − baseline"})
+    if zero_at != "As recorded":
+        table = table.rename(columns={fcv.TIME: {
+            "End of the curve": "Time from the end (s)",
+            "Start of the curve": "Time from the start (s)"}[zero_at]})
+    # time counted from the end (or start) keeps that zero on the stack
+    r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
+              on_click=send_to_stack,
+              args=(stem, table, "Single force curve", lines,
+                    "As in the file" if zero_at != "As recorded"
+                    else None),
+              help="Sends time and force (and force less the baseline) to "
+                   "the Stack & compare tab, with this summary for its "
+                   "balloon.", **STRETCH)
+    r3.download_button("💾 Save as CSV", key="fc_csv",
+                       data=lambda: table.to_csv(index=False).encode(),
+                       file_name=f"{stem}_force_vs_time.csv",
+                       mime="text/csv", **STRETCH)
+    note = s.pop("_vq_sent_note", None)
+    if note:
+        st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
+
+
+def force_curve_tab():
+    s = st.session_state
+    section("Single force curve: force against time")
+    if fcv is None or sc is None:
+        st.error("The force curve tools could not be loaded: "
+                 f"{FORCE_CURVE_ERROR or STACK_ERROR}")
+        return
+    for key, value in FC_DEFAULTS.items():
+        s.setdefault(key, value)
+    up = st.file_uploader(
+        "Force file", type=list(fcv.FILE_TYPES), key="fc_file",
+        help="An Asylum .ibw force file (its time step, spring constant "
+             "and segments come from the file), or a CSV, TXT or Excel "
+             "table with a time column and a force or deflection column.")
+    if up is None:
+        st.caption("Load one force recording to plot it against time, mark "
+                   "where it ends against the baseline after it, and send "
+                   "it to the stacked plot.")
+        return
+    try:
+        item = fc_read(up.getvalue(), up.name)
+    except Exception as exc:
+        st.error(f"Could not read {up.name}: {exc}")
+        return
+    fc_reset(f"{up.name}:{up.size}")
+    signal = fc_signal(item)
+    if signal is None:
+        return
+    t, y, ylab, stem = signal
+    opts = fc_baseline_controls(t)
+    end, start = fc_analyse(t, y, opts)
+    segments = item.get("segments") if item["kind"] == "ibw" else []
+    fc_plot(t, y, ylab, stem, end, start, segments)
+    if segments:
+        st.caption("Dotted lines: where the file's segments (approach, "
+                   "dwell, retract) meet.")
+    fc_results(t, y, ylab, stem, end, start)
+
+
+with tab_force:
+    force_curve_tab()
 
 
 with tab_igor:
