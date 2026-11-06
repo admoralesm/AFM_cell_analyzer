@@ -506,6 +506,51 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                               "y = %{y:.6g}<extra></extra>"),
                 row=r, col=1, secondary_y=any(t is u for u in right[r]))
 
+    # a file that ends (or starts) before the others carried on at a level
+    # to the plot's edge, and a flat (saturated) top carried on by its rise
+    # and fall; drawn last, so a click still reaches the files' own traces
+    spans = [(np.nanmin(v), np.nanmax(v)) for v in
+             (np.asarray(t["x"], float) for t in traces)
+             if v.size and np.isfinite(v).any()]
+    all_lo = min((a for a, _ in spans), default=None)
+    all_hi = max((b for _, b in spans), default=None)
+    for t in traces:
+        r = row_of[t["_panel"]]
+        on_right = any(t is u for u in right[r])
+        ext = t.get("extend") or {}
+        xs = np.asarray(t["x"], float)
+        if (ext.get("after") or ext.get("before")) and spans \
+                and np.isfinite(xs).any():
+            rng = x_range or t.get("x_range") or (
+                shared_range if linked else None)
+            lo_edge, hi_edge = (sorted(map(float, rng)) if rng is not None
+                                else (all_lo, all_hi))
+            first, last = float(np.nanmin(xs)), float(np.nanmax(xs))
+            level = float(ext.get("level", 0.0) or 0.0)
+            pieces = []
+            if ext.get("after") and hi_edge > last:
+                pieces.append((last, hi_edge))
+            if ext.get("before") and lo_edge < first:
+                pieces.append((lo_edge, first))
+            for a, b in pieces:
+                fig.add_trace(go.Scatter(
+                    x=[a, b], y=[level, level], mode="lines",
+                    showlegend=False, hoverinfo="skip",
+                    name=f"{t['label']} carried on",
+                    line=dict(color=t["colour"], width=line_width,
+                              dash=ext.get("dash", "dash"))),
+                    row=r, col=1, secondary_y=on_right)
+        sat = t.get("sat_line")
+        if sat:
+            fig.add_trace(go.Scatter(
+                x=sat["x"], y=sat["y"], mode="lines", showlegend=False,
+                name=f"{t['label']} past the saturation",
+                hovertemplate=(f"{t['label']}: past the saturation<br>"
+                               "x = %{x:.6g}<br>y = %{y:.6g}<extra></extra>"),
+                line=dict(color=t["colour"], width=line_width,
+                          dash="dash")),
+                row=r, col=1, secondary_y=on_right)
+
     # the summary balloons: one per panel (or one per file below the plot)
     extra_bottom = 0
     if stats_box != "Off":
@@ -707,6 +752,130 @@ def departure_from(x, y, coeffs, sd, after_x, k=3.0, direction="either",
                 j -= 1
             return float(x[j]), coeffs, sd
     return None, coeffs, sd
+
+
+# ------------------------------------------- a saturated (flat) top --
+
+def _runs(mask):
+    """(start, end) index pairs of the stretches where ``mask`` is True."""
+    m = np.concatenate([[False], np.asarray(mask, bool), [False]])
+    edges = np.flatnonzero(np.diff(m.astype(int)))
+    return list(zip(edges[::2], edges[1::2] - 1))
+
+
+def flat_top(x, y, side="high", tolerance=0.01, min_points=5):
+    """
+    Where the signal sits flat at its limit, as a saturated sensor does.
+
+    ``side`` "high" looks at the largest values, "low" at the smallest.
+    Points within ``tolerance`` × the signal's height of the limit count
+    as flat; the longest such stretch (at least ``min_points``) is the
+    flat top. Returns {"i0", "i1", "level", "base"} (indices into x and y
+    sorted by x; base is the level the signal rises from) or None.
+    """
+    y = np.asarray(y, float)
+    finite = np.isfinite(y)
+    if finite.sum() < 10:
+        return None
+    high = side != "low"
+    extreme = float(np.nanmax(y) if high else np.nanmin(y))
+    base = float(np.nanpercentile(y[finite], 5 if high else 95))
+    height = abs(extreme - base)
+    if not height > 0:
+        return None
+    band = float(tolerance) * height
+    # the flat level is the middle of the top points, not the noisiest one
+    top = finite & (np.abs(y - extreme) <= band)
+    level = float(np.nanmedian(y[top]))
+    near = finite & (np.abs(y - level) <= band)
+    # a noisy point or two dipping out does not end the flat top
+    for a, b in _runs(~near):
+        if 0 < a and b < y.size - 1 and b - a + 1 <= 3:
+            near[a:b + 1] = True
+    runs = [(a, b) for a, b in _runs(near) if b - a + 1 >= int(min_points)]
+    if not runs:
+        return None
+    a, b = max(runs, key=lambda r: r[1] - r[0])
+    # flat, not just a sharp peak: a saturated top fills most of the
+    # stretch where the signal is within 10 % of its limit, a peak only a
+    # small middle part of it
+    wide = finite & (np.abs(y - level) <= 0.1 * height)
+    lo, hi = a, b
+    while lo > 0 and wide[lo - 1]:
+        lo -= 1
+    while hi < y.size - 1 and wide[hi + 1]:
+        hi += 1
+    x = np.asarray(x, float)
+    span = float(x[hi] - x[lo])
+    if span > 0 and float(x[b] - x[a]) < 0.5 * span:
+        return None
+    return {"i0": int(a), "i1": int(b), "level": level, "base": base}
+
+
+def flat_top_continuation(x, y, top, band=(0.5, 0.97)):
+    """
+    Straight lines through the rise into a flat top and the fall out of
+    it, carried on past the top to where they meet: where the signal would
+    have gone without the saturation.
+
+    The rise is the stretch just before the top whose height (0 at the
+    base, 1 at the top) lies within ``band``; the fall is the same just
+    after it. Returns {"x": [...], "y": [...]} for a dashed line, "peak"
+    (x, y) where the two lines meet (None with only one side) and
+    "flat" (x where the top starts, x where it ends), or None when neither
+    side has enough points.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    i0, i1 = int(top["i0"]), int(top["i1"])
+    level, base = float(top["level"]), float(top["base"])
+    h = (y - base) / (level - base)
+    lo, hi = sorted(float(v) for v in band)
+
+    def side(step):
+        idx = []
+        j = (i0 - 1) if step < 0 else (i1 + 1)
+        while 0 <= j < y.size and np.isfinite(h[j]) and h[j] >= lo:
+            if h[j] <= hi:
+                idx.append(j)
+            j += step
+        if len(idx) < 2:
+            return None
+        return np.polyfit(x[idx], y[idx], 1)
+
+    rise, fall = side(-1), side(+1)
+    if rise is None and fall is None:
+        return None
+    up = 1.0 if level > base else -1.0
+    out = {"flat": (float(x[i0]), float(x[i1])), "peak": None}
+    if rise is not None and up * rise[0] <= 0:
+        rise = None
+    if fall is not None and up * fall[0] >= 0:
+        fall = None
+    if rise is None and fall is None:
+        return None
+    if rise is not None:
+        xa = (level - rise[1]) / rise[0]      # where the rise reaches the top
+    if fall is not None:
+        xb = (level - fall[1]) / fall[0]      # where the fall leaves it
+    if rise is not None and fall is not None:
+        xp = (fall[1] - rise[1]) / (rise[0] - fall[0])
+        yp = float(np.polyval(rise, xp))
+        out["peak"] = (float(xp), yp)
+        out["x"] = [float(xa), float(xp), float(xb)]
+        out["y"] = [level, yp, level]
+    elif rise is not None:
+        end = float(x[i1])
+        out["x"] = [float(xa), end]
+        out["y"] = [level, float(np.polyval(rise, end))]
+    else:
+        start = float(x[i0])
+        out["x"] = [start, float(xb)]
+        out["y"] = [float(np.polyval(fall, start)), level]
+    return out
+
+
+EXTEND_DASHES = {"Dashed": "dash", "Dotted": "dot", "Solid": "solid"}
 
 
 PEAK_DIRECTIONS = ("both", "up", "down")
