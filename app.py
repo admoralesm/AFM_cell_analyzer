@@ -612,10 +612,39 @@ def _current(module, *needed):
     return module
 
 
-aa = _current(aa, "AutoCellAnalysis.edit_events",
-              "AutoCellAnalysis.event_under", "AutoCellAnalysis.event_span")
-sc = _current(sc, "_extreme_near", "peak_analysis")
-fcv = _current(fcv, "baseline_after", "curve_stats")
+# What this app.py uses from each companion file. A file uploaded without
+# its matching app.py (or the other way round) is caught here: it is loaded
+# again once, and if it is still missing something, the page says which
+# file to upload instead of stopping in the middle of a tab.
+COMPANION_NEEDS = {
+    "auto_analysis.py": ("AutoCellAnalysis.edit_events",
+                         "AutoCellAnalysis.event_under",
+                         "AutoCellAnalysis.event_span"),
+    "stack_compare.py": ("_extreme_near", "peak_analysis", "flat_top",
+                         "flat_top_continuation", "baseline_through",
+                         "baseline_typed", "EXTEND_DASHES"),
+    "force_curve.py": ("baseline_after", "curve_stats", "corrected",
+                       "table_to_send"),
+}
+aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
+sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
+fcv = _current(fcv, *COMPANION_NEEDS["force_curve.py"])
+OUTDATED = [name for name, module in (("auto_analysis.py", aa),
+                                      ("stack_compare.py", sc),
+                                      ("force_curve.py", fcv))
+            if module is not None
+            and any(not _has_name(module, n) for n in COMPANION_NEEDS[name])]
+
+
+def outdated_notice(name):
+    """True (with the notice shown) when ``name`` on the server is older
+    than this app.py."""
+    if name not in OUTDATED:
+        return False
+    st.error(f"**{name}** on the server is older than app.py, so this part "
+             f"is paused. Upload the latest **{name}** to GitHub (in the "
+             "same folder as app.py), then reboot the app.", icon="🔄")
+    return True
 ct = _current(ct)
 va = _current(va)
 ai = _current(ai)
@@ -22509,6 +22538,12 @@ head_left, head_right = st.columns([4, 1])
 with head_left:
     st.markdown('<p class="app-title">🔬 Single cell compression tools</p>',
                 unsafe_allow_html=True)
+    if OUTDATED:
+        st.warning("Older than app.py on the server: **"
+                   + "**, **".join(OUTDATED) + "**. Upload the latest "
+                   + ("copies" if len(OUTDATED) > 1 else "copy")
+                   + " to GitHub, next to app.py, and reboot the app. The "
+                   "tabs that use them are paused until then.", icon="🔄")
 with head_right:
     st.toggle("Compact layout", key="ui_compact", value=True
               if "ui_compact" not in st.session_state else None,
@@ -26950,7 +26985,9 @@ def force_curve_tab():
 
 
 with tab_force:
-    force_curve_tab()
+    if not outdated_notice("force_curve.py") \
+            and not outdated_notice("stack_compare.py"):
+        force_curve_tab()
 
 
 with tab_igor:
@@ -29872,7 +29909,7 @@ with tab_stack:
     if sc is None or STACK_ERROR:
         st.error("This tab needs **stack_compare.py** beside app.py"
                  + (f" ({STACK_ERROR})." if STACK_ERROR else "."), icon="🚫")
-    else:
+    elif not outdated_notice("stack_compare.py"):
         sc_panel()
 
 
