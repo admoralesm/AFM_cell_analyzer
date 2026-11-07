@@ -569,6 +569,15 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                           width=line_width,
                           dash=hand.get("dash", "dash"))),
                 row=r, col=1, secondary_y=on_right)
+        marks = t.get("sat_marks")
+        if marks is not None and len(marks[0]):
+            fig.add_trace(go.Scatter(
+                x=marks[0], y=marks[1], mode="markers", showlegend=False,
+                name=f"{t['label']} flat part marked", hoverinfo="skip",
+                marker=dict(symbol="diamond-open", size=13,
+                            color=t["colour"],
+                            line=dict(color=t["colour"], width=2.5))),
+                row=r, col=1, secondary_y=on_right)
         sat = t.get("sat_line")
         if sat:
             fig.add_trace(go.Scatter(
@@ -907,6 +916,30 @@ def flat_top(x, y, side="high", tolerance=0.01, min_points=5):
     if span > 0 and float(x[b] - x[a]) < 0.5 * span:
         return None
     return {"i0": int(a), "i1": int(b), "level": level, "base": base}
+
+
+def flat_top_between(x, y, xa, xb, side="high"):
+    """
+    A flat (saturated) top marked by hand: from the point nearest ``xa``
+    to the one nearest ``xb`` (x sorted). Its level is the median there;
+    the level it rises from is taken as flat_top does. Returns the same
+    {"i0", "i1", "level", "base"} as flat_top, or None.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 10:
+        return None
+    lo, hi = sorted((float(xa), float(xb)))
+    i0 = int(np.nanargmin(np.where(finite, np.abs(x - lo), np.inf)))
+    i1 = int(np.nanargmin(np.where(finite, np.abs(x - hi), np.inf)))
+    if i1 <= i0:
+        return None
+    level = float(np.nanmedian(y[i0:i1 + 1]))
+    base = float(np.nanpercentile(y[finite], 5 if side != "low" else 95))
+    if abs(level - base) <= 0:
+        return None
+    return {"i0": i0, "i1": i1, "level": level, "base": base}
 
 
 def flat_top_continuation(x, y, top, band=(0.5, 0.97)):
