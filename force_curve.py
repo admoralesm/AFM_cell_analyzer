@@ -359,13 +359,40 @@ def curve_stats(t, f, end_info, start_info=None, unit="nN"):
     return lines, numbers
 
 
-def table_to_send(t, f, end_info, zero=0.0):
+def corrected(t, f, end_info, start_info=None):
+    """
+    The force less the baseline fitted after the end, so the curve ends
+    on zero, with both baselines put in those terms (the one after the end
+    becomes 0). Returns (force, end info, start info); unchanged when there
+    is no baseline.
+    """
+    coeffs = (end_info or {}).get("coeffs")
+    if coeffs is None:
+        return np.asarray(f, float), end_info, start_info
+    t = np.asarray(t, float)
+    coeffs = np.asarray(coeffs, float)
+    out = np.asarray(f, float) - np.polyval(coeffs, t)
+    end_c = dict(end_info, coeffs=np.array([0.0]), level=0.0)
+    start_c = start_info
+    if start_info and start_info.get("coeffs") is not None:
+        diff = np.polysub(np.asarray(start_info["coeffs"], float), coeffs)
+        at = (start_info["start"] if start_info.get("start") is not None
+              else start_info["window"][1])
+        start_c = dict(start_info, coeffs=diff,
+                       level=float(np.polyval(diff, at)))
+    return out, end_c, start_c
+
+
+def table_to_send(t, f, end_info, zero=0.0, corrected=False):
     """Time, force and force less the baseline after the end, with time
-    counted from ``zero``."""
+    counted from ``zero``; with ``corrected`` the force less the baseline
+    comes first (the column a plot takes)."""
     t = np.asarray(t, float)
     f = np.asarray(f, float)
     out = pd.DataFrame({TIME: t - float(zero), FORCE: f})
     coeffs = (end_info or {}).get("coeffs")
     if coeffs is not None:
         out[FORCE_LESS_BASE] = f - np.polyval(coeffs, t)
+        if corrected:
+            out = out[[TIME, FORCE_LESS_BASE, FORCE]]
     return out
