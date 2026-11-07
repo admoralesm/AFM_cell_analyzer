@@ -622,9 +622,10 @@ COMPANION_NEEDS = {
                          "AutoCellAnalysis.event_span"),
     "stack_compare.py": ("_extreme_near", "peak_analysis", "flat_top",
                          "flat_top_continuation", "baseline_through",
-                         "baseline_typed", "EXTEND_DASHES"),
+                         "baseline_typed", "EXTEND_DASHES",
+                         "flat_top_between"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
-                       "table_to_send"),
+                       "table_to_send", "incline"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -26498,7 +26499,8 @@ FC_DIRECTIONS = {"Either way": "either", "Above only": "up",
                  "Below only": "down"}
 FC_CLICKS = ("🎯 Set the end", "🎯 Set the start")
 FC_NO_TIME = "(none: use a sampling rate)"
-FC_DEFAULTS = {"fc_base": True, "fc_correct": False, "fc_shape": "Flat",
+FC_CORRECT = ("No", "End baseline", "Start and end (incline)")
+FC_DEFAULTS = {"fc_base": True, "fc_corr": "No", "fc_shape": "Flat",
                "fc_dir": "Either way",
                "fc_ksd": 3.0, "fc_run": 5, "fc_findstart": False,
                "fc_lw": 1.5, "fc_height": 420, "fc_zero": "As recorded",
@@ -26658,11 +26660,15 @@ def fc_baseline_controls(t):
                        help="A baseline is fitted to the quiet stretch after "
                             "the curve (the shaded window); the curve ends "
                             "the last moment the force is away from it.")
-        b5.toggle("Correct (subtract)", key="fc_correct", disabled=not on,
-                  help="Takes the baseline away from the whole curve, so it "
-                       "ends on zero: the plot, the numbers, the CSV and "
-                       "what is sent to the stack all use the corrected "
-                       "force.")
+        b5.selectbox("Correct (subtract)", FC_CORRECT, key="fc_corr",
+                     disabled=not on,
+                     help="Takes a baseline away from the whole curve. End "
+                          "baseline: the one after the end, so it ends on "
+                          "zero. Start and end (incline): the straight line "
+                          "from the baseline before the curve to the one "
+                          "after it, so it starts and ends on zero. The "
+                          "plot, the numbers, the CSV and what is sent to "
+                          "the stack all use the corrected force.")
         b2.radio("Shape", ("Flat", "Sloped"), key="fc_shape",
                  horizontal=True, label_visibility="collapsed",
                  disabled=not on)
@@ -26685,17 +26691,20 @@ def fc_baseline_controls(t):
                       key="fc_win", step=step, format="%.4g",
                       help="Drag both ends onto a flat stretch after the "
                            "curve.")
-            if s.get("fc_findstart"):
+            if s.get("fc_findstart") or s.get("fc_corr") == FC_CORRECT[2]:
                 if "fc_win0" not in s:
                     s["fc_win0"] = tuple(fcv.default_window(t, after=False))
                 st.slider("Baseline window before the start (s)", lo, hi,
-                          key="fc_win0", step=step, format="%.4g")
+                          key="fc_win0", step=step, format="%.4g",
+                          help="Drag both ends onto a flat stretch before "
+                               "the curve.")
     return {"on": on, "order": 1 if s.get("fc_shape") == "Sloped" else 0,
             "direction": FC_DIRECTIONS.get(s.get("fc_dir"), "either"),
             "k": float(s.get("fc_ksd") or 3.0),
             "run": int(s.get("fc_run") or 5),
             "start": bool(on and s.get("fc_findstart")),
-            "correct": bool(on and s.get("fc_correct"))}
+            "correct": (s.get("fc_corr", FC_CORRECT[0]) if on
+                        else FC_CORRECT[0])}
 
 
 def fc_analyse(t, y, opts):
@@ -26723,7 +26732,8 @@ def fc_analyse(t, y, opts):
     return end, start
 
 
-def fc_figure(t, y, ylab, end, start, segments, clickable):
+def fc_figure(t, y, ylab, end, start, segments, clickable,
+              start_window=None):
     s = st.session_state
     colour, base_colour = "#1f77b4", "#F58231"
     keep = sc.thin_index(y) if sc else np.arange(y.size)
@@ -26755,6 +26765,10 @@ def fc_figure(t, y, ylab, end, start, segments, clickable):
                 yshift=6, showarrow=False, font=dict(color=base_colour, size=13),
                 text=f"<b>End {end['end']:.4g} s</b>"
                      + (" (by hand)" if end.get("by_hand") else ""))
+    if start_window and not (start and start.get("coeffs") is not None):
+        # the window the start of the incline is taken from
+        fig.add_vrect(x0=start_window[0], x1=start_window[1],
+                      fillcolor="#888888", opacity=0.10, line_width=0)
     if start and start.get("coeffs") is not None:
         a, b = start["window"]
         fig.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.10,
@@ -26803,7 +26817,7 @@ def fc_figure(t, y, ylab, end, start, segments, clickable):
     return fig
 
 
-def fc_plot(t, y, ylab, stem, end, start, segments):
+def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None):
     """The plot, with a click setting the end (or start) by hand."""
     s = st.session_state
     p1, p2, p3, p4 = st.columns([2.2, 1.0, 1.0, 1.2])
@@ -26832,7 +26846,8 @@ def fc_plot(t, y, ylab, stem, end, start, segments):
                   step=max((hi - lo) / 2000.0, 1e-9), format="%.4g")
     p4.caption("Drag to zoom · double-click to reset")
     click_do = s.get("fc_clickdo")
-    fig = fc_figure(t, y, ylab, end, start, segments, bool(click_do))
+    fig = fc_figure(t, y, ylab, end, start, segments, bool(click_do),
+                    start_window)
     config = {"scrollZoom": True, "doubleClick": "reset",
               "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
     if click_do:
@@ -26865,11 +26880,19 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
     raw = raw or {"y": y, "end": end}
     unit = "nN" if ylab == "Force (nN)" else ""
     lines, nums = fcv.curve_stats(t, y, end or {}, start, unit=unit)
+    inc = raw.get("incline") if raw.get("line") is not None else None
     if corrected and (raw.get("end") or {}).get("level") is not None:
         was = raw["end"]
-        lines = [(a, f"{was['level']:.4g} ± {was['sd']:.2g} {unit}, "
-                     "subtracted") if a == "Baseline after the end" else (a, b)
+        level_text = was["level"] if abs(was["level"]) > 1e-9 else 0.0
+        lines = [(a, f"{level_text:.4g} ± {was['sd']:.2g} {unit}"
+                     + ("" if inc else ", subtracted"))
+                 if a == "Baseline after the end" else (a, b)
                  for a, b in lines]
+    if corrected and inc:
+        (ta, ya), (tb, yb) = inc["start"], inc["end"]
+        lines.append(("Baseline taken away",
+                      f"line from {ya:.4g} {unit} ({ta:.3g} s) to "
+                      f"{yb:.4g} {unit} ({tb:.3g} s)"))
     m = st.columns(4)
     m[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
                 if "end_s" in nums else "not found",
@@ -26877,8 +26900,10 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
                      "curve." if end else "Turn on the baseline after the "
                                           "end to find it.")
     level = (raw["end"] or {}).get("level")
-    m[1].metric("Baseline after the end",
-                (f"{level:.3g} {unit}" + (" (taken away)" if corrected
+    m[1].metric("Baseline taken away" if inc else "Baseline after the end",
+                (f"{inc['start'][1]:.3g} → {inc['end'][1]:.3g} {unit}"
+                 if inc else
+                 f"{level:.3g} {unit}" + (" (taken away)" if corrected
                                           else ""))
                 if "baseline" in nums and level is not None else "-",
                 help=(f"± {nums['baseline_sd']:.2g} {unit} (SD in the window)"
@@ -26911,7 +26936,7 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
     zero = {"End of the curve": nums.get("end_s"),
             "Start of the curve": nums.get("start_s")}.get(zero_at) or 0.0
     table = fcv.table_to_send(t, raw["y"], raw["end"], zero,
-                              corrected=corrected)
+                              corrected=corrected, line=raw.get("line"))
     if ylab != "Force (nN)":
         table = table.rename(columns={
             fcv.FORCE: ylab,
@@ -26969,14 +26994,30 @@ def force_curve_tab():
     t, y, ylab, stem = signal
     opts = fc_baseline_controls(t)
     end, start = fc_analyse(t, y, opts)
-    raw = {"y": y, "end": end}
+    raw = {"y": y, "end": end, "line": None, "incline": None}
     shown_y, shown_lab = y, ylab
-    if opts["correct"] and end and end.get("coeffs") is not None:
-        shown_y, end, start = fcv.corrected(t, y, end, start)
+    if opts["correct"] != FC_CORRECT[0] and end \
+            and end.get("coeffs") is not None:
         shown_lab = ("Force − baseline (nN)" if ylab == "Force (nN)"
                      else f"{ylab} − baseline")
+        incline = (fcv.incline(t, y, s["fc_win0"], s["fc_win"])
+                   if opts["correct"] == FC_CORRECT[2] else None)
+        if opts["correct"] == FC_CORRECT[2] and incline is None:
+            st.warning("A baseline window holds too few points to draw "
+                       "the line from start to end: widen the windows. "
+                       "The end baseline is taken off meanwhile.", icon="〰")
+        if incline is not None:
+            # the line from start to end comes off first; the end (and
+            # start) are then found on the corrected, level curve
+            raw["incline"], raw["line"] = incline, incline["coeffs"]
+            shown_y = y - np.polyval(incline["coeffs"], t)
+            end, start = fc_analyse(t, shown_y, opts)
+            raw["end"] = end
+        else:
+            shown_y, end, start = fcv.corrected(t, y, end, start)
     segments = item.get("segments") if item["kind"] == "ibw" else []
-    fc_plot(t, shown_y, shown_lab, stem, end, start, segments)
+    fc_plot(t, shown_y, shown_lab, stem, end, start, segments,
+            s.get("fc_win0") if raw["incline"] else None)
     if segments:
         st.caption("Dotted lines: where the file's segments (approach, "
                    "dwell, retract) meet.")
@@ -28976,6 +29017,44 @@ def sc_peak_controls(i, y_all):
 
 
 SC_SAT_SIDES = ("Highest values", "Lowest values")
+SC_SAT_SOURCES = ("Found automatically", "Two points I click")
+SC_SAT_CLICK = "⤴ Flat part"
+
+
+def sc_sat_source_changed(i):
+    """Choosing Two points I click readies the plot for clicking them."""
+    if st.session_state.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1]:
+        st.session_state["sc_clickdo"] = SC_SAT_CLICK
+
+
+def sc_sat_points_push(i):
+    s = st.session_state
+    history = list(s.get("_sc_zero_hist") or [])
+    history.append(("satpts", i, list(s.get(f"_sc_satpts{i}") or [])))
+    s["_sc_zero_hist"] = history[-40:]
+
+
+def sc_sat_points_edit(i):
+    """✕ Clear the marked flat part, undoable."""
+    sc_sat_points_push(i)
+    st.session_state[f"_sc_satpts{i}"] = []
+
+
+def sc_sat_click(point, traces):
+    """A click while ⤴ Flat part is chosen: the first marks where a file's
+    flat (saturated) top starts, the second where it ends; a third starts
+    again. Kept on the file's own x."""
+    s = st.session_state
+    hit = sc_click_target(point, traces)
+    if not hit or hit[2] == 3:
+        return
+    slot, raw_x, _ = hit
+    marks = list(s.get(f"_sc_satpts{slot}") or [])
+    sc_sat_points_push(slot)
+    marks = ([] if len(marks) >= 2 else marks) + [float(raw_x)]
+    s[f"_sc_satpts{slot}"] = marks
+    # its menu shows Saturated top › Two points I click from the next run
+    s["_sc_satsrc_next"] = slot
 
 
 def sc_extend_controls(i):
@@ -29007,14 +29086,33 @@ def sc_extend_controls(i):
                        "part and the fall out of it on to where they meet: "
                        "the curve went on, it did not level off.")
         if s.get(f"sc_sat{i}"):
+            st.radio("Flat part", SC_SAT_SOURCES, key=f"sc_satsrc{i}",
+                     horizontal=True, on_change=sc_sat_source_changed,
+                     args=(i,),
+                     help="Two points I click: choose ⤴ Flat part above the "
+                          "plot and click where the flat part starts, then "
+                          "where it ends.")
+            by_hand = s.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1]
+            if by_hand:
+                marks = list(s.get(f"_sc_satpts{i}") or [])
+                g1, g2 = st.columns([1.6, 1])
+                g1.caption(("Marked from both ends." if len(marks) == 2
+                            else "Start marked: click where it ends."
+                            if marks else "Nothing marked yet.")
+                           + " With **⤴ Flat part** chosen above the plot, "
+                             "click the start, then the end.")
+                g2.button("✕ Clear", key=f"sc_satclr{i}", disabled=not marks,
+                          on_click=sc_sat_points_edit, args=(i,), **STRETCH)
             f1, f2 = st.columns(2)
             f1.selectbox("Flat at the", SC_SAT_SIDES, key=f"sc_satside{i}",
                          help="Lowest values for a signal saturated "
                               "downwards (or drawn negative up).")
             f2.number_input("Flat within (% of height)", 0.05, 20.0,
                             step=0.25, key=f"sc_sattol{i}", format="%.3g",
+                            disabled=by_hand,
                             help="How close to the limit a point must be to "
-                                 "count as part of the flat top.")
+                                 "count as part of the flat top (when it is "
+                                 "found automatically).")
             st.slider("Part of the rise and fall used (% of height)", 5, 99,
                       key=f"sc_satband{i}",
                       help="The straight lines are fitted to the rise and "
@@ -29030,7 +29128,9 @@ def sc_extend_controls(i):
             "side": "low" if s.get(f"sc_satside{i}") == SC_SAT_SIDES[1]
             else "high",
             "tolerance": float(s.get(f"sc_sattol{i}") or 1.0) / 100.0,
-            "band": (band[0] / 100.0, band[1] / 100.0)}
+            "band": (band[0] / 100.0, band[1] / 100.0),
+            "by_hand": s.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1],
+            "marks": list(s.get(f"_sc_satpts{i}") or [])}
 
 
 def sc_slot_name(i):
@@ -29228,16 +29328,31 @@ def sc_slot(i, n=3):
                 py = py - base_fn(px)
             baseline_points = (px - zero, py)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
-    sat_line = None
+    sat_line = sat_marks = None
     if extend["saturation"] and len(x) > 10:
         order = np.argsort(x, kind="stable")
         xs, ys = x[order], y[order]
-        top = sc.flat_top(xs, ys, extend["side"], extend["tolerance"])
+        if extend["by_hand"]:
+            marks = [m - zero for m in extend["marks"]]
+            near = [int(np.nanargmin(np.abs(xs - m))) for m in marks]
+            sat_marks = (xs[near], ys[near])
+            top = (sc.flat_top_between(xs, ys, marks[0], marks[1],
+                                       extend["side"])
+                   if len(marks) == 2 else None)
+        else:
+            top = sc.flat_top(xs, ys, extend["side"], extend["tolerance"])
         sat_line = (sc.flat_top_continuation(xs, ys, top, extend["band"])
                     if top is not None else None)
-        if top is None:
+        if top is None and extend["by_hand"]:
+            st.caption("⤴ " + ("Click where the flat part ends."
+                               if len(extend["marks"]) == 1 else
+                               "Choose **⤴ Flat part** above the plot and "
+                               "click where the flat part starts, then "
+                               "where it ends."))
+        elif top is None:
             st.caption("⤴ No flat top found: raise “Flat within” or check "
-                       "“Flat at the” in ↦ Extend.")
+                       "“Flat at the” in ↦ Extend, or mark it with two "
+                       "clicks.")
         elif sat_line is None:
             st.caption(f"⤴ Flat from {xs[top['i0']]:.4g} to "
                        f"{xs[top['i1']]:.4g} at {top['level']:.4g}, but "
@@ -29304,7 +29419,7 @@ def sc_slot(i, n=3):
             "xcol": xcol, "panel": int(s.get(f"sc_panel{i}") or (i + 1)),
             "right": bool(s.get(f"sc_right{i}")), "x_range": x_range,
             "y_range": y_range, "extend": extend["carry"],
-            "sat_line": sat_line}
+            "sat_line": sat_line, "sat_marks": sat_marks}
 
 
 def sc_global_x_range():
@@ -29326,7 +29441,8 @@ def sc_y_titles():
     return out
 
 
-SC_CLICKS = ("🎯 Set zero", "✎ Edit peaks", "✏ Draw line", SC_BL_CLICK)
+SC_CLICKS = ("🎯 Set zero", "✎ Edit peaks", "✏ Draw line", SC_BL_CLICK,
+             SC_SAT_CLICK)
 SC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 
 
@@ -29707,6 +29823,9 @@ def sc_panel():
         elif last[0] == "blpts":
             _, i, points = last
             s[f"_sc_blpts{i}"] = list(points)
+        elif last[0] == "satpts":
+            _, i, points = last
+            s[f"_sc_satpts{i}"] = list(points)
         elif last[0] == "lines":
             _, lines, draft = last
             # fresh tables for the restored lines
@@ -29721,6 +29840,10 @@ def sc_panel():
             s[f"sc_zval{i}"] = float(value or 0.0)
             s[f"sc_shift{i}"] = float(shift or 0.0)
     sc_hl_fold_all()
+    slot = s.pop("_sc_satsrc_next", None)
+    if slot is not None:
+        s[f"sc_sat{slot}"] = True
+        s[f"sc_satsrc{slot}"] = SC_SAT_SOURCES[1]
     slot = s.pop("_sc_blsrc_next", None)
     if slot is not None:
         s[f"sc_bllvl{slot}"] = "Points"
@@ -29780,7 +29903,8 @@ def sc_panel():
                  "out, a click on the line adds the peak or dip it sits "
                  "on. ✏ Draw line: a click for the start, a click for "
                  "the end. 〰 Baseline points: clicks set a file's "
-                 "baseline. Click the chosen one again for neither.")
+                 "baseline. ⤴ Flat part: two clicks mark a saturated top. "
+                 "Click the chosen one again for neither.")
         k2.button("↶ Undo", key="sc_undo_zero",
                   disabled=not s.get("_sc_zero_hist"),
                   on_click=s.__setitem__, args=("_sc_zero_undo", True),
@@ -29864,6 +29988,8 @@ def sc_panel():
                     sc_hl_click(points[-1], traces)
                 elif click_do == SC_CLICKS[3]:
                     sc_bl_click(points[-1], traces)
+                elif click_do == SC_CLICKS[4]:
+                    sc_sat_click(points[-1], traces)
                 elif hit and click_do == SC_CLICKS[0]:
                     s["_sc_zero_next"] = {hit[0]: hit[1]}
                 elif hit:
@@ -29881,6 +30007,12 @@ def sc_panel():
                 st.warning(note, icon="⛰")
             if click_do == SC_CLICKS[2]:
                 sc_hl_panel(traces)
+            elif click_do == SC_CLICKS[4]:
+                st.caption("⤴ Click where a flat (saturated) top starts, "
+                           "then where it ends: the dashed rise and fall "
+                           "are carried on from there to where they meet. "
+                           "A third click starts again; ↶ Undo and ↦ Extend "
+                           "› ✕ Clear work too.")
             elif click_do == SC_CLICKS[3]:
                 st.caption("〰 Click points on a trace: its baseline goes "
                            "through them (flat for 1, straight for 2, joined "
