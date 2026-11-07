@@ -300,7 +300,7 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    stats_place="Inside, bottom right", baselines=True,
                    crosshair=False, crosshair_width=1.0, zero_width=1.0,
                    bold_ticks=False, legend_title="", legend_box=False,
-                   legend_bold=False):
+                   legend_bold=False, click_grid=False):
     """
     The files in panels, one above the other.
 
@@ -362,7 +362,10 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
             # not a bare line. Bigger than the ▲ ▼ on purpose: Plotly
             # gives a click to the smaller of two markers under the
             # cursor, so a click on a peak's mark reaches the mark
-            marker=dict(size=14, opacity=0, color=t["colour"]),
+            # (small while drawing lines: then the nearest of the curve's
+            # points and the click grid's takes the click, not a tie)
+            marker=dict(size=6 if click_grid else 14, opacity=0,
+                        color=t["colour"]),
             selected=dict(marker=dict(opacity=0)),
             unselected=dict(marker=dict(opacity=0)),
             line=dict(color=t["colour"], width=line_width),
@@ -540,16 +543,74 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                     line=dict(color=t["colour"], width=line_width,
                               dash=ext.get("dash", "dash"))),
                     row=r, col=1, secondary_y=on_right)
+        # the points a baseline was clicked through
+        pts = t.get("baseline_points")
+        if pts is not None and len(pts[0]):
+            fig.add_trace(go.Scatter(
+                x=pts[0], y=pts[1], mode="markers", showlegend=False,
+                name=f"{t['label']} baseline points", hoverinfo="skip",
+                marker=dict(symbol="circle-open", size=11,
+                            color=t["colour"],
+                            line=dict(color=t["colour"], width=2.5))),
+                row=r, col=1, secondary_y=on_right)
+        # lines drawn by hand (the one being drawn shows its points)
+        for hand in t.get("hand_lines") or ():
+            fig.add_trace(go.Scatter(
+                x=hand["x"], y=hand["y"],
+                mode="lines+markers" if hand.get("draft") else "lines",
+                showlegend=False, name=f"{t['label']} line drawn",
+                # no hover: a click near it still reaches the curve
+                hoverinfo="skip",
+                marker=dict(symbol="x-thin", size=11,
+                            color=hand.get("colour") or t["colour"],
+                            line=dict(color=hand.get("colour")
+                                      or t["colour"], width=2)),
+                line=dict(color=hand.get("colour") or t["colour"],
+                          width=line_width,
+                          dash=hand.get("dash", "dash"))),
+                row=r, col=1, secondary_y=on_right)
         sat = t.get("sat_line")
         if sat:
             fig.add_trace(go.Scatter(
                 x=sat["x"], y=sat["y"], mode="lines", showlegend=False,
                 name=f"{t['label']} past the saturation",
-                hovertemplate=(f"{t['label']}: past the saturation<br>"
-                               "x = %{x:.6g}<br>y = %{y:.6g}<extra></extra>"),
+                hoverinfo="skip",
                 line=dict(color=t["colour"], width=line_width,
                           dash="dash")),
                 row=r, col=1, secondary_y=on_right)
+
+    # a click anywhere: an invisible grid of points over each panel, so a
+    # line can start or end off the curves; the nearest point (of a curve
+    # or of the grid) takes the click
+    if click_grid:
+        for r in sorted(set(row_of.values())):
+            mine = [t for t in traces if row_of[t["_panel"]] == r
+                    and not any(t is u for u in right[r])]
+            if not mine:
+                continue
+            gx = np.concatenate([np.asarray(t["x"], float) for t in mine])
+            gy = np.concatenate([np.asarray(t["y"], float) for t in mine])
+            gx, gy = gx[np.isfinite(gx)], gy[np.isfinite(gy)]
+            if not gx.size or not gy.size:
+                continue
+            x0, x1 = (sorted(map(float, x_range)) if x_range is not None
+                      else (float(gx.min()), float(gx.max())))
+            y0, y1 = float(gy.min()), float(gy.max())
+            if y1 <= y0:
+                y0, y1 = y0 - 1.0, y1 + 1.0
+            pad = 0.08 * (y1 - y0)
+            ax, ay = np.meshgrid(np.linspace(x0, x1, 120),
+                                 np.linspace(y0 - pad, y1 + pad, 48))
+            owner = mine[0]
+            fig.add_trace(go.Scatter(
+                x=ax.ravel(), y=ay.ravel(), mode="markers",
+                showlegend=False, name="anywhere", hoverinfo="none",
+                customdata=np.column_stack([
+                    np.full(ax.size, owner.get("slot", 0)),
+                    ax.ravel() + float(owner.get("zero", 0.0)),
+                    np.full(ax.size, 3)]),
+                marker=dict(size=6, opacity=0, color="#000")),
+                row=r, col=1)
 
     # the summary balloons: one per panel (or one per file below the plot)
     extra_bottom = 0
@@ -719,6 +780,42 @@ def baseline_departure(x, y, x0, x1, k=3.0, order=1, direction="either",
     if coeffs is None:
         return None, None, None
     return departure_from(x, y, coeffs, sd, max(x0, x1), k, direction, run)
+
+
+def baseline_through(points):
+    """
+    A baseline set by clicked points [(x, y), ...], as a function of x:
+    one point gives a flat line, two a straight line, more a line joining
+    them in order of x. Before the first point and after the last, the
+    first and last pieces carry straight on. None without points.
+    """
+    clean = {}
+    for a, b in points or ():
+        a, b = float(a), float(b)
+        if np.isfinite(a) and np.isfinite(b):
+            clean.setdefault(a, []).append(b)
+    if not clean:
+        return None
+    xs = np.array(sorted(clean), float)
+    ys = np.array([np.mean(clean[v]) for v in xs], float)
+    if xs.size == 1:
+        return lambda v: np.full(np.shape(v), ys[0], dtype=float)
+    first = (ys[1] - ys[0]) / (xs[1] - xs[0])
+    last = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+
+    def line(v):
+        v = np.asarray(v, float)
+        out = np.interp(v, xs, ys)
+        before, after = v < xs[0], v > xs[-1]
+        out = np.where(before, ys[0] + (v - xs[0]) * first, out)
+        return np.where(after, ys[-1] + (v - xs[-1]) * last, out)
+    return line
+
+
+def baseline_typed(level, slope=0.0):
+    """y = level + slope × x, as a function of x."""
+    level, slope = float(level), float(slope)
+    return lambda v: level + slope * np.asarray(v, float)
 
 
 def departure_from(x, y, coeffs, sd, after_x, k=3.0, direction="either",
