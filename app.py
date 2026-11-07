@@ -26463,7 +26463,8 @@ FC_DIRECTIONS = {"Either way": "either", "Above only": "up",
                  "Below only": "down"}
 FC_CLICKS = ("🎯 Set the end", "🎯 Set the start")
 FC_NO_TIME = "(none: use a sampling rate)"
-FC_DEFAULTS = {"fc_base": True, "fc_shape": "Flat", "fc_dir": "Either way",
+FC_DEFAULTS = {"fc_base": True, "fc_correct": False, "fc_shape": "Flat",
+               "fc_dir": "Either way",
                "fc_ksd": 3.0, "fc_run": 5, "fc_findstart": False,
                "fc_lw": 1.5, "fc_height": 420, "fc_zero": "As recorded",
                "fc_frac": 15}
@@ -26617,11 +26618,16 @@ def fc_baseline_controls(t):
             s.pop(key, None)
         s["_fc_span"] = span
     with st.container(border=True):
-        b1, b2, b3, b4 = st.columns([1.5, 1.0, 1.1, 0.9])
+        b1, b5, b2, b3, b4 = st.columns([1.45, 1.05, 0.95, 1.05, 0.9])
         on = b1.toggle("〰 Baseline after the end", key="fc_base",
                        help="A baseline is fitted to the quiet stretch after "
                             "the curve (the shaded window); the curve ends "
                             "the last moment the force is away from it.")
+        b5.toggle("Correct (subtract)", key="fc_correct", disabled=not on,
+                  help="Takes the baseline away from the whole curve, so it "
+                       "ends on zero: the plot, the numbers, the CSV and "
+                       "what is sent to the stack all use the corrected "
+                       "force.")
         b2.radio("Shape", ("Flat", "Sloped"), key="fc_shape",
                  horizontal=True, label_visibility="collapsed",
                  disabled=not on)
@@ -26653,7 +26659,8 @@ def fc_baseline_controls(t):
             "direction": FC_DIRECTIONS.get(s.get("fc_dir"), "either"),
             "k": float(s.get("fc_ksd") or 3.0),
             "run": int(s.get("fc_run") or 5),
-            "start": bool(on and s.get("fc_findstart"))}
+            "start": bool(on and s.get("fc_findstart")),
+            "correct": bool(on and s.get("fc_correct"))}
 
 
 def fc_analyse(t, y, opts):
@@ -26710,7 +26717,7 @@ def fc_figure(t, y, ylab, end, start, segments, clickable):
                                                   width=2, dash="dash"))
             fig.add_annotation(
                 x=end["end"], y=1.0, yref="paper", yanchor="bottom",
-                yshift=3, showarrow=False, font=dict(color=base_colour, size=13),
+                yshift=6, showarrow=False, font=dict(color=base_colour, size=13),
                 text=f"<b>End {end['end']:.4g} s</b>"
                      + (" (by hand)" if end.get("by_hand") else ""))
     if start and start.get("coeffs") is not None:
@@ -26728,7 +26735,7 @@ def fc_figure(t, y, ylab, end, start, segments, clickable):
                                                       width=2, dash="dash"))
             fig.add_annotation(
                 x=start["start"], y=1.0, yref="paper", yanchor="bottom",
-                yshift=3, showarrow=False, font=dict(color="#3CB44B", size=13),
+                yshift=6, showarrow=False, font=dict(color="#3CB44B", size=13),
                 text=f"<b>Start {start['start']:.4g} s</b>"
                      + (" (by hand)" if start.get("by_hand") else ""))
             if end and end.get("end") is not None \
@@ -26815,20 +26822,30 @@ def fc_plot(t, y, ylab, stem, end, start, segments):
         st.plotly_chart(fig, key="fc_chart", config=config, **STRETCH)
 
 
-def fc_results(t, y, ylab, stem, end, start):
-    """The numbers, the file to take away and the trip to the stack."""
+def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
+    """The numbers, the file to take away and the trip to the stack.
+    ``y`` is the force as shown (corrected or not), ``raw`` the force as
+    read with its baseline, for the table."""
     s = st.session_state
+    raw = raw or {"y": y, "end": end}
     unit = "nN" if ylab == "Force (nN)" else ""
     lines, nums = fcv.curve_stats(t, y, end or {}, start, unit=unit)
+    if corrected and (raw.get("end") or {}).get("level") is not None:
+        was = raw["end"]
+        lines = [(a, f"{was['level']:.4g} ± {was['sd']:.2g} {unit}, "
+                     "subtracted") if a == "Baseline after the end" else (a, b)
+                 for a, b in lines]
     m = st.columns(4)
     m[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
                 if "end_s" in nums else "not found",
                 help="Where the force is back on the baseline after the "
                      "curve." if end else "Turn on the baseline after the "
                                           "end to find it.")
+    level = (raw["end"] or {}).get("level")
     m[1].metric("Baseline after the end",
-                f"{nums['baseline']:.3g} {unit}" if "baseline" in nums
-                else "-",
+                (f"{level:.3g} {unit}" + (" (taken away)" if corrected
+                                          else ""))
+                if "baseline" in nums and level is not None else "-",
                 help=(f"± {nums['baseline_sd']:.2g} {unit} (SD in the window)"
                       if "baseline_sd" in nums else None))
     m[2].metric("Peak force (from the baseline)",
@@ -26858,7 +26875,8 @@ def fc_results(t, y, ylab, stem, end, start):
              "curves line up by their end (or start) on the stack.")
     zero = {"End of the curve": nums.get("end_s"),
             "Start of the curve": nums.get("start_s")}.get(zero_at) or 0.0
-    table = fcv.table_to_send(t, y, end, zero)
+    table = fcv.table_to_send(t, raw["y"], raw["end"], zero,
+                              corrected=corrected)
     if ylab != "Force (nN)":
         table = table.rename(columns={
             fcv.FORCE: ylab,
@@ -26916,12 +26934,19 @@ def force_curve_tab():
     t, y, ylab, stem = signal
     opts = fc_baseline_controls(t)
     end, start = fc_analyse(t, y, opts)
+    raw = {"y": y, "end": end}
+    shown_y, shown_lab = y, ylab
+    if opts["correct"] and end and end.get("coeffs") is not None:
+        shown_y, end, start = fcv.corrected(t, y, end, start)
+        shown_lab = ("Force − baseline (nN)" if ylab == "Force (nN)"
+                     else f"{ylab} − baseline")
     segments = item.get("segments") if item["kind"] == "ibw" else []
-    fc_plot(t, y, ylab, stem, end, start, segments)
+    fc_plot(t, shown_y, shown_lab, stem, end, start, segments)
     if segments:
         st.caption("Dotted lines: where the file's segments (approach, "
                    "dwell, retract) meet.")
-    fc_results(t, y, ylab, stem, end, start)
+    fc_results(t, shown_y, ylab, stem, end, start, raw,
+               corrected=shown_y is not y)
 
 
 with tab_force:
@@ -28646,6 +28671,57 @@ def sc_axis_ranges(i):
 
 
 BASELINE_MODES = ("Off", "Show", "Correct")
+BASELINE_SOURCES = {"Fitted": "Fitted over a window",
+                    "By hand": "A flat level on a slider",
+                    "Points": "Click points on the trace",
+                    "Typed": "Type it: y = level + slope × x"}
+SC_BL_CLICK = "〰 Baseline points"
+
+
+def sc_bl_source_changed(i):
+    """Choosing Click points readies the plot for clicking them."""
+    s = st.session_state
+    if s.get(f"sc_bllvl{i}") == "Points":
+        s["sc_clickdo"] = SC_BL_CLICK
+        if s.get(f"sc_blmode{i}", "Off") == "Off":
+            s[f"sc_blmode{i}"] = "Show"
+
+
+def sc_bl_points_push(i):
+    s = st.session_state
+    history = list(s.get("_sc_zero_hist") or [])
+    history.append(("blpts", i, list(s.get(f"_sc_blpts{i}") or [])))
+    s["_sc_zero_hist"] = history[-40:]
+
+
+def sc_bl_points_edit(i, what):
+    """↶ Last point / ✕ Clear points, undoable."""
+    s = st.session_state
+    points = list(s.get(f"_sc_blpts{i}") or [])
+    sc_bl_points_push(i)
+    s[f"_sc_blpts{i}"] = points[:-1] if what == "last" else []
+
+
+def sc_bl_click(point, traces):
+    """A click while 〰 Baseline points is chosen: the point (on the trace's
+    own x, and its y before any baseline is taken off) goes on that file's
+    baseline, which then comes from clicked points."""
+    s = st.session_state
+    hit = sc_click_target(point, traces)
+    if not hit or hit[2] == 3:
+        return
+    slot, raw_x, _ = hit
+    t = next((u for u in traces if u["slot"] == slot), None)
+    if t is None:
+        return
+    y = float(point["y"])
+    if t.get("base_subtracted") and t.get("baseline_fn") is not None:
+        y += float(np.ravel(t["baseline_fn"](np.array([raw_x])))[0])
+    sc_bl_points_push(slot)
+    s[f"_sc_blpts{slot}"] = list(s.get(f"_sc_blpts{slot}") or []) + [
+        [float(raw_x), y]]
+    # its menu shows Click points from the next run on
+    s["_sc_blsrc_next"] = slot
 
 
 def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
@@ -28690,27 +28766,54 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                                                                      1.0)
     if y_hi <= y_lo:
         y_hi = y_lo + 1.0
-    if s.get(f"sc_bllvl{i}") not in ("Fitted", "By hand"):
+    if s.get(f"sc_bllvl{i}") not in BASELINE_SOURCES:
         s[f"sc_bllvl{i}"] = "Fitted"
     if not (y_lo <= float(s.get(f"sc_blval{i}", y_lo - 1)) <= y_hi):
         s[f"sc_blval{i}"] = float(np.median(ys)) if ys.size else 0.0
+    s.setdefault(f"sc_bltl{i}", float(np.median(ys)) if ys.size else 0.0)
+    s.setdefault(f"sc_blts{i}", 0.0)
+    source = s.get(f"sc_bllvl{i}")
+    points = list(s.get(f"_sc_blpts{i}") or [])
     with b2.popover("⚙ Baseline", **STRETCH):
-        st.radio("Level", ("Fitted", "By hand"), key=f"sc_bllvl{i}",
-                 horizontal=True,
-                 format_func={"Fitted": "Fitted over the window",
-                              "By hand": "Set by hand"}.get,
-                 help="By hand: move the horizontal baseline with the "
-                      "slider and watch it, the threshold and the peaks "
-                      "counted follow on the plot.")
-        if s.get(f"sc_bllvl{i}") == "By hand":
+        st.radio("Baseline from", BASELINE_SOURCES, key=f"sc_bllvl{i}",
+                 format_func=BASELINE_SOURCES.get,
+                 on_change=sc_bl_source_changed, args=(i,),
+                 help="Fitted: over a window you choose. Slider: a flat "
+                      "level you move. Click points: the baseline goes "
+                      "through points you click on the trace (straight "
+                      "through 2, joined pieces through more). Type it: "
+                      "y = level + slope × x. Show and Correct work the "
+                      "same with each.")
+        if source == "By hand":
             st.slider("Baseline level (y)", y_lo, y_hi,
                       step=(y_hi - y_lo) / 1000.0, key=f"sc_blval{i}",
                       format="%.4g")
-        st.radio("Baseline", ("Horizontal", "Sloped (linear)"),
-                 key=f"sc_blo{i}", horizontal=True,
-                 disabled=s.get(f"sc_bllvl{i}") == "By hand",
-                 help="Horizontal: the mean level over the window. Sloped: "
-                      "a straight line through it, for a drifting signal.")
+        elif source == "Points":
+            plural = "" if len(points) == 1 else "s"
+            st.caption(f"**{len(points)} point{plural}.** With "
+                       "**〰 Baseline points** chosen "
+                       "above the plot, each click on this trace adds one. "
+                       "One point gives a flat line, two a straight line, "
+                       "more a line joining them.")
+            p1, p2 = st.columns(2)
+            p1.button("↶ Last point", key=f"sc_blp_last{i}",
+                      on_click=sc_bl_points_edit, args=(i, "last"),
+                      disabled=not points, **STRETCH)
+            p2.button("✕ Clear points", key=f"sc_blp_clear{i}",
+                      on_click=sc_bl_points_edit, args=(i, "clear"),
+                      disabled=not points, **STRETCH)
+        elif source == "Typed":
+            t1, t2 = st.columns(2)
+            t1.number_input("level", key=f"sc_bltl{i}", format="%.6g")
+            t2.number_input("slope", key=f"sc_blts{i}", format="%.6g")
+            st.caption("y = level + slope × x, with x as in the file "
+                       "(before its zero is moved).")
+        if source == "Fitted":
+            st.radio("Baseline", ("Horizontal", "Sloped (linear)"),
+                     key=f"sc_blo{i}", horizontal=True,
+                     help="Horizontal: the mean level over the window. "
+                          "Sloped: a straight line through it, for a "
+                          "drifting signal.")
         a, b = st.columns(2)
         a.number_input("Window from x", key=f"sc_bl0{i}", format="%.6g")
         b.number_input("to x", key=f"sc_bl1{i}", format="%.6g")
@@ -28721,7 +28824,9 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                   args=(0.10,), **STRETCH)
         q3.button("25 %", key=f"sc_blq25{i}", on_click=first,
                   args=(0.25,), **STRETCH)
-        st.caption("For **Zero of x at → Departure from baseline**: the "
+        st.caption("The window is where the baseline is fitted (or, for "
+                   "the other ways, where its noise is measured). For "
+                   "**Zero of x at → Departure from baseline**: the "
                    "contact is where the signal stays k × SD from the "
                    "baseline.")
         c1, c2 = st.columns(2)
@@ -28738,6 +28843,9 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
             "direction": s.get(f"sc_bld{i}", "either"),
             "manual": (float(s.get(f"sc_blval{i}"))
                        if s.get(f"sc_bllvl{i}") == "By hand" else None),
+            "source": source, "points": points,
+            "typed": (float(s.get(f"sc_bltl{i}") or 0.0),
+                      float(s.get(f"sc_blts{i}") or 0.0)),
             "show": True, "subtract": chosen == "Correct"}
 
 
@@ -29006,21 +29114,37 @@ def sc_slot(i, n=3):
                         help="-1 changes the sign of the values.")
         st.slider("Smoothing (points)", 1, 501, step=2, key=f"sc_sm{i}",
                   value=None if f"sc_sm{i}" in s else 1)
-    coeffs, contact, sd = None, None, None
-    if baseline is not None and baseline["manual"] is not None:
-        coeffs = np.array([baseline["manual"]])
+    # the baseline as a function of the file's own x, whichever way it is
+    # set; Show, Correct, the peaks and the contact point all use it
+    base_fn, contact, sd = None, None, None
+    if baseline is not None:
         lo_w, hi_w = sorted((baseline["x0"], baseline["x1"]))
-        inside = (x_all >= lo_w) & (x_all <= hi_w) & np.isfinite(y_all)
-        sd = (float(np.std(y_all[inside] - baseline["manual"]))
-              if inside.sum() > 2 else 0.0)
-        contact, coeffs, sd = sc.departure_from(
-            x_all, y_all, coeffs, sd, hi_w, baseline["k"],
-            baseline["direction"])
-    elif baseline is not None:
-        contact, coeffs, sd = sc.baseline_departure(
-            x_all, y_all, baseline["x0"], baseline["x1"],
-            k=baseline["k"], order=baseline["order"],
-            direction=baseline["direction"])
+        source = baseline.get("source", "Fitted")
+        if source == "By hand" and baseline["manual"] is not None:
+            base_fn = sc.baseline_typed(baseline["manual"])
+        elif source == "Typed":
+            base_fn = sc.baseline_typed(*baseline["typed"])
+        elif source == "Points":
+            base_fn = sc.baseline_through(baseline["points"])
+            if base_fn is None:
+                st.caption("〰 No baseline points yet: choose **〰 Baseline "
+                           "points** above the plot and click this trace.")
+        else:
+            fitted, sd = sc.fit_baseline(x_all, y_all, lo_w, hi_w,
+                                         baseline["order"])
+            if fitted is not None:
+                base_fn = (lambda v, c=fitted: np.polyval(c, np.asarray(
+                    v, float)))
+        if base_fn is not None:
+            if sd is None:
+                inside = ((x_all >= lo_w) & (x_all <= hi_w)
+                          & np.isfinite(y_all))
+                sd = (float(np.std(y_all[inside] - base_fn(x_all[inside])))
+                      if inside.sum() > 2 else 0.0)
+            contact, _, _ = sc.departure_from(
+                x_all, y_all - base_fn(x_all), np.array([0.0]), sd, hi_w,
+                baseline["k"], baseline["direction"])
+    coeffs = base_fn
     if mode == sc.CONTACT_MODE:
         zero = contact if contact is not None else float(
             max(baseline["x0"], baseline["x1"]) if baseline else 0.0)
@@ -29031,7 +29155,7 @@ def sc_slot(i, n=3):
     shift = float(s.get(f"sc_shift{i}") or 0.0)
     note = ""
     if coeffs is not None:
-        level = float(np.polyval(coeffs, baseline["x0"]))
+        level = float(np.ravel(base_fn(np.array([baseline["x0"]])))[0])
         note += (f" · baseline {level:.4g}" + (f" ± {sd:.2g} (SD)" if sd
                                                else "")
                  + (", corrected" if baseline["subtract"] else ""))
@@ -29048,15 +29172,24 @@ def sc_slot(i, n=3):
     x, y = sc.prepare(frame, xcol, ycol, xf, yf, zero)
     baseline_line = baseline_window = None
     fit_y = None
-    if coeffs is not None:
-        fit_y = np.polyval(coeffs, x + zero)
+    baseline_points = None
+    if base_fn is not None:
+        fit_y = np.asarray(base_fn(x + zero), float)
         if baseline["subtract"]:
             y = y - fit_y
             fit_y = np.zeros_like(fit_y)
         if baseline["show"] and len(x):
             order = np.argsort(x)
             baseline_line = (x[order], fit_y[order])
-            baseline_window = (baseline["x0"] - zero, baseline["x1"] - zero)
+            if baseline.get("source", "Fitted") == "Fitted":
+                baseline_window = (baseline["x0"] - zero,
+                                   baseline["x1"] - zero)
+        if baseline.get("source") == "Points" and baseline["points"]:
+            px = np.array([p[0] for p in baseline["points"]], float)
+            py = np.array([p[1] for p in baseline["points"]], float)
+            if baseline["subtract"]:
+                py = py - base_fn(px)
+            baseline_points = (px - zero, py)
     y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
     sat_line = None
     if extend["saturation"] and len(x) > 10:
@@ -29120,6 +29253,10 @@ def sc_slot(i, n=3):
             "stats": (sent or {}).get("stats") if sent is not None else None,
             "baseline_line": baseline_line,
             "baseline_window": baseline_window,
+            "baseline_points": baseline_points,
+            "baseline_fn": base_fn,
+            "base_subtracted": bool(base_fn is not None and baseline
+                                    and baseline["subtract"]),
             "peak_marks": peak_marks, "peak_stats": peak_stats,
             "threshold_lines": threshold_lines,
             "stats_factor": peaks["factor"], "stats_unit": peaks["unit"],
@@ -29152,7 +29289,226 @@ def sc_y_titles():
     return out
 
 
-SC_CLICKS = ("🎯 Set zero", "✎ Edit peaks")
+SC_CLICKS = ("🎯 Set zero", "✎ Edit peaks", "✏ Draw line", SC_BL_CLICK)
+SC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
+
+
+# ------------------------------------------------- lines drawn by hand --
+# Kept in session state as {slot: [line]} under "_sc_hlines", the line
+# being drawn under "_sc_draft". A line is {"id", "file", "pts": [[x on
+# the file's own axis, y]], "dash", "ver", "zero"}: x is kept on the file's
+# own axis so the line moves with the file's zero; "zero" is the zero its
+# table was last shown with (the table shows x as plotted), "ver" renews
+# the table after an edit is taken in.
+
+def sc_hl_ver():
+    s = st.session_state
+    s["_sc_hl_n"] = int(s.get("_sc_hl_n", 0)) + 1
+    return s["_sc_hl_n"]
+
+
+def sc_hl_push():
+    """Keep the lines as they are, for ↶ Undo."""
+    s = st.session_state
+    history = list(s.get("_sc_zero_hist") or [])
+    history.append(("lines", copy.deepcopy(s.get("_sc_hlines") or {}),
+                    copy.deepcopy(s.get("_sc_draft"))))
+    s["_sc_zero_hist"] = history[-40:]
+
+
+def sc_hl_editor_key(line):
+    return f"sc_hl_{line['id']}_v{line['ver']}"
+
+
+def sc_hl_take_edits(line):
+    """Fold what was typed into a line's table into its points. True when
+    something changed."""
+    s = st.session_state
+    state = s.get(sc_hl_editor_key(line)) or {}
+    edited = state.get("edited_rows") or {}
+    added = state.get("added_rows") or []
+    deleted = set(int(k) for k in (state.get("deleted_rows") or []))
+    if not (edited or added or deleted):
+        return False
+    zero = float(line.get("zero") or 0.0)
+    rows = [[x - zero, y] for x, y in line["pts"]]
+    for k, change in edited.items():
+        k = int(k)
+        if 0 <= k < len(rows):
+            if change.get("x") is not None:
+                rows[k][0] = float(change["x"])
+            if change.get("y") is not None:
+                rows[k][1] = float(change["y"])
+    rows = [r for k, r in enumerate(rows) if k not in deleted]
+    for row in added:
+        if row.get("x") is not None and row.get("y") is not None:
+            rows.append([float(row["x"]), float(row["y"])])
+    line["pts"] = [[x + zero, y] for x, y in rows]
+    line["ver"] = sc_hl_ver()
+    return True
+
+
+def sc_hl_fold_all():
+    """Every table's typed changes into its line, before the plot is
+    drawn (so the plot shows them at once)."""
+    s = st.session_state
+    lines = s.get("_sc_hlines") or {}
+    draft = s.get("_sc_draft")
+    pending = [ln for group in lines.values() for ln in group]
+    if draft:
+        pending.append(draft)
+    if any((s.get(sc_hl_editor_key(ln)) or {}).get(k)
+           for ln in pending
+           for k in ("edited_rows", "added_rows", "deleted_rows")):
+        sc_hl_push()
+        for ln in pending:
+            sc_hl_take_edits(ln)
+
+
+def sc_hl_click(point, traces):
+    """A click while ✏ Draw line is chosen: the point goes on the line
+    being drawn (started on the file clicked)."""
+    s = st.session_state
+    hit = sc_click_target(point, traces)
+    if not hit:
+        return
+    draft = s.get("_sc_draft")
+    by_slot = {t["slot"]: t for t in traces}
+    if draft and draft["slot"] not in by_slot:
+        draft = None
+    owner = by_slot[draft["slot"] if draft else hit[0]]
+    clicked = by_slot.get(hit[0], owner)
+    if draft and clicked.get("_panel") != owner.get("_panel"):
+        s["_sc_click_note"] = ("That point is in another panel: finish or "
+                               "cancel this line first.")
+        return
+    sc_hl_push()
+    if not draft:
+        draft = {"id": sc_hl_ver(), "slot": owner["slot"],
+                 "file": owner["file"], "pts": [],
+                 "dash": s.get("sc_hl_style", "Dashed"), "colour": None,
+                 "zero": owner["zero"], "ver": sc_hl_ver()}
+    draft["pts"].append([float(point["x"]) + owner["zero"],
+                         float(point["y"])])
+    draft["ver"] = sc_hl_ver()
+    if len(draft["pts"]) >= 2:
+        # the end point: the line is done
+        draft["dash"] = s.get("sc_hl_style", "Dashed")
+        lines = copy.deepcopy(s.get("_sc_hlines") or {})
+        lines.setdefault(draft["slot"], []).append(draft)
+        s["_sc_hlines"] = lines
+        s["_sc_draft"] = None
+    else:
+        s["_sc_draft"] = draft
+
+
+def sc_hl_cancel():
+    sc_hl_push()
+    st.session_state["_sc_draft"] = None
+
+
+def sc_hl_delete(slot, line_id):
+    s = st.session_state
+    sc_hl_push()
+    lines = copy.deepcopy(s.get("_sc_hlines") or {})
+    lines[slot] = [ln for ln in lines.get(slot, []) if ln["id"] != line_id]
+    s["_sc_hlines"] = lines
+
+
+def sc_hl_restyle(slot, line_id, key, field="dash"):
+    s = st.session_state
+    for ln in (s.get("_sc_hlines") or {}).get(slot, []):
+        if ln["id"] == line_id:
+            ln[field] = s.get(key)
+
+
+def sc_hl_for(t):
+    """The hand lines of one file, as plotted (x less its zero)."""
+    s = st.session_state
+    out = []
+    for ln in (s.get("_sc_hlines") or {}).get(t["slot"], []):
+        if ln.get("file") != t["file"] or len(ln["pts"]) < 2:
+            continue
+        out.append({"x": [x - t["zero"] for x, _ in ln["pts"]],
+                    "y": [y for _, y in ln["pts"]],
+                    "dash": sc.EXTEND_DASHES.get(ln.get("dash"), "dash"),
+                    "colour": ln.get("colour")})
+    draft = s.get("_sc_draft")
+    if draft and draft["slot"] == t["slot"] and draft.get("file") == t["file"]:
+        out.append({"x": [x - t["zero"] for x, _ in draft["pts"]],
+                    "y": [y for _, y in draft["pts"]],
+                    "dash": sc.EXTEND_DASHES.get(
+                        s.get("sc_hl_style", "Dashed"), "dash"),
+                    "draft": True})
+    return out
+
+
+def sc_hl_table(line, zero, key_prefix=""):
+    """The points of a line as plotted, to retype or add to."""
+    line["zero"] = float(zero)
+    frame = pd.DataFrame([[x - zero, y] for x, y in line["pts"]],
+                         columns=["x", "y"])
+    st.data_editor(
+        frame, key=sc_hl_editor_key(line), num_rows="dynamic",
+        hide_index=True, **STRETCH,
+        column_config={
+            "x": st.column_config.NumberColumn("x (as plotted)",
+                                               format="%.6g"),
+            "y": st.column_config.NumberColumn("y", format="%.6g")})
+
+
+def sc_hl_panel(traces):
+    """Under the plot while ✏ Draw line is chosen: the start point of the
+    line being drawn, and every line drawn so far with its style, colour
+    and points."""
+    s = st.session_state
+    by_slot = {t["slot"]: t for t in traces}
+    draft = s.get("_sc_draft")
+    s.setdefault("sc_hl_style", "Dashed")
+    with st.container(border=True):
+        d1, d2, d3 = st.columns([2.6, 1.0, 1.0])
+        if draft and draft["slot"] in by_slot and draft["pts"]:
+            t = by_slot[draft["slot"]]
+            x0, y0 = draft["pts"][0]
+            d1.markdown(f"**✏ Start set** at x = {x0 - t['zero']:.4g}, "
+                        f"y = {y0:.4g}: now click the end point.")
+        else:
+            d1.markdown("**✏ Draw line**: click the start point, then the "
+                        "end point. Anywhere on the plot works; a click on "
+                        "a curve takes that point of the curve.")
+        d2.selectbox("Style of new lines", SC_LINE_STYLES,
+                     key="sc_hl_style", label_visibility="collapsed")
+        d3.button("✕ Cancel line", key="sc_hl_cancel", on_click=sc_hl_cancel,
+                  disabled=not draft, **STRETCH)
+    drawn = [(slot, ln) for slot, group in (s.get("_sc_hlines") or {}).items()
+             for ln in group if slot in by_slot
+             and ln.get("file") == by_slot[slot]["file"]]
+    for n, (slot, ln) in enumerate(drawn, 1):
+        t = by_slot[slot]
+        (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
+        with st.container(border=True):
+            c0, c1, c2, c3 = st.columns([2.6, 1.0, 0.45, 0.9])
+            extra = (f" · {len(ln['pts'])} points"
+                     if len(ln["pts"]) > 2 else "")
+            c0.markdown(f"**Line {n}** on {t['label']}: "
+                        f"({xa - t['zero']:.4g}, {ya:.4g}) → "
+                        f"({xb - t['zero']:.4g}, {yb:.4g}){extra}")
+            key = f"sc_hl_dash_{ln['id']}"
+            s[key] = ln.get("dash", "Dashed")
+            c1.selectbox("Style", SC_LINE_STYLES, key=key,
+                         label_visibility="collapsed",
+                         on_change=sc_hl_restyle, args=(slot, ln["id"], key))
+            ckey = f"sc_hl_col_{ln['id']}"
+            s[ckey] = ln.get("colour") or t["colour"]
+            c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
+                            on_change=sc_hl_restyle,
+                            args=(slot, ln["id"], ckey, "colour"))
+            c3.button("🗑 Delete", key=f"sc_hl_del_{ln['id']}",
+                      on_click=sc_hl_delete, args=(slot, ln["id"]),
+                      **STRETCH)
+            with st.expander("✎ Retype its points"):
+                sc_hl_table(ln, t["zero"])
+
 
 SC_DEFAULTS = {
     "sc_n": 3, "sc_link": False, "sc_zline": True, "sc_height": 240,
@@ -29311,11 +29667,28 @@ def sc_panel():
             _, i, removed, added = last
             s[f"sc_pkrm{i}"] = list(removed)
             s[f"sc_pkadd{i}"] = list(added)
+        elif last[0] == "blpts":
+            _, i, points = last
+            s[f"_sc_blpts{i}"] = list(points)
+        elif last[0] == "lines":
+            _, lines, draft = last
+            # fresh tables for the restored lines
+            for ln in [x for g in lines.values() for x in g] + (
+                    [draft] if draft else []):
+                ln["ver"] = sc_hl_ver()
+            s["_sc_hlines"] = lines
+            s["_sc_draft"] = draft
         else:
             i, mode, value, shift = last
             s[f"sc_zmode{i}"] = mode or "Start of the data"
             s[f"sc_zval{i}"] = float(value or 0.0)
             s[f"sc_shift{i}"] = float(shift or 0.0)
+    sc_hl_fold_all()
+    slot = s.pop("_sc_blsrc_next", None)
+    if slot is not None:
+        s[f"sc_bllvl{slot}"] = "Points"
+        if s.get(f"sc_blmode{slot}", "Off") == "Off":
+            s[f"sc_blmode{slot}"] = "Show"
     for key, value in SC_DEFAULTS.items():
         s.setdefault(key, value)
     # Options on the left, grouped in four tabs; the plot on the right, so
@@ -29350,7 +29723,9 @@ def sc_panel():
         sc_save_controls(traces, stem)
 
     with right:
-        k0, kc, k1, k2, k3, k4 = st.columns([1.0, 1.2, 2.1, 0.8, 1.3, 1])
+        # two rows: how the plot looks and moves, then what a click does
+        k0, kc, k3, k4 = st.columns([1.0, 1.2, 1.3, 1.1])
+        k1, k2 = st.columns([3.2, 1.0])
         click_do = s.get("sc_clickdo")
         k0.toggle("💬 Stats", key="sc_balloons",
                   value=None if "sc_balloons" in s else True,
@@ -29366,12 +29741,15 @@ def sc_panel():
             help="🎯 Set zero: the point clicked becomes x = 0 for its "
                  "file. ✎ Edit peaks: a click on a ▲ ▼ takes that peak "
                  "out, a click on the line adds the peak or dip it sits "
-                 "on. Click the chosen one again for neither.")
+                 "on. ✏ Draw line: a click for the start, a click for "
+                 "the end. 〰 Baseline points: clicks set a file's "
+                 "baseline. Click the chosen one again for neither.")
         k2.button("↶ Undo", key="sc_undo_zero",
                   disabled=not s.get("_sc_zero_hist"),
                   on_click=s.__setitem__, args=("_sc_zero_undo", True),
-                  help="Puts back what the last click changed (a zero or "
-                       "a peak), one click at a time.", **STRETCH)
+                  help="Puts back what the last click changed (a zero, a "
+                       "peak, a line or a baseline point), one at a time.",
+                  **STRETCH)
         k3.radio("Drag to", ("zoom", "pan"), key="sc_drag",
                  horizontal=True, label_visibility="collapsed",
                  help="What dragging on the plot does. The mouse wheel "
@@ -29381,6 +29759,8 @@ def sc_panel():
                       "_sc_view", int(s.get("_sc_view", 0)) + 1),
                   help="Back to the full plot (double-clicking the plot "
                        "does the same).")
+        for t in traces:
+            t["hand_lines"] = sc_hl_for(t)
         fig = sc.stacked_figure(
             traces, linked=bool(s.get("sc_link")),
             overlay=bool(s.get("sc_overlay")),
@@ -29392,6 +29772,7 @@ def sc_panel():
             zero_line=bool(s.get("sc_zline")),
             grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
             clickable=bool(s.get("sc_clickdo")),
+            click_grid=s.get("sc_clickdo") == SC_CLICKS[2],
             x_range=sc_global_x_range(),
             frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
             y_titles=sc_y_titles(),
@@ -29442,7 +29823,11 @@ def sc_panel():
             if points:
                 hit = sc_click_target(points[-1], traces)
                 s["_sc_chart_ver"] = version + 1
-                if hit and click_do == SC_CLICKS[0]:
+                if click_do == SC_CLICKS[2]:
+                    sc_hl_click(points[-1], traces)
+                elif click_do == SC_CLICKS[3]:
+                    sc_bl_click(points[-1], traces)
+                elif hit and click_do == SC_CLICKS[0]:
                     s["_sc_zero_next"] = {hit[0]: hit[1]}
                 elif hit:
                     slot, raw, kind = hit
@@ -29457,7 +29842,16 @@ def sc_panel():
             note = s.pop("_sc_click_note", None)
             if note:
                 st.warning(note, icon="⛰")
-            if click_do == SC_CLICKS[0]:
+            if click_do == SC_CLICKS[2]:
+                sc_hl_panel(traces)
+            elif click_do == SC_CLICKS[3]:
+                st.caption("〰 Click points on a trace: its baseline goes "
+                           "through them (flat for 1, straight for 2, joined "
+                           "pieces for more). That file's ⚙ Baseline menu "
+                           "has ↶ Last point and ✕ Clear points; ↶ Undo "
+                           "works too. Show or Correct (subtract) in its "
+                           "〰 Baseline row.")
+            elif click_do == SC_CLICKS[0]:
                 st.caption("Point at the moment you want (a ▲ ▼ peak works "
                            "too) and click: that point becomes x = 0 for its "
                            "file. The crosshair snaps to the point a click "
