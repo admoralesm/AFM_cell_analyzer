@@ -625,7 +625,8 @@ COMPANION_NEEDS = {
                          "baseline_typed", "EXTEND_DASHES",
                          "flat_top_between"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
-                       "table_to_send", "incline", "pad_zero"),
+                       "table_to_send", "incline", "pad_zero",
+                       "side_fit", "side_line", "bridged", "line_value"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -26510,17 +26511,31 @@ FC_ZEROS = ("As recorded", "End of the curve", "Start of the curve")
 FC_UNITS = ("N", "nN", "pN", "m", "µm", "nm", "V", "as stored")
 FC_DIRECTIONS = {"Either way": "either", "Above only": "up",
                  "Below only": "down"}
-FC_CLICKS = ("🎯 Set the end", "🎯 Set the start", "✏ Draw line")
+FC_CORRECT = ("None", "Before and after (bridged)", "Line before only",
+              "Line after only", "One straight line")
+# which side lines each way of correcting uses
+FC_USES = {FC_CORRECT[1]: ("before", "after"), FC_CORRECT[2]: ("before",),
+           FC_CORRECT[3]: ("after",)}
+FC_VIEWS = ("Corrected", "Raw with baseline")
+FC_CLICK_END = "🎯 Set the end"
+FC_CLICK_START = "🎯 Set the start"
+FC_CLICK_PIN = {"before": "📍 Line before: its point",
+                "after": "📍 Line after: its point"}
+FC_CLICK_DRAW = "✏ Draw line"
+FC_CLICKS = (FC_CLICK_END, FC_CLICK_START, FC_CLICK_DRAW)
+FC_CURVE_COLOUR = "#1F4E9C"
+FC_SIDE_COLOUR = {"before": "#2E8B57", "after": "#D2691E"}
+FC_BRIDGE_COLOUR = "#6E6E6E"
 FC_LINE_COLOUR = "#444444"
 FC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 FC_NO_TIME = "(none: use a sampling rate)"
-FC_CORRECT = ("No", "End baseline", "Start and end (incline)", "By hand")
-FC_DEFAULTS = {"fc_base": True, "fc_corr": "No", "fc_shape": "Flat",
-               "fc_dir": "Either way",
-               "fc_ksd": 3.0, "fc_run": 5, "fc_findstart": False,
-               "fc_lw": 1.5, "fc_height": 420, "fc_zero": "As recorded",
-    "fc_pad0": 0.0, "fc_pad1": 0.0,
-               "fc_frac": 15}
+FC_SIDE_KEYS = {"before": ("fc_mvb", "fc_rtb"), "after": ("fc_mva", "fc_rta")}
+FC_DEFAULTS = {"fc_base": True, "fc_corr": "None", "fc_shape": "Sloped",
+               "fc_dir": "Either way", "fc_ksd": 3.0, "fc_run": 5,
+               "fc_findstart": False, "fc_lw": 1.5, "fc_height": 440,
+               "fc_zero": "As recorded", "fc_pad0": 0.0, "fc_pad1": 0.0,
+               "fc_view": "Corrected", "fc_under": True,
+               "fc_mvb": 0.0, "fc_rtb": 0.0, "fc_mva": 0.0, "fc_rta": 0.0}
 
 
 @st.cache_data(max_entries=6, show_spinner=False)
@@ -26543,14 +26558,15 @@ def fc_unit_guess(name, values):
 
 
 def fc_reset(sig):
-    """A new file: its own windows, end and signal choices."""
+    """A new file: its own windows, end, lines and signal choices."""
     s = st.session_state
     if s.get("_fc_sig") == sig:
         return
     for key in ("fc_win", "fc_win0", "fc_end_hand", "fc_start_hand",
                 "fc_ch", "fc_tcol", "fc_fcol", "fc_unit", "fc_xr",
                 "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate",
-                "fc_hand_a", "fc_hand_b", "_fc_lines", "_fc_draft"):
+                "_fc_lines", "_fc_draft", "_fc_pin_next",
+                "fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
         s.pop(key, None)
     s["_fc_sig"] = sig
 
@@ -26657,66 +26673,51 @@ def fc_signal(item):
     return t, y, ylab, stem
 
 
-def fc_hand_defaults(t, y):
-    """Where the hand-set baseline starts out: the line from the window
-    before the curve to the one after it, at the first and last point."""
+def fc_side_reset(side):
+    """↺ Fitted: the line back on its window's fit."""
+    for key in FC_SIDE_KEYS[side]:
+        st.session_state[key] = 0.0
+
+
+def fc_line_card(side, fit, y, t, unit):
+    """One side line: ↕ move and ↻ rotate about where it meets the curve.
+    Returns a placeholder for its readout (filled once the line is
+    known)."""
     s = st.session_state
-    w0 = s.get("fc_win0") or fcv.default_window(t, after=False)
-    w1 = s.get("fc_win") or fcv.default_window(t, after=True)
-    inc = fcv.incline(t, y, w0, w1)
-    if inc is None:
-        level = float(np.nanmedian(y))
-        return level, level
-    a, b = np.polyval(inc["coeffs"], [float(t[0]), float(t[-1])])
-    return float(a), float(b)
+    move_key, turn_key = FC_SIDE_KEYS[side]
+    title = ("Line before the curve" if side == "before"
+             else "Line after the curve")
+    span = float(np.nanmax(y) - np.nanmin(y)) or 1.0
+    duration = float(t[-1] - t[0]) or 1.0
+    rate = " (nN/s)" if unit == " (nN)" else " (per s)"
+    with st.container(border=True):
+        st.markdown(f"<span style='color:{FC_SIDE_COLOUR[side]};"
+                    f"font-weight:700'>━━</span> **{title}**",
+                    unsafe_allow_html=True)
+        if fit is None:
+            st.caption("Its window holds too few points: widen it.")
+            return None
+        st.slider(f"↕ Move{unit}", -0.5 * span, 0.5 * span, key=move_key,
+                  step=span / 2000.0, format="%.4g",
+                  help="Shifts the line up or down at the point where it "
+                       "meets the curve (0 = the fit).")
+        st.slider(f"↻ Rotate{rate}", -span / duration, span / duration,
+                  key=turn_key, step=span / duration / 1000.0, format="%.4g",
+                  help="Turns the line about that point: this is added to "
+                       "its slope (0 = the fit). The arrow keys give small "
+                       "steps.")
+        c1, c2 = st.columns([2.4, 1])
+        readout = c1.empty()
+        c2.button("↺ Fitted", key=f"fc_fit_{side}", on_click=fc_side_reset,
+                  args=(side,), **STRETCH,
+                  help="Back to the straight line fitted in its window.")
+    return readout
 
 
-def fc_hand_reset(t, y):
-    a, b = fc_hand_defaults(t, y)
-    st.session_state["fc_hand_a"] = a
-    st.session_state["fc_hand_b"] = b
-
-
-def fc_hand_line(t):
-    """The hand-set baseline: straight from the start level at the first
-    point to the end level at the last, as the incline is given."""
-    s = st.session_state
-    t0, t1 = float(t[0]), float(t[-1])
-    a, b = float(s["fc_hand_a"]), float(s["fc_hand_b"])
-    slope = (b - a) / (t1 - t0) if t1 > t0 else 0.0
-    return {"coeffs": np.array([slope, a - slope * t0]), "start": (t0, a),
-            "end": (t1, b), "by_hand": True}
-
-
-def fc_hand_controls(t, y, unit):
-    """Two sliders: the baseline at the start and at the end."""
-    s = st.session_state
-    lo, hi = float(np.nanmin(y)), float(np.nanmax(y))
-    pad = 0.1 * (hi - lo) if hi > lo else 1.0
-    lo, hi = lo - pad, hi + pad
-    if "fc_hand_a" not in s or "fc_hand_b" not in s:
-        s["fc_hand_a"], s["fc_hand_b"] = fc_hand_defaults(t, y)
-    step = (hi - lo) / 4000.0
-    h1, h2, h3 = st.columns([2, 2, 1])
-    h1.slider(f"Baseline at the start{unit}", lo, hi, key="fc_hand_a",
-              step=step, format="%.4g",
-              help=f"Its level at the first point (t = {t[0]:.4g} s). "
-                   "The arrow keys move it in small steps.")
-    h2.slider(f"Baseline at the end{unit}", lo, hi, key="fc_hand_b",
-              step=step, format="%.4g",
-              help=f"Its level at the last point (t = {t[-1]:.4g} s).")
-    h3.button("↺ From the windows", key="fc_hand_reset", **STRETCH,
-              on_click=fc_hand_reset, args=(t, y),
-              help="Back to the straight line through the two shaded "
-                   "windows.")
-    st.caption("The baseline is the straight line from the start level to "
-               "the end level. Move them until the corrected curve sits "
-               "on the dotted zero line at both ends.")
-
-
-def fc_baseline_controls(t, y=None, unit=""):
-    """The 〰 baseline after the end (and, if wanted, before the start).
-    Returns the settings."""
+def fc_baseline_controls(t, y, unit=""):
+    """The 〰 baseline card: how it is taken off, its windows, a card per
+    side line, the view and the dashed baseline under the curve. Returns
+    the settings (with the side fits and readout placeholders)."""
     s = st.session_state
     lo, hi = float(t[0]), float(t[-1])
     step = max((hi - lo) / 2000.0, 1e-9)
@@ -26725,33 +26726,48 @@ def fc_baseline_controls(t, y=None, unit=""):
     span = (round(lo, 9), round(hi, 9))
     if s.get("_fc_span") != span:
         for key in ("fc_win", "fc_win0", "fc_xr", "fc_end_hand",
-                    "fc_start_hand", "fc_hand_a", "fc_hand_b"):
+                    "fc_start_hand", "fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
             s.pop(key, None)
         s["_fc_span"] = span
+    if s.get("fc_corr") not in FC_CORRECT:
+        s["fc_corr"] = FC_CORRECT[0]
+    for key in ("fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
+        s.setdefault(key, 0.0)
+    if "fc_win" not in s:
+        s["fc_win"] = tuple(fcv.default_window(t, after=True))
+    if "fc_win0" not in s:
+        s["fc_win0"] = tuple(fcv.default_window(t, after=False))
+    mode = s["fc_corr"]
+    uses = FC_USES.get(mode, ())
+    opts = {"readout": {}, "fits": (None, None)}
     with st.container(border=True):
-        b1, b5, b2, b3, b4 = st.columns([1.45, 1.05, 0.95, 1.05, 0.9])
-        on = b1.toggle("〰 Baseline after the end", key="fc_base",
-                       help="A baseline is fitted to the quiet stretch after "
-                            "the curve (the shaded window); the curve ends "
-                            "the last moment the force is away from it.")
-        b5.selectbox("Correct (subtract)", FC_CORRECT, key="fc_corr",
-                     disabled=not on,
-                     help="Takes a baseline away from the whole curve. End "
-                          "baseline: the one after the end, so it ends on "
-                          "zero. Start and end (incline): the straight line "
-                          "from the baseline before the curve to the one "
-                          "after it, so it starts and ends on zero. By "
-                          "hand: a straight line whose start and end you "
-                          "set with two sliders. The plot, the numbers, the "
-                          "CSV and what is sent to the stack all use the "
-                          "corrected force.")
-        b2.radio("Shape", ("Flat", "Sloped"), key="fc_shape",
-                 horizontal=True, label_visibility="collapsed",
-                 disabled=not on)
-        b3.toggle("Also find the start", key="fc_findstart", disabled=not on,
-                  help="A second baseline before the curve gives where it "
-                       "starts, so the duration and area too.")
-        with b4.popover("⚙ Detection", disabled=not on, **STRETCH):
+        b1, b2, b3, b4, b5 = st.columns([1.2, 1.7, 1.0, 1.1, 0.9])
+        on = b1.toggle("〰 Baseline", key="fc_base",
+                       help="Baselines fitted on quiet stretches before and "
+                            "after the curve (the shaded windows): they give "
+                            "where the curve starts and ends, and can be "
+                            "taken off.")
+        b2.selectbox(
+            "Correct (subtract)", FC_CORRECT, key="fc_corr", disabled=not on,
+            help="Before and after (bridged): a line on each side, each with "
+                 "its own level and tilt, joined under the curve by a "
+                 "straight bridge, so both sides end flat at zero. Line "
+                 "before / after only: one side's line all the way. One "
+                 "straight line: through the two windows' means.")
+        b3.radio("Fit", ("Flat", "Sloped"), key="fc_shape", horizontal=True,
+                 disabled=not on,
+                 help="How each window's line is fitted: its mean (flat) or "
+                      "a straight line through it (sloped).")
+        needs_start = bool(uses) or mode == FC_CORRECT[4]
+        if on and needs_start:
+            b4.caption("✓ Start and end both found (the lines meet the "
+                       "curve there)")
+        else:
+            b4.toggle("Find the start", key="fc_findstart",
+                      disabled=not on,
+                      help="Where the curve starts, from the window before "
+                           "it, for the duration and area too.")
+        with b5.popover("⚙ Detection", disabled=not on, **STRETCH):
             st.selectbox("Counts as part of the curve", list(FC_DIRECTIONS),
                          key="fc_dir",
                          help="Above only: an adhesion dip at the end is not "
@@ -26761,28 +26777,59 @@ def fc_baseline_controls(t, y=None, unit=""):
             st.number_input("For at least (points in a row)", 1, 1000,
                             key="fc_run")
         if on:
-            if "fc_win" not in s:
-                s["fc_win"] = tuple(fcv.default_window(t, after=True))
-            st.slider("Baseline window after the end (s)", lo, hi,
-                      key="fc_win", step=step, format="%.4g",
-                      help="Drag both ends onto a flat stretch after the "
+            w1, w2 = st.columns(2)
+            w1.slider("Window before the curve (s)", lo, hi, key="fc_win0",
+                      step=step, format="%.4g",
+                      help="Drag both ends onto a quiet stretch before the "
                            "curve.")
-            if on and s.get("fc_corr") == FC_CORRECT[3] and y is not None:
-                fc_hand_controls(t, y, unit)
-            if s.get("fc_findstart") or s.get("fc_corr") == FC_CORRECT[2]:
-                if "fc_win0" not in s:
-                    s["fc_win0"] = tuple(fcv.default_window(t, after=False))
-                st.slider("Baseline window before the start (s)", lo, hi,
-                          key="fc_win0", step=step, format="%.4g",
-                          help="Drag both ends onto a flat stretch before "
-                               "the curve.")
-    return {"on": on, "order": 1 if s.get("fc_shape") == "Sloped" else 0,
-            "direction": FC_DIRECTIONS.get(s.get("fc_dir"), "either"),
-            "k": float(s.get("fc_ksd") or 3.0),
-            "run": int(s.get("fc_run") or 5),
-            "start": bool(on and s.get("fc_findstart")),
-            "correct": (s.get("fc_corr", FC_CORRECT[0]) if on
-                        else FC_CORRECT[0])}
+            w2.slider("Window after the curve (s)", lo, hi, key="fc_win",
+                      step=step, format="%.4g",
+                      help="Drag both ends onto a quiet stretch after the "
+                           "curve.")
+            sloped = s.get("fc_shape") == "Sloped"
+            fits = (fcv.side_fit(t, y, s["fc_win0"], sloped),
+                    fcv.side_fit(t, y, s["fc_win"], sloped))
+            opts["fits"] = fits
+            # a point clicked on the plot for a line: that line meets the
+            # curve there (its time) and passes through it (its move)
+            pin = s.pop("_fc_pin_next", None)
+            if pin:
+                side, px, py = pin
+                fit = fits[0 if side == "before" else 1]
+                s["fc_start_hand" if side == "before" else "fc_end_hand"] = px
+                if fit is not None:
+                    s[FC_SIDE_KEYS[side][0]] = float(
+                        py - (fit["slope"] * px + fit["intercept"]))
+            if uses:
+                cards = st.columns(2)
+                for k, side in enumerate(("before", "after")):
+                    if side in uses:
+                        with cards[k]:
+                            opts["readout"][side] = fc_line_card(
+                                side, fits[k], y, t, unit)
+            if mode != FC_CORRECT[0]:
+                v1, v2 = st.columns([1.4, 2.0])
+                v1.segmented_control("Show", FC_VIEWS, key="fc_view",
+                                     label_visibility="collapsed",
+                                     help="Corrected: the force less the "
+                                          "baseline. Raw with baseline: the "
+                                          "force as read, with the lines "
+                                          "drawn on it.")
+                v2.toggle("┄ Baseline under the curve (dashed)",
+                          key="fc_under",
+                          help="A dashed line under the curve from where it "
+                               "starts to where it ends: the baseline it is "
+                               "measured from. Sent to the stack with it.")
+    opts.update({
+        "on": on, "order": 1 if s.get("fc_shape") == "Sloped" else 0,
+        "direction": FC_DIRECTIONS.get(s.get("fc_dir"), "either"),
+        "k": float(s.get("fc_ksd") or 3.0),
+        "run": int(s.get("fc_run") or 5),
+        "start": bool(on and (s.get("fc_findstart") or uses
+                              or mode == FC_CORRECT[4])),
+        "correct": mode if on else FC_CORRECT[0], "uses": uses if on else (),
+        "unit": unit.strip(" ()")})
+    return opts
 
 
 def fc_analyse(t, y, opts):
@@ -26810,30 +26857,225 @@ def fc_analyse(t, y, opts):
     return end, start
 
 
-def fc_figure(t, y, ylab, end, start, segments, clickable,
-              start_window=None, zero_line=False, grid=False):
+def fc_model(t, y, opts):
+    """
+    What the baseline makes of the curve: the force as shown (corrected or
+    not), the baseline itself (in the force as read), the side lines and
+    where they meet the curve, the start and end, all in one dict.
+    """
     s = st.session_state
-    colour, base_colour = "#1f77b4", "#F58231"
+    m = {"mode": opts["correct"], "corrected": False, "raw": y, "shown": y,
+         "base": None, "end": None, "start": None, "ts": None, "te": None,
+         "before": None, "after": None, "incline": None, "under": False,
+         "fits": opts.get("fits", (None, None))}
+    if not opts["on"]:
+        return m
+    end, start = fc_analyse(t, y, opts)
+    m["end"], m["start"] = end, start
+    uses = opts["uses"]
+    if uses:
+        fb, fa = m["fits"]
+        found_s = start.get("start") if start else None
+        found_e = end.get("end") if end else None
+        # where each line meets the curve: the start and end found (or
+        # clicked), else the inner edge of its window
+        ts = found_s if found_s is not None else max(s["fc_win0"])
+        te = found_e if found_e is not None else min(s["fc_win"])
+        lb = (fcv.side_line(fb, ts, s["fc_mvb"], s["fc_rtb"])
+              if "before" in uses and fb else None)
+        la = (fcv.side_line(fa, te, s["fc_mva"], s["fc_rta"])
+              if "after" in uses and fa else None)
+        base = fcv.bridged(t, lb, la)
+        if base is None:
+            st.warning("A baseline window holds too few points: widen it.",
+                       icon="〰")
+            return m
+        sd_b = fb["sd"] if fb else 0.0
+        sd_a = fa["sd"] if fa else sd_b
+        m.update(corrected=True, shown=y - base, base=base, before=lb,
+                 after=la, ts=ts, te=te)
+        # in corrected terms the baseline is 0 on both sides
+        m["end"] = dict(end, coeffs=np.array([0.0]), level=0.0, sd=sd_a)
+        m["start"] = {"start": found_s, "coeffs": np.array([0.0]),
+                      "level": 0.0, "sd": sd_b,
+                      "window": tuple(s["fc_win0"]),
+                      "by_hand": bool(start and start.get("by_hand"))}
+        m["under"] = bool(s.get("fc_under")) and te > ts
+        for side, line in (("before", lb), ("after", la)):
+            ph = opts["readout"].get(side)
+            if ph is not None and line is not None:
+                u = opts.get("unit") or ""
+                adjusted = (abs(line["level"] - line["fit_level"]) > 1e-12
+                            or abs(line["slope"] - line["fit_slope"]) > 1e-12)
+                ph.caption(
+                    f"Meets the curve at **{line['t']:.4g} s**, "
+                    f"{line['level']:.4g} {u} · slope "
+                    f"{line['slope']:.3g} {u}/s"
+                    + (f" (fit: {line['fit_level']:.4g} {u}, "
+                       f"{line['fit_slope']:.3g} {u}/s)" if adjusted
+                       else " (as fitted)"))
+    elif opts["correct"] == FC_CORRECT[4]:
+        inc = fcv.incline(t, y, s["fc_win0"], s["fc_win"])
+        if inc is None:
+            st.warning("A baseline window holds too few points to draw the "
+                       "line: widen the windows.", icon="〰")
+            return m
+        base = np.polyval(inc["coeffs"], t)
+        shown = y - base
+        # the end (and start) found again on the corrected, level curve
+        end2, start2 = fc_analyse(t, shown, opts)
+        m.update(corrected=True, shown=shown, base=base, incline=inc,
+                 end=end2, start=start2,
+                 ts=(start2 or {}).get("start"), te=(end2 or {}).get("end"))
+        m["under"] = (bool(s.get("fc_under")) and m["ts"] is not None
+                      and m["te"] is not None and m["te"] > m["ts"])
+    return m
+
+
+def fc_marker(fig, x, colour, text, by_hand):
+    """A dashed vertical line with its label above the plot."""
+    fig.add_vline(x=x, line=dict(color=colour, width=1.6, dash="dash"))
+    fig.add_annotation(x=x, y=1.0, yref="paper", yanchor="bottom", yshift=6,
+                       showarrow=False, font=dict(color=colour, size=13),
+                       text=f"<b>{text} {x:.4g} s</b>"
+                            + (" (by hand)" if by_hand else ""))
+
+
+def fc_figure(t, m, ylab, segments, clickable, grid=False, view=None):
+    """The force against time, with the baseline as the model has it:
+    corrected (the force less the baseline, on its zero line) or raw (the
+    force as read, with each side line, the bridge and the points where
+    they meet the curve)."""
+    s = st.session_state
+    lw = float(s.get("fc_lw", 1.5))
+    raw_view = (not m["corrected"]) or view == FC_VIEWS[1]
+    y = m["raw"] if raw_view else m["shown"]
     keep = sc.thin_index(y) if sc else np.arange(y.size)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=t[keep], y=y[keep], mode="lines+markers" if clickable else "lines",
-        name=ylab, line=dict(color=colour, width=float(s.get("fc_lw", 1.5))),
-        # small while drawing lines, so the nearest point (of the curve or
-        # of the click grid) takes a click
-        marker=dict(size=6 if grid else 12, opacity=0) if clickable
-        else None,
+        name=ylab if raw_view else (
+            "Force − baseline (nN)" if ylab == "Force (nN)"
+            else f"{ylab} − baseline"),
+        line=dict(color=FC_CURVE_COLOUR, width=lw),
+        # small: the nearest point (of the curve, or of the click grid
+        # while drawing lines) takes a click, not the first of a tie
+        marker=dict(size=6, opacity=0) if clickable else None,
         hovertemplate="%{x:.5g} s<br>%{y:.4g}<extra></extra>"))
-    if zero_line:
+    for i in segments or ():
+        if 0 <= i < t.size:
+            fig.add_vline(x=float(t[i]), line=dict(color="#B0B0B0", width=1,
+                                                   dash="dot"))
+    end, start = m["end"], m["start"]
+    shade = dict(fillcolor="#8C8C8C", opacity=0.10, line_width=0)
+    if m["corrected"] and raw_view:
+        # the windows, each side line where it is fitted and carried on,
+        # the bridge under the curve and the points where they meet it
+        for side, window in (("before", s.get("fc_win0")),
+                             ("after", s.get("fc_win"))):
+            if window and (side in FC_USES.get(m["mode"], ())
+                           or m["incline"] is not None):
+                fig.add_vrect(x0=window[0], x1=window[1], **shade)
+        lb, la = m["before"], m["after"]
+        if lb is not None:
+            xs = np.array([t[0], lb["t"]])
+            fig.add_trace(go.Scatter(
+                x=xs, y=fcv.line_value(lb, xs), mode="lines",
+                name="Line before the curve", hoverinfo="skip",
+                line=dict(color=FC_SIDE_COLOUR["before"], width=lw + 1.5)))
+            if la is None:
+                xs = np.array([lb["t"], t[-1]])
+                fig.add_trace(go.Scatter(
+                    x=xs, y=fcv.line_value(lb, xs), mode="lines",
+                    showlegend=False, hoverinfo="skip",
+                    line=dict(color=FC_SIDE_COLOUR["before"], width=lw,
+                              dash="dot")))
+        if la is not None:
+            xs = np.array([la["t"], t[-1]])
+            fig.add_trace(go.Scatter(
+                x=xs, y=fcv.line_value(la, xs), mode="lines",
+                name="Line after the curve", hoverinfo="skip",
+                line=dict(color=FC_SIDE_COLOUR["after"], width=lw + 1.5)))
+            if lb is None:
+                xs = np.array([t[0], la["t"]])
+                fig.add_trace(go.Scatter(
+                    x=xs, y=fcv.line_value(la, xs), mode="lines",
+                    showlegend=False, hoverinfo="skip",
+                    line=dict(color=FC_SIDE_COLOUR["after"], width=lw,
+                              dash="dot")))
+        if lb is not None and la is not None and la["t"] > lb["t"]:
+            fig.add_trace(go.Scatter(
+                x=[lb["t"], la["t"]], y=[lb["level"], la["level"]],
+                mode="lines", name="Bridge under the curve",
+                hoverinfo="skip",
+                line=dict(color=FC_BRIDGE_COLOUR, width=lw + 0.5,
+                          dash="dash")))
+        if m["incline"] is not None:
+            fig.add_trace(go.Scatter(
+                x=t[[0, -1]], y=m["base"][[0, -1]], mode="lines",
+                name="Baseline (one straight line)", hoverinfo="skip",
+                line=dict(color=FC_BRIDGE_COLOUR, width=lw + 1,
+                          dash="dash")))
+        for side, line in (("before", lb), ("after", la)):
+            if line is not None:
+                fig.add_trace(go.Scatter(
+                    x=[line["t"]], y=[line["level"]], mode="markers",
+                    showlegend=False, name=f"line {side} meets the curve",
+                    # no hover: a click near it still reaches the curve
+                    hoverinfo="skip",
+                    marker=dict(symbol="circle", size=11, color="white",
+                                line=dict(color=FC_SIDE_COLOUR[side],
+                                          width=2.5))))
+    elif m["corrected"]:
+        # corrected: the zero line, and the dashed baseline closing the
+        # curve from its start to its end
         fig.add_hline(y=0, line=dict(color="#555", width=1, dash="dot"))
+        if m["under"]:
+            fig.add_trace(go.Scatter(
+                x=[m["ts"], m["te"]], y=[0.0, 0.0], mode="lines",
+                name="Baseline under the curve", hoverinfo="skip",
+                line=dict(color=FC_BRIDGE_COLOUR, width=lw + 0.5,
+                          dash="dash")))
+    elif end and end.get("coeffs") is not None:
+        # nothing taken off: the baseline after the end (and before the
+        # start) as fitted, on the force as read
+        a, b = end["window"]
+        fig.add_vrect(x0=a, x1=b, **shade)
+        from_t = end["end"] if end.get("end") is not None else a
+        xs = np.linspace(from_t, t[-1], 50)
+        fig.add_trace(go.Scatter(
+            x=xs, y=np.polyval(end["coeffs"], xs), mode="lines",
+            name="Baseline after the end", hoverinfo="skip",
+            line=dict(color=FC_SIDE_COLOUR["after"], width=lw + 1.5)))
+        if start and start.get("coeffs") is not None:
+            a, b = start["window"]
+            fig.add_vrect(x0=a, x1=b, **shade)
+            to_t = start["start"] if start.get("start") is not None else b
+            xs = np.linspace(t[0], to_t, 50)
+            fig.add_trace(go.Scatter(
+                x=xs, y=np.polyval(start["coeffs"], xs), mode="lines",
+                name="Baseline before the start", hoverinfo="skip",
+                line=dict(color=FC_SIDE_COLOUR["before"], width=lw + 1.5)))
+    # where the curve starts and ends, and how long it lasts
+    if end and end.get("end") is not None:
+        fc_marker(fig, end["end"], FC_SIDE_COLOUR["after"], "End",
+                  end.get("by_hand"))
+    if start and start.get("start") is not None:
+        fc_marker(fig, start["start"], FC_SIDE_COLOUR["before"], "Start",
+                  start.get("by_hand"))
+        if end and end.get("end") is not None \
+                and end["end"] > start["start"]:
+            fig.add_annotation(
+                x=0.5 * (start["start"] + end["end"]), y=0.95, yref="paper",
+                showarrow=False, font=dict(size=13, color="#333"),
+                text=f"↔ {end['end'] - start['start']:.4g} s")
     # dashed lines drawn by hand, and the start of the one being drawn
     for ln in s.get("_fc_lines") or ():
         fig.add_trace(go.Scatter(
             x=[p[0] for p in ln["pts"]], y=[p[1] for p in ln["pts"]],
             mode="lines", showlegend=False, hoverinfo="skip",
             name="line drawn",
-            line=dict(color=ln.get("colour") or FC_LINE_COLOUR,
-                      width=float(s.get("fc_lw", 1.5)),
+            line=dict(color=ln.get("colour") or FC_LINE_COLOUR, width=lw,
                       dash=sc.EXTEND_DASHES.get(ln.get("dash"), "dash"))))
     draft = s.get("_fc_draft")
     if draft:
@@ -26853,67 +27095,20 @@ def fc_figure(t, y, ylab, end, start, segments, clickable,
             x=gx.ravel(), y=gy.ravel(), mode="markers", showlegend=False,
             hoverinfo="none", name="anywhere",
             marker=dict(size=6, opacity=0, color="#000")))
-    for i in segments or ():
-        if 0 <= i < t.size:
-            fig.add_vline(x=float(t[i]), line=dict(color="#999", width=1,
-                                                   dash="dot"))
-    if end and end.get("coeffs") is not None:
-        a, b = end["window"]
-        fig.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.10,
-                      line_width=0)
-        from_t = end["end"] if end.get("end") is not None else a
-        xs = np.linspace(from_t, t[-1], 50)
-        fig.add_trace(go.Scatter(
-            x=xs, y=np.polyval(end["coeffs"], xs), mode="lines",
-            name="Baseline after the end", hoverinfo="skip",
-            line=dict(color=base_colour, width=3)))
-        if end.get("end") is not None:
-            fig.add_vline(x=end["end"], line=dict(color=base_colour,
-                                                  width=2, dash="dash"))
-            fig.add_annotation(
-                x=end["end"], y=1.0, yref="paper", yanchor="bottom",
-                yshift=6, showarrow=False, font=dict(color=base_colour, size=13),
-                text=f"<b>End {end['end']:.4g} s</b>"
-                     + (" (by hand)" if end.get("by_hand") else ""))
-    if start_window and not (start and start.get("coeffs") is not None):
-        # the window the start of the incline is taken from
-        fig.add_vrect(x0=start_window[0], x1=start_window[1],
-                      fillcolor="#888888", opacity=0.10, line_width=0)
-    if start and start.get("coeffs") is not None:
-        a, b = start["window"]
-        fig.add_vrect(x0=a, x1=b, fillcolor="#888888", opacity=0.10,
-                      line_width=0)
-        to_t = start["start"] if start.get("start") is not None else b
-        xs = np.linspace(t[0], to_t, 50)
-        fig.add_trace(go.Scatter(
-            x=xs, y=np.polyval(start["coeffs"], xs), mode="lines",
-            name="Baseline before the start", hoverinfo="skip",
-            line=dict(color="#3CB44B", width=3)))
-        if start.get("start") is not None:
-            fig.add_vline(x=start["start"], line=dict(color="#3CB44B",
-                                                      width=2, dash="dash"))
-            fig.add_annotation(
-                x=start["start"], y=1.0, yref="paper", yanchor="bottom",
-                yshift=6, showarrow=False, font=dict(color="#3CB44B", size=13),
-                text=f"<b>Start {start['start']:.4g} s</b>"
-                     + (" (by hand)" if start.get("by_hand") else ""))
-            if end and end.get("end") is not None \
-                    and end["end"] > start["start"]:
-                mid = 0.5 * (start["start"] + end["end"])
-                fig.add_annotation(
-                    x=mid, y=0.93, yref="paper", showarrow=False,
-                    text=f"↔ {end['end'] - start['start']:.4g} s",
-                    font=dict(size=13))
     xr = s.get("fc_xr")
+    axis = dict(showline=True, linecolor="black", linewidth=1.2, mirror=True,
+                ticks="outside", ticklen=5, tickwidth=1.2, showgrid=True,
+                gridcolor="#ECECEC", zeroline=False,
+                title_font=dict(size=15), tickfont=dict(size=13))
     fig.update_layout(
-        height=int(s.get("fc_height", 420)), template="plotly_white",
-        margin=dict(l=70, r=20, t=64, b=55), showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.09, x=0),
-        xaxis=dict(title="Time (s)", showline=True, linecolor="black",
-                   mirror=True, ticks="outside",
-                   range=list(xr) if xr else None),
-        yaxis=dict(title=ylab, showline=True, linecolor="black",
-                   mirror=True, ticks="outside"),
+        height=int(s.get("fc_height", 440)), template="plotly_white",
+        margin=dict(l=75, r=20, t=64, b=58), showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.09, x=0,
+                    font=dict(size=12)),
+        xaxis=dict(title="Time (s)", range=list(xr) if xr else None, **axis),
+        yaxis=dict(title=(ylab if raw_view else (
+            "Force − baseline (nN)" if ylab == "Force (nN)"
+            else f"{ylab} − baseline")), **axis),
         hovermode="closest", dragmode="zoom",
         # a zoom survives other changes; moving "Time shown" resets it
         uirevision=f"fc-{xr}")
@@ -26991,28 +27186,39 @@ def fc_lines_panel(drawing):
                   on_click=fc_line_delete, args=(ln["id"],), **STRETCH)
 
 
-def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None,
-            zero_line=False):
-    """The plot, with a click setting the end (or start) by hand, or
-    drawing a line."""
+def fc_plot(t, m, ylab, stem, segments):
+    """The plot, with a click setting the end (or start), placing a side
+    line at a point, or drawing a line."""
     s = st.session_state
-    p1, p2, p3, p4 = st.columns([2.6, 1.0, 1.0, 1.0])
-    clicks = ([FC_CLICKS[0]] + ([FC_CLICKS[1]] if start is not None else [])
-              + [FC_CLICKS[2]])
+    uses = FC_USES.get(m["mode"], ())
+    clicks = []
+    if "before" in uses:
+        clicks.append(FC_CLICK_PIN["before"])
+    elif m["start"] is not None:
+        clicks.append(FC_CLICK_START)
+    if "after" in uses:
+        clicks.append(FC_CLICK_PIN["after"])
+    elif m["end"] is not None:
+        clicks.append(FC_CLICK_END)
+    clicks.append(FC_CLICK_DRAW)
     if s.get("fc_clickdo") not in clicks:
         s["fc_clickdo"] = None
-    p1.segmented_control("What a click on the plot does", clicks,
-                         key="fc_clickdo", label_visibility="collapsed",
-                         help="Set the end (or start): click the moment the "
-                              "curve really ends (or starts). Draw line: a "
-                              "click for the start, a click for the end. "
-                              "Click the chosen button again to stop.")
+    p1, p2, p3 = st.columns([3.4, 1.0, 1.0])
+    p1.segmented_control(
+        "What a click on the plot does", clicks, key="fc_clickdo",
+        label_visibility="collapsed",
+        help="📍 Line before / after: click the point where that line should "
+             "meet the curve; it passes through it and turns about it. 🎯 "
+             "Set the end (start): click the moment the curve ends (starts). "
+             "✏ Draw line: a click for the start, a click for the end. "
+             "Click the chosen button again to stop.")
     hand = s.get("fc_end_hand") is not None or \
         s.get("fc_start_hand") is not None
     p2.button("↺ Automatic", key="fc_auto", disabled=not hand, **STRETCH,
               on_click=lambda: [s.pop("fc_end_hand", None),
                                 s.pop("fc_start_hand", None)],
-              help="Back to the end (and start) found from the baseline.")
+              help="The start and end found from the baselines again, not "
+                   "the clicked ones.")
     with p3.popover("🎨 Plot", **STRETCH):
         st.slider("Line thickness", 0.5, 6.0, step=0.25, key="fc_lw")
         st.slider("Plot height", 250, 900, step=10, key="fc_height")
@@ -27021,11 +27227,12 @@ def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None,
             s["fc_xr"] = (lo, hi)
         st.slider("Time shown (s)", lo, hi, key="fc_xr",
                   step=max((hi - lo) / 2000.0, 1e-9), format="%.4g")
-    p4.caption("Drag to zoom · double-click to reset")
+        st.caption("Drag on the plot to zoom; double-click to reset.")
     click_do = s.get("fc_clickdo")
-    drawing = click_do == FC_CLICKS[2]
-    fig = fc_figure(t, y, ylab, end, start, segments, bool(click_do),
-                    start_window, zero_line, grid=drawing)
+    drawing = click_do == FC_CLICK_DRAW
+    view = s.get("fc_view") or FC_VIEWS[0]
+    fig = fc_figure(t, m, ylab, segments, bool(click_do), grid=drawing,
+                    view=view)
     config = {"scrollZoom": True, "doubleClick": "reset",
               "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
     if click_do:
@@ -27039,15 +27246,28 @@ def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None,
         except Exception:
             points = []
         if points:
-            when = float(points[-1]["x"])
+            point = points[-1]
+            x, y_click = float(point["x"]), float(point["y"])
             s["_fc_chart_ver"] = version + 1
             if drawing:
-                fc_line_click(points[-1])
+                fc_line_click(point)
+            elif click_do in FC_CLICK_PIN.values():
+                side = ("before" if click_do == FC_CLICK_PIN["before"]
+                        else "after")
+                # the point in the force as read, whichever view was shown
+                if m["corrected"] and view == FC_VIEWS[0]:
+                    y_click += float(np.interp(x, t, m["base"]))
+                s["_fc_pin_next"] = (side, x, y_click)
             else:
-                s["fc_end_hand" if click_do == FC_CLICKS[0]
-                  else "fc_start_hand"] = when
+                s["fc_end_hand" if click_do == FC_CLICK_END
+                  else "fc_start_hand"] = x
             st.rerun()
-        if not drawing:
+        if click_do in FC_CLICK_PIN.values():
+            st.caption("📍 Click the point where this line should meet the "
+                       "curve: it moves there and turns about it (↻ Rotate). "
+                       "↺ Automatic gives back the time found; ↺ Fitted its "
+                       "level and tilt.")
+        elif not drawing:
             st.caption("Point at the moment and click; the crosshair snaps "
                        "to the point a click takes. ↺ Automatic undoes it.")
     else:
@@ -27056,54 +27276,62 @@ def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None,
         fc_lines_panel(drawing)
 
 
-def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
-    """The numbers, the file to take away and the trip to the stack.
-    ``y`` is the force as shown (corrected or not), ``raw`` the force as
-    read with its baseline, for the table."""
+def fc_results(t, m, ylab, stem):
+    """The numbers, the file to take away and the trip to the stack."""
     s = st.session_state
-    raw = raw or {"y": y, "end": end}
     unit = "nN" if ylab == "Force (nN)" else ""
+    y = m["shown"]
+    end, start = m["end"], m["start"]
     lines, nums = fcv.curve_stats(t, y, end or {}, start, unit=unit)
-    inc = raw.get("incline") if raw.get("line") is not None else None
-    if corrected and (raw.get("end") or {}).get("level") is not None:
-        was = raw["end"]
-        level_text = was["level"] if abs(was["level"]) > 1e-9 else 0.0
-        lines = [(a, f"{level_text:.4g} ± {was['sd']:.2g} {unit}"
-                     + ("" if inc else ", subtracted"))
-                 if a == "Baseline after the end" else (a, b)
-                 for a, b in lines]
-    if corrected and inc:
+    lb, la, inc = m["before"], m["after"], m["incline"]
+    taken = None
+    if m["corrected"] and (lb or la):
+        parts = []
+        for name, line in (("before", lb), ("after", la)):
+            if line is not None:
+                parts.append(f"line {name} {line['level']:.4g} {unit} at "
+                             f"{line['t']:.4g} s, slope "
+                             f"{line['slope']:.3g} {unit}/s")
+        taken = "; ".join(parts) + ("; bridged under the curve"
+                                    if lb and la else "")
+    elif m["corrected"] and inc:
         (ta, ya), (tb, yb) = inc["start"], inc["end"]
-        lines.append(("Baseline taken away",
-                      f"line from {ya:.4g} {unit} ({ta:.3g} s) to "
-                      f"{yb:.4g} {unit} ({tb:.3g} s)"
-                      + (", set by hand" if inc.get("by_hand") else "")))
-    m = st.columns(4)
-    m[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
+        taken = (f"one line from {ya:.4g} {unit} ({ta:.3g} s) to "
+                 f"{yb:.4g} {unit} ({tb:.3g} s)")
+    if m["corrected"]:
+        lines = [(a, b) for a, b in lines if a != "Baseline after the end"]
+        if taken:
+            lines.append(("Baseline taken away", taken))
+    k = st.columns(4)
+    k[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
                 if "end_s" in nums else "not found",
                 help="Where the force is back on the baseline after the "
-                     "curve." if end else "Turn on the baseline after the "
-                                          "end to find it.")
-    level = (raw["end"] or {}).get("level")
-    m[1].metric("Baseline taken away" if inc else "Baseline after the end",
-                (f"{inc['start'][1]:.3g} → {inc['end'][1]:.3g} {unit}"
-                 if inc else
-                 f"{level:.3g} {unit}" + (" (taken away)" if corrected
-                                          else ""))
-                if "baseline" in nums and level is not None else "-",
-                help=(f"± {nums['baseline_sd']:.2g} {unit} (SD in the window)"
-                      if "baseline_sd" in nums else None))
-    m[2].metric("Peak force (from the baseline)",
+                     "curve.")
+    if m["corrected"] and (lb or la):
+        levels = [f"{line['level']:.3g}" for line in (lb, la) if line]
+        k[1].metric("Baseline taken away", " → ".join(levels) + f" {unit}",
+                    help="Where the side line(s) meet the curve; " + taken)
+    elif m["corrected"] and inc:
+        k[1].metric("Baseline taken away",
+                    f"{inc['start'][1]:.3g} → {inc['end'][1]:.3g} {unit}",
+                    help=taken)
+    else:
+        k[1].metric("Baseline after the end",
+                    f"{nums['baseline']:.3g} {unit}" if "baseline" in nums
+                    else "-",
+                    help=(f"± {nums['baseline_sd']:.2g} {unit} (SD in the "
+                          "window)" if "baseline_sd" in nums else None))
+    k[2].metric("Peak force (from the baseline)",
                 f"{nums['peak']:.4g} {unit}" if "peak" in nums else "-",
                 help=(f"at {nums['peak_t']:.4g} s" if "peak_t" in nums
                       else None))
-    m[3].metric("Duration", f"{nums['duration_s']:.4g} s"
+    k[3].metric("Duration", f"{nums['duration_s']:.4g} s"
                 if "duration_s" in nums else "-",
-                help="Start to end; turn on Also find the start."
-                if "duration_s" not in nums else None)
+                help="From start to end." if "duration_s" in nums
+                else "Needs the start: turn on Find the start.")
     if end is not None and end.get("end") is None:
         st.warning("The force never comes back to the baseline: move the "
-                   "window onto a flat stretch after the curve, or click "
+                   "window onto a quiet stretch after the curve, or click "
                    "the end on the plot.", icon="〰")
     if lines:
         st.caption(" · ".join(f"{a}: {b}" for a, b in lines))
@@ -27113,59 +27341,66 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
                     or (z == "Start of the curve" and "start_s" in nums)]
     if s.get("fc_zero") not in zero_options:
         s["fc_zero"] = "As recorded"
-    r1, r2, r3 = st.columns([1.3, 1.4, 1.2])
-    zero_at = r1.selectbox(
-        "Time zero at", zero_options, key="fc_zero",
-        help="Time in the table sent on (and saved) counts from here, so "
-             "curves line up by their end (or start) on the stack.")
-    zero = {"End of the curve": nums.get("end_s"),
-            "Start of the curve": nums.get("start_s")}.get(zero_at) or 0.0
-    table = fcv.table_to_send(t, raw["y"], raw["end"], zero,
-                              corrected=corrected, line=raw.get("line"))
-    q1, q2, q3 = st.columns([1.0, 1.0, 2.2])
-    q1.number_input("Zero force before (s)", 0.0, 1e6, step=1.0,
-                    key="fc_pad0", format="%.4g",
-                    help="Adds points at zero force for this long ahead of "
-                         "the first point.")
-    q2.number_input("Zero force after (s)", 0.0, 1e6, step=1.0,
-                    key="fc_pad1", format="%.4g",
-                    help="Adds points at zero force for this long past the "
-                         "last point.")
-    q3.caption("Zero force added before and after the data, so on the "
-               "stack the corrected baseline goes on at 0 beside longer "
-               "recordings. Saved in the CSV too. With Correct (subtract) "
-               "off, the force as read follows its baseline there instead.")
-    table = fcv.pad_zero(table, s.get("fc_pad0") or 0.0,
-                         s.get("fc_pad1") or 0.0)
-    if ylab != "Force (nN)":
-        table = table.rename(columns={
-            fcv.FORCE: ylab,
-            fcv.FORCE_LESS_BASE: f"{ylab} − baseline"})
-    if zero_at != "As recorded":
-        table = table.rename(columns={fcv.TIME: {
-            "End of the curve": "Time from the end (s)",
-            "Start of the curve": "Time from the start (s)"}[zero_at]})
-    # time counted from the end (or start) keeps that zero on the stack
-    # lines drawn by hand go along, on the time sent
-    drawn = [{"pts": [[px - zero, py] for px, py in ln["pts"]],
-              "dash": ln.get("dash", "Dashed"),
-              "colour": ln.get("colour")}
-             for ln in s.get("_fc_lines") or []]
-    r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
-              on_click=send_to_stack,
-              args=(stem, table, "Single force curve", lines,
-                    "As in the file" if zero_at != "As recorded"
-                    else None, drawn),
-              help="Sends time and force (and force less the baseline) to "
-                   "the Stack & compare tab, with this summary for its "
-                   "balloon.", **STRETCH)
-    r3.download_button("💾 Save as CSV", key="fc_csv",
-                       data=lambda: table.to_csv(index=False).encode(),
-                       file_name=f"{stem}_force_vs_time.csv",
-                       mime="text/csv", **STRETCH)
-    note = s.pop("_vq_sent_note", None)
-    if note:
-        st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
+    with st.container(border=True):
+        st.markdown("**📚 To the stacked plot**")
+        r1, q1, q2 = st.columns([1.3, 1.0, 1.0])
+        zero_at = r1.selectbox(
+            "Time zero at", zero_options, key="fc_zero",
+            help="Time in the table sent on (and saved) counts from here, "
+                 "so curves line up by their end (or start) on the stack.")
+        q1.number_input("Zero force before (s)", 0.0, 1e6, step=1.0,
+                        key="fc_pad0", format="%.4g",
+                        help="Adds points at zero force for this long ahead "
+                             "of the first point, so the corrected baseline "
+                             "goes on at 0 beside longer recordings.")
+        q2.number_input("Zero force after (s)", 0.0, 1e6, step=1.0,
+                        key="fc_pad1", format="%.4g",
+                        help="Adds points at zero force for this long past "
+                             "the last point.")
+        zero = {"End of the curve": nums.get("end_s"),
+                "Start of the curve": nums.get("start_s")}.get(zero_at) \
+            or 0.0
+        if m["corrected"]:
+            table = fcv.table_to_send(t, m["raw"], None, zero,
+                                      corrected=True, base=m["base"])
+        else:
+            table = fcv.table_to_send(t, m["raw"], end, zero)
+        table = fcv.pad_zero(table, s.get("fc_pad0") or 0.0,
+                             s.get("fc_pad1") or 0.0)
+        if ylab != "Force (nN)":
+            table = table.rename(columns={
+                fcv.FORCE: ylab,
+                fcv.FORCE_LESS_BASE: f"{ylab} − baseline"})
+        if zero_at != "As recorded":
+            table = table.rename(columns={fcv.TIME: {
+                "End of the curve": "Time from the end (s)",
+                "Start of the curve": "Time from the start (s)"}[zero_at]})
+        # lines drawn by hand (and the dashed baseline under the curve) go
+        # along, on the time sent
+        drawn = [{"pts": [[px - zero, py] for px, py in ln["pts"]],
+                  "dash": ln.get("dash", "Dashed"),
+                  "colour": ln.get("colour")}
+                 for ln in s.get("_fc_lines") or []]
+        if m["under"]:
+            drawn.append({"pts": [[m["ts"] - zero, 0.0],
+                                  [m["te"] - zero, 0.0]],
+                          "dash": "Dashed", "colour": FC_BRIDGE_COLOUR})
+        r2, r3 = st.columns(2)
+        r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
+                  on_click=send_to_stack,
+                  args=(stem, table, "Single force curve", lines,
+                        "As in the file" if zero_at != "As recorded"
+                        else None, drawn),
+                  help="Sends time and force (corrected first, then as "
+                       "read), the lines drawn and this summary to the "
+                       "Stack & compare tab.", **STRETCH)
+        r3.download_button("💾 Save as CSV", key="fc_csv",
+                           data=lambda: table.to_csv(index=False).encode(),
+                           file_name=f"{stem}_force_vs_time.csv",
+                           mime="text/csv", **STRETCH)
+        note = s.pop("_vq_sent_note", None)
+        if note:
+            st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
 
 
 def force_curve_tab():
@@ -27183,9 +27418,9 @@ def force_curve_tab():
              "and segments come from the file), or a CSV, TXT or Excel "
              "table with a time column and a force or deflection column.")
     if up is None:
-        st.caption("Load one force recording to plot it against time, mark "
-                   "where it ends against the baseline after it, and send "
-                   "it to the stacked plot.")
+        st.caption("Load one force recording to plot it against time, take "
+                   "its baseline off, mark where it starts and ends, and "
+                   "send it to the stacked plot.")
         return
     try:
         item = fc_read(up.getvalue(), up.name)
@@ -27197,42 +27432,15 @@ def force_curve_tab():
     if signal is None:
         return
     t, y, ylab, stem = signal
-    opts = fc_baseline_controls(
-        t, y, " (nN)" if ylab == "Force (nN)" else "")
-    end, start = fc_analyse(t, y, opts)
-    raw = {"y": y, "end": end, "line": None, "incline": None}
-    shown_y, shown_lab = y, ylab
-    if opts["correct"] != FC_CORRECT[0] and end \
-            and end.get("coeffs") is not None:
-        shown_lab = ("Force − baseline (nN)" if ylab == "Force (nN)"
-                     else f"{ylab} − baseline")
-        incline = (fcv.incline(t, y, s["fc_win0"], s["fc_win"])
-                   if opts["correct"] == FC_CORRECT[2]
-                   else fc_hand_line(t)
-                   if opts["correct"] == FC_CORRECT[3] else None)
-        if opts["correct"] == FC_CORRECT[2] and incline is None:
-            st.warning("A baseline window holds too few points to draw "
-                       "the line from start to end: widen the windows. "
-                       "The end baseline is taken off meanwhile.", icon="〰")
-        if incline is not None:
-            # the line from start to end comes off first; the end (and
-            # start) are then found on the corrected, level curve
-            raw["incline"], raw["line"] = incline, incline["coeffs"]
-            shown_y = y - np.polyval(incline["coeffs"], t)
-            end, start = fc_analyse(t, shown_y, opts)
-            raw["end"] = end
-        else:
-            shown_y, end, start = fcv.corrected(t, y, end, start)
+    opts = fc_baseline_controls(t, y,
+                                " (nN)" if ylab == "Force (nN)" else "")
+    model = fc_model(t, y, opts)
     segments = item.get("segments") if item["kind"] == "ibw" else []
-    fc_plot(t, shown_y, shown_lab, stem, end, start, segments,
-            s.get("fc_win0") if raw["incline"]
-            and not raw["incline"].get("by_hand") else None,
-            zero_line=shown_y is not y)
+    fc_plot(t, model, ylab, stem, segments)
     if segments:
-        st.caption("Dotted lines: where the file's segments (approach, "
+        st.caption("Dotted grey lines: where the file's segments (approach, "
                    "dwell, retract) meet.")
-    fc_results(t, shown_y, ylab, stem, end, start, raw,
-               corrected=shown_y is not y)
+    fc_results(t, model, ylab, stem)
 
 
 with tab_force:
