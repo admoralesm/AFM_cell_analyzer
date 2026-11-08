@@ -416,7 +416,79 @@ def corrected(t, f, end_info, start_info=None, line=None):
     return out, end_c, start_c
 
 
-def table_to_send(t, f, end_info, zero=0.0, corrected=False, line=None):
+# ------------------------------------------- a baseline in two lines --
+
+def side_fit(t, f, window, sloped=True):
+    """
+    A straight line fitted (least squares) to the force in one window, or
+    its mean level when not ``sloped``: {"slope", "intercept", "sd", "n"},
+    or None when the window holds fewer than 3 points.
+    """
+    t = np.asarray(t, float)
+    f = np.asarray(f, float)
+    lo, hi = sorted(float(v) for v in window)
+    inside = (t >= lo) & (t <= hi) & np.isfinite(f) & np.isfinite(t)
+    if inside.sum() < 3:
+        return None
+    tt, ff = t[inside], f[inside]
+    if sloped and np.ptp(tt) > 0:
+        slope, intercept = np.polyfit(tt, ff, 1)
+    else:
+        slope, intercept = 0.0, float(np.mean(ff))
+    resid = ff - (slope * tt + intercept)
+    return {"slope": float(slope), "intercept": float(intercept),
+            "sd": float(np.std(resid)), "n": int(inside.sum())}
+
+
+def side_line(fit, pivot, move=0.0, rotate=0.0):
+    """
+    One side of the baseline: the fitted line, moved up or down by
+    ``move`` at its ``pivot`` time (where it meets the curve) and turned
+    about that point by ``rotate`` (added to its slope). Returns {"t",
+    "level", "slope", "fit_level", "fit_slope"}.
+    """
+    pivot = float(pivot)
+    level = fit["slope"] * pivot + fit["intercept"]
+    return {"t": pivot, "level": float(level + move),
+            "slope": float(fit["slope"] + rotate),
+            "fit_level": float(level), "fit_slope": float(fit["slope"])}
+
+
+def line_value(line, t):
+    """A side line's value at ``t``."""
+    return line["level"] + line["slope"] * (np.asarray(t, float) - line["t"])
+
+
+def bridged(t, before=None, after=None):
+    """
+    The baseline at every ``t`` from a line before the curve and a line
+    after it (see side_line). With both: the line before up to its point
+    (where the curve starts), the line after from its point (where the
+    curve ends), and under the curve a straight bridge from one point to
+    the other, so each side keeps its own level and tilt. With one: that
+    line all the way. None with neither.
+    """
+    t = np.asarray(t, float)
+    if before and after:
+        ts, te = before["t"], after["t"]
+        out = np.empty_like(t)
+        lo, hi = t <= ts, t >= te
+        out[lo] = line_value(before, t[lo])
+        out[hi] = line_value(after, t[hi])
+        mid = ~lo & ~hi
+        if te > ts and mid.any():
+            out[mid] = before["level"] + (after["level"] - before["level"]) \
+                * (t[mid] - ts) / (te - ts)
+        return out
+    if before:
+        return line_value(before, t)
+    if after:
+        return line_value(after, t)
+    return None
+
+
+def table_to_send(t, f, end_info, zero=0.0, corrected=False, line=None,
+                  base=None):
     """Time, force and force less the baseline (``line`` when given, e.g.
     the incline from start to end, else the one after the end), with time
     counted from ``zero``; with ``corrected`` the force less the baseline
@@ -425,7 +497,11 @@ def table_to_send(t, f, end_info, zero=0.0, corrected=False, line=None):
     f = np.asarray(f, float)
     out = pd.DataFrame({TIME: t - float(zero), FORCE: f})
     coeffs = line if line is not None else (end_info or {}).get("coeffs")
-    if coeffs is not None:
+    if base is not None:
+        out[FORCE_LESS_BASE] = f - np.asarray(base, float)
+        if corrected:
+            out = out[[TIME, FORCE_LESS_BASE, FORCE]]
+    elif coeffs is not None:
         out[FORCE_LESS_BASE] = f - np.polyval(coeffs, t)
         if corrected:
             out = out[[TIME, FORCE_LESS_BASE, FORCE]]
@@ -457,20 +533,27 @@ def pad_zero(table, before=0.0, after=0.0):
     steps = np.diff(np.sort(t[finite]))
     steps = steps[steps > 0]
     dt = float(np.median(steps)) if steps.size else 1e-3
-    base = None
+    # the baseline (force as read less force corrected) carries on along a
+    # line through its first (or last) fifth: its own end, as drawn
+    ends = {}
     if FORCE in table.columns and FORCE_LESS_BASE in table.columns:
         b = (pd.to_numeric(table[FORCE], errors="coerce")
              - pd.to_numeric(table[FORCE_LESS_BASE], errors="coerce")
              ).to_numpy(float)
         ok = finite & np.isfinite(b)
-        if ok.sum() >= 2:
-            base = np.polyfit(t[ok], b[ok], 1)
+        if ok.sum() >= 4:
+            tt, bb = t[ok], b[ok]
+            order = np.argsort(tt)
+            tt, bb = tt[order], bb[order]
+            k = max(2, tt.size // 5)
+            ends["before"] = np.polyfit(tt[:k], bb[:k], 1)
+            ends["after"] = np.polyfit(tt[-k:], bb[-k:], 1)
 
-    def rows(times):
+    def rows(times, side):
         out = {tcol: times}
         for col in table.columns[1:]:
-            if col == FORCE and base is not None:
-                out[col] = np.polyval(base, times)
+            if col == FORCE and side in ends:
+                out[col] = np.polyval(ends[side], times)
             else:
                 out[col] = np.zeros(len(times))
         return pd.DataFrame(out)
@@ -478,9 +561,10 @@ def pad_zero(table, before=0.0, after=0.0):
     parts = []
     if before > 0:
         parts.append(rows(np.array(sorted({t0 - before,
-                                           t0 - min(dt, before)}))))
+                                           t0 - min(dt, before)})),
+                          "before"))
     parts.append(table)
     if after > 0:
         parts.append(rows(np.array(sorted({t1 + min(dt, after),
-                                           t1 + after}))))
+                                           t1 + after})), "after"))
     return pd.concat(parts, ignore_index=True)
