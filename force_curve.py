@@ -508,18 +508,20 @@ def table_to_send(t, f, end_info, zero=0.0, corrected=False, line=None,
     return out
 
 
-def pad_zero(table, before=0.0, after=0.0):
+def pad_zero(table, before=0.0, after=0.0, points=50):
     """
     The table carried on at zero force for ``before`` seconds ahead of its
     first point and ``after`` seconds past its last, so on a plot beside
     longer recordings the corrected baseline goes on at 0.
 
-    Two points are added on each side (one sample step out, and the far
-    end), which a plot joins into a flat line. The force less the baseline
-    is 0 there; the force as read carries on along its baseline (the
-    straight line between the two columns), or is 0 when there is no
-    baseline. The first column is time.
+    ``points`` evenly spaced points are added on each side (from one sample
+    step out to the far end), which a plot joins into a flat line, and
+    which a click on that stretch can take (to set a zero, or a baseline
+    point there). The force less the baseline is 0 there; the force as read
+    carries on along its baseline (the straight line between the two
+    columns), or is 0 when there is no baseline. The first column is time.
     """
+    points = max(2, int(points or 2))
     before = max(float(before or 0.0), 0.0)
     after = max(float(after or 0.0), 0.0)
     if not (before > 0 or after > 0) or len(table) < 2:
@@ -558,13 +560,15 @@ def pad_zero(table, before=0.0, after=0.0):
                 out[col] = np.zeros(len(times))
         return pd.DataFrame(out)
 
+    def times(near, far):
+        return np.array(sorted(set(np.linspace(near, far, points)
+                                   .tolist())))
+
     parts = []
     if before > 0:
-        parts.append(rows(np.array(sorted({t0 - before,
-                                           t0 - min(dt, before)})),
+        parts.append(rows(times(t0 - before, t0 - min(dt, before)),
                           "before"))
     parts.append(table)
     if after > 0:
-        parts.append(rows(np.array(sorted({t1 + min(dt, after),
-                                           t1 + after})), "after"))
+        parts.append(rows(times(t1 + min(dt, after), t1 + after), "after"))
     return pd.concat(parts, ignore_index=True)
