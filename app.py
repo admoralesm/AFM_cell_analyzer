@@ -26534,53 +26534,6 @@ def ends_note(on, names=("its start", "its end")):
     return f" ({', '.join(said)})" if said else ""
 
 
-def stroke_peak(stroke, xs, ys, x_span, y_span, snap=True,
-                size=(800.0, 320.0), reach=14.0, ends=()):
-    """
-    An inverted V (a peak) drawn in one stroke: pressed at one foot, up to
-    the top, down to the other foot, let go. The top is the point of the
-    stroke farthest from the line joining its two ends (so a V works the
-    same). With ``snap`` the feet go onto the curve (or onto the end of a
-    line drawn) when let go near it, and the top onto a line's end.
-
-    Returns (left foot, top, right foot, (snapped, snapped, snapped)), the
-    feet in time order, or None for a stroke with no clear bend.
-    """
-    try:
-        px = np.asarray([float(v) for v in stroke.get("x") or []])
-        py = np.asarray([float(v) for v in stroke.get("y") or []])
-    except (TypeError, ValueError):
-        return None
-    if px.size < 3 or py.size != px.size \
-            or not (np.isfinite(px).all() and np.isfinite(py).all()):
-        return None
-    w = float(size[0]) / (abs(float(x_span)) or 1.0)
-    h = float(size[1]) / (abs(float(y_span)) or 1.0)
-    X, Y = px * w, py * h
-    cx, cy = X[-1] - X[0], Y[-1] - Y[0]
-    chord = float(np.hypot(cx, cy))
-    if chord < 1.0:
-        far = np.hypot(X - X[0], Y - Y[0])
-    else:
-        far = np.abs(cx * (Y - Y[0]) - cy * (X - X[0])) / chord
-    k = 1 + int(np.argmax(far[1:-1]))
-    if far[k] < 12.0:
-        return None
-    a, top, b = ([float(px[0]), float(py[0])], [float(px[k]), float(py[k])],
-                 [float(px[-1]), float(py[-1])])
-    on = [False, False, False]
-    if snap:
-        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
-        ok = np.isfinite(xs) & np.isfinite(ys)
-        xs, ys = xs[ok], ys[ok]
-        a, on[0] = snap_point(a, xs, ys, w, h, reach, ends)
-        b, on[2] = snap_point(b, xs, ys, w, h, reach, ends)
-        top, on[1] = snap_point(top, xs, ys, w, h, reach, ends, curve=False)
-    if b[0] < a[0]:
-        a, b, on = b, a, [on[2], on[1], on[0]]
-    return a, top, b, tuple(on)
-
-
 def stroke_line(stroke, xs, ys, x_span, y_span, snap=True, level=True,
                 size=(800.0, 320.0), reach=14.0, ends=()):
     """
@@ -26677,8 +26630,11 @@ FC_YUNITS = {"nN": 1.0, "µN": 1e-3, "pN": 1e3}
 FC_BARS = (("app", "Approach", "#7B1FA2", True),
            ("dwell", "Dwell", "#757575", False),
            ("ret", "Retract", "#D32F2F", True))
-FC_PEAK = "Λ Peak: two lines"
-FC_DRAWS = ("✏ Line", FC_PEAK) + tuple(f"━ {label}"
+# what a drag draws: a line (plain, or marking the approach or the
+# retract, in that colour), or one of the bars along the top
+FC_DRAW_ROLE = {"✏ Line": None, "↗ Approach line": "app",
+                "↘ Retract line": "ret"}
+FC_DRAWS = tuple(FC_DRAW_ROLE) + tuple(f"━ {label} bar"
                                        for _, label, _, _ in FC_BARS)
 # what a line drawn stands for: its colour is that of the approach (the
 # retract) when it marks one, the same colour as that bar
@@ -26690,7 +26646,8 @@ FC_DEFAULTS = {"fc_base": True, "fc_corr": "None", "fc_shape": "Sloped",
                "fc_view": "Corrected", "fc_under": True,
                "fc_mvb": 0.0, "fc_rtb": 0.0, "fc_mva": 0.0, "fc_rta": 0.0,
                "fc_yunit": "nN", "fc_snap": True, "fc_level": True,
-               "fc_bars": False, "fc_bar_w": 4.0, "fc_draws": FC_DRAWS[0]}
+               "fc_bars": False, "fc_bar_w": 4.0, "fc_draws": FC_DRAWS[0],
+               "fc_bar_labels": True, "fc_new_col": "#444444"}
 
 
 @st.cache_data(max_entries=6, show_spinner=False)
@@ -27218,6 +27175,10 @@ def fc_bar_specs(t, y):
     top = float(finite.max()) if finite.size else 1.0
     span = float(finite.max() - finite.min()) if finite.size > 1 else 1.0
     span = span or 1.0
+    # above the lines drawn too (a peak drawn over a flat top)
+    for ln in s.get("_fc_lines") or []:
+        top = max([top] + [float(p[1]) for p in ln["pts"]
+                           if np.isfinite(p[1])])
     level = s.get("fc_bar_y")
     level = top + 0.10 * span if level is None else float(level)
     out = []
@@ -27227,7 +27188,8 @@ def fc_bar_specs(t, y):
         a, b = sorted(s.get(f"fc_bar_t_{k}") or (0.0, 0.0))
         if b > a:
             out.append({"key": k, "x": [a, b], "y": [level, level],
-                        "text": str(s.get(f"fc_bar_lab_{k}") or label),
+                        "text": (str(s.get(f"fc_bar_lab_{k}") or label)
+                                 if s.get("fc_bar_labels", True) else ""),
                         "colour": s.get(f"fc_bar_col_{k}") or colour,
                         "width": float(s.get("fc_bar_w") or 4.0),
                         "caps": True, "dash": "solid",
@@ -27249,7 +27211,7 @@ def fc_bars_panel(t):
     label, times and colour."""
     s = st.session_state
     with st.container(border=True):
-        h1, h2, h3, h4 = st.columns([1.5, 1.1, 1.3, 0.9])
+        h1, h5, h2, h3, h4 = st.columns([1.5, 0.8, 1.1, 1.1, 0.9])
         on = h1.toggle(
             "━ Approach / retract bars", key="fc_bars",
             help="Bars along the top of the plot marking the approach and "
@@ -27258,8 +27220,12 @@ def fc_bars_panel(t):
                  "(.ibw), else from the curve: its start to its peak, its "
                  "peak to its end. Sent to the stack with the curve.")
         if not on:
-            h2.caption("Off")
+            h5.caption("Off")
             return
+        h5.toggle("🏷 Labels", key="fc_bar_labels",
+                  help="The names over the bars (Approach, Retract), on the "
+                       "plot here and on the stack. Off: the bars alone, "
+                       "told apart by their colours.")
         h2.slider("Thickness", 1.0, 12.0, step=0.5, key="fc_bar_w")
         h3.caption("Height: just above the curve" if s.get("fc_bar_y") is None
                    else f"Height: {s['fc_bar_y']:.4g} (as dragged)")
@@ -27276,7 +27242,8 @@ def fc_bars_panel(t):
                         help=f"Show the {label.lower()} bar.")
             c1.text_input("Label", key=f"fc_bar_lab_{k}",
                           label_visibility="collapsed",
-                          disabled=not s.get(f"fc_bar_on_{k}"))
+                          disabled=not (s.get(f"fc_bar_on_{k}")
+                                        and s.get("fc_bar_labels", True)))
             c2.slider(f"{label}: from, to (s)", lo, hi, key=f"fc_bar_t_{k}",
                       step=step, format="%.4g", label_visibility="collapsed",
                       disabled=not s.get(f"fc_bar_on_{k}"))
@@ -27509,7 +27476,7 @@ def fc_lines_undo():
 def fc_line_colour(ln):
     """A line's colour: the approach's (retract's) when it marks one."""
     role = ln.get("role")
-    if role:
+    if role and not ln.get("own"):
         default = next(c for k, _, c, _ in FC_BARS if k == role)
         return st.session_state.get(f"fc_bar_col_{role}") or default
     return ln.get("colour") or FC_LINE_COLOUR
@@ -27528,7 +27495,7 @@ def fc_bar_drawn(kind, a, b, t):
     (start) where it starts (ends), so approach, dwell and retract follow
     each other."""
     s = st.session_state
-    k = next(k for k, label, _, _ in FC_BARS if kind == f"━ {label}")
+    k = next(k for k, label, _, _ in FC_BARS if kind == f"━ {label} bar")
     x0, x1 = sorted((float(a[0]), float(b[0])))
     x0, x1 = max(x0, float(t[0])), min(x1, float(t[-1]))
     if x1 <= x0:
@@ -27547,18 +27514,17 @@ def fc_bar_drawn(kind, a, b, t):
             s[f"fc_bar_t_{other}"] = (x1, b2)
     s["fc_bars"] = True
     s["fc_bar_y"] = float(a[1])
-    s["_fc_draw_note"] = (f"✅ {kind[2:]} bar from {x0:.4g} s to "
+    s["_fc_draw_note"] = (f"✅ {kind[2:]} from {x0:.4g} s to "
                           f"{x1:.4g} s, at {a[1]:.4g}. Its colour and "
                           "label are under ━ Approach / retract bars.")
 
 
 def fc_line_drawn(stroke, t, y):
     """
-    A drag on the plot while ✏ Draw lines is chosen. ✏ Line: a straight
-    line from where it started to where it was let go. Λ Peak: two lines,
-    up to the top of the stroke and down again (approach and retract). A
-    bar: that bar over the time dragged. Or the line (peak) being redrawn,
-    moved to the drag.
+    A drag on the plot while ✏ Draw lines is chosen: a straight line from
+    where it started to where it was let go, plain or marking the
+    approach (the retract) in that colour; or a bar over the time dragged;
+    or the line being redrawn, moved to the drag.
     """
     s = st.session_state
     lo, hi = sorted(map(float, s.get("fc_xr") or (t[0], t[-1])))
@@ -27574,13 +27540,9 @@ def fc_line_drawn(stroke, t, y):
     old = next((ln for ln in lines if ln["id"] == target), None)
     kind = s.get("fc_draws") or FC_DRAWS[0]
     if old is not None:
-        kind = FC_PEAK if old.get("group") else FC_DRAWS[0]
-    group = ([ln for ln in lines if ln.get("group") == old.get("group")]
-             if old is not None and old.get("group") else
-             [old] if old is not None else [])
-    skip = {ln["id"] for ln in group}
-    snap = bool(s.get("fc_snap", True))
-    if kind.startswith("━"):
+        kind = next(k for k, r in FC_DRAW_ROLE.items()
+                    if r == old.get("role"))
+    if kind not in FC_DRAW_ROLE:
         # a bar is taken as dragged: no snapping onto the curve
         got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span,
                           snap=False, level=False, size=size)
@@ -27590,60 +27552,48 @@ def fc_line_drawn(stroke, t, y):
         else:
             fc_bar_drawn(kind, got[0], got[1], t)
         return
-    if kind == FC_PEAK:
-        got = stroke_peak(stroke, t, y, (hi - lo) or 1.0, y_span, snap=snap,
-                          size=size, ends=fc_line_ends(skip))
-        if got is None:
-            s["_fc_draw_note"] = (
-                "⚠️ No peak in that stroke: press at one foot, go up to the "
-                "top, come down to the other foot and let go, all in one "
-                "stroke.")
-            return
-        a, top, b, on = got
-        legs = [[a, top], [top, b]]
-        names = ("left foot", "top", "right foot")
-    else:
-        got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span, snap=snap,
-                          level=bool(s.get("fc_level", True)), size=size,
-                          ends=fc_line_ends(skip))
-        if got is None:
-            s["_fc_draw_note"] = ("⚠️ That was a click, too short for a "
-                                  "line: press where the line starts, drag "
-                                  "to where it ends and let go.")
-            return
-        a, b, on = got
-        legs = [[a, b]]
-        names = ("its start", "its end")
+    got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span,
+                      snap=bool(s.get("fc_snap", True)),
+                      level=bool(s.get("fc_level", True)), size=size,
+                      ends=fc_line_ends({target} if old is not None else ()))
+    if got is None:
+        s["_fc_draw_note"] = ("⚠️ That was a click, too short for a line: "
+                              "press where the line starts, drag to where "
+                              "it ends and let go.")
+        return
+    a, b, on = got
     fc_lines_push()
-    style = s.get("fc_line_style", "Dashed")
-    if group and len(group) == len(legs):
-        # redrawn: the same lines (style, colour, kind) moved to the drag
-        for ln, pts in zip(group, legs):
-            ln["pts"] = pts
-        what = ("Peak redrawn" if len(legs) == 2 else
-                f"Line {lines.index(group[0]) + 1} redrawn")
+    role = FC_DRAW_ROLE[kind]
+    after = ""
+    if old is not None:
+        old["pts"] = [a, b]
+        what = f"Line {lines.index(old) + 1} redrawn"
     else:
-        lines = [ln for ln in lines if ln["id"] not in skip]
-        made = []
-        gid = None
-        if len(legs) == 2:
-            s["_fc_g"] = gid = int(s.get("_fc_g", 0)) + 1
-        for pts, role in zip(legs, ("app", "ret") if len(legs) == 2
-                             else (None,)):
-            s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
-            line = {"id": s["_fc_n"], "pts": pts, "dash": style,
-                    "colour": FC_LINE_COLOUR, "role": role}
-            if gid:
-                line["group"] = gid
-            lines.append(line)
-            made.append(len(lines))
-        what = (f"Lines {made[0]} (approach) and {made[1]} (retract) drawn"
-                if len(made) == 2 else f"Line {made[0]} drawn")
+        s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
+        lines.append({"id": s["_fc_n"], "pts": [a, b],
+                      "dash": s.get("fc_line_style", "Dashed"),
+                      "colour": s.get("fc_new_col") or FC_LINE_COLOUR,
+                      "role": role})
+        what = {"app": "Approach line", "ret": "Retract line"}.get(
+            role, "Line") + f" {len(lines)} drawn"
+        if role == "app":
+            # next, its partner: the retract, which joins it when pressed
+            # near its end
+            s["fc_draws"] = "↘ Retract line"
+            after = (" Next: the retract line. Press near the approach's "
+                     "end to join them.")
     s["_fc_lines"] = lines
     s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
-    corners = " → ".join(f"({p[0]:.4g} s, {p[1]:.4g})"
-                         for p in [legs[0][0]] + [leg[1] for leg in legs])
-    s["_fc_draw_note"] = f"✅ {what}: {corners}{ends_note(on, names)}."
+    s["_fc_draw_note"] = (f"✅ {what}: ({a[0]:.4g} s, {a[1]:.4g}) → "
+                          f"({b[0]:.4g} s, {b[1]:.4g}){ends_note(on)}."
+                          + after)
+
+
+def fc_kind_colour(role):
+    """The approach (retract) colour picked while drawing: every line of
+    that kind without a colour of its own, and that bar, take it."""
+    s = st.session_state
+    s[f"fc_bar_col_{role}"] = s.get(f"fc_kcol_{role}")
 
 
 def fc_line_set(line_id, key, field):
@@ -27656,9 +27606,14 @@ def fc_line_set(line_id, key, field):
             continue
         value = s.get(key)
         if field == "role":
+            # a new kind: the line takes that kind's colour
             ln["role"] = FC_ROLES.get(value)
-        elif field == "colour" and ln.get("role"):
-            s[f"fc_bar_col_{ln['role']}"] = value
+            ln.pop("own", None)
+        elif field == "colour":
+            # this line alone in that colour
+            ln["colour"] = value
+            if ln.get("role"):
+                ln["own"] = True
         else:
             ln[field] = value
 
@@ -27683,7 +27638,8 @@ def fc_line_redraw(line_id):
     s["fc_clickdo"] = FC_CLICK_DRAW
     line = next((ln for ln in s.get("_fc_lines") or []
                  if ln["id"] == line_id), {})
-    s["fc_draws"] = FC_PEAK if line.get("group") else FC_DRAWS[0]
+    s["fc_draws"] = next(k for k, r in FC_DRAW_ROLE.items()
+                         if r == line.get("role"))
 
 
 def fc_lines_typed(key):
@@ -27739,30 +27695,29 @@ def fc_lines_panel(drawing, ylab):
             if s.get("fc_draws") not in FC_DRAWS:
                 s["fc_draws"] = FC_DRAWS[0]
             kind = s["fc_draws"]
-            bar = kind.startswith("━") and not n
-            peak = kind == FC_PEAK
+            bar = kind not in FC_DRAW_ROLE and not n
+            role = FC_DRAW_ROLE.get(kind)
             st.markdown(
-                (f"**✏ Redrawing the peak of line {n}**: draw the Λ again "
-                 "in one stroke." if peak else
-                 f"**✏ Redrawing line {n}**: drag from its new start to its "
-                 "new end.") if n else
-                f"**{kind} bar: drag along the top, from where it starts "
-                "to where it ends.**" if bar else
-                "**Λ Press at one foot of the peak, go up to its top, come "
-                "down to the other foot, let go: one stroke.** The way up "
-                "is drawn as the approach, the way down as the retract, "
-                "each in its colour, joined at the top." if peak else
+                f"**✏ Redrawing line {n}**: drag from its new start to its "
+                "new end." if n else
+                f"**{kind}: drag along the top, from where it starts to "
+                "where it ends.**" if bar else
+                "**↗ Press where the approach line starts, drag to where it "
+                "ends, let go.**" if role == "app" else
+                "**↘ Press where the retract line starts (near the end of "
+                "the approach line to join them), drag to where it ends, "
+                "let go.**" if role == "ret" else
                 "**✏ Press where a line starts, drag to where it ends, "
-                "let go.** Each drag is one line; let go on the end of "
+                "let go.** Each drag is one line; let go near the end of "
                 "another line to join them.")
             st.segmented_control(
                 "A drag draws", FC_DRAWS, key="fc_draws",
                 label_visibility="collapsed",
-                help="✏ Line: a line from where the drag starts to where it "
-                     "ends. Λ Peak: two lines in one stroke, up and down "
-                     "(an inverted V), coloured as approach and retract. "
-                     "━ Approach / Dwell / Retract: that bar along the top, "
-                     "over the time the drag covers.")
+                help="✏ Line: a line in the colour for new lines. ↗ "
+                     "Approach line / ↘ Retract line: a line in the "
+                     "approach (retract) colour; after an approach line "
+                     "comes its retract line. ━ bars: that bar along the "
+                     "top, over the time the drag covers.")
             d2, d3, d4, d5, d6 = st.columns([1.2, 0.9, 0.8, 0.8, 1.6])
             d2.selectbox("Style of new lines", FC_LINE_STYLES,
                          key="fc_line_style", label_visibility="collapsed",
@@ -27770,26 +27725,43 @@ def fc_lines_panel(drawing, ylab):
             d3.toggle("🧲 Snap", key="fc_snap", disabled=bar,
                       help="An end let go close to the end of another line "
                            "goes exactly onto it (they join); one close to "
-                           "the curve goes onto the curve.")
-            d4.toggle("─ Level", key="fc_level", disabled=bar or peak,
+                           "the curve goes onto the curve. Off: the line "
+                           "ends exactly where you let go.")
+            d4.toggle("─ Level", key="fc_level", disabled=bar,
                       help="A line drawn nearly level (or upright) is made "
-                           "exactly level (upright).")
+                           "exactly level (upright). Off: as drawn.")
             d5.button("↶ Undo", key="fc_line_undo", on_click=fc_lines_undo,
                       disabled=not s.get("_fc_lines_hist"), **STRETCH,
-                      help="Takes back the last line (or peak) drawn, "
-                           "moved, typed or deleted.")
+                      help="Takes back the last line drawn, moved, typed "
+                           "or deleted.")
             note = s.pop("_fc_draw_note", None)
             if note:
                 d6.caption(note)
+            # the colours: approach and retract (shared with their bars),
+            # and the one new plain lines get
+            k1, k2, k3, k4 = st.columns([1.0, 1.0, 1.0, 2.2],
+                                        vertical_alignment="bottom")
+            for col, (key, label, colour, _) in zip(
+                    (k1, k2), [bar_ for bar_ in FC_BARS if bar_[0] != "dwell"]):
+                mirror = f"fc_kcol_{key}"
+                s[mirror] = s.get(f"fc_bar_col_{key}") or colour
+                col.color_picker(
+                    f"{label} colour", key=mirror, on_change=fc_kind_colour,
+                    args=(key,),
+                    help=f"Every {label.lower()} line (but one given its own "
+                         f"colour in its row) and the {label.lower()} bar.")
+            k3.color_picker("New plain lines", key="fc_new_col",
+                            help="The colour a ✏ Line gets when drawn.")
+            k4.caption("A line's own colour: the square in its row below. "
+                       "Its kind (Line, Approach, Retract) gives it that "
+                       "kind's colour again.")
     unit = fc_force_unit(ylab)
     roles = {v: k for k, v in FC_ROLES.items()}
     for n, ln in enumerate(lines, 1):
         (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
         c0, c1, c2, c3, c4, c5 = st.columns([2.3, 1.0, 1.0, 0.42, 0.9,
                                              0.85])
-        joined = (" · Λ " + ("up" if ln.get("role") == "app" else "down")
-                  if ln.get("group") else "")
-        c0.markdown(f"**Line {n}**{joined}: ({xa:.4g} s, {ya:.4g}) → "
+        c0.markdown(f"**Line {n}**: ({xa:.4g} s, {ya:.4g}) → "
                     f"({xb:.4g} s, {yb:.4g})"
                     + (f" {unit}" if unit else ""))
         rkey = f"fc_line_role_{ln['id']}"
@@ -27797,9 +27769,8 @@ def fc_lines_panel(drawing, ylab):
         c1.selectbox("Kind", tuple(FC_ROLES), key=rkey,
                      label_visibility="collapsed", on_change=fc_line_set,
                      args=(ln["id"], rkey, "role"),
-                     help="Approach / Retract: the line takes that colour "
-                          "(the same as its bar); change it here and every "
-                          "approach (retract) line follows.")
+                     help="Approach / Retract: the line takes that kind's "
+                          "colour (set while drawing, or with the bars).")
         key = f"fc_line_dash_{ln['id']}"
         s[key] = ln.get("dash", "Dashed")
         c2.selectbox("Style", FC_LINE_STYLES, key=key,
@@ -27813,9 +27784,8 @@ def fc_lines_panel(drawing, ylab):
         c4.button("✕ Stop" if ln["id"] == target else "✏ Redraw",
                   key=f"fc_line_redo_{ln['id']}", on_click=fc_line_redraw,
                   args=(ln["id"],), **STRETCH,
-                  help="Then drag on the plot: this line (or its whole "
-                       "peak) moves to the new drag; style, colour and "
-                       "kind stay.")
+                  help="Then drag on the plot: this line moves to the new "
+                       "drag; its style, colour and kind stay.")
         c5.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
                   on_click=fc_line_delete, args=(ln["id"],), **STRETCH)
     if lines:
@@ -30868,7 +30838,9 @@ def sc_hl_for(t):
                     "y": [y for _, y in ln["pts"]],
                     "dash": sc.EXTEND_DASHES.get(ln.get("dash"), "dash"),
                     "colour": ln.get("colour"), "width": ln.get("width"),
-                    "caps": ln.get("caps"), "text": ln.get("text")})
+                    "caps": ln.get("caps"),
+                    "text": (ln.get("text") if ln.get("show_text", True)
+                             else None)})
     draft = s.get("_sc_draft")
     if draft and draft["slot"] == t["slot"] and draft.get("file") == t["file"]:
         out.append({"x": [x - t["zero"] for x, _ in draft["pts"]],
@@ -30938,13 +30910,20 @@ def sc_hl_panel(traces):
                         f"({xa - t['zero']:.4g}, {ya:.4g}) → "
                         f"({xb - t['zero']:.4g}, {yb:.4g}){extra}")
             if ln.get("text") is not None:
-                tkey = f"sc_hl_txt_{ln['id']}"
-                s[tkey] = ln.get("text") or ""
-                c0.text_input("Label", key=tkey,
-                              label_visibility="collapsed",
-                              on_change=sc_hl_restyle,
-                              args=(slot, ln["id"], tkey, "text"),
-                              help="The label over the bar.")
+                skey = f"sc_hl_show_{ln['id']}"
+                s[skey] = bool(ln.get("show_text", True))
+                c0.toggle("🏷 Label on the plot", key=skey,
+                          on_change=sc_hl_restyle,
+                          args=(slot, ln["id"], skey, "show_text"),
+                          help="Off: the bar (line) alone, without its name.")
+                if ln.get("show_text", True):
+                    tkey = f"sc_hl_txt_{ln['id']}"
+                    s[tkey] = ln.get("text") or ""
+                    c0.text_input("Label", key=tkey,
+                                  label_visibility="collapsed",
+                                  on_change=sc_hl_restyle,
+                                  args=(slot, ln["id"], tkey, "text"),
+                                  help="The label over the bar.")
             key = f"sc_hl_dash_{ln['id']}"
             s[key] = ln.get("dash", "Dashed")
             c1.selectbox("Style", SC_LINE_STYLES, key=key,
