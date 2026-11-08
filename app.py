@@ -26507,8 +26507,82 @@ def igor_result_panel():
 
 # ============================================= lines drawn by dragging ==
 
+def snap_point(p, xs, ys, w, h, reach, ends=(), curve=True):
+    """``p`` moved onto the nearest end of a line drawn (``ends``) or else
+    onto the curve, when one is within ``reach`` px (``w``, ``h``: px per
+    unit on x and y). Returns (point, "line" | "curve" | False)."""
+    best = None
+    for q in ends or ():
+        d = float(np.hypot((q[0] - p[0]) * w, (q[1] - p[1]) * h))
+        if d <= reach and (best is None or d < best[0]):
+            best = (d, q)
+    if best is not None:
+        return [float(best[1][0]), float(best[1][1])], "line"
+    if curve and xs.size:
+        d = np.hypot((xs - p[0]) * w, (ys - p[1]) * h)
+        i = int(np.argmin(d))
+        if d[i] <= reach:
+            return [float(xs[i]), float(ys[i])], "curve"
+    return [float(p[0]), float(p[1])], False
+
+
+def ends_note(on, names=("its start", "its end")):
+    """' (its start on the curve, its end on a line)' for the ends that
+    were snapped."""
+    said = [f"{name} on {'the curve' if where == 'curve' else 'a line'}"
+            for name, where in zip(names, on) if where]
+    return f" ({', '.join(said)})" if said else ""
+
+
+def stroke_peak(stroke, xs, ys, x_span, y_span, snap=True,
+                size=(800.0, 320.0), reach=14.0, ends=()):
+    """
+    An inverted V (a peak) drawn in one stroke: pressed at one foot, up to
+    the top, down to the other foot, let go. The top is the point of the
+    stroke farthest from the line joining its two ends (so a V works the
+    same). With ``snap`` the feet go onto the curve (or onto the end of a
+    line drawn) when let go near it, and the top onto a line's end.
+
+    Returns (left foot, top, right foot, (snapped, snapped, snapped)), the
+    feet in time order, or None for a stroke with no clear bend.
+    """
+    try:
+        px = np.asarray([float(v) for v in stroke.get("x") or []])
+        py = np.asarray([float(v) for v in stroke.get("y") or []])
+    except (TypeError, ValueError):
+        return None
+    if px.size < 3 or py.size != px.size \
+            or not (np.isfinite(px).all() and np.isfinite(py).all()):
+        return None
+    w = float(size[0]) / (abs(float(x_span)) or 1.0)
+    h = float(size[1]) / (abs(float(y_span)) or 1.0)
+    X, Y = px * w, py * h
+    cx, cy = X[-1] - X[0], Y[-1] - Y[0]
+    chord = float(np.hypot(cx, cy))
+    if chord < 1.0:
+        far = np.hypot(X - X[0], Y - Y[0])
+    else:
+        far = np.abs(cx * (Y - Y[0]) - cy * (X - X[0])) / chord
+    k = 1 + int(np.argmax(far[1:-1]))
+    if far[k] < 12.0:
+        return None
+    a, top, b = ([float(px[0]), float(py[0])], [float(px[k]), float(py[k])],
+                 [float(px[-1]), float(py[-1])])
+    on = [False, False, False]
+    if snap:
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        xs, ys = xs[ok], ys[ok]
+        a, on[0] = snap_point(a, xs, ys, w, h, reach, ends)
+        b, on[2] = snap_point(b, xs, ys, w, h, reach, ends)
+        top, on[1] = snap_point(top, xs, ys, w, h, reach, ends, curve=False)
+    if b[0] < a[0]:
+        a, b, on = b, a, [on[2], on[1], on[0]]
+    return a, top, b, tuple(on)
+
+
 def stroke_line(stroke, xs, ys, x_span, y_span, snap=True, level=True,
-                size=(800.0, 320.0), reach=14.0):
+                size=(800.0, 320.0), reach=14.0, ends=()):
     """
     The straight line a drag on a plot makes: from where the press was to
     where the mouse was let go (the first and last points of the lasso
@@ -26517,7 +26591,9 @@ def stroke_line(stroke, xs, ys, x_span, y_span, snap=True, level=True,
     ``xs``, ``ys``: the curve as plotted; ``x_span``, ``y_span``: what the
     axes show; ``size``: the plot's size in px (roughly), so distances are
     judged as they are seen. With ``snap``, an end let go within ``reach``
-    px of the curve goes exactly onto it. With ``level``, a line within 3°
+    px of the end of a line already drawn (``ends``) goes exactly onto it,
+    joining the two, else one near the curve onto the curve. With
+    ``level``, a line within 3°
     of level (or of upright) is made level (upright), keeping the end that
     is on the curve where it is.
 
@@ -26541,13 +26617,10 @@ def stroke_line(stroke, xs, ys, x_span, y_span, snap=True, level=True,
     xs, ys = np.asarray(xs, float), np.asarray(ys, float)
     ok = np.isfinite(xs) & np.isfinite(ys)
     xs, ys = xs[ok], ys[ok]
-    if snap and xs.size:
-        for k, p in enumerate((a, b)):
-            d = np.hypot((xs - p[0]) * w, (ys - p[1]) * h)
-            i = int(np.argmin(d))
-            if d[i] <= reach:
-                p[0], p[1] = float(xs[i]), float(ys[i])
-                on[k] = True
+    if snap:
+        # onto the end of a line drawn (to join it), else onto the curve
+        a, on[0] = snap_point(a, xs, ys, w, h, reach, ends)
+        b, on[1] = snap_point(b, xs, ys, w, h, reach, ends)
     if level and not all(on):
         dx, dy = (b[0] - a[0]) * w, (b[1] - a[1]) * h
         if abs(dy) <= 0.0524 * abs(dx):
@@ -26604,7 +26677,12 @@ FC_YUNITS = {"nN": 1.0, "µN": 1e-3, "pN": 1e3}
 FC_BARS = (("app", "Approach", "#7B1FA2", True),
            ("dwell", "Dwell", "#757575", False),
            ("ret", "Retract", "#D32F2F", True))
-FC_DRAWS = ("✏ Line",) + tuple(f"━ {label}" for _, label, _, _ in FC_BARS)
+FC_PEAK = "Λ Peak: two lines"
+FC_DRAWS = ("✏ Line", FC_PEAK) + tuple(f"━ {label}"
+                                       for _, label, _, _ in FC_BARS)
+# what a line drawn stands for: its colour is that of the approach (the
+# retract) when it marks one, the same colour as that bar
+FC_ROLES = {"Line": None, "Approach": "app", "Retract": "ret"}
 FC_DEFAULTS = {"fc_base": True, "fc_corr": "None", "fc_shape": "Sloped",
                "fc_dir": "Either way", "fc_ksd": 3.0, "fc_run": 5,
                "fc_findstart": False, "fc_lw": 1.5, "fc_height": 440,
@@ -26643,7 +26721,8 @@ def fc_reset(sig):
                 "fc_ch", "fc_tcol", "fc_fcol", "fc_unit", "fc_xr",
                 "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate",
                 "_fc_lines", "_fc_draft", "_fc_pin_next", "_fc_lines_hist",
-                "_fc_redraw", "_fc_draw_note", "fc_bar_y", "fc_bar_t_app",
+                "_fc_redraw", "_fc_draw_note", "fc_bar_y", "fc_yr",
+                "fc_bar_t_app",
                 "fc_bar_t_dwell", "fc_bar_t_ret",
                 "fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
         s.pop(key, None)
@@ -26675,6 +26754,8 @@ def fc_yunit_change():
     for key in ("fc_mvb", "fc_rtb", "fc_mva", "fc_rta", "fc_bar_y"):
         if s.get(key) is not None:
             s[key] = float(s[key]) * factor
+    if s.get("fc_yr") is not None:
+        s["fc_yr"] = tuple(float(v) * factor for v in s["fc_yr"])
     for ln in s.get("_fc_lines") or []:
         ln["pts"] = [[x, y * factor] for x, y in ln["pts"]]
     s["_fc_lines_hist"] = []
@@ -27217,7 +27298,7 @@ def fc_marker(fig, x, colour, text, by_hand):
 
 
 def fc_figure(t, m, ylab, segments, clickable, drawing=False, view=None,
-              bars=()):
+              bars=(), yr=None):
     """The force against time, with the baseline as the model has it:
     corrected (the force less the baseline, on its zero line) or raw (the
     force as read, with each side line, the bridge and the points where
@@ -27361,13 +27442,11 @@ def fc_figure(t, m, ylab, segments, clickable, drawing=False, view=None,
             x=[p[0] for p in ln["pts"]], y=[p[1] for p in ln["pts"]],
             mode="lines", showlegend=False, hoverinfo="skip",
             name="line drawn",
-            line=dict(color=ln.get("colour") or FC_LINE_COLOUR,
-                      width=max(lw, 1.6),
+            line=dict(color=fc_line_colour(ln), width=max(lw, 1.6),
                       dash=sc.EXTEND_DASHES.get(ln.get("dash"), "dash"))))
         (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
         marks.append((0.5 * (xa + xb), 0.5 * (ya + yb), str(n),
-                      ln.get("colour") or FC_LINE_COLOUR,
-                      ln["id"] == s.get("_fc_redraw")))
+                      fc_line_colour(ln), ln["id"] == s.get("_fc_redraw")))
     if drawing and marks:
         fig.add_trace(go.Scatter(
             x=[k[0] for k in marks], y=[k[1] for k in marks], mode="text",
@@ -27387,10 +27466,10 @@ def fc_figure(t, m, ylab, segments, clickable, drawing=False, view=None,
                     font=dict(size=12)),
         xaxis=dict(title="Time (s)", range=list(xr) if xr else None, **axis),
         yaxis=dict(title=(ylab if raw_view else fc_less_label(ylab)),
-                   **axis),
+                   range=list(yr) if yr else None, **axis),
         hovermode="closest", dragmode="zoom",
-        # a zoom survives other changes; moving "Time shown" resets it
-        uirevision=f"fc-{xr}")
+        # a zoom survives other changes; moving the view resets it
+        uirevision=f"fc-{xr}-{yr}")
     if clickable:
         # a crosshair: on the point a click takes, or (drawing lines) right
         # at the cursor, where a line starts or ends
@@ -27427,85 +27506,161 @@ def fc_lines_undo():
         s.pop("_fc_redraw", None)
 
 
+def fc_line_colour(ln):
+    """A line's colour: the approach's (retract's) when it marks one."""
+    role = ln.get("role")
+    if role:
+        default = next(c for k, _, c, _ in FC_BARS if k == role)
+        return st.session_state.get(f"fc_bar_col_{role}") or default
+    return ln.get("colour") or FC_LINE_COLOUR
+
+
+def fc_line_ends(skip=()):
+    """The ends of the lines drawn (not those in ``skip``): a new line let
+    go near one joins it."""
+    return [p for ln in st.session_state.get("_fc_lines") or []
+            if ln["id"] not in skip for p in (ln["pts"][0], ln["pts"][-1])]
+
+
+def fc_bar_drawn(kind, a, b, t):
+    """A bar dragged in place: the drag's two ends give where it starts
+    and ends, its start the height of every bar; the bars beside it end
+    (start) where it starts (ends), so approach, dwell and retract follow
+    each other."""
+    s = st.session_state
+    k = next(k for k, label, _, _ in FC_BARS if kind == f"━ {label}")
+    x0, x1 = sorted((float(a[0]), float(b[0])))
+    x0, x1 = max(x0, float(t[0])), min(x1, float(t[-1]))
+    if x1 <= x0:
+        s["_fc_draw_note"] = "⚠️ Drag along the time the bar covers."
+        return
+    s[f"fc_bar_t_{k}"] = (x0, x1)
+    s[f"fc_bar_on_{k}"] = True
+    order = [key for key, _, _, _ in FC_BARS]
+    for j, other in enumerate(order):
+        if other == k or not s.get(f"fc_bar_on_{other}"):
+            continue
+        a2, b2 = sorted(s.get(f"fc_bar_t_{other}") or (0.0, 0.0))
+        if j < order.index(k) and a2 < x0 < b2:
+            s[f"fc_bar_t_{other}"] = (a2, x0)
+        elif j > order.index(k) and a2 < x1 < b2:
+            s[f"fc_bar_t_{other}"] = (x1, b2)
+    s["fc_bars"] = True
+    s["fc_bar_y"] = float(a[1])
+    s["_fc_draw_note"] = (f"✅ {kind[2:]} bar from {x0:.4g} s to "
+                          f"{x1:.4g} s, at {a[1]:.4g}. Its colour and "
+                          "label are under ━ Approach / retract bars.")
+
+
 def fc_line_drawn(stroke, t, y):
-    """A drag on the plot while ✏ Draw lines is chosen: a straight line
-    from where it started to where it was let go (or the line being
-    redrawn, moved there)."""
+    """
+    A drag on the plot while ✏ Draw lines is chosen. ✏ Line: a straight
+    line from where it started to where it was let go. Λ Peak: two lines,
+    up to the top of the stroke and down again (approach and retract). A
+    bar: that bar over the time dragged. Or the line (peak) being redrawn,
+    moved to the drag.
+    """
     s = st.session_state
     lo, hi = sorted(map(float, s.get("fc_xr") or (t[0], t[-1])))
-    inside = (t >= lo) & (t <= hi)
-    shown = y[inside] if inside.sum() > 1 else y
-    y_span = 1.16 * float(np.nanmax(shown) - np.nanmin(shown)) or 1.0
+    y_lo, y_hi = s.get("fc_yr") or s.get("_fc_yauto") or (None, None)
+    if y_lo is None:
+        inside = (t >= lo) & (t <= hi)
+        shown = y[inside] if inside.sum() > 1 else y
+        y_lo, y_hi = float(np.nanmin(shown)), float(np.nanmax(shown))
+    y_span = float(y_hi - y_lo) or 1.0
     size = (800.0, max(120.0, float(s.get("fc_height", 440)) - 122.0))
-    kind = s.get("fc_draws") or FC_DRAWS[0]
-    if s.get("_fc_redraw") is not None:
-        kind = FC_DRAWS[0]
-    line = kind == FC_DRAWS[0]
-    # a bar is taken as dragged: no snapping onto the curve
-    got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span,
-                      snap=line and bool(s.get("fc_snap", True)),
-                      level=line and bool(s.get("fc_level", True)),
-                      size=size)
-    if got is None:
-        s["_fc_draw_note"] = ("⚠️ That was a click, too short for a line: "
-                              "press where the line starts, drag to where "
-                              "it ends and let go.")
-        return
-    a, b, on = got
-    if not line:
-        # a bar: the drag's two ends give where it starts and ends, its
-        # start the height of every bar
-        k = next(k for k, label, _, _ in FC_BARS if kind == f"━ {label}")
-        x0, x1 = sorted((float(a[0]), float(b[0])))
-        x0, x1 = max(x0, float(t[0])), min(x1, float(t[-1]))
-        if x1 <= x0:
-            s["_fc_draw_note"] = "⚠️ Drag along the time the bar covers."
-            return
-        s[f"fc_bar_t_{k}"] = (x0, x1)
-        s[f"fc_bar_on_{k}"] = True
-        order = [key for key, _, _, _ in FC_BARS]
-        for j, other in enumerate(order):
-            if other == k or not s.get(f"fc_bar_on_{other}"):
-                continue
-            a2, b2 = sorted(s.get(f"fc_bar_t_{other}") or (0.0, 0.0))
-            if j < order.index(k) and a2 < x0 < b2:
-                s[f"fc_bar_t_{other}"] = (a2, x0)
-            elif j > order.index(k) and a2 < x1 < b2:
-                s[f"fc_bar_t_{other}"] = (x1, b2)
-        s["fc_bars"] = True
-        s["fc_bar_y"] = float(a[1])
-        s["_fc_draw_note"] = (f"✅ {kind[2:]} bar from {x0:.4g} s to "
-                              f"{x1:.4g} s, at {a[1]:.4g}. Its colour and "
-                              "label are under ━ Approach / retract bars.")
-        return
-    fc_lines_push()
     lines = copy.deepcopy(s.get("_fc_lines") or [])
     target = s.pop("_fc_redraw", None)
-    n = next((k for k, ln in enumerate(lines, 1) if ln["id"] == target),
-             None)
-    if n is not None:
-        lines[n - 1]["pts"] = [a, b]
-        what = f"Line {n} redrawn"
+    old = next((ln for ln in lines if ln["id"] == target), None)
+    kind = s.get("fc_draws") or FC_DRAWS[0]
+    if old is not None:
+        kind = FC_PEAK if old.get("group") else FC_DRAWS[0]
+    group = ([ln for ln in lines if ln.get("group") == old.get("group")]
+             if old is not None and old.get("group") else
+             [old] if old is not None else [])
+    skip = {ln["id"] for ln in group}
+    snap = bool(s.get("fc_snap", True))
+    if kind.startswith("━"):
+        # a bar is taken as dragged: no snapping onto the curve
+        got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span,
+                          snap=False, level=False, size=size)
+        if got is None:
+            s["_fc_draw_note"] = ("⚠️ That was a click: drag along the time "
+                                  "the bar covers.")
+        else:
+            fc_bar_drawn(kind, got[0], got[1], t)
+        return
+    if kind == FC_PEAK:
+        got = stroke_peak(stroke, t, y, (hi - lo) or 1.0, y_span, snap=snap,
+                          size=size, ends=fc_line_ends(skip))
+        if got is None:
+            s["_fc_draw_note"] = (
+                "⚠️ No peak in that stroke: press at one foot, go up to the "
+                "top, come down to the other foot and let go, all in one "
+                "stroke.")
+            return
+        a, top, b, on = got
+        legs = [[a, top], [top, b]]
+        names = ("left foot", "top", "right foot")
     else:
-        s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
-        lines.append({"id": s["_fc_n"], "pts": [a, b],
-                      "dash": s.get("fc_line_style", "Dashed"),
-                      "colour": FC_LINE_COLOUR})
-        what = f"Line {len(lines)} drawn"
+        got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span, snap=snap,
+                          level=bool(s.get("fc_level", True)), size=size,
+                          ends=fc_line_ends(skip))
+        if got is None:
+            s["_fc_draw_note"] = ("⚠️ That was a click, too short for a "
+                                  "line: press where the line starts, drag "
+                                  "to where it ends and let go.")
+            return
+        a, b, on = got
+        legs = [[a, b]]
+        names = ("its start", "its end")
+    fc_lines_push()
+    style = s.get("fc_line_style", "Dashed")
+    if group and len(group) == len(legs):
+        # redrawn: the same lines (style, colour, kind) moved to the drag
+        for ln, pts in zip(group, legs):
+            ln["pts"] = pts
+        what = ("Peak redrawn" if len(legs) == 2 else
+                f"Line {lines.index(group[0]) + 1} redrawn")
+    else:
+        lines = [ln for ln in lines if ln["id"] not in skip]
+        made = []
+        gid = None
+        if len(legs) == 2:
+            s["_fc_g"] = gid = int(s.get("_fc_g", 0)) + 1
+        for pts, role in zip(legs, ("app", "ret") if len(legs) == 2
+                             else (None,)):
+            s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
+            line = {"id": s["_fc_n"], "pts": pts, "dash": style,
+                    "colour": FC_LINE_COLOUR, "role": role}
+            if gid:
+                line["group"] = gid
+            lines.append(line)
+            made.append(len(lines))
+        what = (f"Lines {made[0]} (approach) and {made[1]} (retract) drawn"
+                if len(made) == 2 else f"Line {made[0]} drawn")
     s["_fc_lines"] = lines
     s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
-    ends = {(True, True): " (both ends on the curve)",
-            (True, False): " (its start on the curve)",
-            (False, True): " (its end on the curve)"}.get(on, "")
-    s["_fc_draw_note"] = (f"✅ {what}: ({a[0]:.4g} s, {a[1]:.4g}) → "
-                          f"({b[0]:.4g} s, {b[1]:.4g}){ends}.")
+    corners = " → ".join(f"({p[0]:.4g} s, {p[1]:.4g})"
+                         for p in [legs[0][0]] + [leg[1] for leg in legs])
+    s["_fc_draw_note"] = f"✅ {what}: {corners}{ends_note(on, names)}."
 
 
 def fc_line_set(line_id, key, field):
+    """A line's style, colour or kind changed in its row. The colour of an
+    approach (retract) line is that of every approach (retract) line and
+    of its bar, so it changes them all."""
     s = st.session_state
     for ln in s.get("_fc_lines") or []:
-        if ln["id"] == line_id:
-            ln[field] = s.get(key)
+        if ln["id"] != line_id:
+            continue
+        value = s.get(key)
+        if field == "role":
+            ln["role"] = FC_ROLES.get(value)
+        elif field == "colour" and ln.get("role"):
+            s[f"fc_bar_col_{ln['role']}"] = value
+        else:
+            ln[field] = value
 
 
 def fc_line_delete(line_id):
@@ -27526,7 +27681,9 @@ def fc_line_redraw(line_id):
         return
     s["_fc_redraw"] = line_id
     s["fc_clickdo"] = FC_CLICK_DRAW
-    s["fc_draws"] = FC_DRAWS[0]
+    line = next((ln for ln in s.get("_fc_lines") or []
+                 if ln["id"] == line_id), {})
+    s["fc_draws"] = FC_PEAK if line.get("group") else FC_DRAWS[0]
 
 
 def fc_lines_typed(key):
@@ -27541,7 +27698,8 @@ def fc_lines_typed(key):
         row = int(row)
         if not 0 <= row < len(lines):
             continue
-        (x0, y0), (x1, y1) = lines[row]["pts"][0], lines[row]["pts"][-1]
+        before = [list(lines[row]["pts"][0]), list(lines[row]["pts"][-1])]
+        (x0, y0), (x1, y1) = before
         ends = {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
         for name, value in change.items():
             if name in ends and value is not None:
@@ -27549,8 +27707,18 @@ def fc_lines_typed(key):
                     ends[name] = float(value)
                 except (TypeError, ValueError):
                     pass
-        lines[row]["pts"] = [[ends["x0"], ends["y0"]],
-                             [ends["x1"], ends["y1"]]]
+        after = [[ends["x0"], ends["y0"]], [ends["x1"], ends["y1"]]]
+        lines[row]["pts"] = after
+        for old, new in zip(before, after):
+            if old == new:
+                continue
+            for k, other in enumerate(lines):
+                if k == row:
+                    continue
+                for i in (0, -1):
+                    if np.allclose(other["pts"][i], old, rtol=0,
+                                   atol=1e-12):
+                        other["pts"][i] = list(new)
     s["_fc_lines"] = lines
     s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
 
@@ -27570,61 +27738,85 @@ def fc_lines_panel(drawing, ylab):
                       if ln["id"] == target), None)
             if s.get("fc_draws") not in FC_DRAWS:
                 s["fc_draws"] = FC_DRAWS[0]
-            bar = s["fc_draws"] != FC_DRAWS[0] and not n
+            kind = s["fc_draws"]
+            bar = kind.startswith("━") and not n
+            peak = kind == FC_PEAK
             st.markdown(
-                f"**✏ Redrawing line {n}**: drag from its new start to its "
-                "new end." if n else
-                f"**{s['fc_draws']} bar: drag along the top, from where it "
-                "starts to where it ends.**" if bar else
+                (f"**✏ Redrawing the peak of line {n}**: draw the Λ again "
+                 "in one stroke." if peak else
+                 f"**✏ Redrawing line {n}**: drag from its new start to its "
+                 "new end.") if n else
+                f"**{kind} bar: drag along the top, from where it starts "
+                "to where it ends.**" if bar else
+                "**Λ Press at one foot of the peak, go up to its top, come "
+                "down to the other foot, let go: one stroke.** The way up "
+                "is drawn as the approach, the way down as the retract, "
+                "each in its colour, joined at the top." if peak else
                 "**✏ Press where a line starts, drag to where it ends, "
-                "let go.** Each drag is one line.")
-            d0, d2, d3, d4, d5 = st.columns([2.9, 1.0, 0.95, 0.85, 0.8])
-            d0.segmented_control(
+                "let go.** Each drag is one line; let go on the end of "
+                "another line to join them.")
+            st.segmented_control(
                 "A drag draws", FC_DRAWS, key="fc_draws",
                 label_visibility="collapsed",
                 help="✏ Line: a line from where the drag starts to where it "
-                     "ends. ━ Approach / Dwell / Retract: that bar along the "
-                     "top, over the time the drag covers (all the bars sit "
-                     "at the height the drag starts at).")
+                     "ends. Λ Peak: two lines in one stroke, up and down "
+                     "(an inverted V), coloured as approach and retract. "
+                     "━ Approach / Dwell / Retract: that bar along the top, "
+                     "over the time the drag covers.")
+            d2, d3, d4, d5, d6 = st.columns([1.2, 0.9, 0.8, 0.8, 1.6])
             d2.selectbox("Style of new lines", FC_LINE_STYLES,
                          key="fc_line_style", label_visibility="collapsed",
                          disabled=bar)
             d3.toggle("🧲 Snap", key="fc_snap", disabled=bar,
-                      help="An end let go close to the curve goes exactly "
-                           "onto it, so a line joins the curve.")
-            d4.toggle("─ Level", key="fc_level", disabled=bar,
+                      help="An end let go close to the end of another line "
+                           "goes exactly onto it (they join); one close to "
+                           "the curve goes onto the curve.")
+            d4.toggle("─ Level", key="fc_level", disabled=bar or peak,
                       help="A line drawn nearly level (or upright) is made "
                            "exactly level (upright).")
             d5.button("↶ Undo", key="fc_line_undo", on_click=fc_lines_undo,
                       disabled=not s.get("_fc_lines_hist"), **STRETCH,
-                      help="Takes back the last line drawn, moved, typed "
-                           "or deleted.")
+                      help="Takes back the last line (or peak) drawn, "
+                           "moved, typed or deleted.")
             note = s.pop("_fc_draw_note", None)
             if note:
-                st.caption(note)
+                d6.caption(note)
     unit = fc_force_unit(ylab)
+    roles = {v: k for k, v in FC_ROLES.items()}
     for n, ln in enumerate(lines, 1):
         (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
-        c0, c1, c2, c3, c4 = st.columns([2.5, 1.0, 0.45, 0.95, 0.9])
-        c0.markdown(f"**Line {n}**: ({xa:.4g} s, {ya:.4g}) → "
+        c0, c1, c2, c3, c4, c5 = st.columns([2.3, 1.0, 1.0, 0.42, 0.9,
+                                             0.85])
+        joined = (" · Λ " + ("up" if ln.get("role") == "app" else "down")
+                  if ln.get("group") else "")
+        c0.markdown(f"**Line {n}**{joined}: ({xa:.4g} s, {ya:.4g}) → "
                     f"({xb:.4g} s, {yb:.4g})"
                     + (f" {unit}" if unit else ""))
+        rkey = f"fc_line_role_{ln['id']}"
+        s[rkey] = roles.get(ln.get("role"), "Line")
+        c1.selectbox("Kind", tuple(FC_ROLES), key=rkey,
+                     label_visibility="collapsed", on_change=fc_line_set,
+                     args=(ln["id"], rkey, "role"),
+                     help="Approach / Retract: the line takes that colour "
+                          "(the same as its bar); change it here and every "
+                          "approach (retract) line follows.")
         key = f"fc_line_dash_{ln['id']}"
         s[key] = ln.get("dash", "Dashed")
-        c1.selectbox("Style", FC_LINE_STYLES, key=key,
+        c2.selectbox("Style", FC_LINE_STYLES, key=key,
                      label_visibility="collapsed", on_change=fc_line_set,
                      args=(ln["id"], key, "dash"))
         ckey = f"fc_line_col_{ln['id']}"
-        s[ckey] = ln.get("colour") or FC_LINE_COLOUR
-        c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
+        s[ckey] = fc_line_colour(ln)
+        c3.color_picker("Colour", key=ckey, label_visibility="collapsed",
                         on_change=fc_line_set,
                         args=(ln["id"], ckey, "colour"))
-        c3.button("✕ Stop" if ln["id"] == target else "✏ Redraw",
+        c4.button("✕ Stop" if ln["id"] == target else "✏ Redraw",
                   key=f"fc_line_redo_{ln['id']}", on_click=fc_line_redraw,
                   args=(ln["id"],), **STRETCH,
-                  help="Then drag on the plot: this line moves to the new "
-                       "drag (its style and colour stay).")
-        c4.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
+                  help="Then drag on the plot: this line (or its whole "
+                       "peak) moves to the new drag; style, colour and "
+                       "kind stay.")
+        c5.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
                   on_click=fc_line_delete, args=(ln["id"],), **STRETCH)
     if lines:
         with st.expander("✎ Type the ends exactly"):
@@ -27650,6 +27842,91 @@ def fc_lines_panel(drawing, ylab):
                                                         format="%.6g")})
             st.caption("Type a number and press Enter: the line moves at "
                        "once. ↶ Undo (while drawing) takes it back.")
+
+
+def fc_y_auto(t, y, bars, xr):
+    """The force range shown unless moved: the curve over the time shown,
+    the lines drawn and the bars with their labels, with a margin."""
+    s = st.session_state
+    lo, hi = sorted(map(float, xr or (t[0], t[-1])))
+    y = np.asarray(y, float)
+    inside = (t >= lo) & (t <= hi)
+    parts = [y[inside] if inside.sum() > 1 else y]
+    for bar in bars or ():
+        parts.append(np.asarray(bar["y"], float) + float(bar.get("room", 0)))
+    for ln in s.get("_fc_lines") or []:
+        parts.append(np.asarray([p[1] for p in ln["pts"]], float))
+    values = np.concatenate(parts)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return (-1.0, 1.0)
+    a, b = float(values.min()), float(values.max())
+    pad = 0.06 * (b - a) or 1.0
+    return (a - pad, b + pad)
+
+
+def fc_view(move=0.0, zoom=1.0, later=0.0):
+    """The view buttons: the curve up (``move`` > 0) or down, the force
+    axis zoomed (``zoom`` < 1 in), the time shown moved (``later`` > 0:
+    the curve to the left)."""
+    s = st.session_state
+    lo, hi = s.get("fc_yr") or s.get("_fc_yauto") or (0.0, 1.0)
+    span = float(hi - lo) or 1.0
+    lo, hi = float(lo) - move * span, float(hi) - move * span
+    if zoom != 1.0:
+        mid, half = 0.5 * (lo + hi), 0.5 * span * zoom
+        lo, hi = mid - half, mid + half
+    s["fc_yr"] = (lo, hi)
+    if later:
+        t0, t1 = s.get("_fc_tspan") or (0.0, 1.0)
+        a, b = sorted(map(float, s.get("fc_xr") or (t0, t1)))
+        width = b - a
+        a = min(max(a + later * width, t0), t1 - width)
+        s["fc_xr"] = (a, a + width)
+
+
+def fc_view_reset():
+    """↺ Reset view: all the time, and the force range that fits it."""
+    s = st.session_state
+    s.pop("fc_yr", None)
+    if s.get("_fc_tspan"):
+        s["fc_xr"] = tuple(s["_fc_tspan"])
+
+
+def fc_view_buttons():
+    """Above the plot: move the curve up, down, left, right, zoom the
+    force axis, reset. The view stays as set while lines are drawn."""
+    s = st.session_state
+    t0, t1 = s.get("_fc_tspan") or (0.0, 1.0)
+    a, b = sorted(map(float, s.get("fc_xr") or (t0, t1)))
+    all_time = a <= t0 + 1e-12 and b >= t1 - 1e-12
+    cols = st.columns([3.0, 0.42, 0.42, 0.42, 0.42, 0.42, 0.42, 1.1],
+                      vertical_alignment="center")
+    cols[0].caption("🧭 View: move the curve, zoom the force axis, reset."
+                    + (" (moved)" if s.get("fc_yr") or not all_time
+                       else ""))
+    for col, (key, icon, kwargs, tip, off) in zip(cols[1:7], (
+            ("up", ":material/arrow_upward:", {"move": 0.2},
+             "Move the curve up (more room under it).", False),
+            ("down", ":material/arrow_downward:", {"move": -0.2},
+             "Move the curve down (more room above it, for a peak drawn "
+             "on top).", False),
+            ("left", ":material/arrow_back:", {"later": 0.2},
+             "Move the curve left (later times). Narrow “Time shown” "
+             "under 🎨 Plot first.", all_time),
+            ("right", ":material/arrow_forward:", {"later": -0.2},
+             "Move the curve right (earlier times).", all_time),
+            ("zin", ":material/zoom_in:", {"zoom": 0.8},
+             "Zoom in on the force axis.", False),
+            ("zout", ":material/zoom_out:", {"zoom": 1.25},
+             "Zoom out on the force axis (room above and below).",
+             False))):
+        col.button(icon, key=f"fc_v_{key}", on_click=fc_view, kwargs=kwargs,
+                   help=tip, disabled=off, **STRETCH)
+    cols[7].button(":material/restart_alt: Reset view", key="fc_v_reset",
+                   on_click=fc_view_reset, **STRETCH,
+                   help="All the time, and the force range that fits the "
+                        "curve, lines and bars.")
 
 
 def fc_plot(t, m, ylab, stem, segments):
@@ -27702,9 +27979,20 @@ def fc_plot(t, m, ylab, stem, segments):
     view = s.get("fc_view") or FC_VIEWS[0]
     raw_view = (not m["corrected"]) or view == FC_VIEWS[1]
     fc_bars_ready(t, m, segments)
-    bars = fc_bar_specs(t, m["raw"] if raw_view else m["shown"])
+    y_view = m["raw"] if raw_view else m["shown"]
+    bars = fc_bar_specs(t, y_view)
+    # the force range: as moved with the buttons, else fitted; a range
+    # moved on one view is dropped when the other view is chosen
+    s["_fc_tspan"] = (float(t[0]), float(t[-1]))
+    shown_as = f"{view}|{m['corrected']}"
+    if s.get("fc_yr") is not None and s.get("_fc_yr_for") != shown_as:
+        s.pop("fc_yr", None)
+    s["_fc_yr_for"] = shown_as
+    s["_fc_yauto"] = fc_y_auto(t, y_view, bars, s.get("fc_xr"))
+    fc_view_buttons()
     fig = fc_figure(t, m, ylab, segments, bool(click_do), drawing=drawing,
-                    view=view, bars=bars)
+                    view=view, bars=bars,
+                    yr=s.get("fc_yr") or s["_fc_yauto"])
     config = {"scrollZoom": True, "doubleClick": "reset",
               "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
     version = int(s.get("_fc_chart_ver", 0))
@@ -27872,7 +28160,7 @@ def fc_results(t, m, ylab, stem):
         # along, on the time sent
         drawn = [{"pts": [[px - zero, py] for px, py in ln["pts"]],
                   "dash": ln.get("dash", "Dashed"),
-                  "colour": ln.get("colour")}
+                  "colour": fc_line_colour(ln)}
                  for ln in s.get("_fc_lines") or []]
         if m["under"]:
             drawn.append({"pts": [[m["ts"] - zero, 0.0],
@@ -30538,9 +30826,7 @@ def sc_hl_drawn(stroke, traces, fig):
     lines.setdefault(owner["slot"], []).append(line)
     s["_sc_hlines"] = lines
     s["_sc_draft"] = None
-    ends = {(True, True): " (both ends on the curve)",
-            (True, False): " (its start on the curve)",
-            (False, True): " (its end on the curve)"}.get(tuple(on), "")
+    ends = ends_note(on)
     s["_sc_draw_note"] = (
         f"✅ Line {'moved' if moved else 'drawn'} on {owner['label']}: "
         f"({a[0]:.4g}, {a[1]:.4g}) → ({b[0]:.4g}, {b[1]:.4g}){ends}.")
