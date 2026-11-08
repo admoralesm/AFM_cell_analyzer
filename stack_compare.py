@@ -553,22 +553,16 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                             color=t["colour"],
                             line=dict(color=t["colour"], width=2.5))),
                 row=r, col=1, secondary_y=on_right)
-        # lines drawn by hand (the one being drawn shows its points)
+        # lines drawn by hand (the one being drawn shows its points), and
+        # bars with a label (an approach, a retract)
+        ys = np.asarray(t["y"], float)
+        ys = ys[np.isfinite(ys)]
+        room = 0.12 * float(ys.max() - ys.min()) if ys.size > 1 else None
         for hand in t.get("hand_lines") or ():
-            fig.add_trace(go.Scatter(
-                x=hand["x"], y=hand["y"],
-                mode="lines+markers" if hand.get("draft") else "lines",
-                showlegend=False, name=f"{t['label']} line drawn",
-                # no hover: a click near it still reaches the curve
-                hoverinfo="skip",
-                marker=dict(symbol="x-thin", size=11,
-                            color=hand.get("colour") or t["colour"],
-                            line=dict(color=hand.get("colour")
-                                      or t["colour"], width=2)),
-                line=dict(color=hand.get("colour") or t["colour"],
-                          width=line_width,
-                          dash=hand.get("dash", "dash"))),
-                row=r, col=1, secondary_y=on_right)
+            for trace in hand_line_traces(hand, t["colour"], line_width,
+                                          name=f"{t['label']} line drawn",
+                                          room=room):
+                fig.add_trace(trace, row=r, col=1, secondary_y=on_right)
         marks = t.get("sat_marks")
         if marks is not None and len(marks[0]):
             fig.add_trace(go.Scatter(
@@ -720,6 +714,56 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
     for t in traces:
         t.pop("_panel", None)
     return fig
+
+
+def hand_line_traces(hand, colour, line_width=1.8, name="line drawn",
+                     room=None):
+    """
+    The traces of one line drawn by hand: ``hand`` has x, y and optionally
+    dash, colour, width (its own thickness), caps (short upright ends, for
+    a bar marking a stretch such as an approach), text (a label above its
+    middle) and draft (the line being drawn: its points shown). ``room``:
+    how far above the label an unseen point keeps the axis, so the label
+    is not cut off.
+
+    None of them takes hover or clicks, so a click near one still reaches
+    the curve under it.
+    """
+    import plotly.graph_objects as go
+
+    colour = hand.get("colour") or colour
+    width = float(hand.get("width") or line_width)
+    caps = bool(hand.get("caps"))
+    x, y = list(hand["x"]), list(hand["y"])
+    if caps:
+        marker = dict(symbol="line-ns", size=max(10.0, 3.0 * width),
+                      color=colour,
+                      line=dict(color=colour, width=max(2.0, 0.6 * width)))
+    else:
+        marker = dict(symbol="x-thin", size=11, color=colour,
+                      line=dict(color=colour, width=2))
+    out = [go.Scatter(
+        x=x, y=y,
+        mode="lines+markers" if (caps or hand.get("draft")) else "lines",
+        showlegend=False, name=name, hoverinfo="skip", marker=marker,
+        line=dict(color=colour, width=width, dash=hand.get("dash", "dash")))]
+    text = str(hand.get("text") or "").strip()
+    if text and len(x) >= 2:
+        xm, ym = 0.5 * (x[0] + x[-1]), 0.5 * (y[0] + y[-1])
+        # an unseen marker as thick as the bar lifts the label clear of it
+        out.append(go.Scatter(
+            x=[xm], y=[ym], mode="markers+text", text=[f"<b>{text}</b>"],
+            textposition="top center", showlegend=False, hoverinfo="skip",
+            name=f"{name}: {text}", cliponaxis=False,
+            marker=dict(size=width + 4.0, opacity=0, color=colour),
+            textfont=dict(color=colour,
+                          size=int(hand.get("text_size") or 13))))
+        if room:
+            out.append(go.Scatter(
+                x=[xm], y=[ym + float(room)], mode="markers",
+                showlegend=False, hoverinfo="skip", name="room for a label",
+                marker=dict(size=1, opacity=0)))
+    return out
 
 
 STATS_BOXES = ("Off", "Analysis summary", "Descriptive statistics")
