@@ -625,7 +625,7 @@ COMPANION_NEEDS = {
                          "baseline_typed", "EXTEND_DASHES",
                          "flat_top_between"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
-                       "table_to_send", "incline"),
+                       "table_to_send", "incline", "pad_zero"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -10894,7 +10894,7 @@ def video_chart_table(fig, y_title):
 
 
 def send_to_stack(name, frame, source="the video", stats=None,
-                  zero_mode=None):
+                  zero_mode=None, lines=None):
     """Put a table in the first free slot of the Stack & compare tab.
     ``zero_mode``: where that file's x = 0 starts out (one of the stack's
     zero options), e.g. "As in the file" for time already counted from a
@@ -10918,6 +10918,19 @@ def send_to_stack(name, frame, source="the video", stats=None,
                            "stats": list(stats or [])}
     if sc is not None and zero_mode in sc.ZERO_MODES:
         s[f"sc_zmode{free}"] = zero_mode
+    # lines drawn on the way (x as sent): that file's hand lines there
+    hand = copy.deepcopy(s.get("_sc_hlines") or {})
+    hand[free] = []
+    for ln in lines or ():
+        # the same numbering the stack's own lines use
+        s["_sc_hl_n"] = int(s.get("_sc_hl_n", 0)) + 2
+        hand[free].append({"id": s["_sc_hl_n"] - 1, "slot": free,
+                           "file": name,
+                           "pts": [list(map(float, p)) for p in ln["pts"]],
+                           "dash": ln.get("dash", "Dashed"),
+                           "colour": ln.get("colour"), "zero": 0.0,
+                           "ver": s["_sc_hl_n"]})
+    s["_sc_hlines"] = hand
     s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
     s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
                           "Open that tab to see it.")
@@ -26497,13 +26510,16 @@ FC_ZEROS = ("As recorded", "End of the curve", "Start of the curve")
 FC_UNITS = ("N", "nN", "pN", "m", "µm", "nm", "V", "as stored")
 FC_DIRECTIONS = {"Either way": "either", "Above only": "up",
                  "Below only": "down"}
-FC_CLICKS = ("🎯 Set the end", "🎯 Set the start")
+FC_CLICKS = ("🎯 Set the end", "🎯 Set the start", "✏ Draw line")
+FC_LINE_COLOUR = "#444444"
+FC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 FC_NO_TIME = "(none: use a sampling rate)"
-FC_CORRECT = ("No", "End baseline", "Start and end (incline)")
+FC_CORRECT = ("No", "End baseline", "Start and end (incline)", "By hand")
 FC_DEFAULTS = {"fc_base": True, "fc_corr": "No", "fc_shape": "Flat",
                "fc_dir": "Either way",
                "fc_ksd": 3.0, "fc_run": 5, "fc_findstart": False,
                "fc_lw": 1.5, "fc_height": 420, "fc_zero": "As recorded",
+    "fc_pad0": 0.0, "fc_pad1": 0.0,
                "fc_frac": 15}
 
 
@@ -26533,7 +26549,8 @@ def fc_reset(sig):
         return
     for key in ("fc_win", "fc_win0", "fc_end_hand", "fc_start_hand",
                 "fc_ch", "fc_tcol", "fc_fcol", "fc_unit", "fc_xr",
-                "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate"):
+                "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate",
+                "fc_hand_a", "fc_hand_b", "_fc_lines", "_fc_draft"):
         s.pop(key, None)
     s["_fc_sig"] = sig
 
@@ -26640,7 +26657,64 @@ def fc_signal(item):
     return t, y, ylab, stem
 
 
-def fc_baseline_controls(t):
+def fc_hand_defaults(t, y):
+    """Where the hand-set baseline starts out: the line from the window
+    before the curve to the one after it, at the first and last point."""
+    s = st.session_state
+    w0 = s.get("fc_win0") or fcv.default_window(t, after=False)
+    w1 = s.get("fc_win") or fcv.default_window(t, after=True)
+    inc = fcv.incline(t, y, w0, w1)
+    if inc is None:
+        level = float(np.nanmedian(y))
+        return level, level
+    a, b = np.polyval(inc["coeffs"], [float(t[0]), float(t[-1])])
+    return float(a), float(b)
+
+
+def fc_hand_reset(t, y):
+    a, b = fc_hand_defaults(t, y)
+    st.session_state["fc_hand_a"] = a
+    st.session_state["fc_hand_b"] = b
+
+
+def fc_hand_line(t):
+    """The hand-set baseline: straight from the start level at the first
+    point to the end level at the last, as the incline is given."""
+    s = st.session_state
+    t0, t1 = float(t[0]), float(t[-1])
+    a, b = float(s["fc_hand_a"]), float(s["fc_hand_b"])
+    slope = (b - a) / (t1 - t0) if t1 > t0 else 0.0
+    return {"coeffs": np.array([slope, a - slope * t0]), "start": (t0, a),
+            "end": (t1, b), "by_hand": True}
+
+
+def fc_hand_controls(t, y, unit):
+    """Two sliders: the baseline at the start and at the end."""
+    s = st.session_state
+    lo, hi = float(np.nanmin(y)), float(np.nanmax(y))
+    pad = 0.1 * (hi - lo) if hi > lo else 1.0
+    lo, hi = lo - pad, hi + pad
+    if "fc_hand_a" not in s or "fc_hand_b" not in s:
+        s["fc_hand_a"], s["fc_hand_b"] = fc_hand_defaults(t, y)
+    step = (hi - lo) / 4000.0
+    h1, h2, h3 = st.columns([2, 2, 1])
+    h1.slider(f"Baseline at the start{unit}", lo, hi, key="fc_hand_a",
+              step=step, format="%.4g",
+              help=f"Its level at the first point (t = {t[0]:.4g} s). "
+                   "The arrow keys move it in small steps.")
+    h2.slider(f"Baseline at the end{unit}", lo, hi, key="fc_hand_b",
+              step=step, format="%.4g",
+              help=f"Its level at the last point (t = {t[-1]:.4g} s).")
+    h3.button("↺ From the windows", key="fc_hand_reset", **STRETCH,
+              on_click=fc_hand_reset, args=(t, y),
+              help="Back to the straight line through the two shaded "
+                   "windows.")
+    st.caption("The baseline is the straight line from the start level to "
+               "the end level. Move them until the corrected curve sits "
+               "on the dotted zero line at both ends.")
+
+
+def fc_baseline_controls(t, y=None, unit=""):
     """The 〰 baseline after the end (and, if wanted, before the start).
     Returns the settings."""
     s = st.session_state
@@ -26651,7 +26725,7 @@ def fc_baseline_controls(t):
     span = (round(lo, 9), round(hi, 9))
     if s.get("_fc_span") != span:
         for key in ("fc_win", "fc_win0", "fc_xr", "fc_end_hand",
-                    "fc_start_hand"):
+                    "fc_start_hand", "fc_hand_a", "fc_hand_b"):
             s.pop(key, None)
         s["_fc_span"] = span
     with st.container(border=True):
@@ -26666,9 +26740,11 @@ def fc_baseline_controls(t):
                           "baseline: the one after the end, so it ends on "
                           "zero. Start and end (incline): the straight line "
                           "from the baseline before the curve to the one "
-                          "after it, so it starts and ends on zero. The "
-                          "plot, the numbers, the CSV and what is sent to "
-                          "the stack all use the corrected force.")
+                          "after it, so it starts and ends on zero. By "
+                          "hand: a straight line whose start and end you "
+                          "set with two sliders. The plot, the numbers, the "
+                          "CSV and what is sent to the stack all use the "
+                          "corrected force.")
         b2.radio("Shape", ("Flat", "Sloped"), key="fc_shape",
                  horizontal=True, label_visibility="collapsed",
                  disabled=not on)
@@ -26691,6 +26767,8 @@ def fc_baseline_controls(t):
                       key="fc_win", step=step, format="%.4g",
                       help="Drag both ends onto a flat stretch after the "
                            "curve.")
+            if on and s.get("fc_corr") == FC_CORRECT[3] and y is not None:
+                fc_hand_controls(t, y, unit)
             if s.get("fc_findstart") or s.get("fc_corr") == FC_CORRECT[2]:
                 if "fc_win0" not in s:
                     s["fc_win0"] = tuple(fcv.default_window(t, after=False))
@@ -26733,7 +26811,7 @@ def fc_analyse(t, y, opts):
 
 
 def fc_figure(t, y, ylab, end, start, segments, clickable,
-              start_window=None):
+              start_window=None, zero_line=False, grid=False):
     s = st.session_state
     colour, base_colour = "#1f77b4", "#F58231"
     keep = sc.thin_index(y) if sc else np.arange(y.size)
@@ -26741,8 +26819,40 @@ def fc_figure(t, y, ylab, end, start, segments, clickable,
     fig.add_trace(go.Scatter(
         x=t[keep], y=y[keep], mode="lines+markers" if clickable else "lines",
         name=ylab, line=dict(color=colour, width=float(s.get("fc_lw", 1.5))),
-        marker=dict(size=12, opacity=0) if clickable else None,
+        # small while drawing lines, so the nearest point (of the curve or
+        # of the click grid) takes a click
+        marker=dict(size=6 if grid else 12, opacity=0) if clickable
+        else None,
         hovertemplate="%{x:.5g} s<br>%{y:.4g}<extra></extra>"))
+    if zero_line:
+        fig.add_hline(y=0, line=dict(color="#555", width=1, dash="dot"))
+    # dashed lines drawn by hand, and the start of the one being drawn
+    for ln in s.get("_fc_lines") or ():
+        fig.add_trace(go.Scatter(
+            x=[p[0] for p in ln["pts"]], y=[p[1] for p in ln["pts"]],
+            mode="lines", showlegend=False, hoverinfo="skip",
+            name="line drawn",
+            line=dict(color=ln.get("colour") or FC_LINE_COLOUR,
+                      width=float(s.get("fc_lw", 1.5)),
+                      dash=sc.EXTEND_DASHES.get(ln.get("dash"), "dash"))))
+    draft = s.get("_fc_draft")
+    if draft:
+        fig.add_trace(go.Scatter(
+            x=[draft[0]], y=[draft[1]], mode="markers", showlegend=False,
+            hoverinfo="skip", name="line start",
+            marker=dict(symbol="x-thin", size=13,
+                        line=dict(color=FC_LINE_COLOUR, width=2.5))))
+    if grid:
+        # an invisible grid of clickable points: a line can start or end
+        # anywhere, not only on the curve
+        y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
+        pad = 0.08 * (y_hi - y_lo if y_hi > y_lo else 1.0)
+        gx, gy = np.meshgrid(np.linspace(float(t[0]), float(t[-1]), 140),
+                             np.linspace(y_lo - pad, y_hi + pad, 56))
+        fig.add_trace(go.Scatter(
+            x=gx.ravel(), y=gy.ravel(), mode="markers", showlegend=False,
+            hoverinfo="none", name="anywhere",
+            marker=dict(size=6, opacity=0, color="#000")))
     for i in segments or ():
         if 0 <= i < t.size:
             fig.add_vline(x=float(t[i]), line=dict(color="#999", width=1,
@@ -26817,19 +26927,86 @@ def fc_figure(t, y, ylab, end, start, segments, clickable,
     return fig
 
 
-def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None):
-    """The plot, with a click setting the end (or start) by hand."""
+def fc_line_click(point):
+    """✏ Draw line: the first click is the start, the second the end."""
     s = st.session_state
-    p1, p2, p3, p4 = st.columns([2.2, 1.0, 1.0, 1.2])
-    clicks = FC_CLICKS if start is not None else FC_CLICKS[:1]
+    here = [float(point["x"]), float(point["y"])]
+    draft = s.get("_fc_draft")
+    if draft is None:
+        s["_fc_draft"] = here
+        return
+    s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
+    s["_fc_lines"] = list(s.get("_fc_lines") or []) + [{
+        "id": s["_fc_n"], "pts": [draft, here],
+        "dash": s.get("fc_line_style", "Dashed"), "colour": FC_LINE_COLOUR}]
+    s["_fc_draft"] = None
+
+
+def fc_line_set(line_id, key, field):
+    s = st.session_state
+    for ln in s.get("_fc_lines") or []:
+        if ln["id"] == line_id:
+            ln[field] = s.get(key)
+
+
+def fc_line_delete(line_id):
+    s = st.session_state
+    s["_fc_lines"] = [ln for ln in s.get("_fc_lines") or []
+                      if ln["id"] != line_id]
+
+
+def fc_lines_panel(drawing):
+    """The line being started, and every line drawn: style, colour,
+    delete."""
+    s = st.session_state
+    s.setdefault("fc_line_style", "Dashed")
+    if drawing:
+        d1, d2, d3 = st.columns([2.6, 1.0, 1.0])
+        draft = s.get("_fc_draft")
+        d1.markdown(f"**✏ Start set** at {draft[0]:.4g} s, {draft[1]:.4g}: "
+                    "now click the end." if draft else
+                    "**✏ Draw line**: click the start, then the end, "
+                    "anywhere on the plot.")
+        d2.selectbox("Style of new lines", FC_LINE_STYLES,
+                     key="fc_line_style", label_visibility="collapsed")
+        d3.button("✕ Cancel line", key="fc_line_cancel", disabled=not draft,
+                  on_click=s.__setitem__, args=("_fc_draft", None),
+                  **STRETCH)
+    for n, ln in enumerate(s.get("_fc_lines") or [], 1):
+        (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
+        c0, c1, c2, c3 = st.columns([2.6, 1.0, 0.45, 0.9])
+        c0.caption(f"**Line {n}**: ({xa:.4g} s, {ya:.4g}) → "
+                   f"({xb:.4g} s, {yb:.4g})")
+        key = f"fc_line_dash_{ln['id']}"
+        s[key] = ln.get("dash", "Dashed")
+        c1.selectbox("Style", FC_LINE_STYLES, key=key,
+                     label_visibility="collapsed", on_change=fc_line_set,
+                     args=(ln["id"], key, "dash"))
+        ckey = f"fc_line_col_{ln['id']}"
+        s[ckey] = ln.get("colour") or FC_LINE_COLOUR
+        c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
+                        on_change=fc_line_set,
+                        args=(ln["id"], ckey, "colour"))
+        c3.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
+                  on_click=fc_line_delete, args=(ln["id"],), **STRETCH)
+
+
+def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None,
+            zero_line=False):
+    """The plot, with a click setting the end (or start) by hand, or
+    drawing a line."""
+    s = st.session_state
+    p1, p2, p3, p4 = st.columns([2.6, 1.0, 1.0, 1.0])
+    clicks = ([FC_CLICKS[0]] + ([FC_CLICKS[1]] if start is not None else [])
+              + [FC_CLICKS[2]])
     if s.get("fc_clickdo") not in clicks:
         s["fc_clickdo"] = None
     p1.segmented_control("What a click on the plot does", clicks,
                          key="fc_clickdo", label_visibility="collapsed",
-                         disabled=end is None,
-                         help="Click the moment the curve really ends (or "
-                              "starts) to set it by hand. Click the chosen "
-                              "button again to stop.")
+                         help="Set the end (or start): click the moment the "
+                              "curve really ends (or starts). Draw line: a "
+                              "click for the start, a click for the end. "
+                              "Click the chosen button again to stop.")
     hand = s.get("fc_end_hand") is not None or \
         s.get("fc_start_hand") is not None
     p2.button("↺ Automatic", key="fc_auto", disabled=not hand, **STRETCH,
@@ -26846,8 +27023,9 @@ def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None):
                   step=max((hi - lo) / 2000.0, 1e-9), format="%.4g")
     p4.caption("Drag to zoom · double-click to reset")
     click_do = s.get("fc_clickdo")
+    drawing = click_do == FC_CLICKS[2]
     fig = fc_figure(t, y, ylab, end, start, segments, bool(click_do),
-                    start_window)
+                    start_window, zero_line, grid=drawing)
     config = {"scrollZoom": True, "doubleClick": "reset",
               "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
     if click_do:
@@ -26863,13 +27041,19 @@ def fc_plot(t, y, ylab, stem, end, start, segments, start_window=None):
         if points:
             when = float(points[-1]["x"])
             s["_fc_chart_ver"] = version + 1
-            s["fc_end_hand" if click_do == FC_CLICKS[0]
-              else "fc_start_hand"] = when
+            if drawing:
+                fc_line_click(points[-1])
+            else:
+                s["fc_end_hand" if click_do == FC_CLICKS[0]
+                  else "fc_start_hand"] = when
             st.rerun()
-        st.caption("Point at the moment and click; the crosshair snaps to "
-                   "the point a click takes. ↺ Automatic undoes it.")
+        if not drawing:
+            st.caption("Point at the moment and click; the crosshair snaps "
+                       "to the point a click takes. ↺ Automatic undoes it.")
     else:
         st.plotly_chart(fig, key="fc_chart", config=config, **STRETCH)
+    if drawing or s.get("_fc_lines"):
+        fc_lines_panel(drawing)
 
 
 def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
@@ -26892,7 +27076,8 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
         (ta, ya), (tb, yb) = inc["start"], inc["end"]
         lines.append(("Baseline taken away",
                       f"line from {ya:.4g} {unit} ({ta:.3g} s) to "
-                      f"{yb:.4g} {unit} ({tb:.3g} s)"))
+                      f"{yb:.4g} {unit} ({tb:.3g} s)"
+                      + (", set by hand" if inc.get("by_hand") else "")))
     m = st.columns(4)
     m[0].metric("Curve ends at", f"{nums['end_s']:.4g} s"
                 if "end_s" in nums else "not found",
@@ -26937,6 +27122,21 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
             "Start of the curve": nums.get("start_s")}.get(zero_at) or 0.0
     table = fcv.table_to_send(t, raw["y"], raw["end"], zero,
                               corrected=corrected, line=raw.get("line"))
+    q1, q2, q3 = st.columns([1.0, 1.0, 2.2])
+    q1.number_input("Zero force before (s)", 0.0, 1e6, step=1.0,
+                    key="fc_pad0", format="%.4g",
+                    help="Adds points at zero force for this long ahead of "
+                         "the first point.")
+    q2.number_input("Zero force after (s)", 0.0, 1e6, step=1.0,
+                    key="fc_pad1", format="%.4g",
+                    help="Adds points at zero force for this long past the "
+                         "last point.")
+    q3.caption("Zero force added before and after the data, so on the "
+               "stack the corrected baseline goes on at 0 beside longer "
+               "recordings. Saved in the CSV too. With Correct (subtract) "
+               "off, the force as read follows its baseline there instead.")
+    table = fcv.pad_zero(table, s.get("fc_pad0") or 0.0,
+                         s.get("fc_pad1") or 0.0)
     if ylab != "Force (nN)":
         table = table.rename(columns={
             fcv.FORCE: ylab,
@@ -26946,11 +27146,16 @@ def fc_results(t, y, ylab, stem, end, start, raw=None, corrected=False):
             "End of the curve": "Time from the end (s)",
             "Start of the curve": "Time from the start (s)"}[zero_at]})
     # time counted from the end (or start) keeps that zero on the stack
+    # lines drawn by hand go along, on the time sent
+    drawn = [{"pts": [[px - zero, py] for px, py in ln["pts"]],
+              "dash": ln.get("dash", "Dashed"),
+              "colour": ln.get("colour")}
+             for ln in s.get("_fc_lines") or []]
     r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
               on_click=send_to_stack,
               args=(stem, table, "Single force curve", lines,
                     "As in the file" if zero_at != "As recorded"
-                    else None),
+                    else None, drawn),
               help="Sends time and force (and force less the baseline) to "
                    "the Stack & compare tab, with this summary for its "
                    "balloon.", **STRETCH)
@@ -26992,7 +27197,8 @@ def force_curve_tab():
     if signal is None:
         return
     t, y, ylab, stem = signal
-    opts = fc_baseline_controls(t)
+    opts = fc_baseline_controls(
+        t, y, " (nN)" if ylab == "Force (nN)" else "")
     end, start = fc_analyse(t, y, opts)
     raw = {"y": y, "end": end, "line": None, "incline": None}
     shown_y, shown_lab = y, ylab
@@ -27001,7 +27207,9 @@ def force_curve_tab():
         shown_lab = ("Force − baseline (nN)" if ylab == "Force (nN)"
                      else f"{ylab} − baseline")
         incline = (fcv.incline(t, y, s["fc_win0"], s["fc_win"])
-                   if opts["correct"] == FC_CORRECT[2] else None)
+                   if opts["correct"] == FC_CORRECT[2]
+                   else fc_hand_line(t)
+                   if opts["correct"] == FC_CORRECT[3] else None)
         if opts["correct"] == FC_CORRECT[2] and incline is None:
             st.warning("A baseline window holds too few points to draw "
                        "the line from start to end: widen the windows. "
@@ -27017,7 +27225,9 @@ def force_curve_tab():
             shown_y, end, start = fcv.corrected(t, y, end, start)
     segments = item.get("segments") if item["kind"] == "ibw" else []
     fc_plot(t, shown_y, shown_lab, stem, end, start, segments,
-            s.get("fc_win0") if raw["incline"] else None)
+            s.get("fc_win0") if raw["incline"]
+            and not raw["incline"].get("by_hand") else None,
+            zero_line=shown_y is not y)
     if segments:
         st.caption("Dotted lines: where the file's segments (approach, "
                    "dwell, retract) meet.")
