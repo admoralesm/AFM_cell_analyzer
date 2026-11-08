@@ -430,3 +430,57 @@ def table_to_send(t, f, end_info, zero=0.0, corrected=False, line=None):
         if corrected:
             out = out[[TIME, FORCE_LESS_BASE, FORCE]]
     return out
+
+
+def pad_zero(table, before=0.0, after=0.0):
+    """
+    The table carried on at zero force for ``before`` seconds ahead of its
+    first point and ``after`` seconds past its last, so on a plot beside
+    longer recordings the corrected baseline goes on at 0.
+
+    Two points are added on each side (one sample step out, and the far
+    end), which a plot joins into a flat line. The force less the baseline
+    is 0 there; the force as read carries on along its baseline (the
+    straight line between the two columns), or is 0 when there is no
+    baseline. The first column is time.
+    """
+    before = max(float(before or 0.0), 0.0)
+    after = max(float(after or 0.0), 0.0)
+    if not (before > 0 or after > 0) or len(table) < 2:
+        return table
+    tcol = table.columns[0]
+    t = pd.to_numeric(table[tcol], errors="coerce").to_numpy(float)
+    finite = np.isfinite(t)
+    if finite.sum() < 2:
+        return table
+    t0, t1 = float(np.nanmin(t)), float(np.nanmax(t))
+    steps = np.diff(np.sort(t[finite]))
+    steps = steps[steps > 0]
+    dt = float(np.median(steps)) if steps.size else 1e-3
+    base = None
+    if FORCE in table.columns and FORCE_LESS_BASE in table.columns:
+        b = (pd.to_numeric(table[FORCE], errors="coerce")
+             - pd.to_numeric(table[FORCE_LESS_BASE], errors="coerce")
+             ).to_numpy(float)
+        ok = finite & np.isfinite(b)
+        if ok.sum() >= 2:
+            base = np.polyfit(t[ok], b[ok], 1)
+
+    def rows(times):
+        out = {tcol: times}
+        for col in table.columns[1:]:
+            if col == FORCE and base is not None:
+                out[col] = np.polyval(base, times)
+            else:
+                out[col] = np.zeros(len(times))
+        return pd.DataFrame(out)
+
+    parts = []
+    if before > 0:
+        parts.append(rows(np.array(sorted({t0 - before,
+                                           t0 - min(dt, before)}))))
+    parts.append(table)
+    if after > 0:
+        parts.append(rows(np.array(sorted({t1 + min(dt, after),
+                                           t1 + after}))))
+    return pd.concat(parts, ignore_index=True)
