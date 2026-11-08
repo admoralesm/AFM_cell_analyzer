@@ -623,7 +623,7 @@ COMPANION_NEEDS = {
     "stack_compare.py": ("_extreme_near", "peak_analysis", "flat_top",
                          "flat_top_continuation", "baseline_through",
                          "baseline_typed", "EXTEND_DASHES",
-                         "flat_top_between"),
+                         "flat_top_between", "hand_line_traces"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
                        "table_to_send", "incline", "pad_zero",
                        "side_fit", "side_line", "bridged", "line_value"),
@@ -10925,12 +10925,12 @@ def send_to_stack(name, frame, source="the video", stats=None,
     for ln in lines or ():
         # the same numbering the stack's own lines use
         s["_sc_hl_n"] = int(s.get("_sc_hl_n", 0)) + 2
-        hand[free].append({"id": s["_sc_hl_n"] - 1, "slot": free,
-                           "file": name,
-                           "pts": [list(map(float, p)) for p in ln["pts"]],
-                           "dash": ln.get("dash", "Dashed"),
-                           "colour": ln.get("colour"), "zero": 0.0,
-                           "ver": s["_sc_hl_n"]})
+        hand[free].append(dict(
+            {"id": s["_sc_hl_n"] - 1, "slot": free, "file": name,
+             "pts": [list(map(float, p)) for p in ln["pts"]],
+             "dash": ln.get("dash", "Dashed"), "colour": ln.get("colour"),
+             "zero": 0.0, "ver": s["_sc_hl_n"]},
+            **{k: ln[k] for k in ("width", "caps", "text") if k in ln}))
     s["_sc_hlines"] = hand
     s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
     s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
@@ -26505,6 +26505,73 @@ def igor_result_panel():
         st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
 
 
+# ============================================= lines drawn by dragging ==
+
+def stroke_line(stroke, xs, ys, x_span, y_span, snap=True, level=True,
+                size=(800.0, 320.0), reach=14.0):
+    """
+    The straight line a drag on a plot makes: from where the press was to
+    where the mouse was let go (the first and last points of the lasso
+    path Plotly reports).
+
+    ``xs``, ``ys``: the curve as plotted; ``x_span``, ``y_span``: what the
+    axes show; ``size``: the plot's size in px (roughly), so distances are
+    judged as they are seen. With ``snap``, an end let go within ``reach``
+    px of the curve goes exactly onto it. With ``level``, a line within 3°
+    of level (or of upright) is made level (upright), keeping the end that
+    is on the curve where it is.
+
+    Returns (start, end, (start on the curve, end on the curve)), or None
+    for a drag too short to be a line (a click).
+    """
+    try:
+        px = [float(v) for v in stroke.get("x") or []]
+        py = [float(v) for v in stroke.get("y") or []]
+    except (TypeError, ValueError):
+        return None
+    if len(px) < 2 or len(py) != len(px) \
+            or not (np.isfinite(px).all() and np.isfinite(py).all()):
+        return None
+    w = float(size[0]) / (abs(float(x_span)) or 1.0)
+    h = float(size[1]) / (abs(float(y_span)) or 1.0)
+    a, b = [px[0], py[0]], [px[-1], py[-1]]
+    if np.hypot((b[0] - a[0]) * w, (b[1] - a[1]) * h) < 8.0:
+        return None
+    on = [False, False]
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[ok], ys[ok]
+    if snap and xs.size:
+        for k, p in enumerate((a, b)):
+            d = np.hypot((xs - p[0]) * w, (ys - p[1]) * h)
+            i = int(np.argmin(d))
+            if d[i] <= reach:
+                p[0], p[1] = float(xs[i]), float(ys[i])
+                on[k] = True
+    if level and not all(on):
+        dx, dy = (b[0] - a[0]) * w, (b[1] - a[1]) * h
+        if abs(dy) <= 0.0524 * abs(dx):
+            if on[1]:
+                a[1] = b[1]
+            else:
+                b[1] = a[1]
+        elif abs(dx) <= 0.0524 * abs(dy):
+            if on[1]:
+                a[0] = b[0]
+            else:
+                b[0] = a[0]
+    return a, b, tuple(on)
+
+
+def lasso_strokes(event):
+    """The drags (lasso paths) a chart's selection reports, newest last."""
+    try:
+        return [d for d in (event.selection.lasso or [])
+                if isinstance(d, dict) and len(d.get("x") or []) >= 2]
+    except Exception:
+        return []
+
+
 # ==================================================== single force curve ==
 
 FC_ZEROS = ("As recorded", "End of the curve", "Start of the curve")
@@ -26521,7 +26588,7 @@ FC_CLICK_END = "🎯 Set the end"
 FC_CLICK_START = "🎯 Set the start"
 FC_CLICK_PIN = {"before": "📍 Line before: its point",
                 "after": "📍 Line after: its point"}
-FC_CLICK_DRAW = "✏ Draw line"
+FC_CLICK_DRAW = "✏ Draw lines"
 FC_CLICKS = (FC_CLICK_END, FC_CLICK_START, FC_CLICK_DRAW)
 FC_CURVE_COLOUR = "#1F4E9C"
 FC_SIDE_COLOUR = {"before": "#2E8B57", "after": "#D2691E"}
@@ -26530,12 +26597,22 @@ FC_LINE_COLOUR = "#444444"
 FC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 FC_NO_TIME = "(none: use a sampling rate)"
 FC_SIDE_KEYS = {"before": ("fc_mvb", "fc_rtb"), "after": ("fc_mva", "fc_rta")}
+# the force can be shown in nN, µN or pN: what one nN is in each
+FC_YUNITS = {"nN": 1.0, "µN": 1e-3, "pN": 1e3}
+# bars along the top marking the stretches of the recording: (key, label,
+# colour, shown at first)
+FC_BARS = (("app", "Approach", "#7B1FA2", True),
+           ("dwell", "Dwell", "#757575", False),
+           ("ret", "Retract", "#D32F2F", True))
+FC_DRAWS = ("✏ Line",) + tuple(f"━ {label}" for _, label, _, _ in FC_BARS)
 FC_DEFAULTS = {"fc_base": True, "fc_corr": "None", "fc_shape": "Sloped",
                "fc_dir": "Either way", "fc_ksd": 3.0, "fc_run": 5,
                "fc_findstart": False, "fc_lw": 1.5, "fc_height": 440,
                "fc_zero": "As recorded", "fc_pad0": 0.0, "fc_pad1": 0.0,
                "fc_view": "Corrected", "fc_under": True,
-               "fc_mvb": 0.0, "fc_rtb": 0.0, "fc_mva": 0.0, "fc_rta": 0.0}
+               "fc_mvb": 0.0, "fc_rtb": 0.0, "fc_mva": 0.0, "fc_rta": 0.0,
+               "fc_yunit": "nN", "fc_snap": True, "fc_level": True,
+               "fc_bars": False, "fc_bar_w": 4.0, "fc_draws": FC_DRAWS[0]}
 
 
 @st.cache_data(max_entries=6, show_spinner=False)
@@ -26565,17 +26642,58 @@ def fc_reset(sig):
     for key in ("fc_win", "fc_win0", "fc_end_hand", "fc_start_hand",
                 "fc_ch", "fc_tcol", "fc_fcol", "fc_unit", "fc_xr",
                 "fc_clickdo", "fc_kspring", "fc_invols", "fc_rate",
-                "_fc_lines", "_fc_draft", "_fc_pin_next",
+                "_fc_lines", "_fc_draft", "_fc_pin_next", "_fc_lines_hist",
+                "_fc_redraw", "_fc_draw_note", "fc_bar_y", "fc_bar_t_app",
+                "fc_bar_t_dwell", "fc_bar_t_ret",
                 "fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
         s.pop(key, None)
     s["_fc_sig"] = sig
+
+
+def fc_force_unit(ylab):
+    """'µN' for 'Force (µN)'; '' when the y title is not a force."""
+    found = re.match(r"Force \((.+)\)$", str(ylab))
+    return found.group(1) if found else ""
+
+
+def fc_less_label(ylab):
+    """The title of the force less its baseline."""
+    unit = fc_force_unit(ylab)
+    return f"Force − baseline ({unit})" if unit else f"{ylab} − baseline"
+
+
+def fc_yunit_change():
+    """Shown in another unit: what is kept in force units (the side lines'
+    moves and turns, the lines drawn) is converted, so nothing moves."""
+    s = st.session_state
+    old = s.get("_fc_yunit_was") or "nN"
+    new = s.get("fc_yunit") or "nN"
+    s["_fc_yunit_was"] = new
+    factor = FC_YUNITS.get(new, 1.0) / FC_YUNITS.get(old, 1.0)
+    if factor == 1.0:
+        return
+    for key in ("fc_mvb", "fc_rtb", "fc_mva", "fc_rta", "fc_bar_y"):
+        if s.get(key) is not None:
+            s[key] = float(s[key]) * factor
+    for ln in s.get("_fc_lines") or []:
+        ln["pts"] = [[x, y * factor] for x, y in ln["pts"]]
+    s["_fc_lines_hist"] = []
+    s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
+
+
+def fc_send_unit_change():
+    """Send in, below the numbers: the tab is shown in that unit too, so
+    the plot shows what is sent."""
+    s = st.session_state
+    s["fc_yunit"] = s.get("fc_send_unit") or "nN"
+    fc_yunit_change()
 
 
 def fc_signal(item):
     """(time in s, values, y title, name for files) from the file and the
     choices above the plot, or None with the problem shown."""
     s = st.session_state
-    c1, c2, c3, c4 = st.columns([1.3, 1.0, 1.0, 1.0])
+    c1, c2, c3, c4, c5 = st.columns([1.3, 1.0, 1.0, 1.0, 0.8])
     if item["kind"] == "ibw":
         names = list(item["channels"])
         if s.get("fc_ch") not in names:
@@ -26659,6 +26777,17 @@ def fc_signal(item):
     except ValueError as exc:
         st.error(str(exc))
         return None
+    if ylab == "Force (nN)":
+        if s.get("fc_yunit") not in FC_YUNITS:
+            s["fc_yunit"] = "nN"
+        s.setdefault("_fc_yunit_was", s["fc_yunit"])
+        shown_in = c5.selectbox(
+            "Force in", tuple(FC_YUNITS), key="fc_yunit",
+            on_change=fc_yunit_change,
+            help="The unit of the y axis, the numbers, the table saved and "
+                 "the curve sent to the stack.")
+        y = y * FC_YUNITS[shown_in]
+        ylab = f"Force ({shown_in})"
     keep = np.isfinite(t) & np.isfinite(y)
     if keep.sum() < 10:
         st.error("Fewer than 10 points with both a time and a value.")
@@ -26689,7 +26818,8 @@ def fc_line_card(side, fit, y, t, unit):
              else "Line after the curve")
     span = float(np.nanmax(y) - np.nanmin(y)) or 1.0
     duration = float(t[-1] - t[0]) or 1.0
-    rate = " (nN/s)" if unit == " (nN)" else " (per s)"
+    bare = unit.strip(" ()")
+    rate = f" ({bare}/s)" if bare else " (per s)"
     with st.container(border=True):
         st.markdown(f"<span style='color:{FC_SIDE_COLOUR[side]};"
                     f"font-weight:700'>━━</span> **{title}**",
@@ -26726,7 +26856,8 @@ def fc_baseline_controls(t, y, unit=""):
     span = (round(lo, 9), round(hi, 9))
     if s.get("_fc_span") != span:
         for key in ("fc_win", "fc_win0", "fc_xr", "fc_end_hand",
-                    "fc_start_hand", "fc_mvb", "fc_rtb", "fc_mva", "fc_rta"):
+                    "fc_start_hand", "fc_mvb", "fc_rtb", "fc_mva", "fc_rta",
+                    "fc_bar_t_app", "fc_bar_t_dwell", "fc_bar_t_ret"):
             s.pop(key, None)
         s["_fc_span"] = span
     if s.get("fc_corr") not in FC_CORRECT:
@@ -26932,6 +27063,150 @@ def fc_model(t, y, opts):
     return m
 
 
+def fc_bar_times(t, m, segments):
+    """Where each bar starts and ends at first: the file's own segments
+    (approach | dwell | retract) for an .ibw, else from the curve: its
+    start to its peak (approach), its peak to its end (retract)."""
+    t0, t1 = float(t[0]), float(t[-1])
+    cut = sorted(float(t[i]) for i in segments or () if 0 < i < t.size)
+    if len(cut) >= 2:
+        return {"app": (t0, cut[0]), "dwell": (cut[0], cut[-1]),
+                "ret": (cut[-1], t1)}
+    if len(cut) == 1:
+        return {"app": (t0, cut[0]), "dwell": (cut[0], cut[0]),
+                "ret": (cut[0], t1)}
+    ts = m.get("ts")
+    if ts is None:
+        ts = (m.get("start") or {}).get("start")
+    te = m.get("te")
+    if te is None:
+        te = (m.get("end") or {}).get("end")
+    ts = t0 if ts is None else float(ts)
+    te = t1 if te is None or te <= ts else float(te)
+    y = np.asarray(m["shown"], float)
+    inside = (t >= ts) & (t <= te) & np.isfinite(y)
+    if inside.sum() < 2:
+        inside = np.isfinite(y)
+    level = 0.0 if m.get("corrected") else float(np.nanmedian(
+        y[: max(5, y.size // 20)]))
+    tp = float(t[inside][int(np.nanargmax(np.abs(y[inside] - level)))])
+    return {"app": (ts, tp), "dwell": (tp, tp), "ret": (tp, te)}
+
+
+def fc_bars_ready(t, m, segments):
+    """Each bar's settings in place before the plot is drawn: its times
+    from the file or the curve the first time, kept inside the time span,
+    and every setting kept while the bars are off."""
+    s = st.session_state
+    lo, hi = float(t[0]), float(t[-1])
+
+    def inside(pair):
+        a, b = sorted(float(v) for v in pair)
+        return (min(max(a, lo), hi), min(max(b, lo), hi))
+
+    # the times the file or the curve gives; a bar still at the times it
+    # was given last run follows them (the start found, the end clicked),
+    # one moved or dragged by hand stays where it was put
+    auto = {k: inside(v) for k, v in fc_bar_times(t, m, segments).items()}
+    given = s.get("_fc_bar_auto") or {}
+    for k, label, colour, shown in FC_BARS:
+        for key, value in ((f"fc_bar_on_{k}", shown),
+                           (f"fc_bar_lab_{k}", label),
+                           (f"fc_bar_col_{k}", colour)):
+            # written back each run: kept while their boxes are not drawn
+            s[key] = s[key] if key in s else value
+        key = f"fc_bar_t_{k}"
+        now = inside(s[key]) if key in s else None
+        if now is None or (k in given and np.allclose(
+                now, given[k], rtol=0, atol=1e-9 * max(1.0, hi - lo))):
+            now = auto[k]
+        s[key] = now
+    s["_fc_bar_auto"] = auto
+    for key in ("fc_bar_w", "fc_bars"):
+        s[key] = s.get(key, FC_DEFAULTS[key])
+
+
+def fc_bar_specs(t, y):
+    """The bars to draw: [{"x", "y", "text", "colour", "width", "caps",
+    "room"}], level just above the curve unless dragged elsewhere."""
+    s = st.session_state
+    if not s.get("fc_bars"):
+        return []
+    finite = np.asarray(y, float)
+    finite = finite[np.isfinite(finite)]
+    top = float(finite.max()) if finite.size else 1.0
+    span = float(finite.max() - finite.min()) if finite.size > 1 else 1.0
+    span = span or 1.0
+    level = s.get("fc_bar_y")
+    level = top + 0.10 * span if level is None else float(level)
+    out = []
+    for k, label, colour, _ in FC_BARS:
+        if not s.get(f"fc_bar_on_{k}"):
+            continue
+        a, b = sorted(s.get(f"fc_bar_t_{k}") or (0.0, 0.0))
+        if b > a:
+            out.append({"key": k, "x": [a, b], "y": [level, level],
+                        "text": str(s.get(f"fc_bar_lab_{k}") or label),
+                        "colour": s.get(f"fc_bar_col_{k}") or colour,
+                        "width": float(s.get("fc_bar_w") or 4.0),
+                        "caps": True, "dash": "solid",
+                        "room": 0.12 * span})
+    return out
+
+
+def fc_bars_reset():
+    """↺ Reset: the bars' times from the file (or curve) again, and their
+    height back to just above the curve."""
+    s = st.session_state
+    for k, _, _, _ in FC_BARS:
+        s.pop(f"fc_bar_t_{k}", None)
+    s.pop("fc_bar_y", None)
+
+
+def fc_bars_panel(t):
+    """━ Approach / retract bars: on or off, thickness, and each bar's
+    label, times and colour."""
+    s = st.session_state
+    with st.container(border=True):
+        h1, h2, h3, h4 = st.columns([1.5, 1.1, 1.3, 0.9])
+        on = h1.toggle(
+            "━ Approach / retract bars", key="fc_bars",
+            help="Bars along the top of the plot marking the approach and "
+                 "the retract (and the dwell if you want it), each in its "
+                 "own colour, with its label. Set from the file's segments "
+                 "(.ibw), else from the curve: its start to its peak, its "
+                 "peak to its end. Sent to the stack with the curve.")
+        if not on:
+            h2.caption("Off")
+            return
+        h2.slider("Thickness", 1.0, 12.0, step=0.5, key="fc_bar_w")
+        h3.caption("Height: just above the curve" if s.get("fc_bar_y") is None
+                   else f"Height: {s['fc_bar_y']:.4g} (as dragged)")
+        h4.button("↺ Reset", key="fc_bars_reset", on_click=fc_bars_reset,
+                  **STRETCH, help="Times from the file (or the curve) "
+                                  "again, height just above the curve.")
+        lo, hi = float(t[0]), float(t[-1])
+        step = max((hi - lo) / 2000.0, 1e-9)
+        for k, label, _, _ in FC_BARS:
+            c0, c1, c2, c3 = st.columns([0.3, 1.0, 3.1, 0.45],
+                                        vertical_alignment="center")
+            c0.checkbox("Show", key=f"fc_bar_on_{k}",
+                        label_visibility="collapsed",
+                        help=f"Show the {label.lower()} bar.")
+            c1.text_input("Label", key=f"fc_bar_lab_{k}",
+                          label_visibility="collapsed",
+                          disabled=not s.get(f"fc_bar_on_{k}"))
+            c2.slider(f"{label}: from, to (s)", lo, hi, key=f"fc_bar_t_{k}",
+                      step=step, format="%.4g", label_visibility="collapsed",
+                      disabled=not s.get(f"fc_bar_on_{k}"))
+            c3.color_picker("Colour", key=f"fc_bar_col_{k}",
+                            label_visibility="collapsed",
+                            disabled=not s.get(f"fc_bar_on_{k}"))
+        st.caption("Or draw one: choose ✏ Draw lines above the plot, pick a "
+                   "bar under “A drag draws”, and drag along the top from "
+                   "where it starts to where it ends.")
+
+
 def fc_marker(fig, x, colour, text, by_hand):
     """A dashed vertical line with its label above the plot."""
     fig.add_vline(x=x, line=dict(color=colour, width=1.6, dash="dash"))
@@ -26941,7 +27216,8 @@ def fc_marker(fig, x, colour, text, by_hand):
                             + (" (by hand)" if by_hand else ""))
 
 
-def fc_figure(t, m, ylab, segments, clickable, grid=False, view=None):
+def fc_figure(t, m, ylab, segments, clickable, drawing=False, view=None,
+              bars=()):
     """The force against time, with the baseline as the model has it:
     corrected (the force less the baseline, on its zero line) or raw (the
     force as read, with each side line, the bridge and the points where
@@ -26954,13 +27230,12 @@ def fc_figure(t, m, ylab, segments, clickable, grid=False, view=None):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=t[keep], y=y[keep], mode="lines+markers" if clickable else "lines",
-        name=ylab if raw_view else (
-            "Force − baseline (nN)" if ylab == "Force (nN)"
-            else f"{ylab} − baseline"),
+        name=ylab if raw_view else fc_less_label(ylab),
         line=dict(color=FC_CURVE_COLOUR, width=lw),
-        # small: the nearest point (of the curve, or of the click grid
-        # while drawing lines) takes a click, not the first of a tie
+        # small: the nearest point takes a click, not the first of a tie
         marker=dict(size=6, opacity=0) if clickable else None,
+        selected=dict(marker=dict(opacity=0)),
+        unselected=dict(marker=dict(opacity=0)),
         hovertemplate="%{x:.5g} s<br>%{y:.4g}<extra></extra>"))
     for i in segments or ():
         if 0 <= i < t.size:
@@ -27065,36 +27340,41 @@ def fc_figure(t, m, ylab, segments, clickable, grid=False, view=None):
                   start.get("by_hand"))
         if end and end.get("end") is not None \
                 and end["end"] > start["start"]:
+            # under the bars' labels when there are bars along the top
             fig.add_annotation(
-                x=0.5 * (start["start"] + end["end"]), y=0.95, yref="paper",
+                x=0.5 * (start["start"] + end["end"]),
+                y=0.03 if bars else 0.95, yref="paper",
+                yanchor="bottom" if bars else "middle",
                 showarrow=False, font=dict(size=13, color="#333"),
                 text=f"↔ {end['end'] - start['start']:.4g} s")
-    # dashed lines drawn by hand, and the start of the one being drawn
-    for ln in s.get("_fc_lines") or ():
+    # the bars along the top: approach, dwell, retract
+    for bar in bars or ():
+        for trace in sc.hand_line_traces(bar, bar["colour"],
+                                         name=f"bar {bar['key']}",
+                                         room=bar.get("room")):
+            fig.add_trace(trace)
+    # the lines drawn by hand (numbered while lines are being drawn, so
+    # each one's row below the plot is easy to find)
+    marks = []
+    for n, ln in enumerate(s.get("_fc_lines") or (), 1):
         fig.add_trace(go.Scatter(
             x=[p[0] for p in ln["pts"]], y=[p[1] for p in ln["pts"]],
             mode="lines", showlegend=False, hoverinfo="skip",
             name="line drawn",
-            line=dict(color=ln.get("colour") or FC_LINE_COLOUR, width=lw,
+            line=dict(color=ln.get("colour") or FC_LINE_COLOUR,
+                      width=max(lw, 1.6),
                       dash=sc.EXTEND_DASHES.get(ln.get("dash"), "dash"))))
-    draft = s.get("_fc_draft")
-    if draft:
+        (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
+        marks.append((0.5 * (xa + xb), 0.5 * (ya + yb), str(n),
+                      ln.get("colour") or FC_LINE_COLOUR,
+                      ln["id"] == s.get("_fc_redraw")))
+    if drawing and marks:
         fig.add_trace(go.Scatter(
-            x=[draft[0]], y=[draft[1]], mode="markers", showlegend=False,
-            hoverinfo="skip", name="line start",
-            marker=dict(symbol="x-thin", size=13,
-                        line=dict(color=FC_LINE_COLOUR, width=2.5))))
-    if grid:
-        # an invisible grid of clickable points: a line can start or end
-        # anywhere, not only on the curve
-        y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
-        pad = 0.08 * (y_hi - y_lo if y_hi > y_lo else 1.0)
-        gx, gy = np.meshgrid(np.linspace(float(t[0]), float(t[-1]), 140),
-                             np.linspace(y_lo - pad, y_hi + pad, 56))
-        fig.add_trace(go.Scatter(
-            x=gx.ravel(), y=gy.ravel(), mode="markers", showlegend=False,
-            hoverinfo="none", name="anywhere",
-            marker=dict(size=6, opacity=0, color="#000")))
+            x=[k[0] for k in marks], y=[k[1] for k in marks], mode="text",
+            text=[f"<b>{k[2]}</b>" + (" ✏" if k[4] else "") for k in marks],
+            textposition="top center", showlegend=False, hoverinfo="skip",
+            name="line numbers",
+            textfont=dict(size=13, color=[k[3] for k in marks])))
     xr = s.get("fc_xr")
     axis = dict(showline=True, linecolor="black", linewidth=1.2, mirror=True,
                 ticks="outside", ticklen=5, tickwidth=1.2, showgrid=True,
@@ -27106,35 +27386,119 @@ def fc_figure(t, m, ylab, segments, clickable, grid=False, view=None):
         legend=dict(orientation="h", yanchor="bottom", y=1.09, x=0,
                     font=dict(size=12)),
         xaxis=dict(title="Time (s)", range=list(xr) if xr else None, **axis),
-        yaxis=dict(title=(ylab if raw_view else (
-            "Force − baseline (nN)" if ylab == "Force (nN)"
-            else f"{ylab} − baseline")), **axis),
+        yaxis=dict(title=(ylab if raw_view else fc_less_label(ylab)),
+                   **axis),
         hovermode="closest", dragmode="zoom",
         # a zoom survives other changes; moving "Time shown" resets it
         uirevision=f"fc-{xr}")
     if clickable:
+        # a crosshair: on the point a click takes, or (drawing lines) right
+        # at the cursor, where a line starts or ends
         spikes = dict(showspikes=True, spikemode="across",
-                      spikesnap="hovered data", spikedash="solid",
-                      spikecolor="#555", spikethickness=1)
+                      spikesnap="cursor" if drawing else "hovered data",
+                      spikedash="solid", spikecolor="#555", spikethickness=1)
         fig.update_xaxes(**spikes)
         fig.update_yaxes(**spikes)
         fig.update_layout(hoverdistance=2000, spikedistance=2000)
+    if drawing:
+        # a drag draws: the stroke shows as a dashed line as it is drawn
+        fig.update_layout(
+            dragmode="lasso",
+            newselection=dict(line=dict(color=FC_LINE_COLOUR, width=2,
+                                        dash="dash")),
+            activeselection=dict(fillcolor="rgba(0,0,0,0)", opacity=1))
     return fig
 
 
-def fc_line_click(point):
-    """✏ Draw line: the first click is the start, the second the end."""
+def fc_lines_push():
+    """Keep the lines as they are, for ↶ Undo."""
     s = st.session_state
-    here = [float(point["x"]), float(point["y"])]
-    draft = s.get("_fc_draft")
-    if draft is None:
-        s["_fc_draft"] = here
+    s["_fc_lines_hist"] = (list(s.get("_fc_lines_hist") or [])
+                           + [copy.deepcopy(s.get("_fc_lines") or [])])[-30:]
+
+
+def fc_lines_undo():
+    s = st.session_state
+    history = list(s.get("_fc_lines_hist") or [])
+    if history:
+        s["_fc_lines"] = history.pop()
+        s["_fc_lines_hist"] = history
+        s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
+        s.pop("_fc_redraw", None)
+
+
+def fc_line_drawn(stroke, t, y):
+    """A drag on the plot while ✏ Draw lines is chosen: a straight line
+    from where it started to where it was let go (or the line being
+    redrawn, moved there)."""
+    s = st.session_state
+    lo, hi = sorted(map(float, s.get("fc_xr") or (t[0], t[-1])))
+    inside = (t >= lo) & (t <= hi)
+    shown = y[inside] if inside.sum() > 1 else y
+    y_span = 1.16 * float(np.nanmax(shown) - np.nanmin(shown)) or 1.0
+    size = (800.0, max(120.0, float(s.get("fc_height", 440)) - 122.0))
+    kind = s.get("fc_draws") or FC_DRAWS[0]
+    if s.get("_fc_redraw") is not None:
+        kind = FC_DRAWS[0]
+    line = kind == FC_DRAWS[0]
+    # a bar is taken as dragged: no snapping onto the curve
+    got = stroke_line(stroke, t, y, (hi - lo) or 1.0, y_span,
+                      snap=line and bool(s.get("fc_snap", True)),
+                      level=line and bool(s.get("fc_level", True)),
+                      size=size)
+    if got is None:
+        s["_fc_draw_note"] = ("⚠️ That was a click, too short for a line: "
+                              "press where the line starts, drag to where "
+                              "it ends and let go.")
         return
-    s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
-    s["_fc_lines"] = list(s.get("_fc_lines") or []) + [{
-        "id": s["_fc_n"], "pts": [draft, here],
-        "dash": s.get("fc_line_style", "Dashed"), "colour": FC_LINE_COLOUR}]
-    s["_fc_draft"] = None
+    a, b, on = got
+    if not line:
+        # a bar: the drag's two ends give where it starts and ends, its
+        # start the height of every bar
+        k = next(k for k, label, _, _ in FC_BARS if kind == f"━ {label}")
+        x0, x1 = sorted((float(a[0]), float(b[0])))
+        x0, x1 = max(x0, float(t[0])), min(x1, float(t[-1]))
+        if x1 <= x0:
+            s["_fc_draw_note"] = "⚠️ Drag along the time the bar covers."
+            return
+        s[f"fc_bar_t_{k}"] = (x0, x1)
+        s[f"fc_bar_on_{k}"] = True
+        order = [key for key, _, _, _ in FC_BARS]
+        for j, other in enumerate(order):
+            if other == k or not s.get(f"fc_bar_on_{other}"):
+                continue
+            a2, b2 = sorted(s.get(f"fc_bar_t_{other}") or (0.0, 0.0))
+            if j < order.index(k) and a2 < x0 < b2:
+                s[f"fc_bar_t_{other}"] = (a2, x0)
+            elif j > order.index(k) and a2 < x1 < b2:
+                s[f"fc_bar_t_{other}"] = (x1, b2)
+        s["fc_bars"] = True
+        s["fc_bar_y"] = float(a[1])
+        s["_fc_draw_note"] = (f"✅ {kind[2:]} bar from {x0:.4g} s to "
+                              f"{x1:.4g} s, at {a[1]:.4g}. Its colour and "
+                              "label are under ━ Approach / retract bars.")
+        return
+    fc_lines_push()
+    lines = copy.deepcopy(s.get("_fc_lines") or [])
+    target = s.pop("_fc_redraw", None)
+    n = next((k for k, ln in enumerate(lines, 1) if ln["id"] == target),
+             None)
+    if n is not None:
+        lines[n - 1]["pts"] = [a, b]
+        what = f"Line {n} redrawn"
+    else:
+        s["_fc_n"] = int(s.get("_fc_n", 0)) + 1
+        lines.append({"id": s["_fc_n"], "pts": [a, b],
+                      "dash": s.get("fc_line_style", "Dashed"),
+                      "colour": FC_LINE_COLOUR})
+        what = f"Line {len(lines)} drawn"
+    s["_fc_lines"] = lines
+    s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
+    ends = {(True, True): " (both ends on the curve)",
+            (True, False): " (its start on the curve)",
+            (False, True): " (its end on the curve)"}.get(on, "")
+    s["_fc_draw_note"] = (f"✅ {what}: ({a[0]:.4g} s, {a[1]:.4g}) → "
+                          f"({b[0]:.4g} s, {b[1]:.4g}){ends}.")
 
 
 def fc_line_set(line_id, key, field):
@@ -27146,32 +27510,105 @@ def fc_line_set(line_id, key, field):
 
 def fc_line_delete(line_id):
     s = st.session_state
+    fc_lines_push()
     s["_fc_lines"] = [ln for ln in s.get("_fc_lines") or []
                       if ln["id"] != line_id]
+    s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
+    if s.get("_fc_redraw") == line_id:
+        s.pop("_fc_redraw", None)
 
 
-def fc_lines_panel(drawing):
-    """The line being started, and every line drawn: style, colour,
-    delete."""
+def fc_line_redraw(line_id):
+    """✏ Redraw: the next drag on the plot moves this line."""
     s = st.session_state
-    s.setdefault("fc_line_style", "Dashed")
+    if s.get("_fc_redraw") == line_id:
+        s.pop("_fc_redraw", None)
+        return
+    s["_fc_redraw"] = line_id
+    s["fc_clickdo"] = FC_CLICK_DRAW
+    s["fc_draws"] = FC_DRAWS[0]
+
+
+def fc_lines_typed(key):
+    """The ends typed into the table, into the lines."""
+    s = st.session_state
+    edits = (s.get(key) or {}).get("edited_rows") or {}
+    if not edits:
+        return
+    fc_lines_push()
+    lines = copy.deepcopy(s.get("_fc_lines") or [])
+    for row, change in edits.items():
+        row = int(row)
+        if not 0 <= row < len(lines):
+            continue
+        (x0, y0), (x1, y1) = lines[row]["pts"][0], lines[row]["pts"][-1]
+        ends = {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+        for name, value in change.items():
+            if name in ends and value is not None:
+                try:
+                    ends[name] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        lines[row]["pts"] = [[ends["x0"], ends["y0"]],
+                             [ends["x1"], ends["y1"]]]
+    s["_fc_lines"] = lines
+    s["_fc_lines_ver"] = int(s.get("_fc_lines_ver", 0)) + 1
+
+
+def fc_lines_panel(drawing, ylab):
+    """How new lines are drawn, and every line drawn: its style, colour,
+    ✏ Redraw, 🗑 Delete, and its ends to type exactly."""
+    s = st.session_state
+    lines = s.get("_fc_lines") or []
+    for key, value in (("fc_line_style", "Dashed"), ("fc_snap", True),
+                       ("fc_level", True)):
+        s.setdefault(key, value)
+    target = s.get("_fc_redraw")
     if drawing:
-        d1, d2, d3 = st.columns([2.6, 1.0, 1.0])
-        draft = s.get("_fc_draft")
-        d1.markdown(f"**✏ Start set** at {draft[0]:.4g} s, {draft[1]:.4g}: "
-                    "now click the end." if draft else
-                    "**✏ Draw line**: click the start, then the end, "
-                    "anywhere on the plot.")
-        d2.selectbox("Style of new lines", FC_LINE_STYLES,
-                     key="fc_line_style", label_visibility="collapsed")
-        d3.button("✕ Cancel line", key="fc_line_cancel", disabled=not draft,
-                  on_click=s.__setitem__, args=("_fc_draft", None),
-                  **STRETCH)
-    for n, ln in enumerate(s.get("_fc_lines") or [], 1):
+        with st.container(border=True):
+            n = next((k for k, ln in enumerate(lines, 1)
+                      if ln["id"] == target), None)
+            if s.get("fc_draws") not in FC_DRAWS:
+                s["fc_draws"] = FC_DRAWS[0]
+            bar = s["fc_draws"] != FC_DRAWS[0] and not n
+            st.markdown(
+                f"**✏ Redrawing line {n}**: drag from its new start to its "
+                "new end." if n else
+                f"**{s['fc_draws']} bar: drag along the top, from where it "
+                "starts to where it ends.**" if bar else
+                "**✏ Press where a line starts, drag to where it ends, "
+                "let go.** Each drag is one line.")
+            d0, d2, d3, d4, d5 = st.columns([2.9, 1.0, 0.95, 0.85, 0.8])
+            d0.segmented_control(
+                "A drag draws", FC_DRAWS, key="fc_draws",
+                label_visibility="collapsed",
+                help="✏ Line: a line from where the drag starts to where it "
+                     "ends. ━ Approach / Dwell / Retract: that bar along the "
+                     "top, over the time the drag covers (all the bars sit "
+                     "at the height the drag starts at).")
+            d2.selectbox("Style of new lines", FC_LINE_STYLES,
+                         key="fc_line_style", label_visibility="collapsed",
+                         disabled=bar)
+            d3.toggle("🧲 Snap", key="fc_snap", disabled=bar,
+                      help="An end let go close to the curve goes exactly "
+                           "onto it, so a line joins the curve.")
+            d4.toggle("─ Level", key="fc_level", disabled=bar,
+                      help="A line drawn nearly level (or upright) is made "
+                           "exactly level (upright).")
+            d5.button("↶ Undo", key="fc_line_undo", on_click=fc_lines_undo,
+                      disabled=not s.get("_fc_lines_hist"), **STRETCH,
+                      help="Takes back the last line drawn, moved, typed "
+                           "or deleted.")
+            note = s.pop("_fc_draw_note", None)
+            if note:
+                st.caption(note)
+    unit = fc_force_unit(ylab)
+    for n, ln in enumerate(lines, 1):
         (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
-        c0, c1, c2, c3 = st.columns([2.6, 1.0, 0.45, 0.9])
-        c0.caption(f"**Line {n}**: ({xa:.4g} s, {ya:.4g}) → "
-                   f"({xb:.4g} s, {yb:.4g})")
+        c0, c1, c2, c3, c4 = st.columns([2.5, 1.0, 0.45, 0.95, 0.9])
+        c0.markdown(f"**Line {n}**: ({xa:.4g} s, {ya:.4g}) → "
+                    f"({xb:.4g} s, {yb:.4g})"
+                    + (f" {unit}" if unit else ""))
         key = f"fc_line_dash_{ln['id']}"
         s[key] = ln.get("dash", "Dashed")
         c1.selectbox("Style", FC_LINE_STYLES, key=key,
@@ -27182,13 +27619,42 @@ def fc_lines_panel(drawing):
         c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
                         on_change=fc_line_set,
                         args=(ln["id"], ckey, "colour"))
-        c3.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
+        c3.button("✕ Stop" if ln["id"] == target else "✏ Redraw",
+                  key=f"fc_line_redo_{ln['id']}", on_click=fc_line_redraw,
+                  args=(ln["id"],), **STRETCH,
+                  help="Then drag on the plot: this line moves to the new "
+                       "drag (its style and colour stay).")
+        c4.button("🗑 Delete", key=f"fc_line_del_{ln['id']}",
                   on_click=fc_line_delete, args=(ln["id"],), **STRETCH)
+    if lines:
+        with st.expander("✎ Type the ends exactly"):
+            frame = pd.DataFrame(
+                [[n, ln["pts"][0][0], ln["pts"][0][1], ln["pts"][-1][0],
+                  ln["pts"][-1][1]] for n, ln in enumerate(lines, 1)],
+                columns=["line", "x0", "y0", "x1", "y1"])
+            key = f"fc_lines_tab_{int(s.get('_fc_lines_ver', 0))}"
+            what = f" ({unit})" if unit else ""
+            st.data_editor(
+                frame, key=key, hide_index=True, disabled=["line"],
+                num_rows="fixed", on_change=fc_lines_typed, args=(key,),
+                **STRETCH, column_config={
+                    "line": st.column_config.NumberColumn("Line",
+                                                          width="small"),
+                    "x0": st.column_config.NumberColumn("Start time (s)",
+                                                        format="%.6g"),
+                    "y0": st.column_config.NumberColumn(f"Start{what}",
+                                                        format="%.6g"),
+                    "x1": st.column_config.NumberColumn("End time (s)",
+                                                        format="%.6g"),
+                    "y1": st.column_config.NumberColumn(f"End{what}",
+                                                        format="%.6g")})
+            st.caption("Type a number and press Enter: the line moves at "
+                       "once. ↶ Undo (while drawing) takes it back.")
 
 
 def fc_plot(t, m, ylab, stem, segments):
-    """The plot, with a click setting the end (or start), placing a side
-    line at a point, or drawing a line."""
+    """The plot, with a click setting the end (or start) or placing a side
+    line at a point, or a drag drawing a line."""
     s = st.session_state
     uses = FC_USES.get(m["mode"], ())
     clicks = []
@@ -27205,13 +27671,13 @@ def fc_plot(t, m, ylab, stem, segments):
         s["fc_clickdo"] = None
     p1, p2, p3 = st.columns([3.4, 1.0, 1.0])
     p1.segmented_control(
-        "What a click on the plot does", clicks, key="fc_clickdo",
+        "What the mouse does on the plot", clicks, key="fc_clickdo",
         label_visibility="collapsed",
         help="📍 Line before / after: click the point where that line should "
              "meet the curve; it passes through it and turns about it. 🎯 "
              "Set the end (start): click the moment the curve ends (starts). "
-             "✏ Draw line: a click for the start, a click for the end. "
-             "Click the chosen button again to stop.")
+             "✏ Draw lines: press where a line starts, drag to its end and "
+             "let go. Click the chosen button again to stop.")
     hand = s.get("fc_end_hand") is not None or \
         s.get("fc_start_hand") is not None
     p2.button("↺ Automatic", key="fc_auto", disabled=not hand, **STRETCH,
@@ -27227,16 +27693,33 @@ def fc_plot(t, m, ylab, stem, segments):
             s["fc_xr"] = (lo, hi)
         st.slider("Time shown (s)", lo, hi, key="fc_xr",
                   step=max((hi - lo) / 2000.0, 1e-9), format="%.4g")
-        st.caption("Drag on the plot to zoom; double-click to reset.")
+        st.caption("Drag on the plot to zoom; double-click to reset. "
+                   "While drawing lines, the mouse wheel zooms.")
     click_do = s.get("fc_clickdo")
     drawing = click_do == FC_CLICK_DRAW
+    if not drawing:
+        s.pop("_fc_redraw", None)
     view = s.get("fc_view") or FC_VIEWS[0]
-    fig = fc_figure(t, m, ylab, segments, bool(click_do), grid=drawing,
-                    view=view)
+    raw_view = (not m["corrected"]) or view == FC_VIEWS[1]
+    fc_bars_ready(t, m, segments)
+    bars = fc_bar_specs(t, m["raw"] if raw_view else m["shown"])
+    fig = fc_figure(t, m, ylab, segments, bool(click_do), drawing=drawing,
+                    view=view, bars=bars)
     config = {"scrollZoom": True, "doubleClick": "reset",
               "toImageButtonOptions": {"filename": f"{stem}_force_vs_time"}}
-    if click_do:
-        version = int(s.get("_fc_chart_ver", 0))
+    version = int(s.get("_fc_chart_ver", 0))
+    if drawing:
+        event = st.plotly_chart(fig, key=f"fc_chart_v{version}_draw",
+                                config=config, on_select="rerun",
+                                selection_mode=("lasso",), **STRETCH)
+        strokes = lasso_strokes(event)
+        if strokes:
+            # a fresh chart next run: the stroke drawn is not kept on it
+            s["_fc_chart_ver"] = version + 1
+            fc_line_drawn(strokes[-1], t, m["raw"] if raw_view
+                          else m["shown"])
+            st.rerun()
+    elif click_do:
         event = st.plotly_chart(fig, key=f"fc_chart_v{version}",
                                 config=config, on_select="rerun",
                                 selection_mode="points", **STRETCH)
@@ -27249,9 +27732,7 @@ def fc_plot(t, m, ylab, stem, segments):
             point = points[-1]
             x, y_click = float(point["x"]), float(point["y"])
             s["_fc_chart_ver"] = version + 1
-            if drawing:
-                fc_line_click(point)
-            elif click_do in FC_CLICK_PIN.values():
+            if click_do in FC_CLICK_PIN.values():
                 side = ("before" if click_do == FC_CLICK_PIN["before"]
                         else "after")
                 # the point in the force as read, whichever view was shown
@@ -27267,19 +27748,20 @@ def fc_plot(t, m, ylab, stem, segments):
                        "curve: it moves there and turns about it (↻ Rotate). "
                        "↺ Automatic gives back the time found; ↺ Fitted its "
                        "level and tilt.")
-        elif not drawing:
+        else:
             st.caption("Point at the moment and click; the crosshair snaps "
                        "to the point a click takes. ↺ Automatic undoes it.")
     else:
         st.plotly_chart(fig, key="fc_chart", config=config, **STRETCH)
     if drawing or s.get("_fc_lines"):
-        fc_lines_panel(drawing)
+        fc_lines_panel(drawing, ylab)
+    fc_bars_panel(t)
 
 
 def fc_results(t, m, ylab, stem):
     """The numbers, the file to take away and the trip to the stack."""
     s = st.session_state
-    unit = "nN" if ylab == "Force (nN)" else ""
+    unit = fc_force_unit(ylab)
     y = m["shown"]
     end, start = m["end"], m["start"]
     lines, nums = fcv.curve_stats(t, y, end or {}, start, unit=unit)
@@ -27343,7 +27825,19 @@ def fc_results(t, m, ylab, stem):
         s["fc_zero"] = "As recorded"
     with st.container(border=True):
         st.markdown("**📚 To the stacked plot**")
-        r1, q1, q2 = st.columns([1.3, 1.0, 1.0])
+        if unit:
+            r1, r0, q1, q2 = st.columns([1.3, 0.8, 1.0, 1.0])
+            # the same choice as "Force in" at the top: the plot here
+            # shows what is sent
+            s["fc_send_unit"] = s.get("fc_yunit") or "nN"
+            r0.selectbox("Send in", tuple(FC_YUNITS), key="fc_send_unit",
+                         on_change=fc_send_unit_change,
+                         help="The force unit of the curve sent to the "
+                              "stack (and saved as CSV). The whole tab "
+                              "switches with it, so what you see is what "
+                              "is sent.")
+        else:
+            r1, q1, q2 = st.columns([1.3, 1.0, 1.0])
         zero_at = r1.selectbox(
             "Time zero at", zero_options, key="fc_zero",
             help="Time in the table sent on (and saved) counts from here, "
@@ -27367,10 +27861,9 @@ def fc_results(t, m, ylab, stem):
             table = fcv.table_to_send(t, m["raw"], end, zero)
         table = fcv.pad_zero(table, s.get("fc_pad0") or 0.0,
                              s.get("fc_pad1") or 0.0)
-        if ylab != "Force (nN)":
-            table = table.rename(columns={
-                fcv.FORCE: ylab,
-                fcv.FORCE_LESS_BASE: f"{ylab} − baseline"})
+        table = table.rename(columns={fcv.FORCE: ylab,
+                                      fcv.FORCE_LESS_BASE:
+                                          fc_less_label(ylab)})
         if zero_at != "As recorded":
             table = table.rename(columns={fcv.TIME: {
                 "End of the curve": "Time from the end (s)",
@@ -27385,10 +27878,30 @@ def fc_results(t, m, ylab, stem):
             drawn.append({"pts": [[m["ts"] - zero, 0.0],
                                   [m["te"] - zero, 0.0]],
                           "dash": "Dashed", "colour": FC_BRIDGE_COLOUR})
+        # the bars along the top, at the height they have over the curve
+        # sent (the corrected one when the baseline is taken off)
+        for bar in fc_bar_specs(t, m["shown"]):
+            drawn.append({"pts": [[x - zero, y] for x, y in
+                                  zip(bar["x"], bar["y"])],
+                          "dash": "Solid", "colour": bar["colour"],
+                          "width": bar["width"], "caps": True,
+                          "text": bar["text"]})
         r2, r3 = st.columns(2)
+        # the balloon on the stack: the essentials only, so it does not
+        # cover the plot
+        wanted = ("Curve starts at", "Curve ends at", "Peak force",
+                  "Duration", "Area above the baseline")
+        balloon = [(a, b) for a, b in lines if a in wanted]
+        if m["corrected"] and (lb or la):
+            balloon.append(("Baseline", ("bridged " if lb and la else "")
+                            + " → ".join(f"{line['level']:.3g}"
+                                         for line in (lb, la) if line)
+                            + f" {unit}, subtracted"))
+        elif m["corrected"] and inc:
+            balloon.append(("Baseline", "one line, subtracted"))
         r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
                   on_click=send_to_stack,
-                  args=(stem, table, "Single force curve", lines,
+                  args=(stem, table, "Single force curve", balloon,
                         "As in the file" if zero_at != "As recorded"
                         else None, drawn),
                   help="Sends time and force (corrected first, then as "
@@ -27411,7 +27924,10 @@ def force_curve_tab():
                  f"{FORCE_CURVE_ERROR or STACK_ERROR}")
         return
     for key, value in FC_DEFAULTS.items():
-        s.setdefault(key, value)
+        # written back every run, so a run that does not draw them (while
+        # a new file comes in) does not lose them: a toggle drawn afresh
+        # would start off
+        s[key] = s[key] if key in s else value
     up = st.file_uploader(
         "Force file", type=list(fcv.FILE_TYPES), key="fc_file",
         help="An Asylum .ibw force file (its time step, spring constant "
@@ -27432,8 +27948,8 @@ def force_curve_tab():
     if signal is None:
         return
     t, y, ylab, stem = signal
-    opts = fc_baseline_controls(t, y,
-                                " (nN)" if ylab == "Force (nN)" else "")
+    unit = fc_force_unit(ylab)
+    opts = fc_baseline_controls(t, y, f" ({unit})" if unit else "")
     model = fc_model(t, y, opts)
     segments = item.get("segments") if item["kind"] == "ibw" else []
     fc_plot(t, model, ylab, stem, segments)
@@ -29936,46 +30452,108 @@ def sc_hl_fold_all():
             sc_hl_take_edits(ln)
 
 
-def sc_hl_click(point, traces):
-    """A click while ✏ Draw line is chosen: the point goes on the line
-    being drawn (started on the file clicked)."""
-    s = st.session_state
-    hit = sc_click_target(point, traces)
-    if not hit:
-        return
-    draft = s.get("_sc_draft")
-    by_slot = {t["slot"]: t for t in traces}
-    if draft and draft["slot"] not in by_slot:
-        draft = None
-    owner = by_slot[draft["slot"] if draft else hit[0]]
-    clicked = by_slot.get(hit[0], owner)
-    if draft and clicked.get("_panel") != owner.get("_panel"):
-        s["_sc_click_note"] = ("That point is in another panel: finish or "
-                               "cancel this line first.")
-        return
-    sc_hl_push()
-    if not draft:
-        draft = {"id": sc_hl_ver(), "slot": owner["slot"],
-                 "file": owner["file"], "pts": [],
-                 "dash": s.get("sc_hl_style", "Dashed"), "colour": None,
-                 "zero": owner["zero"], "ver": sc_hl_ver()}
-    draft["pts"].append([float(point["x"]) + owner["zero"],
-                         float(point["y"])])
-    draft["ver"] = sc_hl_ver()
-    if len(draft["pts"]) >= 2:
-        # the end point: the line is done
-        draft["dash"] = s.get("sc_hl_style", "Dashed")
-        lines = copy.deepcopy(s.get("_sc_hlines") or {})
-        lines.setdefault(draft["slot"], []).append(draft)
-        s["_sc_hlines"] = lines
-        s["_sc_draft"] = None
-    else:
-        s["_sc_draft"] = draft
-
-
 def sc_hl_cancel():
     sc_hl_push()
     st.session_state["_sc_draft"] = None
+
+
+def sc_hl_drawn(stroke, traces, fig):
+    """
+    A drag on the plot while ✏ Draw line is chosen: a straight line from
+    where it started to where it was let go, on the file it was drawn over
+    (in its panel, the one whose curve is nearest the start). Or, after
+    ✏ Redraw, that line moved to the drag.
+    """
+    s = st.session_state
+    xref, yref = stroke.get("xref") or "x", stroke.get("yref") or "y"
+    # the panel the drag was in: the files plotted on its axes (a file on
+    # a panel's right axis is in other units, so a file on its left axis
+    # takes the line when there is one)
+    in_panel = []
+    for k, t in enumerate(traces):
+        if k < len(fig.data) and (fig.data[k].xaxis or "x") == xref:
+            in_panel.append((t, (fig.data[k].yaxis or "y") == yref))
+    mine = [t for t, left in in_panel if left] or [t for t, _ in in_panel]
+    if not mine:
+        s["_sc_draw_note"] = "⚠️ Draw the line over one of the files."
+        return
+    rng = sc_global_x_range() or mine[0].get("x_range")
+    xs_all = np.concatenate([np.asarray(t["x"], float) for t, _ in in_panel])
+    xs_all = xs_all[np.isfinite(xs_all)]
+    if rng is not None:
+        x_lo, x_hi = sorted(map(float, rng))
+    elif xs_all.size:
+        x_lo, x_hi = float(xs_all.min()), float(xs_all.max())
+    else:
+        x_lo, x_hi = 0.0, 1.0
+
+    def y_span(t):
+        if t.get("y_range") is not None:
+            lo, hi = sorted(map(float, t["y_range"]))
+            return (hi - lo) or 1.0
+        y = np.asarray(t["y"], float)
+        y = y[np.isfinite(y)]
+        return 1.1 * float(y.max() - y.min()) if y.size > 1 else 1.0
+
+    size = (800.0, float(s.get("sc_height", 240)))
+    x0, y0 = float(stroke["x"][0]), float(stroke["y"][0])
+
+    def gap(t):
+        x, y = np.asarray(t["x"], float), np.asarray(t["y"], float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        if not ok.any():
+            return np.inf
+        return float(np.min(np.hypot(
+            (x[ok] - x0) * size[0] / ((x_hi - x_lo) or 1.0),
+            (y[ok] - y0) * size[1] / y_span(t))))
+
+    owner = min(mine, key=gap)
+    got = stroke_line(stroke, owner["x"], owner["y"], (x_hi - x_lo) or 1.0,
+                      y_span(owner), snap=bool(s.get("sc_hl_snap", True)),
+                      level=bool(s.get("sc_hl_level", True)), size=size)
+    if got is None:
+        s["_sc_draw_note"] = ("⚠️ That was a click, too short for a line: "
+                              "press where the line starts, drag to where "
+                              "it ends and let go.")
+        return
+    a, b, on = got
+    sc_hl_push()
+    zero = float(owner["zero"])
+    pts = [[a[0] + zero, a[1]], [b[0] + zero, b[1]]]
+    lines = copy.deepcopy(s.get("_sc_hlines") or {})
+    target = s.pop("_sc_redraw", None)
+    moved = None
+    if target:
+        old = next((ln for ln in lines.get(target[0], [])
+                    if ln["id"] == target[1]), None)
+        if old is not None:
+            lines[target[0]] = [ln for ln in lines[target[0]]
+                                if ln["id"] != target[1]]
+            moved = dict(old, pts=pts, slot=owner["slot"],
+                         file=owner["file"], zero=zero, ver=sc_hl_ver())
+    line = moved or {"id": sc_hl_ver(), "slot": owner["slot"],
+                     "file": owner["file"], "pts": pts,
+                     "dash": s.get("sc_hl_style", "Dashed"), "colour": None,
+                     "zero": zero, "ver": sc_hl_ver()}
+    lines.setdefault(owner["slot"], []).append(line)
+    s["_sc_hlines"] = lines
+    s["_sc_draft"] = None
+    ends = {(True, True): " (both ends on the curve)",
+            (True, False): " (its start on the curve)",
+            (False, True): " (its end on the curve)"}.get(tuple(on), "")
+    s["_sc_draw_note"] = (
+        f"✅ Line {'moved' if moved else 'drawn'} on {owner['label']}: "
+        f"({a[0]:.4g}, {a[1]:.4g}) → ({b[0]:.4g}, {b[1]:.4g}){ends}.")
+
+
+def sc_hl_redraw(slot, line_id):
+    """✏ Redraw: the next drag on the plot moves this line."""
+    s = st.session_state
+    if s.get("_sc_redraw") == (slot, line_id):
+        s.pop("_sc_redraw", None)
+        return
+    s["_sc_redraw"] = (slot, line_id)
+    s["sc_clickdo"] = SC_CLICKS[2]
 
 
 def sc_hl_delete(slot, line_id):
@@ -30003,7 +30581,8 @@ def sc_hl_for(t):
         out.append({"x": [x - t["zero"] for x, _ in ln["pts"]],
                     "y": [y for _, y in ln["pts"]],
                     "dash": sc.EXTEND_DASHES.get(ln.get("dash"), "dash"),
-                    "colour": ln.get("colour")})
+                    "colour": ln.get("colour"), "width": ln.get("width"),
+                    "caps": ln.get("caps"), "text": ln.get("text")})
     draft = s.get("_sc_draft")
     if draft and draft["slot"] == t["slot"] and draft.get("file") == t["file"]:
         out.append({"x": [x - t["zero"] for x, _ in draft["pts"]],
@@ -30029,41 +30608,57 @@ def sc_hl_table(line, zero, key_prefix=""):
 
 
 def sc_hl_panel(traces):
-    """Under the plot while ✏ Draw line is chosen: the start point of the
-    line being drawn, and every line drawn so far with its style, colour
-    and points."""
+    """Under the plot while ✏ Draw line is chosen: how new lines are drawn,
+    and every line drawn so far with its style, colour and points."""
     s = st.session_state
     by_slot = {t["slot"]: t for t in traces}
-    draft = s.get("_sc_draft")
-    s.setdefault("sc_hl_style", "Dashed")
-    with st.container(border=True):
-        d1, d2, d3 = st.columns([2.6, 1.0, 1.0])
-        if draft and draft["slot"] in by_slot and draft["pts"]:
-            t = by_slot[draft["slot"]]
-            x0, y0 = draft["pts"][0]
-            d1.markdown(f"**✏ Start set** at x = {x0 - t['zero']:.4g}, "
-                        f"y = {y0:.4g}: now click the end point.")
-        else:
-            d1.markdown("**✏ Draw line**: click the start point, then the "
-                        "end point. Anywhere on the plot works; a click on "
-                        "a curve takes that point of the curve.")
-        d2.selectbox("Style of new lines", SC_LINE_STYLES,
-                     key="sc_hl_style", label_visibility="collapsed")
-        d3.button("✕ Cancel line", key="sc_hl_cancel", on_click=sc_hl_cancel,
-                  disabled=not draft, **STRETCH)
+    for key, value in (("sc_hl_style", "Dashed"), ("sc_hl_snap", True),
+                       ("sc_hl_level", True)):
+        s.setdefault(key, value)
     drawn = [(slot, ln) for slot, group in (s.get("_sc_hlines") or {}).items()
              for ln in group if slot in by_slot
              and ln.get("file") == by_slot[slot]["file"]]
+    target = s.get("_sc_redraw")
+    with st.container(border=True):
+        d1, d2, d3, d4 = st.columns([2.6, 1.0, 1.0, 0.9])
+        n = next((k for k, (slot, ln) in enumerate(drawn, 1)
+                  if (slot, ln["id"]) == target), None)
+        d1.markdown(
+            f"**✏ Redrawing line {n}**: drag from its new start to its new "
+            "end." if n else
+            "**✏ Press where a line starts, drag to where it ends, let "
+            "go.** Each drag is one line, on the file drawn over.")
+        d2.selectbox("Style of new lines", SC_LINE_STYLES,
+                     key="sc_hl_style", label_visibility="collapsed")
+        d3.toggle("🧲 Snap", key="sc_hl_snap",
+                  help="An end let go close to the curve goes exactly onto "
+                       "it, so a line joins the curve.")
+        d4.toggle("─ Level", key="sc_hl_level",
+                  help="A line drawn nearly level (or upright) is made "
+                       "exactly level (upright).")
+        note = s.pop("_sc_draw_note", None)
+        if note:
+            st.caption(note)
     for n, (slot, ln) in enumerate(drawn, 1):
         t = by_slot[slot]
         (xa, ya), (xb, yb) = ln["pts"][0], ln["pts"][-1]
         with st.container(border=True):
-            c0, c1, c2, c3 = st.columns([2.6, 1.0, 0.45, 0.9])
+            c0, c1, c2, c3, c4 = st.columns([2.5, 1.0, 0.45, 0.95, 0.9])
             extra = (f" · {len(ln['pts'])} points"
                      if len(ln["pts"]) > 2 else "")
-            c0.markdown(f"**Line {n}** on {t['label']}: "
+            name = (f"━ {ln['text']}" if ln.get("text")
+                    else f"Line {n}")
+            c0.markdown(f"**{name}** on {t['label']}: "
                         f"({xa - t['zero']:.4g}, {ya:.4g}) → "
                         f"({xb - t['zero']:.4g}, {yb:.4g}){extra}")
+            if ln.get("text") is not None:
+                tkey = f"sc_hl_txt_{ln['id']}"
+                s[tkey] = ln.get("text") or ""
+                c0.text_input("Label", key=tkey,
+                              label_visibility="collapsed",
+                              on_change=sc_hl_restyle,
+                              args=(slot, ln["id"], tkey, "text"),
+                              help="The label over the bar.")
             key = f"sc_hl_dash_{ln['id']}"
             s[key] = ln.get("dash", "Dashed")
             c1.selectbox("Style", SC_LINE_STYLES, key=key,
@@ -30074,10 +30669,16 @@ def sc_hl_panel(traces):
             c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
                             on_change=sc_hl_restyle,
                             args=(slot, ln["id"], ckey, "colour"))
-            c3.button("🗑 Delete", key=f"sc_hl_del_{ln['id']}",
+            c3.button("✕ Stop" if (slot, ln["id"]) == target
+                      else "✏ Redraw", key=f"sc_hl_redo_{ln['id']}",
+                      on_click=sc_hl_redraw, args=(slot, ln["id"]),
+                      **STRETCH,
+                      help="Then drag on the plot: this line moves to the "
+                           "new drag (its style and colour stay).")
+            c4.button("🗑 Delete", key=f"sc_hl_del_{ln['id']}",
                       on_click=sc_hl_delete, args=(slot, ln["id"]),
                       **STRETCH)
-            with st.expander("✎ Retype its points"):
+            with st.expander("✎ Type its points exactly"):
                 sc_hl_table(ln, t["zero"])
 
 
@@ -30319,8 +30920,8 @@ def sc_panel():
             help="🎯 Set zero: the point clicked becomes x = 0 for its "
                  "file. ✎ Edit peaks: a click on a ▲ ▼ takes that peak "
                  "out, a click on the line adds the peak or dip it sits "
-                 "on. ✏ Draw line: a click for the start, a click for "
-                 "the end. 〰 Baseline points: clicks set a file's "
+                 "on. ✏ Draw line: press where a line starts, drag to "
+                 "its end and let go. 〰 Baseline points: clicks set a file's "
                  "baseline. ⤴ Flat part: two clicks mark a saturated top. "
                  "Click the chosen one again for neither.")
         k2.button("↶ Undo", key="sc_undo_zero",
@@ -30351,7 +30952,6 @@ def sc_panel():
             zero_line=bool(s.get("sc_zline")),
             grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
             clickable=bool(s.get("sc_clickdo")),
-            click_grid=s.get("sc_clickdo") == SC_CLICKS[2],
             x_range=sc_global_x_range(),
             frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
             y_titles=sc_y_titles(),
@@ -30376,10 +30976,29 @@ def sc_panel():
         view = int(s.get("_sc_view", 0))
         fig.update_layout(uirevision=f"sc{view}", editrevision=f"sc{view}",
                           dragmode=s.get("sc_drag", "zoom"))
+        drawing = s.get("sc_clickdo") == SC_CLICKS[2]
+        if drawing:
+            # a drag draws a line: the stroke shows dashed as it is drawn
+            fig.update_layout(
+                dragmode="lasso",
+                newselection=dict(line=dict(color="#333", width=2,
+                                            dash="dash")),
+                activeselection=dict(fillcolor="rgba(0,0,0,0)", opacity=1))
+            for k in range(min(len(traces), len(fig.data))):
+                fig.data[k].update(selected=dict(marker=dict(opacity=0)),
+                                   unselected=dict(marker=dict(opacity=0)))
+            # the crosshair right at the cursor, where a line starts or ends
+            fig.update_xaxes(spikesnap="cursor")
+            fig.update_yaxes(spikesnap="cursor")
+        else:
+            s.pop("_sc_redraw", None)
         config = {"displaylogo": False, "scrollZoom": True,
                   "displayModeBar": True, "doubleClick": "reset",
-                  # the summary balloons can be dragged where they fit
-                  "edits": {"annotationPosition": True},
+                  # the summary balloons can be dragged where they fit, but
+                  # not while clicks are for the plot: a balloon that can be
+                  # dragged takes every click on it, so a click on a curve
+                  # under it would do nothing
+                  "edits": {"annotationPosition": not s.get("sc_clickdo")},
                   "toImageButtonOptions": {
                       "format": s.get("sc_fmt", "png"), "filename": stem,
                       "width": int(s.get("sc_w") or 900),
@@ -30388,7 +31007,18 @@ def sc_panel():
         fit = not s.get("sc_width")
         version = int(s.get("_sc_chart_ver", 0))
         click_do = s.get("sc_clickdo")
-        if click_do:
+        if drawing:
+            event = st.plotly_chart(
+                fig, key=f"sc_chart_v{version}_{view}_draw", config=config,
+                theme=None, on_select="rerun", selection_mode=("lasso",),
+                **(STRETCH if fit else {}))
+            strokes = lasso_strokes(event)
+            if strokes:
+                s["_sc_chart_ver"] = version + 1
+                sc_hl_drawn(strokes[-1], traces, fig)
+                st.rerun()
+            sc_hl_panel(traces)
+        elif click_do:
             event = st.plotly_chart(
                 fig, key=f"sc_chart_v{version}_{view}", config=config,
                 theme=None,
@@ -30402,9 +31032,7 @@ def sc_panel():
             if points:
                 hit = sc_click_target(points[-1], traces)
                 s["_sc_chart_ver"] = version + 1
-                if click_do == SC_CLICKS[2]:
-                    sc_hl_click(points[-1], traces)
-                elif click_do == SC_CLICKS[3]:
+                if click_do == SC_CLICKS[3]:
                     sc_bl_click(points[-1], traces)
                 elif click_do == SC_CLICKS[4]:
                     sc_sat_click(points[-1], traces)
@@ -30423,9 +31051,7 @@ def sc_panel():
             note = s.pop("_sc_click_note", None)
             if note:
                 st.warning(note, icon="⛰")
-            if click_do == SC_CLICKS[2]:
-                sc_hl_panel(traces)
-            elif click_do == SC_CLICKS[4]:
+            if click_do == SC_CLICKS[4]:
                 st.caption("⤴ Click where a flat (saturated) top starts, "
                            "then where it ends: the dashed rise and fall "
                            "are carried on from there to where they meet. "
