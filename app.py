@@ -8,6 +8,7 @@ with the diagnostics needed to tell a real measurement from a bad window.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import csv
 import fnmatch
@@ -623,7 +624,9 @@ COMPANION_NEEDS = {
     "stack_compare.py": ("_extreme_near", "peak_analysis", "flat_top",
                          "flat_top_continuation", "baseline_through",
                          "baseline_typed", "EXTEND_DASHES",
-                         "flat_top_between", "hand_line_traces"),
+                         "flat_top_between", "hand_line_traces",
+                         "series_layout", "series_decorate",
+                         "series_table", "SERIES_STARTS"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
                        "table_to_send", "incline", "pad_zero",
                        "side_fit", "side_line", "bridged", "line_value"),
@@ -10894,46 +10897,123 @@ def video_chart_table(fig, y_title):
     return pd.DataFrame(columns) if len(columns) > 1 else None
 
 
+# ===================================== Stack & compare, and the Series ==
+#
+# The Stack & compare tab (files one above the other) and the Series tab
+# (files one after another) are the same code, run twice: every setting of
+# the first is kept under keys starting "sc_", of the second under "sr_".
+# SCP is the prefix of the tab being drawn, or being sent to; a callback
+# made on one of them runs with its prefix (sc_ns), whichever tab was drawn
+# last.
+SCP = "sc_"
+SC_PLACES = {"stack": "sc_", "series": "sr_"}
+
+
+@contextlib.contextmanager
+def sc_namespace(prefix):
+    """Everything inside works on that tab's settings."""
+    global SCP
+    before, SCP = SCP, prefix
+    try:
+        yield
+    finally:
+        SCP = before
+
+
+def sc_ns(fn):
+    """``fn`` as a callback: it runs on the tab it was made on."""
+    prefix = SCP
+
+    def run(*args, **kwargs):
+        with sc_namespace(prefix):
+            return fn(*args, **kwargs)
+    return run
+
+
+def sc_is_series():
+    return SCP == SC_PLACES["series"]
+
+
+def sc_tab_name():
+    return "Series" if sc_is_series() else "Stack & compare"
+
+
+def sc_rel(key):
+    """A setting's name without its tab's prefix (sc_x0 → x0, _sc_hlines →
+    _hlines), or None when it is not this tab's."""
+    key = str(key)
+    if key.startswith(SCP):
+        return key[len(SCP):]
+    if key.startswith("_" + SCP):
+        return "_" + key[len(SCP) + 1:]
+    return None
+
+
+def sc_abs(rel):
+    """This tab's key for a setting's name (x0 → sc_x0 or sr_x0)."""
+    rel = str(rel)
+    return f"_{SCP}{rel[1:]}" if rel.startswith("_") else f"{SCP}{rel}"
+
+
+def sc_upload_key(i):
+    """The key of file slot i's upload box. Opening a saved analysis gives
+    every box a new key, so none still holds a file from before."""
+    ver = int(st.session_state.get(f"_{SCP}upver", 0) or 0)
+    return f"{SCP}file{i}" if not ver else f"{SCP}file{i}_v{ver}"
+
+
 def send_to_stack(name, frame, source="the video", stats=None,
-                  zero_mode=None, lines=None):
-    """Put a table in the first free slot of the Stack & compare tab.
-    ``zero_mode``: where that file's x = 0 starts out (one of the stack's
-    zero options), e.g. "As in the file" for time already counted from a
-    chosen moment."""
+                  zero_mode=None, lines=None, series=False):
+    """Put a table in the first free slot of the Stack & compare tab (or,
+    with ``series``, of the Series tab). ``zero_mode``: where that file's
+    x = 0 starts out (one of the stack's zero options), e.g. "As in the
+    file" for time already counted from a chosen moment."""
+    with sc_namespace(SC_PLACES["series" if series else "stack"]):
+        return _send_here(name, frame, source, stats, zero_mode, lines)
+
+
+def send_to_series(name, frame, source="the video", stats=None,
+                   zero_mode=None, lines=None):
+    """The same, into the Series tab."""
+    return send_to_stack(name, frame, source, stats, zero_mode, lines,
+                         series=True)
+
+
+def _send_here(name, frame, source, stats, zero_mode, lines):
     s = st.session_state
     if frame is None:
         return
     free = None
     for i in range(6):
-        taken = s.get(f"sc_sent{i}") is not None or \
-            s.get(f"sc_file{i}") is not None
+        taken = s.get(f"{SCP}sent{i}") is not None or \
+            s.get(sc_upload_key(i)) is not None
         if not taken:
             free = i
             break
     if free is None:
-        s["_vq_sent_note"] = ("All six slots on Stack & compare are in use. "
-                              "Remove one there first.")
+        s["_vq_sent_note"] = (f"All six slots on {sc_tab_name()} are in "
+                              "use. Remove one there first.")
         return None
-    s[f"sc_sent{free}"] = {"name": name, "frame": frame.copy(),
+    s[f"{SCP}sent{free}"] = {"name": name, "frame": frame.copy(),
                            "source": source,
                            "stats": list(stats or [])}
     if sc is not None and zero_mode in sc.ZERO_MODES:
-        s[f"sc_zmode{free}"] = zero_mode
+        s[f"{SCP}zmode{free}"] = zero_mode
     # lines drawn on the way (x as sent): that file's hand lines there
-    hand = copy.deepcopy(s.get("_sc_hlines") or {})
+    hand = copy.deepcopy(s.get(f"_{SCP}hlines") or {})
     hand[free] = []
     for ln in lines or ():
         # the same numbering the stack's own lines use
-        s["_sc_hl_n"] = int(s.get("_sc_hl_n", 0)) + 2
+        s[f"_{SCP}hl_n"] = int(s.get(f"_{SCP}hl_n", 0)) + 2
         hand[free].append(dict(
-            {"id": s["_sc_hl_n"] - 1, "slot": free, "file": name,
+            {"id": s[f"_{SCP}hl_n"] - 1, "slot": free, "file": name,
              "pts": [list(map(float, p)) for p in ln["pts"]],
              "dash": ln.get("dash", "Dashed"), "colour": ln.get("colour"),
-             "zero": 0.0, "ver": s["_sc_hl_n"]},
+             "zero": 0.0, "ver": s[f"_{SCP}hl_n"]},
             **{k: ln[k] for k in ("width", "caps", "text") if k in ln}))
-    s["_sc_hlines"] = hand
-    s["sc_n"] = max(int(s.get("sc_n", 3) or 3), free + 1)
-    s["_vq_sent_note"] = (f"Sent to Stack & compare as file {free + 1}. "
+    s[f"_{SCP}hlines"] = hand
+    s[f"{SCP}n"] = max(int(s.get(f"{SCP}n", 3) or 3), free + 1)
+    s["_vq_sent_note"] = (f"Sent to {sc_tab_name()} as file {free + 1}. "
                           "Open that tab to see it.")
     return free
 
@@ -10951,13 +11031,19 @@ def video_axis_ranges(slug, send=None):
         for name in names:
             s[name] = ""
 
-    note_col, send_col, right = st.columns([3.6, 1.8, 1.4])
+    note_col, send_col, series_col, right = st.columns([3.0, 1.25, 1.25,
+                                                         1.4])
     if send is not None and send[1] is not None:
-        send_col.button("📚 Send to stacked plot", key=f"vs_{slug}",
+        send_col.button("📚 Send to stack", key=f"vs_{slug}",
                         on_click=send_to_stack, args=send, **STRETCH,
                         help="Sends this plot's data (time as recorded and "
                              "each line) to the Stack & compare tab, to "
                              "stack and line up with other recordings.")
+        series_col.button("🔗 Send to series", key=f"vss_{slug}",
+                          on_click=send_to_series, args=send, **STRETCH,
+                          help="Sends this plot's data to the Series tab, "
+                               "to put it before or after other "
+                               "recordings along one time axis.")
         note = s.get("_vq_sent_note")
         if note and s.get("_vq_sent_from") in (None, slug):
             note_col.caption("✅ " + note if note.startswith("Sent")
@@ -22584,13 +22670,14 @@ SHOW_DATABASE_TAB = False
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_stack, tab_force, tab_igor, tab_fitting,
-    tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_series, tab_force, tab_igor,
+    tab_fitting, tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
         "🔬 AFM output analysis",
         "📚 Stack & compare",
+        "🔗 Series",
         "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
@@ -22598,7 +22685,7 @@ SHOW_DATABASE_TAB = False
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 6
+FITTING_TAB_NUMBER = 7
 
 with tab_fitting:
     (
@@ -22626,7 +22713,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((7, SHOW_VIDEO_TAB), (8, SHOW_DATABASE_TAB))
+    index for index, wanted in ((8, SHOW_VIDEO_TAB), (9, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -26494,12 +26581,18 @@ def igor_result_panel():
     with c3:
         frame = pd.DataFrame({"Relative Deformation": eps_gen,
                               "Force (nN)": force_N_gen * 1e9})
-        st.button("📚 Send to stacked plot", key="igor_send", **STRETCH,
+        st.button("📚 Send to stack", key="igor_send", **STRETCH,
                   on_click=send_to_stack,
                   args=(f"{gen['name']} · force curve", frame,
                         "Create force-ε file", gen["stats"]),
                   help="Sends force against ε, with this summary, to the "
                        "Stack & compare tab.")
+        st.button("🔗 Send to series", key="igor_send_sr", **STRETCH,
+                  on_click=send_to_series,
+                  args=(f"{gen['name']} · force curve", frame,
+                        "Create force-ε file", gen["stats"]),
+                  help="Sends force against ε, with this summary, to the "
+                       "Series tab.")
     note = st.session_state.pop("_vq_sent_note", None)
     if note:
         st.caption(("✅ " if note.startswith("Sent") else "⚠️ ") + note)
@@ -28082,7 +28175,7 @@ def fc_results(t, m, ylab, stem):
     if s.get("fc_zero") not in zero_options:
         s["fc_zero"] = "As recorded"
     with st.container(border=True):
-        st.markdown("**📚 To the stacked plot**")
+        st.markdown("**📚 To the stacked plot, or 🔗 the series**")
         if unit:
             r1, r0, q1, q2 = st.columns([1.3, 0.8, 1.0, 1.0])
             # the same choice as "Force in" at the top: the plot here
@@ -28144,7 +28237,7 @@ def fc_results(t, m, ylab, stem):
                           "dash": "Solid", "colour": bar["colour"],
                           "width": bar["width"], "caps": True,
                           "text": bar["text"]})
-        r2, r3 = st.columns(2)
+        r2, r2b, r3 = st.columns(3)
         # the balloon on the stack: the essentials only, so it does not
         # cover the plot
         wanted = ("Curve starts at", "Curve ends at", "Peak force",
@@ -28157,14 +28250,18 @@ def fc_results(t, m, ylab, stem):
                             + f" {unit}, subtracted"))
         elif m["corrected"] and inc:
             balloon.append(("Baseline", "one line, subtracted"))
-        r2.button("📚 Send to stacked plot", key="fc_send", type="primary",
-                  on_click=send_to_stack,
-                  args=(stem, table, "Single force curve", balloon,
-                        "As in the file" if zero_at != "As recorded"
-                        else None, drawn),
+        sent = (stem, table, "Single force curve", balloon,
+                "As in the file" if zero_at != "As recorded" else None,
+                drawn)
+        r2.button("📚 Send to stack", key="fc_send", type="primary",
+                  on_click=send_to_stack, args=sent,
                   help="Sends time and force (corrected first, then as "
                        "read), the lines drawn and this summary to the "
                        "Stack & compare tab.", **STRETCH)
+        r2b.button("🔗 Send to series", key="fc_send_sr", type="primary",
+                   on_click=send_to_series, args=sent,
+                   help="The same, to the Series tab: curves one after "
+                        "another along one time axis.", **STRETCH)
         r3.download_button("💾 Save as CSV", key="fc_csv",
                            data=lambda: table.to_csv(index=False).encode(),
                            file_name=f"{stem}_force_vs_time.csv",
@@ -29694,19 +29791,20 @@ def ai_quick_line_controls(two):
               on_change=axis)
 
 
-def ai_send_to_stack(tables):
-    """Each plot into its own Stack & compare slot."""
+def ai_send_to_stack(tables, series=False):
+    """Each plot into its own slot of Stack & compare (or of Series)."""
     s = st.session_state
     slots = []
     for name, frame, stats in tables:
         slot = send_to_stack(name, frame, source="AFM output analysis",
-                             stats=stats)
+                             stats=stats, series=series)
         if slot is None:
             break
         slots.append(slot + 1)
     if slots:
         s["_ai_sent_note"] = (
-            "Sent to Stack & compare as file"
+            ("Sent to Series as file" if series
+             else "Sent to Stack & compare as file")
             + ("s " + " and ".join(map(str, slots)) if len(slots) > 1
                else f" {slots[0]}") + ". Open that tab to see it.")
     else:
@@ -29762,13 +29860,19 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
                        pd.DataFrame({tlabel or "Time (s)": np.asarray(x),
                                      label: np.asarray(y)}),
                        ai_trace_stats(x, y, units[which], channel)))
-    note_col, send_col = st.columns([4, 1.8])
-    send_col.button("📚 Send to stacked plot", key="ai_send_stack",
+    note_col, send_col, series_col = st.columns([3.4, 1.25, 1.25])
+    send_col.button("📚 Send to stack", key="ai_send_stack",
                     on_click=ai_send_to_stack, args=(tables,),
                     disabled=not tables, **STRETCH,
                     help="Sends the plotted data (each plot as its own "
                          "file) to the Stack & compare tab, to stack or "
                          "overlay with videos and other recordings.")
+    series_col.button("🔗 Send to series", key="ai_send_series",
+                      on_click=ai_send_to_stack, args=(tables, True),
+                      disabled=not tables, **STRETCH,
+                      help="Sends the plotted data (each plot as its own "
+                           "file) to the Series tab, one after another "
+                           "along one time axis.")
     note = s.pop("_ai_sent_note", None)
     if note:
         note_col.caption(("✅ " if note.startswith("Sent") else "⚠️ ")
@@ -29915,23 +30019,27 @@ def sc_axis_ranges(i):
     """The 📏 popover of one file: its x range (its panel's x axis) and its
     y range (its own y axis). Empty means automatic."""
     s = st.session_state
-    names = [f"sc_r{i}_{end}" for end in ("x0", "x1", "y0", "y1")]
+    names = [f"{SCP}r{i}_{end}" for end in ("x0", "x1", "y0", "y1")]
 
     def clear():
         for name in names:
             s[name] = ""
 
     with st.popover("📏 Ranges", **STRETCH):
-        with st.form(f"sc_r{i}_form", border=False):
-            st.caption("For this file: x is its panel's x axis, y is its "
-                       "own y axis. Leave a box empty for automatic.")
+        with st.form(f"{SCP}r{i}_form", border=False):
+            st.caption(
+                "For this file: x is the part of it put in the series (the "
+                "rest is left out), y is the y axis. Leave a box empty for "
+                "automatic." if sc_is_series() else
+                "For this file: x is its panel's x axis, y is its own y "
+                "axis. Leave a box empty for automatic.")
             a, b = st.columns(2)
             a.text_input("x from", key=names[0], placeholder="auto")
             b.text_input("x to", key=names[1], placeholder="auto")
             a.text_input("y from", key=names[2], placeholder="auto")
             b.text_input("y to", key=names[3], placeholder="auto")
             st.form_submit_button("✔ Apply", **STRETCH)
-        st.button("↺ Automatic", key=f"sc_r{i}_reset", on_click=clear,
+        st.button("↺ Automatic", key=f"{SCP}r{i}_reset", on_click=sc_ns(clear),
                   **STRETCH)
     v = [sc.finite_or_none(str(s.get(n, "")).replace(",", "."))
          for n in names]
@@ -29951,25 +30059,25 @@ SC_BL_CLICK = "〰 Baseline points"
 def sc_bl_source_changed(i):
     """Choosing Click points readies the plot for clicking them."""
     s = st.session_state
-    if s.get(f"sc_bllvl{i}") == "Points":
-        s["sc_clickdo"] = SC_BL_CLICK
-        if s.get(f"sc_blmode{i}", "Off") == "Off":
-            s[f"sc_blmode{i}"] = "Show"
+    if s.get(f"{SCP}bllvl{i}") == "Points":
+        s[f"{SCP}clickdo"] = SC_BL_CLICK
+        if s.get(f"{SCP}blmode{i}", "Off") == "Off":
+            s[f"{SCP}blmode{i}"] = "Show"
 
 
 def sc_bl_points_push(i):
     s = st.session_state
-    history = list(s.get("_sc_zero_hist") or [])
-    history.append(("blpts", i, list(s.get(f"_sc_blpts{i}") or [])))
-    s["_sc_zero_hist"] = history[-40:]
+    history = list(s.get(f"_{SCP}zero_hist") or [])
+    history.append(("blpts", i, list(s.get(f"_{SCP}blpts{i}") or [])))
+    s[f"_{SCP}zero_hist"] = history[-40:]
 
 
 def sc_bl_points_edit(i, what):
     """↶ Last point / ✕ Clear points, undoable."""
     s = st.session_state
-    points = list(s.get(f"_sc_blpts{i}") or [])
+    points = list(s.get(f"_{SCP}blpts{i}") or [])
     sc_bl_points_push(i)
-    s[f"_sc_blpts{i}"] = points[:-1] if what == "last" else []
+    s[f"_{SCP}blpts{i}"] = points[:-1] if what == "last" else []
 
 
 def sc_bl_click(point, traces):
@@ -29988,10 +30096,10 @@ def sc_bl_click(point, traces):
     if t.get("base_subtracted") and t.get("baseline_fn") is not None:
         y += float(np.ravel(t["baseline_fn"](np.array([raw_x])))[0])
     sc_bl_points_push(slot)
-    s[f"_sc_blpts{slot}"] = list(s.get(f"_sc_blpts{slot}") or []) + [
+    s[f"_{SCP}blpts{slot}"] = list(s.get(f"_{SCP}blpts{slot}") or []) + [
         [float(raw_x), y]]
     # its menu shows Click points from the next run on
-    s["_sc_blsrc_next"] = slot
+    s[f"_{SCP}blsrc_next"] = slot
 
 
 def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
@@ -30006,23 +30114,23 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
     if not finite.size:
         return None
     lo, hi = float(finite.min()), float(finite.max())
-    if s.get(f"sc_bl0{i}") is None or not (lo <= s.get(f"sc_bl0{i}") <= hi):
-        s[f"sc_bl0{i}"] = lo
-    if s.get(f"sc_bl1{i}") is None or not (lo <= s.get(f"sc_bl1{i}") <= hi):
-        s[f"sc_bl1{i}"] = lo + 0.1 * (hi - lo)
-    s.setdefault(f"sc_blk{i}", 3.0)
-    s.setdefault(f"sc_blo{i}", "Horizontal")
-    s.setdefault(f"sc_bld{i}", "either")
-    if s.get(f"sc_blmode{i}") not in BASELINE_MODES:
-        s[f"sc_blmode{i}"] = "Off"
+    if s.get(f"{SCP}bl0{i}") is None or not (lo <= s.get(f"{SCP}bl0{i}") <= hi):
+        s[f"{SCP}bl0{i}"] = lo
+    if s.get(f"{SCP}bl1{i}") is None or not (lo <= s.get(f"{SCP}bl1{i}") <= hi):
+        s[f"{SCP}bl1{i}"] = lo + 0.1 * (hi - lo)
+    s.setdefault(f"{SCP}blk{i}", 3.0)
+    s.setdefault(f"{SCP}blo{i}", "Horizontal")
+    s.setdefault(f"{SCP}bld{i}", "either")
+    if s.get(f"{SCP}blmode{i}") not in BASELINE_MODES:
+        s[f"{SCP}blmode{i}"] = "Off"
     contact_mode = mode == sc.CONTACT_MODE
 
     def first(fraction):
-        s[f"sc_bl0{i}"] = lo
-        s[f"sc_bl1{i}"] = lo + fraction * (hi - lo)
+        s[f"{SCP}bl0{i}"] = lo
+        s[f"{SCP}bl1{i}"] = lo + fraction * (hi - lo)
 
     b1, b2 = st.columns([2.2, 1])
-    b1.radio("〰 Baseline", BASELINE_MODES, key=f"sc_blmode{i}",
+    b1.radio("〰 Baseline", BASELINE_MODES, key=f"{SCP}blmode{i}",
              horizontal=True,
              format_func={"Off": "Off", "Show": "Show",
                           "Correct": "Correct (subtract)"}.get,
@@ -30036,18 +30144,18 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                                                                      1.0)
     if y_hi <= y_lo:
         y_hi = y_lo + 1.0
-    if s.get(f"sc_bllvl{i}") not in BASELINE_SOURCES:
-        s[f"sc_bllvl{i}"] = "Fitted"
-    if not (y_lo <= float(s.get(f"sc_blval{i}", y_lo - 1)) <= y_hi):
-        s[f"sc_blval{i}"] = float(np.median(ys)) if ys.size else 0.0
-    s.setdefault(f"sc_bltl{i}", float(np.median(ys)) if ys.size else 0.0)
-    s.setdefault(f"sc_blts{i}", 0.0)
-    source = s.get(f"sc_bllvl{i}")
-    points = list(s.get(f"_sc_blpts{i}") or [])
+    if s.get(f"{SCP}bllvl{i}") not in BASELINE_SOURCES:
+        s[f"{SCP}bllvl{i}"] = "Fitted"
+    if not (y_lo <= float(s.get(f"{SCP}blval{i}", y_lo - 1)) <= y_hi):
+        s[f"{SCP}blval{i}"] = float(np.median(ys)) if ys.size else 0.0
+    s.setdefault(f"{SCP}bltl{i}", float(np.median(ys)) if ys.size else 0.0)
+    s.setdefault(f"{SCP}blts{i}", 0.0)
+    source = s.get(f"{SCP}bllvl{i}")
+    points = list(s.get(f"_{SCP}blpts{i}") or [])
     with b2.popover("⚙ Baseline", **STRETCH):
-        st.radio("Baseline from", BASELINE_SOURCES, key=f"sc_bllvl{i}",
+        st.radio("Baseline from", BASELINE_SOURCES, key=f"{SCP}bllvl{i}",
                  format_func=BASELINE_SOURCES.get,
-                 on_change=sc_bl_source_changed, args=(i,),
+                 on_change=sc_ns(sc_bl_source_changed), args=(i,),
                  help="Fitted: over a window you choose. Slider: a flat "
                       "level you move. Click points: the baseline goes "
                       "through points you click on the trace (straight "
@@ -30056,7 +30164,7 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                       "same with each.")
         if source == "By hand":
             st.slider("Baseline level (y)", y_lo, y_hi,
-                      step=(y_hi - y_lo) / 1000.0, key=f"sc_blval{i}",
+                      step=(y_hi - y_lo) / 1000.0, key=f"{SCP}blval{i}",
                       format="%.4g")
         elif source == "Points":
             plural = "" if len(points) == 1 else "s"
@@ -30066,33 +30174,33 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                        "One point gives a flat line, two a straight line, "
                        "more a line joining them.")
             p1, p2 = st.columns(2)
-            p1.button("↶ Last point", key=f"sc_blp_last{i}",
-                      on_click=sc_bl_points_edit, args=(i, "last"),
+            p1.button("↶ Last point", key=f"{SCP}blp_last{i}",
+                      on_click=sc_ns(sc_bl_points_edit), args=(i, "last"),
                       disabled=not points, **STRETCH)
-            p2.button("✕ Clear points", key=f"sc_blp_clear{i}",
-                      on_click=sc_bl_points_edit, args=(i, "clear"),
+            p2.button("✕ Clear points", key=f"{SCP}blp_clear{i}",
+                      on_click=sc_ns(sc_bl_points_edit), args=(i, "clear"),
                       disabled=not points, **STRETCH)
         elif source == "Typed":
             t1, t2 = st.columns(2)
-            t1.number_input("level", key=f"sc_bltl{i}", format="%.6g")
-            t2.number_input("slope", key=f"sc_blts{i}", format="%.6g")
+            t1.number_input("level", key=f"{SCP}bltl{i}", format="%.6g")
+            t2.number_input("slope", key=f"{SCP}blts{i}", format="%.6g")
             st.caption("y = level + slope × x, with x as in the file "
                        "(before its zero is moved).")
         if source == "Fitted":
             st.radio("Baseline", ("Horizontal", "Sloped (linear)"),
-                     key=f"sc_blo{i}", horizontal=True,
+                     key=f"{SCP}blo{i}", horizontal=True,
                      help="Horizontal: the mean level over the window. "
                           "Sloped: a straight line through it, for a "
                           "drifting signal.")
         a, b = st.columns(2)
-        a.number_input("Window from x", key=f"sc_bl0{i}", format="%.6g")
-        b.number_input("to x", key=f"sc_bl1{i}", format="%.6g")
+        a.number_input("Window from x", key=f"{SCP}bl0{i}", format="%.6g")
+        b.number_input("to x", key=f"{SCP}bl1{i}", format="%.6g")
         q1, q2, q3 = st.columns(3)
-        q1.button("First 5 %", key=f"sc_blq5{i}", on_click=first,
+        q1.button("First 5 %", key=f"{SCP}blq5{i}", on_click=sc_ns(first),
                   args=(0.05,), **STRETCH)
-        q2.button("10 %", key=f"sc_blq10{i}", on_click=first,
+        q2.button("10 %", key=f"{SCP}blq10{i}", on_click=sc_ns(first),
                   args=(0.10,), **STRETCH)
-        q3.button("25 %", key=f"sc_blq25{i}", on_click=first,
+        q3.button("25 %", key=f"{SCP}blq25{i}", on_click=sc_ns(first),
                   args=(0.25,), **STRETCH)
         st.caption("The window is where the baseline is fitted (or, for "
                    "the other ways, where its noise is measured). For "
@@ -30100,22 +30208,22 @@ def sc_baseline_controls(i, x_all, mode, y_all=None, needed=False):
                    "contact is where the signal stays k × SD from the "
                    "baseline.")
         c1, c2 = st.columns(2)
-        c1.number_input("k × SD", 1.0, 50.0, step=0.5, key=f"sc_blk{i}")
-        c2.selectbox("Direction", ("either", "up", "down"), key=f"sc_bld{i}",
+        c1.number_input("k × SD", 1.0, 50.0, step=0.5, key=f"{SCP}blk{i}")
+        c2.selectbox("Direction", ("either", "up", "down"), key=f"{SCP}bld{i}",
                      format_func={"either": "Either way", "up": "Upwards",
                                   "down": "Downwards"}.get)
-    chosen = s.get(f"sc_blmode{i}", "Off")
+    chosen = s.get(f"{SCP}blmode{i}", "Off")
     if chosen == "Off" and not (contact_mode or needed):
         return None
-    return {"x0": float(s.get(f"sc_bl0{i}")), "x1": float(s.get(f"sc_bl1{i}")),
-            "k": float(s.get(f"sc_blk{i}", 3.0)),
-            "order": 0 if s.get(f"sc_blo{i}") == "Horizontal" else 1,
-            "direction": s.get(f"sc_bld{i}", "either"),
-            "manual": (float(s.get(f"sc_blval{i}"))
-                       if s.get(f"sc_bllvl{i}") == "By hand" else None),
+    return {"x0": float(s.get(f"{SCP}bl0{i}")), "x1": float(s.get(f"{SCP}bl1{i}")),
+            "k": float(s.get(f"{SCP}blk{i}", 3.0)),
+            "order": 0 if s.get(f"{SCP}blo{i}") == "Horizontal" else 1,
+            "direction": s.get(f"{SCP}bld{i}", "either"),
+            "manual": (float(s.get(f"{SCP}blval{i}"))
+                       if s.get(f"{SCP}bllvl{i}") == "By hand" else None),
             "source": source, "points": points,
-            "typed": (float(s.get(f"sc_bltl{i}") or 0.0),
-                      float(s.get(f"sc_blts{i}") or 0.0)),
+            "typed": (float(s.get(f"{SCP}bltl{i}") or 0.0),
+                      float(s.get(f"{SCP}blts{i}") or 0.0)),
             "show": True, "subtract": chosen == "Correct"}
 
 
@@ -30130,11 +30238,11 @@ def sc_peak_edit(i, raw, flag):
     the file's own x. ``flag`` None drops every hand edit.
     """
     s = st.session_state
-    removed = list(s.get(f"sc_pkrm{i}") or [])
-    added = list(s.get(f"sc_pkadd{i}") or [])
-    history = list(s.get("_sc_zero_hist") or [])
+    removed = list(s.get(f"{SCP}pkrm{i}") or [])
+    added = list(s.get(f"{SCP}pkadd{i}") or [])
+    history = list(s.get(f"_{SCP}zero_hist") or [])
     history.append(("peaks", i, list(removed), list(added)))
-    s["_sc_zero_hist"] = history[-40:]
+    s[f"_{SCP}zero_hist"] = history[-40:]
     if flag is None:
         removed, added = [], []
     elif int(flag) == 2 and added:
@@ -30144,8 +30252,8 @@ def sc_peak_edit(i, raw, flag):
         removed.append(float(raw))
     else:
         added.append(float(raw))
-    s[f"sc_pkrm{i}"] = removed
-    s[f"sc_pkadd{i}"] = added
+    s[f"{SCP}pkrm{i}"] = removed
+    s[f"{SCP}pkadd{i}"] = added
 
 
 def sc_peak_controls(i, y_all):
@@ -30155,56 +30263,56 @@ def sc_peak_controls(i, y_all):
     ys = np.asarray(y_all, float)
     ys = ys[np.isfinite(ys)]
     span = float(np.ptp(ys)) if ys.size else 1.0
-    s.setdefault(f"sc_pkh{i}", float(f"{0.1 * span:.3g}") if span else 0.0)
-    s.setdefault(f"sc_pkd{i}", "both")
-    s.setdefault(f"sc_pksep{i}", 0.0)
-    s.setdefault(f"sc_pku{i}", "As plotted")
-    s.setdefault(f"sc_pkk{i}", float(s.get("ai_k", 0.1) or 0.1))
-    s.setdefault(f"sc_pkdu{i}", "µm")
+    s.setdefault(f"{SCP}pkh{i}", float(f"{0.1 * span:.3g}") if span else 0.0)
+    s.setdefault(f"{SCP}pkd{i}", "both")
+    s.setdefault(f"{SCP}pksep{i}", 0.0)
+    s.setdefault(f"{SCP}pku{i}", "As plotted")
+    s.setdefault(f"{SCP}pkk{i}", float(s.get("ai_k", 0.1) or 0.1))
+    s.setdefault(f"{SCP}pkdu{i}", "µm")
     with st.popover("⛰ Peaks", **STRETCH):
-        st.toggle("Peak analysis", key=f"sc_pk{i}",
+        st.toggle("Peak analysis", key=f"{SCP}pk{i}",
                   help="Counts the peaks above and the dips below the "
                        "baseline (set under ⚙ Baseline), marks each one "
                        "counted on the plot (▲ ▼), and puts their "
                        "statistics in the balloon.")
         a, b = st.columns(2)
-        a.radio("Count", sc.PEAK_DIRECTIONS, key=f"sc_pkd{i}",
+        a.radio("Count", sc.PEAK_DIRECTIONS, key=f"{SCP}pkd{i}",
                 format_func={"both": "Up and down", "up": "Up only",
                              "down": "Down only"}.get)
         b.number_input("Min. height from baseline (y)", 0.0, None,
-                       key=f"sc_pkh{i}", format="%.4g",
+                       key=f"{SCP}pkh{i}", format="%.4g",
                        help="A peak counts when it clears the baseline by "
                             "this much: the dotted lines on the plot.")
-        b.number_input("Min. spacing (x)", 0.0, None, key=f"sc_pksep{i}",
+        b.number_input("Min. spacing (x)", 0.0, None, key=f"{SCP}pksep{i}",
                        format="%.4g",
                        help="Peaks closer than this count as one.")
         st.radio("Statistics in", ("As plotted", "Force (nN)"),
-                 key=f"sc_pku{i}", horizontal=True,
+                 key=f"{SCP}pku{i}", horizontal=True,
                  help="Force: the plotted deflection × the cantilever's "
                       "spring constant, so peak heights read in nN while "
                       "the plot stays in its own units.")
-        if s.get(f"sc_pku{i}") == "Force (nN)":
+        if s.get(f"{SCP}pku{i}") == "Force (nN)":
             c, d = st.columns(2)
             c.number_input("Spring constant k (N/m)", 0.0001, 1000.0,
-                           key=f"sc_pkk{i}", format="%.4g")
+                           key=f"{SCP}pkk{i}", format="%.4g")
             d.selectbox("Deflection plotted in", list(DEFLECTION_UNITS),
-                        key=f"sc_pkdu{i}")
-        edited = bool(s.get(f"sc_pkrm{i}") or s.get(f"sc_pkadd{i}"))
+                        key=f"{SCP}pkdu{i}")
+        edited = bool(s.get(f"{SCP}pkrm{i}") or s.get(f"{SCP}pkadd{i}"))
         st.button("↺ Peaks as found (drop the hand edits)",
-                  key=f"sc_pkreset{i}", disabled=not edited,
-                  on_click=sc_peak_edit, args=(i, None, None), **STRETCH,
+                  key=f"{SCP}pkreset{i}", disabled=not edited,
+                  on_click=sc_ns(sc_peak_edit), args=(i, None, None), **STRETCH,
                   help="Peaks are taken out or added by clicking them on "
                        "the plot with ✎ Edit peaks chosen above it.")
-    if s.get(f"sc_pku{i}") == "Force (nN)":
-        factor = float(s.get(f"sc_pkk{i}", 0.1)) * DEFLECTION_UNITS.get(
-            s.get(f"sc_pkdu{i}", "µm"), 1.0)
+    if s.get(f"{SCP}pku{i}") == "Force (nN)":
+        factor = float(s.get(f"{SCP}pkk{i}", 0.1)) * DEFLECTION_UNITS.get(
+            s.get(f"{SCP}pkdu{i}", "µm"), 1.0)
         unit = "nN"
     else:
         factor, unit = 1.0, ""
-    return {"on": bool(s.get(f"sc_pk{i}")),
-            "height": float(s.get(f"sc_pkh{i}") or 0.0),
-            "direction": s.get(f"sc_pkd{i}", "both"),
-            "sep": float(s.get(f"sc_pksep{i}") or 0.0),
+    return {"on": bool(s.get(f"{SCP}pk{i}")),
+            "height": float(s.get(f"{SCP}pkh{i}") or 0.0),
+            "direction": s.get(f"{SCP}pkd{i}", "both"),
+            "sep": float(s.get(f"{SCP}pksep{i}") or 0.0),
             "factor": factor, "unit": unit}
 
 
@@ -30215,21 +30323,21 @@ SC_SAT_CLICK = "⤴ Flat part"
 
 def sc_sat_source_changed(i):
     """Choosing Two points I click readies the plot for clicking them."""
-    if st.session_state.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1]:
-        st.session_state["sc_clickdo"] = SC_SAT_CLICK
+    if st.session_state.get(f"{SCP}satsrc{i}") == SC_SAT_SOURCES[1]:
+        st.session_state[f"{SCP}clickdo"] = SC_SAT_CLICK
 
 
 def sc_sat_points_push(i):
     s = st.session_state
-    history = list(s.get("_sc_zero_hist") or [])
-    history.append(("satpts", i, list(s.get(f"_sc_satpts{i}") or [])))
-    s["_sc_zero_hist"] = history[-40:]
+    history = list(s.get(f"_{SCP}zero_hist") or [])
+    history.append(("satpts", i, list(s.get(f"_{SCP}satpts{i}") or [])))
+    s[f"_{SCP}zero_hist"] = history[-40:]
 
 
 def sc_sat_points_edit(i):
     """✕ Clear the marked flat part, undoable."""
     sc_sat_points_push(i)
-    st.session_state[f"_sc_satpts{i}"] = []
+    st.session_state[f"_{SCP}satpts{i}"] = []
 
 
 def sc_sat_click(point, traces):
@@ -30241,12 +30349,12 @@ def sc_sat_click(point, traces):
     if not hit or hit[2] == 3:
         return
     slot, raw_x, _ = hit
-    marks = list(s.get(f"_sc_satpts{slot}") or [])
+    marks = list(s.get(f"_{SCP}satpts{slot}") or [])
     sc_sat_points_push(slot)
     marks = ([] if len(marks) >= 2 else marks) + [float(raw_x)]
-    s[f"_sc_satpts{slot}"] = marks
+    s[f"_{SCP}satpts{slot}"] = marks
     # its menu shows Saturated top › Two points I click from the next run
-    s["_sc_satsrc_next"] = slot
+    s[f"_{SCP}satsrc_next"] = slot
 
 
 def sc_extend_controls(i):
@@ -30254,105 +30362,110 @@ def sc_extend_controls(i):
     saturated (flat) top on along its rise and fall. Returns the
     settings."""
     s = st.session_state
-    s.setdefault(f"sc_extdash{i}", "Dashed")
-    s.setdefault(f"sc_extlev{i}", 0.0)
-    s.setdefault(f"sc_sattol{i}", 1.0)
-    s.setdefault(f"sc_satband{i}", (50, 97))
-    if f"sc_satside{i}" not in s:
-        s[f"sc_satside{i}"] = SC_SAT_SIDES[1 if s.get(f"sc_neg{i}") else 0]
+    s.setdefault(f"{SCP}extdash{i}", "Dashed")
+    s.setdefault(f"{SCP}extlev{i}", 0.0)
+    s.setdefault(f"{SCP}sattol{i}", 1.0)
+    s.setdefault(f"{SCP}satband{i}", (50, 97))
+    if f"{SCP}satside{i}" not in s:
+        s[f"{SCP}satside{i}"] = SC_SAT_SIDES[1 if s.get(f"{SCP}neg{i}") else 0]
     with st.popover("↦ Extend", **STRETCH):
-        st.caption("**Carry on at a level** past the data, to the plot's "
+        st.caption("**Carry on at a level** past the data, to the end "
+                   "(start) of its place in the series: beside a longer "
+                   "file sharing its place." if sc_is_series() else
+                   "**Carry on at a level** past the data, to the plot's "
                    "edge: to set a short recording beside longer ones.")
         e1, e2 = st.columns(2)
-        e1.toggle("After the end", key=f"sc_extA{i}")
-        e2.toggle("Before the start", key=f"sc_extB{i}")
+        e1.toggle("After the end", key=f"{SCP}extA{i}")
+        e2.toggle("Before the start", key=f"{SCP}extB{i}")
         e3, e4 = st.columns(2)
-        e3.number_input("at y =", key=f"sc_extlev{i}", format="%.6g",
+        e3.number_input("at y =", key=f"{SCP}extlev{i}", format="%.6g",
                         help="0 is zero; with the baseline corrected it "
                              "is the baseline.")
-        e4.selectbox("Line", list(sc.EXTEND_DASHES), key=f"sc_extdash{i}")
+        e4.selectbox("Line", list(sc.EXTEND_DASHES), key=f"{SCP}extdash{i}")
         st.divider()
-        st.toggle("Saturated top: carry the rise and fall on", key=f"sc_sat{i}",
+        st.toggle("Saturated top: carry the rise and fall on", key=f"{SCP}sat{i}",
                   help="Where the signal goes flat because the sensor "
                        "saturated, dashed lines carry the rise into the flat "
                        "part and the fall out of it on to where they meet: "
                        "the curve went on, it did not level off.")
-        if s.get(f"sc_sat{i}"):
-            st.radio("Flat part", SC_SAT_SOURCES, key=f"sc_satsrc{i}",
-                     horizontal=True, on_change=sc_sat_source_changed,
+        if s.get(f"{SCP}sat{i}"):
+            st.radio("Flat part", SC_SAT_SOURCES, key=f"{SCP}satsrc{i}",
+                     horizontal=True, on_change=sc_ns(sc_sat_source_changed),
                      args=(i,),
                      help="Two points I click: choose ⤴ Flat part above the "
                           "plot and click where the flat part starts, then "
                           "where it ends.")
-            by_hand = s.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1]
+            by_hand = s.get(f"{SCP}satsrc{i}") == SC_SAT_SOURCES[1]
             if by_hand:
-                marks = list(s.get(f"_sc_satpts{i}") or [])
+                marks = list(s.get(f"_{SCP}satpts{i}") or [])
                 g1, g2 = st.columns([1.6, 1])
                 g1.caption(("Marked from both ends." if len(marks) == 2
                             else "Start marked: click where it ends."
                             if marks else "Nothing marked yet.")
                            + " With **⤴ Flat part** chosen above the plot, "
                              "click the start, then the end.")
-                g2.button("✕ Clear", key=f"sc_satclr{i}", disabled=not marks,
-                          on_click=sc_sat_points_edit, args=(i,), **STRETCH)
+                g2.button("✕ Clear", key=f"{SCP}satclr{i}", disabled=not marks,
+                          on_click=sc_ns(sc_sat_points_edit), args=(i,), **STRETCH)
             f1, f2 = st.columns(2)
-            f1.selectbox("Flat at the", SC_SAT_SIDES, key=f"sc_satside{i}",
+            f1.selectbox("Flat at the", SC_SAT_SIDES, key=f"{SCP}satside{i}",
                          help="Lowest values for a signal saturated "
                               "downwards (or drawn negative up).")
             f2.number_input("Flat within (% of height)", 0.05, 20.0,
-                            step=0.25, key=f"sc_sattol{i}", format="%.3g",
+                            step=0.25, key=f"{SCP}sattol{i}", format="%.3g",
                             disabled=by_hand,
                             help="How close to the limit a point must be to "
                                  "count as part of the flat top (when it is "
                                  "found automatically).")
             st.slider("Part of the rise and fall used (% of height)", 5, 99,
-                      key=f"sc_satband{i}",
+                      key=f"{SCP}satband{i}",
                       help="The straight lines are fitted to the rise and "
                            "fall between these heights (0 at the base, 100 "
                            "at the flat top).")
-    band = s.get(f"sc_satband{i}") or (50, 97)
-    return {"carry": {"after": bool(s.get(f"sc_extA{i}")),
-                      "before": bool(s.get(f"sc_extB{i}")),
-                      "level": float(s.get(f"sc_extlev{i}") or 0.0),
+    band = s.get(f"{SCP}satband{i}") or (50, 97)
+    return {"carry": {"after": bool(s.get(f"{SCP}extA{i}")),
+                      "before": bool(s.get(f"{SCP}extB{i}")),
+                      "level": float(s.get(f"{SCP}extlev{i}") or 0.0),
                       "dash": sc.EXTEND_DASHES.get(
-                          s.get(f"sc_extdash{i}"), "dash")},
-            "saturation": bool(s.get(f"sc_sat{i}")),
-            "side": "low" if s.get(f"sc_satside{i}") == SC_SAT_SIDES[1]
+                          s.get(f"{SCP}extdash{i}"), "dash")},
+            "saturation": bool(s.get(f"{SCP}sat{i}")),
+            "side": "low" if s.get(f"{SCP}satside{i}") == SC_SAT_SIDES[1]
             else "high",
-            "tolerance": float(s.get(f"sc_sattol{i}") or 1.0) / 100.0,
+            "tolerance": float(s.get(f"{SCP}sattol{i}") or 1.0) / 100.0,
             "band": (band[0] / 100.0, band[1] / 100.0),
-            "by_hand": s.get(f"sc_satsrc{i}") == SC_SAT_SOURCES[1],
-            "marks": list(s.get(f"_sc_satpts{i}") or [])}
+            "by_hand": s.get(f"{SCP}satsrc{i}") == SC_SAT_SOURCES[1],
+            "marks": list(s.get(f"_{SCP}satpts{i}") or [])}
 
 
 def sc_slot_name(i):
     """What the file slot holds, for its heading."""
     s = st.session_state
-    sent = s.get(f"sc_sent{i}")
+    sent = s.get(f"{SCP}sent{i}")
     if sent is not None:
         return "📥 " + str(sent["name"])
-    up = s.get(f"sc_file{i}")
+    up = s.get(sc_upload_key(i))
     return str(getattr(up, "name", "") or "empty")
 
 
 def sc_slot(i, n=3):
     """One file's controls, compact. Returns the prepared trace or None."""
     s = st.session_state
-    sent = s.get(f"sc_sent{i}")
+    sent = s.get(f"{SCP}sent{i}")
     if sent is not None:
         # data sent here from another tab, in place of a file
         a, b = st.columns([3, 1])
         a.caption(f"From {sent.get('source', 'the video')}: "
                   f"{sent['name']}")
-        b.button("✖", key=f"sc_unsend{i}", on_click=s.pop,
-                 args=(f"sc_sent{i}", None), help="Remove it", **STRETCH)
+        b.button("✖", key=f"{SCP}unsend{i}", on_click=sc_ns(s.pop),
+                 args=(f"{SCP}sent{i}", None), help="Remove it", **STRETCH)
         frame, file_name = sent["frame"], sent["name"]
     else:
         up = st.file_uploader(
-            f"File {i + 1}", key=f"sc_file{i}", label_visibility="collapsed",
+            f"File {i + 1}", key=sc_upload_key(i), label_visibility="collapsed",
             type=["csv", "txt", "tsv", "dat", "xlsx", "xls"],
-            help="CSV, TSV, TXT or Excel. Plots on the video and AFM tabs "
-                 "can also be sent here with **Send to stacked plot**.")
+            help="CSV, TSV, TXT or Excel. Plots on the video, AFM and "
+                 "force curve tabs can also be sent here with **"
+                 + ("🔗 Send to series" if sc_is_series()
+                    else "📚 Send to stack") + "**.")
         if up is None:
             return None
         try:
@@ -30363,68 +30476,74 @@ def sc_slot(i, n=3):
         file_name = up.name
     cols = list(frame.columns)
     stem = re.sub(r"\.(csv|txt|tsv|dat|xlsx|xls)$", "", file_name)
-    sc_default(f"sc_label{i}", stem)
-    if s.get(f"sc_x{i}") not in cols:
-        s[f"sc_x{i}"] = sc.guess_x(cols)
-    if s.get(f"sc_y{i}") not in cols:
-        s[f"sc_y{i}"] = sc.guess_y(cols, s[f"sc_x{i}"])
-    s.setdefault(f"sc_col{i}", sc.DEFAULT_COLOURS[i % len(
+    sc_default(f"{SCP}label{i}", stem)
+    if s.get(f"{SCP}x{i}") not in cols:
+        s[f"{SCP}x{i}"] = sc.guess_x(cols)
+    if s.get(f"{SCP}y{i}") not in cols:
+        s[f"{SCP}y{i}"] = sc.guess_y(cols, s[f"{SCP}x{i}"])
+    s.setdefault(f"{SCP}col{i}", sc.DEFAULT_COLOURS[i % len(
         sc.DEFAULT_COLOURS)])
-    s.setdefault(f"sc_zmode{i}", "Start of the data")
+    s.setdefault(f"{SCP}zmode{i}", "Start of the data")
     options = list(range(1, max(n, 1) + 1))
-    if s.get(f"sc_panel{i}") not in options:
-        s[f"sc_panel{i}"] = min(i + 1, options[-1])
+    if s.get(f"{SCP}panel{i}") not in options:
+        s[f"{SCP}panel{i}"] = min(i + 1, options[-1])
 
     # what to draw, and where
     c1, c2, c3 = st.columns([1.3, 1.3, 0.8])
-    xcol = c1.selectbox("x", cols, key=f"sc_x{i}")
-    ycol = c2.selectbox("y", cols, key=f"sc_y{i}")
-    c3.selectbox("Panel", options, key=f"sc_panel{i}",
-                 help="Same number = overlaid; different = stacked.")
-    sc_default(f"sc_ylab{i}", str(ycol))
+    xcol = c1.selectbox("x", cols, key=f"{SCP}x{i}")
+    ycol = c2.selectbox("y", cols, key=f"{SCP}y{i}")
+    if sc_is_series():
+        c3.selectbox("Place", options, key=f"{SCP}panel{i}",
+                     help="Its place in the series: 1 first, 2 after it, "
+                          "and so on. The same number puts files in the "
+                          "same place, overlaid.")
+    else:
+        c3.selectbox("Panel", options, key=f"{SCP}panel{i}",
+                     help="Same number = overlaid; different = stacked.")
+    sc_default(f"{SCP}ylab{i}", str(ycol))
     n1, n2 = st.columns(2)
-    n1.text_input("Name in the legend", key=f"sc_label{i}")
-    n2.text_input("y axis title", key=f"sc_ylab{i}",
+    n1.text_input("Name in the legend", key=f"{SCP}label{i}")
+    n2.text_input("y axis title", key=f"{SCP}ylab{i}",
                   help="This file's y axis title on the plot. Where files "
                        "share a panel their titles are joined, unless one "
                        "title for the whole panel is set under 📐 Axes.")
     # where it starts
     z1, z2, z3 = st.columns([1.6, 1, 1])
     mode = z1.selectbox(
-        "Zero of x at", sc.ZERO_MODES, key=f"sc_zmode{i}",
+        "Zero of x at", sc.ZERO_MODES, key=f"{SCP}zmode{i}",
         help="Where this file's x = 0 is: the first point, a value you "
              "type, the peak, the lowest point, a level crossing, or the "
              "contact point (where the signal leaves the baseline set "
              "under 〰 Baseline). With **🎯 Set zero** chosen above the "
              "plot, a click on the plot sets it too.")
     if mode == "A value I type":
-        z2.number_input("at x =", key=f"sc_zval{i}", format="%.6g",
-                        value=float(s.get(f"sc_zval{i}", 0.0) or 0.0)
-                        if f"sc_zval{i}" not in s else None)
+        z2.number_input("at x =", key=f"{SCP}zval{i}", format="%.6g",
+                        value=float(s.get(f"{SCP}zval{i}", 0.0) or 0.0)
+                        if f"{SCP}zval{i}" not in s else None)
     elif mode == "Where it first crosses a level":
-        z2.number_input("level y =", key=f"sc_zlevel{i}", format="%.6g")
+        z2.number_input("level y =", key=f"{SCP}zlevel{i}", format="%.6g")
     else:
         z2.empty()
     z3.number_input(
-        "then move by", key=f"sc_shift{i}", format="%.6g",
-        value=None if f"sc_shift{i}" in s else 0.0,
+        "then move by", key=f"{SCP}shift{i}", format="%.6g",
+        value=None if f"{SCP}shift{i}" in s else 0.0,
         help="Slides the trace along x after its zero is set (negative = "
              "left), so the zero can sit before the trace starts.")
     # how it looks
     t1, t2 = st.columns(2)
-    t1.toggle("Negative up", key=f"sc_neg{i}",
+    t1.toggle("Negative up", key=f"{SCP}neg{i}",
               help="Flips this file's y axis. The numbers keep their sign.")
-    t2.toggle("Own right axis", key=f"sc_right{i}",
+    t2.toggle("Own right axis", key=f"{SCP}right{i}",
               help="When overlaid, this file gets its own y axis on the "
                    "right, for other units or sizes.")
-    xf = float(s.get(f"sc_xf{i}") or 1.0)
-    yf = float(s.get(f"sc_yf{i}") if s.get(f"sc_yf{i}") is not None
+    xf = float(s.get(f"{SCP}xf{i}") or 1.0)
+    yf = float(s.get(f"{SCP}yf{i}") if s.get(f"{SCP}yf{i}") is not None
                else 1.0)
     x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
-    peaks_on = bool(s.get(f"sc_pk{i}"))
+    peaks_on = bool(s.get(f"{SCP}pk{i}"))
     baseline = sc_baseline_controls(i, x_all, mode, y_all, needed=peaks_on)
     u1, u2, u3 = st.columns([0.45, 1.05, 1.05])
-    u1.color_picker("Colour", key=f"sc_col{i}",
+    u1.color_picker("Colour", key=f"{SCP}col{i}",
                     label_visibility="collapsed")
     with u2:
         x_range, y_range = sc_axis_ranges(i)
@@ -30435,14 +30554,14 @@ def sc_slot(i, n=3):
         extend = sc_extend_controls(i)
     with u4.popover("⋯ More", **STRETCH):
         m1, m2 = st.columns(2)
-        m1.number_input("x ×", key=f"sc_xf{i}", value=None
-                        if f"sc_xf{i}" in s else 1.0, format="%.6g",
+        m1.number_input("x ×", key=f"{SCP}xf{i}", value=None
+                        if f"{SCP}xf{i}" in s else 1.0, format="%.6g",
                         help="E.g. 0.001 for ms to s.")
-        m2.number_input("y ×", key=f"sc_yf{i}", value=None
-                        if f"sc_yf{i}" in s else 1.0, format="%.6g",
+        m2.number_input("y ×", key=f"{SCP}yf{i}", value=None
+                        if f"{SCP}yf{i}" in s else 1.0, format="%.6g",
                         help="-1 changes the sign of the values.")
-        st.slider("Smoothing (points)", 1, 501, step=2, key=f"sc_sm{i}",
-                  value=None if f"sc_sm{i}" in s else 1)
+        st.slider("Smoothing (points)", 1, 501, step=2, key=f"{SCP}sm{i}",
+                  value=None if f"{SCP}sm{i}" in s else 1)
     # the baseline as a function of the file's own x, whichever way it is
     # set; Show, Correct, the peaks and the contact point all use it
     base_fn, contact, sd = None, None, None
@@ -30479,9 +30598,9 @@ def sc_slot(i, n=3):
             max(baseline["x0"], baseline["x1"]) if baseline else 0.0)
     else:
         zero = sc.zero_point(x_all, y_all, mode,
-                             typed=float(s.get(f"sc_zval{i}") or 0.0),
-                             level=float(s.get(f"sc_zlevel{i}") or 0.0))
-    shift = float(s.get(f"sc_shift{i}") or 0.0)
+                             typed=float(s.get(f"{SCP}zval{i}") or 0.0),
+                             level=float(s.get(f"{SCP}zlevel{i}") or 0.0))
+    shift = float(s.get(f"{SCP}shift{i}") or 0.0)
     note = ""
     if coeffs is not None:
         level = float(np.ravel(base_fn(np.array([baseline["x0"]])))[0])
@@ -30519,7 +30638,7 @@ def sc_slot(i, n=3):
             if baseline["subtract"]:
                 py = py - base_fn(px)
             baseline_points = (px - zero, py)
-    y = sc.smooth(y, int(s.get(f"sc_sm{i}") or 1))
+    y = sc.smooth(y, int(s.get(f"{SCP}sm{i}") or 1))
     sat_line = sat_marks = None
     if extend["saturation"] and len(x) > 10:
         order = np.argsort(x, kind="stable")
@@ -30568,8 +30687,8 @@ def sc_slot(i, n=3):
             x, y, fit_y, peaks["height"], peaks["direction"], peaks["sep"],
             factor=peaks["factor"], unit=peaks["unit"],
             x_unit=sc.unit_of(str(xcol)) if not xf or xf == 1.0 else "",
-            removed=[v - zero for v in s.get(f"sc_pkrm{i}") or ()],
-            added=[v - zero for v in s.get(f"sc_pkadd{i}") or ()])
+            removed=[v - zero for v in s.get(f"{SCP}pkrm{i}") or ()],
+            added=[v - zero for v in s.get(f"{SCP}pkadd{i}") or ()])
         hand = set(int(v) for v in found["added"])
         peak_marks = []
         for side, symbol, text in (("up", "triangle-up", "peak"),
@@ -30604,19 +30723,19 @@ def sc_slot(i, n=3):
             "peak_marks": peak_marks, "peak_stats": peak_stats,
             "threshold_lines": threshold_lines,
             "stats_factor": peaks["factor"], "stats_unit": peaks["unit"],
-            "label": s.get(f"sc_label{i}") or stem,
-            "ylabel": s.get(f"sc_ylab{i}") or str(ycol),
-            "colour": s.get(f"sc_col{i}"), "neg_up": bool(
-                s.get(f"sc_neg{i}")), "slot": i, "file": file_name,
-            "xcol": xcol, "panel": int(s.get(f"sc_panel{i}") or (i + 1)),
-            "right": bool(s.get(f"sc_right{i}")), "x_range": x_range,
+            "label": s.get(f"{SCP}label{i}") or stem,
+            "ylabel": s.get(f"{SCP}ylab{i}") or str(ycol),
+            "colour": s.get(f"{SCP}col{i}"), "neg_up": bool(
+                s.get(f"{SCP}neg{i}")), "slot": i, "file": file_name,
+            "xcol": xcol, "panel": int(s.get(f"{SCP}panel{i}") or (i + 1)),
+            "right": bool(s.get(f"{SCP}right{i}")), "x_range": x_range,
             "y_range": y_range, "extend": extend["carry"],
             "sat_line": sat_line, "sat_marks": sat_marks}
 
 
 def sc_global_x_range():
-    lo = sc.finite_or_none(str(st.session_state.get("sc_xmin", "")))
-    hi = sc.finite_or_none(str(st.session_state.get("sc_xmax", "")))
+    lo = sc.finite_or_none(str(st.session_state.get(f"{SCP}xmin", "")))
+    hi = sc.finite_or_none(str(st.session_state.get(f"{SCP}xmax", "")))
     return (lo, hi) if lo is not None and hi is not None and lo != hi \
         else None
 
@@ -30625,7 +30744,7 @@ def sc_y_titles():
     """{panel: title, (panel, "right"): title} for the titles typed."""
     out = {}
     for key, value in st.session_state.items():
-        m = re.fullmatch(r"sc_ytitle(\d+)(r?)", str(key))
+        m = re.fullmatch(re.escape(SCP) + r"ytitle(\d+)(r?)", str(key))
         if m and str(value or "").strip():
             panel = int(m.group(1))
             out[(panel, "right") if m.group(2) else panel] = \
@@ -30648,21 +30767,21 @@ SC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 
 def sc_hl_ver():
     s = st.session_state
-    s["_sc_hl_n"] = int(s.get("_sc_hl_n", 0)) + 1
-    return s["_sc_hl_n"]
+    s[f"_{SCP}hl_n"] = int(s.get(f"_{SCP}hl_n", 0)) + 1
+    return s[f"_{SCP}hl_n"]
 
 
 def sc_hl_push():
     """Keep the lines as they are, for ↶ Undo."""
     s = st.session_state
-    history = list(s.get("_sc_zero_hist") or [])
-    history.append(("lines", copy.deepcopy(s.get("_sc_hlines") or {}),
-                    copy.deepcopy(s.get("_sc_draft"))))
-    s["_sc_zero_hist"] = history[-40:]
+    history = list(s.get(f"_{SCP}zero_hist") or [])
+    history.append(("lines", copy.deepcopy(s.get(f"_{SCP}hlines") or {}),
+                    copy.deepcopy(s.get(f"_{SCP}draft"))))
+    s[f"_{SCP}zero_hist"] = history[-40:]
 
 
 def sc_hl_editor_key(line):
-    return f"sc_hl_{line['id']}_v{line['ver']}"
+    return f"{SCP}hl_{line['id']}_v{line['ver']}"
 
 
 def sc_hl_take_edits(line):
@@ -30697,8 +30816,8 @@ def sc_hl_fold_all():
     """Every table's typed changes into its line, before the plot is
     drawn (so the plot shows them at once)."""
     s = st.session_state
-    lines = s.get("_sc_hlines") or {}
-    draft = s.get("_sc_draft")
+    lines = s.get(f"_{SCP}hlines") or {}
+    draft = s.get(f"_{SCP}draft")
     pending = [ln for group in lines.values() for ln in group]
     if draft:
         pending.append(draft)
@@ -30712,7 +30831,7 @@ def sc_hl_fold_all():
 
 def sc_hl_cancel():
     sc_hl_push()
-    st.session_state["_sc_draft"] = None
+    st.session_state[f"_{SCP}draft"] = None
 
 
 def sc_hl_drawn(stroke, traces, fig):
@@ -30733,7 +30852,7 @@ def sc_hl_drawn(stroke, traces, fig):
             in_panel.append((t, (fig.data[k].yaxis or "y") == yref))
     mine = [t for t, left in in_panel if left] or [t for t, _ in in_panel]
     if not mine:
-        s["_sc_draw_note"] = "⚠️ Draw the line over one of the files."
+        s[f"_{SCP}draw_note"] = "⚠️ Draw the line over one of the files."
         return
     rng = sc_global_x_range() or mine[0].get("x_range")
     xs_all = np.concatenate([np.asarray(t["x"], float) for t, _ in in_panel])
@@ -30753,7 +30872,7 @@ def sc_hl_drawn(stroke, traces, fig):
         y = y[np.isfinite(y)]
         return 1.1 * float(y.max() - y.min()) if y.size > 1 else 1.0
 
-    size = (800.0, float(s.get("sc_height", 240)))
+    size = (800.0, float(s.get(f"{SCP}height", 240)))
     x0, y0 = float(stroke["x"][0]), float(stroke["y"][0])
 
     def gap(t):
@@ -30765,12 +30884,17 @@ def sc_hl_drawn(stroke, traces, fig):
             (x[ok] - x0) * size[0] / ((x_hi - x_lo) or 1.0),
             (y[ok] - y0) * size[1] / y_span(t))))
 
+    if sc_is_series():
+        # in a series, the file whose part of the x axis the drag starts in
+        here = [t for t in mine if t.get("series")
+                and t["series"]["start"] <= x0 <= t["series"]["end"]]
+        mine = here or mine
     owner = min(mine, key=gap)
     got = stroke_line(stroke, owner["x"], owner["y"], (x_hi - x_lo) or 1.0,
-                      y_span(owner), snap=bool(s.get("sc_hl_snap", True)),
-                      level=bool(s.get("sc_hl_level", True)), size=size)
+                      y_span(owner), snap=bool(s.get(f"{SCP}hl_snap", True)),
+                      level=bool(s.get(f"{SCP}hl_level", True)), size=size)
     if got is None:
-        s["_sc_draw_note"] = ("⚠️ That was a click, too short for a line: "
+        s[f"_{SCP}draw_note"] = ("⚠️ That was a click, too short for a line: "
                               "press where the line starts, drag to where "
                               "it ends and let go.")
         return
@@ -30778,8 +30902,8 @@ def sc_hl_drawn(stroke, traces, fig):
     sc_hl_push()
     zero = float(owner["zero"])
     pts = [[a[0] + zero, a[1]], [b[0] + zero, b[1]]]
-    lines = copy.deepcopy(s.get("_sc_hlines") or {})
-    target = s.pop("_sc_redraw", None)
+    lines = copy.deepcopy(s.get(f"_{SCP}hlines") or {})
+    target = s.pop(f"_{SCP}redraw", None)
     moved = None
     if target:
         old = next((ln for ln in lines.get(target[0], [])
@@ -30791,13 +30915,13 @@ def sc_hl_drawn(stroke, traces, fig):
                          file=owner["file"], zero=zero, ver=sc_hl_ver())
     line = moved or {"id": sc_hl_ver(), "slot": owner["slot"],
                      "file": owner["file"], "pts": pts,
-                     "dash": s.get("sc_hl_style", "Dashed"), "colour": None,
+                     "dash": s.get(f"{SCP}hl_style", "Dashed"), "colour": None,
                      "zero": zero, "ver": sc_hl_ver()}
     lines.setdefault(owner["slot"], []).append(line)
-    s["_sc_hlines"] = lines
-    s["_sc_draft"] = None
+    s[f"_{SCP}hlines"] = lines
+    s[f"_{SCP}draft"] = None
     ends = ends_note(on)
-    s["_sc_draw_note"] = (
+    s[f"_{SCP}draw_note"] = (
         f"✅ Line {'moved' if moved else 'drawn'} on {owner['label']}: "
         f"({a[0]:.4g}, {a[1]:.4g}) → ({b[0]:.4g}, {b[1]:.4g}){ends}.")
 
@@ -30805,24 +30929,24 @@ def sc_hl_drawn(stroke, traces, fig):
 def sc_hl_redraw(slot, line_id):
     """✏ Redraw: the next drag on the plot moves this line."""
     s = st.session_state
-    if s.get("_sc_redraw") == (slot, line_id):
-        s.pop("_sc_redraw", None)
+    if s.get(f"_{SCP}redraw") == (slot, line_id):
+        s.pop(f"_{SCP}redraw", None)
         return
-    s["_sc_redraw"] = (slot, line_id)
-    s["sc_clickdo"] = SC_CLICKS[2]
+    s[f"_{SCP}redraw"] = (slot, line_id)
+    s[f"{SCP}clickdo"] = SC_CLICKS[2]
 
 
 def sc_hl_delete(slot, line_id):
     s = st.session_state
     sc_hl_push()
-    lines = copy.deepcopy(s.get("_sc_hlines") or {})
+    lines = copy.deepcopy(s.get(f"_{SCP}hlines") or {})
     lines[slot] = [ln for ln in lines.get(slot, []) if ln["id"] != line_id]
-    s["_sc_hlines"] = lines
+    s[f"_{SCP}hlines"] = lines
 
 
 def sc_hl_restyle(slot, line_id, key, field="dash"):
     s = st.session_state
-    for ln in (s.get("_sc_hlines") or {}).get(slot, []):
+    for ln in (s.get(f"_{SCP}hlines") or {}).get(slot, []):
         if ln["id"] == line_id:
             ln[field] = s.get(key)
 
@@ -30831,7 +30955,7 @@ def sc_hl_for(t):
     """The hand lines of one file, as plotted (x less its zero)."""
     s = st.session_state
     out = []
-    for ln in (s.get("_sc_hlines") or {}).get(t["slot"], []):
+    for ln in (s.get(f"_{SCP}hlines") or {}).get(t["slot"], []):
         if ln.get("file") != t["file"] or len(ln["pts"]) < 2:
             continue
         out.append({"x": [x - t["zero"] for x, _ in ln["pts"]],
@@ -30841,12 +30965,12 @@ def sc_hl_for(t):
                     "caps": ln.get("caps"),
                     "text": (ln.get("text") if ln.get("show_text", True)
                              else None)})
-    draft = s.get("_sc_draft")
+    draft = s.get(f"_{SCP}draft")
     if draft and draft["slot"] == t["slot"] and draft.get("file") == t["file"]:
         out.append({"x": [x - t["zero"] for x, _ in draft["pts"]],
                     "y": [y for _, y in draft["pts"]],
                     "dash": sc.EXTEND_DASHES.get(
-                        s.get("sc_hl_style", "Dashed"), "dash"),
+                        s.get(f"{SCP}hl_style", "Dashed"), "dash"),
                     "draft": True})
     return out
 
@@ -30870,13 +30994,13 @@ def sc_hl_panel(traces):
     and every line drawn so far with its style, colour and points."""
     s = st.session_state
     by_slot = {t["slot"]: t for t in traces}
-    for key, value in (("sc_hl_style", "Dashed"), ("sc_hl_snap", True),
-                       ("sc_hl_level", True)):
+    for key, value in ((f"{SCP}hl_style", "Dashed"), (f"{SCP}hl_snap", True),
+                       (f"{SCP}hl_level", True)):
         s.setdefault(key, value)
-    drawn = [(slot, ln) for slot, group in (s.get("_sc_hlines") or {}).items()
+    drawn = [(slot, ln) for slot, group in (s.get(f"_{SCP}hlines") or {}).items()
              for ln in group if slot in by_slot
              and ln.get("file") == by_slot[slot]["file"]]
-    target = s.get("_sc_redraw")
+    target = s.get(f"_{SCP}redraw")
     with st.container(border=True):
         d1, d2, d3, d4 = st.columns([2.6, 1.0, 1.0, 0.9])
         n = next((k for k, (slot, ln) in enumerate(drawn, 1)
@@ -30887,14 +31011,14 @@ def sc_hl_panel(traces):
             "**✏ Press where a line starts, drag to where it ends, let "
             "go.** Each drag is one line, on the file drawn over.")
         d2.selectbox("Style of new lines", SC_LINE_STYLES,
-                     key="sc_hl_style", label_visibility="collapsed")
-        d3.toggle("🧲 Snap", key="sc_hl_snap",
+                     key=f"{SCP}hl_style", label_visibility="collapsed")
+        d3.toggle("🧲 Snap", key=f"{SCP}hl_snap",
                   help="An end let go close to the curve goes exactly onto "
                        "it, so a line joins the curve.")
-        d4.toggle("─ Level", key="sc_hl_level",
+        d4.toggle("─ Level", key=f"{SCP}hl_level",
                   help="A line drawn nearly level (or upright) is made "
                        "exactly level (upright).")
-        note = s.pop("_sc_draw_note", None)
+        note = s.pop(f"_{SCP}draw_note", None)
         if note:
             st.caption(note)
     for n, (slot, ln) in enumerate(drawn, 1):
@@ -30910,151 +31034,619 @@ def sc_hl_panel(traces):
                         f"({xa - t['zero']:.4g}, {ya:.4g}) → "
                         f"({xb - t['zero']:.4g}, {yb:.4g}){extra}")
             if ln.get("text") is not None:
-                skey = f"sc_hl_show_{ln['id']}"
+                skey = f"{SCP}hl_show_{ln['id']}"
                 s[skey] = bool(ln.get("show_text", True))
                 c0.toggle("🏷 Label on the plot", key=skey,
-                          on_change=sc_hl_restyle,
+                          on_change=sc_ns(sc_hl_restyle),
                           args=(slot, ln["id"], skey, "show_text"),
                           help="Off: the bar (line) alone, without its name.")
                 if ln.get("show_text", True):
-                    tkey = f"sc_hl_txt_{ln['id']}"
+                    tkey = f"{SCP}hl_txt_{ln['id']}"
                     s[tkey] = ln.get("text") or ""
                     c0.text_input("Label", key=tkey,
                                   label_visibility="collapsed",
-                                  on_change=sc_hl_restyle,
+                                  on_change=sc_ns(sc_hl_restyle),
                                   args=(slot, ln["id"], tkey, "text"),
                                   help="The label over the bar.")
-            key = f"sc_hl_dash_{ln['id']}"
+            key = f"{SCP}hl_dash_{ln['id']}"
             s[key] = ln.get("dash", "Dashed")
             c1.selectbox("Style", SC_LINE_STYLES, key=key,
                          label_visibility="collapsed",
-                         on_change=sc_hl_restyle, args=(slot, ln["id"], key))
-            ckey = f"sc_hl_col_{ln['id']}"
+                         on_change=sc_ns(sc_hl_restyle), args=(slot, ln["id"], key))
+            ckey = f"{SCP}hl_col_{ln['id']}"
             s[ckey] = ln.get("colour") or t["colour"]
             c2.color_picker("Colour", key=ckey, label_visibility="collapsed",
-                            on_change=sc_hl_restyle,
+                            on_change=sc_ns(sc_hl_restyle),
                             args=(slot, ln["id"], ckey, "colour"))
             c3.button("✕ Stop" if (slot, ln["id"]) == target
-                      else "✏ Redraw", key=f"sc_hl_redo_{ln['id']}",
-                      on_click=sc_hl_redraw, args=(slot, ln["id"]),
+                      else "✏ Redraw", key=f"{SCP}hl_redo_{ln['id']}",
+                      on_click=sc_ns(sc_hl_redraw), args=(slot, ln["id"]),
                       **STRETCH,
                       help="Then drag on the plot: this line moves to the "
                            "new drag (its style and colour stay).")
-            c4.button("🗑 Delete", key=f"sc_hl_del_{ln['id']}",
-                      on_click=sc_hl_delete, args=(slot, ln["id"]),
+            c4.button("🗑 Delete", key=f"{SCP}hl_del_{ln['id']}",
+                      on_click=sc_ns(sc_hl_delete), args=(slot, ln["id"]),
                       **STRETCH)
             with st.expander("✎ Type its points exactly"):
                 sc_hl_table(ln, t["zero"])
 
 
 SC_DEFAULTS = {
-    "sc_n": 3, "sc_link": False, "sc_zline": True, "sc_height": 240,
-    "sc_lw": 1.8, "sc_aw": 1.2, "sc_fs": 14, "sc_ts": 16, "sc_ls": 13,
-    "sc_align": True, "sc_tspace": 70, "sc_legend": "Above",
-    "sc_legline": 40, "sc_width": 0, "sc_ticks": "outside",
-    "sc_stats": "Analysis summary", "sc_stats_at": "Inside, bottom right",
-    "sc_fmt": "png", "sc_zw": 1.0, "sc_crossw": 1.0, "sc_cross": True,
+    "n": 3, "link": False, "zline": True, "height": 240,
+    "lw": 1.8, "aw": 1.2, "fs": 14, "ts": 16, "ls": 13,
+    "align": True, "tspace": 70, "legend": "Above",
+    "legline": 40, "width": 0, "ticks": "outside",
+    "stats": "Analysis summary", "stats_at": "Inside, bottom right",
+    "fmt": "png", "zw": 1.0, "crossw": 1.0, "cross": True,
 }
+
+
+# The Series tab's own starting values, over the stack's
+SR_DEFAULTS = {"height": 340, "legend": "Hidden", "srgap": 0.0,
+               "srsep": True, "srnames": True, "srshade": False,
+               "zline": False, "stats_at": "Below the plot"}
+
+
+def sc_series_controls():
+    """🔗 Series: how the files follow each other."""
+    s = st.session_state
+    st.markdown("**🔗 The series**")
+    if s.get(f"{SCP}srstart") not in sc.SERIES_STARTS:
+        s[f"{SCP}srstart"] = sc.SERIES_STARTS[0]
+    g1, g2 = st.columns(2)
+    g1.number_input(
+        "Gap between files", min_value=0.0, key=f"{SCP}srgap",
+        format="%.6g", step=None,
+        help="Empty x between one file's end and the next file's start, "
+             "in x units (seconds for time). 0: end to end.")
+    g2.selectbox(
+        "x = 0 of the series", sc.SERIES_STARTS, key=f"{SCP}srstart",
+        help="The first file's start: the series' x counts from where it "
+             "begins. The first file's zero: the first file keeps its own x "
+             "(its zero, set under its Zero of x, stays at 0).")
+    h1, h2, h3 = st.columns(3)
+    h1.toggle("Dividers", key=f"{SCP}srsep",
+              help="A dotted line between one file and the next.")
+    h2.toggle("Names", key=f"{SCP}srnames",
+              help="Each file's name over its part of the series, in its "
+                   "colour (files sharing a place joined with +).")
+    h3.toggle("Shading", key=f"{SCP}srshade",
+              help="Every other file on a light grey band.")
+    st.caption("The order is each file's **Place** (📂 Files); the same "
+               "Place overlays files. A file's **📏 Ranges** › x keeps only "
+               "that part of it in the series.")
+    st.divider()
 
 
 def sc_axes_controls(traces):
     """The 📐 Axes group: x for all panels, titles, outline, ticks."""
     s = st.session_state
-    s.setdefault("sc_frame", sc.FRAMES[0])
+    s.setdefault(f"{SCP}frame", sc.FRAMES[0])
+    series = sc_is_series()
+    if series:
+        sc_series_controls()
     a1, a2 = st.columns(2)
-    a1.toggle("Link the x axes", key="sc_link",
-              help="On: the panels share one x axis and zoom together.")
-    a2.toggle("Line at x = 0", key="sc_zline")
+    if series:
+        a1.toggle("Mark each file's zero", key=f"{SCP}zline",
+                  help="A dotted line in the file's colour where its own "
+                       "x = 0 falls in the series.")
+    else:
+        a1.toggle("Link the x axes", key=f"{SCP}link",
+                  help="On: the panels share one x axis and zoom together.")
+        a2.toggle("Line at x = 0", key=f"{SCP}zline")
     a3, a4 = st.columns(2)
-    a3.slider("Crosshair thickness", 0.5, 4.0, step=0.25, key="sc_crossw",
+    a3.slider("Crosshair thickness", 0.5, 4.0, step=0.25, key=f"{SCP}crossw",
               help="The ✛ Crosshair switch sits above the plot.")
-    a4.slider("x = 0 line thickness", 0.5, 5.0, step=0.25, key="sc_zw",
-              disabled=not s.get("sc_zline"))
+    a4.slider("Zero marks' thickness" if series else
+              "x = 0 line thickness", 0.5, 5.0, step=0.25, key=f"{SCP}zw",
+              disabled=not s.get(f"{SCP}zline"))
     b1, b2 = st.columns(2)
-    b1.text_input("x from (all)", key="sc_xmin", placeholder="auto",
-                  help="Sets the x axis of every panel at once.")
-    b2.text_input("x to (all)", key="sc_xmax", placeholder="auto")
-    sc_default("sc_xtitle", str(traces[0]["xcol"]))
-    st.text_input("x axis title", key="sc_xtitle")
-    panels_used = sorted({1 if s.get("sc_overlay") else t["panel"]
-                          for t in traces})
+    b1.text_input("x from (all)", key=f"{SCP}xmin", placeholder="auto",
+                  help="Sets the x axis of the series." if series else
+                       "Sets the x axis of every panel at once.")
+    b2.text_input("x to (all)", key=f"{SCP}xmax", placeholder="auto")
+    sc_default(f"{SCP}xtitle", str(traces[0]["xcol"]))
+    st.text_input("x axis title", key=f"{SCP}xtitle")
+    panels_used = sorted({1 if (series or s.get(f"{SCP}overlay"))
+                          else t["panel"] for t in traces})
     st.caption("y axis titles (empty = the files' own)")
     boxes = []
     for panel in panels_used:
-        boxes.append((f"Panel {panel}", f"sc_ytitle{panel}"))
-        if any(t.get("right") and (t["panel"] == panel
-                                   or s.get("sc_overlay")) for t in traces):
-            boxes.append((f"Panel {panel} right", f"sc_ytitle{panel}r"))
+        boxes.append(("Left" if series else f"Panel {panel}",
+                      f"{SCP}ytitle{panel}"))
+        if any(t.get("right") and (t["panel"] == panel or series
+                                   or s.get(f"{SCP}overlay")) for t in traces):
+            boxes.append(("Right" if series else f"Panel {panel} right",
+                          f"{SCP}ytitle{panel}r"))
     for start in range(0, len(boxes), 2):
         cols = st.columns(2)
         for col, (label, key) in zip(cols, boxes[start:start + 2]):
             col.text_input(label, key=key, placeholder="automatic")
-    st.selectbox("Axis outline", sc.FRAMES, key="sc_frame")
+    st.selectbox("Axis outline", sc.FRAMES, key=f"{SCP}frame")
     c1, c2 = st.columns(2)
-    c1.selectbox("Ticks", ("outside", "inside"), key="sc_ticks")
-    c2.slider("Axis thickness", 0.5, 5.0, step=0.1, key="sc_aw")
+    c1.selectbox("Ticks", ("outside", "inside"), key=f"{SCP}ticks")
+    c2.slider("Axis thickness", 0.5, 5.0, step=0.1, key=f"{SCP}aw")
     c1, c2 = st.columns(2)
-    c1.checkbox("Line up the y titles", key="sc_align",
+    c1.checkbox("Line up the y titles", key=f"{SCP}align",
                 help="Every y title the same distance from its axis, so "
                      "stacked panels line up.")
-    c2.checkbox("Grid", key="sc_grid")
+    c2.checkbox("Grid", key=f"{SCP}grid")
     st.slider("Room for the y numbers (px)", 30, 200, step=5,
-              key="sc_tspace", disabled=not s.get("sc_align"))
+              key=f"{SCP}tspace", disabled=not s.get(f"{SCP}align"))
 
 
 def sc_style_controls():
     """The 🎨 Look group: lines, legend, text, size."""
     c1, c2 = st.columns(2)
-    c1.slider("Line thickness", 0.5, 6.0, step=0.1, key="sc_lw")
-    c2.slider("Panel height", 120, 700, step=10, key="sc_height")
+    c1.slider("Line thickness", 0.5, 6.0, step=0.1, key=f"{SCP}lw")
+    c2.slider("Plot height" if sc_is_series() else "Panel height", 120, 700,
+              step=10, key=f"{SCP}height")
     c1, c2 = st.columns(2)
-    c1.selectbox("Legend", sc.LEGEND_PLACES, key="sc_legend")
-    c2.slider("Legend line length", 30, 120, step=5, key="sc_legline",
+    c1.selectbox("Legend", sc.LEGEND_PLACES, key=f"{SCP}legend")
+    c2.slider("Legend line length", 30, 120, step=5, key=f"{SCP}legline",
               help="How long the coloured line is beside each name.")
     c1, c2 = st.columns(2)
-    c1.text_input("Legend title", key="sc_legtitle", placeholder="none",
+    c1.text_input("Legend title", key=f"{SCP}legtitle", placeholder="none",
                   help="A heading over the legend's entries. The entries "
                        "themselves are each file's Name in the legend.")
     c2.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
-    c2.checkbox("Box round the legend", key="sc_legbox")
+    c2.checkbox("Box round the legend", key=f"{SCP}legbox")
     c1, c2, c3 = st.columns(3)
-    c1.number_input("Titles", 8, 36, key="sc_ts")
-    c2.number_input("Numbers", 8, 30, key="sc_fs")
-    c3.number_input("Legend", 6, 30, key="sc_ls")
+    c1.number_input("Titles", 8, 36, key=f"{SCP}ts")
+    c2.number_input("Numbers", 8, 30, key=f"{SCP}fs")
+    c3.number_input("Legend", 6, 30, key=f"{SCP}ls")
     c1, c2, c3 = st.columns(3)
-    c1.checkbox("Bold titles", key="sc_bold")
-    c2.checkbox("Bold numbers", key="sc_boldticks",
+    c1.checkbox("Bold titles", key=f"{SCP}bold")
+    c2.checkbox("Bold numbers", key=f"{SCP}boldticks",
                 help="The tick labels on every axis.")
-    c3.checkbox("Bold legend", key="sc_legbold")
-    st.toggle("All on one plot", key="sc_overlay",
-              help="Every file in one panel, whatever its panel number.")
+    c3.checkbox("Bold legend", key=f"{SCP}legbold")
+    if not sc_is_series():
+        st.toggle("All on one plot", key=f"{SCP}overlay",
+                  help="Every file in one panel, whatever its panel number.")
     st.slider("Plot width (px, 0 = fit the page)", 0, 2000, step=50,
-              key="sc_width",
+              key=f"{SCP}width",
               help="Narrower makes the lines (and x axis) shorter.")
     c1, c2 = st.columns(2)
-    c1.selectbox("Summary balloon", sc.STATS_BOXES, key="sc_stats",
+    c1.selectbox("Summary balloon", sc.STATS_BOXES, key=f"{SCP}stats",
                  help="Analysis summary: the statistics sent with a plot "
                       "from the video tab (contractions, shortening, "
                       "speeds…). Descriptive statistics: n, mean ± SD, "
                       "median, min/max of every trace as plotted. The "
                       "balloon can be dragged on the plot.")
-    c2.selectbox("Balloon position", sc.STATS_PLACES, key="sc_stats_at")
+    c2.selectbox("Balloon position", sc.STATS_PLACES, key=f"{SCP}stats_at")
+
+
+def sc_figure(traces, clickable=False):
+    """The plot of these files, as set on the tab: stacked panels, or (on
+    the Series tab, with traces laid out by sc.series_layout) one after
+    another on one x axis."""
+    s = st.session_state
+    series = sc_is_series()
+    fig = sc.stacked_figure(
+        traces, linked=bool(s.get(f"{SCP}link")),
+        overlay=series or bool(s.get(f"{SCP}overlay")),
+        panel_height=int(s.get(f"{SCP}height", 240)),
+        line_width=float(s.get(f"{SCP}lw", 1.8)),
+        axis_width=float(s.get(f"{SCP}aw", 1.2)),
+        font_size=int(s.get(f"{SCP}fs", 14)),
+        x_title=s.get(f"{SCP}xtitle") or "x",
+        zero_line=(not series) and bool(s.get(f"{SCP}zline")),
+        grid=bool(s.get(f"{SCP}grid")), ticks=s.get(f"{SCP}ticks", "outside"),
+        clickable=clickable,
+        x_range=sc_global_x_range(),
+        frame=s.get(f"{SCP}frame"), legend=s.get(f"{SCP}legend", "Above"),
+        y_titles=sc_y_titles(),
+        align_titles=bool(s.get(f"{SCP}align", True)),
+        title_space=int(s.get(f"{SCP}tspace", 70)),
+        title_size=int(s.get(f"{SCP}ts", 16)),
+        bold_titles=bool(s.get(f"{SCP}bold")),
+        legend_size=int(s.get(f"{SCP}ls", 13)),
+        legend_line=int(s.get(f"{SCP}legline", 40)),
+        width=int(s.get(f"{SCP}width") or 0) or None,
+        stats_box=(s.get(f"{SCP}stats", "Analysis summary")
+                   if s.get(f"{SCP}balloons", True) else "Off"),
+        stats_place=s.get(f"{SCP}stats_at", "Inside, bottom right"),
+        crosshair=bool(s.get(f"{SCP}cross")),
+        crosshair_width=float(s.get(f"{SCP}crossw", 1.0)),
+        zero_width=float(s.get(f"{SCP}zw", 1.0)),
+        bold_ticks=bool(s.get(f"{SCP}boldticks")),
+        legend_title=str(s.get(f"{SCP}legtitle") or "").strip(),
+        legend_box=bool(s.get(f"{SCP}legbox")),
+        legend_bold=bool(s.get(f"{SCP}legbold")))
+    if series:
+        sc.series_decorate(
+            fig, traces, separators=bool(s.get(f"{SCP}srsep", True)),
+            names=bool(s.get(f"{SCP}srnames", True)),
+            shade=bool(s.get(f"{SCP}srshade")),
+            zeros=bool(s.get(f"{SCP}zline")),
+            font_size=int(s.get(f"{SCP}fs", 14)),
+            zero_width=float(s.get(f"{SCP}zw", 1.0)))
+    return fig
+
+
+# ================================== a stacked plot saved to the database ==
+#
+# Saved: the files the plot was made from (as loaded, or the table sent from
+# another tab), the plot (interactive HTML), the data as plotted, each
+# file's numbers, and every setting of the tab, so that opening it puts the
+# stack back exactly as it was: zeros, baselines, peaks, lines, colours.
+
+# Session keys that are not settings: buttons, upload boxes, charts, the
+# rows of each line drawn (rebuilt from the lines), what a click does, the
+# database's own boxes, and passing notes and undo history.
+SC_DB_SKIP = re.compile(
+    r"^((file|sent)\d+(_v\d+)?|chart.*|csv|clickdo|db_.*"
+    r"|hl_(col|dash|del|redo|show|txt)_.*|hl_\d+_v\d+"
+    r"|(blp_clear|blp_last|blq10|blq25|blq5|pkreset|satclr|unsend)\d+"
+    r"|reset_view|undo_zero|r\d+_(reset|form)"
+    r"|_(click_note|draw_note|chart_ver|redraw|draft|zero_next|blsrc_next"
+    r"|satsrc_next|view|zero_hist|zero_undo|upver|db_.*))$")
+
+
+class _NotStorable(Exception):
+    pass
+
+
+def sc_db_encode(value):
+    """A setting as JSON: tuples, dicts with number keys and numpy numbers
+    kept apart so they come back as they were. Anything else (a table, a
+    file) is not a setting and is left out."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating)) \
+            and not isinstance(value, bool):
+        number = value.item() if hasattr(value, "item") else value
+        if isinstance(number, float) and not math.isfinite(number):
+            return {"__float__": repr(number)}
+        return number
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, tuple):
+        return {"__tuple__": [sc_db_encode(v) for v in value]}
+    if isinstance(value, (list, np.ndarray)):
+        return [sc_db_encode(v) for v in list(value)]
+    if isinstance(value, dict):
+        return {"__dict__": [[sc_db_encode(k), sc_db_encode(v)]
+                             for k, v in value.items()]}
+    raise _NotStorable(type(value).__name__)
+
+
+def sc_db_decode(value):
+    if isinstance(value, list):
+        return [sc_db_decode(v) for v in value]
+    if isinstance(value, dict):
+        if "__tuple__" in value:
+            return tuple(sc_db_decode(v) for v in value["__tuple__"])
+        if "__dict__" in value:
+            return {sc_db_decode(k): sc_db_decode(v)
+                    for k, v in value["__dict__"]}
+        if "__float__" in value:
+            return float(value["__float__"])
+        return {k: sc_db_decode(v) for k, v in value.items()}
+    return value
+
+
+def sc_db_snapshot():
+    """Every setting of this tab, as JSON, by its name without the tab's
+    prefix (so it opens on the other tab too)."""
+    s = st.session_state
+    out = {}
+    for key in sorted(map(str, s.keys())):
+        rel = sc_rel(key)
+        if rel is None or SC_DB_SKIP.match(rel):
+            continue
+        try:
+            out[rel] = sc_db_encode(s[key])
+        except _NotStorable:
+            pass
+    return out
+
+
+def sc_db_safe(name):
+    """A file or folder name OneDrive (and any disk) accepts."""
+    text = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in str(name))
+    return text.strip().strip(".") or "untitled"
+
+
+def sc_db_summary(traces):
+    """Each file's numbers (its summary and statistics) as one table."""
+    rows = []
+    for t in traces:
+        seen = set()
+        for mode in ("Analysis summary", "Descriptive statistics"):
+            for line in sc.summary_lines(t, mode):
+                what, _, value = str(line).partition(": ")
+                if (what, value) not in seen:
+                    seen.add((what, value))
+                    rows.append({"file": t["file"], "legend": t["label"],
+                                 "panel": t["panel"], "quantity": what,
+                                 "value": value})
+    return pd.DataFrame(rows, columns=["file", "legend", "panel", "quantity",
+                                       "value"])
+
+
+def sc_db_package(traces, name, notes=""):
+    """
+    One analysis ready to store: (record, {path in its folder: bytes}).
+    The record (analysis.json) lists the files and holds every setting.
+    """
+    s = st.session_state
+    now = datetime.now()
+    files, entries = {}, []
+    for i in range(int(s.get(f"{SCP}n", 3) or 3)):
+        sent = s.get(f"{SCP}sent{i}")
+        if sent is not None:
+            fname = str(sent["name"])
+            rel = f"files/{i + 1}_{sc_db_safe(fname)}"
+            if not rel.lower().endswith(".csv"):
+                rel += ".csv"
+            files[rel] = sent["frame"].to_csv(index=False).encode("utf-8")
+            entries.append({"slot": i, "name": fname, "kind": "sent",
+                            "source": str(sent.get("source", "")),
+                            "stats": [list(map(str, x)) for x in
+                                      sent.get("stats") or []],
+                            "path": rel})
+            continue
+        up = s.get(sc_upload_key(i))
+        if up is None:
+            continue
+        rel = f"files/{i + 1}_{sc_db_safe(up.name)}"
+        files[rel] = up.getvalue()
+        entries.append({"slot": i, "name": up.name, "kind": "upload",
+                        "source": "a file loaded on the tab", "stats": [],
+                        "path": rel})
+    for t in traces:
+        t["hand_lines"] = sc_hl_for(t)
+    fig = sc_figure(traces, clickable=False)
+    files["plot.html"] = fig.to_html(
+        include_plotlyjs="cdn", full_html=True,
+        config={"displaylogo": False}).encode("utf-8")
+    files["aligned.csv"] = (sc.series_table(traces) if sc_is_series()
+                            else sc.aligned_table(traces)).to_csv(
+        index=False).encode("utf-8")
+    files["summary.csv"] = sc_db_summary(traces).to_csv(
+        index=False).encode("utf-8")
+    record = {
+        "stack_id": f"{now:%Y-%m-%d %H%M%S} {name}".strip(),
+        "name": name, "notes": notes,
+        "saved_at": now.isoformat(timespec="seconds"),
+        "what": ("Series plot" if sc_is_series()
+                 else "Stack & compare plot"),
+        "format": 2,
+        "files": entries,
+        "legends": [t["label"] for t in traces],
+        "outputs": ["plot.html", "aligned.csv", "summary.csv"],
+        "state": sc_db_snapshot(),
+    }
+    return record, files
+
+
+def sc_db_zip(record, files):
+    """The analysis as one ZIP: analysis.json and its files."""
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("analysis.json",
+                         json.dumps(record, indent=2, default=str))
+        for rel in sorted(files):
+            archive.writestr(rel, files[rel])
+    return buffer.getvalue()
+
+
+def sc_db_restore(record, fetch):
+    """
+    Put a saved analysis on the stack, in place of what is there: its files
+    into the slots they were in, every setting back. ``fetch(path)`` gives
+    one of its files. Everything is read before the stack is touched, so
+    a file that cannot be read leaves the stack as it was.
+    """
+    s = st.session_state
+    loaded = []
+    for entry in record.get("files") or []:
+        data = fetch(entry["path"])
+        if entry.get("kind") == "upload":
+            frame = sc_read(data, entry["name"])
+        else:
+            frame = pd.read_csv(io.BytesIO(data))
+        loaded.append((int(entry["slot"]), entry, frame))
+    keep = re.compile(r"^_?db_|^_upver$")
+    for key in [str(k) for k in list(s.keys())]:
+        rel = sc_rel(key)
+        if rel is not None and not keep.match(rel):
+            s.pop(key, None)
+    s[f"_{SCP}upver"] = int(s.get(f"_{SCP}upver", 0) or 0) + 1
+    for key, value in (record.get("state") or {}).items():
+        # the first saves kept the stack's own names (sc_x0)
+        rel = re.sub(r"^(_?)sc_", r"\1", key) if int(
+            record.get("format", 1) or 1) < 2 else key
+        if not SC_DB_SKIP.match(rel):
+            s[sc_abs(rel)] = sc_db_decode(value)
+    name = record.get("name") or record.get("stack_id", "")
+    for slot, entry, frame in loaded:
+        s[f"{SCP}sent{slot}"] = {
+            "name": entry["name"], "frame": frame,
+            "source": f"the saved analysis “{name}”",
+            "stats": [tuple(x) for x in entry.get("stats") or []]}
+    s[f"{SCP}n"] = max([int(s.get(f"{SCP}n", 1) or 1)]
+                    + [slot + 1 for slot, _, _ in loaded])
+    # saved again, it keeps its name and notes
+    s[f"{SCP}db_name"] = name
+    s[f"{SCP}db_notes"] = str(record.get("notes") or "")
+    s.pop(f"_{SCP}db_autoname", None)
+    when = str(record.get("saved_at", ""))[:16].replace("T", " ")
+    s[f"_{SCP}db_note"] = (f"✅ Opened “{name}” (saved {when}): "
+                        f"{len(loaded)} file{'s' if len(loaded) != 1 else ''}.")
+
+
+def sc_db_store():
+    """The connected OneDrive, when it can hold stacked plots."""
+    store = st.session_state.get("onedrive_store")
+    return store if store is not None and hasattr(store, "save_stack") \
+        else None
+
+
+def sc_db_open_onedrive():
+    s = st.session_state
+    store, stack_id = sc_db_store(), s.get(f"{SCP}db_pick")
+    if store is None or not stack_id:
+        return
+    try:
+        record = store.load_stack(stack_id)
+        if record is None:
+            raise RuntimeError("it is not in OneDrive any more")
+        sc_db_restore(record, lambda rel: store.stack_file(stack_id, rel))
+    except Exception as exc:
+        s[f"_{SCP}db_note"] = f"⚠️ Could not open it: {exc}"
+
+
+def sc_db_open_zip():
+    import zipfile
+
+    s = st.session_state
+    up = s.get(f"{SCP}db_zipup")
+    if up is None:
+        return
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+        record = json.loads(archive.read("analysis.json").decode("utf-8"))
+        sc_db_restore(record, archive.read)
+    except Exception as exc:
+        s[f"_{SCP}db_note"] = f"⚠️ Could not open {up.name}: {exc}"
+
+
+def sc_db_open_controls():
+    """📂 Open a saved analysis: from OneDrive, or from a ZIP saved here.
+    Shown even with nothing on the stack."""
+    s = st.session_state
+    st.markdown("**📂 Open a saved analysis**")
+    note = s.pop(f"_{SCP}db_note", None)
+    if note:
+        (st.success if note.startswith("✅") else st.warning)(note)
+    store = sc_db_store()
+    if store is not None:
+        r1, r2 = st.columns([3, 1])
+        if r2.button("🔄", key=f"{SCP}db_refresh", help="Read the list again.",
+                     **STRETCH) or s.get(f"_{SCP}db_index") is None:
+            try:
+                s[f"_{SCP}db_index"] = store.load_stack_index()
+            except Exception as exc:
+                st.warning(f"Could not read the list: {exc}")
+                s[f"_{SCP}db_index"] = pd.DataFrame()
+        index = s.get(f"_{SCP}db_index")
+        if index is None or index.empty:
+            r1.caption("Nothing saved to OneDrive yet.")
+        else:
+            rows = {str(r["stack_id"]): r for r in index.to_dict("records")}
+            r1.selectbox(
+                "Saved analyses", list(rows), key=f"{SCP}db_pick",
+                label_visibility="collapsed",
+                format_func=lambda k: (
+                    ("🔗 " if rows[k].get("what") == "Series plot"
+                     else "📚 ")
+                    + f"{rows[k].get('name') or k} · "
+                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+            row = rows.get(s.get(f"{SCP}db_pick")) or {}
+            st.caption(f"Files: {row.get('files', '')}"
+                       + (f" · {row['notes']}" if row.get("notes") else ""))
+            o1, o2 = st.columns(2)
+            o1.button("📂 Open here", key=f"{SCP}db_open",
+                      on_click=sc_ns(sc_db_open_onedrive), type="primary",
+                      **STRETCH,
+                      help=f"Replaces what is on {sc_tab_name()} now with "
+                           "the saved files and settings. A stacked plot "
+                           "opens as a series here (and a series as a "
+                           "stack on 📚 Stack & compare).")
+            if row.get("folder_url"):
+                o2.link_button("↗ Its folder", row["folder_url"], **STRETCH)
+    elif s.get("onedrive_store") is not None:
+        st.caption("⚠️ The onedrive_store.py on the server is older than "
+                   "app.py: upload the new one to save plots there.")
+    else:
+        st.caption("Connect OneDrive to save and open analyses there: it "
+                   "is in the sidebar (☁️ OneDrive database), shown while "
+                   "the 🧮 Fitting tab is open.")
+    st.file_uploader("Or a ZIP saved from here", type=["zip"],
+                     key=f"{SCP}db_zipup")
+    st.button("📂 Open the ZIP", key=f"{SCP}db_openzip",
+              on_click=sc_ns(sc_db_open_zip),
+              disabled=s.get(f"{SCP}db_zipup") is None, **STRETCH,
+              help=f"Replaces what is on {sc_tab_name()} now with the files "
+                   "and settings in the ZIP.")
+
+
+def sc_db_save_controls(traces, stem):
+    """☁️ Save this analysis: to OneDrive, or as a ZIP."""
+    s = st.session_state
+    st.markdown("**☁️ Save this analysis**")
+    # named after its files until a name is typed
+    typed = str(s.get(f"{SCP}db_name") or "").strip()
+    if not typed or typed == s.get(f"_{SCP}db_autoname"):
+        s[f"{SCP}db_name"] = s[f"_{SCP}db_autoname"] = stem
+    st.text_input("Name", key=f"{SCP}db_name",
+                  help="What it is called in the list of saved analyses. "
+                       "The date and time are added to its folder's name.")
+    st.text_area("Notes", key=f"{SCP}db_notes", height=70,
+                 placeholder="cell, condition, what this shows…")
+    name = str(s.get(f"{SCP}db_name") or "").strip()
+    notes = str(s.get(f"{SCP}db_notes") or "").strip()
+    store = sc_db_store()
+    if st.button("☁️ Save to OneDrive", key=f"{SCP}db_save", type="primary",
+                 disabled=store is None or not name, **STRETCH,
+                 help="A folder with the files used, the plot (interactive "
+                      "HTML), the data as plotted, each file's numbers and "
+                      "every setting, so it opens again exactly as it is."):
+        with st.spinner("Saving to OneDrive…"):
+            try:
+                record, files = sc_db_package(traces, name, notes)
+                saved = store.save_stack(record, files)
+                s[f"_{SCP}db_index"] = None
+                st.success(f"✅ Saved “{name}”: {len(record['files'])} "
+                           f"file{'s' if len(record['files']) != 1 else ''}"
+                           f", the plot and its numbers, in "
+                           f"{saved.get('onedrive_path', 'OneDrive')}.")
+                if saved.get("folder_url"):
+                    st.link_button("↗ Open the folder", saved["folder_url"],
+                                   **STRETCH)
+            except Exception as exc:
+                st.error(f"Could not save to OneDrive: {exc}")
+    if store is None:
+        st.caption("OneDrive is not connected (it is in the sidebar of the "
+                   "🧮 Fitting tab, ☁️ OneDrive database); or keep it as a "
+                   "ZIP.")
+    if st.button("📦 Make a ZIP of it", key=f"{SCP}db_mkzip",
+                 disabled=not name, **STRETCH,
+                 help="The same as is saved to OneDrive, as one file to "
+                      "keep; open it again below."):
+        record, files = sc_db_package(traces, name, notes)
+        s[f"_{SCP}db_zip"] = (sc_db_safe(record["stack_id"]) + ".zip",
+                           sc_db_zip(record, files))
+    made = s.pop(f"_{SCP}db_zip", None)
+    if made:
+        st.download_button("⬇️ Download the ZIP", made[1], file_name=made[0],
+                           mime="application/zip", key=f"{SCP}db_dlzip",
+                           **STRETCH)
 
 
 def sc_save_controls(traces, stem):
     s = st.session_state
-    st.selectbox("Format", ("png", "svg", "jpeg"), key="sc_fmt")
+    st.selectbox("Format", ("png", "svg", "jpeg"), key=f"{SCP}fmt")
     c1, c2 = st.columns(2)
-    c1.number_input("Width (px)", 300, 4000, step=50, key="sc_w",
-                    value=None if "sc_w" in s else 900)
-    c2.number_input("Resolution ×", 1, 8, key="sc_scale",
-                    value=None if "sc_scale" in s else 3)
+    c1.number_input("Width (px)", 300, 4000, step=50, key=f"{SCP}w",
+                    value=None if f"{SCP}w" in s else 900)
+    c2.number_input("Resolution ×", 1, 8, key=f"{SCP}scale",
+                    value=None if f"{SCP}scale" in s else 3)
     st.caption("Then press the 📷 camera icon on the plot.")
-    table = sc.aligned_table(traces)
-    st.download_button("💾 Aligned data (CSV)",
+    series = sc_is_series()
+    table = sc.series_table(traces) if series else sc.aligned_table(traces)
+    st.download_button("💾 Series data (CSV)" if series
+                       else "💾 Aligned data (CSV)",
                        data=table.to_csv(index=False).encode("utf-8"),
-                       file_name=stem + "_aligned.csv", mime="text/csv",
-                       key="sc_csv", **STRETCH)
+                       file_name=stem + ("_series.csv" if series
+                                         else "_aligned.csv"),
+                       mime="text/csv", key=f"{SCP}csv", **STRETCH,
+                       help="Each file's x along the series, its own x "
+                            "and its y." if series else None)
 
 
 def sc_click_target(point, traces):
@@ -31087,68 +31679,74 @@ def sc_panel():
     s = st.session_state
     # a click on the plot asked for a new zero on the previous run; what it
     # replaces is kept, so it can be undone
-    for i, value in (s.pop("_sc_zero_next", None) or {}).items():
-        history = list(s.get("_sc_zero_hist") or [])
-        history.append((i, s.get(f"sc_zmode{i}"), s.get(f"sc_zval{i}"),
-                        s.get(f"sc_shift{i}")))
-        s["_sc_zero_hist"] = history[-30:]
-        s[f"sc_zmode{i}"] = "A value I type"
-        s[f"sc_zval{i}"] = float(value)
-        s[f"sc_shift{i}"] = 0.0
-    undo = s.pop("_sc_zero_undo", False)
-    if undo and s.get("_sc_zero_hist"):
-        history = list(s["_sc_zero_hist"])
+    for i, value in (s.pop(f"_{SCP}zero_next", None) or {}).items():
+        history = list(s.get(f"_{SCP}zero_hist") or [])
+        history.append((i, s.get(f"{SCP}zmode{i}"), s.get(f"{SCP}zval{i}"),
+                        s.get(f"{SCP}shift{i}")))
+        s[f"_{SCP}zero_hist"] = history[-30:]
+        s[f"{SCP}zmode{i}"] = "A value I type"
+        s[f"{SCP}zval{i}"] = float(value)
+        s[f"{SCP}shift{i}"] = 0.0
+    undo = s.pop(f"_{SCP}zero_undo", False)
+    if undo and s.get(f"_{SCP}zero_hist"):
+        history = list(s[f"_{SCP}zero_hist"])
         last = history.pop()
-        s["_sc_zero_hist"] = history
+        s[f"_{SCP}zero_hist"] = history
         if last[0] == "peaks":
             _, i, removed, added = last
-            s[f"sc_pkrm{i}"] = list(removed)
-            s[f"sc_pkadd{i}"] = list(added)
+            s[f"{SCP}pkrm{i}"] = list(removed)
+            s[f"{SCP}pkadd{i}"] = list(added)
         elif last[0] == "blpts":
             _, i, points = last
-            s[f"_sc_blpts{i}"] = list(points)
+            s[f"_{SCP}blpts{i}"] = list(points)
         elif last[0] == "satpts":
             _, i, points = last
-            s[f"_sc_satpts{i}"] = list(points)
+            s[f"_{SCP}satpts{i}"] = list(points)
         elif last[0] == "lines":
             _, lines, draft = last
             # fresh tables for the restored lines
             for ln in [x for g in lines.values() for x in g] + (
                     [draft] if draft else []):
                 ln["ver"] = sc_hl_ver()
-            s["_sc_hlines"] = lines
-            s["_sc_draft"] = draft
+            s[f"_{SCP}hlines"] = lines
+            s[f"_{SCP}draft"] = draft
         else:
             i, mode, value, shift = last
-            s[f"sc_zmode{i}"] = mode or "Start of the data"
-            s[f"sc_zval{i}"] = float(value or 0.0)
-            s[f"sc_shift{i}"] = float(shift or 0.0)
+            s[f"{SCP}zmode{i}"] = mode or "Start of the data"
+            s[f"{SCP}zval{i}"] = float(value or 0.0)
+            s[f"{SCP}shift{i}"] = float(shift or 0.0)
     sc_hl_fold_all()
-    slot = s.pop("_sc_satsrc_next", None)
+    slot = s.pop(f"_{SCP}satsrc_next", None)
     if slot is not None:
-        s[f"sc_sat{slot}"] = True
-        s[f"sc_satsrc{slot}"] = SC_SAT_SOURCES[1]
-    slot = s.pop("_sc_blsrc_next", None)
+        s[f"{SCP}sat{slot}"] = True
+        s[f"{SCP}satsrc{slot}"] = SC_SAT_SOURCES[1]
+    slot = s.pop(f"_{SCP}blsrc_next", None)
     if slot is not None:
-        s[f"sc_bllvl{slot}"] = "Points"
-        if s.get(f"sc_blmode{slot}", "Off") == "Off":
-            s[f"sc_blmode{slot}"] = "Show"
+        s[f"{SCP}bllvl{slot}"] = "Points"
+        if s.get(f"{SCP}blmode{slot}", "Off") == "Off":
+            s[f"{SCP}blmode{slot}"] = "Show"
+    if sc_is_series():
+        for key, value in SR_DEFAULTS.items():
+            s.setdefault(sc_abs(key), value)
     for key, value in SC_DEFAULTS.items():
-        s.setdefault(key, value)
+        s.setdefault(sc_abs(key), value)
     # Options on the left, grouped in four tabs; the plot on the right, so
     # every change is seen next to the control that made it.
     left, right = st.columns([1.05, 2.2], gap="medium")
     with left:
         t_files, t_axes, t_look, t_save = st.tabs(
             ["📂 Files", "📐 Axes", "🎨 Look", "💾 Save"])
+        with t_save:
+            save_box = st.container()
+            sc_db_open_controls()
         with t_files:
-            n = st.select_slider("Files", list(range(1, 7)), key="sc_n")
+            n = st.select_slider("Files", list(range(1, 7)), key=f"{SCP}n")
             traces = []
             for i in range(n):
                 with st.expander(f"{i + 1} · {sc_slot_name(i)}",
-                                 expanded=(i == 0 or s.get(f"sc_sent{i}")
+                                 expanded=(i == 0 or s.get(f"{SCP}sent{i}")
                                            is not None
-                                           or s.get(f"sc_file{i}")
+                                           or s.get(sc_upload_key(i))
                                            is not None)):
                     t = sc_slot(i, n)
                     if t is not None:
@@ -31156,31 +31754,44 @@ def sc_panel():
     if not traces:
         with right:
             st.info("Load a file on the left (📂 Files), or send a plot "
-                    "here from the video or AFM output tab.", icon="📂")
+                    "here from the video, AFM output or Single force curve "
+                    "tab" + (" with **🔗 Send to series**: the files are "
+                             "put one after another along x."
+                             if sc_is_series() else "."), icon="📂")
         return
+    if sc_is_series():
+        # one after another: every file moved to its place along x (and
+        # everything drawn on it), its zero the other way, so clicks and
+        # lines still land on the file's own x
+        traces = sc.series_layout(
+            traces, gap=float(s.get(f"{SCP}srgap") or 0.0),
+            start=s.get(f"{SCP}srstart", sc.SERIES_STARTS[0]))
     with t_axes:
         sc_axes_controls(traces)
     with t_look:
         sc_style_controls()
     stem = sc.nice_stem([t["file"] for t in traces])
-    with t_save:
+    with save_box:
         sc_save_controls(traces, stem)
+        st.divider()
+        sc_db_save_controls(traces, stem)
+        st.divider()
 
     with right:
         # two rows: how the plot looks and moves, then what a click does
         k0, kc, k3, k4 = st.columns([1.0, 1.2, 1.3, 1.1])
         k1, k2 = st.columns([3.2, 1.0])
-        click_do = s.get("sc_clickdo")
-        k0.toggle("💬 Stats", key="sc_balloons",
-                  value=None if "sc_balloons" in s else True,
+        click_do = s.get(f"{SCP}clickdo")
+        k0.toggle("💬 Stats", key=f"{SCP}balloons",
+                  value=None if f"{SCP}balloons" in s else True,
                   help="Show or hide every summary balloon on the plot "
                        "at once. What they show is set under 🎨 Look.")
-        kc.toggle("✛ Crosshair", key="sc_cross",
+        kc.toggle("✛ Crosshair", key=f"{SCP}cross",
                   help="Lines across the plot at the cursor, to read a "
                        "value or aim a zero. Its thickness is under "
                        "📐 Axes.")
         k1.segmented_control(
-            "What a click on the plot does", SC_CLICKS, key="sc_clickdo",
+            "What a click on the plot does", SC_CLICKS, key=f"{SCP}clickdo",
             label_visibility="collapsed",
             help="🎯 Set zero: the point clicked becomes x = 0 for its "
                  "file. ✎ Edit peaks: a click on a ▲ ▼ takes that peak "
@@ -31189,59 +31800,29 @@ def sc_panel():
                  "its end and let go. 〰 Baseline points: clicks set a file's "
                  "baseline. ⤴ Flat part: two clicks mark a saturated top. "
                  "Click the chosen one again for neither.")
-        k2.button("↶ Undo", key="sc_undo_zero",
-                  disabled=not s.get("_sc_zero_hist"),
-                  on_click=s.__setitem__, args=("_sc_zero_undo", True),
+        k2.button("↶ Undo", key=f"{SCP}undo_zero",
+                  disabled=not s.get(f"_{SCP}zero_hist"),
+                  on_click=sc_ns(s.__setitem__), args=(f"_{SCP}zero_undo", True),
                   help="Puts back what the last click changed (a zero, a "
                        "peak, a line or a baseline point), one at a time.",
                   **STRETCH)
-        k3.radio("Drag to", ("zoom", "pan"), key="sc_drag",
+        k3.radio("Drag to", ("zoom", "pan"), key=f"{SCP}drag",
                  horizontal=True, label_visibility="collapsed",
                  help="What dragging on the plot does. The mouse wheel "
                       "zooms too.")
-        k4.button("⤢ Reset view", key="sc_reset_view", **STRETCH,
-                  on_click=lambda: s.__setitem__(
-                      "_sc_view", int(s.get("_sc_view", 0)) + 1),
+        k4.button("⤢ Reset view", key=f"{SCP}reset_view", **STRETCH,
+                  on_click=sc_ns(lambda: s.__setitem__(
+                      f"_{SCP}view", int(s.get(f"_{SCP}view", 0)) + 1)),
                   help="Back to the full plot (double-clicking the plot "
                        "does the same).")
         for t in traces:
             t["hand_lines"] = sc_hl_for(t)
-        fig = sc.stacked_figure(
-            traces, linked=bool(s.get("sc_link")),
-            overlay=bool(s.get("sc_overlay")),
-            panel_height=int(s.get("sc_height", 240)),
-            line_width=float(s.get("sc_lw", 1.8)),
-            axis_width=float(s.get("sc_aw", 1.2)),
-            font_size=int(s.get("sc_fs", 14)),
-            x_title=s.get("sc_xtitle") or "x",
-            zero_line=bool(s.get("sc_zline")),
-            grid=bool(s.get("sc_grid")), ticks=s.get("sc_ticks", "outside"),
-            clickable=bool(s.get("sc_clickdo")),
-            x_range=sc_global_x_range(),
-            frame=s.get("sc_frame"), legend=s.get("sc_legend", "Above"),
-            y_titles=sc_y_titles(),
-            align_titles=bool(s.get("sc_align", True)),
-            title_space=int(s.get("sc_tspace", 70)),
-            title_size=int(s.get("sc_ts", 16)),
-            bold_titles=bool(s.get("sc_bold")),
-            legend_size=int(s.get("sc_ls", 13)),
-            legend_line=int(s.get("sc_legline", 40)),
-            width=int(s.get("sc_width") or 0) or None,
-            stats_box=(s.get("sc_stats", "Analysis summary")
-                       if s.get("sc_balloons", True) else "Off"),
-            stats_place=s.get("sc_stats_at", "Inside, bottom right"),
-            crosshair=bool(s.get("sc_cross")),
-            crosshair_width=float(s.get("sc_crossw", 1.0)),
-            zero_width=float(s.get("sc_zw", 1.0)),
-            bold_ticks=bool(s.get("sc_boldticks")),
-            legend_title=str(s.get("sc_legtitle") or "").strip(),
-            legend_box=bool(s.get("sc_legbox")),
-            legend_bold=bool(s.get("sc_legbold")))
+        fig = sc_figure(traces, clickable=bool(s.get(f"{SCP}clickdo")))
         # the zoom survives restyling, until ⤢ Reset view
-        view = int(s.get("_sc_view", 0))
+        view = int(s.get(f"_{SCP}view", 0))
         fig.update_layout(uirevision=f"sc{view}", editrevision=f"sc{view}",
-                          dragmode=s.get("sc_drag", "zoom"))
-        drawing = s.get("sc_clickdo") == SC_CLICKS[2]
+                          dragmode=s.get(f"{SCP}drag", "zoom"))
+        drawing = s.get(f"{SCP}clickdo") == SC_CLICKS[2]
         if drawing:
             # a drag draws a line: the stroke shows dashed as it is drawn
             fig.update_layout(
@@ -31256,36 +31837,36 @@ def sc_panel():
             fig.update_xaxes(spikesnap="cursor")
             fig.update_yaxes(spikesnap="cursor")
         else:
-            s.pop("_sc_redraw", None)
+            s.pop(f"_{SCP}redraw", None)
         config = {"displaylogo": False, "scrollZoom": True,
                   "displayModeBar": True, "doubleClick": "reset",
                   # the summary balloons can be dragged where they fit, but
                   # not while clicks are for the plot: a balloon that can be
                   # dragged takes every click on it, so a click on a curve
                   # under it would do nothing
-                  "edits": {"annotationPosition": not s.get("sc_clickdo")},
+                  "edits": {"annotationPosition": not s.get(f"{SCP}clickdo")},
                   "toImageButtonOptions": {
-                      "format": s.get("sc_fmt", "png"), "filename": stem,
-                      "width": int(s.get("sc_w") or 900),
+                      "format": s.get(f"{SCP}fmt", "png"), "filename": stem,
+                      "width": int(s.get(f"{SCP}w") or 900),
                       "height": int(fig.layout.height),
-                      "scale": int(s.get("sc_scale") or 3)}}
-        fit = not s.get("sc_width")
-        version = int(s.get("_sc_chart_ver", 0))
-        click_do = s.get("sc_clickdo")
+                      "scale": int(s.get(f"{SCP}scale") or 3)}}
+        fit = not s.get(f"{SCP}width")
+        version = int(s.get(f"_{SCP}chart_ver", 0))
+        click_do = s.get(f"{SCP}clickdo")
         if drawing:
             event = st.plotly_chart(
-                fig, key=f"sc_chart_v{version}_{view}_draw", config=config,
+                fig, key=f"{SCP}chart_v{version}_{view}_draw", config=config,
                 theme=None, on_select="rerun", selection_mode=("lasso",),
                 **(STRETCH if fit else {}))
             strokes = lasso_strokes(event)
             if strokes:
-                s["_sc_chart_ver"] = version + 1
+                s[f"_{SCP}chart_ver"] = version + 1
                 sc_hl_drawn(strokes[-1], traces, fig)
                 st.rerun()
             sc_hl_panel(traces)
         elif click_do:
             event = st.plotly_chart(
-                fig, key=f"sc_chart_v{version}_{view}", config=config,
+                fig, key=f"{SCP}chart_v{version}_{view}", config=config,
                 theme=None,
                 on_select="rerun", selection_mode="points",
                 **(STRETCH if fit else {}))
@@ -31296,24 +31877,24 @@ def sc_panel():
                 points = []
             if points:
                 hit = sc_click_target(points[-1], traces)
-                s["_sc_chart_ver"] = version + 1
+                s[f"_{SCP}chart_ver"] = version + 1
                 if click_do == SC_CLICKS[3]:
                     sc_bl_click(points[-1], traces)
                 elif click_do == SC_CLICKS[4]:
                     sc_sat_click(points[-1], traces)
                 elif hit and click_do == SC_CLICKS[0]:
-                    s["_sc_zero_next"] = {hit[0]: hit[1]}
+                    s[f"_{SCP}zero_next"] = {hit[0]: hit[1]}
                 elif hit:
                     slot, raw, kind = hit
                     on = next((t for t in traces if t["slot"] == slot), None)
                     if on is not None and on.get("peak_marks") is not None:
                         sc_peak_edit(slot, raw, kind)
                     else:
-                        s["_sc_click_note"] = (
+                        s[f"_{SCP}click_note"] = (
                             f"File {slot + 1} has no peak analysis: turn it "
                             f"on under its ⛰ Peaks first.")
                 st.rerun()
-            note = s.pop("_sc_click_note", None)
+            note = s.pop(f"_{SCP}click_note", None)
             if note:
                 st.warning(note, icon="⛰")
             if click_do == SC_CLICKS[4]:
@@ -31341,7 +31922,7 @@ def sc_panel():
                            "takes back one click; ⛰ Peaks › ↺ drops them "
                            "all.")
         else:
-            st.plotly_chart(fig, key=f"sc_chart_{view}", config=config,
+            st.plotly_chart(fig, key=f"{SCP}chart_{view}", config=config,
                             theme=None, **(STRETCH if fit else {}))
 
 
@@ -31351,7 +31932,18 @@ with tab_stack:
         st.error("This tab needs **stack_compare.py** beside app.py"
                  + (f" ({STACK_ERROR})." if STACK_ERROR else "."), icon="🚫")
     elif not outdated_notice("stack_compare.py"):
-        sc_panel()
+        with sc_namespace(SC_PLACES["stack"]):
+            sc_panel()
+
+with tab_series:
+    section("Series: files one after another")
+    if sc is None or STACK_ERROR:
+        st.error("This tab needs **stack_compare.py** beside app.py"
+                 + (f" ({STACK_ERROR})." if STACK_ERROR else "."), icon="🚫")
+    elif not outdated_notice("stack_compare.py"):
+        # the same tools as Stack & compare, on settings of its own
+        with sc_namespace(SC_PLACES["series"]):
+            sc_panel()
 
 
 # ------------------------------------------------ settings kept offstage --
