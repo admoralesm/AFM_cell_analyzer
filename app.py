@@ -32079,7 +32079,7 @@ with tab_series:
 # shown); btb_ buttons, btc_ charts, btf_ the upload box; _bt_ the rest.
 
 BT_MOUSE = ("🔍 Zoom", "━ Baseline", "━ Upper line", "━ Lower line",
-            "✕ Leave out / put back")
+            "✕ Click peaks", "🗑 Box over peaks")
 BT_FORCE_UNITS = ("N", "mN", "µN", "nN", "pN", "not a force")
 BT_PER_MINUTE = {"s": 60.0, "sec": 60.0, "seconds": 60.0, "ms": 60000.0,
                  "min": 1.0}
@@ -32224,6 +32224,42 @@ def bt_apply_pending(sid):
         s[f"bt_lo_{sid}"] = float(base - level)
 
 
+def bt_set_out(sid, marks):
+    """The peaks left out of the beats (each by where it peaks), the last
+    list kept for ↶ Undo."""
+    s = st.session_state
+    history = list(s.get(f"_bt_hist_{sid}") or [])
+    history.append(list(s.get(f"_bt_out_{sid}") or []))
+    s[f"_bt_hist_{sid}"] = history[-50:]
+    s[f"_bt_out_{sid}"] = sorted(set(float(m) for m in marks))
+    s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
+
+
+def bt_undo(sid):
+    s = st.session_state
+    history = list(s.get(f"_bt_hist_{sid}") or [])
+    if history:
+        s[f"_bt_out_{sid}"] = history.pop()
+        s[f"_bt_hist_{sid}"] = history
+        s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
+
+
+def bt_put_all_back(sid):
+    bt_set_out(sid, [])
+
+
+def bt_table_edited(sid, key, marks_by_row):
+    """Beats unticked in the table: their peaks left out."""
+    s = st.session_state
+    edits = (s.get(key) or {}).get("edited_rows") or {}
+    gone = [int(row) for row, change in edits.items()
+            if change.get("Keep") is False]
+    if gone:
+        bt_set_out(sid, list(s.get(f"_bt_out_{sid}") or [])
+                   + [m for row in gone if row < len(marks_by_row)
+                      for m in marks_by_row[row]])
+
+
 def bt_lines_from_noise(sid):
     s = st.session_state
     for name in ("hi", "lo"):
@@ -32320,16 +32356,25 @@ def bt_settings(sid, got):
 def bt_plot(sid, got):
     """The plot, what the mouse does on it, and a drag or click acted on."""
     s = st.session_state
-    m1, m2 = st.columns([4, 1])
+    m1, m3, m4, m2 = st.columns([4.6, 0.75, 1.0, 0.8])
     if s.get("bt_mouse") not in BT_MOUSE:
         s["bt_mouse"] = BT_MOUSE[0]
     mouse = m1.segmented_control(
         "The mouse on the plot", BT_MOUSE, key="bt_mouse",
         label_visibility="collapsed",
         help="━ Baseline / Upper line / Lower line: drag across the plot "
-             "at the height the line should be. ✕ Leave out / put back: "
-             "click a peak to leave it out of the beats (click again to "
-             "put it back).") or BT_MOUSE[0]
+             "at the height the line should be. ✕ Click peaks: each click "
+             "on a peak removes it (a click on a removed one, ✕, puts it "
+             "back). 🗑 Box over peaks: drag a box around peaks to remove "
+             "them all at once (a box around removed ones only puts them "
+             "back).") or BT_MOUSE[0]
+    gone = list(s.get(f"_bt_out_{sid}") or [])
+    m3.button("↶ Undo", key=f"btb_undo_{sid}", on_click=bt_undo,
+              args=(sid,), disabled=not s.get(f"_bt_hist_{sid}"),
+              **STRETCH, help="Takes back the last removal or putting back.")
+    m4.button(f"↺ Put back ({len(gone)})", key=f"btb_back_{sid}",
+              on_click=bt_put_all_back, args=(sid,), disabled=not gone,
+              **STRETCH, help="Every removed peak back in the beats.")
     with m2.popover("🎨 Plot", **STRETCH):
         st.slider("Height", 250, 900, step=10, key="bt_height")
         st.slider("Line thickness", 0.5, 4.0, step=0.1, key="bt_lw")
@@ -32340,6 +32385,7 @@ def bt_plot(sid, got):
         st.toggle("Shade each full beat", key="bt_shade")
     drawing = mouse in BT_MOUSE[1:4]
     clicking = mouse == BT_MOUSE[4]
+    boxing = mouse == BT_MOUSE[5]
     fig = bta.beat_figure(
         got["x"], got["y"], got["base"], got["up"], got["down"],
         got["kept"], got["beats"], left_out=got["left_out"],
@@ -32397,11 +32443,46 @@ def bt_plot(sid, got):
                     marks = [m for m in marks if m not in inside]
                 else:
                     marks.append(e["peak_x"])
-            s[f"_bt_out_{sid}"] = marks
+            bt_set_out(sid, marks)
             s["_bt_chart_ver"] = ver + 1
             st.rerun()
-        st.caption("Click a peak to leave it out (✕); click it again to "
-                   "put it back.")
+        st.caption("Click a peak to remove it; click a removed one (✕) to "
+                   "put it back. ↶ Undo takes back the last click.")
+    elif boxing:
+        fig.update_layout(dragmode="select",
+                          newselection=dict(line=dict(color="#D62728",
+                                                      width=1.5)))
+        event = st.plotly_chart(fig, key=f"btc_{ver}_box", config=config,
+                                on_select="rerun", selection_mode=("box",),
+                                **STRETCH)
+        try:
+            boxes = list(event.selection.box or [])
+        except Exception:
+            boxes = []
+        if boxes:
+            x0, x1 = sorted(map(float, boxes[-1]["x"]))
+            y0, y1 = sorted(map(float, boxes[-1]["y"]))
+
+            def inside(e):
+                return (x0 <= e["peak_x"] <= x1
+                        and y0 <= got["base"] + e["peak"] <= y1)
+
+            marks = list(s.get(f"_bt_out_{sid}") or [])
+            kept = [e for e in got["kept"] if inside(e)]
+            if kept:
+                marks += [e["peak_x"] for e in kept]
+            else:
+                back = [e for e in got["left_out"] if inside(e)]
+                marks = [m for m in marks
+                         if not any(e["start"] <= m <= e["end"]
+                                    for e in back)]
+            bt_set_out(sid, marks)
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
+        st.caption("Drag a box around peaks to remove them all; a box "
+                   "around only removed ones (✕) puts them back. Above the "
+                   "baseline only takes positive peaks, below it negative "
+                   "ones.")
     else:
         st.plotly_chart(fig, key=f"btc_{ver}", config=config, **STRETCH)
 
@@ -32446,16 +32527,33 @@ def bt_results(sid, got):
         st.caption(f"Time between beats: {mean:.4g} ± {sd:.2g}"
                    + (f" {unit}" if unit else "")
                    + (f" · {len(got['left_out'])} peak"
-                      f"{'s' if len(got['left_out']) != 1 else ''} left out"
-                      if got["left_out"] else ""))
+                      f"{'s' if len(got['left_out']) != 1 else ''} removed "
+                      "(✕ on the plot)" if got["left_out"] else ""))
     table = got["table"]
     if table.empty:
         st.info("No peak gets past the lines: move them closer to the "
                 "baseline (〰 The lines), or drag them on the plot.")
         return
-    # blank where a beat has no such peak (the CSV keeps them empty too)
-    st.dataframe(table.astype(object).where(table.notna(), ""),
-                 hide_index=True, **STRETCH)
+    # blank where a beat has no such peak (the CSV keeps them empty too);
+    # untick Keep to remove a beat's peaks
+    def neat(value):
+        if isinstance(value, (float, np.floating)):
+            return "" if not np.isfinite(value) else f"{value:.5g}"
+        return value
+
+    shown = table.map(neat)
+    shown.insert(0, "Keep", True)
+    marks_by_row = [[e["peak_x"] for e in (b["pos"], b["neg"]) if e]
+                    for b in got["beats"]]
+    key = f"bte_{sid}_{int(s.get('_bt_tab_ver', 0) or 0)}"
+    st.data_editor(
+        shown, key=key, hide_index=True, **STRETCH,
+        disabled=[c for c in shown.columns if c != "Keep"],
+        on_change=bt_table_edited, args=(sid, key, marks_by_row),
+        column_config={"Keep": st.column_config.CheckboxColumn(
+            "Keep", width="small",
+            help="Untick to remove this beat's peaks (both, for a full "
+                 "beat). ↺ Put back above the plot brings them back.")})
     name = sc_db_safe(s["_bt_sets"][sid]["name"])
     d1, d2 = st.columns(2)
     d1.download_button("💾 Beats (CSV)", table.to_csv(index=False)
