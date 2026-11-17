@@ -30740,6 +30740,15 @@ def sc_global_x_range():
         else None
 
 
+def sc_series_titles(traces):
+    """The series' y axis titles: as typed, else one each side (the first
+    file's own), never several joined with /."""
+    out = sc_y_titles()
+    out.setdefault(1, sc_series_y_title(traces))
+    out.setdefault((1, "right"), sc_series_y_title(traces, True))
+    return {k: v for k, v in out.items() if v}
+
+
 def sc_y_titles():
     """{panel: title, (panel, "right"): title} for the titles typed."""
     out = {}
@@ -31087,10 +31096,33 @@ SR_DEFAULTS = {"height": 340, "legend": "Hidden", "srgap": 0.0,
                "zline": False, "stats_at": "Below the plot"}
 
 
-def sc_series_controls():
-    """🔗 Series: how the files follow each other."""
+def sc_series_y_title(traces, right=False):
+    """The one title of the series' y axis (or right axis) when none is
+    typed: the first file's own along the series, not every file's joined
+    with /."""
+    side = [t for t in traces if bool(t.get("right")) == right]
+    side.sort(key=lambda t: ((t.get("series") or {}).get("start", 0.0),
+                             t.get("slot", 0)))
+    return str(side[0].get("ylabel") or "") if side else ""
+
+
+def sc_series_controls(traces):
+    """🔗 Series: how the files follow each other, and the one y axis
+    title."""
     s = st.session_state
     st.markdown("**🔗 The series**")
+    y1, y2 = st.columns(2)
+    y1.text_input(
+        "y axis title", key=f"{SCP}ytitle1",
+        placeholder=sc_series_y_title(traces) or "automatic",
+        help="One title for the y axis of the whole series. Empty: the "
+             "first file's own (shown greyed).")
+    if any(t.get("right") for t in traces):
+        y2.text_input("Right y axis title", key=f"{SCP}ytitle1r",
+                      placeholder=sc_series_y_title(traces, True)
+                      or "automatic",
+                      help="One title for the right y axis (files with "
+                           "Own right axis on).")
     if s.get(f"{SCP}srstart") not in sc.SERIES_STARTS:
         s[f"{SCP}srstart"] = sc.SERIES_STARTS[0]
     g1, g2 = st.columns(2)
@@ -31124,7 +31156,7 @@ def sc_axes_controls(traces):
     s.setdefault(f"{SCP}frame", sc.FRAMES[0])
     series = sc_is_series()
     if series:
-        sc_series_controls()
+        sc_series_controls(traces)
     a1, a2 = st.columns(2)
     if series:
         a1.toggle("Mark each file's zero", key=f"{SCP}zline",
@@ -31149,15 +31181,15 @@ def sc_axes_controls(traces):
     st.text_input("x axis title", key=f"{SCP}xtitle")
     panels_used = sorted({1 if (series or s.get(f"{SCP}overlay"))
                           else t["panel"] for t in traces})
-    st.caption("y axis titles (empty = the files' own)")
+    if not series:
+        st.caption("y axis titles (empty = the files' own)")
     boxes = []
-    for panel in panels_used:
-        boxes.append(("Left" if series else f"Panel {panel}",
-                      f"{SCP}ytitle{panel}"))
-        if any(t.get("right") and (t["panel"] == panel or series
+    for panel in ([] if series else panels_used):
+        # (the series' y axis title is with its own settings above)
+        boxes.append((f"Panel {panel}", f"{SCP}ytitle{panel}"))
+        if any(t.get("right") and (t["panel"] == panel
                                    or s.get(f"{SCP}overlay")) for t in traces):
-            boxes.append(("Right" if series else f"Panel {panel} right",
-                          f"{SCP}ytitle{panel}r"))
+            boxes.append((f"Panel {panel} right", f"{SCP}ytitle{panel}r"))
     for start in range(0, len(boxes), 2):
         cols = st.columns(2)
         for col, (label, key) in zip(cols, boxes[start:start + 2]):
@@ -31235,7 +31267,7 @@ def sc_figure(traces, clickable=False):
         clickable=clickable,
         x_range=sc_global_x_range(),
         frame=s.get(f"{SCP}frame"), legend=s.get(f"{SCP}legend", "Above"),
-        y_titles=sc_y_titles(),
+        y_titles=sc_series_titles(traces) if series else sc_y_titles(),
         align_titles=bool(s.get(f"{SCP}align", True)),
         title_space=int(s.get(f"{SCP}tspace", 70)),
         title_size=int(s.get(f"{SCP}ts", 16)),
