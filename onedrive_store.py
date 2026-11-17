@@ -615,6 +615,146 @@ class OneDriveStore:
         )
         return frame
 
+    # --------------------------------------------------- stacked plots
+
+    def stacks_folder(self):
+        return self.ensure_folder("stacks", self.ensure_folder(self.root_folder))
+
+    def stack_index_columns(self):
+        return ["stack_id", "name", "saved_at", "n_files", "files", "notes",
+                "onedrive_path", "folder_url", "what"]
+
+    def web_url(self, path):
+        """The address of a stored item, as its owner opens it (no sharing
+        link is made)."""
+        try:
+            return _request("GET", self._by_path(path),
+                            token=self.token()).get("webUrl", "")
+        except OneDriveError:
+            return ""
+
+    def save_stack(self, record, files):
+        """
+        Write one stacked analysis: ``files`` maps a path inside its folder
+        (e.g. ``files/1_cell.csv``) to its content. The files go up first,
+        analysis.json after them, the index last.
+        """
+        if not str(record.get("stack_id", "")).strip():
+            raise OneDriveError("The analysis needs a name before it is saved.")
+        stack_id = safe_name(record["stack_id"])
+        folder = self.ensure_folder(stack_id, self.stacks_folder())
+        made = {"": folder}
+        for rel in sorted(files):
+            parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
+            where = ""
+            for part in parts[:-1]:
+                sub = f"{where}/{part}".strip("/")
+                if sub not in made:
+                    made[sub] = self.ensure_folder(part, made[where])
+                where = sub
+            self.upload(made[where], parts[-1], files[rel])
+        record = dict(record, stack_id=stack_id, onedrive_path=folder)
+        record["folder_url"] = self.web_url(folder)
+        self.upload(folder, "analysis.json",
+                    json.dumps(record, indent=2, default=str))
+        self.append_to_stack_index(record)
+        return record
+
+    def load_stack(self, stack_id):
+        """An analysis's record (analysis.json), or None if it is not there."""
+        folder = f"{self.stacks_folder()}/{safe_name(stack_id)}"
+        try:
+            return json.loads(
+                self._download(f"{folder}/analysis.json").decode("utf-8"))
+        except OneDriveError:
+            return None
+
+    def stack_file(self, stack_id, rel):
+        """One file of a saved analysis, by its path inside the folder."""
+        parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
+        return self._download(
+            f"{self.stacks_folder()}/{safe_name(stack_id)}/" + "/".join(parts))
+
+    def stack_index_path(self):
+        return f"{self.ensure_folder(self.root_folder)}/stacks_index.csv"
+
+    def stack_row(self, record):
+        names = [str(f.get("name", "")) for f in record.get("files") or []]
+        row = {key: record.get(key, "") for key in self.stack_index_columns()}
+        row["n_files"] = len(names)
+        row["files"] = "; ".join(names)
+        return row
+
+    def load_stack_index(self):
+        """The list of saved analyses, newest first; empty if there is none."""
+        import pandas as pd
+
+        try:
+            text = self._download(self.stack_index_path()).decode("utf-8")
+            frame = pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+        except Exception:
+            return pd.DataFrame(columns=self.stack_index_columns())
+        if "saved_at" in frame.columns:
+            frame = frame.sort_values("saved_at", ascending=False)
+        return frame.reset_index(drop=True)
+
+    def append_to_stack_index(self, record):
+        """Add or replace one analysis's row."""
+        import pandas as pd
+
+        frame = self.load_stack_index()
+        row = self.stack_row(record)
+        if not frame.empty and "stack_id" in frame.columns:
+            frame = frame[frame["stack_id"].astype(str) != str(row["stack_id"])]
+        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+        self.upload(self.ensure_folder(self.root_folder), "stacks_index.csv",
+                    frame.to_csv(index=False))
+        return frame
+
+    def rebuild_stack_index(self):
+        """Walk the stacks folder and write the list again from each
+        analysis.json."""
+        import pandas as pd
+
+        listing = _request("GET", f"{self._by_path(self.stacks_folder())}:/children",
+                           token=self.token())
+        rows = []
+        for item in listing.get("value", []):
+            if "folder" not in item:
+                continue
+            record = self.load_stack(item["name"])
+            if record:
+                rows.append(self.stack_row(record))
+        frame = pd.DataFrame(rows, columns=self.stack_index_columns())
+        self.upload(self.ensure_folder(self.root_folder), "stacks_index.csv",
+                    frame.to_csv(index=False))
+        return frame
+
+
+# ---------------------------------------------------------- stacked plots
+#
+# A plot saved from the Stack & compare (or Series) tab, one folder each,
+# beside the cells:
+#
+#     <root>/
+#         stacks_index.csv              rebuildable list of every analysis
+#         stacks/
+#             <stack_id>/
+#                 analysis.json         what is needed to open it again
+#                 plot.html             the plot, interactive
+#                 aligned.csv           the data as plotted
+#                 summary.csv           each file's numbers
+#                 files/                the files the plot was made from
+#
+# As with the cells, analysis.json is the source of truth and the index is
+# only a cache: it goes up last, so a save that fails half way leaves no
+# entry pointing at a folder with files missing.
+
+def safe_name(name):
+    """A name OneDrive accepts: the characters it refuses replaced."""
+    text = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in str(name))
+    return text.strip().strip(".") or "untitled"
+
 
 def store_from_secrets(st, root_folder=None):
     """Build a store from ``st.secrets['onedrive']``, or None when unset."""
