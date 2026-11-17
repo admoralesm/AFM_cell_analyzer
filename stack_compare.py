@@ -528,6 +528,9 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                 shared_range if linked else None)
             lo_edge, hi_edge = (sorted(map(float, rng)) if rng is not None
                                 else (all_lo, all_hi))
+            if t.get("extend_edges") is not None:
+                # in a series: only as far as its own place goes
+                lo_edge, hi_edge = sorted(map(float, t["extend_edges"]))
             first, last = float(np.nanmin(xs)), float(np.nanmax(xs))
             level = float(ext.get("level", 0.0) or 0.0)
             pieces = []
@@ -764,6 +767,209 @@ def hand_line_traces(hand, colour, line_width=1.8, name="line drawn",
                 showlegend=False, hoverinfo="skip", name="room for a label",
                 marker=dict(size=1, opacity=0)))
     return out
+
+
+# ------------------------------------------------------------- the series --
+#
+# The same files, one after another along x instead of one above the other:
+# each keeps its own x (after its zero) and is moved along, as a whole, to
+# its place in the series. Everything drawn on its x moves with it, and its
+# zero moves the other way, so x + zero is still the file's own x and a
+# click on it still means the same moment of that file.
+
+SERIES_STARTS = ("The first file's start", "The first file's zero")
+
+
+def _series_extent(t):
+    """The part of a file that goes in the series, on its own x (after its
+    zero): its 📏 x range when one is set, else all of it."""
+    x = np.asarray(t["x"], float)
+    x = x[np.isfinite(x)]
+    if not x.size:
+        return None
+    lo, hi = float(x.min()), float(x.max())
+    crop = t.get("x_range")
+    if crop is not None:
+        a, b = sorted(map(float, crop))
+        lo, hi = max(lo, a), min(hi, b)
+        if hi <= lo:
+            return None
+    return lo, hi
+
+
+def series_shift(t, offset, window=None):
+    """
+    A copy of trace ``t`` moved ``offset`` along x, with everything drawn
+    on its x (baseline, its window and points, peak marks, the flat part
+    carried on, the points marking it); its zero moved the other way. With
+    ``window`` (lo, hi on the file's x after its zero) only that part is
+    drawn: the rest becomes gaps (NaN), and peaks outside it are dropped.
+    """
+    d = float(offset)
+    u = dict(t)
+    x = np.asarray(t["x"], float)
+    y = np.asarray(t["y"], float).copy()
+    outside = np.zeros(x.shape, bool)
+    if window is not None:
+        lo, hi = window
+        outside = ~((x >= lo) & (x <= hi))
+        y[outside] = np.nan
+
+    def keep(px):
+        px = np.asarray(px, float)
+        if window is None:
+            return np.ones(px.shape, bool)
+        return (px >= window[0]) & (px <= window[1])
+
+    u["x"], u["y"] = x + d, y
+    u["zero"] = float(t.get("zero", 0.0)) - d
+    line = t.get("baseline_line")
+    if line is not None:
+        bx, by = np.asarray(line[0], float), np.asarray(line[1], float)
+        gone = ~keep(bx)
+        by = np.where(gone, np.nan, by)
+        u["baseline_line"] = (bx + d, by)
+        if t.get("threshold_lines"):
+            u["threshold_lines"] = [np.where(gone, np.nan,
+                                             np.asarray(b, float))
+                                    for b in t["threshold_lines"]]
+    if t.get("baseline_window") is not None:
+        a, b = t["baseline_window"]
+        u["baseline_window"] = (a + d, b + d)
+    if t.get("baseline_points") is not None:
+        px, py = t["baseline_points"]
+        u["baseline_points"] = (np.asarray(px, float) + d, py)
+    if t.get("peak_marks"):
+        marks = []
+        for mark in t["peak_marks"]:
+            px, py = np.asarray(mark[0], float), np.asarray(mark[1], float)
+            ok = keep(px)
+            marks.append((px[ok] + d, py[ok]) + tuple(mark[2:]))
+        u["peak_marks"] = marks
+    if t.get("sat_line"):
+        sat = dict(t["sat_line"])
+        sat["x"] = np.asarray(sat["x"], float) + d
+        if sat.get("flat") is not None:
+            sat["flat"] = (sat["flat"][0] + d, sat["flat"][1] + d)
+        if sat.get("peak") is not None:
+            sat["peak"] = (sat["peak"][0] + d, sat["peak"][1])
+        u["sat_line"] = sat
+    if t.get("sat_marks") is not None:
+        mx, my = t["sat_marks"]
+        u["sat_marks"] = (np.asarray(mx, float) + d, my)
+    u["x_range"] = None
+    return u
+
+
+def series_layout(traces, gap=0.0, start=SERIES_STARTS[0]):
+    """
+    The files one after another along x. Files with the same place
+    (their "panel" number) share it, overlaid; the places follow each
+    other in order, ``gap`` apart (in x units). Each file's part is its
+    📏 x range, or all of it. ``start``: the series begins at x = 0 (the
+    first file's start), or the first place keeps its own x (its zero at
+    x = 0).
+
+    Returns the moved traces in the order given (so trace numbers still
+    match the files), each with ``series``: its place, the place's start
+    and end on the series' x, where its own zero sits (offset) and the
+    part used.
+    """
+    by_place = {}
+    for t in traces:
+        by_place.setdefault(int(t.get("panel") or 1), []).append(t)
+    moved = {}
+    cursor = None
+    for place in sorted(by_place):
+        parts = [(t, _series_extent(t)) for t in by_place[place]]
+        spans = [e for _, e in parts if e is not None]
+        if not spans:
+            for t, _ in parts:
+                moved[id(t)] = dict(series_shift(t, 0.0), series=None)
+            continue
+        lo = min(a for a, _ in spans)
+        hi = max(b for _, b in spans)
+        if cursor is None:
+            offset = -lo if start == SERIES_STARTS[0] else 0.0
+        else:
+            offset = cursor + float(gap or 0.0) - lo
+        for t, extent in parts:
+            cropped = (extent if (extent is not None
+                                  and t.get("x_range") is not None) else None)
+            u = series_shift(t, offset, cropped)
+            u["series"] = {"place": place, "offset": offset,
+                           "start": lo + offset, "end": hi + offset,
+                           "part": extent}
+            # ↦ Extend carries it on only to the ends of its own place
+            u["extend_edges"] = (lo + offset, hi + offset)
+            moved[id(t)] = u
+        cursor = hi + offset
+    return [moved[id(t)] for t in traces]
+
+
+def series_places(traces):
+    """The places of a laid-out series: [(start, end, [traces])], in
+    order along x."""
+    places = {}
+    for t in traces:
+        info = t.get("series")
+        if info:
+            entry = places.setdefault(info["place"],
+                                      [info["start"], info["end"], []])
+            entry[2].append(t)
+    return [tuple(places[p]) for p in sorted(places, key=lambda p: places[p][0])]
+
+
+def series_decorate(fig, traces, separators=True, names=True, shade=False,
+                    zeros=False, font_size=14, zero_width=1.0):
+    """
+    What shows a series for what it is: a dotted line between places, each
+    place's name over it (its file's colour; files sharing a place joined
+    with +), every other place shaded, and each file's own zero marked.
+    """
+    places = series_places(traces)
+    for k, (a, b, members) in enumerate(places):
+        if shade and k % 2 == 1:
+            fig.add_vrect(x0=a, x1=b, fillcolor="#808080", opacity=0.08,
+                          line_width=0, layer="below")
+        if separators and k > 0:
+            prev_end = places[k - 1][1]
+            fig.add_vline(x=0.5 * (prev_end + a),
+                          line=dict(color="#777", width=1, dash="dot"))
+        if names:
+            text = " + ".join(
+                f"<span style='color:{t['colour']}'>{t['label']}</span>"
+                for t in members)
+            fig.add_annotation(
+                x=0.5 * (a + b), y=1.0, xref="x", yref="paper",
+                yanchor="bottom", yshift=4, showarrow=False, text=text,
+                font=dict(size=max(9, int(font_size) - 1)))
+        if zeros:
+            for t in members:
+                at = t["series"]["offset"]
+                if a <= at <= b:
+                    fig.add_vline(x=at, line=dict(color=t["colour"],
+                                                  width=float(zero_width),
+                                                  dash="dot"))
+    if names and places:
+        # room for the names above the plot
+        top = fig.layout.margin.t if fig.layout.margin.t is not None else 50
+        fig.update_layout(margin=dict(t=int(top) + int(font_size) + 10))
+    return fig
+
+
+def series_table(traces) -> pd.DataFrame:
+    """The series as plotted, one block of columns per file: x along the
+    series, the file's own x (after its zero), and y."""
+    columns = {}
+    for t in traces:
+        label = t["label"]
+        offset = (t.get("series") or {}).get("offset", 0.0)
+        x = np.asarray(t["x"], float)
+        columns[f"{label} | x (series)"] = pd.Series(x)
+        columns[f"{label} | x (own)"] = pd.Series(x - offset)
+        columns[f"{label} | {t.get('ylabel') or 'y'}"] = pd.Series(t["y"])
+    return pd.DataFrame(columns)
 
 
 STATS_BOXES = ("Off", "Analysis summary", "Descriptive statistics")
