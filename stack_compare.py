@@ -780,14 +780,19 @@ def hand_line_traces(hand, colour, line_width=1.8, name="line drawn",
 SERIES_STARTS = ("The first file's start", "The first file's zero")
 
 
-def _series_extent(t):
+def _series_extent(t, from_zero=False):
     """The part of a file that goes in the series, on its own x (after its
-    zero): its 📏 x range when one is set, else all of it."""
+    zero): its 📏 x range when one is set, else all of it. ``from_zero``:
+    the file starts at its zero, so what comes before it is left out (and
+    a zero before its first point leaves an empty stretch before it); a
+    zero past its last point leaves it whole."""
     x = np.asarray(t["x"], float)
     x = x[np.isfinite(x)]
     if not x.size:
         return None
     lo, hi = float(x.min()), float(x.max())
+    if from_zero and hi > 0:
+        lo = 0.0
     crop = t.get("x_range")
     if crop is not None:
         a, b = sorted(map(float, crop))
@@ -861,12 +866,13 @@ def series_shift(t, offset, window=None):
     return u
 
 
-def series_layout(traces, gap=0.0, start=SERIES_STARTS[0]):
+def series_layout(traces, gap=0.0, start=SERIES_STARTS[0], from_zero=False):
     """
     The files one after another along x. Files with the same place
     (their "panel" number) share it, overlaid; the places follow each
     other in order, ``gap`` apart (in x units). Each file's part is its
-    📏 x range, or all of it. ``start``: the series begins at x = 0 (the
+    📏 x range, or all of it; with ``from_zero`` each file starts at its
+    zero (see _series_extent). ``start``: the series begins at x = 0 (the
     first file's start), or the first place keeps its own x (its zero at
     x = 0).
 
@@ -881,7 +887,7 @@ def series_layout(traces, gap=0.0, start=SERIES_STARTS[0]):
     moved = {}
     cursor = None
     for place in sorted(by_place):
-        parts = [(t, _series_extent(t)) for t in by_place[place]]
+        parts = [(t, _series_extent(t, from_zero)) for t in by_place[place]]
         spans = [e for _, e in parts if e is not None]
         if not spans:
             for t, _ in parts:
@@ -895,7 +901,8 @@ def series_layout(traces, gap=0.0, start=SERIES_STARTS[0]):
             offset = cursor + float(gap or 0.0) - lo
         for t, extent in parts:
             cropped = (extent if (extent is not None
-                                  and t.get("x_range") is not None) else None)
+                                  and (from_zero or t.get("x_range")
+                                       is not None)) else None)
             u = series_shift(t, offset, cropped)
             u["series"] = {"place": place, "offset": offset,
                            "start": lo + offset, "end": hi + offset,
