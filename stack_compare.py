@@ -280,13 +280,18 @@ def _first(items, key):
     return None
 
 
-def _axis_title(items):
+def axis_title(items, one=False):
+    """The y title of an axis shared by these files: every file's own title
+    joined with /, or (``one``) only the first file's."""
     names = []
     for t in items:
         label = t.get("ylabel") or ""
         if label and label not in names:
             names.append(label)
-    return " / ".join(names)
+    return names[0] if (one and names) else " / ".join(names)
+
+
+_axis_title = axis_title
 
 
 def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
@@ -300,9 +305,11 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
                    stats_place="Inside, bottom right", baselines=True,
                    crosshair=False, crosshair_width=1.0, zero_width=1.0,
                    bold_ticks=False, legend_title="", legend_box=False,
-                   legend_bold=False, click_grid=False):
+                   legend_bold=False, click_grid=False, one_title=False):
     """
-    The files in panels, one above the other.
+    The files in panels, one above the other. ``one_title``: where files
+    share an axis, its title is the first file's alone, not all of them
+    joined with /.
 
     Each trace dict: x, y, label, ylabel, colour, neg_up, slot (its number,
     returned in customdata with the file's own x so a click can set its
@@ -405,7 +412,7 @@ def stacked_figure(traces, linked=True, overlay=False, panel_height=260,
             colour = items[0]["colour"] if len(items) == 1 else "black"
             panel = panels[r - 1]
             title = y_titles.get((panel, "right") if side else panel)
-            title = styled(title if title else _axis_title(items))
+            title = styled(title if title else axis_title(items, one_title))
             if align_titles:
                 side_titles.append((r, side, title, colour))
             spec = dict(axes, title_text=("" if align_titles else title),
