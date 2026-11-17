@@ -561,6 +561,15 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     sc = None
     STACK_ERROR = str(exc)
 
+# The Beat analysis tab: a signal's beats, their areas and energies.
+try:
+    import beat_analysis as bta
+
+    BEAT_ERROR = ""
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    bta = None
+    BEAT_ERROR = str(exc)
+
 # The Single force curve tab: one force recording against time.
 try:
     import force_curve as fcv
@@ -626,17 +635,21 @@ COMPANION_NEEDS = {
                          "baseline_typed", "EXTEND_DASHES",
                          "flat_top_between", "hand_line_traces",
                          "series_layout", "series_decorate",
-                         "series_table", "SERIES_STARTS"),
+                         "series_table", "SERIES_STARTS", "axis_title"),
     "force_curve.py": ("baseline_after", "curve_stats", "corrected",
                        "table_to_send", "incline", "pad_zero",
                        "side_fit", "side_line", "bridged", "line_value"),
+    "beat_analysis.py": ("excursions", "pair_beats", "beat_table",
+                         "summary", "beat_figure", "suggest_thresholds"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
 fcv = _current(fcv, *COMPANION_NEEDS["force_curve.py"])
+bta = _current(bta, *COMPANION_NEEDS["beat_analysis.py"])
 OUTDATED = [name for name, module in (("auto_analysis.py", aa),
                                       ("stack_compare.py", sc),
-                                      ("force_curve.py", fcv))
+                                      ("force_curve.py", fcv),
+                                      ("beat_analysis.py", bta))
             if module is not None
             and any(not _has_name(module, n) for n in COMPANION_NEEDS[name])]
 
@@ -10979,6 +10992,23 @@ def send_to_series(name, frame, source="the video", stats=None,
                          series=True)
 
 
+def send_to_analysis(name, frame, source="the video", stats=None,
+                     zero_mode=None, lines=None):
+    """Put a table on the Beat analysis tab (as a new signal there, shown
+    at once). Takes the same arguments as send_to_stack."""
+    s = st.session_state
+    sets = s.setdefault("_bt_sets", {})
+    s["_bt_n"] = int(s.get("_bt_n", 0) or 0) + 1
+    sid = f"s{s['_bt_n']}"
+    sets[sid] = {"name": str(name), "frame": frame.copy(),
+                 "source": str(source)}
+    s["bt_pick"] = sid
+    s["_vq_sent_note"] = (f"Sent to Beat analysis as “{name}”. Open that "
+                          "tab to see it.")
+    s["_ai_sent_note"] = s["_vq_sent_note"]
+    return sid
+
+
 def _send_here(name, frame, source, stats, zero_mode, lines):
     s = st.session_state
     if frame is None:
@@ -11031,8 +11061,8 @@ def video_axis_ranges(slug, send=None):
         for name in names:
             s[name] = ""
 
-    note_col, send_col, series_col, right = st.columns([3.0, 1.25, 1.25,
-                                                         1.4])
+    note_col, send_col, series_col, beat_col, right = st.columns(
+        [2.6, 1.15, 1.15, 1.15, 1.3])
     if send is not None and send[1] is not None:
         send_col.button("📚 Send to stack", key=f"vs_{slug}",
                         on_click=send_to_stack, args=send, **STRETCH,
@@ -11044,6 +11074,11 @@ def video_axis_ranges(slug, send=None):
                           help="Sends this plot's data to the Series tab, "
                                "to put it before or after other "
                                "recordings along one time axis.")
+        beat_col.button("📊 Send to analysis", key=f"vsb_{slug}",
+                        on_click=send_to_analysis, args=send, **STRETCH,
+                        help="Sends this plot's data to the Beat analysis "
+                             "tab: its peaks, their areas, beats and "
+                             "energy.")
         note = s.get("_vq_sent_note")
         if note and s.get("_vq_sent_from") in (None, slug):
             note_col.caption("✅ " + note if note.startswith("Sent")
@@ -22670,14 +22705,15 @@ SHOW_DATABASE_TAB = False
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_stack, tab_series, tab_force, tab_igor,
-    tab_fitting, tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_force,
+    tab_igor, tab_fitting, tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
         "🔬 AFM output analysis",
         "📚 Stack & compare",
         "🔗 Series",
+        "💓 Beat analysis",
         "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
@@ -22685,7 +22721,7 @@ SHOW_DATABASE_TAB = False
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 7
+FITTING_TAB_NUMBER = 8
 
 with tab_fitting:
     (
@@ -22713,7 +22749,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((8, SHOW_VIDEO_TAB), (9, SHOW_DATABASE_TAB))
+    index for index, wanted in ((9, SHOW_VIDEO_TAB), (10, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -28237,7 +28273,7 @@ def fc_results(t, m, ylab, stem):
                           "dash": "Solid", "colour": bar["colour"],
                           "width": bar["width"], "caps": True,
                           "text": bar["text"]})
-        r2, r2b, r3 = st.columns(3)
+        r2, r2b, r2c, r3 = st.columns(4)
         # the balloon on the stack: the essentials only, so it does not
         # cover the plot
         wanted = ("Curve starts at", "Curve ends at", "Peak force",
@@ -28262,6 +28298,10 @@ def fc_results(t, m, ylab, stem):
                    on_click=send_to_series, args=sent,
                    help="The same, to the Series tab: curves one after "
                         "another along one time axis.", **STRETCH)
+        r2c.button("📊 Send to analysis", key="fc_send_bt",
+                   on_click=send_to_analysis, args=sent,
+                   help="Time and force to the Beat analysis tab: its "
+                        "peaks, their areas, beats and energy.", **STRETCH)
         r3.download_button("💾 Save as CSV", key="fc_csv",
                            data=lambda: table.to_csv(index=False).encode(),
                            file_name=f"{stem}_force_vs_time.csv",
@@ -29791,6 +29831,16 @@ def ai_quick_line_controls(two):
               on_change=axis)
 
 
+def ai_send_to_analysis(tables):
+    """Each plot as its own signal on the Beat analysis tab."""
+    for name, frame, _stats in tables:
+        send_to_analysis(name, frame, source="AFM output analysis")
+    if tables:
+        st.session_state["_ai_sent_note"] = (
+            f"Sent {len(tables)} plot{'s' if len(tables) != 1 else ''} to "
+            "Beat analysis. Open that tab to see them.")
+
+
 def ai_send_to_stack(tables, series=False):
     """Each plot into its own slot of Stack & compare (or of Series)."""
     s = st.session_state
@@ -29860,7 +29910,8 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
                        pd.DataFrame({tlabel or "Time (s)": np.asarray(x),
                                      label: np.asarray(y)}),
                        ai_trace_stats(x, y, units[which], channel)))
-    note_col, send_col, series_col = st.columns([3.4, 1.25, 1.25])
+    note_col, send_col, series_col, beat_col = st.columns(
+        [3.0, 1.15, 1.15, 1.15])
     send_col.button("📚 Send to stack", key="ai_send_stack",
                     on_click=ai_send_to_stack, args=(tables,),
                     disabled=not tables, **STRETCH,
@@ -29873,6 +29924,11 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
                       help="Sends the plotted data (each plot as its own "
                            "file) to the Series tab, one after another "
                            "along one time axis.")
+    beat_col.button("📊 Send to analysis", key="ai_send_beats",
+                    on_click=ai_send_to_analysis, args=(tables,),
+                    disabled=not tables, **STRETCH,
+                    help="Sends the plotted data (each plot as its own "
+                         "signal) to the Beat analysis tab.")
     note = s.pop("_ai_sent_note", None)
     if note:
         note_col.caption(("✅ " if note.startswith("Sent") else "⚠️ ")
@@ -30727,6 +30783,20 @@ def sc_slot(i, n=3):
                      f"{len(hand)} added (hollow)")
         st.caption(f"⛰ {len(found['up'])} peaks up, {len(found['down'])} "
                    "down counted (▲ ▼ on the plot)" + edits)
+    # this file as plotted (its zero, baseline taken off if so) to the
+    # Beat analysis tab
+    if len(x) > 2:
+        y_name = s.get(f"{SCP}ylab{i}") or str(ycol)
+        if str(y_name) == str(xcol):
+            y_name = f"{y_name} (y)"
+        st.button("📊 Send to analysis", key=f"{SCP}tobeat{i}", **STRETCH,
+                  on_click=send_to_analysis,
+                  args=(s.get(f"{SCP}label{i}") or stem,
+                        pd.DataFrame({str(xcol): x, str(y_name): y}),
+                        f"{sc_tab_name()}, file {i + 1}"),
+                  help="This file as plotted here (its zero, its baseline "
+                       "taken off if so) to the Beat analysis tab: its "
+                       "peaks, their areas, beats and energy.")
     return {"x": x, "y": y, "raw_x": x + zero, "zero": zero,
             "stats": (sent or {}).get("stats") if sent is not None else None,
             "baseline_line": baseline_line,
@@ -31096,7 +31166,7 @@ def sc_hl_panel(traces):
 
 
 SC_DEFAULTS = {
-    "n": 3, "link": False, "zline": True, "height": 240,
+    "n": 3, "link": False, "zline": True, "height": 240, "onetitle": True,
     "lw": 1.8, "aw": 1.2, "fs": 14, "ts": 16, "ls": 13,
     "align": True, "tspace": 70, "legend": "Above",
     "legline": 40, "width": 0, "ticks": "outside",
@@ -31194,6 +31264,12 @@ def sc_axes_controls(traces):
     panels_used = sorted({1 if (series or s.get(f"{SCP}overlay"))
                           else t["panel"] for t in traces})
     if not series:
+        st.toggle("One y title where files are overlaid",
+                  key=f"{SCP}onetitle",
+                  help="Where files share a panel (or with All on one "
+                       "plot): the first file's y title alone, not every "
+                       "file's joined with /. A title typed below still "
+                       "wins.")
         st.caption("y axis titles (empty = the files' own)")
     boxes = []
     for panel in ([] if series else panels_used):
@@ -31280,6 +31356,7 @@ def sc_figure(traces, clickable=False):
         x_range=sc_global_x_range(),
         frame=s.get(f"{SCP}frame"), legend=s.get(f"{SCP}legend", "Above"),
         y_titles=sc_series_titles(traces) if series else sc_y_titles(),
+        one_title=bool(s.get(f"{SCP}onetitle", True)),
         align_titles=bool(s.get(f"{SCP}align", True)),
         title_space=int(s.get(f"{SCP}tspace", 70)),
         title_size=int(s.get(f"{SCP}ts", 16)),
@@ -31321,7 +31398,8 @@ def sc_figure(traces, clickable=False):
 SC_DB_SKIP = re.compile(
     r"^((file|sent)\d+(_v\d+)?|chart.*|csv|clickdo|db_.*"
     r"|hl_(col|dash|del|redo|show|txt)_.*|hl_\d+_v\d+"
-    r"|(blp_clear|blp_last|blq10|blq25|blq5|pkreset|satclr|unsend)\d+"
+    r"|(blp_clear|blp_last|blq10|blq25|blq5|pkreset|satclr|unsend|tobeat)"
+    r"\d+"
     r"|reset_view|undo_zero|r\d+_(reset|form)"
     r"|_(click_note|draw_note|chart_ver|redraw|draft|zero_next|blsrc_next"
     r"|satsrc_next|view|zero_hist|zero_undo|upver|db_.*))$")
@@ -31988,6 +32066,503 @@ with tab_series:
         # the same tools as Stack & compare, on settings of its own
         with sc_namespace(SC_PLACES["series"]):
             sc_panel()
+
+
+# ======================================================== beat analysis ==
+#
+# A signal sent here (or a file added here) and its beats: a baseline and two
+# lines (above and below it), the excursions past them with their areas, the
+# excursions paired into full beats (positive then negative), and per beat
+# and in total the areas and the cantilever's spring energy (F²/2k).
+#
+# Keys: bt_<setting>_<signal> are settings (kept while another signal is
+# shown); btb_ buttons, btc_ charts, btf_ the upload box; _bt_ the rest.
+
+BT_MOUSE = ("🔍 Zoom", "━ Baseline", "━ Upper line", "━ Lower line",
+            "✕ Leave out / put back")
+BT_FORCE_UNITS = ("N", "mN", "µN", "nN", "pN", "not a force")
+BT_PER_MINUTE = {"s": 60.0, "sec": 60.0, "seconds": 60.0, "ms": 60000.0,
+                 "min": 1.0}
+
+
+def bt_add_upload(key):
+    """A file added on the tab: a new signal."""
+    s = st.session_state
+    up = s.get(key)
+    if up is None:
+        return
+    try:
+        frame = sc_read(up.getvalue(), up.name)
+    except Exception as exc:
+        s["_bt_note"] = f"⚠️ Could not read {up.name}: {exc}"
+        return
+    send_to_analysis(re.sub(r"\.[A-Za-z0-9]+$", "", up.name), frame,
+                     source=f"the file {up.name}")
+    s["_bt_upver"] = int(s.get("_bt_upver", 0) or 0) + 1
+
+
+def bt_remove(sid):
+    s = st.session_state
+    s.get("_bt_sets", {}).pop(sid, None)
+    for key in [k for k in list(s.keys()) if str(k).endswith(f"_{sid}")
+                and str(k).startswith(("bt_", "_bt_"))]:
+        s.pop(key, None)
+    s.pop("bt_pick", None)
+
+
+def bt_columns(frame):
+    """The columns with numbers in them."""
+    out = []
+    for col in frame.columns:
+        values = pd.to_numeric(frame[col], errors="coerce")
+        if values.notna().sum() >= 3:
+            out.append(col)
+    return out
+
+
+def bt_signal(sid):
+    """(x, y, x column, y column) of a signal, as chosen."""
+    s = st.session_state
+    frame = s["_bt_sets"][sid]["frame"]
+    cols = bt_columns(frame)
+    if len(cols) < 2:
+        return None
+    if s.get(f"bt_x_{sid}") not in cols:
+        timeish = [c for c in cols if re.search(r"time|\bt\b|\(s\)|sec",
+                                                 str(c), re.I)]
+        s[f"bt_x_{sid}"] = timeish[0] if timeish else cols[0]
+    if s.get(f"bt_y_{sid}") not in cols:
+        s[f"bt_y_{sid}"] = next(c for c in cols if c != s[f"bt_x_{sid}"])
+    xcol, ycol = s[f"bt_x_{sid}"], s[f"bt_y_{sid}"]
+    x = pd.to_numeric(frame[xcol], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(frame[ycol], errors="coerce").to_numpy(float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    order = np.argsort(x[ok], kind="stable")
+    return x[ok][order], y[ok][order], xcol, ycol
+
+
+def bt_defaults(sid, x, y):
+    """A signal's settings the first time it is shown: the median as the
+    baseline, lines 5 noise SDs from it, a negative peak within twice the
+    usual positive one's width counted with it."""
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    if s.get(key("bmode")) not in bta.BASELINES:
+        s[key("bmode")] = bta.BASELINES[0]
+    if key("base") not in s:
+        s[key("base")] = float(bta.baseline_level(y))
+    base = float(bta.baseline_level(y, s[key("bmode")])) \
+        if s[key("bmode")] != bta.BASELINES[2] else float(s[key("base")])
+    if key("hi") not in s or key("lo") not in s:
+        up, down = bta.suggest_thresholds(y, base)
+        s.setdefault(key("hi"), float(up))
+        s.setdefault(key("lo"), float(down))
+    if key("gap") not in s:
+        found = bta.excursions(x, y, base, s[key("hi")], s[key("lo")])
+        widths = [e["width"] for e in found if e["sign"] > 0]
+        s[key("gap")] = float(2.0 * np.median(widths)) if widths else 1.0
+    for name, value in (("sm", 1), ("merge", 0.0), ("minw", 0.0),
+                        ("order", bta.ORDERS[0]), ("k", 0.0)):
+        s.setdefault(key(name), value)
+    if s.get(key("fu")) not in BT_FORCE_UNITS:
+        unit = bta.unit_of(s.get(f"bt_y_{sid}"))
+        s[key("fu")] = unit if unit in BT_FORCE_UNITS else (
+            "µN" if unit in ("uN", "μN") else "not a force")
+
+
+def bt_analyse(sid):
+    """Everything about one signal, from its settings: the arrays, the
+    baseline and lines, the excursions (kept and left out), the beats,
+    their table and the summary."""
+    s = st.session_state
+    got = bt_signal(sid)
+    if got is None:
+        return None
+    x, y, xcol, ycol = got
+    bt_defaults(sid, x, y)
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    ys = bta.smooth(y, int(s[key("sm")]))
+    base = (float(s[key("base")]) if s[key("bmode")] == bta.BASELINES[2]
+            else float(bta.baseline_level(ys, s[key("bmode")])))
+    up, down = float(s[key("hi")] or 0.0), float(s[key("lo")] or 0.0)
+    events = bta.excursions(x, ys, base, up, down,
+                            min_width=float(s[key("minw")] or 0.0),
+                            merge=float(s[key("merge")] or 0.0))
+    out_marks = list(s.get(f"_bt_out_{sid}") or [])
+    left_out = [e for e in events
+                if any(e["start"] <= m <= e["end"] for m in out_marks)]
+    kept = [e for e in events if e not in left_out]
+    beats = bta.pair_beats(kept, float(s[key("gap")] or 0.0), s[key("order")])
+    x_unit, y_unit = bta.unit_of(xcol), bta.unit_of(ycol)
+    fu = s[key("fu")]
+    newtons = bta.newtons_per_unit(fu) if fu != BT_FORCE_UNITS[-1] else None
+    k = float(s[key("k")] or 0.0) or None
+    table = bta.beat_table(beats, x_unit, y_unit, k=k, newtons=newtons)
+    info = bta.summary(beats, x_unit, y_unit, k=k, newtons=newtons,
+                       per_minute=BT_PER_MINUTE.get(x_unit))
+    return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
+            "base": base, "up": up, "down": down, "events": events,
+            "kept": kept, "left_out": left_out, "beats": beats,
+            "table": table, "info": info, "x_unit": x_unit,
+            "y_unit": y_unit, "k": k, "newtons": newtons}
+
+
+def bt_apply_pending(sid):
+    """A line dragged on the plot (last run), into its setting, before the
+    boxes are drawn."""
+    s = st.session_state
+    pending = s.pop("_bt_pending", None)
+    if not pending or pending[0] != sid:
+        return
+    _, what, level, base = pending
+    if what == BT_MOUSE[1]:
+        s[f"bt_bmode_{sid}"] = bta.BASELINES[2]
+        s[f"bt_base_{sid}"] = float(level)
+    elif what == BT_MOUSE[2] and level > base:
+        s[f"bt_hi_{sid}"] = float(level - base)
+    elif what == BT_MOUSE[3] and level < base:
+        s[f"bt_lo_{sid}"] = float(base - level)
+
+
+def bt_lines_from_noise(sid):
+    s = st.session_state
+    for name in ("hi", "lo"):
+        s.pop(f"bt_{name}_{sid}", None)
+
+
+def bt_columns_changed(sid):
+    """Another column: its own baseline, lines and pairing, nothing left
+    out."""
+    s = st.session_state
+    for name in ("hi", "lo", "gap", "base", "fu"):
+        s.pop(f"bt_{name}_{sid}", None)
+    s.pop(f"_bt_out_{sid}", None)
+
+
+def bt_settings(sid, got):
+    """The left column: which columns, the lines, the beats, the energy."""
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    frame = s["_bt_sets"][sid]["frame"]
+    cols = bt_columns(frame)
+    c1, c2 = st.columns(2)
+    c1.selectbox("x", cols, key=key("x"), on_change=bt_columns_changed,
+                 args=(sid,))
+    c2.selectbox("y", cols, key=key("y"), on_change=bt_columns_changed,
+                 args=(sid,))
+    unit = bta.unit_of(s.get(key("y")))
+    st.markdown("**〰 The lines**")
+    st.radio("Baseline", bta.BASELINES, key=key("bmode"), horizontal=True,
+             help="Median: the middle of all the signal. Most common "
+                  "level: where it spends most time (better when the "
+                  "beats are a large part of it). Typed or dragged: the "
+                  "value below, or ━ Baseline dragged on the plot.")
+    b1, b2, b3 = st.columns(3)
+    b1.number_input("Baseline at", key=key("base"), format="%.6g",
+                    disabled=s.get(key("bmode")) != bta.BASELINES[2],
+                    help="Used with Typed or dragged; otherwise it shows "
+                         "where the baseline was found.")
+    b2.number_input("Upper line, above it", key=key("hi"), min_value=0.0,
+                    format="%.6g",
+                    help="A positive peak is one that gets this far above "
+                         "the baseline. Its area runs from where it leaves "
+                         "the baseline to where it comes back.")
+    b3.number_input("Lower line, below it", key=key("lo"), min_value=0.0,
+                    format="%.6g",
+                    help="A negative peak is one that gets this far below "
+                         "the baseline.")
+    st.button("↺ Lines from the noise (5 × SD)", key=f"btb_noise_{sid}",
+              on_click=bt_lines_from_noise, args=(sid,), **STRETCH,
+              help="Puts both lines 5 times the baseline's noise (a robust "
+                   "SD) away from it.")
+    if got is not None:
+        st.caption(f"Baseline {got['base']:.4g}"
+                   + (f" {unit}" if unit else "")
+                   + f" · noise SD {bta.noise_sd(got['y'], got['base']):.3g}"
+                   + f" · {len(got['events'])} peaks past the lines")
+    st.slider("Smooth (points)", 1, 51, step=2, key=key("sm"),
+              help="A running mean over this many points before the peaks "
+                   "are found and their areas taken. 1: as recorded.")
+    st.markdown("**💓 Beats**")
+    st.selectbox("A full beat is", bta.ORDERS, key=key("order"),
+                 help="Positive then negative: a positive peak and the "
+                      "negative one right after it. Peaks that are not "
+                      "paired count as positive only or negative only.")
+    g1, g2, g3 = st.columns(3)
+    g1.number_input("Pair within", key=key("gap"), min_value=0.0,
+                    format="%.4g",
+                    help="The second peak of a beat starts at most this "
+                         "long after the first one ends (x units).")
+    g2.number_input("Join peaks closer than", key=key("merge"),
+                    min_value=0.0, format="%.4g",
+                    help="Peaks of the same sign this close (end to start) "
+                         "count as one, their areas added. 0: never.")
+    g3.number_input("Shortest peak", key=key("minw"), min_value=0.0,
+                    format="%.4g",
+                    help="Narrower peaks (from leaving the baseline to "
+                         "coming back) are ignored.")
+    st.markdown("**⚡ Energy**")
+    e1, e2 = st.columns(2)
+    e1.selectbox("y is a force in", BT_FORCE_UNITS, key=key("fu"),
+                 help="For the spring energy F²/2k. Read from the y column's "
+                      "name when it says (e.g. Force (µN)).")
+    e2.number_input("Spring constant k (N/m)", key=key("k"), min_value=0.0,
+                    format="%.6g",
+                    help="The cantilever's. With it, each peak's spring "
+                         "energy F²/2k (F its height from the baseline), "
+                         "each full beat's (both peaks) and the total. "
+                         "0: areas only.")
+    st.caption("Areas are ∫(y − baseline) dx over each peak: "
+               + (f"{unit}·{bta.unit_of(s.get(key('x'))) or 'x'}"
+                  if unit else "y × x") + " (an impulse for force × time).")
+
+
+def bt_plot(sid, got):
+    """The plot, what the mouse does on it, and a drag or click acted on."""
+    s = st.session_state
+    m1, m2 = st.columns([4, 1])
+    if s.get("bt_mouse") not in BT_MOUSE:
+        s["bt_mouse"] = BT_MOUSE[0]
+    mouse = m1.segmented_control(
+        "The mouse on the plot", BT_MOUSE, key="bt_mouse",
+        label_visibility="collapsed",
+        help="━ Baseline / Upper line / Lower line: drag across the plot "
+             "at the height the line should be. ✕ Leave out / put back: "
+             "click a peak to leave it out of the beats (click again to "
+             "put it back).") or BT_MOUSE[0]
+    with m2.popover("🎨 Plot", **STRETCH):
+        st.slider("Height", 250, 900, step=10, key="bt_height")
+        st.slider("Line thickness", 0.5, 4.0, step=0.1, key="bt_lw")
+        st.color_picker("Signal", key="bt_col")
+        st.color_picker("Positive peaks", key="bt_pcol")
+        st.color_picker("Negative peaks", key="bt_ncol")
+        st.toggle("Number the beats", key="bt_numbers")
+        st.toggle("Shade each full beat", key="bt_shade")
+    drawing = mouse in BT_MOUSE[1:4]
+    clicking = mouse == BT_MOUSE[4]
+    fig = bta.beat_figure(
+        got["x"], got["y"], got["base"], got["up"], got["down"],
+        got["kept"], got["beats"], left_out=got["left_out"],
+        colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
+        x_title=got["xcol"], y_title=got["ycol"], height=s["bt_height"],
+        line_width=s["bt_lw"], numbers=s["bt_numbers"],
+        shade_beats=s["bt_shade"], clickable=clicking)
+    if drawing:
+        fig.update_layout(
+            dragmode="lasso",
+            newselection=dict(line=dict(color="#333", width=2, dash="dash")),
+            activeselection=dict(fillcolor="rgba(0,0,0,0)", opacity=1))
+        fig.update_xaxes(showspikes=True, spikemode="across",
+                         spikesnap="cursor", spikedash="solid",
+                         spikecolor="#555", spikethickness=1)
+        fig.update_yaxes(showspikes=True, spikemode="across",
+                         spikesnap="cursor", spikedash="solid",
+                         spikecolor="#555", spikethickness=1)
+    config = {"scrollZoom": True, "displaylogo": False,
+              "toImageButtonOptions": {
+                  "filename": sc_db_safe(s["_bt_sets"][sid]["name"])
+                  + "_beats"}}
+    ver = int(s.get("_bt_chart_ver", 0))
+    if drawing:
+        event = st.plotly_chart(fig, key=f"btc_{ver}_draw", config=config,
+                                on_select="rerun", selection_mode=("lasso",),
+                                **STRETCH)
+        strokes = lasso_strokes(event)
+        if strokes:
+            ys = [float(v) for v in strokes[-1]["y"]]
+            s["_bt_pending"] = (sid, mouse, float(np.median(ys)),
+                                got["base"])
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
+        st.caption(f"Drag across the plot at the height of the "
+                   f"{mouse[2:].lower()}.")
+    elif clicking:
+        event = st.plotly_chart(fig, key=f"btc_{ver}_click", config=config,
+                                on_select="rerun", selection_mode="points",
+                                **STRETCH)
+        try:
+            points = list(event.selection.points or [])
+        except Exception:
+            points = []
+        if points:
+            at = float(points[-1]["x"])
+            hit = [e for e in got["events"] if e["start"] <= at <= e["end"]]
+            if not hit and got["events"]:
+                hit = [min(got["events"],
+                           key=lambda e: abs(e["peak_x"] - at))]
+            marks = list(s.get(f"_bt_out_{sid}") or [])
+            for e in hit[:1]:
+                inside = [m for m in marks if e["start"] <= m <= e["end"]]
+                if inside:
+                    marks = [m for m in marks if m not in inside]
+                else:
+                    marks.append(e["peak_x"])
+            s[f"_bt_out_{sid}"] = marks
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
+        st.caption("Click a peak to leave it out (✕); click it again to "
+                   "put it back.")
+    else:
+        st.plotly_chart(fig, key=f"btc_{ver}", config=config, **STRETCH)
+
+
+def bt_results(sid, got):
+    """The numbers: at a glance, then every beat."""
+    s = st.session_state
+    info = got["info"]
+    area_unit = (f"{got['y_unit']}·{got['x_unit']}"
+                 if got["y_unit"] and got["x_unit"] else "")
+    cols = st.columns(4)
+    cols[0].metric("Full beats", info["Full beats"])
+    cols[1].metric("Positive only", info["Positive only"])
+    cols[2].metric("Negative only", info["Negative only"])
+    cols[3].metric("Beats per minute",
+                   f"{info['Beat rate (per minute)']:.3g}"
+                   if "Beat rate (per minute)" in info else "–")
+    cols = st.columns(4)
+    pos, neg = info["Positive area, total"], info["Negative area, total"]
+    cols[0].metric(f"Positive area, total ({area_unit or 'area'})",
+                   f"{pos[0]:.4g}")
+    cols[1].metric(f"Negative area, total ({area_unit or 'area'})",
+                   f"{neg[0]:.4g}")
+    if "Total area per full beat" in info:
+        mean, sd, _ = info["Total area per full beat"]
+        cols[2].metric("Area per full beat", f"{mean:.4g} ± {sd:.2g}")
+    if "Spring energy, total" in info:
+        total, unit = info["Spring energy, total"]
+        cols[3].metric(f"Spring energy, total ({unit})", f"{total:.4g}")
+        if "Spring energy per full beat" in info:
+            mean, sd, unit = info["Spring energy per full beat"]
+            st.caption(f"Spring energy per full beat: {mean:.4g} ± "
+                       f"{sd:.2g} {unit} (F²/2k of its positive and "
+                       f"negative peaks, k = {got['k']:.4g} N/m).")
+    elif got["newtons"] is None:
+        cols[3].caption("Spring energy: set y as a force (⚡ Energy).")
+    else:
+        cols[3].caption("Spring energy: type the spring constant k "
+                        "(⚡ Energy).")
+    if "Time between beats" in info:
+        mean, sd, unit = info["Time between beats"]
+        st.caption(f"Time between beats: {mean:.4g} ± {sd:.2g}"
+                   + (f" {unit}" if unit else "")
+                   + (f" · {len(got['left_out'])} peak"
+                      f"{'s' if len(got['left_out']) != 1 else ''} left out"
+                      if got["left_out"] else ""))
+    table = got["table"]
+    if table.empty:
+        st.info("No peak gets past the lines: move them closer to the "
+                "baseline (〰 The lines), or drag them on the plot.")
+        return
+    # blank where a beat has no such peak (the CSV keeps them empty too)
+    st.dataframe(table.astype(object).where(table.notna(), ""),
+                 hide_index=True, **STRETCH)
+    name = sc_db_safe(s["_bt_sets"][sid]["name"])
+    d1, d2 = st.columns(2)
+    d1.download_button("💾 Beats (CSV)", table.to_csv(index=False)
+                       .encode("utf-8"), file_name=f"{name}_beats.csv",
+                       mime="text/csv", key=f"btb_csv_{sid}", **STRETCH)
+    d2.download_button("💾 Summary (CSV)", bt_summary_frame([sid]).to_csv(
+        index=False).encode("utf-8"), file_name=f"{name}_summary.csv",
+                       mime="text/csv", key=f"btb_sum_{sid}", **STRETCH)
+
+
+def bt_summary_frame(ids):
+    """One row per signal: its counts, totals, means and rate."""
+    s = st.session_state
+    rows = []
+    for sid in ids:
+        got = bt_analyse(sid)
+        if got is None:
+            continue
+        row = {"Signal": s["_bt_sets"][sid]["name"], "y": got["ycol"]}
+        for name, value in got["info"].items():
+            if isinstance(value, tuple):
+                unit = value[-1]
+                label = f"{name} ({unit})" if unit else name
+                row[label] = value[0]
+                if len(value) == 3:
+                    row[f"{name}, SD"] = value[1]
+            else:
+                row[name] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def beat_tab():
+    s = st.session_state
+    for key, value in (("bt_height", 420), ("bt_lw", 1.4),
+                       ("bt_col", "#222222"),
+                       ("bt_pcol", bta.POS_COLOUR),
+                       ("bt_ncol", bta.NEG_COLOUR),
+                       ("bt_numbers", True), ("bt_shade", False)):
+        s.setdefault(key, value)
+    # every signal's settings kept while another one is shown
+    for key in [k for k in list(s.keys()) if str(k).startswith("bt_")]:
+        s[key] = s[key]
+    sets = s.setdefault("_bt_sets", {})
+    left, right = st.columns([1, 2.5], gap="medium")
+    with left:
+        upkey = f"btf_{int(s.get('_bt_upver', 0) or 0)}"
+        st.file_uploader("Add a file (CSV, TXT or Excel)",
+                         type=["csv", "tsv", "txt", "xlsx", "xls"],
+                         key=upkey, on_change=bt_add_upload, args=(upkey,),
+                         help="Or send a plot here with 📊 Send to analysis, "
+                              "from the video, AFM output and Single force "
+                              "curve tabs, or from a file on Stack & "
+                              "compare or Series.")
+        note = s.pop("_bt_note", None)
+        if note:
+            st.warning(note)
+    if not sets:
+        with right:
+            st.info("Send a signal here with **📊 Send to analysis** (video, "
+                    "AFM output and Single force curve tabs, or a file on "
+                    "📚 Stack & compare or 🔗 Series), or add a file on the "
+                    "left. Then set a baseline and two lines: the peaks past "
+                    "them are found, their areas taken, and paired into "
+                    "beats.", icon="💓")
+        return
+    ids = list(sets)
+    if s.get("bt_pick") not in ids:
+        s["bt_pick"] = ids[-1]
+    sid = s["bt_pick"]
+    bt_apply_pending(sid)
+    with left:
+        p1, p2 = st.columns([4, 1], vertical_alignment="bottom")
+        p1.selectbox("Signal", ids, key="bt_pick",
+                     format_func=lambda k: sets[k]["name"])
+        p2.button("🗑", key="btb_del", on_click=bt_remove, args=(sid,),
+                  help="Remove this signal from the tab.", **STRETCH)
+        st.caption(f"From {sets[sid]['source']}.")
+    got = bt_analyse(sid)
+    with left:
+        if got is None:
+            st.error("This table needs two columns of numbers.")
+            return
+        bt_settings(sid, got)
+    with right:
+        bt_plot(sid, got)
+        bt_results(sid, got)
+        if len(ids) > 1:
+            with st.expander(f"📋 All {len(ids)} signals side by side"):
+                frame = bt_summary_frame(ids)
+                st.dataframe(frame, hide_index=True, **STRETCH)
+                st.download_button(
+                    "💾 All signals (CSV)", frame.to_csv(index=False)
+                    .encode("utf-8"), file_name="beats_all_signals.csv",
+                    mime="text/csv", key="btb_all", **STRETCH)
+
+
+with tab_beats:
+    section("Beat analysis: peaks, areas and energy per beat")
+    if bta is None or BEAT_ERROR:
+        st.error("This tab needs **beat_analysis.py** beside app.py"
+                 + (f" ({BEAT_ERROR})." if BEAT_ERROR else "."), icon="🚫")
+    elif sc is None or STACK_ERROR:
+        st.error("This tab needs **stack_compare.py** beside app.py.",
+                 icon="🚫")
+    elif not outdated_notice("beat_analysis.py"):
+        beat_tab()
 
 
 # ------------------------------------------------ settings kept offstage --
