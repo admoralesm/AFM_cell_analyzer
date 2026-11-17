@@ -30515,7 +30515,10 @@ def sc_slot(i, n=3):
              "type, the peak, the lowest point, a level crossing, or the "
              "contact point (where the signal leaves the baseline set "
              "under 〰 Baseline). With **🎯 Set zero** chosen above the "
-             "plot, a click on the plot sets it too.")
+             "plot, a click on the plot sets it too."
+             + (" In the series the file starts at its zero: what comes "
+                "before it is left out (Start of the data keeps all of "
+                "it)." if sc_is_series() else ""))
     if mode == "A value I type":
         z2.number_input("at x =", key=f"{SCP}zval{i}", format="%.6g",
                         value=float(s.get(f"{SCP}zval{i}", 0.0) or 0.0)
@@ -30527,7 +30530,12 @@ def sc_slot(i, n=3):
     z3.number_input(
         "then move by", key=f"{SCP}shift{i}", format="%.6g",
         value=None if f"{SCP}shift{i}" in s else 0.0,
-        help="Slides the trace along x after its zero is set (negative = "
+        help="In the series: positive starts the file that much before "
+             "its zero (the zero moment then sits that far into its place; "
+             "before its first point, the rest is left empty), negative "
+             "leaves out that much more of its start."
+             if sc_is_series() else
+             "Slides the trace along x after its zero is set (negative = "
              "left), so the zero can sit before the trace starts.")
     # how it looks
     t1, t2 = st.columns(2)
@@ -30612,6 +30620,13 @@ def sc_slot(i, n=3):
                 if contact is not None else
                 " · ⚠️ no departure found: widen the baseline window or "
                 "lower k")
+    if sc_is_series() and len(x_all):
+        before = np.isfinite(x_all) & (x_all < zero - shift)
+        if np.nanmax(x_all) <= zero - shift:
+            note += " · ⚠️ its zero is past its last point: all of it is shown"
+        elif before.any():
+            note += (f" · starts in the series at its zero ({before.sum():,}"
+                     " pts before it left out)")
     st.caption(f"{len(x_all):,} pts · x {np.nanmin(x_all):.4g} to "
                f"{np.nanmax(x_all):.4g} · zero at {zero:.4g}"
                + (f", moved {shift:+.4g}" if shift else "") + note
@@ -31123,19 +31138,16 @@ def sc_series_controls(traces):
                       or "automatic",
                       help="One title for the right y axis (files with "
                            "Own right axis on).")
-    if s.get(f"{SCP}srstart") not in sc.SERIES_STARTS:
-        s[f"{SCP}srstart"] = sc.SERIES_STARTS[0]
     g1, g2 = st.columns(2)
     g1.number_input(
         "Gap between files", min_value=0.0, key=f"{SCP}srgap",
         format="%.6g", step=None,
         help="Empty x between one file's end and the next file's start, "
              "in x units (seconds for time). 0: end to end.")
-    g2.selectbox(
-        "x = 0 of the series", sc.SERIES_STARTS, key=f"{SCP}srstart",
-        help="The first file's start: the series' x counts from where it "
-             "begins. The first file's zero: the first file keeps its own x "
-             "(its zero, set under its Zero of x, stays at 0).")
+    g2.caption("Each file starts at its **zero** (📂 Files › Zero of x "
+               "at, or 🎯 Set zero on the plot): what comes before it is "
+               "left out. Its **then move by** starts it that much earlier "
+               "(or, negative, later).")
     h1, h2, h3 = st.columns(3)
     h1.toggle("Dividers", key=f"{SCP}srsep",
               help="A dotted line between one file and the next.")
@@ -31797,7 +31809,7 @@ def sc_panel():
         # lines still land on the file's own x
         traces = sc.series_layout(
             traces, gap=float(s.get(f"{SCP}srgap") or 0.0),
-            start=s.get(f"{SCP}srstart", sc.SERIES_STARTS[0]))
+            start=sc.SERIES_STARTS[0], from_zero=True)
     with t_axes:
         sc_axes_controls(traces)
     with t_look:
