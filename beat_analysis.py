@@ -22,9 +22,15 @@ NEG_COLOUR = "#1F77B4"
 # what one unit of a force is in newtons
 NEWTONS = {"N": 1.0, "mN": 1e-3, "µN": 1e-6, "μN": 1e-6, "uN": 1e-6,
            "nN": 1e-9, "pN": 1e-12}
+# what one unit of a deflection is in metres
+METRES = {"m": 1.0, "mm": 1e-3, "µm": 1e-6, "μm": 1e-6, "um": 1e-6,
+          "nm": 1e-9, "pm": 1e-12}
 ENERGY_PREFIXES = ((1.0, "J"), (1e-3, "mJ"), (1e-6, "µJ"), (1e-9, "nJ"),
                    (1e-12, "pJ"), (1e-15, "fJ"), (1e-18, "aJ"),
                    (1e-21, "zJ"))
+ENERGY_UNITS = tuple(unit for _, unit in ENERGY_PREFIXES)
+FORCE_PREFIXES = ((1.0, "N"), (1e-3, "mN"), (1e-6, "µN"), (1e-9, "nN"),
+                  (1e-12, "pN"), (1e-15, "fN"))
 
 
 def unit_of(label):
@@ -34,10 +40,28 @@ def unit_of(label):
     return found.group(1).strip() if found else ""
 
 
-def newtons_per_unit(unit):
-    """How many newtons one unit of the signal is, or None when it is not
-    a force."""
-    return NEWTONS.get(str(unit or "").strip())
+def newtons_per_unit(unit, k=None, invols=None):
+    """
+    How many newtons one unit of the signal is. A force: its own size. A
+    deflection of the cantilever (m, µm, nm, pm): k × its size in metres,
+    since F = k·δ. Volts on the photodiode: k × InvOLS (nm/V) × 1e-9.
+    None when it is not a force, or cannot be made one without k (or
+    InvOLS).
+    """
+    unit = str(unit or "").strip()
+    if unit in NEWTONS:
+        return NEWTONS[unit]
+    if k is None or not float(k) > 0:
+        return None
+    if unit in METRES:
+        return float(k) * METRES[unit]
+    if unit == "V" and invols is not None and float(invols) > 0:
+        return float(k) * float(invols) * 1e-9
+    return None
+
+
+def is_force(unit):
+    return str(unit or "").strip() in NEWTONS
 
 
 def energy_scale(values):
@@ -52,6 +76,28 @@ def energy_scale(values):
         if typical >= factor:
             return factor, unit
     return ENERGY_PREFIXES[-1]
+
+
+def energy_factor(e_unit=None, energies=()):
+    """(factor, unit) for energies in J: the unit asked for (one of
+    ENERGY_UNITS), or the one that fits these energies when none is."""
+    for factor, unit in ENERGY_PREFIXES:
+        if unit == e_unit:
+            return factor, unit
+    return energy_scale(energies)
+
+
+def force_scale(values):
+    """(factor, unit) that shows these forces (in N) as numbers near 1."""
+    values = np.abs(np.asarray([v for v in values if v is not None], float))
+    values = values[np.isfinite(values) & (values > 0)]
+    if not values.size:
+        return 1.0, "N"
+    typical = float(np.median(values))
+    for factor, unit in FORCE_PREFIXES:
+        if typical >= factor:
+            return factor, unit
+    return FORCE_PREFIXES[-1]
 
 
 def smooth(y, points=1):
@@ -241,7 +287,8 @@ def spring_energy(height, k, newtons):
     return force * force / (2.0 * float(k))
 
 
-def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None):
+def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
+               e_unit=None):
     """
     One row per beat: its kind, when it starts and ends, the positive
     peak's height and area, the negative peak's depth and area, the net and
@@ -258,7 +305,7 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None):
             if b[side] is not None:
                 energies.append(spring_energy(abs(b[side]["peak"]), k,
                                               newtons))
-    factor, e_unit = energy_scale(energies)
+    factor, e_unit = energy_factor(e_unit, energies)
     rows = []
     previous = None
     for b in beats:
@@ -296,7 +343,7 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None):
 
 
 def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
-            per_minute=None):
+            per_minute=None, e_unit=None):
     """
     The whole recording at a glance: how many beats of each kind, the
     total and mean (± SD) areas, the mean time between beats and the beat
@@ -312,6 +359,7 @@ def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else ""
     out["Positive area, total"] = (sum(e["area"] for e in pos), area_unit)
     out["Negative area, total"] = (sum(e["area"] for e in neg), area_unit)
+    out["Net area, total"] = (sum(e["area"] for e in pos + neg), area_unit)
     full = [b for b in beats if b["kind"] == KINDS[0]]
     per_beat = [b["pos"]["area"] - b["neg"]["area"] for b in full]
     if per_beat:
@@ -332,8 +380,17 @@ def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
         energies = [spring_energy(abs(e["peak"]), k, newtons)
                     for e in pos + neg]
         total = float(sum(e for e in energies if e is not None))
-        factor, unit = energy_scale(energies)
+        factor, unit = energy_factor(e_unit, energies)
         out["Spring energy, total"] = (total / factor, unit)
+        for name, side in (("positive", pos), ("negative", neg)):
+            out[f"Spring energy, {name} peaks"] = (
+                float(sum(spring_energy(abs(e["peak"]), k, newtons)
+                          for e in side)) / factor, unit)
+        each = [e / factor for e in energies if e is not None]
+        if each:
+            out["Spring energy per peak"] = (
+                float(np.mean(each)),
+                float(np.std(each, ddof=1)) if len(each) > 1 else 0.0, unit)
         beat_energy = [(spring_energy(abs(b["pos"]["peak"]), k, newtons)
                         + spring_energy(abs(b["neg"]["peak"]), k, newtons))
                        / factor for b in full]
@@ -343,6 +400,52 @@ def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
                 float(np.std(beat_energy, ddof=1))
                 if len(beat_energy) > 1 else 0.0, unit)
     return out
+
+
+def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
+               e_unit=None):
+    """
+    One row per peak integrated (each peak in the beats), in time order:
+    its sign, the beat it belongs to, where it starts, peaks and ends, its
+    height above (or depth below) the baseline and its integral
+    ∫(y − baseline) dx, trapezoid by trapezoid from where it leaves the
+    baseline to where it comes back. When y is a deflection made a force
+    (``newtons`` per unit), the force at the peak and ∫F dx too. With k,
+    the energy: ∫F dδ from the baseline to the peak with δ = F/k, which
+    comes to F²/2k.
+    """
+    peaks = []
+    for b in beats:
+        for side in ("pos", "neg"):
+            if b[side] is not None:
+                peaks.append((b[side], b))
+    peaks.sort(key=lambda pair: pair[0]["start"])
+    xu = f" ({x_unit})" if x_unit else ""
+    yu = f" ({y_unit})" if y_unit else ""
+    area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else "y·x"
+    as_force = bool(newtons) and not is_force(y_unit)
+    f_factor, f_unit = force_scale(
+        [abs(e["peak"]) * newtons for e, _ in peaks] if as_force else [])
+    energies = [spring_energy(abs(e["peak"]), k, newtons) for e, _ in peaks]
+    e_factor, e_name = energy_factor(e_unit, energies)
+    rows = []
+    for n, ((e, b), energy) in enumerate(zip(peaks, energies), start=1):
+        row = {"Peak": n, "Sign": "+" if e["sign"] > 0 else "−",
+               "Beat": b["n"], "Beat kind": b["kind"],
+               f"Starts{xu}": e["start"], f"Peaks at{xu}": e["peak_x"],
+               f"Ends{xu}": e["end"], f"Width{xu}": e["width"],
+               f"Height{yu}": e["peak"],
+               f"∫(y − baseline) dx ({area_unit})": e["area"]}
+        if as_force:
+            row[f"Force at the peak ({f_unit})"] = (
+                e["peak"] * newtons / f_factor)
+            row[f"∫F dx ({f_unit}·{x_unit or 'x'})"] = (
+                e["area"] * newtons / f_factor)
+        if k and newtons:
+            row[f"Energy F²/2k ({e_name})"] = (
+                energy / e_factor if energy is not None else np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _rgba(hex_colour, alpha):
