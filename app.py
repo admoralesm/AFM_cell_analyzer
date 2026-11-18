@@ -570,6 +570,15 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     bta = None
     BEAT_ERROR = str(exc)
 
+# The Fourier tab: spectra, peaks, spectrogram, band-pass.
+try:
+    import fourier as ftr
+
+    FOURIER_ERROR = ""
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    ftr = None
+    FOURIER_ERROR = str(exc)
+
 # The Single force curve tab: one force recording against time.
 try:
     import force_curve as fcv
@@ -644,17 +653,21 @@ COMPANION_NEEDS = {
                          "peak_table", "energy_factor", "ENERGY_UNITS"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
+    "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
+                   "bandpass", "seconds_per"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
 fcv = _current(fcv, *COMPANION_NEEDS["force_curve.py"])
 bta = _current(bta, *COMPANION_NEEDS["beat_analysis.py"])
 ai = _current(ai, *COMPANION_NEEDS["afm_images.py"])
+ftr = _current(ftr, *COMPANION_NEEDS["fourier.py"])
 OUTDATED = [name for name, module in (("auto_analysis.py", aa),
                                       ("stack_compare.py", sc),
                                       ("force_curve.py", fcv),
                                       ("beat_analysis.py", bta),
-                                      ("afm_images.py", ai))
+                                      ("afm_images.py", ai),
+                                      ("fourier.py", ftr))
             if module is not None
             and any(not _has_name(module, n) for n in COMPANION_NEEDS[name])]
 
@@ -1021,10 +1034,10 @@ def hint(text: str):
 
 DEFAULTS = {
     # display
-    "force_unit": "N",
+    "force_unit": "μN",
     # The piecewise plot's own force unit, separate from the page's, so the
     # graph can be read in newtons without changing every table.
-    "pw_force_unit": "N",
+    "pw_force_unit": "μN",
     # What the plot draws besides the data and the fit. All on by default;
     # a figure for a paper usually wants most of them off.
     # The default picture is the curve, the fit and what each component
@@ -1284,7 +1297,7 @@ DEFAULTS = {
     "ai_invols": 50.0,
     "ai_sp": 0.0,
     "ai_subsp": False,
-    "ai_funit": "Best fit",
+    "ai_funit": "µN",
     "ai_bl1": "None",
     "ai_bl2": "None",
     "ai_mult1": "1",
@@ -3586,7 +3599,7 @@ def replace_style(style, **changes):
 
 def with_force_unit(style, force_N=None):
     """The same style with the piecewise plot's own force unit applied."""
-    want = st.session_state.get("pw_force_unit", "N")
+    want = st.session_state.get("pw_force_unit", "μN")
     if want == "auto":
         want = (autoscale_unit(force_N)
                 if force_N is not None and np.size(force_N) else "nN")
@@ -8576,10 +8589,11 @@ def eq1_panel(epsilon, force_N, model, result=None, style=None):
                       if np.isfinite(fit["eps_star"]) else "n/a")
             m4.caption("where the two laws carry equal load")
 
-        unit = (style.force_unit if style is not None and
-                getattr(style, "force_unit", None) in ("pN", "nN", "µN", "N")
-                else "nN")
-        scale = {"pN": 1e-12, "nN": 1e-9, "µN": 1e-6, "N": 1.0}[unit]
+        unit = {"μN": "µN"}.get(getattr(style, "force_unit", None),
+                                getattr(style, "force_unit", None))
+        unit = unit if unit in ("pN", "nN", "µN", "mN", "N") else "µN"
+        scale = {"pN": 1e-12, "nN": 1e-9, "µN": 1e-6, "mN": 1e-3,
+                 "N": 1.0}[unit]
         st.plotly_chart(eq1_curve_figure(fit, epsilon, force_N, unit, scale),
                         key="eq1_curve", **STRETCH)
         g1, g2 = st.columns(2)
@@ -11076,6 +11090,23 @@ def send_to_analysis(name, frame, source="the video", stats=None,
     return sid
 
 
+def send_to_fourier(name, frame, source="the video", stats=None,
+                    zero_mode=None, lines=None, meta=None):
+    """Put a table on the 〰 Fourier tab, picked there at once. Takes the
+    same arguments as send_to_stack."""
+    s = st.session_state
+    sets = s.setdefault("_ft_sets", {})
+    s["_ft_n"] = int(s.get("_ft_n", 0) or 0) + 1
+    sid = f"f{s['_ft_n']}"
+    sets[sid] = {"name": str(name), "frame": frame.copy(),
+                 "source": str(source), "meta": dict(meta or {})}
+    s["ft_pick"] = [f"ft:{sid}"]
+    s["_vq_sent_note"] = (f"Sent to Fourier as “{name}”. Open that tab to "
+                          "see its spectrum.")
+    s["_ai_sent_note"] = s["_vq_sent_note"]
+    return sid
+
+
 def _send_here(name, frame, source, stats, zero_mode, lines, meta=None):
     s = st.session_state
     if frame is None:
@@ -11097,8 +11128,9 @@ def _send_here(name, frame, source, stats, zero_mode, lines, meta=None):
                            "meta": dict(meta or {})}
     # the file's own spring constant (and deflection unit) for its peaks
     # in force, not the last one typed for another file
-    for key in ("pkk", "pkdu"):
+    for key in ("pkk", "pkdu", "yfu"):
         s.pop(f"{SCP}{key}{free}", None)
+    s.pop(f"_{SCP}yfu_was{free}", None)
     if (meta or {}).get("k"):
         s[f"{SCP}pkk{free}"] = float(meta["k"])
     if (meta or {}).get("y_unit") in ("nm", "µm", "m"):
@@ -17030,12 +17062,10 @@ def piecewise_section(model, epsilon, force_N, rupture):
                              horizontal=True, label_visibility="collapsed")
                 with v2:
                     st.selectbox(
-                        "Force unit", ["N"] + [u for u in FORCE_UNITS
-                                               if u != "N"] + ["auto"],
+                        "Force unit", ["μN"] + [u for u in FORCE_UNITS
+                                                if u != "μN"] + ["auto"],
                         key="pw_force_unit", label_visibility="collapsed",
-                        help="Newtons by default, with the ticks in "
-                             "scientific notation so zooming in never turns "
-                             "1e-8 into “10n”. “auto” picks the unit that "
+                        help="µN by default. “auto” picks the unit that "
                              "keeps the peak between 1 and 1000.",
                     )
                 with v3:
@@ -22781,8 +22811,8 @@ SHOW_DATABASE_TAB = False
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_force,
-    tab_igor, tab_fitting, tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_fourier,
+    tab_force, tab_igor, tab_fitting, tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
@@ -22790,6 +22820,7 @@ SHOW_DATABASE_TAB = False
         "📚 Stack & compare",
         "🔗 Series",
         "💓 Beat analysis",
+        "〰 Fourier",
         "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
@@ -22797,7 +22828,7 @@ SHOW_DATABASE_TAB = False
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 8
+FITTING_TAB_NUMBER = 9
 
 with tab_fitting:
     (
@@ -22825,7 +22856,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((9, SHOW_VIDEO_TAB), (10, SHOW_DATABASE_TAB))
+    index for index, wanted in ((10, SHOW_VIDEO_TAB), (11, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -26829,7 +26860,8 @@ FC_LINE_STYLES = ("Dashed", "Dotted", "Solid")
 FC_NO_TIME = "(none: use a sampling rate)"
 FC_SIDE_KEYS = {"before": ("fc_mvb", "fc_rtb"), "after": ("fc_mva", "fc_rta")}
 # the force can be shown in nN, µN or pN: what one nN is in each
-FC_YUNITS = {"nN": 1.0, "µN": 1e-3, "pN": 1e3}
+# per nN: the force is shown in µN unless changed
+FC_YUNITS = {"µN": 1e-3, "nN": 1.0, "N": 1e-9}
 # bars along the top marking the stretches of the recording: (key, label,
 # colour, shown at first)
 FC_BARS = (("app", "Approach", "#7B1FA2", True),
@@ -26850,7 +26882,7 @@ FC_DEFAULTS = {"fc_base": True, "fc_corr": "None", "fc_shape": "Sloped",
                "fc_zero": "As recorded", "fc_pad0": 0.0, "fc_pad1": 0.0,
                "fc_view": "Corrected", "fc_under": True,
                "fc_mvb": 0.0, "fc_rtb": 0.0, "fc_mva": 0.0, "fc_rta": 0.0,
-               "fc_yunit": "nN", "fc_snap": True, "fc_level": True,
+               "fc_yunit": "µN", "fc_snap": True, "fc_level": True,
                "fc_bars": False, "fc_bar_w": 4.0, "fc_draws": FC_DRAWS[0],
                "fc_bar_labels": True, "fc_new_col": "#444444"}
 
@@ -26907,8 +26939,8 @@ def fc_yunit_change():
     """Shown in another unit: what is kept in force units (the side lines'
     moves and turns, the lines drawn) is converted, so nothing moves."""
     s = st.session_state
-    old = s.get("_fc_yunit_was") or "nN"
-    new = s.get("fc_yunit") or "nN"
+    old = s.get("_fc_yunit_was") or "µN"
+    new = s.get("fc_yunit") or "µN"
     s["_fc_yunit_was"] = new
     factor = FC_YUNITS.get(new, 1.0) / FC_YUNITS.get(old, 1.0)
     if factor == 1.0:
@@ -26928,7 +26960,7 @@ def fc_send_unit_change():
     """Send in, below the numbers: the tab is shown in that unit too, so
     the plot shows what is sent."""
     s = st.session_state
-    s["fc_yunit"] = s.get("fc_send_unit") or "nN"
+    s["fc_yunit"] = s.get("fc_send_unit") or "µN"
     fc_yunit_change()
 
 
@@ -27022,7 +27054,7 @@ def fc_signal(item):
         return None
     if ylab == "Force (nN)":
         if s.get("fc_yunit") not in FC_YUNITS:
-            s["fc_yunit"] = "nN"
+            s["fc_yunit"] = "µN"
         s.setdefault("_fc_yunit_was", s["fc_yunit"])
         shown_in = c5.selectbox(
             "Force in", tuple(FC_YUNITS), key="fc_yunit",
@@ -28310,7 +28342,7 @@ def fc_results(t, m, ylab, stem):
             r1, r0, q1, q2 = st.columns([1.3, 0.8, 1.0, 1.0])
             # the same choice as "Force in" at the top: the plot here
             # shows what is sent
-            s["fc_send_unit"] = s.get("fc_yunit") or "nN"
+            s["fc_send_unit"] = s.get("fc_yunit") or "µN"
             r0.selectbox("Send in", tuple(FC_YUNITS), key="fc_send_unit",
                          on_change=fc_send_unit_change,
                          help="The force unit of the curve sent to the "
@@ -28367,7 +28399,7 @@ def fc_results(t, m, ylab, stem):
                           "dash": "Solid", "colour": bar["colour"],
                           "width": bar["width"], "caps": True,
                           "text": bar["text"]})
-        r2, r2b, r2c, r3 = st.columns(4)
+        r2, r2b, r2c, r2d, r3 = st.columns(5)
         # the balloon on the stack: the essentials only, so it does not
         # cover the plot
         wanted = ("Curve starts at", "Curve ends at", "Peak force",
@@ -28397,6 +28429,10 @@ def fc_results(t, m, ylab, stem):
                    on_click=send_to_analysis, args=sent, kwargs=sent_meta,
                    help="Time and force to the Beat analysis tab: its "
                         "peaks, their areas, beats and energy.", **STRETCH)
+        r2d.button("〰 Send to Fourier", key="fc_send_ft",
+                   on_click=send_to_fourier, args=sent, kwargs=sent_meta,
+                   help="Time and force to the Fourier tab: the "
+                        "frequencies it is made of.", **STRETCH)
         r3.download_button("💾 Save as CSV", key="fc_csv",
                            data=lambda: table.to_csv(index=False).encode(),
                            file_name=f"{stem}_force_vs_time.csv",
@@ -29418,7 +29454,7 @@ def ai_files_panel():
     return upload.name, item
 
 
-AI_FORCE_SHOW = ("Best fit",) + FORCE_SHOWN
+AI_FORCE_SHOW = ("µN", "nN", "N", "Best fit")
 AI_CONVERT_HELP = (
     "Defl → force (unit as stored): reads how the file stores the "
     "deflection. Asylum saves it in metres (10 nm is stored as 1e-8), so "
@@ -29658,8 +29694,9 @@ def ai_panel():
         if st.session_state.get("ai_funit") not in AI_FORCE_SHOW:
             st.session_state["ai_funit"] = AI_FORCE_SHOW[0]
         k5.selectbox("Force unit", AI_FORCE_SHOW, key="ai_funit",
-                     help="Best fit: N, µN or nN, whichever shows the "
-                          "force best (each plot its own).")
+                     help="µN unless changed. Best fit: N, µN or nN, "
+                          "whichever shows the force best (each plot its "
+                          "own).")
         k_n, iv_n, sp_n = ai.note_calibration(nd)
         said = ai_cal_meta(name, nd)
         found = ", ".join(
@@ -30067,6 +30104,14 @@ def ai_quick_line_controls(two):
               on_change=axis)
 
 
+def ai_send_to_fourier(tables):
+    """Each plot as its own signal on the Fourier tab, all picked."""
+    keys = []
+    for name, frame, _stats, meta in tables:
+        keys.append(f"ft:{send_to_fourier(name, frame, source='AFM output analysis', meta=meta)}")
+    st.session_state["ft_pick"] = keys
+
+
 def ai_send_to_analysis(tables):
     """Each plot as its own signal on the Beat analysis tab, with its
     file's own cantilever."""
@@ -30151,8 +30196,8 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None,
                        ai_trace_stats(x, y, units[which], channel),
                        dict(meta or {}, y_unit=units[which],
                             channel=channel)))
-    note_col, send_col, series_col, beat_col = st.columns(
-        [3.0, 1.15, 1.15, 1.15])
+    note_col, send_col, series_col, beat_col, ft_col = st.columns(
+        [2.2, 1.1, 1.1, 1.25, 1.15])
     send_col.button("📚 Send to stack", key="ai_send_stack",
                     on_click=ai_send_to_stack, args=(tables,),
                     disabled=not tables, **STRETCH,
@@ -30170,6 +30215,12 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None,
                     disabled=not tables, **STRETCH,
                     help="Sends the plotted data (each plot as its own "
                          "signal) to the Beat analysis tab.")
+    ft_col.button("〰 Send to Fourier", key="ai_send_ft",
+                  on_click=ai_send_to_fourier, args=(tables,),
+                  disabled=not tables, **STRETCH,
+                  help="Sends the plotted data (each plot as its own "
+                       "signal) to the Fourier tab: the frequencies it is "
+                       "made of.")
     note = s.pop("_ai_sent_note", None)
     if note:
         note_col.caption(("✅ " if note.startswith("Sent") else "⚠️ ")
@@ -30553,6 +30604,36 @@ def sc_peak_edit(i, raw, flag):
     s[f"{SCP}pkadd{i}"] = added
 
 
+def retitle(name, unit):
+    """The name with this unit in its brackets ('Force (nN)' → 'Force
+    (µN)'), or added when it has none."""
+    name = str(name)
+    if re.search(r"\(([^()]*)\)\s*$", name):
+        return re.sub(r"\(([^()]*)\)\s*$", f"({unit})", name)
+    return f"{name} ({unit})"
+
+
+def sc_force_unit_changed(i):
+    """Another unit for a force file: what is kept in its y units (the
+    peak threshold, a level typed, its y range, its baseline level and
+    points) follows, so nothing moves on the plot."""
+    s = st.session_state
+    new = s.get(f"{SCP}yfu{i}") or "µN"
+    old = s.get(f"_{SCP}yfu_was{i}") or new
+    s[f"_{SCP}yfu_was{i}"] = new
+    ratio = FORCE_NEWTONS[old] / FORCE_NEWTONS[new]
+    if ratio == 1.0:
+        return
+    for key in (f"{SCP}pkh{i}", f"{SCP}zlevel{i}", f"{SCP}blval{i}",
+                f"{SCP}r{i}_y0", f"{SCP}r{i}_y1"):
+        if isinstance(s.get(key), (int, float)) and not isinstance(
+                s.get(key), bool):
+            s[key] = float(s[key]) * ratio
+    points = s.get(f"_{SCP}blpts{i}")
+    if points:
+        s[f"_{SCP}blpts{i}"] = [[p[0], p[1] * ratio] for p in points]
+
+
 def sc_peaks_off(slots):
     """Peak analysis off for these files."""
     for i in slots:
@@ -30606,18 +30687,16 @@ def sc_peak_controls(i, y_all, y_label=""):
                        format="%.4g",
                        help="Peaks closer than this count as one.")
         if force:
-            shown = best_force_unit(ys * FORCE_NEWTONS[force])
-            st.caption(f"Statistics in {shown}: the plot is a force "
-                       f"({force}), shown in whichever of N, µN or nN "
-                       "reads best.")
+            st.caption(f"Statistics in {force}, the plot's unit (change it "
+                       "with Force in, above).")
         else:
             st.radio("Statistics in", ("As plotted", "Force (nN)"),
                      key=f"{SCP}pku{i}", horizontal=True,
                      format_func=lambda v: "Force (k × deflection)"
                      if v.startswith("Force") else v,
                      help="Force: the plotted deflection × the cantilever's "
-                          "spring constant, in N, µN or nN, whichever reads "
-                          "best; the plot stays in its own units.")
+                          "spring constant, in µN; the plot stays in its "
+                          "own units.")
         if not force and s.get(f"{SCP}pku{i}") == "Force (nN)":
             c, d = st.columns(2)
             c.number_input("Spring constant k (N/m)", 0.0001, 1000.0,
@@ -30635,15 +30714,13 @@ def sc_peak_controls(i, y_all, y_label=""):
                   help="Peaks are taken out or added by clicking them on "
                        "the plot with ✎ Edit peaks chosen above it.")
     if force:
-        # a force: in whichever of N, µN or nN reads best
-        unit = best_force_unit(ys * FORCE_NEWTONS[force])
-        factor = FORCE_NEWTONS[force] / FORCE_NEWTONS[unit]
+        # a force: in the plot's own unit (µN unless changed)
+        factor, unit = 1.0, force
     elif s.get(f"{SCP}pku{i}") == "Force (nN)":
-        # deflection × k: nN per plotted unit, then the best unit
+        # deflection × k: nN per plotted unit, given in µN
         per_nn = float(s.get(f"{SCP}pkk{i}", 0.1)) * DEFLECTION_UNITS.get(
             s.get(f"{SCP}pkdu{i}", "µm"), 1.0)
-        unit = best_force_unit(ys * per_nn * 1e-9)
-        factor = per_nn * 1e-9 / FORCE_NEWTONS[unit]
+        factor, unit = per_nn * 1e-9 / FORCE_NEWTONS["µN"], "µN"
     else:
         # as plotted: in the plot's own unit
         factor, unit = 1.0, bta_unit(y_label)
@@ -30838,8 +30915,24 @@ def sc_slot(i, n=3):
     else:
         c3.selectbox("Panel", options, key=f"{SCP}panel{i}",
                      help="Same number = overlaid; different = stacked.")
-    sc_default(f"{SCP}ylab{i}", str(ycol))
-    n1, n2 = st.columns(2)
+    # a force is shown in µN unless changed (its title says so)
+    source = force_unit_of(ycol)
+    if source:
+        if s.get(f"{SCP}yfu{i}") not in FORCE_SHOWN:
+            s[f"{SCP}yfu{i}"] = "µN"
+        s.setdefault(f"_{SCP}yfu_was{i}", s[f"{SCP}yfu{i}"])
+        shown = s[f"{SCP}yfu{i}"]
+        unit_factor = FORCE_NEWTONS[source] / FORCE_NEWTONS[shown]
+        sc_default(f"{SCP}ylab{i}", retitle(ycol, shown))
+        n1, n2, n3 = st.columns([1.25, 1.25, 0.8])
+        n3.selectbox("Force in", ("µN", "nN", "N"), key=f"{SCP}yfu{i}",
+                     on_change=sc_ns(sc_force_unit_changed), args=(i,),
+                     help=f"The file is in {source}; it is plotted (and its "
+                          "statistics given) in this unit.")
+    else:
+        unit_factor = 1.0
+        sc_default(f"{SCP}ylab{i}", str(ycol))
+        n1, n2 = st.columns(2)
     n1.text_input("Name in the legend", key=f"{SCP}label{i}")
     n2.text_input("y axis title", key=f"{SCP}ylab{i}",
                   help="This file's y axis title on the plot. Where files "
@@ -30885,7 +30978,7 @@ def sc_slot(i, n=3):
     xf = float(s.get(f"{SCP}xf{i}") or 1.0)
     yf = float(s.get(f"{SCP}yf{i}") if s.get(f"{SCP}yf{i}") is not None
                else 1.0)
-    x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf)
+    x_all, y_all = sc.prepare(frame, xcol, ycol, xf, yf * unit_factor)
     peaks_on = bool(s.get(f"{SCP}pk{i}"))
     baseline = sc_baseline_controls(i, x_all, mode, y_all, needed=peaks_on)
     u1, u2, u3 = st.columns([0.45, 1.05, 1.05])
@@ -32383,7 +32476,7 @@ BT_MOUSE = ("🔍 Zoom", "━ Baseline", "━ Upper line", "━ Lower line",
 # what y is shown in: a force in N, µN or nN (Best fit: whichever reads
 # best), or not a force at all
 BT_FORCES = FORCE_SHOWN
-BT_SHOW = ("Best fit",) + BT_FORCES + ("Not a force",)
+BT_SHOW = ("µN", "nN", "N", "Best fit", "Not a force")
 BT_ENERGY_UNITS = ("Auto",) + tuple(getattr(bta, "ENERGY_UNITS", ()) or ())
 BT_TENS = {"J": "1 J", "mJ": "10⁻³ J", "µJ": "10⁻⁶ J", "nJ": "10⁻⁹ J",
            "pJ": "10⁻¹² J", "fJ": "10⁻¹⁵ J", "aJ": "10⁻¹⁸ J",
@@ -32536,10 +32629,13 @@ def bt_unit_changed(sid):
     s[f"_bt_scale_{sid}"] = new
 
 
+BT_ENERGY = "aJ"
+
+
 def bt_energy_unit(e_unit=None):
-    """The energy unit asked for (None: the one that fits the numbers)."""
-    chosen = e_unit or st.session_state.get("bt_eunit", "Auto")
-    return chosen if chosen in BT_ENERGY_UNITS[1:] else None
+    """The energy unit: aJ (10⁻¹⁸ J) for every signal, so the results
+    compare and add up in one database."""
+    return e_unit if e_unit in BT_ENERGY_UNITS[1:] else BT_ENERGY
 
 
 def bt_analyse(sid, e_unit=None):
@@ -32744,8 +32840,9 @@ def bt_settings(sid, got):
         "Force in", BT_SHOW, key=key("fu"), on_change=bt_unit_changed,
         args=(sid,),
         format_func=lambda u: f"Best fit ({shown})" if (
-            u == BT_SHOW[0] and shown and s.get(key("fu")) == u) else u,
-        help="Best fit: N, µN or nN, whichever shows the numbers best. "
+            u == "Best fit" and shown and s.get(key("fu")) == u) else u,
+        help="µN unless changed. Best fit: N, µN or nN, whichever shows "
+             "the numbers best. "
              + (f"The data are in {source} (from the column); they are "
                 "shown in the unit chosen." if source else
                 "The column does not say its unit: choose the one y is "
@@ -32799,13 +32896,7 @@ def bt_plot(sid, got):
     drawing = mouse in BT_MOUSE[1:4]
     clicking = mouse == BT_MOUSE[4]
     boxing = mouse == BT_MOUSE[5]
-    fig = bta.beat_figure(
-        got["x"], got["y"], got["base"], got["up"], got["down"],
-        got["kept"], got["beats"], left_out=got["left_out"],
-        colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
-        x_title=got["xcol"], y_title=bt_y_title(got), height=s["bt_height"],
-        line_width=s["bt_lw"], numbers=s["bt_numbers"],
-        shade_beats=s["bt_shade"], clickable=clicking)
+    fig = bt_figure(got, clickable=clicking)
     if drawing:
         fig.update_layout(
             dragmode="lasso",
@@ -32916,7 +33007,6 @@ def bt_report(sid, got):
     x_u = f" {xu}" if xu else ""
     y_u = f" {yu}" if yu else ""
     area = f"{yu}·{xu}" if (xu and yu) else ""
-    a_u = f" {area}" if area else ""
     x = got["x"]
     lines = ["BEAT ANALYSIS", f"Signal: {sets['name']} (from {sets['source']})"]
     if meta.get("file"):
@@ -32996,16 +33086,11 @@ def bt_report(sid, got):
         for name, values, unit in group["params"]:
             lines.append(f"  {name}: {bta.mean_sd_range(values, unit)}")
 
-    lines += ["", "TOTALS",
-              f"∫ positive peaks: {info['Positive area, total'][0]:.5g}{a_u}",
-              f"∫ negative peaks: {info['Negative area, total'][0]:.5g}{a_u}",
-              f"∫ net: {info['Net area, total'][0]:.5g}{a_u}"]
-    if "Spring energy, total" in info:
-        total, eu = info["Spring energy, total"]
-        lines.append(
-            f"Energy: {total:.5g} {eu} in all (positive peaks "
-            f"{info['Spring energy, positive peaks'][0]:.5g}, negative "
-            f"peaks {info['Spring energy, negative peaks'][0]:.5g} {eu})")
+    lines += ["", "RESULTS (energies and areas without sign, so they add "
+              "up)"]
+    for param, value, unit in bt_results_rows(got):
+        lines.append(f"{param}: {bt_neat(value) or '–'}"
+                     + (f" {unit}" if unit and unit != "n" else ""))
     lines += ["", "UNITS AND HOW"]
     if area:
         lines.append(f"Areas in {area}" + (
@@ -33023,52 +33108,140 @@ def bt_report(sid, got):
     return text, tsv
 
 
-def bt_integration(sid, got):
-    """∫ Integration results: what each peak integrates to and its
-    energy, the totals, and the unit of every number."""
+def bt_results_rows(got):
+    """
+    The results as (parameter, value, unit) rows, the same for every
+    signal so they line up as a data sheet: how many beats and peaks of
+    each kind, the peaks' force (height above, depth below the baseline,
+    without sign), their energies and areas without sign (so positive and
+    negative add up), the rate, and the spring constant.
+    """
+    beats = got["beats"]
+    yu, xu = got["y_unit"], got["x_unit"]
+    area = f"{yu}·{xu}" if (xu and yu) else ""
+    pos = [b["pos"] for b in beats if b["pos"] is not None]
+    neg = [b["neg"] for b in beats if b["neg"] is not None]
+    full = [b for b in beats if b["kind"] == bta.KINDS[0]]
+
+    def mean(v):
+        return float(np.mean(v)) if len(v) else np.nan
+
+    def sd(v):
+        return float(np.std(v, ddof=1)) if len(v) > 1 else np.nan
+
     info = got["info"]
+    rows = [("Full beats", info["Full beats"], "n"),
+            ("Positive only", info["Positive only"], "n"),
+            ("Negative only", info["Negative only"], "n"),
+            ("Beats in all", len(beats), "n"),
+            ("Positive peaks", len(pos), "n"),
+            ("Negative peaks", len(neg), "n")]
+    hp, hn = [abs(e["peak"]) for e in pos], [abs(e["peak"]) for e in neg]
+    rows += [("Positive peak height, mean", mean(hp), yu),
+             ("Positive peak height, SD", sd(hp), yu),
+             ("Negative peak depth, mean", mean(hn), yu),
+             ("Negative peak depth, SD", sd(hn), yu)]
+    factor, eu = bta.energy_factor(bt_energy_unit())
+    k, newtons = got["k"], got["newtons"]
+
+    def energy(e):
+        if not (k and newtons):
+            return np.nan
+        return bta.spring_energy(abs(e["peak"]), k, newtons) / factor
+
+    ep, en = [energy(e) for e in pos], [energy(e) for e in neg]
+    total = (float(np.sum(ep)) if ep else 0.0) + (float(np.sum(en))
+                                                  if en else 0.0)
+    rows += [("Energy, positive peaks (total)",
+              float(np.sum(ep)) if ep else 0.0, eu),
+             ("Energy, negative peaks (total)",
+              float(np.sum(en)) if en else 0.0, eu),
+             ("Energy, all peaks (total)", total, eu),
+             ("Energy per positive peak, mean", mean(ep), eu),
+             ("Energy per negative peak, mean", mean(en), eu),
+             ("Energy per full beat, mean",
+              mean([energy(b["pos"]) + energy(b["neg"]) for b in full]), eu)]
+    if not (k and newtons):
+        rows = [(n, np.nan if u == eu else v, u) for n, v, u in rows]
+    ap, an = [abs(e["area"]) for e in pos], [abs(e["area"]) for e in neg]
+    rows += [("∫ positive peaks (total)", float(np.sum(ap)) if ap else 0.0,
+              area),
+             ("∫ negative peaks (total, no sign)",
+              float(np.sum(an)) if an else 0.0, area),
+             ("∫ all peaks (total, no sign)",
+              (float(np.sum(ap)) if ap else 0.0)
+              + (float(np.sum(an)) if an else 0.0), area)]
+    between = info.get("Time between beats")
+    rows += [("Beats per minute", info.get("Beat rate (per minute)", np.nan),
+              "/min"),
+             ("Time between beats, mean",
+              between[0] if between else np.nan, xu),
+             ("Spring constant k", k if k else np.nan, "N/m")]
+    return rows
+
+
+def bt_results_frame(got):
+    return pd.DataFrame(bt_results_rows(got),
+                        columns=["Parameter", "Value", "Unit"])
+
+
+def bt_results_line(name, got):
+    """The results as one row (a column for each, its unit in its name):
+    a line for a data sheet."""
+    row = {"Signal": name}
+    for param, value, unit in bt_results_rows(got):
+        row[f"{param} ({unit})" if unit and unit != "n" else param] = value
+    return row
+
+
+def bt_neat(value):
+    if isinstance(value, (float, np.floating)):
+        return "" if not np.isfinite(value) else f"{value:.5g}"
+    return str(value)
+
+
+def bt_integration(sid, got):
+    """📋 Results: the table of what was found (counts, forces, energies
+    and areas without sign), to read and to copy, then each peak's
+    integral."""
     xu, yu = got["x_unit"], got["y_unit"]
     area = f"{yu}·{xu}" if (xu and yu) else "y·x"
+    name = st.session_state["_bt_sets"][sid]["name"]
     with st.container(border=True):
-        st.markdown("#### ∫ Integration results")
-        cols = st.columns(4)
-        cols[0].metric(f"∫ positive peaks ({area})",
-                       f"{info['Positive area, total'][0]:.5g}")
-        cols[1].metric(f"∫ negative peaks ({area})",
-                       f"{info['Negative area, total'][0]:.5g}")
-        cols[2].metric(f"∫ net ({area})", f"{info['Net area, total'][0]:.5g}")
-        if "Total area per full beat" in info:
-            mean, sd, _ = info["Total area per full beat"]
-            cols[3].metric(f"∫ per full beat ({area})",
-                           f"{mean:.4g} ± {sd:.2g}",
-                           help="|∫ positive| + |∫ negative| of each full "
-                                "beat: mean ± SD.")
-        if "Spring energy, total" in info:
-            total, eu = info["Spring energy, total"]
-            cols = st.columns(4)
-            cols[0].metric(f"Total energy ({eu})", f"{total:.5g}",
-                           help="Every peak kept: Σ F²/2k.")
-            cols[1].metric(f"Positive peaks ({eu})",
-                           f"{info['Spring energy, positive peaks'][0]:.5g}")
-            cols[2].metric(f"Negative peaks ({eu})",
-                           f"{info['Spring energy, negative peaks'][0]:.5g}")
-            if "Spring energy per full beat" in info:
-                mean, sd, _ = info["Spring energy per full beat"]
-                cols[3].metric(f"Per full beat ({eu})",
-                               f"{mean:.4g} ± {sd:.2g}",
-                               help="Mean ± SD over the full beats.")
-            elif "Spring energy per peak" in info:
-                mean, sd, _ = info["Spring energy per peak"]
-                cols[3].metric(f"Per peak ({eu})", f"{mean:.4g} ± {sd:.2g}")
-        elif not got["shown"]:
-            st.caption("⚡ No energy: y is not a force. Choose the unit it "
-                       "is in under ⚡ Force and energy, on the left.")
-        elif not got["k"]:
-            st.caption("⚡ No energy: type the cantilever's spring constant "
-                       "k under ⚡ Force and energy, on the left.")
-        if xu in BT_PER_MINUTE and got["shown"]:
-            st.caption(f"∫F dt is in {area} (force × time). The energy is "
-                       "F²/2k, the work of bending the cantilever.")
+        st.markdown("#### 📋 Results")
+        frame = bt_results_frame(got)
+        left, right = st.columns([1.15, 1])
+        with left:
+            st.dataframe(
+                frame.assign(Value=frame["Value"].map(bt_neat)),
+                hide_index=True, **STRETCH,
+                height=min(36 * (len(frame) + 1) + 4, 820))
+        with right:
+            st.caption("Copy with the icon at the top right of a box; it "
+                       "pastes into Excel as cells.")
+            table, line = st.tabs(["Table", "One row (data sheet)"])
+            with table:
+                st.code("Parameter\tValue\tUnit\n" + "\n".join(
+                    f"{p}\t{bt_neat(v)}\t{u}" for p, v, u in
+                    bt_results_rows(got)), language=None, height=380)
+            with line:
+                row = bt_results_line(name, got)
+                st.code("\t".join(row) + "\n" + "\t".join(
+                    bt_neat(v) for v in row.values()), language=None,
+                    height=140)
+                st.caption("A header and one line: paste the line under "
+                           "the last one in your data sheet.")
+            if not got["shown"]:
+                st.caption("⚡ No energy: y is not a force. Choose its unit "
+                           "under ⚡ Force and energy, on the left.")
+            elif not got["k"]:
+                st.caption("⚡ No energy: type the cantilever's spring "
+                           "constant k under ⚡ Force and energy, on the "
+                           "left.")
+            else:
+                st.caption(f"Energy of a peak: F²/2k, in aJ (10⁻¹⁸ J). "
+                           f"Areas: ∫(y − baseline) dt, in {area}, without "
+                           "sign so positive and negative add up.")
         peaks = got["peaks"]
         with st.expander(f"∫ Each peak ({len(peaks)})"):
             if peaks.empty:
@@ -33086,6 +33259,234 @@ def bt_integration(sid, got):
                     file_name=f"{name}_peaks.csv", mime="text/csv",
                     key=f"btb_int_{sid}", **STRETCH,
                     help="One row per peak, every column with its unit.")
+
+
+def bt_figure(got, clickable=False):
+    """The beat plot as it is drawn on the tab."""
+    s = st.session_state
+    return bta.beat_figure(
+        got["x"], got["y"], got["base"], got["up"], got["down"],
+        got["kept"], got["beats"], left_out=got["left_out"],
+        colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
+        x_title=got["xcol"], y_title=bt_y_title(got), height=s["bt_height"],
+        line_width=s["bt_lw"], numbers=s["bt_numbers"],
+        shade_beats=s["bt_shade"], clickable=clickable)
+
+
+# what is kept of each signal's settings when it is saved, to open it again
+BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
+                  "merge", "gap", "order", "fu", "k")
+
+
+def bt_db_store():
+    """The connected OneDrive, when it can hold beat analyses."""
+    store = st.session_state.get("onedrive_store")
+    return store if store is not None and hasattr(store, "save_beats") \
+        else None
+
+
+def bt_plain(value):
+    """A setting as JSON can keep it."""
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [bt_plain(v) for v in value]
+    return value
+
+
+def bt_db_package(sid, got, name, notes=""):
+    """
+    (record, files) for one analysed signal: the signal itself, its
+    results (the 📋 Results table, a line of the database), every beat and
+    peak, the report and the plot, with every setting and the peaks
+    removed by hand, so it opens again as it is.
+    """
+    s = st.session_state
+    sets = s["_bt_sets"][sid]
+    stamp = datetime.now()
+    results = bt_results_line(name, got)
+    results.pop("Signal", None)
+    text, _tsv = bt_report(sid, got)
+    record = {
+        "beat_id": f"{stamp:%Y-%m-%d %H%M} {name}", "name": name,
+        "saved_at": stamp.isoformat(timespec="seconds"), "notes": notes,
+        "source": sets["source"], "file": got["meta"].get("file", ""),
+        "signal": sets["name"], "what": "Beat analysis",
+        "results": {k: bt_plain(v) if not (isinstance(v, float)
+                                           and not np.isfinite(v)) else None
+                    for k, v in results.items()},
+        "settings": {k: bt_plain(s[f"bt_{k}_{sid}"]) for k in BT_DB_SETTINGS
+                     if f"bt_{k}_{sid}" in s},
+        "removed": bt_plain(list(s.get(f"_bt_out_{sid}") or [])),
+        "meta": dict(got["meta"])}
+    files = {
+        "data.csv": sets["frame"].to_csv(index=False),
+        "results.csv": bt_results_frame(got).to_csv(index=False),
+        "beats.csv": got["table"].to_csv(index=False),
+        "peaks.csv": got["peaks"].to_csv(index=False),
+        "report.txt": text,
+        "plot.html": bt_figure(got).to_html(include_plotlyjs="cdn")}
+    return record, files
+
+
+def bt_db_restore(record, fetch):
+    """A saved analysis back on the tab, as a new signal with its
+    settings and its peaks removed by hand."""
+    s = st.session_state
+    frame = pd.read_csv(io.BytesIO(fetch("data.csv")))
+    sid = send_to_analysis(record.get("signal") or record.get("name") or
+                           "saved analysis", frame,
+                           source=f"the database ({record.get('name', '')})",
+                           meta=record.get("meta") or {})
+    for key, value in (record.get("settings") or {}).items():
+        if key in BT_DB_SETTINGS:
+            s[f"bt_{key}_{sid}"] = value
+    s[f"_bt_out_{sid}"] = sorted(float(v) for v in record.get("removed") or [])
+    s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
+    s["_bt_db_note"] = f"✅ Opened “{record.get('name', '')}”."
+
+
+def bt_db_open_onedrive():
+    s = st.session_state
+    store, beat_id = bt_db_store(), s.get("bt_db_pick")
+    if store is None or not beat_id:
+        return
+    try:
+        record = store.load_beats(beat_id)
+        if record is None:
+            raise RuntimeError("it is not in OneDrive any more")
+        bt_db_restore(record, lambda rel: store.beat_file(beat_id, rel))
+    except Exception as exc:
+        s["_bt_db_note"] = f"⚠️ Could not open it: {exc}"
+
+
+def bt_db_open_zip():
+    import zipfile
+
+    s = st.session_state
+    up = s.get("btf_dbzip")
+    if up is None:
+        return
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+        record = json.loads(archive.read("analysis.json").decode("utf-8"))
+        bt_db_restore(record, archive.read)
+    except Exception as exc:
+        s["_bt_db_note"] = f"⚠️ Could not open {up.name}: {exc}"
+
+
+def bt_database(sid, got):
+    """🗄 Database: save this analysis (to OneDrive, or a ZIP), open a
+    saved one, and the table of every analysis saved, one line each with
+    its results."""
+    s = st.session_state
+    store = bt_db_store()
+    with st.container(border=True):
+        st.markdown("#### 🗄 Database")
+        note = s.pop("_bt_db_note", None)
+        if note:
+            (st.success if note.startswith("✅") else st.warning)(note)
+        save, look = st.columns(2)
+        with save:
+            st.markdown("**☁️ Save this analysis**")
+            sig = s["_bt_sets"][sid]["name"]
+            typed = str(s.get(f"btd_name_{sid}") or "").strip()
+            if not typed:
+                s[f"btd_name_{sid}"] = sig
+            st.text_input("Name", key=f"btd_name_{sid}",
+                          help="What it is called in the database. The date "
+                               "and time are added to its folder's name.")
+            st.text_area("Notes", key=f"btd_notes_{sid}", height=68,
+                         placeholder="cell, condition, treatment…")
+            name = str(s.get(f"btd_name_{sid}") or "").strip()
+            notes = str(s.get(f"btd_notes_{sid}") or "").strip()
+            if st.button("☁️ Save to the database (OneDrive)",
+                         key=f"btb_dbsave_{sid}", type="primary",
+                         disabled=store is None or not name, **STRETCH,
+                         help="A folder with the signal, the 📋 Results, "
+                              "every beat and peak, the report, the plot and "
+                              "every setting; and a line with its results "
+                              "in the database table (beats_index.csv)."):
+                with st.spinner("Saving to OneDrive…"):
+                    try:
+                        record, files = bt_db_package(sid, got, name, notes)
+                        saved = store.save_beats(record, files)
+                        s["_bt_db_index"] = None
+                        st.success(f"✅ Saved “{name}” with its results.")
+                        if saved.get("folder_url"):
+                            st.link_button("↗ Its folder", saved["folder_url"],
+                                           **STRETCH)
+                    except Exception as exc:
+                        st.error(f"Could not save to OneDrive: {exc}")
+            if store is None:
+                st.caption("OneDrive is not connected: it is in the sidebar "
+                           "(☁️ OneDrive database), shown while the 🧮 "
+                           "Fitting tab is open. Or keep it as a ZIP.")
+            if st.button("📦 Make a ZIP of it", key=f"btb_dbzip_{sid}",
+                         disabled=not name, **STRETCH,
+                         help="The same as is saved to OneDrive, as one "
+                              "file; open it again on the right."):
+                import zipfile
+
+                record, files = bt_db_package(sid, got, name, notes)
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for rel, content in files.items():
+                        zf.writestr(rel, content)
+                    zf.writestr("analysis.json", json.dumps(
+                        record, indent=2, default=str))
+                s["_bt_db_zip"] = (sc_db_safe(record["beat_id"]) + ".zip",
+                                   buf.getvalue())
+            made = s.pop("_bt_db_zip", None)
+            if made:
+                st.download_button("⬇️ Download the ZIP", made[1],
+                                   file_name=made[0], mime="application/zip",
+                                   key=f"btb_dbdl_{sid}", **STRETCH)
+        with look:
+            st.markdown("**📂 Open a saved analysis**")
+            index = None
+            if store is not None:
+                if st.button("🔄 Read the database again",
+                             key="btb_dbrefresh", **STRETCH) \
+                        or s.get("_bt_db_index") is None:
+                    try:
+                        s["_bt_db_index"] = store.load_beat_index()
+                    except Exception as exc:
+                        st.warning(f"Could not read the database: {exc}")
+                        s["_bt_db_index"] = pd.DataFrame()
+                index = s.get("_bt_db_index")
+                if index is None or index.empty:
+                    st.caption("Nothing saved yet.")
+                else:
+                    rows = {str(r["beat_id"]): r
+                            for r in index.to_dict("records")}
+                    st.selectbox(
+                        "Saved analyses", list(rows), key="bt_db_pick",
+                        format_func=lambda k: (
+                            f"{rows[k].get('name') or k} · "
+                            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+                    st.button("📂 Open it here", key="btb_dbopen",
+                              on_click=bt_db_open_onedrive, **STRETCH,
+                              help="Adds it as a signal on this tab, with "
+                                   "its settings and removed peaks.")
+            st.file_uploader("Or a ZIP saved from here", type=["zip"],
+                             key="btf_dbzip")
+            st.button("📂 Open the ZIP", key="btb_dbopenzip",
+                      on_click=bt_db_open_zip, **STRETCH,
+                      disabled=s.get("btf_dbzip") is None)
+        if index is not None and not index.empty:
+            with st.expander(f"📊 The database: every saved analysis "
+                             f"({len(index)}), one line each"):
+                shown = index.drop(columns=[c for c in ("onedrive_path",)
+                                            if c in index.columns])
+                st.dataframe(shown, hide_index=True, **STRETCH,
+                             column_config={"folder_url": st.column_config
+                                            .LinkColumn("Folder")})
+                st.download_button(
+                    "💾 The database table (CSV)",
+                    index.to_csv(index=False).encode("utf-8"),
+                    file_name="beat_analyses.csv", mime="text/csv",
+                    key="btb_dbcsv", **STRETCH)
 
 
 def bt_report_box(sid, got):
@@ -33137,7 +33538,7 @@ def bt_results(sid, got):
                 "baseline (〰 The lines), or drag them on the plot.")
         return
     bt_integration(sid, got)
-    st.markdown("#### 💓 Each beat")
+    st.markdown("#### 💓 Each beat")  # (📋 Results above)
     # blank where a beat has no such peak (the CSV keeps them empty too);
     # untick Keep to remove a beat's peaks
     def neat(value):
@@ -33167,47 +33568,28 @@ def bt_results(sid, got):
         index=False).encode("utf-8"), file_name=f"{name}_summary.csv",
                        mime="text/csv", key=f"btb_sum_{sid}", **STRETCH)
     bt_report_box(sid, got)
+    bt_database(sid, got)
 
 
 def bt_summary_frame(ids):
-    """One row per signal: its counts, totals, means and rate, the
-    constants they were found with, and every energy in one unit (the one
-    chosen, or one that fits them all)."""
+    """One row per signal, the same columns as the 📋 Results table (its
+    unit in each name), then where it came from and the constants: the
+    lines of a data sheet."""
     s = st.session_state
-    e_unit = bt_energy_unit()
-    if e_unit is None and len(ids) > 1:
-        energies = []
-        for sid in ids:
-            got = bt_analyse(sid)
-            if got is not None and got["k"] and got["newtons"]:
-                energies += [bta.spring_energy(abs(e["peak"]), got["k"],
-                                               got["newtons"])
-                             for e in got["kept"]]
-        e_unit = bta.energy_factor(None, energies)[1] if energies else None
     rows = []
     for sid in ids:
-        got = bt_analyse(sid, e_unit)
+        got = bt_analyse(sid)
         if got is None:
             continue
-        row = {"Signal": s["_bt_sets"][sid]["name"], "y": got["ycol"],
-               "x unit": got["x_unit"], "y unit": got["y_unit"],
-               "Force in": got["shown"] or "not a force",
-               "k (N/m)": got["k"] if got["k"] else np.nan,
-               "k from": (meta_said(got["meta"])
-                          if got["k"] and got["meta"].get("k") and abs(
-                              got["k"] - got["meta"]["k"])
-                          <= 1e-9 * got["meta"]["k"] else
-                          "typed on Beat analysis" if got["k"] else ""),
-               "Baseline": got["base"]}
-        for name, value in got["info"].items():
-            if isinstance(value, tuple):
-                unit = value[-1]
-                label = f"{name} ({unit})" if unit else name
-                row[label] = value[0]
-                if len(value) == 3:
-                    row[f"{name}, SD"] = value[1]
-            else:
-                row[name] = value
+        sets, meta = s["_bt_sets"][sid], got["meta"]
+        row = bt_results_line(sets["name"], got)
+        row.update({
+            "From": sets["source"], "File": meta.get("file", ""),
+            "y": got["ycol"], "Force in": got["shown"] or "not a force",
+            "k from": (meta_said(meta) if got["k"] and meta.get("k") and abs(
+                got["k"] - meta["k"]) <= 1e-9 * meta["k"] else
+                "typed on Beat analysis" if got["k"] else ""),
+            "Baseline": got["base"]})
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -33288,6 +33670,577 @@ with tab_beats:
                  icon="🚫")
     elif not outdated_notice("beat_analysis.py"):
         beat_tab()
+
+
+# ================================================================ Fourier ==
+#
+# The 〰 Fourier tab: what frequencies a signal is made of. The signals are
+# those sent here (or added here) and every one on Beat analysis, Stack &
+# compare and Series. Settings are the tab's own (ft_*), x and y per signal
+# (ft_x_<id>, ft_y_<id>).
+
+FT_COLOURS = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
+              "#8c564b", "#e377c2", "#17becf")
+FT_AXES = ("Hz", "Per minute")
+
+
+def ft_sources():
+    """Every signal the tab can use, {id: (label, frame, meta, where)}:
+    those sent or added here, and those on Beat analysis, Stack & compare
+    and Series (as they are there now)."""
+    s = st.session_state
+    out = {}
+    for sid, d in (s.get("_ft_sets") or {}).items():
+        out[f"ft:{sid}"] = (f"〰 {d['name']}", d["frame"], d.get("meta") or {},
+                            d.get("source", ""))
+    for sid, d in (s.get("_bt_sets") or {}).items():
+        out[f"bt:{sid}"] = (f"💓 {d['name']}", d["frame"],
+                            d.get("meta") or {}, "Beat analysis")
+    for prefix, icon, where in (("sc_", "📚", "Stack & compare"),
+                                ("sr_", "🔗", "Series")):
+        for i in range(24):
+            sent = s.get(f"{prefix}sent{i}")
+            if sent and sent.get("frame") is not None:
+                out[f"{prefix}{i}"] = (f"{icon} {where} {i + 1}: "
+                                       f"{sent['name']}", sent["frame"],
+                                       sent.get("meta") or {}, where)
+    return out
+
+
+def ft_add_upload():
+    """A file added on the tab: each of its columns after the first is a
+    signal against the first."""
+    s = st.session_state
+    key = f"ftf_{int(s.get('_ft_upver', 0) or 0)}"
+    up = s.get(key)
+    if up is None:
+        return
+    try:
+        if up.name.lower().endswith((".xlsx", ".xls")):
+            frame = pd.read_excel(io.BytesIO(up.getvalue()))
+        else:
+            frame = pd.read_csv(io.BytesIO(up.getvalue()), sep=None,
+                                engine="python")
+        frame = frame.apply(pd.to_numeric, errors="coerce").dropna(
+            axis=1, how="all")
+        if frame.shape[1] < 2:
+            raise ValueError("it needs two columns of numbers (x and y)")
+        send_to_fourier(re.sub(r"\.[^.]+$", "", up.name), frame,
+                        source="a file added here")
+    except Exception as exc:
+        s["_ft_note"] = f"⚠️ Could not read {up.name}: {exc}"
+    s["_ft_upver"] = int(s.get("_ft_upver", 0) or 0) + 1
+
+
+def ft_remove(key):
+    """A signal added or sent here off the tab (those of other tabs stay
+    on theirs)."""
+    s = st.session_state
+    sid = key.split(":", 1)[1]
+    (s.get("_ft_sets") or {}).pop(sid, None)
+    s["ft_pick"] = [k for k in (s.get("ft_pick") or []) if k != key]
+
+
+def ft_columns(key, frame, write=True):
+    """(numeric columns, x, y) of a signal: x a time column when there is
+    one, y the first other. With ``write`` the choice is kept as its
+    settings (before their widgets are drawn)."""
+    s = st.session_state
+    cols = [c for c in frame.columns
+            if pd.to_numeric(frame[c], errors="coerce").notna().sum() > 7]
+    if len(cols) < 2:
+        return cols, None, None
+    xcol = s.get(f"ft_x_{key}")
+    if xcol not in cols:
+        timeish = [c for c in cols if "time" in str(c).lower()]
+        xcol = timeish[0] if timeish else cols[0]
+    ycol = s.get(f"ft_y_{key}")
+    if ycol not in cols or ycol == xcol:
+        ycol = next(c for c in cols if c != xcol)
+    if write:
+        s[f"ft_x_{key}"], s[f"ft_y_{key}"] = xcol, ycol
+    return cols, xcol, ycol
+
+
+def ft_signal(key, src):
+    """One signal as analysed: dict with x, y (a force in the unit chosen),
+    its columns and units, x × x_scale in seconds (None when x is not a
+    time) and its name; or None when it has no two numeric columns."""
+    s = st.session_state
+    label, frame, meta, where = src
+    cols, xcol, ycol = ft_columns(key, frame, write=False)
+    if xcol is None:
+        return None
+    x = pd.to_numeric(frame[xcol], errors="coerce").to_numpy(float)
+    y = pd.to_numeric(frame[ycol], errors="coerce").to_numpy(float)
+    source = force_unit_of(ycol)
+    if not source and meta.get("y_unit"):
+        said = FORCE_SPELLED.get(meta["y_unit"], meta["y_unit"])
+        source = said if said in FORCE_NEWTONS else ""
+    if source:
+        yu = s.get("ft_fu") or "µN"
+        y = y * FORCE_NEWTONS[source] / FORCE_NEWTONS[yu]
+        ytitle = retitle(ycol, yu)
+    else:
+        yu, ytitle = bta_unit(ycol), str(ycol)
+    xu = bta_unit(xcol)
+    scale = ftr.seconds_per(xu)
+    if scale is None and not xu and "time" in str(xcol).lower():
+        scale = 1.0
+    t0, t1 = s.get("ft_t0"), s.get("ft_t1")
+    keep = np.isfinite(x) & np.isfinite(y)
+    if t0 is not None:
+        keep &= x >= float(t0)
+    if t1 is not None:
+        keep &= x <= float(t1)
+    return {"key": key, "name": label, "x": x[keep], "y": y[keep],
+            "x_all": x, "y_all": y, "xcol": xcol, "ycol": ycol,
+            "ytitle": ytitle, "xu": xu, "yu": yu, "scale": scale,
+            "force": bool(source), "meta": meta, "where": where}
+
+
+def ft_spectrum(sig):
+    """The spectrum of one signal with the tab's settings, and its peaks;
+    None (with the reason) when it cannot be made."""
+    s = st.session_state
+    try:
+        spec = ftr.spectrum(sig["x"], sig["y"], kind=s["ft_kind"],
+                            win=s["ft_win"], how=s["ft_detrend"],
+                            pad=int(s["ft_pad"]), pieces=int(s["ft_pieces"]),
+                            x_scale=sig["scale"] or 1.0)
+    except ValueError as exc:
+        return None, str(exc)
+    lo = s.get("ft_fmin") or None
+    hi = s.get("ft_fmax") or None
+    peaks = ftr.find_peaks(spec["freq"], spec["value"],
+                           count=int(s["ft_npk"]), fmin=lo, fmax=hi)
+    for p, h in zip(peaks, ftr.harmonic_of(peaks)):
+        p["harmonic"] = h
+    spec["peaks"] = peaks
+    return spec, ""
+
+
+def ft_units(sig):
+    """(frequency unit, value unit) of a signal's spectrum."""
+    f_unit = "Hz" if sig["scale"] else f"1/{sig['xu'] or 'x'}"
+    yu = sig["yu"] or ""
+    if st.session_state["ft_kind"] == ftr.KINDS[1]:
+        return f_unit, (f"{yu}²/{f_unit}" if yu else f"(y)²/{f_unit}")
+    return f_unit, yu
+
+
+def ft_peaks_frame(signals, spectra):
+    """Every signal's peaks, one row each, every column with its unit."""
+    rows = []
+    for sig, spec in zip(signals, spectra):
+        if spec is None:
+            continue
+        f_unit, v_unit = ft_units(sig)
+        top = spec["peaks"][0]["value"] if spec["peaks"] else np.nan
+        for p in spec["peaks"]:
+            row = {"Signal": sig["name"], "Peak": p["rank"],
+                   f"Frequency ({f_unit})": p["freq"]}
+            if sig["scale"]:
+                row["Period (s)"] = 1.0 / p["freq"] if p["freq"] else np.nan
+                row["Per minute"] = p["freq"] * 60.0
+            row[(f"Amplitude ({v_unit})" if st.session_state["ft_kind"]
+                 == ftr.KINDS[0] else f"Power density ({v_unit})")] = p["value"]
+            row["% of the strongest"] = 100.0 * p["value"] / top if top else np.nan
+            row["Harmonic"] = p.get("harmonic", "")
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def ft_settings(sources):
+    """The left column: signals, what of them is used, and how the
+    spectrum is made."""
+    s = st.session_state
+    st.file_uploader("Add a file (CSV, TXT or Excel)", type=[
+        "csv", "txt", "tsv", "xlsx", "xls"],
+        key=f"ftf_{int(s.get('_ft_upver', 0) or 0)}", on_change=ft_add_upload,
+        help="Its first column is x (time); the others are signals.")
+    note = s.pop("_ft_note", None)
+    if note:
+        st.warning(note)
+    keys = list(sources)
+    s["ft_pick"] = [k for k in (s.get("ft_pick") or []) if k in keys] or (
+        keys[-1:] if keys else [])
+    st.multiselect("Signals", keys, key="ft_pick",
+                   format_func=lambda k: sources[k][0],
+                   help="One or more: their spectra are drawn together. "
+                        "The first one's peaks are marked on the plot, and "
+                        "its spectrogram and filter are below. Signals on "
+                        "💓 Beat analysis, 📚 Stack & compare and 🔗 Series "
+                        "are listed here by themselves.")
+    for key in s["ft_pick"]:
+        if key.startswith("ft:"):
+            st.button(f"🗑 Remove {sources[key][0]}", key=f"ftb_rm_{key}",
+                      on_click=ft_remove, args=(key,), **STRETCH)
+    with st.expander("Columns of each signal"):
+        for key in s["ft_pick"]:
+            cols, xcol, _ = ft_columns(key, sources[key][1])
+            if xcol is None:
+                continue
+            st.caption(sources[key][0])
+            a, b = st.columns(2)
+            a.selectbox("x", cols, key=f"ft_x_{key}")
+            b.selectbox("y", cols, key=f"ft_y_{key}")
+    st.markdown("**〰 The spectrum**")
+    a, b = st.columns(2)
+    a.selectbox("Show", ftr.KINDS, key="ft_kind",
+                help="Amplitude: each frequency's size, in the signal's "
+                     "unit (a sine of amplitude A gives a peak of A). Power "
+                     "density: unit² per Hz; its area over a band is the "
+                     "power (variance) in that band.")
+    b.selectbox("Force in", ("µN", "nN", "N"), key="ft_fu",
+                help="For signals that are a force: the unit of their "
+                     "spectrum.")
+    a, b = st.columns(2)
+    a.selectbox("Window", ftr.WINDOWS, key="ft_win",
+                help="Tapers the ends so the cut does not spread the peaks "
+                     "(Hann: a good default).")
+    b.selectbox("Take off first", ftr.DETRENDS, key="ft_detrend",
+                help="The mean (or a straight-line drift) would otherwise "
+                     "make a huge peak at 0 Hz.")
+    a, b = st.columns(2)
+    a.select_slider("Pieces averaged", (1, 2, 3, 4, 6, 8, 12, 16),
+                    key="ft_pieces",
+                    help="1: one spectrum of the whole signal, the finest. "
+                         "More: the spectra of half-overlapping pieces "
+                         "averaged (Welch): steadier, coarser.")
+    b.select_slider("Finer drawing (zero padding)", (1, 2, 4, 8),
+                    key="ft_pad",
+                    help="Draws the spectrum on more points; it does not "
+                         "separate peaks closer than the resolution.")
+    st.markdown("**🔎 Part of the signal and peaks**")
+    a, b = st.columns(2)
+    a.number_input("From x", value=None, key="ft_t0", format="%.6g",
+                   placeholder="the start",
+                   help="Only this part of each signal (in its x unit).")
+    b.number_input("To x", value=None, key="ft_t1", format="%.6g",
+                   placeholder="the end")
+    a, b = st.columns(2)
+    a.number_input("Peaks from (Hz)", min_value=0.0, value=None,
+                   key="ft_fmin", format="%.4g", placeholder="above 0",
+                   help="Peaks are looked for above this frequency.")
+    b.number_input("up to (Hz)", min_value=0.0, value=None, key="ft_fmax",
+                   format="%.4g", placeholder="Nyquist")
+    a, b = st.columns(2)
+    a.slider("Peaks listed", 1, 12, key="ft_npk")
+    b.number_input("Plot up to (Hz)", min_value=0.0, value=None,
+                   key="ft_fview", format="%.4g", placeholder="auto")
+    a, b = st.columns(2)
+    a.radio("Frequency axis", FT_AXES, key="ft_axis", horizontal=True)
+    b.toggle("Log scale (y)", key="ft_log")
+
+
+def ft_time_figure(signals, filtered=None):
+    """The signals against time, the part used shaded."""
+    s = st.session_state
+    fig = go.Figure()
+    for n, sig in enumerate(signals):
+        fig.add_trace(go.Scattergl(x=sig["x_all"], y=sig["y_all"],
+                                   mode="lines", name=sig["name"],
+                                   line=dict(color=FT_COLOURS[n % 8],
+                                             width=1.2)))
+    if filtered is not None:
+        fig.add_trace(go.Scattergl(x=filtered[0], y=filtered[1], mode="lines",
+                                   name="band-pass", line=dict(
+                                       color="#111", width=1.6)))
+    if s.get("ft_t0") is not None or s.get("ft_t1") is not None:
+        fig.add_vrect(x0=s.get("ft_t0") if s.get("ft_t0") is not None
+                      else float(np.nanmin(signals[0]["x_all"])),
+                      x1=s.get("ft_t1") if s.get("ft_t1") is not None
+                      else float(np.nanmax(signals[0]["x_all"])),
+                      fillcolor="rgba(31,119,180,0.08)", line_width=0)
+    first = signals[0]
+    fig.update_layout(height=250, margin=dict(l=60, r=20, t=30, b=40),
+                      template="plotly_white", showlegend=len(signals) > 1
+                      or filtered is not None,
+                      legend=dict(orientation="h", y=1.15),
+                      xaxis_title=str(first["xcol"]),
+                      yaxis_title=first["ytitle"])
+    return fig
+
+
+def ft_figure(signals, spectra):
+    """The spectra, the first one's peaks marked and named."""
+    s = st.session_state
+    per_min = s["ft_axis"] == FT_AXES[1]
+    fig = go.Figure()
+    view = s.get("ft_fview")
+    top_f = 0.0
+    for n, (sig, spec) in enumerate(zip(signals, spectra)):
+        if spec is None:
+            continue
+        mult = 60.0 if (per_min and sig["scale"]) else 1.0
+        fig.add_trace(go.Scatter(x=spec["freq"] * mult, y=spec["value"],
+                                 mode="lines", name=sig["name"],
+                                 line=dict(color=FT_COLOURS[n % 8],
+                                           width=1.4)))
+        if spec["peaks"]:
+            top_f = max(top_f, spec["peaks"][0]["freq"])
+        if n == 0 and spec["peaks"]:
+            f_unit, _ = ft_units(sig)
+            fig.add_trace(go.Scatter(
+                x=[p["freq"] * mult for p in spec["peaks"]],
+                y=[p["value"] for p in spec["peaks"]], mode="markers+text",
+                marker=dict(symbol="triangle-down", size=10,
+                            color=FT_COLOURS[0]),
+                text=[(f"{p['freq'] * 60:.3g}/min" if per_min and sig["scale"]
+                       else f"{p['freq']:.3g} {f_unit}")
+                      + (f" {p['harmonic']}" if p.get("harmonic")
+                         and p["rank"] > 1 else "")
+                      for p in spec["peaks"]],
+                textposition="top center", name="peaks", showlegend=False,
+                hovertemplate="%{text}<extra></extra>"))
+    first = next(((sig, spec) for sig, spec in zip(signals, spectra)
+                  if spec is not None), None)
+    if first is None:
+        return fig
+    sig, spec = first
+    f_unit, v_unit = ft_units(sig)
+    mult = 60.0 if (per_min and sig["scale"]) else 1.0
+    hi = view if view else min(spec["nyquist"], max(6 * top_f, 4 * (
+        spec["freq"][1] if spec["freq"].size > 1 else 1.0)))
+    fig.update_layout(
+        height=380, margin=dict(l=70, r=20, t=30, b=50),
+        template="plotly_white", legend=dict(orientation="h", y=1.12),
+        showlegend=len(signals) > 1,
+        xaxis=dict(title=("Beats per minute" if per_min and sig["scale"]
+                          else f"Frequency ({f_unit})"),
+                   range=[0, hi * mult]),
+        yaxis=dict(title=(f"Amplitude ({v_unit})" if s["ft_kind"]
+                          == ftr.KINDS[0] else f"Power density ({v_unit})"),
+                   type="log" if s.get("ft_log") else "linear"))
+    return fig
+
+
+def ft_report(signals, spectra):
+    """The spectrum's settings and every peak, as text to paste."""
+    s = st.session_state
+    lines = ["FOURIER ANALYSIS",
+             f"Shown: {s['ft_kind']} spectrum, {s['ft_win']} window, "
+             f"{s['ft_detrend'].lower()} taken off first, "
+             f"{s['ft_pieces']} piece(s) averaged, zero padding "
+             f"×{s['ft_pad']}"]
+    if s.get("ft_t0") is not None or s.get("ft_t1") is not None:
+        lines.append(f"Part used: x from {s.get('ft_t0', 'the start')} to "
+                     f"{s.get('ft_t1', 'the end')}")
+    for sig, spec in zip(signals, spectra):
+        lines += ["", f"Signal: {sig['name']} (y: {sig['ytitle']}, x: "
+                  f"{sig['xcol']})"]
+        if spec is None:
+            lines.append("  no spectrum: too few points")
+            continue
+        f_unit, v_unit = ft_units(sig)
+        lines.append(f"  {spec['n']} points, a step of {spec['step']:.4g} s "
+                     f"({spec['fs']:.4g} Hz); resolution "
+                     f"{spec['resolution']:.4g} {f_unit}; up to "
+                     f"{spec['nyquist']:.4g} {f_unit} (Nyquist)"
+                     + (f"; {100 * spec['filled']:.1f}% bridged over gaps"
+                        if spec["filled"] else ""))
+        for p in spec["peaks"]:
+            lines.append(
+                f"  Peak {p['rank']}: {p['freq']:.5g} {f_unit}"
+                + (f" ({p['freq'] * 60:.4g} per minute, period "
+                   f"{1 / p['freq']:.4g} s)" if sig["scale"] and p["freq"]
+                   else "")
+                + f", {p['value']:.4g} {v_unit}"
+                + (f", {p['harmonic']} of the strongest"
+                   if p.get("harmonic") and p["rank"] > 1 else ""))
+    return "\n".join(lines)
+
+
+def ft_extras(sig, spec):
+    """The first signal's spectrogram and band-pass filter."""
+    s = st.session_state
+    f_unit, v_unit = ft_units(sig)
+    length = (float(np.nanmax(sig["x"]) - np.nanmin(sig["x"]))
+              * (sig["scale"] or 1.0)) if sig["x"].size else 0.0
+    with st.expander("🌈 Spectrogram: the frequencies over time"):
+        if s.get("ft_sgp") is None and length:
+            s["ft_sgp"] = float(f"{max(length / 8, 8 * spec['step']):.3g}")
+        a, b = st.columns(2)
+        a.number_input("Piece length (s)" if sig["scale"] else
+                       f"Piece length ({sig['xu'] or 'x'})", min_value=0.0,
+                       key="ft_sgp", format="%.4g",
+                       help="Each column is the spectrum of a piece this "
+                            "long: longer pieces, finer frequencies; "
+                            "shorter, finer in time.")
+        b.slider("Overlap", 0.0, 0.9, key="ft_sgo", step=0.1)
+        try:
+            sg = ftr.spectrogram(sig["x"], sig["y"], float(s["ft_sgp"] or 1),
+                                 overlap=float(s["ft_sgo"]), win=s["ft_win"],
+                                 how=s["ft_detrend"],
+                                 x_scale=sig["scale"] or 1.0,
+                                 fmin=s.get("ft_fmin") or None,
+                                 fmax=s.get("ft_fmax") or None)
+        except (ValueError, TypeError) as exc:
+            st.caption(f"No spectrogram: {exc}")
+            sg = None
+        if sg is not None and sg["times"].size:
+            hi = s.get("ft_fview") or min(
+                spec["nyquist"], 6 * (spec["peaks"][0]["freq"]
+                                      if spec["peaks"] else 1.0))
+            rows = sg["freq"] <= hi
+            fig = go.Figure(go.Heatmap(
+                x=sg["times"], y=sg["freq"][rows], z=sg["value"][rows],
+                colorscale="Viridis", colorbar=dict(title=v_unit)))
+            fig.add_trace(go.Scatter(x=sg["times"], y=sg["peak"],
+                                     mode="lines+markers", name="strongest",
+                                     line=dict(color="white", width=1.5)))
+            fig.update_layout(height=320, margin=dict(l=70, r=20, t=20, b=50),
+                              template="plotly_white", showlegend=False,
+                              xaxis_title=str(sig["xcol"]),
+                              yaxis_title=f"Frequency ({f_unit})")
+            st.plotly_chart(fig, key="ftc_sg", **STRETCH)
+            rate = sg["peak"] * (60.0 if sig["scale"] else 1.0)
+            st.caption(
+                f"The strongest frequency, piece by piece: "
+                f"{np.nanmean(sg['peak']):.4g} ± {np.nanstd(sg['peak']):.2g} "
+                f"{f_unit}"
+                + (f" ({np.nanmean(rate):.4g} ± {np.nanstd(rate):.2g} per "
+                   "minute)" if sig["scale"] else "")
+                + f", over {sg['times'].size} pieces of "
+                f"{sg['seg_s']:.3g} s.")
+    with st.expander("🎚 Band-pass filter: keep only some frequencies"):
+        a, b = st.columns(2)
+        a.number_input(f"From ({f_unit})", min_value=0.0, value=None,
+                       key="ft_bp0", format="%.4g", placeholder="0 (keeps the mean)")
+        b.number_input(f"To ({f_unit})", min_value=0.0, value=None,
+                       key="ft_bp1", format="%.4g", placeholder="the top")
+        filtered = None
+        if s.get("ft_bp0") or s.get("ft_bp1"):
+            try:
+                filtered = ftr.bandpass(sig["x"], sig["y"],
+                                        low=s.get("ft_bp0") or None,
+                                        high=s.get("ft_bp1") or None,
+                                        x_scale=sig["scale"] or 1.0)
+            except ValueError as exc:
+                st.caption(f"No filter: {exc}")
+        if filtered is not None:
+            st.caption("Drawn in black on the signal above. Send it on:")
+            frame = pd.DataFrame({str(sig["xcol"]): filtered[0],
+                                  f"{sig['ycol']} band-passed"
+                                  if not sig["force"] else
+                                  retitle(f"{sig['ycol']} band-passed",
+                                          sig["yu"]): filtered[1]})
+            name = f"{sig['name'].split(' ', 1)[-1]} (band-pass)"
+            c, d = st.columns(2)
+            c.button("📊 Send to beat analysis", key="ftb_bp_beat",
+                     on_click=send_to_analysis,
+                     args=(name, frame, "the Fourier filter"),
+                     kwargs={"meta": sig["meta"]}, **STRETCH)
+            d.button("📚 Send to stack", key="ftb_bp_stack",
+                     on_click=send_to_stack,
+                     args=(name, frame, "the Fourier filter"),
+                     kwargs={"meta": sig["meta"]}, **STRETCH)
+        return filtered
+
+
+def fourier_tab():
+    s = st.session_state
+    for key, value in (("ft_kind", ftr.KINDS[0]), ("ft_win", ftr.WINDOWS[0]),
+                       ("ft_detrend", ftr.DETRENDS[0]), ("ft_pieces", 1),
+                       ("ft_pad", 2), ("ft_npk", 5), ("ft_axis", FT_AXES[0]),
+                       ("ft_log", False), ("ft_fu", "µN"), ("ft_sgo", 0.5)):
+        s.setdefault(key, value)
+    # settings kept while their widgets are not drawn
+    for key in [k for k in list(s.keys()) if str(k).startswith("ft_")]:
+        s[key] = s[key]
+    sources = ft_sources()
+    left, right = st.columns([1, 2.5], gap="medium")
+    with left:
+        ft_settings(sources)
+    with right:
+        if not s.get("ft_pick"):
+            st.info("Send a signal here (〰 Send to Fourier, on 🔬 AFM output "
+                    "analysis or 📈 Single force curve), add a file on the "
+                    "left, or pick one already on 💓 Beat analysis, 📚 Stack "
+                    "& compare or 🔗 Series.", icon="〰")
+            return
+        signals = [sig for sig in (ft_signal(k, sources[k])
+                                   for k in s["ft_pick"]) if sig is not None]
+        if not signals:
+            st.warning("These signals have no two columns of numbers.")
+            return
+        spectra = []
+        for sig in signals:
+            spec, why = ft_spectrum(sig)
+            if spec is None:
+                st.warning(f"{sig['name']}: {why}")
+            spectra.append(spec)
+        main, spec = signals[0], spectra[0]
+        if spec is None:
+            return
+        f_unit, v_unit = ft_units(main)
+        cols = st.columns(4)
+        if spec["peaks"]:
+            top = spec["peaks"][0]
+            cols[0].metric(f"Strongest ({f_unit})", f"{top['freq']:.4g}")
+            cols[1].metric("Per minute", f"{top['freq'] * 60:.4g}"
+                           if main["scale"] else "–")
+            cols[2].metric("Period (s)", f"{1 / top['freq']:.4g}"
+                           if main["scale"] and top["freq"] else "–")
+            cols[3].metric(("Amplitude" if s["ft_kind"] == ftr.KINDS[0]
+                            else "Power density") + f" ({v_unit})",
+                           f"{top['value']:.4g}")
+        st.caption(
+            f"{main['name']}: {spec['n']} points, a step of "
+            f"{spec['step']:.4g} s ({spec['fs']:.4g} Hz) · resolution "
+            f"{spec['resolution']:.3g} {f_unit} · up to {spec['nyquist']:.4g} "
+            f"{f_unit} (Nyquist)"
+            + (f" · {100 * spec['filled']:.1f}% bridged over gaps"
+               if spec["filled"] > 0.001 else "")
+            + ("" if main["scale"] else
+               " · x is not a time: frequencies are cycles per unit of x"))
+        time_slot = st.container()
+        st.plotly_chart(ft_figure(signals, spectra), key="ftc_spec",
+                        **STRETCH)
+        filtered = ft_extras(main, spec)
+        with time_slot:
+            st.plotly_chart(ft_time_figure(signals, filtered), key="ftc_time",
+                            **STRETCH)
+        peaks = ft_peaks_frame(signals, spectra)
+        st.markdown("#### 🔺 Peaks")
+        if peaks.empty:
+            st.caption("No peak in the range looked at.")
+        else:
+            st.dataframe(peaks, hide_index=True, **STRETCH,
+                         column_config={c: st.column_config.NumberColumn(
+                             format="%.5g") for c in peaks.columns
+                             if peaks[c].dtype.kind == "f"})
+        text = ft_report(signals, spectra)
+        with st.container(border=True):
+            st.markdown("#### 📋 Report to copy")
+            st.code(text, language=None, wrap_lines=True, height=260)
+        d1, d2, d3 = st.columns(3)
+        table = pd.DataFrame({f"Frequency ({f_unit})": spec["freq"]})
+        for sig, sp in zip(signals, spectra):
+            if sp is not None and sp["freq"].size == spec["freq"].size:
+                table[f"{sig['name']} ({ft_units(sig)[1]})"] = sp["value"]
+        d1.download_button("💾 Spectrum (CSV)",
+                           table.to_csv(index=False).encode("utf-8"),
+                           file_name="spectrum.csv", mime="text/csv",
+                           key="ftb_spec", **STRETCH)
+        d2.download_button("💾 Peaks (CSV)",
+                           peaks.to_csv(index=False).encode("utf-8"),
+                           file_name="spectrum_peaks.csv", mime="text/csv",
+                           key="ftb_peaks", disabled=peaks.empty, **STRETCH)
+        d3.download_button("💾 Report (TXT)", text.encode("utf-8"),
+                           file_name="fourier_report.txt", mime="text/plain",
+                           key="ftb_rep", **STRETCH)
+
+
+with tab_fourier:
+    section("Fourier: the frequencies a signal is made of")
+    if ftr is None or FOURIER_ERROR:
+        st.error("This tab needs **fourier.py** beside app.py"
+                 + (f" ({FOURIER_ERROR})." if FOURIER_ERROR else "."),
+                 icon="🚫")
+    elif not outdated_notice("fourier.py"):
+        fourier_tab()
 
 
 # ------------------------------------------------ settings kept offstage --
