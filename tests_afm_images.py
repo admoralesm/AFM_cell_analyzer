@@ -146,6 +146,44 @@ def main():
     check("deflection to force, relative to the setpoint",
           abs(np.nanmedian(f)) < 0.5 and abs(np.nanmax(f) - 0.3 * 65 * 0.08)
           < 0.2, f"{np.nanmax(f):.3f}")
+    print("deflection stored in metres, as Asylum saves it")
+    stored = (y - sp) * invols * 1e-9          # V → m, as the file holds it
+    check("values that small can only be metres",
+          ai.stored_deflection_unit(stored) == "m"
+          and ai.stored_deflection_unit(y) == "V"
+          and ai.stored_deflection_unit(y * 100, "nm") == "nm")
+    in_un = ai.force_convert(stored, ai.FORCE_AUTO, k=2.5, invols=invols,
+                             force_unit="µN")
+    check("metres × k, in µN: 10 nm on 2.5 N/m is 0.025 µN",
+          abs(ai.force_convert(np.array([1e-8]), ai.FORCE_AUTO, k=2.5,
+                               force_unit="µN")[0] - 0.025) < 1e-12
+          and abs(np.nanmax(in_un) - 0.3 * 65e-9 * 2.5 * 1e6) < 0.005,
+          f"{np.nanmax(in_un):.5f}")
+    check("the same force from volts, from metres and from nm",
+          np.allclose(ai.force_convert(y, "Defl (V) → force", k=2.5,
+                                       invols=invols, setpoint=sp,
+                                       subtract_setpoint=True,
+                                       force_unit="µN"),
+                      in_un, equal_nan=True)
+          and np.allclose(ai.force_convert(stored * 1e9, "Defl (nm) → force",
+                                           k=2.5, force_unit="µN"),
+                          in_un, equal_nan=True))
+    check("'nm' on values only metres can be is taken as metres",
+          ai.deflection_unit_used(stored, "Defl (nm) → force (nN)") == "m"
+          and np.allclose(ai.force_convert(stored, "Defl (nm) → force",
+                                           k=2.5, force_unit="µN"),
+                          in_un, equal_nan=True))
+    check("the old names still work, and in nN as before",
+          abs(np.nanmax(ai.force_convert(y, "Defl (V) → force (nN)", k=k,
+                                         invols=invols, setpoint=sp,
+                                         subtract_setpoint=True))
+              - np.nanmax(f)) < 1e-9)
+    check("the setpoint (V) comes off a deflection in metres too",
+          abs(np.nanmedian(ai.force_convert(
+              y * invols * 1e-9, ai.FORCE_AUTO, k=k, invols=invols,
+              setpoint=sp, subtract_setpoint=True))) < 0.5)
+    check("a force conversion is in the force unit",
+          ai.units_for(ai.FORCE_AUTO, "raw", "µN") == "µN")
     # between beats (sin < 0: 0.71 to 1.43 s) the cell is at rest at 0.5
     a, b = ai.fit_baseline(t, y, 0.8, 1.3, "Offset")
     check("an offset baseline is the median of the region",
