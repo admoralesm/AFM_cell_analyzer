@@ -402,6 +402,82 @@ def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
     return out
 
 
+def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
+               e_unit=None):
+    """
+    The beats by kind (full, positive only, negative only), each with how
+    many there are and its parameters, every one a (name, values, unit)
+    to give as mean ± SD and range. Each peak: its height (or depth), width,
+    rise (start to peak), fall (peak to end), area and, with k, energy.
+    Full beats also: duration, time between their two peaks, net and total
+    area and the beat's energy.
+    """
+    area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else ""
+    energies = [spring_energy(abs(b[side]["peak"]), k, newtons)
+                for b in beats for side in ("pos", "neg")
+                if b[side] is not None]
+    e_factor, e_name = energy_factor(e_unit, energies)
+    with_energy = bool(k and newtons)
+
+    def energy(e):
+        return spring_energy(abs(e["peak"]), k, newtons) / e_factor
+
+    out = []
+    for kind in KINDS:
+        these = [b for b in beats if b["kind"] == kind]
+        params = []
+        if these and kind == KINDS[0]:
+            params.append(("Duration", [b["end"] - b["start"]
+                                        for b in these], x_unit))
+        for side, name, size in (("pos", "Positive peak", "height"),
+                                 ("neg", "Negative peak", "depth")):
+            peaks = [b[side] for b in these if b[side] is not None]
+            if not peaks:
+                continue
+            params += [
+                (f"{name} {size}", [abs(e["peak"]) for e in peaks], y_unit),
+                (f"{name} width", [e["width"] for e in peaks], x_unit),
+                (f"{name} rise (start to peak)",
+                 [e["peak_x"] - e["start"] for e in peaks], x_unit),
+                (f"{name} fall (peak to end)",
+                 [e["end"] - e["peak_x"] for e in peaks], x_unit),
+                (f"{name} area", [e["area"] for e in peaks], area_unit)]
+            if with_energy:
+                params.append((f"{name} energy", [energy(e) for e in peaks],
+                               e_name))
+        if these and kind == KINDS[0]:
+            params += [
+                ("Time between its two peaks",
+                 [abs(b["neg"]["peak_x"] - b["pos"]["peak_x"])
+                  for b in these], x_unit),
+                ("Net area", [b["pos"]["area"] + b["neg"]["area"]
+                              for b in these], area_unit),
+                ("Total area (|positive| + |negative|)",
+                 [abs(b["pos"]["area"]) + abs(b["neg"]["area"])
+                  for b in these], area_unit)]
+            if with_energy:
+                params.append(("Energy of the beat",
+                               [energy(b["pos"]) + energy(b["neg"])
+                                for b in these], e_name))
+        out.append({"kind": kind, "n": len(these),
+                    "params": [(n, np.asarray(v, float), u)
+                               for n, v, u in params]})
+    return out
+
+
+def mean_sd_range(values, unit=""):
+    """'52.1 ± 1.2 nN (50.3 to 54.0)': one value as it is."""
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v)]
+    u = f" {unit}" if unit else ""
+    if not v.size:
+        return "–"
+    if v.size == 1:
+        return f"{v[0]:.4g}{u}"
+    return (f"{np.mean(v):.4g} ± {np.std(v, ddof=1):.2g}{u} "
+            f"({np.min(v):.4g} to {np.max(v):.4g})")
+
+
 def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                e_unit=None):
     """
