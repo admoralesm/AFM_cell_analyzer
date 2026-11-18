@@ -409,8 +409,9 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
     many there are and its parameters, every one a (name, values, unit)
     to give as mean ± SD and range. Each peak: its height (or depth), width,
     rise (start to peak), fall (peak to end), area and, with k, energy.
-    Full beats also: duration, time between their two peaks, net and total
-    area and the beat's energy.
+    Full beats also: duration, time between their two peaks, total area
+    (both without sign) and the beat's energy. Areas have no sign, so a
+    negative peak's adds to a positive one's.
     """
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else ""
     energies = [spring_energy(abs(b[side]["peak"]), k, newtons)
@@ -441,7 +442,8 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                  [e["peak_x"] - e["start"] for e in peaks], x_unit),
                 (f"{name} fall (peak to end)",
                  [e["end"] - e["peak_x"] for e in peaks], x_unit),
-                (f"{name} area", [e["area"] for e in peaks], area_unit)]
+                (f"{name} area" + (" (no sign)" if side == "neg" else ""),
+                 [abs(e["area"]) for e in peaks], area_unit)]
             if with_energy:
                 params.append((f"{name} energy", [energy(e) for e in peaks],
                                e_name))
@@ -450,8 +452,6 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                 ("Time between its two peaks",
                  [abs(b["neg"]["peak_x"] - b["pos"]["peak_x"])
                   for b in these], x_unit),
-                ("Net area", [b["pos"]["area"] + b["neg"]["area"]
-                              for b in these], area_unit),
                 ("Total area (|positive| + |negative|)",
                  [abs(b["pos"]["area"]) + abs(b["neg"]["area"])
                   for b in these], area_unit)]
