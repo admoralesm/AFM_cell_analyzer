@@ -168,17 +168,27 @@ DEFAULT_DEFL_INVOLS = 50.0      # nm/V
 DEFAULT_SETPOINT = 0.0          # raw deflection units (V or nm)
 DEFAULT_SUBTRACT_SETPOINT = False
 DEFAULT_FORCE_MODE = "None"
+# "Defl → force" reads how the file stores the deflection: Asylum saves
+# image channels in metres (10 nm is stored as 1e-8), so F = y(m) × k in N;
+# a deflection in nm is × 1e-9 first, one in volts × InvOLS (nm/V) × 1e-9.
+FORCE_AUTO = "Defl → force (unit as stored)"
 FORCE_MODES = [
     "None",
+    FORCE_AUTO,
+    "Defl (m) → force",
+    "Defl (nm) → force",
+    "Defl (V) → force",
     "Defl (V) → nm",
-    "Defl (V) → force (nN)",
-    "Defl (nm) → force (nN)",
 ]
+# the names these had before, still understood
+LEGACY_FORCE_MODES = {"Defl (V) → force (nN)": "Defl (V) → force",
+                      "Defl (nm) → force (nN)": "Defl (nm) → force"}
 # Output unit for force conversions. Native result of nm × k(N/m) is nN;
 # these factors rescale it: 1 nN = 1000 pN = 0.001 µN.
 FORCE_UNITS = ["pN", "nN", "µN"]
 DEFAULT_FORCE_UNIT = "nN"
 FORCE_UNIT_SCALE = {"pN": 1000.0, "nN": 1.0, "µN": 1e-3}
+METRES_PER = {"m": 1.0, "nm": 1e-9}
 # k, InvOLS and conversion choices are remembered between sessions here:
 CONFIG_PATH = os.path.join(os.path.expanduser("~"),
                            ".afm_ibw_viewer_config.json")
@@ -1378,27 +1388,70 @@ def scan_size_um(nd):
     return fast, slow
 
 
+def stored_deflection_unit(y, file_unit=""):
+    """
+    How a deflection channel is stored: 'm', 'nm' or 'V'. Values under
+    1e-3 can only be metres (no deflection is a thousandth of a nm, or a
+    millimetre); larger ones are nm when the file says so, else volts, the
+    photodiode's own signal.
+    """
+    v = np.abs(np.asarray(y, dtype=float))
+    v = v[np.isfinite(v)]
+    if v.size and float(np.percentile(v, 99)) < 1e-3:
+        return "m"
+    if str(file_unit or "").strip() == "nm":
+        return "nm"
+    return "V"
+
+
+def deflection_unit_used(y, mode, file_unit=""):
+    """The unit a force conversion takes the deflection to be in ('m',
+    'nm' or 'V'), or None when ``mode`` is not one. "Defl → force" reads
+    it from the values (and the file); "Defl (nm) → force" on values that
+    can only be metres takes them as metres."""
+    mode = LEGACY_FORCE_MODES.get((mode or "None").strip(),
+                                  (mode or "None").strip())
+    if "force" not in mode:
+        return None
+    if mode == FORCE_AUTO:
+        return stored_deflection_unit(y, file_unit)
+    if mode == "Defl (nm) → force" and stored_deflection_unit(y) == "m":
+        return "m"
+    return {"Defl (m) → force": "m", "Defl (nm) → force": "nm",
+            "Defl (V) → force": "V"}.get(mode)
+
+
 def force_convert(y, mode, k=DEFAULT_SPRING_K, invols=DEFAULT_DEFL_INVOLS,
                   setpoint=0.0, subtract_setpoint=False,
-                  force_unit=DEFAULT_FORCE_UNIT):
-    """Deflection -> nm or force. With the setpoint subtracted first the
-    result is relative to the setpoint:
-    V->nm: (y-sp)*InvOLS.  V->nN: (y-sp)*InvOLS*k.  nm->nN: (y-sp)*k."""
+                  force_unit=DEFAULT_FORCE_UNIT, file_unit=""):
+    """
+    Deflection -> nm or force (in ``force_unit``). The force is
+    F = deflection in metres × k (N/m), in N, then shown in pN, nN or µN:
+    metres as stored × k; nm × 1e-9 × k; volts × InvOLS (nm/V) × 1e-9 × k.
+    The setpoint (in V, as the note gives it) is taken off first when
+    asked, turned into the deflection's own unit through InvOLS.
+    """
     if y is None:
         return y
-    mode = (mode or "None").strip()
+    mode = LEGACY_FORCE_MODES.get((mode or "None").strip(),
+                                  (mode or "None").strip())
     if mode == "None":
         return y
     y = np.asarray(y, dtype=float)
-    sp = float(setpoint) if subtract_setpoint else 0.0
-    fscale = FORCE_UNIT_SCALE.get(force_unit, 1.0)
+    sp_v = float(setpoint) if subtract_setpoint else 0.0
     if mode == "Defl (V) → nm":
-        return (y - sp) * float(invols)
-    if mode == "Defl (V) → force (nN)":
-        return (y - sp) * float(invols) * float(k) * fscale
-    if mode == "Defl (nm) → force (nN)":
-        return (y - sp) * float(k) * fscale
-    return y
+        return (y - sp_v) * float(invols)
+    unit = deflection_unit_used(y, mode, file_unit)
+    if unit is None:
+        return y
+    if unit == "V":
+        metres = (y - sp_v) * float(invols) * 1e-9
+    else:
+        sp = sp_v * float(invols) * 1e-9 / METRES_PER[unit]
+        metres = (y - sp) * METRES_PER[unit]
+    newtons = metres * float(k)
+    # FORCE_UNIT_SCALE is per nN
+    return newtons * 1e9 * FORCE_UNIT_SCALE.get(force_unit, 1.0)
 
 
 def units_for(mode, base_units, force_unit=DEFAULT_FORCE_UNIT,
