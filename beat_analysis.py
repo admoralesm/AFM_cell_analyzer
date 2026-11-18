@@ -465,17 +465,42 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
     return out
 
 
+SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def pretty(value, digits=4):
+    """
+    A number as it reads on a slide: 0.0523 or 544.7 as they are, and in
+    scientific notation when very small or large: 5.447 × 10⁻¹⁶ (with real
+    superscripts, so it pastes into PowerPoint or Word as it reads). ''
+    when it is not a number.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(v):
+        return ""
+    if v == 0 or 1e-3 <= abs(v) < 1e5:
+        return f"{v:.{digits}g}"
+    mantissa, exponent = f"{v:.{max(digits - 1, 0)}e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".") if "." in mantissa \
+        else mantissa
+    return f"{mantissa} × 10{str(int(exponent)).translate(SUPERSCRIPT)}"
+
+
 def mean_sd_range(values, unit=""):
-    """'52.1 ± 1.2 nN (50.3 to 54.0)': one value as it is."""
+    """'52.1 ± 1.2 nN (50.3 to 54.0)': one value as it is. Very small or
+    large numbers in scientific notation (5.447 × 10⁻¹⁶ J)."""
     v = np.asarray(values, float)
     v = v[np.isfinite(v)]
     u = f" {unit}" if unit else ""
     if not v.size:
         return "–"
     if v.size == 1:
-        return f"{v[0]:.4g}{u}"
-    return (f"{np.mean(v):.4g} ± {np.std(v, ddof=1):.2g}{u} "
-            f"({np.min(v):.4g} to {np.max(v):.4g})")
+        return f"{pretty(v[0])}{u}"
+    return (f"{pretty(np.mean(v))} ± {pretty(np.std(v, ddof=1), 2)}{u} "
+            f"({pretty(np.min(v))} to {pretty(np.max(v))})")
 
 
 def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
