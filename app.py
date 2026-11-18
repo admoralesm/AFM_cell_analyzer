@@ -642,15 +642,19 @@ COMPANION_NEEDS = {
     "beat_analysis.py": ("excursions", "pair_beats", "beat_table",
                          "summary", "beat_figure", "suggest_thresholds",
                          "peak_table", "energy_factor", "ENERGY_UNITS"),
+    "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
+                      "stored_deflection_unit", "deflection_unit_used"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
 fcv = _current(fcv, *COMPANION_NEEDS["force_curve.py"])
 bta = _current(bta, *COMPANION_NEEDS["beat_analysis.py"])
+ai = _current(ai, *COMPANION_NEEDS["afm_images.py"])
 OUTDATED = [name for name, module in (("auto_analysis.py", aa),
                                       ("stack_compare.py", sc),
                                       ("force_curve.py", fcv),
-                                      ("beat_analysis.py", bta))
+                                      ("beat_analysis.py", bta),
+                                      ("afm_images.py", ai))
             if module is not None
             and any(not _has_name(module, n) for n in COMPANION_NEEDS[name])]
 
@@ -1280,7 +1284,7 @@ DEFAULTS = {
     "ai_invols": 50.0,
     "ai_sp": 0.0,
     "ai_subsp": False,
-    "ai_funit": "nN",
+    "ai_funit": "µN",
     "ai_bl1": "None",
     "ai_bl2": "None",
     "ai_mult1": "1",
@@ -29318,12 +29322,37 @@ def ai_trace(arr, axis, a, b, timing):
         turnaround_on=timing["turn"], turnaround_gap_s=timing["turn_s"])
 
 
-def ai_channel_pick(label, key, n, names, allow_none=True):
+def ai_channel_pick(label, key, n, names, allow_none=True, which=None):
     options = (["None"] if allow_none else []) + list(range(n))
     ai_choice(key, options, options[0])
     return st.selectbox(
         label, options, key=key,
-        format_func=lambda v: "None" if v == "None" else f"{v}: {names[v]}")
+        format_func=lambda v: "None" if v == "None" else f"{v}: {names[v]}",
+        on_change=ai_auto_convert if which else None,
+        args=(which, names) if which else None)
+
+
+def ai_auto_convert(which, names):
+    """
+    A deflection channel picked for a plot is shown as a force: "Defl →
+    force", which reads how the file stores it (Asylum: metres) and
+    multiplies by the file's k. Any other channel (a height, say) is not a
+    force, so it is shown as it is.
+    """
+    s = st.session_state
+    picked = []
+    for seg in ("a", "b"):
+        value = s.get(f"ai_{seg}{which}")
+        if value not in (None, "None") and 0 <= int(value) < len(names):
+            picked.append(str(names[int(value)]))
+    if not picked:
+        return
+    deflection = all("defl" in n.lower() for n in picked)
+    mode = s.get(f"ai_fmode{which}", "None")
+    if deflection and mode == "None":
+        s[f"ai_fmode{which}"] = ai.FORCE_AUTO
+    elif not deflection and mode != "None":
+        s[f"ai_fmode{which}"] = "None"
 
 
 def ai_files_panel():
@@ -29364,6 +29393,14 @@ def ai_files_panel():
         st.error(f"Could not read {upload.name}: {exc}", icon="🚫")
         return None
     return upload.name, item
+
+
+AI_CONVERT_HELP = (
+    "Defl → force (unit as stored): reads how the file stores the "
+    "deflection. Asylum saves it in metres (10 nm is stored as 1e-8), so "
+    "F = deflection (m) × k (N/m) in N, shown in the force unit under 🪝 "
+    "Cantilever (µN unless changed). nm and volts are read too (volts "
+    "through InvOLS). Picked by itself for a deflection channel.")
 
 
 def ai_use_note(nd):
@@ -29413,7 +29450,8 @@ def ai_panel():
     # A new file brings its own channel axis, line rate and cantilever
     # (k, InvOLS and setpoint from its note), so every number made from it
     # (force, its peaks' energy wherever it is sent) uses the file's own.
-    if st.session_state.get("_ai_for") != name:
+    fresh = st.session_state.get("_ai_for") != name
+    if fresh:
         st.session_state["_ai_for"] = name
         st.session_state["ai_axis"] = ai.guess_channel_axis(arr)
         if guess.get("scan_hz"):
@@ -29424,6 +29462,16 @@ def ai_panel():
     presets = bool(st.session_state.get("ai_presets", True))
     names = [ai.channel_display_name(meta, axis, i, presets)
              for i in range(nch)]
+    for which in (1, 2):
+        mode = st.session_state.get(f"ai_fmode{which}", "None")
+        if mode in ai.LEGACY_FORCE_MODES:
+            st.session_state[f"ai_fmode{which}"] = \
+                ai.LEGACY_FORCE_MODES[mode]
+        elif mode not in ai.FORCE_MODES:
+            st.session_state[f"ai_fmode{which}"] = "None"
+        if fresh:
+            # the deflection of a new file in force, from its own k
+            ai_auto_convert(which, names)
     st.caption(f"{name} · {' × '.join(str(s) for s in arr.shape)} · "
                f"{nch} channel{'s' if nch != 1 else ''}: "
                + ", ".join(names)
@@ -29534,14 +29582,16 @@ def ai_panel():
     s1, s2 = st.columns(2)
     with s1:
         st.markdown("Plot 1 · left axis")
-        a1 = ai_channel_pick("Segment A", "ai_a1", nch, names)
-        b1 = ai_channel_pick("Segment B", "ai_b1", nch, names)
-        st.selectbox("Convert", ai.FORCE_MODES, key="ai_fmode1")
+        a1 = ai_channel_pick("Segment A", "ai_a1", nch, names, which=1)
+        b1 = ai_channel_pick("Segment B", "ai_b1", nch, names, which=1)
+        st.selectbox("Convert", ai.FORCE_MODES, key="ai_fmode1",
+                     help=AI_CONVERT_HELP)
     with s2:
         p2_on = st.toggle("Plot 2 · right axis", key="ai_p2")
-        a2 = ai_channel_pick("Segment A₂", "ai_a2", nch, names)
-        b2 = ai_channel_pick("Segment B₂", "ai_b2", nch, names)
-        st.selectbox("Convert ", ai.FORCE_MODES, key="ai_fmode2")
+        a2 = ai_channel_pick("Segment A₂", "ai_a2", nch, names, which=2)
+        b2 = ai_channel_pick("Segment B₂", "ai_b2", nch, names, which=2)
+        st.selectbox("Convert ", ai.FORCE_MODES, key="ai_fmode2",
+                     help=AI_CONVERT_HELP)
     a1 = None if a1 == "None" else int(a1)
     b1 = None if b1 == "None" else int(b1)
     a2 = None if (a2 == "None" or not p2_on) else int(a2)
@@ -29576,8 +29626,10 @@ def ai_panel():
                         key="ai_k")
         k2.number_input("Defl InvOLS (nm/V)", 0.001, 100000.0, step=1.0,
                         format="%.5g", key="ai_invols")
-        k3.number_input("Setpoint (raw)", -1000.0, 1000.0, step=0.01,
-                        format="%.5g", key="ai_sp")
+        k3.number_input("Setpoint (V)", -1000.0, 1000.0, step=0.01,
+                        format="%.5g", key="ai_sp",
+                        help="In volts, as the note gives it; taken off a "
+                             "deflection in m or nm through InvOLS.")
         k4.checkbox("Subtract the setpoint", key="ai_subsp")
         k5.selectbox("Force unit", ai.FORCE_UNITS, key="ai_funit")
         k_n, iv_n, sp_n = ai.note_calibration(nd)
@@ -29619,23 +29671,10 @@ def ai_panel():
                invols=st.session_state.get("ai_invols", 50.0),
                setpoint=st.session_state.get("ai_sp", 0.0),
                subtract_setpoint=bool(st.session_state.get("ai_subsp")),
-               force_unit=st.session_state.get("ai_funit", "nN"))
+               force_unit=st.session_state.get("ai_funit", "µN"),
+               file_unit=meta.get("data_units", ""))
     cal_meta = ai_cal_meta(name, nd)
-    modes = {st.session_state.get(f"ai_fmode{w}", "None")
-             for w, on in ((1, True), (2, p2_on)) if on}
-    if any(m != "None" for m in modes):
-        uses_v = any("(V)" in m for m in modes)
-        k_said = meta_said(cal_meta, "k")
-        iv_said = meta_said(cal_meta, "invols")
-        st.caption(
-            f"🪝 Converted with k = {cal_meta['k'] or 0:g} N/m"
-            + (f" and InvOLS = {cal_meta['invols'] or 0:g} nm/V"
-               if uses_v else "")
-            + (f", both {k_said}" if uses_v and k_said == iv_said
-               else f" ({k_said})" if not uses_v
-               else f" (k {k_said}, InvOLS {iv_said})")
-            + ". Change them under 🪝 Cantilever.")
-    traces = {}
+    traces, read_as = {}, {}
     try:
         for which, (a, b) in ((1, (a1, b1)), (2, (a2, b2))):
             t, y = ai_trace(arr, axis, a, b, timing)
@@ -29644,11 +29683,49 @@ def ai_panel():
                 if fmode == "None":
                     # unconverted: in the same units as the image above
                     y = np.asarray(y, dtype=float) * factor
+                else:
+                    used = ai.deflection_unit_used(y, fmode,
+                                                   cal["file_unit"])
+                    if used:
+                        v = np.abs(np.asarray(y, float))
+                        v = v[np.isfinite(v)]
+                        read_as[which] = (used, float(np.median(v))
+                                          if v.size else 0.0)
                 y = ai.force_convert(y, fmode, **cal)
                 traces[which] = (np.asarray(t) * tfactor, np.asarray(y))
     except Exception as exc:
         st.error(f"Could not build the time trace: {exc}", icon="🚫")
         return
+    tens = {"pN": "10⁻¹² N", "nN": "10⁻⁹ N", "µN": "10⁻⁶ N"}
+    for which, (used, typical) in sorted(read_as.items()):
+        chosen = [names[c] for c in ((a1, b1) if which == 1 else (a2, b2))
+                  if c is not None]
+        how = {"m": "stored in metres (as Asylum saves it)",
+               "nm": "stored in nm", "V": "in volts"}[used]
+        chain = {"m": "deflection (m) × k",
+                 "nm": "deflection (nm) × 1e-9 × k",
+                 "V": "V × InvOLS × 1e-9 × k"}[used]
+        st.caption(
+            f"🪝 Plot {which}: {' / '.join(chosen)} is {how}, typically "
+            f"{typical:.3g} {used}. Force = {chain}, in N, shown in "
+            f"{cal['force_unit']} (1 {cal['force_unit']} = "
+            f"{tens.get(cal['force_unit'], '')}).")
+    modes = {st.session_state.get(f"ai_fmode{w}", "None")
+             for w, on in ((1, True), (2, p2_on)) if on}
+    if any(m != "None" for m in modes):
+        uses_v = (any(used == "V" for used, _ in read_as.values())
+                  or "Defl (V) → nm" in modes
+                  or bool(st.session_state.get("ai_subsp")))
+        k_said = meta_said(cal_meta, "k")
+        iv_said = meta_said(cal_meta, "invols")
+        st.caption(
+            f"🪝 k = {cal_meta['k'] or 0:g} N/m"
+            + (f" and InvOLS = {cal_meta['invols'] or 0:g} nm/V"
+               if uses_v else "")
+            + (f", both {k_said}" if uses_v and k_said == iv_said
+               else f", {k_said}" if not uses_v
+               else f" (k {k_said}; InvOLS {iv_said})")
+            + ". Change them, or the force unit, under 🪝 Cantilever.")
     if not traces:
         st.info("Choose a channel for segment A and/or B of Plot 1 (or "
                 "turn on Plot 2) to draw the signal against time.",
@@ -29737,7 +29814,7 @@ def ai_panel():
 
     units = {w: ai.units_for(
         st.session_state.get(f"ai_fmode{w}"), unit or "raw",
-        st.session_state.get("ai_funit", "nN"),
+        st.session_state.get("ai_funit", "µN"),
         st.session_state.get(f"ai_yunit{w}", "")) for w in processed}
 
     # style --------------------------------------------------------------
@@ -30172,7 +30249,7 @@ with tab_afm:
         st.error("This tab needs **afm_images.py** beside app.py"
                  + (f" ({AFM_IMAGE_ERROR})." if AFM_IMAGE_ERROR else "."),
                  icon="🚫")
-    else:
+    elif not outdated_notice("afm_images.py"):
         ai_panel()
 
 
