@@ -32629,12 +32629,12 @@ def bt_unit_changed(sid):
     s[f"_bt_scale_{sid}"] = new
 
 
-BT_ENERGY = "aJ"
+BT_ENERGY = "J"
 
 
 def bt_energy_unit(e_unit=None):
-    """The energy unit: aJ (10⁻¹⁸ J) for every signal, so the results
-    compare and add up in one database."""
+    """The energy unit: joules for every signal (written × 10ⁿ), so the
+    results compare and add up in one database."""
     return e_unit if e_unit in BT_ENERGY_UNITS[1:] else BT_ENERGY
 
 
@@ -33099,8 +33099,10 @@ def bt_report(sid, got):
     if "Spring energy, total" in info:
         eu = info["Spring energy, total"][1]
         lines.append(f"Energy of a peak: F²/2k, F its height above (or "
-                     f"depth below) the baseline in N, k in N/m; in {eu} "
-                     f"({BT_TENS.get(eu, eu)}). It equals ∫F dδ with δ = F/k, "
+                     f"depth below) the baseline in N, k in N/m; in "
+                     + ("joules (J)" if eu == "J" else
+                        f"{eu} ({BT_TENS.get(eu, eu)})")
+                     + ". It equals ∫F dδ with δ = F/k, "
                      "the work of bending the cantilever. A full beat's "
                      "energy is its two peaks' together.")
     text = "\n".join(lines)
@@ -33195,8 +33197,17 @@ def bt_results_line(name, got):
 
 
 def bt_neat(value):
+    """A number as it reads (and pastes into PowerPoint): very small or
+    large ones in scientific notation, 5.447 × 10⁻¹⁶."""
     if isinstance(value, (float, np.floating)):
-        return "" if not np.isfinite(value) else f"{value:.5g}"
+        return bta.pretty(value, 4)
+    return str(value)
+
+
+def bt_excel(value):
+    """A number as Excel reads it: 5.447e-16."""
+    if isinstance(value, (float, np.floating)):
+        return "" if not np.isfinite(value) else f"{value:.6g}"
     return str(value)
 
 
@@ -33217,9 +33228,11 @@ def bt_integration(sid, got):
                 hide_index=True, **STRETCH,
                 height=min(36 * (len(frame) + 1) + 4, 820))
         with right:
-            st.caption("Copy with the icon at the top right of a box; it "
-                       "pastes into Excel as cells.")
-            table, line = st.tabs(["Table", "One row (data sheet)"])
+            st.caption("Copy with the icon at the top right of a box. "
+                       "Table: for PowerPoint or Word, numbers as they read "
+                       "(5.447 × 10⁻¹⁶). One row: for Excel, numbers it "
+                       "reads as numbers (5.447e-16).")
+            table, line = st.tabs(["Table", "One row (Excel)"])
             with table:
                 st.code("Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_neat(v)}\t{u}" for p, v, u in
@@ -33227,7 +33240,7 @@ def bt_integration(sid, got):
             with line:
                 row = bt_results_line(name, got)
                 st.code("\t".join(row) + "\n" + "\t".join(
-                    bt_neat(v) for v in row.values()), language=None,
+                    bt_excel(v) for v in row.values()), language=None,
                     height=140)
                 st.caption("A header and one line: paste the line under "
                            "the last one in your data sheet.")
@@ -33239,9 +33252,10 @@ def bt_integration(sid, got):
                            "constant k under ⚡ Force and energy, on the "
                            "left.")
             else:
-                st.caption(f"Energy of a peak: F²/2k, in aJ (10⁻¹⁸ J). "
-                           f"Areas: ∫(y − baseline) dt, in {area}, without "
-                           "sign so positive and negative add up.")
+                st.caption("Energy of a peak: F²/2k, in joules (J). "
+                           f"Areas: ∫(y − baseline) dt, in {area} (force × "
+                           "time, not an energy), without sign so positive "
+                           "and negative add up.")
         peaks = got["peaks"]
         with st.expander(f"∫ Each peak ({len(peaks)})"):
             if peaks.empty:
@@ -33250,7 +33264,8 @@ def bt_integration(sid, got):
                 st.dataframe(
                     peaks, hide_index=True, **STRETCH,
                     column_config={c: st.column_config.NumberColumn(
-                        format="%.5g") for c in peaks.columns
+                        format="%.4e" if c.startswith("Energy") else "%.5g")
+                        for c in peaks.columns
                         if peaks[c].dtype.kind == "f"})
                 name = sc_db_safe(st.session_state["_bt_sets"][sid]["name"])
                 st.download_button(
@@ -33541,12 +33556,8 @@ def bt_results(sid, got):
     st.markdown("#### 💓 Each beat")  # (📋 Results above)
     # blank where a beat has no such peak (the CSV keeps them empty too);
     # untick Keep to remove a beat's peaks
-    def neat(value):
-        if isinstance(value, (float, np.floating)):
-            return "" if not np.isfinite(value) else f"{value:.5g}"
-        return value
-
-    shown = table.map(neat)
+    shown = table.map(lambda v: bt_neat(v) if isinstance(
+        v, (float, np.floating)) else v)
     shown.insert(0, "Keep", True)
     marks_by_row = [[e["peak_x"] for e in (b["pos"], b["neg"]) if e]
                     for b in got["beats"]]
