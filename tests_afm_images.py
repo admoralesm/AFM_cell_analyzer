@@ -108,6 +108,8 @@ def main():
     k, invols, sp = ai.note_calibration(item["note_dict"])
     check("and the calibration, InvOLS turned from m/V into nm/V",
           (k, invols, sp) == (0.08, 65.0, 0.5), str((k, invols, sp)))
+    check("the unit the file gives its values (none in this one)",
+          item["meta"].get("data_units") == "", item["meta"].get("data_units"))
     check("and the scan size in µm",
           ai.scan_size_um(item["note_dict"]) == (20.0, 20.0))
 
