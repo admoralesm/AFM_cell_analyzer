@@ -174,6 +174,34 @@ check("…and the energy k·δ²/2",
 check("no k, no energy column",
       not any("Energy" in c for c in ba.peak_table(beats, "s", "µN").columns))
 
+print("beats by kind, every parameter")
+kinds = ba.kind_stats(beats, "s", "µN", k=0.1, newtons=1e-6, e_unit="fJ")
+by = {group["kind"]: group for group in kinds}
+check("three kinds, counted", [g["kind"] for g in kinds] == list(ba.KINDS)
+      and [by[kd]["n"] for kd in ba.KINDS] == [3, 1, 1],
+      [(g["kind"], g["n"]) for g in kinds])
+full = {n: (v, u) for n, v, u in by[ba.KINDS[0]]["params"]}
+check("a full beat's peaks: height, width, rise, area, energy, in units",
+      abs(np.mean(full["Positive peak height"][0]) - 0.1) < 1e-3
+      and full["Positive peak height"][1] == "µN"
+      and abs(np.mean(full["Positive peak width"][0]) - 1.0) < 0.02
+      and abs(np.mean(full["Positive peak rise (start to peak)"][0]) - 0.5)
+      < 0.02 and full["Positive peak area"][1] == "µN·s"
+      and full["Positive peak energy"][1] == "fJ", sorted(full))
+check("…and the beat's own: duration, time between its peaks, energy",
+      abs(np.mean(full["Time between its two peaks"][0]) - 1.0) < 0.02
+      and abs(np.mean(full["Energy of the beat"][0])
+              - np.mean(full["Positive peak energy"][0])
+              - np.mean(full["Negative peak energy"][0])) < 1e-9,
+      full["Time between its two peaks"][0])
+alone = [n for n, _, _ in by[ba.KINDS[1]]["params"]]
+check("a positive-only beat has only its peak's parameters",
+      alone and all(n.startswith("Positive peak") for n in alone), alone)
+check("mean ± SD (range), or the one value",
+      ba.mean_sd_range([1.0, 2.0, 3.0], "nN") == "2 ± 1 nN (1 to 3)"
+      and ba.mean_sd_range([5.0], "s") == "5 s"
+      and ba.mean_sd_range([]) == "–")
+
 print("plot")
 fig = ba.beat_figure(t, y, base, 0.01, 0.01, events, beats,
                      left_out=[events[0]], shade_beats=True)
