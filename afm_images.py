@@ -579,6 +579,7 @@ def try_read_ibw(path):
 
     meta = {
         "wave_name": name,
+        "data_units": _ibw_data_units(wave),
         "channel_labels": _ibw_dimension_labels(wave),
         "note": note,
         "shape": arr.shape,
@@ -587,6 +588,29 @@ def try_read_ibw(path):
         "path": path,
     }
     return arr, meta
+
+
+def _ibw_data_units(wave):
+    """The unit the file gives its values (e.g. 'm' or 'V'): the long
+    form when there is one, else the header's four characters; '' when the
+    file does not say."""
+    def text(value):
+        if value is None:
+            return ""
+        try:
+            if isinstance(value, (bytes, bytearray, str)):
+                out = _ensure_text(value)
+            else:
+                out = "".join(_ensure_text(v) for v in np.ravel(value))
+        except Exception:
+            return ""
+        return out.replace("\x00", "").strip()
+
+    try:
+        return (text(wave.get("data_units"))
+                or text((wave.get("wave_header") or {}).get("dataUnits")))
+    except Exception:
+        return ""
 
 
 def _ibw_dimension_labels(wave):
