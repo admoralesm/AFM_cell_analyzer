@@ -640,7 +640,8 @@ COMPANION_NEEDS = {
                        "table_to_send", "incline", "pad_zero",
                        "side_fit", "side_line", "bridged", "line_value"),
     "beat_analysis.py": ("excursions", "pair_beats", "beat_table",
-                         "summary", "beat_figure", "suggest_thresholds"),
+                         "summary", "beat_figure", "suggest_thresholds",
+                         "peak_table", "energy_factor", "ENERGY_UNITS"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -10976,24 +10977,63 @@ def sc_upload_key(i):
 
 
 def send_to_stack(name, frame, source="the video", stats=None,
-                  zero_mode=None, lines=None, series=False):
+                  zero_mode=None, lines=None, series=False, meta=None):
     """Put a table in the first free slot of the Stack & compare tab (or,
     with ``series``, of the Series tab). ``zero_mode``: where that file's
     x = 0 starts out (one of the stack's zero options), e.g. "As in the
-    file" for time already counted from a chosen moment."""
+    file" for time already counted from a chosen moment. ``meta``: what
+    the recording's own file says about it (see file_meta)."""
     with sc_namespace(SC_PLACES["series" if series else "stack"]):
-        return _send_here(name, frame, source, stats, zero_mode, lines)
+        return _send_here(name, frame, source, stats, zero_mode, lines,
+                          meta)
 
 
 def send_to_series(name, frame, source="the video", stats=None,
-                   zero_mode=None, lines=None):
+                   zero_mode=None, lines=None, meta=None):
     """The same, into the Series tab."""
     return send_to_stack(name, frame, source, stats, zero_mode, lines,
-                         series=True)
+                         series=True, meta=meta)
+
+
+def file_meta(file="", k=None, k_from="", invols=None, invols_from="",
+              y_unit="", channel=""):
+    """
+    What a recording's own file says about it, carried with it wherever
+    it is sent so the numbers there use the file's values: the
+    cantilever's spring constant k (N/m) and InvOLS (nm/V), where each
+    came from ("the file's note" or where it was typed), the unit of y and
+    the channel it was read from.
+    """
+    def num(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) and value > 0 else None
+
+    return {"file": str(file or ""), "k": num(k), "k_from": str(k_from or ""),
+            "invols": num(invols), "invols_from": str(invols_from or ""),
+            "y_unit": str(y_unit or ""), "channel": str(channel or "")}
+
+
+def bta_unit(label):
+    """The unit in brackets at the end of a column name ('' when none)."""
+    found = re.search(r"\(([^()]*)\)\s*$", str(label or ""))
+    return found.group(1).strip() if found else ""
+
+
+def meta_said(meta, what="k"):
+    """'from the file's note (cell01.ibw)': where a value in meta came
+    from, for a caption."""
+    meta = meta or {}
+    where = meta.get(f"{what}_from") or ""
+    if where == "the file's note" and meta.get("file"):
+        return f"from the file's note ({meta['file']})"
+    return f"from {where}" if where else ""
 
 
 def send_to_analysis(name, frame, source="the video", stats=None,
-                     zero_mode=None, lines=None):
+                     zero_mode=None, lines=None, meta=None):
     """Put a table on the Beat analysis tab (as a new signal there, shown
     at once). Takes the same arguments as send_to_stack."""
     s = st.session_state
@@ -11001,7 +11041,7 @@ def send_to_analysis(name, frame, source="the video", stats=None,
     s["_bt_n"] = int(s.get("_bt_n", 0) or 0) + 1
     sid = f"s{s['_bt_n']}"
     sets[sid] = {"name": str(name), "frame": frame.copy(),
-                 "source": str(source)}
+                 "source": str(source), "meta": dict(meta or {})}
     s["bt_pick"] = sid
     s["_vq_sent_note"] = (f"Sent to Beat analysis as “{name}”. Open that "
                           "tab to see it.")
@@ -11009,7 +11049,7 @@ def send_to_analysis(name, frame, source="the video", stats=None,
     return sid
 
 
-def _send_here(name, frame, source, stats, zero_mode, lines):
+def _send_here(name, frame, source, stats, zero_mode, lines, meta=None):
     s = st.session_state
     if frame is None:
         return
@@ -11026,7 +11066,16 @@ def _send_here(name, frame, source, stats, zero_mode, lines):
         return None
     s[f"{SCP}sent{free}"] = {"name": name, "frame": frame.copy(),
                            "source": source,
-                           "stats": list(stats or [])}
+                           "stats": list(stats or []),
+                           "meta": dict(meta or {})}
+    # the file's own spring constant (and deflection unit) for its peaks
+    # in force, not the last one typed for another file
+    for key in ("pkk", "pkdu"):
+        s.pop(f"{SCP}{key}{free}", None)
+    if (meta or {}).get("k"):
+        s[f"{SCP}pkk{free}"] = float(meta["k"])
+    if (meta or {}).get("y_unit") in ("nm", "µm", "m"):
+        s[f"{SCP}pkdu{free}"] = meta["y_unit"]
     if sc is not None and zero_mode in sc.ZERO_MODES:
         s[f"{SCP}zmode{free}"] = zero_mode
     # lines drawn on the way (x as sent): that file's hand lines there
@@ -26966,6 +27015,24 @@ def fc_signal(item):
                + (f" · k = {item['k']:g} N/m in the file"
                   if item.get("k") else ""))
     stem = re.sub(r"\.[^.]+$", "", str(item["name"]))
+    # the cantilever the force was made with (or the file says it had),
+    # sent with the curve so its energy elsewhere uses the same k
+    if unit in ("m", "µm", "nm", "V"):
+        k_used = float(s.get("fc_kspring") or 0.0)
+        iv_used = float(s.get("fc_invols") or 0.0) if unit == "V" else None
+    else:
+        k_used, iv_used = item.get("k"), item.get("invols")
+
+    def came(value, own):
+        if not value:
+            return ""
+        return ("the file's note" if own and abs(float(own) - value)
+                <= 1e-9 * value else "typed on the Single force curve tab")
+
+    s["_fc_meta"] = file_meta(
+        file=item["name"], k=k_used, k_from=came(k_used, item.get("k")),
+        invols=iv_used, invols_from=came(iv_used, item.get("invols")),
+        y_unit=fc_force_unit(ylab) or bta_unit(ylab), channel=str(ch))
     return t, y, ylab, stem
 
 
@@ -28289,17 +28356,18 @@ def fc_results(t, m, ylab, stem):
         sent = (stem, table, "Single force curve", balloon,
                 "As in the file" if zero_at != "As recorded" else None,
                 drawn)
+        sent_meta = {"meta": s.get("_fc_meta")}
         r2.button("📚 Send to stack", key="fc_send", type="primary",
-                  on_click=send_to_stack, args=sent,
+                  on_click=send_to_stack, args=sent, kwargs=sent_meta,
                   help="Sends time and force (corrected first, then as "
                        "read), the lines drawn and this summary to the "
                        "Stack & compare tab.", **STRETCH)
         r2b.button("🔗 Send to series", key="fc_send_sr", type="primary",
-                   on_click=send_to_series, args=sent,
+                   on_click=send_to_series, args=sent, kwargs=sent_meta,
                    help="The same, to the Series tab: curves one after "
                         "another along one time axis.", **STRETCH)
         r2c.button("📊 Send to analysis", key="fc_send_bt",
-                   on_click=send_to_analysis, args=sent,
+                   on_click=send_to_analysis, args=sent, kwargs=sent_meta,
                    help="Time and force to the Beat analysis tab: its "
                         "peaks, their areas, beats and energy.", **STRETCH)
         r3.download_button("💾 Save as CSV", key="fc_csv",
@@ -29298,6 +29366,37 @@ def ai_files_panel():
     return upload.name, item
 
 
+def ai_use_note(nd):
+    """The cantilever of the file's note into the settings: k, InvOLS and
+    the setpoint, each where the note has it."""
+    s = st.session_state
+    k_n, iv_n, sp_n = ai.note_calibration(nd)
+    if k_n:
+        s["ai_k"] = float(min(max(k_n, 0.0001), 1000.0))
+    if iv_n:
+        s["ai_invols"] = float(min(max(iv_n, 0.001), 100000.0))
+    if sp_n is not None:
+        s["ai_sp"] = float(min(max(sp_n, -1000.0), 1000.0))
+
+
+def ai_cal_meta(name, nd):
+    """The cantilever used now, and where each value came from: the file's
+    note when it still says so, else typed here."""
+    s = st.session_state
+    k_n, iv_n, _ = ai.note_calibration(nd)
+    k, iv = float(s.get("ai_k") or 0.0), float(s.get("ai_invols") or 0.0)
+
+    def same(a, b):
+        return bool(a) and abs(a - b) <= 1e-9 * abs(a)
+
+    return file_meta(
+        file=name, k=k, invols=iv,
+        k_from="the file's note" if same(k_n, k)
+        else "typed on the AFM output tab",
+        invols_from="the file's note" if same(iv_n, iv)
+        else "typed on the AFM output tab")
+
+
 def ai_panel():
     """The whole 🔬 tab."""
     loaded = ai_files_panel()
@@ -29311,12 +29410,15 @@ def ai_panel():
                  "dimensions.", icon="🚫")
         return
 
-    # A new file brings its own channel axis and line rate.
+    # A new file brings its own channel axis, line rate and cantilever
+    # (k, InvOLS and setpoint from its note), so every number made from it
+    # (force, its peaks' energy wherever it is sent) uses the file's own.
     if st.session_state.get("_ai_for") != name:
         st.session_state["_ai_for"] = name
         st.session_state["ai_axis"] = ai.guess_channel_axis(arr)
         if guess.get("scan_hz"):
             st.session_state["ai_rate"] = float(guess["scan_hz"])
+        ai_use_note(nd)
     axis = int(st.session_state.get("ai_axis", 2))
     nch = ai.n_channels(arr, axis)
     presets = bool(st.session_state.get("ai_presets", True))
@@ -29359,8 +29461,10 @@ def ai_panel():
                           "ai_img_scale", "as stored")][1] or "nm")
     factor, auto_unit = AI_IMAGE_SCALES[st.session_state.get(
         "ai_img_scale", "as stored")]
+    # the unit the file itself gives its values, when it does
     unit = st.session_state.get("ai_img_unit") or auto_unit or \
-        guess.get("units") or ""
+        guess.get("units") or (meta.get("data_units") if factor == 1.0
+                               else "") or ""
     ch = int(st.session_state.get("ai_ch", 0))
     img = ai.orient_image(ai.channel_image(arr, axis, ch) * factor,
                           st.session_state.get("ai_orient"))
@@ -29477,22 +29581,23 @@ def ai_panel():
         k4.checkbox("Subtract the setpoint", key="ai_subsp")
         k5.selectbox("Force unit", ai.FORCE_UNITS, key="ai_funit")
         k_n, iv_n, sp_n = ai.note_calibration(nd)
-
-        def use_note():
-            if k_n:
-                st.session_state["ai_k"] = float(k_n)
-            if iv_n:
-                st.session_state["ai_invols"] = float(iv_n)
-            if sp_n is not None:
-                st.session_state["ai_sp"] = float(sp_n)
-
+        said = ai_cal_meta(name, nd)
+        found = ", ".join(
+            ([f"k {k_n:g} N/m"] if k_n else [])
+            + ([f"InvOLS {iv_n:g} nm/V"] if iv_n else [])
+            + ([f"setpoint {sp_n:g}"] if sp_n is not None else []))
         st.button(
             "📄 Use the file's own values"
-            + (f" (k {k_n:g} N/m, InvOLS {iv_n:g} nm/V"
-               + (f", setpoint {sp_n:g}" if sp_n is not None else "") + ")"
-               if (k_n or iv_n) else " (none in its note)"),
-            key="ai_use_note", on_click=use_note,
-            disabled=not (k_n or iv_n or sp_n is not None))
+            + (f" ({found})" if found else " (none in its note)"),
+            key="ai_use_note", on_click=ai_use_note, args=(nd,),
+            disabled=not (k_n or iv_n or sp_n is not None),
+            help="A new file fills these from its note by itself; this "
+                 "puts them back after a change.")
+        st.caption(
+            f"k {said['k'] or 0:g} N/m {meta_said(said, 'k')} · InvOLS "
+            f"{said['invols'] or 0:g} nm/V {meta_said(said, 'invols')}."
+            + ("" if k_n else " ⚠️ The note has no spring constant: type "
+               "the cantilever's k."))
         st.caption("V → nm: (y − setpoint) × InvOLS · V → force: "
                    "(y − setpoint) × InvOLS × k · nm → force: "
                    "(y − setpoint) × k.")
@@ -29515,6 +29620,21 @@ def ai_panel():
                setpoint=st.session_state.get("ai_sp", 0.0),
                subtract_setpoint=bool(st.session_state.get("ai_subsp")),
                force_unit=st.session_state.get("ai_funit", "nN"))
+    cal_meta = ai_cal_meta(name, nd)
+    modes = {st.session_state.get(f"ai_fmode{w}", "None")
+             for w, on in ((1, True), (2, p2_on)) if on}
+    if any(m != "None" for m in modes):
+        uses_v = any("(V)" in m for m in modes)
+        k_said = meta_said(cal_meta, "k")
+        iv_said = meta_said(cal_meta, "invols")
+        st.caption(
+            f"🪝 Converted with k = {cal_meta['k'] or 0:g} N/m"
+            + (f" and InvOLS = {cal_meta['invols'] or 0:g} nm/V"
+               if uses_v else "")
+            + (f", both {k_said}" if uses_v and k_said == iv_said
+               else f" ({k_said})" if not uses_v
+               else f" (k {k_said}, InvOLS {iv_said})")
+            + ". Change them under 🪝 Cantilever.")
     traces = {}
     try:
         for which, (a, b) in ((1, (a1, b1)), (2, (a2, b2))):
@@ -29670,7 +29790,8 @@ def ai_panel():
     base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
                                 labels=names)
     ai_send_row(processed, units, tlabel, base,
-                channels={1: (a1, b1), 2: (a2, b2)}, names=names)
+                channels={1: (a1, b1), 2: (a2, b2)}, names=names,
+                meta=cal_meta)
     ai_chart(fig, base, key="ai_time")
 
     # P1 against P2 -----------------------------------------------------
@@ -29832,9 +29953,11 @@ def ai_quick_line_controls(two):
 
 
 def ai_send_to_analysis(tables):
-    """Each plot as its own signal on the Beat analysis tab."""
-    for name, frame, _stats in tables:
-        send_to_analysis(name, frame, source="AFM output analysis")
+    """Each plot as its own signal on the Beat analysis tab, with its
+    file's own cantilever."""
+    for name, frame, _stats, meta in tables:
+        send_to_analysis(name, frame, source="AFM output analysis",
+                         meta=meta)
     if tables:
         st.session_state["_ai_sent_note"] = (
             f"Sent {len(tables)} plot{'s' if len(tables) != 1 else ''} to "
@@ -29845,9 +29968,9 @@ def ai_send_to_stack(tables, series=False):
     """Each plot into its own slot of Stack & compare (or of Series)."""
     s = st.session_state
     slots = []
-    for name, frame, stats in tables:
+    for name, frame, stats, meta in tables:
         slot = send_to_stack(name, frame, source="AFM output analysis",
-                             stats=stats, series=series)
+                             stats=stats, series=series, meta=meta)
         if slot is None:
             break
         slots.append(slot + 1)
@@ -29892,10 +30015,11 @@ def ai_trace_stats(x, y, unit, channel=None):
     return stats
 
 
-def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
+def ai_send_row(processed, units, tlabel, base, channels=None, names=None,
+                meta=None):
     """The 📚 Send to stacked plot button above the time plot: Plot 1 and
     Plot 2, as processed (baseline, Y math), each as its own file, with
-    its summary statistics."""
+    its summary statistics and its file's own cantilever (``meta``)."""
     s = st.session_state
     tables = []
     for which in sorted(processed):
@@ -29909,7 +30033,9 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None):
         tables.append((f"{base} · Plot {which}",
                        pd.DataFrame({tlabel or "Time (s)": np.asarray(x),
                                      label: np.asarray(y)}),
-                       ai_trace_stats(x, y, units[which], channel)))
+                       ai_trace_stats(x, y, units[which], channel),
+                       dict(meta or {}, y_unit=units[which],
+                            channel=channel)))
     note_col, send_col, series_col, beat_col = st.columns(
         [3.0, 1.15, 1.15, 1.15])
     send_col.button("📚 Send to stack", key="ai_send_stack",
@@ -30353,6 +30479,10 @@ def sc_peak_controls(i, y_all):
                            key=f"{SCP}pkk{i}", format="%.4g")
             d.selectbox("Deflection plotted in", list(DEFLECTION_UNITS),
                         key=f"{SCP}pkdu{i}")
+            meta = (s.get(f"{SCP}sent{i}") or {}).get("meta") or {}
+            if meta.get("k") and abs(float(s.get(f"{SCP}pkk{i}") or 0.0)
+                                     - meta["k"]) <= 1e-9 * meta["k"]:
+                st.caption(f"k {meta_said(meta)}.")
         edited = bool(s.get(f"{SCP}pkrm{i}") or s.get(f"{SCP}pkadd{i}"))
         st.button("↺ Peaks as found (drop the hand edits)",
                   key=f"{SCP}pkreset{i}", disabled=not edited,
@@ -30789,11 +30919,19 @@ def sc_slot(i, n=3):
         y_name = s.get(f"{SCP}ylab{i}") or str(ycol)
         if str(y_name) == str(xcol):
             y_name = f"{y_name} (y)"
+        meta = dict((sent or {}).get("meta") or {})
+        if s.get(f"{SCP}pku{i}") == "Force (nN)":
+            # its peaks are in force here: the k (and unit) used for that
+            typed = float(s.get(f"{SCP}pkk{i}", 0.0) or 0.0)
+            if typed and typed != meta.get("k"):
+                meta.update(k=typed, k_from=f"{sc_tab_name()}, file {i + 1}")
+            meta.setdefault("y_unit", s.get(f"{SCP}pkdu{i}", "µm"))
         st.button("📊 Send to analysis", key=f"{SCP}tobeat{i}", **STRETCH,
                   on_click=send_to_analysis,
                   args=(s.get(f"{SCP}label{i}") or stem,
                         pd.DataFrame({str(xcol): x, str(y_name): y}),
                         f"{sc_tab_name()}, file {i + 1}"),
+                  kwargs={"meta": meta},
                   help="This file as plotted here (its zero, its baseline "
                        "taken off if so) to the Beat analysis tab: its "
                        "peaks, their areas, beats and energy.")
@@ -31507,6 +31645,7 @@ def sc_db_package(traces, name, notes=""):
                             "source": str(sent.get("source", "")),
                             "stats": [list(map(str, x)) for x in
                                       sent.get("stats") or []],
+                            "meta": dict(sent.get("meta") or {}),
                             "path": rel})
             continue
         up = s.get(sc_upload_key(i))
@@ -31589,7 +31728,8 @@ def sc_db_restore(record, fetch):
         s[f"{SCP}sent{slot}"] = {
             "name": entry["name"], "frame": frame,
             "source": f"the saved analysis “{name}”",
-            "stats": [tuple(x) for x in entry.get("stats") or []]}
+            "stats": [tuple(x) for x in entry.get("stats") or []],
+            "meta": dict(entry.get("meta") or {})}
     s[f"{SCP}n"] = max([int(s.get(f"{SCP}n", 1) or 1)]
                     + [slot + 1 for slot, _, _ in loaded])
     # saved again, it keeps its name and notes
@@ -32080,7 +32220,27 @@ with tab_series:
 
 BT_MOUSE = ("🔍 Zoom", "━ Baseline", "━ Upper line", "━ Lower line",
             "✕ Click peaks", "🗑 Box over peaks")
-BT_FORCE_UNITS = ("N", "mN", "µN", "nN", "pN", "not a force")
+BT_FORCES = ("N", "mN", "µN", "nN", "pN")
+BT_DEFLECTIONS = ("m", "µm", "nm", "pm", "V")
+BT_Y_UNITS = BT_FORCES + BT_DEFLECTIONS + ("not a force",)
+BT_SPELLED = {"uN": "µN", "μN": "µN", "um": "µm", "μm": "µm"}
+BT_ENERGY_UNITS = ("Auto",) + tuple(getattr(bta, "ENERGY_UNITS", ()) or ())
+BT_TENS = {"J": "1 J", "mJ": "10⁻³ J", "µJ": "10⁻⁶ J", "nJ": "10⁻⁹ J",
+           "pJ": "10⁻¹² J", "fJ": "10⁻¹⁵ J", "aJ": "10⁻¹⁸ J",
+           "zJ": "10⁻²¹ J", "N": "1 N", "mN": "10⁻³ N", "µN": "10⁻⁶ N",
+           "nN": "10⁻⁹ N", "pN": "10⁻¹² N", "fN": "10⁻¹⁵ N",
+           "m": "1 m", "µm": "10⁻⁶ m", "nm": "10⁻⁹ m", "pm": "10⁻¹² m"}
+
+
+def bt_y_label(unit):
+    """How a choice of 'y is in' reads."""
+    if unit in BT_FORCES:
+        return f"{unit} (a force)"
+    if unit == "V":
+        return "V (deflection: F = k × InvOLS × V)"
+    if unit in BT_DEFLECTIONS:
+        return f"{unit} (deflection: F = k × δ)"
+    return unit
 BT_PER_MINUTE = {"s": 60.0, "sec": 60.0, "seconds": 60.0, "ms": 60000.0,
                  "min": 1.0}
 
@@ -32161,16 +32321,51 @@ def bt_defaults(sid, x, y):
         found = bta.excursions(x, y, base, s[key("hi")], s[key("lo")])
         widths = [e["width"] for e in found if e["sign"] > 0]
         s[key("gap")] = float(2.0 * np.median(widths)) if widths else 1.0
+    # the recording's own cantilever, when its file said (or it was set
+    # where it came from)
+    meta = s["_bt_sets"][sid].get("meta") or {}
     for name, value in (("sm", 1), ("merge", 0.0), ("minw", 0.0),
-                        ("order", bta.ORDERS[0]), ("k", 0.0)):
+                        ("order", bta.ORDERS[0]),
+                        ("k", float(meta.get("k") or 0.0)),
+                        ("iv", float(meta.get("invols") or 0.0))):
         s.setdefault(key(name), value)
-    if s.get(key("fu")) not in BT_FORCE_UNITS:
-        unit = bta.unit_of(s.get(f"bt_y_{sid}"))
-        s[key("fu")] = unit if unit in BT_FORCE_UNITS else (
-            "µN" if unit in ("uN", "μN") else "not a force")
+    if s.get(key("fu")) not in BT_Y_UNITS:
+        s[key("fu")] = bt_guess_y(s.get(f"bt_y_{sid}"), meta, y)
 
 
-def bt_analyse(sid):
+def bt_guess_y(ycol, meta, y=None):
+    """What y is, from its column's unit (or the file's): a force as it
+    says; a length or volts as a deflection only when it is one (its name
+    or channel says Defl), since F = k·δ means nothing for a height. A
+    deflection whose unit nobody gave is told by its size: metres when
+    tiny, volts up to tens, else nm (as Asylum stores them)."""
+    unit = bta.unit_of(ycol)
+    if unit in ("", "raw"):
+        unit = str((meta or {}).get("y_unit") or "")
+    unit = BT_SPELLED.get(unit, unit)
+    if unit in BT_FORCES:
+        return unit
+    named = f"{ycol} {(meta or {}).get('channel', '')}".lower()
+    if "defl" not in named:
+        return BT_Y_UNITS[-1]
+    if unit in BT_DEFLECTIONS:
+        return unit
+    if unit in ("", "raw") and y is not None:
+        v = np.abs(np.asarray(y, float))
+        v = v[np.isfinite(v)]
+        if v.size:
+            top = float(np.percentile(v, 99))
+            return "m" if top < 1e-3 else "V" if top < 50 else "nm"
+    return BT_Y_UNITS[-1]
+
+
+def bt_energy_unit(e_unit=None):
+    """The energy unit asked for (None: the one that fits the numbers)."""
+    chosen = e_unit or st.session_state.get("bt_eunit", "Auto")
+    return chosen if chosen in BT_ENERGY_UNITS[1:] else None
+
+
+def bt_analyse(sid, e_unit=None):
     """Everything about one signal, from its settings: the arrays, the
     baseline and lines, the excursions (kept and left out), the beats,
     their table and the summary."""
@@ -32193,18 +32388,29 @@ def bt_analyse(sid):
                 if any(e["start"] <= m <= e["end"] for m in out_marks)]
     kept = [e for e in events if e not in left_out]
     beats = bta.pair_beats(kept, float(s[key("gap")] or 0.0), s[key("order")])
-    x_unit, y_unit = bta.unit_of(xcol), bta.unit_of(ycol)
     fu = s[key("fu")]
-    newtons = bta.newtons_per_unit(fu) if fu != BT_FORCE_UNITS[-1] else None
+    x_unit = bta.unit_of(xcol)
+    # y's unit is what it was said to be (a force or deflection unit), or
+    # its column's own
+    y_unit = fu if fu in BT_Y_UNITS[:-1] else bta.unit_of(ycol)
     k = float(s[key("k")] or 0.0) or None
-    table = bta.beat_table(beats, x_unit, y_unit, k=k, newtons=newtons)
+    invols = float(s.get(key("iv")) or 0.0) or None
+    newtons = (bta.newtons_per_unit(fu, k, invols)
+               if fu != BT_Y_UNITS[-1] else None)
+    e_unit = bt_energy_unit(e_unit)
+    table = bta.beat_table(beats, x_unit, y_unit, k=k, newtons=newtons,
+                           e_unit=e_unit)
     info = bta.summary(beats, x_unit, y_unit, k=k, newtons=newtons,
-                       per_minute=BT_PER_MINUTE.get(x_unit))
+                       per_minute=BT_PER_MINUTE.get(x_unit), e_unit=e_unit)
+    peaks = bta.peak_table(beats, x_unit, y_unit, k=k, newtons=newtons,
+                           e_unit=e_unit)
     return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
             "base": base, "up": up, "down": down, "events": events,
             "kept": kept, "left_out": left_out, "beats": beats,
-            "table": table, "info": info, "x_unit": x_unit,
-            "y_unit": y_unit, "k": k, "newtons": newtons}
+            "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
+            "y_unit": y_unit, "k": k, "invols": invols, "fu": fu,
+            "newtons": newtons, "sid": sid,
+            "meta": s["_bt_sets"][sid].get("meta") or {}}
 
 
 def bt_apply_pending(sid):
@@ -32260,6 +32466,16 @@ def bt_table_edited(sid, key, marks_by_row):
                       for m in marks_by_row[row]])
 
 
+def bt_use_own(sid):
+    """The recording's own k and InvOLS back in its settings."""
+    s = st.session_state
+    meta = s.get("_bt_sets", {}).get(sid, {}).get("meta") or {}
+    if meta.get("k"):
+        s[f"bt_k_{sid}"] = float(meta["k"])
+    if meta.get("invols"):
+        s[f"bt_iv_{sid}"] = float(meta["invols"])
+
+
 def bt_lines_from_noise(sid):
     s = st.session_state
     for name in ("hi", "lo"):
@@ -32312,6 +32528,7 @@ def bt_settings(sid, got):
               help="Puts both lines 5 times the baseline's noise (a robust "
                    "SD) away from it.")
     if got is not None:
+        unit = got["y_unit"] or unit
         st.caption(f"Baseline {got['base']:.4g}"
                    + (f" {unit}" if unit else "")
                    + f" · noise SD {bta.noise_sd(got['y'], got['base']):.3g}"
@@ -32338,19 +32555,50 @@ def bt_settings(sid, got):
                     help="Narrower peaks (from leaving the baseline to "
                          "coming back) are ignored.")
     st.markdown("**⚡ Energy**")
+    meta = s["_bt_sets"][sid].get("meta") or {}
     e1, e2 = st.columns(2)
-    e1.selectbox("y is a force in", BT_FORCE_UNITS, key=key("fu"),
-                 help="For the spring energy F²/2k. Read from the y column's "
-                      "name when it says (e.g. Force (µN)).")
+    fu = e1.selectbox(
+        "y is in", BT_Y_UNITS, key=key("fu"), format_func=bt_y_label,
+        help="What the numbers on y are, for the force and energy. Read "
+             "from the y column's name (e.g. Force (nN)) or the file. A "
+             "deflection (m, µm, nm, pm) is made a force by F = k·δ, "
+             "volts by F = k × InvOLS × V.")
     e2.number_input("Spring constant k (N/m)", key=key("k"), min_value=0.0,
                     format="%.6g",
-                    help="The cantilever's. With it, each peak's spring "
-                         "energy F²/2k (F its height from the baseline), "
-                         "each full beat's (both peaks) and the total. "
-                         "0: areas only.")
-    st.caption("Areas are ∫(y − baseline) dx over each peak: "
-               + (f"{unit}·{bta.unit_of(s.get(key('x'))) or 'x'}"
-                  if unit else "y × x") + " (an impulse for force × time).")
+                    help="The cantilever's, from the recording's own file "
+                         "when it says. With it, each peak's energy "
+                         "∫F dδ = F²/2k, each full beat's (both peaks) and "
+                         "the total. 0: areas only.")
+    if fu == "V":
+        st.number_input("InvOLS (nm/V)", key=key("iv"), min_value=0.0,
+                        format="%.6g",
+                        help="The photodiode's: nm of deflection per volt. "
+                             "From the recording's own file when it says.")
+    said = []
+    for what, name, unit_ in (("k", "k", "N/m"), ("iv", "invols", "nm/V")):
+        if what == "iv" and fu != "V":
+            continue
+        own = meta.get(name)
+        now = float(s.get(key(what)) or 0.0)
+        if own and abs(now - own) <= 1e-9 * own:
+            said.append(f"{'k' if what == 'k' else 'InvOLS'} "
+                        f"{meta_said(meta, name)}")
+        elif own:
+            said.append(f"⚠️ {'k' if what == 'k' else 'InvOLS'} changed: "
+                        f"the file says {own:g} {unit_}")
+    if said:
+        st.caption(" · ".join(said) + ".")
+    if any(meta.get(n) and abs(float(s.get(key(w)) or 0.0) - meta[n])
+           > 1e-9 * meta[n] for w, n in (("k", "k"), ("iv", "invols"))):
+        st.button("📄 Use the file's own k and InvOLS",
+                  key=f"btb_own_{sid}", on_click=bt_use_own, args=(sid,),
+                  **STRETCH)
+    st.selectbox("Energy in", BT_ENERGY_UNITS, key="bt_eunit",
+                 format_func=lambda u: u if u == "Auto" else
+                 f"{u} ({BT_TENS.get(u, u)})",
+                 help="One unit for every energy (and every signal), so "
+                      "they compare. Auto: the one that reads best (shown "
+                      "with every number).")
 
 
 def bt_plot(sid, got):
@@ -32487,12 +32735,146 @@ def bt_plot(sid, got):
         st.plotly_chart(fig, key=f"btc_{ver}", config=config, **STRETCH)
 
 
+def bt_units_rows(got):
+    """The units and constants every integration result is in, as rows
+    (quantity, what it is, unit)."""
+    s = st.session_state
+    xu, yu, fu = got["x_unit"], got["y_unit"], got["fu"]
+    area = f"{yu}·{xu}" if (xu and yu) else "y·x"
+    meta = got["meta"]
+    mode = s.get("bt_bmode_" + got["sid"], "")
+    rows = [("x", f"the column “{got['xcol']}”", xu or "–"),
+            ("y", f"the column “{got['ycol']}”"
+             + (f", {bt_y_label(fu)}" if fu in BT_Y_UNITS[:-1] else ""),
+             yu or "–"),
+            ("Baseline", f"{got['base']:.5g} ({mode})", yu or "–"),
+            ("∫ of a peak", "∫(y − baseline) dx, by trapezoids from where "
+             "the peak leaves the baseline to where it comes back "
+             "(negative below it)", area)]
+    if fu in BT_FORCES:
+        rows.append(("Force", f"y itself: 1 {fu} = {BT_TENS[fu]}", fu))
+    elif fu == "V" and got["newtons"]:
+        rows.append(("Force", "F = k × InvOLS × V: "
+                     f"{got['newtons']:.4g} N per V", "N"))
+    elif fu in BT_DEFLECTIONS and got["newtons"]:
+        rows.append(("Force", f"F = k × δ, 1 {fu} = {BT_TENS[fu]}: "
+                     f"{got['newtons']:.4g} N per {fu}", "N"))
+    if got["k"]:
+        rows.append(("Spring constant k", f"{got['k']:.6g} N/m"
+                     + (f", {meta_said(meta)}" if meta.get("k") and abs(
+                         got["k"] - meta["k"]) <= 1e-9 * meta["k"]
+                        else ", typed here"), "N/m"))
+    if fu == "V" and got["invols"]:
+        rows.append(("InvOLS", f"{got['invols']:.6g} nm/V"
+                     + (f", {meta_said(meta, 'invols')}"
+                        if meta.get("invols") and abs(
+                            got["invols"] - meta["invols"])
+                        <= 1e-9 * meta["invols"] else ", typed here"),
+                     "nm/V"))
+    energy = got["info"].get("Spring energy, total")
+    if energy:
+        eu = energy[1]
+        rows += [("Energy of a peak", "E = ∫F dδ from the baseline to the "
+                  "peak, with δ = F/k: F²/2k (F its height as a force)",
+                  f"{eu} = {BT_TENS.get(eu, eu)}"),
+                 ("Energy of a full beat", "E of its positive peak + E of "
+                  "its negative peak", eu),
+                 ("Total energy", "the sum over every peak kept", eu)]
+    return rows
+
+
+def bt_integration(sid, got):
+    """∫ Integration results: what each peak integrates to and its
+    energy, the totals, and the unit of every number."""
+    info = got["info"]
+    xu, yu = got["x_unit"], got["y_unit"]
+    area = f"{yu}·{xu}" if (xu and yu) else "y·x"
+    with st.container(border=True):
+        st.markdown("#### ∫ Integration results")
+        cols = st.columns(4)
+        cols[0].metric(f"∫ positive peaks ({area})",
+                       f"{info['Positive area, total'][0]:.5g}")
+        cols[1].metric(f"∫ negative peaks ({area})",
+                       f"{info['Negative area, total'][0]:.5g}")
+        cols[2].metric(f"∫ net ({area})", f"{info['Net area, total'][0]:.5g}")
+        if "Total area per full beat" in info:
+            mean, sd, _ = info["Total area per full beat"]
+            cols[3].metric(f"∫ per full beat ({area})",
+                           f"{mean:.4g} ± {sd:.2g}",
+                           help="|∫ positive| + |∫ negative| of each full "
+                                "beat: mean ± SD.")
+        if "Spring energy, total" in info:
+            total, eu = info["Spring energy, total"]
+            cols = st.columns(4)
+            cols[0].metric(f"Total energy ({eu})", f"{total:.5g}",
+                           help="Every peak kept: Σ F²/2k.")
+            cols[1].metric(f"Positive peaks ({eu})",
+                           f"{info['Spring energy, positive peaks'][0]:.5g}")
+            cols[2].metric(f"Negative peaks ({eu})",
+                           f"{info['Spring energy, negative peaks'][0]:.5g}")
+            if "Spring energy per full beat" in info:
+                mean, sd, _ = info["Spring energy per full beat"]
+                cols[3].metric(f"Per full beat ({eu})",
+                               f"{mean:.4g} ± {sd:.2g}",
+                               help="Mean ± SD over the full beats.")
+            elif "Spring energy per peak" in info:
+                mean, sd, _ = info["Spring energy per peak"]
+                cols[3].metric(f"Per peak ({eu})", f"{mean:.4g} ± {sd:.2g}")
+        elif got["fu"] == BT_Y_UNITS[-1]:
+            st.warning("No energy yet: say what y is in (⚡ Energy, on the "
+                       "left): a force, or a deflection to make one with "
+                       "k.", icon="⚡")
+        elif not got["k"]:
+            st.warning("No energy yet: type the cantilever's spring "
+                       "constant k (⚡ Energy, on the left); the file did "
+                       "not say it.", icon="⚡")
+        elif got["fu"] == "V":
+            st.warning("No energy yet: type InvOLS (nm/V) to turn volts "
+                       "into a deflection (⚡ Energy, on the left).",
+                       icon="⚡")
+        if xu in BT_PER_MINUTE and got["fu"] in BT_FORCES:
+            st.caption(f"∫F dt ({area}) is an impulse, force × time, not "
+                       "an energy. The energy, in J, is ∫F dδ: the work "
+                       "each beat does bending the cantilever.")
+        units, each = st.tabs(["📏 Units and constants",
+                               f"∫ Each peak ({len(got['peaks'])})"])
+        with units:
+            table = "| | How it is found | Unit |\n|---|---|---|\n" + "".join(
+                f"| **{a}** | {b} | {c} |\n" for a, b, c in
+                bt_units_rows(got))
+            st.markdown(table)
+        with each:
+            peaks = got["peaks"]
+            if peaks.empty:
+                st.caption("No peak is kept.")
+            else:
+                st.dataframe(
+                    peaks, hide_index=True, **STRETCH,
+                    column_config={c: st.column_config.NumberColumn(
+                        format="%.5g") for c in peaks.columns
+                        if peaks[c].dtype.kind == "f"})
+        name = sc_db_safe(st.session_state["_bt_sets"][sid]["name"])
+        u1, u2 = st.columns(2)
+        u1.download_button(
+            "💾 Integration results (CSV)",
+            got["peaks"].to_csv(index=False).encode("utf-8"),
+            file_name=f"{name}_integration.csv", mime="text/csv",
+            key=f"btb_int_{sid}", disabled=got["peaks"].empty, **STRETCH,
+            help="One row per peak, every column with its unit.")
+        u2.download_button(
+            "💾 Units and constants (CSV)",
+            pd.DataFrame(bt_units_rows(got),
+                         columns=["Quantity", "How it is found", "Unit"])
+            .to_csv(index=False).encode("utf-8"),
+            file_name=f"{name}_units.csv", mime="text/csv",
+            key=f"btb_units_{sid}", **STRETCH)
+
+
 def bt_results(sid, got):
-    """The numbers: at a glance, then every beat."""
+    """The numbers: at a glance, the integration with its units, then
+    every beat."""
     s = st.session_state
     info = got["info"]
-    area_unit = (f"{got['y_unit']}·{got['x_unit']}"
-                 if got["y_unit"] and got["x_unit"] else "")
     cols = st.columns(4)
     cols[0].metric("Full beats", info["Full beats"])
     cols[1].metric("Positive only", info["Positive only"])
@@ -32500,33 +32882,13 @@ def bt_results(sid, got):
     cols[3].metric("Beats per minute",
                    f"{info['Beat rate (per minute)']:.3g}"
                    if "Beat rate (per minute)" in info else "–")
-    cols = st.columns(4)
-    pos, neg = info["Positive area, total"], info["Negative area, total"]
-    cols[0].metric(f"Positive area, total ({area_unit or 'area'})",
-                   f"{pos[0]:.4g}")
-    cols[1].metric(f"Negative area, total ({area_unit or 'area'})",
-                   f"{neg[0]:.4g}")
-    if "Total area per full beat" in info:
-        mean, sd, _ = info["Total area per full beat"]
-        cols[2].metric("Area per full beat", f"{mean:.4g} ± {sd:.2g}")
-    if "Spring energy, total" in info:
-        total, unit = info["Spring energy, total"]
-        cols[3].metric(f"Spring energy, total ({unit})", f"{total:.4g}")
-        if "Spring energy per full beat" in info:
-            mean, sd, unit = info["Spring energy per full beat"]
-            st.caption(f"Spring energy per full beat: {mean:.4g} ± "
-                       f"{sd:.2g} {unit} (F²/2k of its positive and "
-                       f"negative peaks, k = {got['k']:.4g} N/m).")
-    elif got["newtons"] is None:
-        cols[3].caption("Spring energy: set y as a force (⚡ Energy).")
-    else:
-        cols[3].caption("Spring energy: type the spring constant k "
-                        "(⚡ Energy).")
-    if "Time between beats" in info:
-        mean, sd, unit = info["Time between beats"]
-        st.caption(f"Time between beats: {mean:.4g} ± {sd:.2g}"
-                   + (f" {unit}" if unit else "")
-                   + (f" · {len(got['left_out'])} peak"
+    if "Time between beats" in info or got["left_out"]:
+        mean, sd, unit = info.get("Time between beats", (None, None, ""))
+        st.caption((f"Time between beats: {mean:.4g} ± {sd:.2g}"
+                    + (f" {unit}" if unit else "") if mean is not None
+                    else "")
+                   + (f"{' · ' if mean is not None else ''}"
+                      f"{len(got['left_out'])} peak"
                       f"{'s' if len(got['left_out']) != 1 else ''} removed "
                       "(✕ on the plot)" if got["left_out"] else ""))
     table = got["table"]
@@ -32534,6 +32896,8 @@ def bt_results(sid, got):
         st.info("No peak gets past the lines: move them closer to the "
                 "baseline (〰 The lines), or drag them on the plot.")
         return
+    bt_integration(sid, got)
+    st.markdown("#### 💓 Each beat")
     # blank where a beat has no such peak (the CSV keeps them empty too);
     # untick Keep to remove a beat's peaks
     def neat(value):
@@ -32565,14 +32929,37 @@ def bt_results(sid, got):
 
 
 def bt_summary_frame(ids):
-    """One row per signal: its counts, totals, means and rate."""
+    """One row per signal: its counts, totals, means and rate, the
+    constants they were found with, and every energy in one unit (the one
+    chosen, or one that fits them all)."""
     s = st.session_state
+    e_unit = bt_energy_unit()
+    if e_unit is None and len(ids) > 1:
+        energies = []
+        for sid in ids:
+            got = bt_analyse(sid)
+            if got is not None and got["k"] and got["newtons"]:
+                energies += [bta.spring_energy(abs(e["peak"]), got["k"],
+                                               got["newtons"])
+                             for e in got["kept"]]
+        e_unit = bta.energy_factor(None, energies)[1] if energies else None
     rows = []
     for sid in ids:
-        got = bt_analyse(sid)
+        got = bt_analyse(sid, e_unit)
         if got is None:
             continue
-        row = {"Signal": s["_bt_sets"][sid]["name"], "y": got["ycol"]}
+        row = {"Signal": s["_bt_sets"][sid]["name"], "y": got["ycol"],
+               "x unit": got["x_unit"], "y unit": got["y_unit"],
+               "y is": bt_y_label(got["fu"]),
+               "k (N/m)": got["k"] if got["k"] else np.nan,
+               "k from": (meta_said(got["meta"])
+                          if got["k"] and got["meta"].get("k") and abs(
+                              got["k"] - got["meta"]["k"])
+                          <= 1e-9 * got["meta"]["k"] else
+                          "typed on Beat analysis" if got["k"] else ""),
+               "Baseline": got["base"]}
+        if got["fu"] == "V":
+            row["InvOLS (nm/V)"] = got["invols"] or np.nan
         for name, value in got["info"].items():
             if isinstance(value, tuple):
                 unit = value[-1]
@@ -32589,6 +32976,7 @@ def bt_summary_frame(ids):
 def beat_tab():
     s = st.session_state
     for key, value in (("bt_height", 420), ("bt_lw", 1.4),
+                       ("bt_eunit", "Auto"),
                        ("bt_col", "#222222"),
                        ("bt_pcol", bta.POS_COLOUR),
                        ("bt_ncol", bta.NEG_COLOUR),
