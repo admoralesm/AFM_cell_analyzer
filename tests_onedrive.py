@@ -1,6 +1,7 @@
 """OneDrive store against a fake Microsoft Graph."""
 import json, sys
-sys.path.insert(0, "/root/AFM_cell_analyzer")
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onedrive_store as od
 
 FAILURES = []
@@ -45,11 +46,17 @@ class FakeGraph:
                 base = unquote(url.split("root:/")[1].split("/children")[0].rstrip(":"))
             self.folders.add(f"{base}/{name}".strip("/"))
             return {"id": name}
+        if method == "GET" and url.endswith(":/children"):
+            from urllib.parse import unquote
+            base = unquote(url.split("root:/")[1][:-len(":/children")])
+            names = {f.split("/")[-1] for f in self.folders
+                     if f.rsplit("/", 1)[0] == base and "/" in f}
+            return {"value": [{"name": n, "folder": {}} for n in sorted(names)]}
         if method == "GET" and "root:/" in url:
             from urllib.parse import unquote
             path = unquote(url.split("root:/")[1])
             if path in self.folders:
-                return {"id": path}
+                return {"id": path, "webUrl": f"https://onedrive/{path}"}
             raise od.OneDriveError("OneDrive said 404: not found")
         if method == "GET" and url.endswith("/root"):
             return {"id": "root"}
@@ -65,7 +72,8 @@ status = store.check()
 check("check reports the drive", status["ok"], str(status))
 check("it names the owner", "David" in status["detail"], status["detail"])
 check("it reports free space", "GB free" in status["detail"], status["detail"])
-check("auth method is named", "refresh token" in store.auth_method())
+check("auth method is named", "signed in" in store.auth_method(),
+      store.auth_method())
 
 print("saving a cell")
 record = {"cell_id": "Cell 04/trial 2", "Em_MPa": 0.6, "Ec_kPa": 1.2,
@@ -127,6 +135,108 @@ try:
     bare.token(); check("bare store refuses to authenticate", False)
 except od.OneDriveError as exc:
     check("bare store explains what is missing", "secrets" in str(exc), str(exc))
+
+print("saving a stacked analysis")
+fake.calls.clear()
+record = {"stack_id": "2026-11-09 1622 Cell 3: compressions",
+          "name": "Cell 3: compressions", "saved_at": "2026-11-09T16:22:00",
+          "notes": "two files", "state": {"sc_n": 2},
+          "files": [{"slot": 0, "name": "a.csv", "path": "files/1_a.csv"},
+                    {"slot": 1, "name": "b.csv", "path": "files/2_b.csv"}]}
+saved = store.save_stack(record, {
+    "files/1_a.csv": "t,F\n0,1\n", "files/2_b.csv": b"t,F\n0,2\n",
+    "plot.html": "<html></html>", "aligned.csv": "x\n1\n"})
+folder = saved["onedrive_path"]
+check("its folder is under stacks, the colon replaced",
+      folder.endswith("stacks/2026-11-09 1622 Cell 3_ compressions"), folder)
+check("the files went into files/",
+      f"{folder}/files/1_a.csv" in fake.files
+      and f"{folder}/files/2_b.csv" in fake.files, str(sorted(fake.files)))
+check("the plot and table beside them",
+      f"{folder}/plot.html" in fake.files and f"{folder}/aligned.csv" in fake.files)
+puts = [u for m, u in fake.calls if m == "PUT"]
+check("analysis.json after the files, the index last",
+      "analysis.json" in puts[-2] and "stacks_index.csv" in puts[-1],
+      str(puts[-3:]))
+check("the folder's address is kept (no sharing link made)",
+      saved["folder_url"].startswith("https://onedrive/")
+      and not any("createLink" in u for _, u in fake.calls),
+      saved.get("folder_url"))
+
+print("reading it back")
+back = store.load_stack("2026-11-09 1622 Cell 3: compressions")
+check("the record comes back", back is not None and back["state"] == {"sc_n": 2},
+      str(back))
+check("a file comes back by its path",
+      store.stack_file(back["stack_id"], "files/1_a.csv") == b"t,F\n0,1\n",
+      repr(store.stack_file(back["stack_id"], "files/1_a.csv")))
+check("a missing analysis is None", store.load_stack("nope") is None)
+index = store.load_stack_index()
+check("one row in the list, with its files named",
+      len(index) == 1 and index.iloc[0]["files"] == "a.csv; b.csv"
+      and str(index.iloc[0]["n_files"]) == "2", index.to_dict("records"))
+store.save_stack(dict(record, notes="again"), {"plot.html": "<html/>"})
+index = store.load_stack_index()
+check("saving it again replaces its row",
+      len(index) == 1 and index.iloc[0]["notes"] == "again",
+      index.to_dict("records"))
+store.save_stack(dict(record, stack_id="second", saved_at="2026-11-10T09:00"),
+                 {"plot.html": "<html/>"})
+index = store.load_stack_index()
+check("the newest first", list(index["stack_id"]) ==
+      ["second", "2026-11-09 1622 Cell 3_ compressions"], list(index["stack_id"]))
+fake.files.pop(store.stack_index_path())
+check("the list is rebuilt from the folders",
+      len(store.rebuild_stack_index()) == 2)
+try:
+    store.save_stack({"stack_id": " "}, {}); check("a nameless save is refused", False)
+except od.OneDriveError:
+    check("a nameless save is refused", True)
+
+print("saving a beat analysis")
+fake.calls.clear()
+beat = {"beat_id": "2026-11-17 2230 Cell 3 beats", "name": "Cell 3 beats",
+        "saved_at": "2026-11-17T22:30:00", "notes": "control",
+        "source": "AFM output analysis", "file": "X202509220920.ibw",
+        "results": {"Full beats": 15, "Positive peaks": 16,
+                    "Energy, all peaks (total) (aJ)": 8650.5,
+                    "Positive peak height, mean (µN)": 0.052},
+        "settings": {"hi": 0.005}}
+saved = store.save_beats(beat, {"data.csv": "t,F\n0,1\n",
+                                "results.csv": "Parameter,Value,Unit\n"})
+folder = saved["onedrive_path"]
+check("its folder is under beats",
+      folder.endswith("beats/2026-11-17 2230 Cell 3 beats"), folder)
+check("its files beside analysis.json",
+      f"{folder}/data.csv" in fake.files
+      and f"{folder}/analysis.json" in fake.files, str(sorted(fake.files)))
+puts = [u for m, u in fake.calls if m == "PUT"]
+check("analysis.json after the files, the index last",
+      "analysis.json" in puts[-2] and "beats_index.csv" in puts[-1],
+      str(puts[-3:]))
+back = store.load_beats(beat["beat_id"])
+check("the record and a file come back",
+      back is not None and back["settings"] == {"hi": 0.005}
+      and store.beat_file(back["beat_id"], "data.csv") == b"t,F\n0,1\n")
+index = store.load_beat_index()
+check("one line in the index, with every result as a column",
+      len(index) == 1 and index.iloc[0]["Full beats"] == 15
+      and abs(index.iloc[0]["Energy, all peaks (total) (aJ)"] - 8650.5) < 1e-9
+      and list(index.columns)[:3] == ["beat_id", "name", "saved_at"]
+      and list(index.columns)[-1] == "folder_url", list(index.columns))
+store.save_beats(dict(beat, beat_id="second", saved_at="2026-11-18T09:00",
+                      results=dict(beat["results"], **{"Beats per minute (/min)": 15.0})),
+                 {"data.csv": "t,F\n"})
+index = store.load_beat_index()
+check("a second line, newest first, a new result a new column",
+      list(index["beat_id"]) == ["second", "2026-11-17 2230 Cell 3 beats"]
+      and "Beats per minute (/min)" in index.columns, index.to_dict("records"))
+store.save_beats(dict(beat, notes="again"), {"data.csv": "t,F\n"})
+check("saving it again replaces its line",
+      len(store.load_beat_index()) == 2)
+fake.files.pop(store.beat_index_path())
+check("the index is rebuilt from the folders",
+      len(store.rebuild_beat_index()) == 2)
 
 print()
 if FAILURES:
