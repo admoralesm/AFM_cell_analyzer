@@ -202,6 +202,17 @@ check("mean ± SD (range), or the one value",
       and ba.mean_sd_range([5.0], "s") == "5 s"
       and ba.mean_sd_range([]) == "–")
 
+print("scientific notation for slides")
+check("tiny and huge numbers as × 10ⁿ, others as they are",
+      ba.pretty(5.4466e-16) == "5.447 × 10⁻¹⁶"
+      and ba.pretty(2.5e7) == "2.5 × 10⁷" and ba.pretty(544.7) == "544.7"
+      and ba.pretty(0.0523) == "0.0523" and ba.pretty(0) == "0"
+      and ba.pretty(float("nan")) == "",
+      [ba.pretty(v) for v in (5.4466e-16, 2.5e7, 544.7, 0.0523)])
+check("…in mean ± SD too", ba.mean_sd_range([5e-16, 6e-16], "J")
+      == "5.5 × 10⁻¹⁶ ± 7.1 × 10⁻¹⁷ J (5 × 10⁻¹⁶ to 6 × 10⁻¹⁶)",
+      ba.mean_sd_range([5e-16, 6e-16], "J"))
+
 print("plot")
 fig = ba.beat_figure(t, y, base, 0.01, 0.01, events, beats,
                      left_out=[events[0]], shade_beats=True)
