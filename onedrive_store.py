@@ -643,6 +643,17 @@ class OneDriveStore:
             raise OneDriveError("The analysis needs a name before it is saved.")
         stack_id = safe_name(record["stack_id"])
         folder = self.ensure_folder(stack_id, self.stacks_folder())
+        self._write_files(folder, files)
+        record = dict(record, stack_id=stack_id, onedrive_path=folder)
+        record["folder_url"] = self.web_url(folder)
+        self.upload(folder, "analysis.json",
+                    json.dumps(record, indent=2, default=str))
+        self.append_to_stack_index(record)
+        return record
+
+    def _write_files(self, folder, files):
+        """``files`` (a path inside ``folder`` → its content) into it, its
+        sub-folders made as needed."""
         made = {"": folder}
         for rel in sorted(files):
             parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
@@ -653,12 +664,6 @@ class OneDriveStore:
                     made[sub] = self.ensure_folder(part, made[where])
                 where = sub
             self.upload(made[where], parts[-1], files[rel])
-        record = dict(record, stack_id=stack_id, onedrive_path=folder)
-        record["folder_url"] = self.web_url(folder)
-        self.upload(folder, "analysis.json",
-                    json.dumps(record, indent=2, default=str))
-        self.append_to_stack_index(record)
-        return record
 
     def load_stack(self, stack_id):
         """An analysis's record (analysis.json), or None if it is not there."""
@@ -731,6 +736,303 @@ class OneDriveStore:
         return frame
 
 
+    # ------------------------------------------- a cell's own analyses
+    #
+    # Everything done with one cell, in that cell's folder: each analysis
+    # (an AFM image, a stacked plot, a beat analysis…) in a sub-folder for
+    # its tab, with item.json (every setting) beside its files, and one
+    # line in cell_items_index.csv, so a cell's whole story is one folder
+    # and one filter of one table:
+    #
+    #   <root>/cells/<cell>/Beat analysis/2026-11-18 164000 Plot 1/…
+    #   <root>/cells/<cell>/Files/…            (raw files added by hand)
+    #   <root>/cell_items_index.csv
+
+    ITEM_FOLDERS = {"afm": "AFM output", "stack": "Stack",
+                    "series": "Series", "beats": "Beat analysis",
+                    "fourier": "Fourier", "force": "Force curve"}
+    ITEMS_FIRST = ["item_id", "cell", "kind", "name", "saved_at", "notes",
+                   "source", "file"]
+    ITEMS_LAST = ["onedrive_path", "folder_url"]
+
+    def cell_folder(self, cell):
+        if not str(cell or "").strip():
+            raise OneDriveError("Name the cell first.")
+        return self.ensure_folder(safe_name(cell), self.cells_folder())
+
+    def items_index_path(self):
+        return f"{self.ensure_folder(self.root_folder)}/cell_items_index.csv"
+
+    def item_row(self, record):
+        """Its line in the index: which cell, what and when, then its
+        results (a column each), then where it is."""
+        row = {key: record.get(key, "") for key in self.ITEMS_FIRST}
+        for key, value in (record.get("results") or {}).items():
+            row[str(key)] = value
+        row.update({key: record.get(key, "") for key in self.ITEMS_LAST})
+        return row
+
+    def _item_folder(self, cell, kind, item_id, make=False):
+        where = self.ITEM_FOLDERS.get(kind, safe_name(kind))
+        if make:
+            return self.ensure_folder(safe_name(item_id), self.ensure_folder(
+                where, self.cell_folder(cell)))
+        return (f"{self.cells_folder()}/{safe_name(cell)}/{where}/"
+                f"{safe_name(item_id)}")
+
+    def save_item(self, record, files):
+        """
+        Write one analysis into its cell's folder: ``record`` names the
+        ``cell``, the ``kind`` (a key of ITEM_FOLDERS) and the ``item_id``;
+        ``files`` maps a path inside its folder to its content. The files
+        go up first, item.json after them, the index line last.
+        """
+        for need in ("cell", "kind", "item_id"):
+            if not str(record.get(need, "")).strip():
+                raise OneDriveError(f"The analysis needs a {need}.")
+        folder = self._item_folder(record["cell"], record["kind"],
+                                   record["item_id"], make=True)
+        self._write_files(folder, files)
+        record = dict(record, cell=str(record["cell"]).strip(),
+                      item_id=safe_name(record["item_id"]),
+                      onedrive_path=folder)
+        record["folder_url"] = self.web_url(folder)
+        self.upload(folder, "item.json",
+                    json.dumps(record, indent=2, default=str))
+        self.append_to_items_index(record)
+        return record
+
+    def load_item(self, cell, kind, item_id):
+        """An analysis's record (item.json), or None."""
+        try:
+            return json.loads(self._download(
+                f"{self._item_folder(cell, kind, item_id)}/item.json")
+                .decode("utf-8"))
+        except OneDriveError:
+            return None
+
+    def item_file(self, cell, kind, item_id, rel):
+        parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
+        return self._download(f"{self._item_folder(cell, kind, item_id)}/"
+                              + "/".join(parts))
+
+    def load_items_index(self):
+        """Every analysis saved in a cell, one line each, newest first;
+        empty if there is none."""
+        import pandas as pd
+
+        try:
+            text = self._download(self.items_index_path()).decode("utf-8")
+            frame = pd.read_csv(io.StringIO(text))
+        except Exception:
+            return pd.DataFrame(columns=self.ITEMS_FIRST + self.ITEMS_LAST)
+        if "saved_at" in frame.columns:
+            frame = frame.sort_values("saved_at", ascending=False)
+        return frame.reset_index(drop=True)
+
+    def _put_items_index(self, frame):
+        import pandas as pd
+
+        first = [c for c in self.ITEMS_FIRST if c in frame.columns]
+        last = [c for c in self.ITEMS_LAST if c in frame.columns]
+        middle = [c for c in frame.columns if c not in first + last]
+        frame = pd.DataFrame(frame)[first + middle + last]
+        self.upload(self.ensure_folder(self.root_folder),
+                    "cell_items_index.csv", frame.to_csv(index=False))
+        return frame
+
+    def append_to_items_index(self, record):
+        """Add or replace one analysis's line."""
+        import pandas as pd
+
+        frame = self.load_items_index()
+        row = self.item_row(record)
+        if not frame.empty and {"item_id", "cell", "kind"} <= set(frame):
+            same = ((frame["item_id"].astype(str) == str(row["item_id"]))
+                    & (frame["cell"].astype(str) == str(row["cell"]))
+                    & (frame["kind"].astype(str) == str(row["kind"])))
+            frame = frame[~same]
+        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+        return self._put_items_index(frame)
+
+    def _children(self, path):
+        try:
+            listing = _request("GET", f"{self._by_path(path)}:/children",
+                               token=self.token())
+        except OneDriveError:
+            return []
+        return listing.get("value", [])
+
+    def rebuild_items_index(self):
+        """Walk every cell's folders and write the index again from each
+        item.json."""
+        import pandas as pd
+
+        rows = []
+        for cell in self._children(self.cells_folder()):
+            if "folder" not in cell:
+                continue
+            for kind, where in self.ITEM_FOLDERS.items():
+                base = f"{self.cells_folder()}/{cell['name']}/{where}"
+                for item in self._children(base):
+                    if "folder" not in item:
+                        continue
+                    try:
+                        record = json.loads(self._download(
+                            f"{base}/{item['name']}/item.json").decode("utf-8"))
+                    except Exception:
+                        continue
+                    rows.append(self.item_row(record))
+        return self._put_items_index(pd.DataFrame(rows))
+
+    def cell_names(self):
+        """Every cell with anything saved: from the analyses' index and
+        the fitted cells' one, sorted."""
+        names = set()
+        frame = self.load_items_index()
+        if "cell" in frame.columns:
+            names |= {str(c) for c in frame["cell"].dropna() if str(c).strip()}
+        try:
+            fitted = self.load_index()
+            if "cell_id" in fitted.columns:
+                names |= {str(c) for c in fitted["cell_id"].dropna()
+                          if str(c).strip()}
+        except Exception:
+            pass
+        return sorted(names, key=str.lower)
+
+    def add_cell_files(self, cell, files):
+        """Raw files (name → content) into the cell's Files folder."""
+        folder = self.ensure_folder("Files", self.cell_folder(cell))
+        for name, content in files.items():
+            self.upload(folder, safe_name(name), content)
+        return folder
+
+    def cell_files(self, cell):
+        """The raw files in a cell's Files folder: [{name, size, url}]."""
+        out = []
+        for item in self._children(f"{self.cells_folder()}/{safe_name(cell)}"
+                                   "/Files"):
+            if "file" in item:
+                out.append({"name": item.get("name", ""),
+                            "size": item.get("size", 0),
+                            "url": item.get("webUrl", "")})
+        return out
+
+    def cell_file(self, cell, name):
+        return self._download(f"{self.cells_folder()}/{safe_name(cell)}/Files/"
+                              f"{safe_name(name)}")
+
+    def cell_url(self, cell):
+        return self.web_url(self.cell_folder(cell))
+
+    # --------------------------------------------------- beat analyses
+
+    BEAT_INDEX_FIRST = ["beat_id", "name", "saved_at", "notes", "source",
+                        "file"]
+    BEAT_INDEX_LAST = ["onedrive_path", "folder_url"]
+
+    def beats_folder(self):
+        return self.ensure_folder("beats", self.ensure_folder(self.root_folder))
+
+    def beat_index_path(self):
+        return f"{self.ensure_folder(self.root_folder)}/beats_index.csv"
+
+    def beat_row(self, record):
+        """Its line in the index: who it is, then every result (a column
+        each, its unit in its name), then where it is."""
+        row = {key: record.get(key, "") for key in self.BEAT_INDEX_FIRST}
+        for key, value in (record.get("results") or {}).items():
+            row[str(key)] = value
+        row.update({key: record.get(key, "") for key in self.BEAT_INDEX_LAST})
+        return row
+
+    def save_beats(self, record, files):
+        """
+        Write one beat analysis: ``files`` maps a path inside its folder to
+        its content (the signal, its results, beats, peaks, report, plot).
+        The files go up first, analysis.json after them, the index last.
+        """
+        if not str(record.get("beat_id", "")).strip():
+            raise OneDriveError("The analysis needs a name before it is saved.")
+        beat_id = safe_name(record["beat_id"])
+        folder = self.ensure_folder(beat_id, self.beats_folder())
+        self._write_files(folder, files)
+        record = dict(record, beat_id=beat_id, onedrive_path=folder)
+        record["folder_url"] = self.web_url(folder)
+        self.upload(folder, "analysis.json",
+                    json.dumps(record, indent=2, default=str))
+        self.append_to_beat_index(record)
+        return record
+
+    def load_beats(self, beat_id):
+        """A beat analysis's record (analysis.json), or None."""
+        folder = f"{self.beats_folder()}/{safe_name(beat_id)}"
+        try:
+            return json.loads(
+                self._download(f"{folder}/analysis.json").decode("utf-8"))
+        except OneDriveError:
+            return None
+
+    def beat_file(self, beat_id, rel):
+        parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
+        return self._download(
+            f"{self.beats_folder()}/{safe_name(beat_id)}/" + "/".join(parts))
+
+    def load_beat_index(self):
+        """Every saved beat analysis, one line each with its results, newest
+        first; empty if there is none."""
+        import pandas as pd
+
+        try:
+            text = self._download(self.beat_index_path()).decode("utf-8")
+            frame = pd.read_csv(io.StringIO(text))
+        except Exception:
+            return pd.DataFrame(columns=self.BEAT_INDEX_FIRST
+                                + self.BEAT_INDEX_LAST)
+        if "saved_at" in frame.columns:
+            frame = frame.sort_values("saved_at", ascending=False)
+        return frame.reset_index(drop=True)
+
+    def _put_beat_index(self, frame):
+        import pandas as pd
+
+        first = [c for c in self.BEAT_INDEX_FIRST if c in frame.columns]
+        last = [c for c in self.BEAT_INDEX_LAST if c in frame.columns]
+        middle = [c for c in frame.columns if c not in first + last]
+        frame = pd.DataFrame(frame)[first + middle + last]
+        self.upload(self.ensure_folder(self.root_folder), "beats_index.csv",
+                    frame.to_csv(index=False))
+        return frame
+
+    def append_to_beat_index(self, record):
+        """Add or replace one analysis's line."""
+        import pandas as pd
+
+        frame = self.load_beat_index()
+        row = self.beat_row(record)
+        if not frame.empty and "beat_id" in frame.columns:
+            frame = frame[frame["beat_id"].astype(str) != str(row["beat_id"])]
+        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+        return self._put_beat_index(frame)
+
+    def rebuild_beat_index(self):
+        """Walk the beats folder and write the index again from each
+        analysis.json."""
+        import pandas as pd
+
+        listing = _request("GET", f"{self._by_path(self.beats_folder())}:/children",
+                           token=self.token())
+        rows = []
+        for item in listing.get("value", []):
+            if "folder" not in item:
+                continue
+            record = self.load_beats(item["name"])
+            if record:
+                rows.append(self.beat_row(record))
+        return self._put_beat_index(pd.DataFrame(rows))
+
+
 # ---------------------------------------------------------- stacked plots
 #
 # A plot saved from the Stack & compare (or Series) tab, one folder each,
@@ -745,6 +1047,10 @@ class OneDriveStore:
 #                 aligned.csv           the data as plotted
 #                 summary.csv           each file's numbers
 #                 files/                the files the plot was made from
+#
+# Beat analyses the same way, in beats/ with beats_index.csv: one line per
+# analysis with every result (counts, forces, energies, areas), so the
+# index is the data sheet of everything analysed.
 #
 # As with the cells, analysis.json is the source of truth and the index is
 # only a cache: it goes up last, so a save that fails half way leaves no
