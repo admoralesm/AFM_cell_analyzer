@@ -11090,6 +11090,376 @@ def send_to_analysis(name, frame, source="the video", stats=None,
     return sid
 
 
+# ========================================================= cell database ==
+#
+# Everything done with one cell goes into that cell's OneDrive folder: from
+# every analysis tab, its 🗄 Cell database box saves what is on the tab (the
+# data, every setting, the results) as one item of the cell, and opens any
+# saved item of that tab again, to look at or analyse further. The cell is
+# one for the whole app (db_cell) until changed, so a cell's AFM image, its
+# beats, its spectrum and its stacked plots all land in one place; the 🗂
+# Cells tab shows them together.
+#
+# OneDrive connects by itself from the app's secrets the first time it is
+# needed (and from the 🔌 button in any box), not only from the sidebar.
+
+CELL_KINDS = {"afm": "🔬 AFM output analysis", "stack": "📚 Stack & compare",
+              "series": "🔗 Series", "beats": "💓 Beat analysis",
+              "fourier": "〰 Fourier", "force": "📈 Single force curve"}
+DB_NEW_CELL = "➕ New cell…"
+
+
+def db_safe(name):
+    """A name a file or folder can have."""
+    text = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in str(name))
+    return text.strip().strip(".") or "untitled"
+
+
+def db_plain(value):
+    """A setting as JSON keeps it (numpy numbers as plain ones), or None
+    when it is not one (a dict, a file, a widget's own state)."""
+    if isinstance(value, (np.floating, np.integer, np.bool_)):
+        return value.item()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        return value
+    if isinstance(value, (list, tuple)):
+        items = [db_plain(v) for v in value]
+        if all(v is not None or o is None for v, o in zip(items, value)):
+            return items
+    return None
+
+
+def db_snapshot(prefixes, skip):
+    """Every setting whose key starts with one of ``prefixes`` and is not
+    matched by ``skip`` (buttons, uploads), as JSON keeps them."""
+    out = {}
+    for key in [str(k) for k in list(st.session_state.keys())]:
+        if not key.startswith(prefixes) or skip.match(key):
+            continue
+        value = st.session_state[key]
+        plain = db_plain(value)
+        if plain is not None or value is None:
+            out[key] = plain
+    return out
+
+
+def od_configured():
+    try:
+        config = dict(st.secrets.get("onedrive", {}))
+    except Exception:
+        return False
+    return bool(config.get("client_id")) and bool(
+        config.get("refresh_token") or config.get("client_secret"))
+
+
+def od_connect():
+    """Connect to OneDrive from the app's secrets. -> the store, or None
+    with the reason in _od_problem."""
+    s = st.session_state
+    if onedrive_store is None:
+        s["_od_problem"] = (ONEDRIVE_IMPORT_ERROR
+                            or "onedrive_store.py did not load")
+        return None
+    store = onedrive_store.store_from_secrets(st, s.get("onedrive_root")
+                                              or None)
+    if store is None:
+        s["_od_problem"] = ("the app's secrets have no [onedrive] part: see "
+                            "📖 How to set this up, in the sidebar of the 🧮 "
+                            "Fitting tab")
+        return None
+    try:
+        status = store.check()
+    except Exception as exc:
+        status = {"ok": False, "detail": str(exc)}
+    if status.get("ok"):
+        s["onedrive_store"] = store
+        s.pop("_od_problem", None)
+        return store
+    s["_od_problem"] = str(status.get("detail") or "it did not answer")
+    return None
+
+
+def od_store():
+    """The connected OneDrive; connected from the secrets by itself the
+    first time it is asked for in a session."""
+    s = st.session_state
+    if s.get("onedrive_store") is None and not s.get("_od_tried"):
+        s["_od_tried"] = True
+        if od_configured():
+            od_connect()
+    return s.get("onedrive_store")
+
+
+def cell_store():
+    """The OneDrive, when its onedrive_store.py can keep cells' items."""
+    store = od_store()
+    return store if store is not None and hasattr(store, "save_item") \
+        else None
+
+
+def db_items(refresh=False):
+    """Every item saved in any cell (one line each), read once and kept
+    until something is saved or 🔄 is pressed; None when not connected."""
+    s = st.session_state
+    store = cell_store()
+    if store is None:
+        return None
+    if refresh or s.get("_db_items") is None:
+        try:
+            s["_db_items"] = store.load_items_index()
+            s["_db_cells"] = store.cell_names()
+        except Exception as exc:
+            s["_db_items"] = pd.DataFrame()
+            s["_db_cells"] = []
+            s["_od_problem"] = f"could not read the database: {exc}"
+    return s["_db_items"]
+
+
+def db_cells():
+    db_items()
+    return list(st.session_state.get("_db_cells") or [])
+
+
+def db_cell_chosen(where):
+    s = st.session_state
+    value = s.get(f"dbc_{where}")
+    s["db_cell"] = "" if value == DB_NEW_CELL else str(value or "")
+
+
+def db_cell_typed(where):
+    s = st.session_state
+    value = str(s.get(f"dbn_{where}") or "").strip()
+    if value:
+        s["db_cell"] = value
+        s[f"dbn_{where}"] = ""
+
+
+def db_cell_picker(where):
+    """The cell everything is saved in, the same on every tab."""
+    s = st.session_state
+    current = str(s.get("db_cell") or "")
+    options = sorted(set(db_cells()) | ({current} if current else set()),
+                     key=str.lower) + [DB_NEW_CELL]
+    s[f"dbc_{where}"] = current or DB_NEW_CELL
+    st.selectbox("Cell", options, key=f"dbc_{where}",
+                 on_change=db_cell_chosen, args=(where,),
+                 help="Everything saved goes into this cell's folder. It is "
+                      "the same cell on every tab until you change it.")
+    if not current:
+        st.text_input("The new cell's name", key=f"dbn_{where}",
+                      on_change=db_cell_typed, args=(where,),
+                      placeholder="e.g. 2026-11-18 dish 2 cell 3, then Enter")
+    return current
+
+
+def db_connect_now():
+    st.session_state.pop("_od_tried", None)
+    od_connect()
+    st.session_state["_db_items"] = None
+
+
+def db_status_line(where):
+    """☁️ Connected, or a 🔌 button and why not."""
+    s = st.session_state
+    store = od_store()
+    if store is not None and not hasattr(store, "save_item"):
+        st.caption("⚠️ onedrive_store.py on the server is older than "
+                   "app.py: upload the new one.")
+    elif store is not None:
+        st.caption("☁️ OneDrive connected")
+    else:
+        st.button("🔌 Connect OneDrive", key=f"dbb_connect_{where}",
+                  on_click=db_connect_now, **STRETCH,
+                  help="Signs in with the app's secrets ([onedrive]).")
+        if s.get("_od_problem"):
+            st.caption(f"Not connected: {s['_od_problem']}")
+
+
+def db_zip(record, files):
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("item.json", json.dumps(record, indent=2,
+                                                 default=str))
+        for rel in sorted(files):
+            archive.writestr(rel, files[rel])
+    return buffer.getvalue()
+
+
+def db_open_item(kind, restore):
+    """The item picked, back on its tab."""
+    s = st.session_state
+    store, cell = cell_store(), str(s.get("db_cell") or "")
+    item_id = s.get(f"dbpick_{kind}")
+    if store is None or not cell or not item_id:
+        return
+    try:
+        record = store.load_item(cell, kind, item_id)
+        if record is None:
+            raise RuntimeError("it is not in OneDrive any more")
+        restore(record, lambda rel: store.item_file(cell, kind, item_id, rel))
+        when = str(record.get("saved_at", ""))[:16].replace("T", " ")
+        s[f"_db_note_{kind}"] = (f"✅ Opened “{record.get('name', item_id)}” "
+                                 f"of {cell} (saved {when}).")
+    except Exception as exc:
+        s[f"_db_note_{kind}"] = f"⚠️ Could not open it: {exc}"
+
+
+def db_open_zip(kind, restore):
+    import zipfile
+
+    s = st.session_state
+    up = s.get(f"dbzip_{kind}")
+    if up is None:
+        return
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(up.getvalue()))
+        names = archive.namelist()
+        record = json.loads(archive.read(
+            "item.json" if "item.json" in names else "analysis.json"))
+        restore(record, archive.read)
+        if record.get("cell"):
+            s["db_cell"] = str(record["cell"])
+        s[f"_db_note_{kind}"] = (f"✅ Opened “{record.get('name', up.name)}” "
+                                 "from the ZIP.")
+    except Exception as exc:
+        s[f"_db_note_{kind}"] = f"⚠️ Could not open {up.name}: {exc}"
+
+
+def cell_db_box(kind, package, restore, default_name="", can_save=True,
+                older=None):
+    """
+    🗄 Cell database, at the foot of an analysis tab: save what is on the
+    tab into the current cell (OneDrive, or a ZIP), and open any of this
+    tab's saved items of that cell again. ``package(name, notes)`` gives
+    (record, files); ``restore(record, fetch)`` puts a saved one back,
+    ``fetch(path)`` reading one of its files. ``older`` draws the opening
+    of saves made before cells, when there are any.
+    """
+    s = st.session_state
+    with st.container(border=True):
+        h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
+        h1.markdown("#### 🗄 Cell database")
+        with h2:
+            db_status_line(kind)
+        note = s.pop(f"_db_note_{kind}", None)
+        if note:
+            (st.success if note.startswith("✅") else st.warning)(note)
+        store = cell_store()
+        left, right = st.columns(2, gap="medium")
+        with left:
+            st.markdown("**☁️ Save to the cell**")
+            cell = db_cell_picker(kind)
+            # named after what is on the tab until a name is typed
+            typed = str(s.get(f"dbname_{kind}") or "").strip()
+            if not typed or typed == s.get(f"_dbauto_{kind}"):
+                s[f"dbname_{kind}"] = s[f"_dbauto_{kind}"] = default_name
+            st.text_input("Name", key=f"dbname_{kind}",
+                          help="What this is called in the cell. The date "
+                               "and time are added to its folder's name.")
+            st.text_input("Notes", key=f"dbnotes_{kind}",
+                          placeholder="condition, treatment, what it shows…")
+            name = str(s.get(f"dbname_{kind}") or "").strip()
+            notes = str(s.get(f"dbnotes_{kind}") or "").strip()
+            label = f"☁️ Save to “{cell}”" if cell else "☁️ Save to the cell"
+            if st.button(label, key=f"dbb_save_{kind}", type="primary",
+                         disabled=(store is None or not cell or not name
+                                   or not can_save), **STRETCH,
+                         help="Into the cell's OneDrive folder: the data, "
+                              "every setting and the results, so it opens "
+                              "again here exactly as it is."):
+                with st.spinner(f"Saving to {cell}…"):
+                    try:
+                        now = datetime.now()
+                        record, files = package(name, notes)
+                        record.update(
+                            cell=cell, kind=kind, name=name, notes=notes,
+                            item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
+                            saved_at=now.isoformat(timespec="seconds"),
+                            tab=CELL_KINDS[kind])
+                        saved = store.save_item(record, files)
+                        s["_db_items"] = None
+                        st.success(f"✅ Saved “{name}” in {cell}.")
+                        if saved.get("folder_url"):
+                            st.link_button("↗ Its folder in OneDrive",
+                                           saved["folder_url"], **STRETCH)
+                    except Exception as exc:
+                        st.error(f"Could not save it: {exc}")
+            if not cell:
+                st.caption("Choose a cell, or name a new one, to save.")
+            if st.button("📦 Make a ZIP of it instead", key=f"dbb_zip_{kind}",
+                         disabled=not name or not can_save, **STRETCH,
+                         help="The same as is saved to OneDrive, as one "
+                              "file; open it again on the right."):
+                now = datetime.now()
+                record, files = package(name, notes)
+                record.update(cell=cell, kind=kind, name=name, notes=notes,
+                              item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
+                              saved_at=now.isoformat(timespec="seconds"),
+                              tab=CELL_KINDS[kind])
+                s[f"_dbzipped_{kind}"] = (db_safe(record["item_id"])
+                                          + ".zip", db_zip(record, files))
+            made = s.pop(f"_dbzipped_{kind}", None)
+            if made:
+                st.download_button("⬇️ Download the ZIP", made[1],
+                                   file_name=made[0], mime="application/zip",
+                                   key=f"dbb_dl_{kind}", **STRETCH)
+        with right:
+            st.markdown("**📂 Open it again**")
+            items = db_items()
+            if store is not None and cell:
+                mine = pd.DataFrame()
+                if items is not None and not items.empty and \
+                        {"cell", "kind"} <= set(items.columns):
+                    mine = items[(items["cell"].astype(str) == cell)
+                                 & (items["kind"].astype(str) == kind)]
+                r1, r2 = st.columns([5, 1], vertical_alignment="bottom")
+                if mine.empty:
+                    r1.caption(f"Nothing from this tab saved in {cell} yet.")
+                else:
+                    rows = {str(r["item_id"]): r
+                            for r in mine.to_dict("records")}
+                    if s.get(f"dbpick_{kind}") not in rows:
+                        s[f"dbpick_{kind}"] = next(iter(rows))
+                    r1.selectbox(
+                        f"Saved in {cell}", list(rows), key=f"dbpick_{kind}",
+                        format_func=lambda k: (
+                            f"{rows[k].get('name') or k} · "
+                            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+                if r2.button("🔄", key=f"dbb_refresh_{kind}",
+                             help="Read the database again."):
+                    db_items(refresh=True)
+                    st.rerun()
+                if not mine.empty:
+                    row = rows.get(s.get(f"dbpick_{kind}")) or {}
+                    if str(row.get("notes") or "").strip() not in ("", "nan"):
+                        st.caption(f"Notes: {row['notes']}")
+                    o1, o2 = st.columns(2)
+                    o1.button("📂 Open here", key=f"dbb_open_{kind}",
+                              on_click=db_open_item, args=(kind, restore),
+                              type="primary", **STRETCH,
+                              help="Puts it back on this tab with its data "
+                                   "and every setting, to look at or "
+                                   "analyse further.")
+                    if str(row.get("folder_url") or "").startswith("http"):
+                        o2.link_button("↗ Its folder", row["folder_url"],
+                                       **STRETCH)
+            elif store is not None:
+                st.caption("Choose the cell on the left to see what is "
+                           "saved in it.")
+            st.file_uploader("Or a ZIP saved from here", type=["zip"],
+                             key=f"dbzip_{kind}")
+            st.button("📂 Open the ZIP", key=f"dbb_openzip_{kind}",
+                      on_click=db_open_zip, args=(kind, restore),
+                      disabled=s.get(f"dbzip_{kind}") is None, **STRETCH)
+            if older is not None:
+                with st.expander("Saved before cells (older)"):
+                    older()
+
+
 def send_to_fourier(name, frame, source="the video", stats=None,
                     zero_mode=None, lines=None, meta=None):
     """Put a table on the 〰 Fourier tab, picked there at once. Takes the
@@ -22812,7 +23182,7 @@ SHOW_DATABASE_TAB = False
 # hidden by CSS on the n-th button of the top tab bar only.
 (
     tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_fourier,
-    tab_force, tab_igor, tab_fitting, tab_video, tab_db,
+    tab_force, tab_igor, tab_fitting, tab_celldb, tab_video, tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
@@ -22824,6 +23194,7 @@ SHOW_DATABASE_TAB = False
         "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
         "🧮 Fitting",
+        "🗂 Cells",
         "🎥 Compression video",
         "📋 Database",
     ]
@@ -22856,7 +23227,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((10, SHOW_VIDEO_TAB), (11, SHOW_DATABASE_TAB))
+    index for index, wanted in ((11, SHOW_VIDEO_TAB), (12, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -28433,6 +28804,8 @@ def fc_results(t, m, ylab, stem):
                    on_click=send_to_fourier, args=sent, kwargs=sent_meta,
                    help="Time and force to the Fourier tab: the "
                         "frequencies it is made of.", **STRETCH)
+        s["_fc_for_db"] = {"table": table, "lines": [
+            (a, b) for a, b in lines]}
         r3.download_button("💾 Save as CSV", key="fc_csv",
                            data=lambda: table.to_csv(index=False).encode(),
                            file_name=f"{stem}_force_vs_time.csv",
@@ -28456,20 +28829,32 @@ def force_curve_tab():
         s[key] = s[key] if key in s else value
     up = st.file_uploader(
         "Force file", type=list(fcv.FILE_TYPES), key="fc_file",
+        on_change=fc_close_saved,
         help="An Asylum .ibw force file (its time step, spring constant "
              "and segments come from the file), or a CSV, TXT or Excel "
              "table with a time column and a force or deflection column.")
-    if up is None:
+    s.pop("_fc_for_db", None)
+    saved = s.get("_fc_db_file")
+    if up is None and saved is None:
         st.caption("Load one force recording to plot it against time, take "
                    "its baseline off, mark where it starts and ends, and "
                    "send it to the stacked plot.")
+        fc_cell_box()
         return
+    if saved is not None:
+        file_name, data = saved
+        c1, c2 = st.columns([4, 1], vertical_alignment="center")
+        c1.caption(f"☁️ {file_name}, opened from the cell database.")
+        c2.button("✕ Close it", key="fc_close_saved", on_click=fc_close_saved,
+                  **STRETCH)
+    else:
+        file_name, data = up.name, up.getvalue()
     try:
-        item = fc_read(up.getvalue(), up.name)
+        item = fc_read(data, file_name)
     except Exception as exc:
-        st.error(f"Could not read {up.name}: {exc}")
+        st.error(f"Could not read {file_name}: {exc}")
         return
-    fc_reset(f"{up.name}:{up.size}")
+    fc_reset(f"{file_name}:{len(data)}")
     signal = fc_signal(item)
     if signal is None:
         return
@@ -28483,6 +28868,58 @@ def force_curve_tab():
         st.caption("Dotted grey lines: where the file's segments (approach, "
                    "dwell, retract) meet.")
     fc_results(t, model, ylab, stem)
+    fc_cell_box(file_name, data)
+
+
+FC_DB_SKIP = re.compile(
+    r"^fc_(auto|bars_reset|chart.*|csv|file|fit_.*|line_del_.*|"
+    r"line_redo_.*|line_undo|send|send_bt|send_ft|send_sr|v_.*|"
+    r"close_saved)$")
+
+
+def fc_close_saved():
+    st.session_state.pop("_fc_db_file", None)
+
+
+def fc_db_package(file_name, data, name, notes):
+    """(record, files) for the cell database: the force file itself, the
+    curve as sent, its numbers and every setting (lines drawn too)."""
+    s = st.session_state
+    rel = f"raw/{db_safe(file_name)}"
+    files = {rel: data}
+    made = s.get("_fc_for_db") or {}
+    if made.get("table") is not None:
+        files["curve.csv"] = made["table"].to_csv(index=False)
+    results = {str(a): str(b) for a, b in made.get("lines") or []}
+    settings = db_snapshot(("fc_",), FC_DB_SKIP)
+    if s.get("_fc_lines"):
+        settings["_fc_lines"] = db_plain(s["_fc_lines"])
+    record = {"file": file_name, "raw": rel, "results": results,
+              "source": "Single force curve", "settings": settings}
+    return record, files
+
+
+def fc_db_restore(record, fetch):
+    """A saved force curve back on the tab: its file (in place of the one
+    uploaded) and every setting."""
+    s = st.session_state
+    name = record.get("file") or "saved force curve"
+    data = fetch(record["raw"])
+    s["_fc_db_file"] = (name, data)
+    # its own settings, kept: not reset as a new file's would be
+    s["_fc_sig"] = f"{name}:{len(data)}"
+    for key, value in (record.get("settings") or {}).items():
+        if key == "_fc_lines" or not FC_DB_SKIP.match(key):
+            s[key] = value
+
+
+def fc_cell_box(file_name=None, data=None):
+    cell_db_box("force",
+                lambda name, notes: fc_db_package(file_name, data, name,
+                                                  notes),
+                fc_db_restore,
+                default_name=re.sub(r"\.[^.]+$", "", str(file_name or "")),
+                can_save=data is not None)
 
 
 with tab_force:
@@ -29391,6 +29828,61 @@ def ai_channel_pick(label, key, n, names, allow_none=True, which=None):
         args=(which, names) if which else None)
 
 
+def ai_pairs(names):
+    """
+    The channels by what they measure, trace and retrace together:
+    {'Deflection': (2, 3), 'Height': (0, 1), …} in the file's order. A
+    channel with no Trace or Retrace in its name is a pair of its own (its
+    retrace None).
+    """
+    pairs = {}
+    for i, name in enumerate(names):
+        name = str(name)
+        found = re.match(r"^(.*?)\s*(Re)?trace$", name, re.IGNORECASE)
+        base = (found.group(1).strip() or name) if found else name
+        slot = 1 if (found and found.group(2)) else 0
+        if base in pairs and pairs[base][slot] is not None:
+            base = name
+        pairs.setdefault(base, [None, None])[slot] = i
+    return {base: (a if a is not None else b, b if a is not None else None)
+            for base, (a, b) in pairs.items()}
+
+
+def ai_set_pair(which, pair):
+    """Segments A and B of a plot set to a pair: (trace, retrace)."""
+    if not pair:
+        return
+    s = st.session_state
+    s[f"ai_a{which}"] = pair[0]
+    s[f"ai_b{which}"] = pair[1] if pair[1] is not None else "None"
+
+
+def ai_pair_picked(which, names):
+    """A pair chosen above a plot: its trace in A, its retrace in B, and a
+    deflection made a force."""
+    s = st.session_state
+    pair = ai_pairs(names).get(s.get(f"ai_pair{which}"))
+    if pair:
+        ai_set_pair(which, pair)
+        ai_auto_convert(which, names)
+
+
+def ai_pair_control(which, names):
+    """One click to switch a plot between channel pairs (Deflection,
+    Height, Amplitude…), trace in A and retrace in B."""
+    s = st.session_state
+    pairs = ai_pairs(names)
+    now = (s.get(f"ai_a{which}"), s.get(f"ai_b{which}"))
+    s[f"ai_pair{which}"] = next(
+        (base for base, (a, b) in pairs.items()
+         if (a, b if b is not None else "None") == now), None)
+    st.segmented_control(
+        "Channels", list(pairs), key=f"ai_pair{which}",
+        on_change=ai_pair_picked, args=(which, names),
+        help="Trace in segment A and retrace in segment B, in one click. "
+             "Or choose the segments one by one below.")
+
+
 def ai_auto_convert(which, names):
     """
     A deflection channel picked for a plot is shown as a force: "Defl →
@@ -29414,18 +29906,37 @@ def ai_auto_convert(which, names):
         s[f"ai_fmode{which}"] = "None"
 
 
+AI_DB_SKIP = re.compile(
+    r"^ai_(files|file|info_dl|next|prev|send_.*|ts_dl|use_note|xyz_dl|"
+    r"xyz_go|gallery.*|pair\d|close_saved)$|^ai_.*_dl$")
+
+
+def ai_close_saved():
+    st.session_state.pop("_ai_db_files", None)
+
+
 def ai_files_panel():
-    """Upload, choose and step through the files. -> (name, item) or None."""
+    """Upload, choose and step through the files (and those opened from
+    the cell database). -> (name, item) or None."""
+    s = st.session_state
     uploads = st.file_uploader(
         "Igor .ibw images", type=["ibw"], accept_multiple_files=True,
         key="ai_files",
         help="One or several Asylum Research .ibw image files. Every "
              "channel in them (height, deflection, trace, retrace…) can be "
-             "shown.")
-    if not uploads:
-        st.info("Upload one or more .ibw images to begin.", icon="🔬")
+             "shown.") or []
+    saved = s.get("_ai_db_files") or {}
+    uploaded = {u.name: u for u in uploads}
+    if saved:
+        c1, c2 = st.columns([4, 1], vertical_alignment="center")
+        c1.caption("☁️ Opened from the cell database: " + ", ".join(saved))
+        c2.button("✕ Close them", key="ai_close_saved",
+                  on_click=ai_close_saved, **STRETCH)
+    if not uploads and not saved:
+        st.info("Upload one or more .ibw images to begin, or open one saved "
+                "in a cell (🗄 Cell database, below).", icon="🔬")
         return None
-    names = [u.name for u in uploads]
+    names = list(uploaded) + [n for n in saved if n not in uploaded]
     ai_choice("ai_file", names, names[0])
 
     def step(n):
@@ -29440,18 +29951,78 @@ def ai_files_panel():
                      label_visibility="collapsed")
     f3.button("▶", key="ai_next", on_click=step, args=(1,), **STRETCH,
               disabled=len(names) < 2)
-    upload = uploads[names.index(st.session_state["ai_file"])]
+    chosen = st.session_state["ai_file"]
+    data = (uploaded[chosen].getvalue() if chosen in uploaded
+            else saved[chosen])
     try:
-        item = ai_load(upload.getvalue(), upload.name)
+        item = ai_load(data, chosen)
     except ImportError:
         st.error("Reading .ibw files needs the **igor2** package. Add the "
                  "line `igor2` to requirements.txt and reboot the app.",
                  icon="🚫")
         return None
     except Exception as exc:
-        st.error(f"Could not read {upload.name}: {exc}", icon="🚫")
+        st.error(f"Could not read {chosen}: {exc}", icon="🚫")
         return None
-    return upload.name, item
+    return chosen, item
+
+
+def ai_file_bytes(name):
+    """The bytes of a file on the tab, uploaded or opened from a cell."""
+    s = st.session_state
+    for up in s.get("ai_files") or []:
+        if up.name == name:
+            return up.getvalue()
+    return (s.get("_ai_db_files") or {}).get(name)
+
+
+def ai_db_package(file_name, tables, name, notes):
+    """(record, files) for the cell database: the .ibw itself, each plot
+    as plotted with its statistics, and every setting of the tab."""
+    s = st.session_state
+    raw = ai_file_bytes(file_name)
+    if raw is None:
+        raise RuntimeError(f"{file_name} is no longer on the tab")
+    rel = f"raw/{db_safe(file_name)}"
+    files = {rel: raw}
+    stats, plots = [], []
+    for n, (title, frame, stat, meta) in enumerate(tables or [], start=1):
+        files[f"plot_{n}.csv"] = frame.to_csv(index=False)
+        plots.append({"name": title, "path": f"plot_{n}.csv",
+                      "meta": dict(meta or {})})
+        stats += [{"Plot": title, "Statistic": str(a), "Value": str(b)}
+                  for a, b in (tuple(x)[:2] for x in stat or [])]
+    if stats:
+        files["statistics.csv"] = pd.DataFrame(stats).to_csv(index=False)
+    results = {"k (N/m)": s.get("ai_k"), "InvOLS (nm/V)": s.get("ai_invols"),
+               "Line rate (Hz)": s.get("ai_rate")}
+    record = {"file": file_name, "raw": rel, "plots": plots,
+              "results": results, "source": "AFM output analysis",
+              "settings": db_snapshot(("ai_",), AI_DB_SKIP)}
+    return record, files
+
+
+def ai_db_restore(record, fetch):
+    """A saved AFM analysis back on the tab: its .ibw (listed with the
+    uploads) and every setting as it was."""
+    s = st.session_state
+    name = record.get("file") or "saved.ibw"
+    s.setdefault("_ai_db_files", {})[name] = fetch(record["raw"])
+    for key, value in (record.get("settings") or {}).items():
+        if not AI_DB_SKIP.match(key):
+            s[key] = value
+    s["ai_file"] = name
+    # its own settings, not a new file's
+    s["_ai_for"] = name
+
+
+def ai_cell_box(file_name=None, tables=None):
+    cell_db_box("afm",
+                lambda name, notes: ai_db_package(file_name, tables, name,
+                                                  notes),
+                ai_db_restore,
+                default_name=re.sub(r"\.[^.]+$", "", str(file_name or "")),
+                can_save=bool(file_name))
 
 
 AI_FORCE_SHOW = ("µN", "nN", "N", "Best fit")
@@ -29498,6 +30069,7 @@ def ai_panel():
     """The whole 🔬 tab."""
     loaded = ai_files_panel()
     if loaded is None:
+        ai_cell_box()
         return
     name, item = loaded
     arr, meta, nd = item["arr"], item["meta"], item["note_dict"]
@@ -29530,7 +30102,10 @@ def ai_panel():
         elif mode not in ai.FORCE_MODES:
             st.session_state[f"ai_fmode{which}"] = "None"
         if fresh:
-            # the deflection of a new file in force, from its own k
+            # a new file opens on its deflection, trace and retrace, as a
+            # force from its own k
+            if which == 1:
+                ai_set_pair(1, ai_pairs(names).get("Deflection"))
             ai_auto_convert(which, names)
     st.caption(f"{name} · {' × '.join(str(s) for s in arr.shape)} · "
                f"{nch} channel{'s' if nch != 1 else ''}: "
@@ -29642,12 +30217,14 @@ def ai_panel():
     s1, s2 = st.columns(2)
     with s1:
         st.markdown("Plot 1 · left axis")
+        ai_pair_control(1, names)
         a1 = ai_channel_pick("Segment A", "ai_a1", nch, names, which=1)
         b1 = ai_channel_pick("Segment B", "ai_b1", nch, names, which=1)
         st.selectbox("Convert", ai.FORCE_MODES, key="ai_fmode1",
                      help=AI_CONVERT_HELP)
     with s2:
         p2_on = st.toggle("Plot 2 · right axis", key="ai_p2")
+        ai_pair_control(2, names)
         a2 = ai_channel_pick("Segment A₂", "ai_a2", nch, names, which=2)
         b2 = ai_channel_pick("Segment B₂", "ai_b2", nch, names, which=2)
         st.selectbox("Convert ", ai.FORCE_MODES, key="ai_fmode2",
@@ -29941,7 +30518,7 @@ def ai_panel():
     fig = ai_time_figure(processed, units, tlabel)
     base = ai.default_save_base(name, (a1, b1), (a2, b2), presets,
                                 labels=names)
-    ai_send_row(processed, units, tlabel, base,
+    ai_tables = ai_send_row(processed, units, tlabel, base,
                 channels={1: (a1, b1), 2: (a2, b2)}, names=names,
                 meta=cal_meta)
     ai_chart(fig, base, key="ai_time")
@@ -30034,6 +30611,7 @@ def ai_panel():
                 else xyz_name + ".xlsx",
                 mime="application/vnd.openxmlformats-officedocument."
                      "spreadsheetml.sheet", key="ai_xyz_dl", **STRETCH)
+    ai_cell_box(name, ai_tables)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -30225,6 +30803,7 @@ def ai_send_row(processed, units, tlabel, base, channels=None, names=None,
     if note:
         note_col.caption(("✅ " if note.startswith("Sent") else "⚠️ ")
                          + note)
+    return tables
 
 
 def ai_time_figure(processed, units, tlabel):
@@ -31782,9 +32361,9 @@ def sc_figure(traces, clickable=False):
 SC_DB_SKIP = re.compile(
     r"^((file|sent)\d+(_v\d+)?|chart.*|csv|clickdo|db_.*"
     r"|hl_(col|dash|del|redo|show|txt)_.*|hl_\d+_v\d+"
-    r"|(blp_clear|blp_last|blq10|blq25|blq5|pkreset|satclr|unsend|tobeat)"
-    r"\d+"
-    r"|reset_view|undo_zero|r\d+_(reset|form)"
+    r"|(blp_clear|blp_last|blq10|blq25|blq5|pkreset|pkoff|satclr|unsend"
+    r"|tobeat)\d+"
+    r"|reset_view|undo_zero|pkalloff|r\d+_(reset|form)"
     r"|_(click_note|draw_note|chart_ver|redraw|draft|zero_next|blsrc_next"
     r"|satsrc_next|view|zero_hist|zero_undo|upver|db_.*))$")
 
@@ -31928,19 +32507,6 @@ def sc_db_package(traces, name, notes=""):
     return record, files
 
 
-def sc_db_zip(record, files):
-    """The analysis as one ZIP: analysis.json and its files."""
-    import zipfile
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("analysis.json",
-                         json.dumps(record, indent=2, default=str))
-        for rel in sorted(files):
-            archive.writestr(rel, files[rel])
-    return buffer.getvalue()
-
-
 def sc_db_restore(record, fetch):
     """
     Put a saved analysis on the stack, in place of what is there: its files
@@ -32008,132 +32574,39 @@ def sc_db_open_onedrive():
         s[f"_{SCP}db_note"] = f"⚠️ Could not open it: {exc}"
 
 
-def sc_db_open_zip():
-    import zipfile
+def sc_cell_box(traces, stem):
+    """🗄 Cell database under the stack (or series): save it in the cell,
+    open a saved one again."""
+    cell_db_box("series" if sc_is_series() else "stack",
+                lambda name, notes: sc_db_package(traces, name, notes),
+                sc_ns(sc_db_restore), default_name=stem,
+                can_save=bool(traces), older=sc_ns(sc_db_older))
 
+
+def sc_db_older():
+    """Stacked plots saved before cells (stacks/ in OneDrive), to open."""
     s = st.session_state
-    up = s.get(f"{SCP}db_zipup")
-    if up is None:
+    store = od_store()
+    if store is None or not hasattr(store, "load_stack_index"):
+        st.caption("Connect OneDrive to see them.")
         return
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(up.getvalue()))
-        record = json.loads(archive.read("analysis.json").decode("utf-8"))
-        sc_db_restore(record, archive.read)
-    except Exception as exc:
-        s[f"_{SCP}db_note"] = f"⚠️ Could not open {up.name}: {exc}"
-
-
-def sc_db_open_controls():
-    """📂 Open a saved analysis: from OneDrive, or from a ZIP saved here.
-    Shown even with nothing on the stack."""
-    s = st.session_state
-    st.markdown("**📂 Open a saved analysis**")
-    note = s.pop(f"_{SCP}db_note", None)
-    if note:
-        (st.success if note.startswith("✅") else st.warning)(note)
-    store = sc_db_store()
-    if store is not None:
-        r1, r2 = st.columns([3, 1])
-        if r2.button("🔄", key=f"{SCP}db_refresh", help="Read the list again.",
-                     **STRETCH) or s.get(f"_{SCP}db_index") is None:
-            try:
-                s[f"_{SCP}db_index"] = store.load_stack_index()
-            except Exception as exc:
-                st.warning(f"Could not read the list: {exc}")
-                s[f"_{SCP}db_index"] = pd.DataFrame()
-        index = s.get(f"_{SCP}db_index")
-        if index is None or index.empty:
-            r1.caption("Nothing saved to OneDrive yet.")
-        else:
-            rows = {str(r["stack_id"]): r for r in index.to_dict("records")}
-            r1.selectbox(
-                "Saved analyses", list(rows), key=f"{SCP}db_pick",
-                label_visibility="collapsed",
-                format_func=lambda k: (
-                    ("🔗 " if rows[k].get("what") == "Series plot"
-                     else "📚 ")
-                    + f"{rows[k].get('name') or k} · "
-                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
-            row = rows.get(s.get(f"{SCP}db_pick")) or {}
-            st.caption(f"Files: {row.get('files', '')}"
-                       + (f" · {row['notes']}" if row.get("notes") else ""))
-            o1, o2 = st.columns(2)
-            o1.button("📂 Open here", key=f"{SCP}db_open",
-                      on_click=sc_ns(sc_db_open_onedrive), type="primary",
-                      **STRETCH,
-                      help=f"Replaces what is on {sc_tab_name()} now with "
-                           "the saved files and settings. A stacked plot "
-                           "opens as a series here (and a series as a "
-                           "stack on 📚 Stack & compare).")
-            if row.get("folder_url"):
-                o2.link_button("↗ Its folder", row["folder_url"], **STRETCH)
-    elif s.get("onedrive_store") is not None:
-        st.caption("⚠️ The onedrive_store.py on the server is older than "
-                   "app.py: upload the new one to save plots there.")
-    else:
-        st.caption("Connect OneDrive to save and open analyses there: it "
-                   "is in the sidebar (☁️ OneDrive database), shown while "
-                   "the 🧮 Fitting tab is open.")
-    st.file_uploader("Or a ZIP saved from here", type=["zip"],
-                     key=f"{SCP}db_zipup")
-    st.button("📂 Open the ZIP", key=f"{SCP}db_openzip",
-              on_click=sc_ns(sc_db_open_zip),
-              disabled=s.get(f"{SCP}db_zipup") is None, **STRETCH,
-              help=f"Replaces what is on {sc_tab_name()} now with the files "
-                   "and settings in the ZIP.")
-
-
-def sc_db_save_controls(traces, stem):
-    """☁️ Save this analysis: to OneDrive, or as a ZIP."""
-    s = st.session_state
-    st.markdown("**☁️ Save this analysis**")
-    # named after its files until a name is typed
-    typed = str(s.get(f"{SCP}db_name") or "").strip()
-    if not typed or typed == s.get(f"_{SCP}db_autoname"):
-        s[f"{SCP}db_name"] = s[f"_{SCP}db_autoname"] = stem
-    st.text_input("Name", key=f"{SCP}db_name",
-                  help="What it is called in the list of saved analyses. "
-                       "The date and time are added to its folder's name.")
-    st.text_area("Notes", key=f"{SCP}db_notes", height=70,
-                 placeholder="cell, condition, what this shows…")
-    name = str(s.get(f"{SCP}db_name") or "").strip()
-    notes = str(s.get(f"{SCP}db_notes") or "").strip()
-    store = sc_db_store()
-    if st.button("☁️ Save to OneDrive", key=f"{SCP}db_save", type="primary",
-                 disabled=store is None or not name, **STRETCH,
-                 help="A folder with the files used, the plot (interactive "
-                      "HTML), the data as plotted, each file's numbers and "
-                      "every setting, so it opens again exactly as it is."):
-        with st.spinner("Saving to OneDrive…"):
-            try:
-                record, files = sc_db_package(traces, name, notes)
-                saved = store.save_stack(record, files)
-                s[f"_{SCP}db_index"] = None
-                st.success(f"✅ Saved “{name}”: {len(record['files'])} "
-                           f"file{'s' if len(record['files']) != 1 else ''}"
-                           f", the plot and its numbers, in "
-                           f"{saved.get('onedrive_path', 'OneDrive')}.")
-                if saved.get("folder_url"):
-                    st.link_button("↗ Open the folder", saved["folder_url"],
-                                   **STRETCH)
-            except Exception as exc:
-                st.error(f"Could not save to OneDrive: {exc}")
-    if store is None:
-        st.caption("OneDrive is not connected (it is in the sidebar of the "
-                   "🧮 Fitting tab, ☁️ OneDrive database); or keep it as a "
-                   "ZIP.")
-    if st.button("📦 Make a ZIP of it", key=f"{SCP}db_mkzip",
-                 disabled=not name, **STRETCH,
-                 help="The same as is saved to OneDrive, as one file to "
-                      "keep; open it again below."):
-        record, files = sc_db_package(traces, name, notes)
-        s[f"_{SCP}db_zip"] = (sc_db_safe(record["stack_id"]) + ".zip",
-                           sc_db_zip(record, files))
-    made = s.pop(f"_{SCP}db_zip", None)
-    if made:
-        st.download_button("⬇️ Download the ZIP", made[1], file_name=made[0],
-                           mime="application/zip", key=f"{SCP}db_dlzip",
-                           **STRETCH)
+    if s.get(f"_{SCP}db_index") is None:
+        try:
+            s[f"_{SCP}db_index"] = store.load_stack_index()
+        except Exception:
+            s[f"_{SCP}db_index"] = pd.DataFrame()
+    index = s.get(f"_{SCP}db_index")
+    if index is None or index.empty:
+        st.caption("None.")
+        return
+    rows = {str(r["stack_id"]): r for r in index.to_dict("records")}
+    st.selectbox("Saved before cells", list(rows), key=f"{SCP}db_pick",
+                 format_func=lambda k: (
+                     ("🔗 " if rows[k].get("what") == "Series plot" else "📚 ")
+                     + f"{rows[k].get('name') or k} · "
+                     f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+    st.button("📂 Open it here", key=f"{SCP}db_open",
+              on_click=sc_ns(sc_db_open_onedrive), **STRETCH)
 
 
 def sc_save_controls(traces, stem):
@@ -32246,7 +32719,8 @@ def sc_panel():
             ["📂 Files", "📐 Axes", "🎨 Look", "💾 Save"])
         with t_save:
             save_box = st.container()
-            sc_db_open_controls()
+            st.caption("To keep this analysis in a cell (OneDrive), and to "
+                       "open it again: 🗄 Cell database, under the plot.")
         with t_files:
             n = st.select_slider("Files", list(range(1, 7)), key=f"{SCP}n")
             traces = []
@@ -32266,6 +32740,7 @@ def sc_panel():
                     "tab" + (" with **🔗 Send to series**: the files are "
                              "put one after another along x."
                              if sc_is_series() else "."), icon="📂")
+            sc_cell_box([], "")
         return
     if sc_is_series():
         # one after another: every file moved to its place along x (and
@@ -32281,8 +32756,6 @@ def sc_panel():
     stem = sc.nice_stem([t["file"] for t in traces])
     with save_box:
         sc_save_controls(traces, stem)
-        st.divider()
-        sc_db_save_controls(traces, stem)
         st.divider()
 
     with right:
@@ -32439,6 +32912,8 @@ def sc_panel():
         else:
             st.plotly_chart(fig, key=f"{SCP}chart_{view}", config=config,
                             theme=None, **(STRETCH if fit else {}))
+    with right:
+        sc_cell_box(traces, stem)
 
 
 with tab_stack:
@@ -32471,8 +32946,12 @@ with tab_series:
 # Keys: bt_<setting>_<signal> are settings (kept while another signal is
 # shown); btb_ buttons, btc_ charts, btf_ the upload box; _bt_ the rest.
 
-BT_MOUSE = ("🔍 Zoom", "━ Baseline", "━ Upper line", "━ Lower line",
-            "✕ Click peaks", "🗑 Box over peaks")
+# what the mouse does on the beat plot: zoom (and a click on a ▲ ▼
+# removes that peak, on a ✕ puts it back), box peaks away, or drag a line
+BT_MOUSE = ("🔍 Zoom · click a peak to remove it", "🗑 Box over peaks",
+            "━ Baseline", "━ Upper line", "━ Lower line")
+BT_ZOOM, BT_BOX, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
+BT_MARKS = ("positive peaks", "negative peaks", "left out")
 # what y is shown in: a force in N, µN or nN (Best fit: whichever reads
 # best), or not a force at all
 BT_FORCES = FORCE_SHOWN
@@ -32623,7 +33102,7 @@ def bt_unit_changed(sid):
     _, y, _, ycol = got
     _, new = bt_shown(s.get(f"bt_fu_{sid}"), bt_source_unit(sid, ycol), y)
     old = float(s.get(f"_bt_scale_{sid}") or 1.0)
-    for name in ("base", "hi", "lo"):
+    for name in ("base", "hi", "lo", "qsmall"):
         if f"bt_{name}_{sid}" in s and old:
             s[f"bt_{name}_{sid}"] = float(s[f"bt_{name}_{sid}"]) * new / old
     s[f"_bt_scale_{sid}"] = new
@@ -32700,12 +33179,12 @@ def bt_apply_pending(sid):
     if not pending or pending[0] != sid:
         return
     _, what, level, base = pending
-    if what == BT_MOUSE[1]:
+    if what == BT_BASE:
         s[f"bt_bmode_{sid}"] = bta.BASELINES[2]
         s[f"bt_base_{sid}"] = float(level)
-    elif what == BT_MOUSE[2] and level > base:
+    elif what == BT_UP and level > base:
         s[f"bt_hi_{sid}"] = float(level - base)
-    elif what == BT_MOUSE[3] and level < base:
+    elif what == BT_LOW and level < base:
         s[f"bt_lo_{sid}"] = float(base - level)
 
 
@@ -32863,21 +33342,63 @@ def bt_settings(sid, got):
                   on_click=bt_use_own, args=(sid,), **STRETCH)
 
 
-def bt_plot(sid, got):
-    """The plot, what the mouse does on it, and a drag or click acted on."""
+def bt_add_out(sid, marks):
+    """These peaks removed too (one step for ↶ Undo)."""
     s = st.session_state
-    m1, m3, m4, m2 = st.columns([4.6, 0.75, 1.0, 0.8])
+    bt_set_out(sid, list(s.get(f"_bt_out_{sid}") or []) + list(marks))
+
+
+def bt_quick_remove(sid, got):
+    """🧹 Peaks removed by kind or size, in one click each."""
+    s = st.session_state
+    yu = got["y_unit"]
+    pos_only = [b["pos"]["peak_x"] for b in got["beats"]
+                if b["kind"] == bta.KINDS[1]]
+    neg_only = [b["neg"]["peak_x"] for b in got["beats"]
+                if b["kind"] == bta.KINDS[2]]
+    for label, marks, key, tip in (
+            (f"✕ Positive-only beats ({len(pos_only)})", pos_only, "qpos",
+             "Positive peaks with no negative peak after them."),
+            (f"✕ Negative-only beats ({len(neg_only)})", neg_only, "qneg",
+             "Negative peaks with no positive peak before them."),
+            ("✕ All positive peaks ({})".format(
+                sum(e["sign"] > 0 for e in got["kept"])),
+             [e["peak_x"] for e in got["kept"] if e["sign"] > 0], "qallp",
+             "Every positive peak: only the negative ones counted."),
+            ("✕ All negative peaks ({})".format(
+                sum(e["sign"] < 0 for e in got["kept"])),
+             [e["peak_x"] for e in got["kept"] if e["sign"] < 0], "qalln",
+             "Every negative peak: only the positive ones counted.")):
+        st.button(label, key=f"btb_{key}_{sid}", on_click=bt_add_out,
+                  args=(sid, marks), disabled=not marks, help=tip, **STRETCH)
+    st.number_input(f"Smaller than ({yu})" if yu else "Smaller than",
+                    min_value=0.0, key=f"bt_qsmall_{sid}", format="%.4g",
+                    help="Height above (or depth below) the baseline.")
+    limit = float(s.get(f"bt_qsmall_{sid}") or 0.0)
+    small = [e["peak_x"] for e in got["kept"] if abs(e["peak"]) < limit]
+    st.button(f"✕ Peaks smaller than that ({len(small)})",
+              key=f"btb_qsmall_{sid}", on_click=bt_add_out,
+              args=(sid, small), disabled=not small, **STRETCH)
+    st.caption("↶ Undo takes any of these back.")
+
+
+def bt_plot(sid, got):
+    """The plot, what the mouse does on it, and a drag or click acted on.
+    In the normal (zoom) mode a click on a ▲ ▼ removes that peak and a
+    click on a ✕ puts it back."""
+    s = st.session_state
+    m1, m3, m4, m5, m2 = st.columns([3.9, 0.75, 1.0, 1.05, 0.8])
     if s.get("bt_mouse") not in BT_MOUSE:
-        s["bt_mouse"] = BT_MOUSE[0]
+        s["bt_mouse"] = BT_ZOOM
     mouse = m1.segmented_control(
         "The mouse on the plot", BT_MOUSE, key="bt_mouse",
         label_visibility="collapsed",
-        help="━ Baseline / Upper line / Lower line: drag across the plot "
-             "at the height the line should be. ✕ Click peaks: each click "
-             "on a peak removes it (a click on a removed one, ✕, puts it "
-             "back). 🗑 Box over peaks: drag a box around peaks to remove "
-             "them all at once (a box around removed ones only puts them "
-             "back).") or BT_MOUSE[0]
+        help="🔍 Zoom: drag to zoom in, double-click to zoom out; a click "
+             "on a ▲ or ▼ removes that peak, a click on a ✕ puts it back. "
+             "🗑 Box over peaks: drag a box around peaks to remove them all "
+             "at once (a box around removed ones only puts them back). "
+             "━ Baseline / Upper line / Lower line: drag across the plot "
+             "at the height the line should be.") or BT_ZOOM
     gone = list(s.get(f"_bt_out_{sid}") or [])
     m3.button("↶ Undo", key=f"btb_undo_{sid}", on_click=bt_undo,
               args=(sid,), disabled=not s.get(f"_bt_hist_{sid}"),
@@ -32885,6 +33406,8 @@ def bt_plot(sid, got):
     m4.button(f"↺ Put back ({len(gone)})", key=f"btb_back_{sid}",
               on_click=bt_put_all_back, args=(sid,), disabled=not gone,
               **STRETCH, help="Every removed peak back in the beats.")
+    with m5.popover("🧹 Remove…", **STRETCH):
+        bt_quick_remove(sid, got)
     with m2.popover("🎨 Plot", **STRETCH):
         st.slider("Height", 250, 900, step=10, key="bt_height")
         st.slider("Line thickness", 0.5, 4.0, step=0.1, key="bt_lw")
@@ -32893,10 +33416,9 @@ def bt_plot(sid, got):
         st.color_picker("Negative peaks", key="bt_ncol")
         st.toggle("Number the beats", key="bt_numbers")
         st.toggle("Shade each full beat", key="bt_shade")
-    drawing = mouse in BT_MOUSE[1:4]
-    clicking = mouse == BT_MOUSE[4]
-    boxing = mouse == BT_MOUSE[5]
-    fig = bt_figure(got, clickable=clicking)
+    drawing = mouse in (BT_BASE, BT_UP, BT_LOW)
+    boxing = mouse == BT_BOX
+    fig = bt_figure(got, peak_click=not (drawing or boxing))
     if drawing:
         fig.update_layout(
             dragmode="lasso",
@@ -32926,32 +33448,6 @@ def bt_plot(sid, got):
             st.rerun()
         st.caption(f"Drag across the plot at the height of the "
                    f"{mouse[2:].lower()}.")
-    elif clicking:
-        event = st.plotly_chart(fig, key=f"btc_{ver}_click", config=config,
-                                on_select="rerun", selection_mode="points",
-                                **STRETCH)
-        try:
-            points = list(event.selection.points or [])
-        except Exception:
-            points = []
-        if points:
-            at = float(points[-1]["x"])
-            hit = [e for e in got["events"] if e["start"] <= at <= e["end"]]
-            if not hit and got["events"]:
-                hit = [min(got["events"],
-                           key=lambda e: abs(e["peak_x"] - at))]
-            marks = list(s.get(f"_bt_out_{sid}") or [])
-            for e in hit[:1]:
-                inside = [m for m in marks if e["start"] <= m <= e["end"]]
-                if inside:
-                    marks = [m for m in marks if m not in inside]
-                else:
-                    marks.append(e["peak_x"])
-            bt_set_out(sid, marks)
-            s["_bt_chart_ver"] = ver + 1
-            st.rerun()
-        st.caption("Click a peak to remove it; click a removed one (✕) to "
-                   "put it back. ↶ Undo takes back the last click.")
     elif boxing:
         fig.update_layout(dragmode="select",
                           newselection=dict(line=dict(color="#D62728",
@@ -32988,7 +33484,34 @@ def bt_plot(sid, got):
                    "baseline only takes positive peaks, below it negative "
                    "ones.")
     else:
-        st.plotly_chart(fig, key=f"btc_{ver}", config=config, **STRETCH)
+        event = st.plotly_chart(fig, key=f"btc_{ver}_zoom", config=config,
+                                on_select="rerun", selection_mode="points",
+                                **STRETCH)
+        try:
+            points = list(event.selection.points or [])
+        except Exception:
+            points = []
+        names = [trace.name for trace in fig.data]
+        hits = [p for p in points
+                if 0 <= int(p.get("curve_number", -1)) < len(names)
+                and names[int(p["curve_number"])] in BT_MARKS]
+        if hits and got["events"]:
+            at = float(hits[-1]["x"])
+            e = min(got["events"], key=lambda e: abs(e["peak_x"] - at))
+            marks = list(s.get(f"_bt_out_{sid}") or [])
+            inside = [m for m in marks if e["start"] <= m <= e["end"]]
+            if inside:
+                marks = [m for m in marks if m not in inside]
+            else:
+                marks.append(e["peak_x"])
+            bt_set_out(sid, marks)
+        if points:
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
+        st.caption("Drag to zoom in, double-click to zoom out. Click a ▲ ▼ "
+                   "to remove that peak, a ✕ to put it back, or untick it "
+                   "in 🔺 Peaks below. ↶ Undo takes back the last change.")
+    bt_peaks_table(sid, got)
 
 
 def bt_report(sid, got):
@@ -33257,26 +33780,18 @@ def bt_integration(sid, got):
                            "time, not an energy), without sign so positive "
                            "and negative add up.")
         peaks = got["peaks"]
-        with st.expander(f"∫ Each peak ({len(peaks)})"):
-            if peaks.empty:
-                st.caption("No peak is kept.")
-            else:
-                st.dataframe(
-                    peaks, hide_index=True, **STRETCH,
-                    column_config={c: st.column_config.NumberColumn(
-                        format="%.4e" if c.startswith("Energy") else "%.5g")
-                        for c in peaks.columns
-                        if peaks[c].dtype.kind == "f"})
-                name = sc_db_safe(st.session_state["_bt_sets"][sid]["name"])
-                st.download_button(
-                    "💾 Each peak (CSV)",
-                    peaks.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{name}_peaks.csv", mime="text/csv",
-                    key=f"btb_int_{sid}", **STRETCH,
-                    help="One row per peak, every column with its unit.")
+        if not peaks.empty:
+            name = sc_db_safe(st.session_state["_bt_sets"][sid]["name"])
+            st.download_button(
+                "💾 Each peak kept (CSV)",
+                peaks.to_csv(index=False).encode("utf-8"),
+                file_name=f"{name}_peaks.csv", mime="text/csv",
+                key=f"btb_int_{sid}", **STRETCH,
+                help="One row per peak kept, its beat, integral and "
+                     "energy, every column with its unit.")
 
 
-def bt_figure(got, clickable=False):
+def bt_figure(got, clickable=False, peak_click=False):
     """The beat plot as it is drawn on the tab."""
     s = st.session_state
     return bta.beat_figure(
@@ -33285,7 +33800,8 @@ def bt_figure(got, clickable=False):
         colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
         x_title=got["xcol"], y_title=bt_y_title(got), height=s["bt_height"],
         line_width=s["bt_lw"], numbers=s["bt_numbers"],
-        shade_beats=s["bt_shade"], clickable=clickable)
+        shade_beats=s["bt_shade"], clickable=clickable,
+        **({"peak_click": True} if peak_click else {}))
 
 
 # what is kept of each signal's settings when it is saved, to open it again
@@ -33375,133 +33891,101 @@ def bt_db_open_onedrive():
         s["_bt_db_note"] = f"⚠️ Could not open it: {exc}"
 
 
-def bt_db_open_zip():
-    import zipfile
-
+def bt_db_older():
+    """Beat analyses saved before cells (beats/ in OneDrive), to open."""
     s = st.session_state
-    up = s.get("btf_dbzip")
-    if up is None:
+    store = od_store()
+    if store is None or not hasattr(store, "load_beat_index"):
+        st.caption("Connect OneDrive to see them.")
         return
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(up.getvalue()))
-        record = json.loads(archive.read("analysis.json").decode("utf-8"))
-        bt_db_restore(record, archive.read)
-    except Exception as exc:
-        s["_bt_db_note"] = f"⚠️ Could not open {up.name}: {exc}"
+    if s.get("_bt_db_index") is None:
+        try:
+            s["_bt_db_index"] = store.load_beat_index()
+        except Exception:
+            s["_bt_db_index"] = pd.DataFrame()
+    index = s["_bt_db_index"]
+    if index is None or index.empty:
+        st.caption("None.")
+        return
+    rows = {str(r["beat_id"]): r for r in index.to_dict("records")}
+    st.selectbox("Saved before cells", list(rows), key="bt_db_pick",
+                 format_func=lambda k: f"{rows[k].get('name') or k} · "
+                 f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}")
+    st.button("📂 Open it here", key="btb_dbopen",
+              on_click=bt_db_open_onedrive, **STRETCH)
 
 
-def bt_database(sid, got):
-    """🗄 Database: save this analysis (to OneDrive, or a ZIP), open a
-    saved one, and the table of every analysis saved, one line each with
-    its results."""
+def bt_peaks_edited(sid, key, spans):
+    """Peaks ticked or unticked in 🔺 Peaks: removed, or put back."""
     s = st.session_state
-    store = bt_db_store()
-    with st.container(border=True):
-        st.markdown("#### 🗄 Database")
-        note = s.pop("_bt_db_note", None)
-        if note:
-            (st.success if note.startswith("✅") else st.warning)(note)
-        save, look = st.columns(2)
-        with save:
-            st.markdown("**☁️ Save this analysis**")
-            sig = s["_bt_sets"][sid]["name"]
-            typed = str(s.get(f"btd_name_{sid}") or "").strip()
-            if not typed:
-                s[f"btd_name_{sid}"] = sig
-            st.text_input("Name", key=f"btd_name_{sid}",
-                          help="What it is called in the database. The date "
-                               "and time are added to its folder's name.")
-            st.text_area("Notes", key=f"btd_notes_{sid}", height=68,
-                         placeholder="cell, condition, treatment…")
-            name = str(s.get(f"btd_name_{sid}") or "").strip()
-            notes = str(s.get(f"btd_notes_{sid}") or "").strip()
-            if st.button("☁️ Save to the database (OneDrive)",
-                         key=f"btb_dbsave_{sid}", type="primary",
-                         disabled=store is None or not name, **STRETCH,
-                         help="A folder with the signal, the 📋 Results, "
-                              "every beat and peak, the report, the plot and "
-                              "every setting; and a line with its results "
-                              "in the database table (beats_index.csv)."):
-                with st.spinner("Saving to OneDrive…"):
-                    try:
-                        record, files = bt_db_package(sid, got, name, notes)
-                        saved = store.save_beats(record, files)
-                        s["_bt_db_index"] = None
-                        st.success(f"✅ Saved “{name}” with its results.")
-                        if saved.get("folder_url"):
-                            st.link_button("↗ Its folder", saved["folder_url"],
-                                           **STRETCH)
-                    except Exception as exc:
-                        st.error(f"Could not save to OneDrive: {exc}")
-            if store is None:
-                st.caption("OneDrive is not connected: it is in the sidebar "
-                           "(☁️ OneDrive database), shown while the 🧮 "
-                           "Fitting tab is open. Or keep it as a ZIP.")
-            if st.button("📦 Make a ZIP of it", key=f"btb_dbzip_{sid}",
-                         disabled=not name, **STRETCH,
-                         help="The same as is saved to OneDrive, as one "
-                              "file; open it again on the right."):
-                import zipfile
+    edits = (s.get(key) or {}).get("edited_rows") or {}
+    marks = list(s.get(f"_bt_out_{sid}") or [])
+    for row, change in edits.items():
+        row = int(row)
+        if "Keep" not in change or row >= len(spans):
+            continue
+        start, end, at = spans[row]
+        inside = [m for m in marks if start <= m <= end]
+        if change["Keep"] is False and not inside:
+            marks.append(at)
+        elif change["Keep"] is True and inside:
+            marks = [m for m in marks if m not in inside]
+    bt_set_out(sid, marks)
 
-                record, files = bt_db_package(sid, got, name, notes)
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for rel, content in files.items():
-                        zf.writestr(rel, content)
-                    zf.writestr("analysis.json", json.dumps(
-                        record, indent=2, default=str))
-                s["_bt_db_zip"] = (sc_db_safe(record["beat_id"]) + ".zip",
-                                   buf.getvalue())
-            made = s.pop("_bt_db_zip", None)
-            if made:
-                st.download_button("⬇️ Download the ZIP", made[1],
-                                   file_name=made[0], mime="application/zip",
-                                   key=f"btb_dbdl_{sid}", **STRETCH)
-        with look:
-            st.markdown("**📂 Open a saved analysis**")
-            index = None
-            if store is not None:
-                if st.button("🔄 Read the database again",
-                             key="btb_dbrefresh", **STRETCH) \
-                        or s.get("_bt_db_index") is None:
-                    try:
-                        s["_bt_db_index"] = store.load_beat_index()
-                    except Exception as exc:
-                        st.warning(f"Could not read the database: {exc}")
-                        s["_bt_db_index"] = pd.DataFrame()
-                index = s.get("_bt_db_index")
-                if index is None or index.empty:
-                    st.caption("Nothing saved yet.")
-                else:
-                    rows = {str(r["beat_id"]): r
-                            for r in index.to_dict("records")}
-                    st.selectbox(
-                        "Saved analyses", list(rows), key="bt_db_pick",
-                        format_func=lambda k: (
-                            f"{rows[k].get('name') or k} · "
-                            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
-                    st.button("📂 Open it here", key="btb_dbopen",
-                              on_click=bt_db_open_onedrive, **STRETCH,
-                              help="Adds it as a signal on this tab, with "
-                                   "its settings and removed peaks.")
-            st.file_uploader("Or a ZIP saved from here", type=["zip"],
-                             key="btf_dbzip")
-            st.button("📂 Open the ZIP", key="btb_dbopenzip",
-                      on_click=bt_db_open_zip, **STRETCH,
-                      disabled=s.get("btf_dbzip") is None)
-        if index is not None and not index.empty:
-            with st.expander(f"📊 The database: every saved analysis "
-                             f"({len(index)}), one line each"):
-                shown = index.drop(columns=[c for c in ("onedrive_path",)
-                                            if c in index.columns])
-                st.dataframe(shown, hide_index=True, **STRETCH,
-                             column_config={"folder_url": st.column_config
-                                            .LinkColumn("Folder")})
-                st.download_button(
-                    "💾 The database table (CSV)",
-                    index.to_csv(index=False).encode("utf-8"),
-                    file_name="beat_analyses.csv", mime="text/csv",
-                    key="btb_dbcsv", **STRETCH)
+
+def bt_peaks_table(sid, got):
+    """🔺 Peaks: every peak found, removed ones too, each with a Keep tick:
+    untick to remove it, tick to put it back."""
+    s = st.session_state
+    xu, yu = got["x_unit"], got["y_unit"]
+    beat_at = {}
+    for b in got["beats"]:
+        for e in (b["pos"], b["neg"]):
+            if e is not None:
+                beat_at[e["peak_x"]] = b
+    gone = {e["peak_x"] for e in got["left_out"]}
+    k, newtons = got["k"], got["newtons"]
+    rows, spans = [], []
+    for n, e in enumerate(sorted(got["events"], key=lambda e: e["start"]),
+                          start=1):
+        b = beat_at.get(e["peak_x"])
+        rows.append({
+            "Keep": e["peak_x"] not in gone, "Peak": n,
+            "Sign": "+" if e["sign"] > 0 else "−",
+            "Beat": b["n"] if b else None,
+            "Kind": b["kind"] if b else "removed",
+            f"At ({xu})" if xu else "At": e["peak_x"],
+            f"Height or depth ({yu})" if yu else "Height or depth":
+                abs(e["peak"]),
+            f"Width ({xu})" if xu else "Width": e["width"],
+            f"∫, no sign ({yu}·{xu})" if (xu and yu) else "∫, no sign":
+                abs(e["area"]),
+            "Energy (J)": (bta.spring_energy(abs(e["peak"]), k, newtons)
+                           if (k and newtons) else np.nan)})
+        spans.append((e["start"], e["end"], e["peak_x"]))
+    kept = sum(r["Keep"] for r in rows)
+    with st.expander(f"🔺 Peaks: {kept} kept of {len(rows)} found · untick "
+                     "to remove, tick to put back", expanded=True):
+        if not rows:
+            st.caption("No peak gets past the lines.")
+            return
+        frame = pd.DataFrame(rows)
+        frame["Beat"] = frame["Beat"].astype("Int64")
+        if not (k and newtons):
+            frame = frame.drop(columns=["Energy (J)"])
+        key = f"btp_{sid}_{int(s.get('_bt_tab_ver', 0) or 0)}"
+        config = {c: st.column_config.NumberColumn(
+            format="%.4e" if c.startswith("Energy") else "%.5g")
+            for c in frame.columns if frame[c].dtype.kind == "f"}
+        config["Keep"] = st.column_config.CheckboxColumn(
+            "Keep", width="small",
+            help="Untick to remove this peak; tick a removed one to put it "
+                 "back.")
+        st.data_editor(frame, key=key, hide_index=True, **STRETCH,
+                       height=min(36 * (len(frame) + 1) + 4, 290),
+                       disabled=[c for c in frame.columns if c != "Keep"],
+                       on_change=bt_peaks_edited, args=(sid, key, spans),
+                       column_config=config)
 
 
 def bt_report_box(sid, got):
@@ -33579,7 +34063,10 @@ def bt_results(sid, got):
         index=False).encode("utf-8"), file_name=f"{name}_summary.csv",
                        mime="text/csv", key=f"btb_sum_{sid}", **STRETCH)
     bt_report_box(sid, got)
-    bt_database(sid, got)
+    cell_db_box("beats",
+                lambda name, notes: bt_db_package(sid, got, name, notes),
+                bt_db_restore, default_name=s["_bt_sets"][sid]["name"],
+                older=bt_db_older)
 
 
 def bt_summary_frame(ids):
@@ -34150,6 +34637,79 @@ def ft_extras(sig, spec):
         return filtered
 
 
+FT_DB_SKIP = re.compile(r"^ft_(pick$|x_|y_)")
+
+
+def ft_db_package(signals, spectra, name, notes):
+    """(record, files) for the cell database: each signal's data, every
+    setting, the spectrum, its peaks and the report."""
+    s = st.session_state
+    sources = ft_sources()
+    files, entries = {}, []
+    for n, sig in enumerate(signals, start=1):
+        label, frame, meta, where = sources[sig["key"]]
+        plain = label.split(" ", 1)[-1]
+        rel = f"signals/{n}_{db_safe(plain)}.csv"
+        files[rel] = frame.to_csv(index=False)
+        entries.append({"name": plain, "path": rel, "meta": dict(meta),
+                        "where": where, "x": str(sig["xcol"]),
+                        "y": str(sig["ycol"])})
+    files["report.txt"] = ft_report(signals, spectra)
+    files["peaks.csv"] = ft_peaks_frame(signals, spectra).to_csv(index=False)
+    first, spec = signals[0], spectra[0]
+    results = {}
+    if spec is not None:
+        f_unit, v_unit = ft_units(first)
+        table = pd.DataFrame({f"Frequency ({f_unit})": spec["freq"],
+                              f"{first['name']} ({v_unit})": spec["value"]})
+        files["spectrum.csv"] = table.to_csv(index=False)
+        if spec["peaks"]:
+            top = spec["peaks"][0]
+            results = {f"Strongest frequency ({f_unit})": top["freq"],
+                       ("Amplitude" if s["ft_kind"] == ftr.KINDS[0]
+                        else "Power density") + f" ({v_unit})": top["value"]}
+            if first["scale"]:
+                results["Per minute"] = top["freq"] * 60.0
+    record = {"signals": entries, "results": results,
+              "settings": db_snapshot(("ft_",), FT_DB_SKIP),
+              "source": ", ".join(sorted({e["where"] for e in entries})),
+              "file": ", ".join(e["name"] for e in entries)}
+    return record, files
+
+
+def ft_db_restore(record, fetch):
+    """A saved Fourier analysis back on the tab: its signals, picked, with
+    their columns and every setting."""
+    s = st.session_state
+    picks = []
+    for entry in record.get("signals") or []:
+        frame = pd.read_csv(io.BytesIO(fetch(entry["path"])))
+        sid = send_to_fourier(entry["name"], frame,
+                              source="the cell database",
+                              meta=entry.get("meta") or {})
+        key = f"ft:{sid}"
+        picks.append(key)
+        for axis in ("x", "y"):
+            if entry.get(axis) in frame.columns:
+                s[f"ft_{axis}_{key}"] = entry[axis]
+    for key, value in (record.get("settings") or {}).items():
+        if not FT_DB_SKIP.match(key):
+            s[key] = value
+    s["ft_pick"] = picks
+
+
+def ft_cell_box(signals=None, spectra=None):
+    first = (signals or [{}])[0].get("name", "") if signals else ""
+    cell_db_box("fourier",
+                lambda name, notes: ft_db_package(signals, spectra, name,
+                                                  notes),
+                ft_db_restore,
+                default_name=(f"{first.split(' ', 1)[-1]} spectrum"
+                              if first else ""),
+                can_save=bool(signals) and bool(spectra)
+                and spectra[0] is not None)
+
+
 def fourier_tab():
     s = st.session_state
     for key, value in (("ft_kind", ftr.KINDS[0]), ("ft_win", ftr.WINDOWS[0]),
@@ -34170,6 +34730,7 @@ def fourier_tab():
                     "analysis or 📈 Single force curve), add a file on the "
                     "left, or pick one already on 💓 Beat analysis, 📚 Stack "
                     "& compare or 🔗 Series.", icon="〰")
+            ft_cell_box()
             return
         signals = [sig for sig in (ft_signal(k, sources[k])
                                    for k in s["ft_pick"]) if sig is not None]
@@ -34242,6 +34803,7 @@ def fourier_tab():
         d3.download_button("💾 Report (TXT)", text.encode("utf-8"),
                            file_name="fourier_report.txt", mime="text/plain",
                            key="ftb_rep", **STRETCH)
+        ft_cell_box(signals, spectra)
 
 
 with tab_fourier:
@@ -34252,6 +34814,194 @@ with tab_fourier:
                  icon="🚫")
     elif not outdated_notice("fourier.py"):
         fourier_tab()
+
+
+# ================================================================= Cells ==
+#
+# 🗂 Cells: one cell's everything. Every analysis saved in it from any tab
+# (opened again on its own tab from here), its fitted moduli when it has
+# them, the raw files kept with it, and every cell's beat results as one
+# table.
+
+def cells_open_stack(prefix):
+    def open_it(record, fetch):
+        with sc_namespace(SC_PLACES[prefix]):
+            sc_db_restore(record, fetch)
+    return open_it
+
+
+CELL_OPENERS = {"afm": ai_db_restore, "stack": cells_open_stack("stack"),
+                "series": cells_open_stack("series"),
+                "beats": bt_db_restore, "fourier": ft_db_restore,
+                "force": fc_db_restore}
+
+
+def cells_open(cell, kind, item_id):
+    """An item of the cell, back on its own tab."""
+    s = st.session_state
+    store = cell_store()
+    try:
+        record = store.load_item(cell, kind, item_id)
+        if record is None:
+            raise RuntimeError("it is not in OneDrive any more")
+        CELL_OPENERS[kind](record, lambda rel: store.item_file(
+            cell, kind, item_id, rel))
+        s["_cells_note"] = (f"✅ “{record.get('name', item_id)}” is open on "
+                            f"{CELL_KINDS[kind]}: go to that tab.")
+    except Exception as exc:
+        s["_cells_note"] = f"⚠️ Could not open it: {exc}"
+
+
+def cells_add_files(cell):
+    s = st.session_state
+    ups = s.get(f"cellsf_{int(s.get('_cells_upver', 0) or 0)}") or []
+    store = cell_store()
+    if not ups or store is None or not cell:
+        return
+    try:
+        store.add_cell_files(cell, {u.name: u.getvalue() for u in ups})
+        s["_cells_note"] = (f"✅ {len(ups)} file{'s' if len(ups) != 1 else ''}"
+                            f" added to {cell}.")
+        s.pop(f"_cells_files_{cell}", None)
+    except Exception as exc:
+        s["_cells_note"] = f"⚠️ Could not add them: {exc}"
+    s["_cells_upver"] = int(s.get("_cells_upver", 0) or 0) + 1
+
+
+def cells_tab():
+    s = st.session_state
+    h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
+    h1.caption("Everything saved for a cell, from any tab: open any of it "
+               "again on its own tab, add the cell's raw files, and see "
+               "every cell's beat results in one table. Save from each "
+               "tab's 🗄 Cell database box.")
+    with h2:
+        db_status_line("cells")
+    store = cell_store()
+    if store is None:
+        st.info("Connect OneDrive (above) to see the cells.", icon="🗂")
+        return
+    note = s.pop("_cells_note", None)
+    if note:
+        (st.success if note.startswith("✅") else st.warning)(note)
+    p1, p2, p3 = st.columns([3, 0.5, 1.2], vertical_alignment="bottom")
+    with p1:
+        cell = db_cell_picker("cells")
+    if p2.button("🔄", key="cellsb_refresh", help="Read the database again."):
+        db_items(refresh=True)
+        s.pop(f"_cells_files_{cell}", None)
+        st.rerun()
+    items = db_items()
+    if not cell:
+        st.caption("Choose a cell, or name a new one.")
+    else:
+        try:
+            if s.get("_cells_url", (None,))[0] != cell:
+                s["_cells_url"] = (cell, store.cell_url(cell))
+            if s["_cells_url"][1]:
+                p3.link_button("↗ The cell's folder", s["_cells_url"][1],
+                               **STRETCH)
+        except Exception:
+            pass
+        mine = pd.DataFrame()
+        if items is not None and not items.empty and "cell" in items:
+            mine = items[items["cell"].astype(str) == cell]
+        st.markdown(f"#### {cell}")
+        if mine.empty:
+            st.caption("Nothing saved in this cell yet: use 🗄 Cell database "
+                       "at the foot of any analysis tab.")
+        else:
+            shown = mine.copy()
+            shown.insert(0, "Tab", shown["kind"].map(
+                lambda k: CELL_KINDS.get(str(k), str(k))))
+            shown["saved_at"] = shown["saved_at"].astype(str).str[:16] \
+                .str.replace("T", " ")
+            keep = ["Tab", "name", "saved_at", "notes"] + [
+                c for c in shown.columns if c not in (
+                    "Tab", "name", "saved_at", "notes", "item_id", "cell",
+                    "kind", "onedrive_path", "folder_url", "source", "file")
+                and shown[c].notna().any()]
+            st.dataframe(shown[keep].rename(columns={
+                "name": "Name", "saved_at": "Saved", "notes": "Notes"}),
+                hide_index=True, **STRETCH)
+            rows = {f"{r['kind']}|{r['item_id']}": r
+                    for r in mine.to_dict("records")}
+            o1, o2, o3 = st.columns([3, 1.2, 1], vertical_alignment="bottom")
+            o1.selectbox(
+                "Open", list(rows), key="cells_pick",
+                format_func=lambda k: (
+                    f"{CELL_KINDS.get(str(rows[k]['kind']), rows[k]['kind'])}"
+                    f" · {rows[k].get('name')} · "
+                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+            row = rows.get(s.get("cells_pick")) or {}
+            if row:
+                o2.button("📂 Open on its tab", key="cellsb_open",
+                          type="primary", on_click=cells_open,
+                          args=(cell, str(row["kind"]), str(row["item_id"])),
+                          **STRETCH,
+                          help="Puts it back on its own tab, with its data "
+                               "and every setting.")
+                if str(row.get("folder_url") or "").startswith("http"):
+                    o3.link_button("↗ Its folder", row["folder_url"],
+                                   **STRETCH)
+        # its fitted moduli, when the 🧮 Fitting tab saved it
+        if s.get("_cells_fitted") is None:
+            try:
+                s["_cells_fitted"] = store.load_index()
+            except Exception:
+                s["_cells_fitted"] = pd.DataFrame()
+        fitted = s["_cells_fitted"]
+        if fitted is not None and not fitted.empty and "cell_id" in fitted:
+            one = fitted[fitted["cell_id"].astype(str) == cell]
+            if not one.empty:
+                st.markdown("**🧮 Fitted (from the Fitting tab)**")
+                st.dataframe(one.drop(columns=[c for c in (
+                    "onedrive_path", "video_url") if c in one.columns]),
+                    hide_index=True, **STRETCH)
+        st.markdown("**📎 The cell's raw files**")
+        if s.get(f"_cells_files_{cell}") is None:
+            try:
+                s[f"_cells_files_{cell}"] = store.cell_files(cell)
+            except Exception:
+                s[f"_cells_files_{cell}"] = []
+        files = s[f"_cells_files_{cell}"]
+        if files:
+            st.markdown("\n".join(
+                f"- [{f['name']}]({f['url']}) · {f['size'] / 1e6:.2f} MB"
+                if f.get("url") else f"- {f['name']}" for f in files))
+        else:
+            st.caption("None yet.")
+        f1, f2 = st.columns([3, 1], vertical_alignment="bottom")
+        f1.file_uploader("Add files to this cell (images, videos, force "
+                         "files…)", accept_multiple_files=True,
+                         key=f"cellsf_{int(s.get('_cells_upver', 0) or 0)}")
+        f2.button("⬆️ Add them", key="cellsb_add", on_click=cells_add_files,
+                  args=(cell,), **STRETCH)
+    if items is not None and not items.empty and "kind" in items:
+        beats = items[items["kind"].astype(str) == "beats"]
+        if not beats.empty:
+            with st.expander(f"📊 Every cell's beat results ({len(beats)} "
+                             "analyses), one line each"):
+                table = beats.drop(columns=[c for c in (
+                    "kind", "onedrive_path", "item_id") if c in beats])
+                table = table.loc[:, table.notna().any()]
+                st.dataframe(table, hide_index=True, **STRETCH,
+                             column_config={"folder_url": st.column_config
+                                            .LinkColumn("Folder")})
+                st.download_button("💾 This table (CSV)",
+                                   table.to_csv(index=False).encode("utf-8"),
+                                   file_name="beat_results_by_cell.csv",
+                                   mime="text/csv", key="cellsb_beatcsv",
+                                   **STRETCH)
+        st.download_button("💾 Everything saved, every cell (CSV)",
+                           items.to_csv(index=False).encode("utf-8"),
+                           file_name="cell_database.csv", mime="text/csv",
+                           key="cellsb_allcsv")
+
+
+with tab_celldb:
+    section("Cells: everything saved for one cell")
+    cells_tab()
 
 
 # ------------------------------------------------ settings kept offstage --
