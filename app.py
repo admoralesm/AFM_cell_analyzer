@@ -11254,6 +11254,41 @@ def db_cell_picker(where):
     return current
 
 
+def db_who_default():
+    """Who is signed in to the app, when it knows (their name, else their
+    email); '' when it does not."""
+    try:
+        user = st.user
+        for field in ("name", "email"):
+            value = (user.get(field) if hasattr(user, "get")
+                     else getattr(user, field, None))
+            if value and not str(value).endswith("@example.com"):
+                return str(value)
+    except Exception:
+        pass
+    return ""
+
+
+def db_who_typed(where):
+    st.session_state["db_analyst"] = str(
+        st.session_state.get(f"dbwho_{where}") or "").strip()
+
+
+def db_who_box(where):
+    """Who analysed it: one name for the whole app until changed, filled
+    from the sign-in when the app has one. -> the name."""
+    s = st.session_state
+    if s.get("db_analyst") is None:
+        s["db_analyst"] = db_who_default()
+    s[f"dbwho_{where}"] = s["db_analyst"]
+    st.text_input("Analysed by", key=f"dbwho_{where}",
+                  on_change=db_who_typed, args=(where,),
+                  placeholder="your name",
+                  help="Saved with the analysis and shown with it in 🗂 "
+                       "Cells. The same on every tab until changed.")
+    return s["db_analyst"]
+
+
 def db_connect_now():
     st.session_state.pop("_od_tried", None)
     od_connect()
@@ -11287,6 +11322,12 @@ def db_zip(record, files):
         for rel in sorted(files):
             archive.writestr(rel, files[rel])
     return buffer.getvalue()
+
+
+def db_by(row):
+    """' · by A. Morales', or '' when nobody was named."""
+    who = str((row or {}).get("analysed_by") or "").strip()
+    return f" · by {who}" if who and who != "nan" else ""
 
 
 def db_open_item(kind, restore):
@@ -11353,6 +11394,7 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
         with left:
             st.markdown("**☁️ Save to the cell**")
             cell = db_cell_picker(kind)
+            who = db_who_box(kind)
             # named after what is on the tab until a name is typed
             typed = str(s.get(f"dbname_{kind}") or "").strip()
             if not typed or typed == s.get(f"_dbauto_{kind}"):
@@ -11379,7 +11421,7 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
                             cell=cell, kind=kind, name=name, notes=notes,
                             item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
                             saved_at=now.isoformat(timespec="seconds"),
-                            tab=CELL_KINDS[kind])
+                            tab=CELL_KINDS[kind], analysed_by=who)
                         saved = store.save_item(record, files)
                         s["_db_items"] = None
                         st.success(f"✅ Saved “{name}” in {cell}.")
@@ -11399,7 +11441,7 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
                 record.update(cell=cell, kind=kind, name=name, notes=notes,
                               item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
                               saved_at=now.isoformat(timespec="seconds"),
-                              tab=CELL_KINDS[kind])
+                              tab=CELL_KINDS[kind], analysed_by=who)
                 s[f"_dbzipped_{kind}"] = (db_safe(record["item_id"])
                                           + ".zip", db_zip(record, files))
             made = s.pop(f"_dbzipped_{kind}", None)
@@ -11428,7 +11470,8 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
                         f"Saved in {cell}", list(rows), key=f"dbpick_{kind}",
                         format_func=lambda k: (
                             f"{rows[k].get('name') or k} · "
-                            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+                            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"
+                            + db_by(rows[k])))
                 if r2.button("🔄", key=f"dbb_refresh_{kind}",
                              help="Read the database again."):
                     db_items(refresh=True)
@@ -22446,6 +22489,62 @@ def refit_stored_cell(store, cell_id, settings):
 
 
 
+def od_signin(where):
+    """The one-time sign-in that gives the refresh token for the secrets
+    (Microsoft's device code: a code typed at microsoft.com/devicelogin)."""
+    s = st.session_state
+    st.caption("Do this once. It needs client_id in the secrets; "
+               "everything else happens in your browser.")
+    account = s.get("onedrive_account") or "personal"
+    if where != "side":
+        st.selectbox("Account type", list(onedrive_store.ACCOUNTS.keys()),
+                     key=f"od_account_{where}",
+                     index=list(onedrive_store.ACCOUNTS).index(account)
+                     if account in onedrive_store.ACCOUNTS else 0,
+                     format_func=lambda key: onedrive_store.ACCOUNTS[key][
+                         "label"])
+        account = s.get(f"od_account_{where}") or account
+    if st.button("Start sign-in", key=f"od_start_{where}", **STRETCH):
+        try:
+            config = dict(st.secrets.get("onedrive", {}))
+            s["_device_login"] = onedrive_store.begin_device_login(
+                config.get("client_id"), account=account)
+            s["_device_account"] = account
+        except Exception as exc:
+            st.error(str(exc))
+    flow = s.get("_device_login")
+    if flow:
+        st.markdown(
+            f"1. Open **{flow.get('verification_uri', '')}**\n\n"
+            f"2. Enter the code **`{flow.get('user_code', '')}`**\n\n"
+            f"3. Sign in, then press the button below.")
+        if st.button("I have signed in", type="primary",
+                     key=f"od_done_{where}", **STRETCH):
+            try:
+                config = dict(st.secrets.get("onedrive", {}))
+                payload = onedrive_store.poll_device_login(
+                    config.get("client_id"), flow.get("device_code"),
+                    account=s.get("_device_account") or account)
+            except Exception as exc:
+                payload = None
+                st.error(str(exc))
+            if payload is None:
+                st.info("Not signed in yet. Finish in the browser and press "
+                        "again.")
+            else:
+                st.success("Signed in. Copy this into your secrets:")
+                st.code(
+                    "[onedrive]\n"
+                    f'account = "{s.get("_device_account") or account}"\n'
+                    f'client_id = "{dict(st.secrets.get("onedrive", {})).get("client_id", "")}"\n'
+                    f'refresh_token = "{payload.get("refresh_token", "")}"\n'
+                    f'root_folder = "{s.get("onedrive_root") or "AFM cells"}"',
+                    language="toml")
+                st.caption("Paste it into Settings → Secrets (replacing the "
+                           "[onedrive] part), save, reboot. Treat it like a "
+                           "password.")
+
+
 def onedrive_instructions():
     """
     How to get OneDrive working, written out once and shown in two places.
@@ -22494,20 +22593,22 @@ def onedrive_instructions():
         language="toml",
     )
     st.markdown(
-        "**6 · Sign in once, in the sidebar.** Open **☁️ OneDrive database** "
-        "→ pick the account type → **Sign in to get a refresh token** → "
-        "**Start sign-in**. Open the address it shows, type the code, sign "
-        "in, then press **I have signed in**. It hands you a block with a "
-        "`refresh_token` in it.\n\n"
+        "**6 · Sign in once.** In 🗂 Cells (or the sidebar's ☁️ OneDrive "
+        "database): **Sign in to get a refresh token** → pick the account "
+        "type → **Start sign-in**. Open the address it shows, type the "
+        "code, sign in, then press **I have signed in**. It hands you a "
+        "block with a `refresh_token` in it.\n\n"
         "**7 · Paste that block into Secrets**, replacing the one from step "
         "5, and reboot. Treat the refresh token like a password: it is a "
         "standing key to that OneDrive. Never put it in the repository, only "
         "in the Secrets box.\n\n"
-        "**8 · Press Connect.** The sidebar says which account it reached. "
-        "Cells you send arrive in the folder from step 5, one folder each, "
-        "holding `record.json`, `curve.csv`, the morphology frame and the "
-        "video if there is one, with an `index.csv` at the root so this tab "
-        "can list them without opening every folder."
+        "**8 · That is all.** From then on the app connects to OneDrive by "
+        "itself every time it opens (each 🗄 Cell database box says ☁️ "
+        "OneDrive connected), and everything saved goes to the folder from "
+        "step 5: `cells/<the cell>/` with a folder for each tab's analyses "
+        "and one for its raw files, plus `cell_items_index.csv` (and the "
+        "fitted cells' `index.csv`) at the root, so the app lists them "
+        "without opening every folder."
     )
     with st.expander("If it will not connect"):
         st.markdown(
@@ -22983,55 +23084,7 @@ with st.sidebar:
 
             with st.expander("Sign in to get a refresh token",
                              expanded=_has_id and not _has_key):
-                st.caption(
-                    "Do this once. It needs client_id and tenant in secrets; "
-                    "everything else happens in your browser."
-                )
-                if st.button("Start sign-in", **STRETCH):
-                    try:
-                        config = dict(st.secrets.get("onedrive", {}))
-                        flow = onedrive_store.begin_device_login(
-                            config.get("client_id"),
-                            account=st.session_state["onedrive_account"],
-                        )
-                        st.session_state["_device_login"] = flow
-                    except Exception as exc:
-                        st.error(str(exc))
-                flow = st.session_state.get("_device_login")
-                if flow:
-                    st.markdown(
-                        f"1. Open **{flow.get('verification_uri', '')}**\n\n"
-                        f"2. Enter the code **`{flow.get('user_code', '')}`**\n\n"
-                        f"3. Sign in, then press the button below."
-                    )
-                    if st.button("I have signed in", type="primary", **STRETCH):
-                        try:
-                            config = dict(st.secrets.get("onedrive", {}))
-                            payload = onedrive_store.poll_device_login(
-                                config.get("client_id"),
-                                flow.get("device_code"),
-                                account=st.session_state["onedrive_account"],
-                            )
-                        except Exception as exc:
-                            payload = None
-                            st.error(str(exc))
-                        if payload is None:
-                            st.info("Not signed in yet. Finish in the browser "
-                                    "and press again.")
-                        else:
-                            st.success("Signed in. Copy this into your secrets:")
-                            st.code(
-                                "[onedrive]\n"
-                                f'account = "{st.session_state["onedrive_account"]}"\n'
-                                f'client_id = "{dict(st.secrets.get("onedrive", {})).get("client_id", "")}"\n'
-                                f'refresh_token = "{payload.get("refresh_token", "")}"\n'
-                                f'root_folder = "{st.session_state["onedrive_root"] or "AFM cells"}"',
-                                language="toml",
-                            )
-                            st.caption(
-                                "Paste it into Settings → Secrets, reboot, "
-                                "then press Connect. Treat it like a password."
-                            )
+                od_signin("side")
 
     with st.expander("🗄️ Google Sheets (optional mirror)"):
         if SHEETS_IMPORT_ERROR:
@@ -34868,6 +34921,56 @@ def cells_add_files(cell):
     s["_cells_upver"] = int(s.get("_cells_upver", 0) or 0) + 1
 
 
+def cells_backup(store, cell):
+    """💾 Back up: one cell, or everything, from OneDrive as a ZIP to keep
+    somewhere else."""
+    s = st.session_state
+    with st.expander("💾 Back up: download a copy to keep elsewhere"):
+        st.caption("A ZIP laid out as in OneDrive (each analysis's folder "
+                   "with its data, settings and results), to keep on a "
+                   "disk or upload to another drive. Files over 200 MB "
+                   "(long videos) stay out, named in LEFT_OUT.txt; the "
+                   "whole ZIP stops at 800 MB.")
+        b1, b2 = st.columns(2)
+        for col, what, label in ((b1, "cell", f"📦 Back up {cell}"
+                                  if cell else "📦 Back up this cell"),
+                                 (b2, "all", "📦 Back up everything")):
+            if col.button(label, key=f"cellsb_bk_{what}", **STRETCH,
+                          disabled=what == "cell" and not cell,
+                          help="Every cell, the saves before cells and the "
+                               "index tables." if what == "all" else
+                               "Every analysis and raw file of this cell."):
+                status = col.empty()
+                try:
+                    with st.spinner("Reading OneDrive…"):
+                        def tell(rel):
+                            status.caption(f"⬇️ {rel}")
+                        data, left = (store.cell_archive(cell, progress=tell)
+                                      if what == "cell" else
+                                      store.everything_archive(progress=tell))
+                    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
+                    name = (f"{db_safe(cell)} backup {stamp}.zip"
+                            if what == "cell" else
+                            f"AFM cell database backup {stamp}.zip")
+                    s["_cells_backup"] = (what, name, data, left)
+                    status.empty()
+                except Exception as exc:
+                    status.error(f"Could not make the backup: {exc}")
+        made = s.get("_cells_backup")
+        if made:
+            what, name, data, left = made
+            st.download_button(f"⬇️ {name} ({len(data) / 1e6:.1f} MB)", data,
+                               file_name=name, mime="application/zip",
+                               key="cellsb_bkdl", **STRETCH)
+            if left:
+                st.caption(f"{len(left)} file"
+                           f"{'s' if len(left) != 1 else ''} left out (too "
+                           "big): " + ", ".join(left[:5])
+                           + (" …" if len(left) > 5 else ""))
+        st.caption("OneDrive also keeps earlier versions of each file and a "
+                   "recycle bin of what is deleted.")
+
+
 def cells_tab():
     s = st.session_state
     h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
@@ -34879,7 +34982,14 @@ def cells_tab():
         db_status_line("cells")
     store = cell_store()
     if store is None:
-        st.info("Connect OneDrive (above) to see the cells.", icon="🗂")
+        st.info("Connect OneDrive (above) to see the cells. Set up once, it "
+                "connects by itself every time the app opens.", icon="🗂")
+        if onedrive_store is not None:
+            with st.expander("📖 Set up OneDrive as the database, step by "
+                             "step", expanded=not od_configured()):
+                onedrive_instructions()
+            with st.expander("🔑 Sign in to get a refresh token (step 6)"):
+                od_signin("cells")
         return
     note = s.pop("_cells_note", None)
     if note:
@@ -34907,6 +35017,11 @@ def cells_tab():
         if items is not None and not items.empty and "cell" in items:
             mine = items[items["cell"].astype(str) == cell]
         st.markdown(f"#### {cell}")
+        if not mine.empty and "analysed_by" in mine:
+            names = sorted({str(v).strip() for v in mine["analysed_by"]
+                            if str(v).strip() not in ("", "nan", "None")})
+            st.caption("Analysed by: " + (", ".join(names) if names
+                                           else "nobody named yet"))
         if mine.empty:
             st.caption("Nothing saved in this cell yet: use 🗄 Cell database "
                        "at the foot of any analysis tab.")
@@ -34916,13 +35031,17 @@ def cells_tab():
                 lambda k: CELL_KINDS.get(str(k), str(k))))
             shown["saved_at"] = shown["saved_at"].astype(str).str[:16] \
                 .str.replace("T", " ")
-            keep = ["Tab", "name", "saved_at", "notes"] + [
+            if "analysed_by" not in shown:
+                shown["analysed_by"] = ""
+            keep = ["Tab", "name", "analysed_by", "saved_at", "notes"] + [
                 c for c in shown.columns if c not in (
-                    "Tab", "name", "saved_at", "notes", "item_id", "cell",
-                    "kind", "onedrive_path", "folder_url", "source", "file")
+                    "Tab", "name", "analysed_by", "saved_at", "notes",
+                    "item_id", "cell", "kind", "onedrive_path", "folder_url",
+                    "source", "file")
                 and shown[c].notna().any()]
             st.dataframe(shown[keep].rename(columns={
-                "name": "Name", "saved_at": "Saved", "notes": "Notes"}),
+                "name": "Name", "analysed_by": "Analysed by",
+                "saved_at": "Saved", "notes": "Notes"}),
                 hide_index=True, **STRETCH)
             rows = {f"{r['kind']}|{r['item_id']}": r
                     for r in mine.to_dict("records")}
@@ -34932,7 +35051,8 @@ def cells_tab():
                 format_func=lambda k: (
                     f"{CELL_KINDS.get(str(rows[k]['kind']), rows[k]['kind'])}"
                     f" · {rows[k].get('name')} · "
-                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"))
+                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"
+                    + db_by(rows[k])))
             row = rows.get(s.get("cells_pick")) or {}
             if row:
                 o2.button("📂 Open on its tab", key="cellsb_open",
@@ -34977,6 +35097,7 @@ def cells_tab():
                          key=f"cellsf_{int(s.get('_cells_upver', 0) or 0)}")
         f2.button("⬆️ Add them", key="cellsb_add", on_click=cells_add_files,
                   args=(cell,), **STRETCH)
+    cells_backup(store, cell)
     if items is not None and not items.empty and "kind" in items:
         beats = items[items["kind"].astype(str) == "beats"]
         if not beats.empty:
