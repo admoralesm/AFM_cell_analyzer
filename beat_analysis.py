@@ -559,7 +559,7 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
                 colour="#222222", pos_colour=POS_COLOUR,
                 neg_colour=NEG_COLOUR, x_title="x", y_title="y",
                 height=420, line_width=1.4, numbers=True, shade_beats=False,
-                clickable=False, font_size=13):
+                clickable=False, font_size=13, peak_click=False):
     """
     The signal with its baseline and the two lines, each excursion's area
     filled (positive and negative in their colours), its peak marked, each
@@ -602,7 +602,10 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
         name="signal", showlegend=False,
         line=dict(color=colour, width=line_width),
         marker=dict(size=6, opacity=0) if clickable else None,
-        hovertemplate="%{x:.4g}, %{y:.4g}<extra></extra>"))
+        # with peak_click only the peak marks take a click
+        hoverinfo="skip" if peak_click else None,
+        hovertemplate=None if peak_click
+        else "%{x:.4g}, %{y:.4g}<extra></extra>"))
     lo, hi = (float(x.min()), float(x.max())) if x.size else (0.0, 1.0)
     for level, dash, line_colour, name in (
             (base, "solid", "#555555", "baseline"),
@@ -615,6 +618,8 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
             x=[lo, hi], y=[level, level], mode="lines", name=name,
             showlegend=False, hoverinfo="skip",
             line=dict(color=line_colour, width=1.4, dash=dash)))
+    # with peak_click the marks take the mouse (a click on one picks it),
+    # larger, and say so when the mouse is over them
     for sign, symbol, e_colour in ((1, "triangle-up", pos_colour),
                                    (-1, "triangle-down", neg_colour)):
         peaks = [e for e in events if e["sign"] == sign]
@@ -623,15 +628,23 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
                 x=[e["peak_x"] for e in peaks],
                 y=[base + e["peak"] for e in peaks], mode="markers",
                 name="positive peaks" if sign > 0 else "negative peaks",
-                showlegend=False, hoverinfo="skip",
-                marker=dict(symbol=symbol, size=9, color=e_colour,
+                showlegend=False,
+                hoverinfo=None if peak_click else "skip",
+                hovertemplate=("%{x:.4g}: click to remove<extra></extra>"
+                               if peak_click else None),
+                marker=dict(symbol=symbol, size=13 if peak_click else 9,
+                            color=e_colour,
                             line=dict(color="white", width=0.8))))
     if left_out:
         fig.add_trace(go.Scatter(
             x=[e["peak_x"] for e in left_out],
             y=[base + e["peak"] for e in left_out], mode="markers",
-            name="left out", showlegend=False, hoverinfo="skip",
-            marker=dict(symbol="x-thin", size=12, color="#999999",
+            name="left out", showlegend=False,
+            hoverinfo=None if peak_click else "skip",
+            hovertemplate=("%{x:.4g}: removed, click to put back"
+                           "<extra></extra>" if peak_click else None),
+            marker=dict(symbol="x-thin", size=14 if peak_click else 12,
+                        color="#999999",
                         line=dict(color="#999999", width=2))))
     if numbers and beats:
         kind_colour = {KINDS[0]: "#111111", KINDS[1]: pos_colour,
@@ -657,4 +670,6 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
         margin=dict(l=70, r=20, t=30, b=55), hovermode="closest",
         xaxis=dict(title=x_title, **axis), yaxis=dict(title=y_title, **axis),
         font=dict(size=font_size))
+    if peak_click:
+        fig.update_layout(dragmode="zoom", clickmode="event+select")
     return fig
