@@ -11145,12 +11145,25 @@ def db_snapshot(prefixes, skip):
     return out
 
 
-def od_configured():
+def od_config():
+    """The [onedrive] part of the app's secrets ({} when there is none)."""
     try:
-        config = dict(st.secrets.get("onedrive", {}))
+        return dict(st.secrets.get("onedrive", {}))
     except Exception:
-        return False
+        return {}
+
+
+def od_configured():
+    config = od_config()
     return bool(config.get("client_id")) and bool(
+        config.get("refresh_token") or config.get("client_secret"))
+
+
+def od_needs_signin():
+    """The client_id is in the secrets but the sign-in's refresh token is
+    not yet: step 6 is next."""
+    config = od_config()
+    return bool(config.get("client_id")) and not (
         config.get("refresh_token") or config.get("client_secret"))
 
 
@@ -11162,12 +11175,17 @@ def od_connect():
         s["_od_problem"] = (ONEDRIVE_IMPORT_ERROR
                             or "onedrive_store.py did not load")
         return None
+    config = od_config()
+    if config and not config.get("client_id"):
+        s["_od_problem"] = "no client id in Secrets yet: 🗂 Cells, step 1"
+        return None
+    if od_needs_signin():
+        s["_od_problem"] = "the sign-in is not done yet: 🗂 Cells, step 2"
+        return None
     store = onedrive_store.store_from_secrets(st, s.get("onedrive_root")
                                               or None)
     if store is None:
-        s["_od_problem"] = ("the app's secrets have no [onedrive] part: see "
-                            "📖 How to set this up, in the sidebar of the 🧮 "
-                            "Fitting tab")
+        s["_od_problem"] = "not set up yet: 🗂 Cells, 3 steps, done once"
         return None
     try:
         status = store.check()
@@ -22490,13 +22508,15 @@ def refit_stored_cell(store, cell_id, settings):
 
 
 def od_signin(where):
-    """The one-time sign-in that gives the refresh token for the secrets
-    (Microsoft's device code: a code typed at microsoft.com/devicelogin)."""
+    """Step 2, the one-time sign-in that gives the refresh token for the
+    secrets (Microsoft's device code: a code typed at
+    microsoft.com/devicelogin). The account type comes from the secrets;
+    it is asked for only when they do not say. When it works, the block
+    for the secrets is kept in _od_block for step 3 to show."""
     s = st.session_state
-    st.caption("Do this once. It needs client_id in the secrets; "
-               "everything else happens in your browser.")
-    account = s.get("onedrive_account") or "personal"
-    if where != "side":
+    config = od_config()
+    account = config.get("account") or s.get("onedrive_account") or "personal"
+    if not config.get("account"):
         st.selectbox("Account type", list(onedrive_store.ACCOUNTS.keys()),
                      key=f"od_account_{where}",
                      index=list(onedrive_store.ACCOUNTS).index(account)
@@ -22504,45 +22524,105 @@ def od_signin(where):
                      format_func=lambda key: onedrive_store.ACCOUNTS[key][
                          "label"])
         account = s.get(f"od_account_{where}") or account
-    if st.button("Start sign-in", key=f"od_start_{where}", **STRETCH):
-        try:
-            config = dict(st.secrets.get("onedrive", {}))
-            s["_device_login"] = onedrive_store.begin_device_login(
-                config.get("client_id"), account=account)
-            s["_device_account"] = account
-        except Exception as exc:
-            st.error(str(exc))
     flow = s.get("_device_login")
-    if flow:
-        st.markdown(
-            f"1. Open **{flow.get('verification_uri', '')}**\n\n"
-            f"2. Enter the code **`{flow.get('user_code', '')}`**\n\n"
-            f"3. Sign in, then press the button below.")
-        if st.button("I have signed in", type="primary",
-                     key=f"od_done_{where}", **STRETCH):
+    if not flow:
+        if st.button("Start sign-in", type="primary",
+                     key=f"od_start_{where}", **STRETCH):
             try:
-                config = dict(st.secrets.get("onedrive", {}))
-                payload = onedrive_store.poll_device_login(
-                    config.get("client_id"), flow.get("device_code"),
-                    account=s.get("_device_account") or account)
+                s["_device_login"] = onedrive_store.begin_device_login(
+                    config.get("client_id"), account=account)
+                s["_device_account"] = account
             except Exception as exc:
-                payload = None
                 st.error(str(exc))
-            if payload is None:
-                st.info("Not signed in yet. Finish in the browser and press "
-                        "again.")
-            else:
-                st.success("Signed in. Copy this into your secrets:")
-                st.code(
-                    "[onedrive]\n"
-                    f'account = "{s.get("_device_account") or account}"\n'
-                    f'client_id = "{dict(st.secrets.get("onedrive", {})).get("client_id", "")}"\n'
-                    f'refresh_token = "{payload.get("refresh_token", "")}"\n'
-                    f'root_folder = "{s.get("onedrive_root") or "AFM cells"}"',
-                    language="toml")
-                st.caption("Paste it into Settings → Secrets (replacing the "
-                           "[onedrive] part), save, reboot. Treat it like a "
-                           "password.")
+            flow = s.get("_device_login")
+    if not flow:
+        return
+    st.markdown(
+        f"Open **{flow.get('verification_uri', '')}**, enter the code "
+        f"**`{flow.get('user_code', '')}`**, sign in, then press:")
+    if st.button("I have signed in", type="primary", key=f"od_done_{where}",
+                 **STRETCH):
+        try:
+            payload = onedrive_store.poll_device_login(
+                config.get("client_id"), flow.get("device_code"),
+                account=s.get("_device_account") or account)
+        except Exception as exc:
+            payload = None
+            st.error(str(exc))
+        if payload is None:
+            st.info("Not signed in yet. Finish in the browser and press "
+                    "again.")
+        else:
+            s["_od_block"] = (
+                "[onedrive]\n"
+                f'account = "{s.get("_device_account") or account}"\n'
+                f'client_id = "{config.get("client_id", "")}"\n'
+                f'refresh_token = "{payload.get("refresh_token", "")}"\n'
+                f'root_folder = "{config.get("root_folder") or s.get("onedrive_root") or "AFM cells"}"')
+            s["_device_login"] = None
+            st.rerun()
+    if st.button("Start again (new code)", key=f"od_again_{where}"):
+        s["_device_login"] = None
+        st.rerun()
+
+
+def od_register_short():
+    """Step 1 in brief: register the app at Microsoft and put its client id
+    in the secrets."""
+    st.markdown(
+        "1. [portal.azure.com](https://portal.azure.com) → **Microsoft "
+        "Entra ID** → **App registrations** → **New registration**. Account "
+        "types: **any organizational directory and personal Microsoft "
+        "accounts**. Register.\n"
+        "2. **Authentication** → **Allow public client flows** → **Yes** → "
+        "Save.\n"
+        "3. **API permissions** → **Add** → **Microsoft Graph** → "
+        "**Delegated**: `offline_access`, `User.Read`, `Files.ReadWrite`.\n"
+        "4. Copy the **Application (client) ID** from **Overview**. In "
+        "Streamlit: **⋮ → Settings → Secrets**, paste this with your id, "
+        "save, reboot:")
+    st.code('[onedrive]\naccount = "personal"\n'
+            'client_id = "the Application (client) ID"\n'
+            'root_folder = "AFM cells"', language="toml")
+
+
+def od_setup_steps(where):
+    """OneDrive set-up as three steps, ticked off as they are done, with
+    only the next one's instructions shown. The full guide, with every
+    error explained, is folded away under them."""
+    s = st.session_state
+    config = od_config()
+    has_id = bool(config.get("client_id"))
+    has_key = bool(config.get("refresh_token") or config.get("client_secret"))
+    block = s.get("_od_block") if not has_key else None
+
+    def mark(done, now):
+        return "✅" if done else ("👉" if now else "⬜")
+
+    st.markdown("##### ☁️ Set up OneDrive: 3 steps, once\n"
+                "After that the app connects by itself every time it opens.")
+    st.markdown(f"{mark(has_id, not has_id)} **1 · Register the app** and "
+                "put its client id in Secrets")
+    if not has_id:
+        od_register_short()
+    st.markdown(f"{mark(has_key or bool(block), has_id and not has_key and not block)} "
+                "**2 · Sign in once** with your Microsoft account")
+    if has_id and not has_key and not block:
+        od_signin(where)
+    st.markdown(f"{mark(has_key, bool(block))} **3 · Paste the block into "
+                "Secrets** and reboot")
+    if block:
+        st.code(block, language="toml")
+        st.caption("Copy it (icon at its top right). In Streamlit: **⋮ → "
+                   "Settings → Secrets**, delete the old [onedrive] part, "
+                   "paste this, save, then **⋮ → Reboot**. The token is "
+                   "like a password: keep it only in Secrets.")
+    elif has_key:
+        st.warning("All 3 steps are in Secrets, but OneDrive did not answer "
+                   "(the reason is above). The fixes are in the guide "
+                   "below, under *If it will not connect*.")
+    with st.expander("📖 Full guide and fixes"):
+        onedrive_instructions()
 
 
 def onedrive_instructions():
@@ -22593,11 +22673,10 @@ def onedrive_instructions():
         language="toml",
     )
     st.markdown(
-        "**6 · Sign in once.** In 🗂 Cells (or the sidebar's ☁️ OneDrive "
-        "database): **Sign in to get a refresh token** → pick the account "
-        "type → **Start sign-in**. Open the address it shows, type the "
-        "code, sign in, then press **I have signed in**. It hands you a "
-        "block with a `refresh_token` in it.\n\n"
+        "**6 · Sign in once.** In 🗂 Cells, step 2: **Start sign-in**. "
+        "Open the address it shows, type the code, sign in, then press "
+        "**I have signed in**. It hands you a block with a `refresh_token` "
+        "in it.\n\n"
         "**7 · Paste that block into Secrets**, replacing the one from step "
         "5, and reboot. Treat the refresh token like a password: it is a "
         "standing key to that OneDrive. Never put it in the repository, only "
@@ -22622,9 +22701,9 @@ def onedrive_instructions():
             "- **AADSTS65001** · nobody has consented yet. Sign in again, or "
             "ask an administrator for consent on a university tenant.\n"
             "- **The scope was refused** · a personal account takes "
-            "`Files.ReadWrite`, not `Files.ReadWrite.All`. The account-type "
-            "dropdown in the sidebar sets both the endpoint and the scopes, "
-            "so change it there rather than in secrets.\n"
+            "`Files.ReadWrite`, not `Files.ReadWrite.All`. The `account` "
+            "line in Secrets (\"personal\" or \"work\") sets both, so check "
+            "it says the right one, then sign in again.\n"
             "- **It worked and then stopped** · a refresh token expires "
             "after about 90 days unused. Sign in again and paste the new "
             "block.\n"
@@ -23006,85 +23085,13 @@ with st.sidebar:
             with st.expander("📖 The setup steps, for when it does load"):
                 onedrive_instructions()
         else:
-            st.caption(
-                "Storage you already have, and you can authorise it yourself. "
-                "Files go to a folder per cell."
-            )
-            with st.expander("📖 How to set this up, step by step"):
-                onedrive_instructions()
-            st.selectbox(
-                "Account type",
-                list(onedrive_store.ACCOUNTS.keys()),
-                key="onedrive_account",
-                format_func=lambda key: onedrive_store.ACCOUNTS[key]["label"],
-                help="This decides both the sign-in endpoint and the "
-                "permissions asked for, and the two are not interchangeable. "
-                "A personal account does not live in a directory, so it "
-                "cannot sign in against a tenant id, and it uses "
-                "Files.ReadWrite rather than the work-account "
-                "Files.ReadWrite.All.",
-            )
+            # Set-up lives in 🗂 Cells, as three ticked steps; here only
+            # whether it is connected, and the folder.
+            db_status_line("side")
+            if od_store() is None:
+                st.caption("Set it up in the 🗂 Cells tab: 3 steps, done "
+                           "once.")
             st.text_input("Folder for the cells", key="onedrive_root")
-            # Which half of the setup is done. A client_id with no token is
-            # the normal halfway state, and it deserves an instruction
-            # rather than the raw error the token request would raise.
-            try:
-                _od = dict(st.secrets.get("onedrive", {}))
-            except Exception:
-                _od = {}
-            _has_id = bool(_od.get("client_id"))
-            _has_key = bool(_od.get("refresh_token") or _od.get("client_secret"))
-            if _has_id and not _has_key:
-                st.info(
-                    "**One step left.** The client id is in secrets and "
-                    "nobody has signed in with it yet, so there is nothing "
-                    "to connect with. Open **Sign in to get a refresh "
-                    "token** below, press **Start sign-in**, and follow it "
-                    "through; it ends by handing you a block to paste back "
-                    "into Secrets. Pressing Connect before that will always "
-                    "say there are no credentials."
-                )
-
-            if st.button("🔌 Connect to OneDrive", **STRETCH):
-                store = onedrive_store.store_from_secrets(
-                    st, st.session_state["onedrive_root"] or None
-                )
-                if store is not None:
-                    # The picker wins over whatever is in secrets, so the fix
-                    # is one dropdown rather than an edit and a reboot.
-                    store.account = st.session_state["onedrive_account"]
-                    chosen = onedrive_store.settings_for(store.account)
-                    store.tenant = chosen["tenant"]
-                    store.scopes = chosen["scopes"]
-                if store is None:
-                    st.error(
-                        "No [onedrive] section in secrets. Add client_id and "
-                        "tenant, then sign in below to get a refresh token."
-                    )
-                else:
-                    status = store.check()
-                    if status["ok"]:
-                        st.session_state["onedrive_store"] = store
-                        st.success(f"Connected: {status['detail']}")
-                    elif "No OneDrive credentials" in str(status["detail"]):
-                        st.warning(
-                            "Nothing to connect with yet: secrets have the "
-                            "client id but no refresh token. That token "
-                            "comes from **Sign in to get a refresh token** "
-                            "just below — do that first, paste the block it "
-                            "gives you into Secrets, reboot, and then press "
-                            "Connect."
-                        )
-                    else:
-                        st.error(status["detail"])
-            if st.session_state.get("onedrive_store"):
-                st.caption(
-                    f"Connected ✓ · {st.session_state['onedrive_store'].auth_method()}"
-                )
-
-            with st.expander("Sign in to get a refresh token",
-                             expanded=_has_id and not _has_key):
-                od_signin("side")
 
     with st.expander("🗄️ Google Sheets (optional mirror)"):
         if SHEETS_IMPORT_ERROR:
@@ -34982,14 +34989,10 @@ def cells_tab():
         db_status_line("cells")
     store = cell_store()
     if store is None:
-        st.info("Connect OneDrive (above) to see the cells. Set up once, it "
-                "connects by itself every time the app opens.", icon="🗂")
         if onedrive_store is not None:
-            with st.expander("📖 Set up OneDrive as the database, step by "
-                             "step", expanded=not od_configured()):
-                onedrive_instructions()
-            with st.expander("🔑 Sign in to get a refresh token (step 6)"):
-                od_signin("cells")
+            od_setup_steps("cells")
+        else:
+            st.info("Connect OneDrive (above) to see the cells.", icon="🗂")
         return
     note = s.pop("_cells_note", None)
     if note:
