@@ -751,8 +751,8 @@ class OneDriveStore:
     ITEM_FOLDERS = {"afm": "AFM output", "stack": "Stack",
                     "series": "Series", "beats": "Beat analysis",
                     "fourier": "Fourier", "force": "Force curve"}
-    ITEMS_FIRST = ["item_id", "cell", "kind", "name", "saved_at", "notes",
-                   "source", "file"]
+    ITEMS_FIRST = ["item_id", "cell", "kind", "name", "analysed_by",
+                   "saved_at", "notes", "source", "file"]
     ITEMS_LAST = ["onedrive_path", "folder_url"]
 
     def cell_folder(self, cell):
@@ -925,6 +925,55 @@ class OneDriveStore:
 
     def cell_url(self, cell):
         return self.web_url(self.cell_folder(cell))
+
+    # ------------------------------------------------------------ backups
+
+    def walk(self, path, rel=""):
+        """Every file under a folder, depth first: (its path inside the
+        folder, its size, its full path)."""
+        for item in self._children(path):
+            name = item.get("name", "")
+            full, inner = f"{path}/{name}", f"{rel}/{name}".strip("/")
+            if "folder" in item:
+                yield from self.walk(full, inner)
+            else:
+                yield inner, int(item.get("size") or 0), full
+
+    def archive(self, path, max_file=200e6, max_total=800e6, progress=None):
+        """
+        (ZIP bytes, files left out): everything under a folder, as it is
+        laid out there. A file bigger than ``max_file``, or one that would
+        take the ZIP past ``max_total``, stays out (it is still in
+        OneDrive) and is named in LEFT_OUT.txt inside the ZIP.
+        """
+        import zipfile
+
+        buffer, left, total = io.BytesIO(), [], 0
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for rel, size, full in self.walk(path):
+                if size > max_file or total + size > max_total:
+                    left.append(f"{rel} ({size / 1e6:.1f} MB)")
+                    continue
+                archive.writestr(rel, self._download(full))
+                total += size
+                if progress is not None:
+                    progress(rel)
+            if left:
+                archive.writestr(
+                    "LEFT_OUT.txt",
+                    "Too big for this backup ZIP; still in OneDrive:\n"
+                    + "\n".join(left) + "\n")
+        return buffer.getvalue(), left
+
+    def cell_archive(self, cell, **limits):
+        """One cell's folder (every analysis, its files) as a ZIP."""
+        return self.archive(f"{self.cells_folder()}/{safe_name(cell)}",
+                            **limits)
+
+    def everything_archive(self, **limits):
+        """The whole database (every cell, the older saves, the indexes) as
+        a ZIP."""
+        return self.archive(self.ensure_folder(self.root_folder), **limits)
 
     # --------------------------------------------------- beat analyses
 
