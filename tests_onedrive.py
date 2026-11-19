@@ -51,7 +51,12 @@ class FakeGraph:
             base = unquote(url.split("root:/")[1][:-len(":/children")])
             names = {f.split("/")[-1] for f in self.folders
                      if f.rsplit("/", 1)[0] == base and "/" in f}
-            return {"value": [{"name": n, "folder": {}} for n in sorted(names)]}
+            files = {f.split("/")[-1]: data for f, data in self.files.items()
+                     if f.rsplit("/", 1)[0] == base}
+            return {"value": [{"name": n, "folder": {}} for n in sorted(names)]
+                    + [{"name": n, "file": {}, "size": len(d),
+                        "webUrl": f"https://onedrive/{base}/{n}"}
+                       for n, d in sorted(files.items())]}
         if method == "GET" and "root:/" in url:
             from urllib.parse import unquote
             path = unquote(url.split("root:/")[1])
@@ -237,6 +242,56 @@ check("saving it again replaces its line",
 fake.files.pop(store.beat_index_path())
 check("the index is rebuilt from the folders",
       len(store.rebuild_beat_index()) == 2)
+
+print("a cell's own analyses, in its folder")
+fake.calls.clear()
+item = {"item_id": "2026-11-18 164000 Plot 1", "cell": "Cell 7", "kind": "beats",
+        "name": "Plot 1", "saved_at": "2026-11-18T16:40:00", "notes": "day 3",
+        "source": "AFM output analysis", "file": "X1.ibw",
+        "results": {"Full beats": 12, "Energy, all peaks (total) (J)": 6.5e-15},
+        "settings": {"hi": 0.005}}
+saved = store.save_item(item, {"data.csv": "t,F\n0,1\n", "report.txt": "ok"})
+folder = saved["onedrive_path"]
+check("it goes in the cell's folder, under its tab",
+      folder.endswith("cells/Cell 7/Beat analysis/2026-11-18 164000 Plot 1"),
+      folder)
+check("its files beside item.json",
+      f"{folder}/data.csv" in fake.files and f"{folder}/item.json" in fake.files)
+puts = [u for m, u in fake.calls if m == "PUT"]
+check("item.json after the files, the index last",
+      "item.json" in puts[-2] and "cell_items_index.csv" in puts[-1], puts[-3:])
+back = store.load_item("Cell 7", "beats", saved["item_id"])
+check("it comes back, with a file",
+      back is not None and back["settings"] == {"hi": 0.005}
+      and store.item_file("Cell 7", "beats", saved["item_id"], "data.csv")
+      == b"t,F\n0,1\n")
+store.save_item(dict(item, item_id="2026-11-18 170000 Stack", kind="stack",
+                     name="Stack", results={}, saved_at="2026-11-18T17:00"),
+                {"plot.html": "<html/>"})
+store.save_item(dict(item, cell="Cell 8", item_id="x", kind="fourier",
+                     saved_at="2026-11-18T18:00"), {"spectrum.csv": "f,A\n"})
+index = store.load_items_index()
+check("one line each, newest first, results as columns",
+      list(index["cell"]) == ["Cell 8", "Cell 7", "Cell 7"]
+      and list(index["kind"]) == ["fourier", "stack", "beats"]
+      and "Full beats" in index.columns, index[["cell", "kind"]].to_dict("records"))
+store.save_item(dict(item, notes="again"), {"data.csv": "t,F\n"})
+check("saving it again replaces its line", len(store.load_items_index()) == 3)
+check("the cells, from the analyses and the fitted cells",
+      "Cell 7" in store.cell_names() and "Cell 8" in store.cell_names()
+      and "Cell 04/trial 2" in store.cell_names(), store.cell_names())
+fake.files.pop(store.items_index_path())
+check("the index is rebuilt from the folders",
+      len(store.rebuild_items_index()) == 3)
+store.add_cell_files("Cell 7", {"X1.ibw": b"raw", "video.mp4": b"mp4"})
+check("raw files in the cell's Files folder",
+      sorted(f["name"] for f in store.cell_files("Cell 7")) == ["X1.ibw", "video.mp4"]
+      and store.cell_file("Cell 7", "X1.ibw") == b"raw",
+      store.cell_files("Cell 7"))
+try:
+    store.save_item(dict(item, cell=" "), {}); check("a cell is needed", False)
+except od.OneDriveError:
+    check("a cell is needed", True)
 
 print()
 if FAILURES:
