@@ -1380,15 +1380,21 @@ def peak_analysis(x, y, base, min_height, direction="both", min_sep=0.0,
             continue
         stats.append((label, f"{picks.size}"))
         stats.append((f"  amplitude ({name})", _mean_sd(amps) + u))
-        stats.append((f"  largest ({name})", f"{np.max(amps):.4g}{u}"))
+        stats.append((f"  median ({name})", f"{np.median(amps):.4g}{u}"))
+        stats.append((f"  range ({name})",
+                       f"{np.min(amps):.4g} to {np.max(amps):.4g}{u} "
+                       f"(spread {np.ptp(amps):.3g})"))
     every = np.sort(np.concatenate([np.asarray(up, int),
                                     np.asarray(down, int)]))
     if every.size >= 2 and span > 0:
         gaps = np.diff(xs[every])
         per = f" /{x_unit}" if x_unit else " per x unit"
         stats.append(("Rate", f"{every.size / span:.4g}{per}"))
-        stats.append(("Interval", _mean_sd(gaps)
-                      + (f" {x_unit}" if x_unit else "")))
+        xu = f" {x_unit}" if x_unit else ""
+        stats.append(("Interval", _mean_sd(gaps) + xu))
+        stats.append(("  median interval", f"{np.median(gaps):.4g}{xu}"))
+        stats.append(("  interval range", f"{np.min(gaps):.4g} to "
+                                          f"{np.max(gaps):.4g}{xu}"))
     out["stats"] = stats
     return out
 
