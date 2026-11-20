@@ -650,7 +650,8 @@ COMPANION_NEEDS = {
                        "side_fit", "side_line", "bridged", "line_value"),
     "beat_analysis.py": ("excursions", "pair_beats", "beat_table",
                          "summary", "beat_figure", "suggest_thresholds",
-                         "peak_table", "energy_factor", "ENERGY_UNITS"),
+                         "peak_table", "energy_factor", "ENERGY_UNITS",
+                         "describe", "STATS", "peak_power", "seconds_per"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -31804,6 +31805,8 @@ def sc_slot(i, n=3):
         if str(y_name) == str(xcol):
             y_name = f"{y_name} (y)"
         meta = dict((sent or {}).get("meta") or {})
+        if sent is None and not meta.get("file"):
+            meta["file"] = file_name    # the file uploaded in this slot
         if (s.get(f"{SCP}pku{i}") == "Force (nN)"
                 and not force_unit_of(y_name)):
             # its peaks are in force here: the k (and unit) used for that
@@ -33591,9 +33594,10 @@ def bt_report(sid, got):
     y_u = f" {yu}" if yu else ""
     area = f"{yu}·{xu}" if (xu and yu) else ""
     x = got["x"]
-    lines = ["BEAT ANALYSIS", f"Signal: {sets['name']} (from {sets['source']})"]
-    if meta.get("file"):
-        lines.append(f"File: {meta['file']}")
+    lines = ["BEAT ANALYSIS", f"Signal: {sets['name']} (from {sets['source']})",
+             f"File used: {bt_file_used(sid) or 'not known'}"]
+    if meta.get("channel"):
+        lines.append(f"Channel: {meta['channel']}")
     if got["k"]:
         k_from = (meta_said(meta) if meta.get("k") and abs(
             got["k"] - meta["k"]) <= 1e-9 * meta["k"] else "typed here")
@@ -33674,6 +33678,17 @@ def bt_report(sid, got):
     for param, value, unit in bt_results_rows(got):
         lines.append(f"{param}: {bt_neat(value) or '–'}"
                      + (f" {unit}" if unit and unit != "n" else ""))
+    lines += ["", "STATISTICS, all peaks (n: mean ± SD, median "
+              "(min to max), range)"]
+    for param, values, unit in bt_stats_rows(got):
+        d = bta.describe(values)
+        if not d["n"]:
+            continue
+        u = f" {unit}" if unit else ""
+        lines.append(f"{param}: n = {d['n']}: "
+                     f"{bta.mean_sd_range(values, unit)}"
+                     + (f", range {bt_neat(d['Range'])}{u}"
+                        if d["n"] > 1 else ""))
     lines += ["", "UNITS AND HOW"]
     if area:
         lines.append(f"Areas in {area}" + (
@@ -33688,18 +33703,53 @@ def bt_report(sid, got):
                      + ". It equals ∫F dδ with δ = F/k, "
                      "the work of bending the cantilever. A full beat's "
                      "energy is its two peaks' together.")
+        if bta.seconds_per(xu):
+            lines.append("Power of a peak: its energy ÷ its rise time (from "
+                         "leaving the baseline to the peak), in watts "
+                         "(W = J/s). Power, all peaks: the total energy ÷ "
+                         "the recording time.")
+    lines.append("Range: the largest minus the smallest.")
     text = "\n".join(lines)
     tsv = got["table"].to_csv(index=False, sep="\t", float_format="%.6g")
     return text, tsv
 
 
-def bt_results_rows(got):
+def bt_file_used(sid):
+    """The data file this signal was read from (an .ibw, a CSV…), as far
+    as the app knows; '' when it does not (the video, a filter)."""
+    sets = st.session_state["_bt_sets"][sid]
+    meta = sets.get("meta") or {}
+    if meta.get("file"):
+        return str(meta["file"])
+    found = re.match(r"the file (.+)$", str(sets.get("source") or ""))
+    return found.group(1) if found else ""
+
+
+def bt_where_from(sid, got):
+    """📄 One line: the file used, where the signal came from, y and x."""
+    sets = st.session_state["_bt_sets"][sid]
+    source = str(sets.get("source") or "")
+    file = bt_file_used(sid)
+    came = ("uploaded here" if source.startswith("the file ")
+            else f"sent from {source}" if source else "")
+    channel = (got.get("meta") or {}).get("channel")
+    parts = [f"📄 **File:** `{file}`" if file
+             else "📄 **File:** not known", came,
+             f"channel {channel}" if channel else "",
+             f"y: {got['ycol']}" + (f", shown in {got['y_unit']}"
+                                    if got["shown"] else ""),
+             f"x: {got['xcol']}"]
+    return " · ".join(p for p in parts if p)
+
+
+def bt_stats_rows(got):
     """
-    The results as (parameter, value, unit) rows, the same for every
-    signal so they line up as a data sheet: how many beats and peaks of
-    each kind, the peaks' force (height above, depth below the baseline,
-    without sign), their energies and areas without sign (so positive and
-    negative add up), the rate, and the spring constant.
+    The peaks' parameters as (name, values, unit), to give as n, mean,
+    SD, median, min, max and range: heights and depths (without sign),
+    widths, rises, areas (without sign), energies, powers and the time
+    between beats. The same rows for every signal, empty where there is
+    nothing (no k: no energy; x not a time: no power), so the lines of a
+    data sheet line up.
     """
     beats = got["beats"]
     yu, xu = got["y_unit"], got["x_unit"]
@@ -33707,25 +33757,6 @@ def bt_results_rows(got):
     pos = [b["pos"] for b in beats if b["pos"] is not None]
     neg = [b["neg"] for b in beats if b["neg"] is not None]
     full = [b for b in beats if b["kind"] == bta.KINDS[0]]
-
-    def mean(v):
-        return float(np.mean(v)) if len(v) else np.nan
-
-    def sd(v):
-        return float(np.std(v, ddof=1)) if len(v) > 1 else np.nan
-
-    info = got["info"]
-    rows = [("Full beats", info["Full beats"], "n"),
-            ("Positive only", info["Positive only"], "n"),
-            ("Negative only", info["Negative only"], "n"),
-            ("Beats in all", len(beats), "n"),
-            ("Positive peaks", len(pos), "n"),
-            ("Negative peaks", len(neg), "n")]
-    hp, hn = [abs(e["peak"]) for e in pos], [abs(e["peak"]) for e in neg]
-    rows += [("Positive peak height, mean", mean(hp), yu),
-             ("Positive peak height, SD", sd(hp), yu),
-             ("Negative peak depth, mean", mean(hn), yu),
-             ("Negative peak depth, SD", sd(hn), yu)]
     factor, eu = bta.energy_factor(bt_energy_unit())
     k, newtons = got["k"], got["newtons"]
 
@@ -33734,20 +33765,93 @@ def bt_results_rows(got):
             return np.nan
         return bta.spring_energy(abs(e["peak"]), k, newtons) / factor
 
-    ep, en = [energy(e) for e in pos], [energy(e) for e in neg]
-    total = (float(np.sum(ep)) if ep else 0.0) + (float(np.sum(en))
-                                                  if en else 0.0)
-    rows += [("Energy, positive peaks (total)",
-              float(np.sum(ep)) if ep else 0.0, eu),
-             ("Energy, negative peaks (total)",
-              float(np.sum(en)) if en else 0.0, eu),
+    def power(e):
+        value = bta.peak_power(e, k, newtons, xu) if (k and newtons) \
+            else None
+        return np.nan if value is None else value
+
+    times = [(b["pos"] or b["neg"])["peak_x"] for b in beats]
+    return [
+        ("Positive peak height", [abs(e["peak"]) for e in pos], yu),
+        ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
+        ("Positive peak width", [e["width"] for e in pos], xu),
+        ("Negative peak width", [e["width"] for e in neg], xu),
+        ("Positive peak rise (start to peak)",
+         [e["peak_x"] - e["start"] for e in pos], xu),
+        ("Negative peak rise (start to peak)",
+         [e["peak_x"] - e["start"] for e in neg], xu),
+        ("∫ positive peak", [abs(e["area"]) for e in pos], area),
+        ("∫ negative peak (no sign)", [abs(e["area"]) for e in neg], area),
+        ("Energy per positive peak", [energy(e) for e in pos], eu),
+        ("Energy per negative peak", [energy(e) for e in neg], eu),
+        ("Energy per full beat",
+         [energy(b["pos"]) + energy(b["neg"]) for b in full], eu),
+        ("Power per positive peak", [power(e) for e in pos], "W"),
+        ("Power per negative peak", [power(e) for e in neg], "W"),
+        ("Time between beats", list(np.diff(times)) if len(times) > 1
+         else [], xu)]
+
+
+def bt_stats_frame(got):
+    """📊 Statistics: one row per parameter, its n, mean, SD, median,
+    min, max and range (max − min), and its unit."""
+    rows = []
+    for name, values, unit in bt_stats_rows(got):
+        row = {"Parameter": name, "Unit": unit}
+        row.update(bta.describe(values))
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["Parameter", "Unit", *bta.STATS])
+
+
+def bt_recording_s(got):
+    """How long the recording is, in seconds; None when x is not a
+    time."""
+    per = bta.seconds_per(got["x_unit"])
+    x = np.asarray(got["x"], float)
+    x = x[np.isfinite(x)]
+    if not per or x.size < 2:
+        return None
+    return float(x.max() - x.min()) * per
+
+
+def bt_results_rows(got):
+    """
+    The totals as (parameter, value, unit) rows, the same for every
+    signal so they line up as a data sheet: how many beats and peaks of
+    each kind, the energies and areas without sign (so positive and
+    negative add up), the power of them all over the recording, the rate,
+    and the spring constant. Each parameter's mean, SD, median and range
+    are in bt_stats_rows.
+    """
+    beats = got["beats"]
+    yu, xu = got["y_unit"], got["x_unit"]
+    area = f"{yu}·{xu}" if (xu and yu) else ""
+    pos = [b["pos"] for b in beats if b["pos"] is not None]
+    neg = [b["neg"] for b in beats if b["neg"] is not None]
+    info = got["info"]
+    rows = [("Full beats", info["Full beats"], "n"),
+            ("Positive only", info["Positive only"], "n"),
+            ("Negative only", info["Negative only"], "n"),
+            ("Beats in all", len(beats), "n"),
+            ("Positive peaks", len(pos), "n"),
+            ("Negative peaks", len(neg), "n")]
+    factor, eu = bta.energy_factor(bt_energy_unit())
+    k, newtons = got["k"], got["newtons"]
+
+    def energies(side):
+        if not (k and newtons):
+            return np.nan
+        return float(sum(bta.spring_energy(abs(e["peak"]), k, newtons)
+                         for e in side)) / factor
+
+    total = energies(pos + neg)
+    seconds = bt_recording_s(got)
+    rows += [("Energy, positive peaks (total)", energies(pos), eu),
+             ("Energy, negative peaks (total)", energies(neg), eu),
              ("Energy, all peaks (total)", total, eu),
-             ("Energy per positive peak, mean", mean(ep), eu),
-             ("Energy per negative peak, mean", mean(en), eu),
-             ("Energy per full beat, mean",
-              mean([energy(b["pos"]) + energy(b["neg"]) for b in full]), eu)]
-    if not (k and newtons):
-        rows = [(n, np.nan if u == eu else v, u) for n, v, u in rows]
+             ("Power, all peaks (average)",
+              total * factor / seconds if seconds and np.isfinite(total)
+              else np.nan, "W")]
     ap, an = [abs(e["area"]) for e in pos], [abs(e["area"]) for e in neg]
     rows += [("∫ positive peaks (total)", float(np.sum(ap)) if ap else 0.0,
               area),
@@ -33756,11 +33860,12 @@ def bt_results_rows(got):
              ("∫ all peaks (total, no sign)",
               (float(np.sum(ap)) if ap else 0.0)
               + (float(np.sum(an)) if an else 0.0), area)]
-    between = info.get("Time between beats")
+    x = np.asarray(got["x"], float)
+    x = x[np.isfinite(x)]
     rows += [("Beats per minute", info.get("Beat rate (per minute)", np.nan),
               "/min"),
-             ("Time between beats, mean",
-              between[0] if between else np.nan, xu),
+             ("Recording time", float(x.max() - x.min()) if x.size > 1
+              else np.nan, xu),
              ("Spring constant k", k if k else np.nan, "N/m")]
     return rows
 
@@ -33770,13 +33875,30 @@ def bt_results_frame(got):
                         columns=["Parameter", "Value", "Unit"])
 
 
-def bt_results_line(name, got):
+BT_LINE_STATS = ("Mean", "SD", "Median", "Min", "Max", "Range")
+
+
+def bt_results_line(name, got, file=""):
     """The results as one row (a column for each, its unit in its name):
-    a line for a data sheet."""
-    row = {"Signal": name}
+    a line for a data sheet. The signal and its file, the totals, then
+    each parameter's mean, SD, median, min, max and range."""
+    row = {"Signal": name, "File": file}
     for param, value, unit in bt_results_rows(got):
         row[f"{param} ({unit})" if unit and unit != "n" else param] = value
+    for param, values, unit in bt_stats_rows(got):
+        stats = bta.describe(values)
+        u = f" ({unit})" if unit else ""
+        for stat in BT_LINE_STATS:
+            row[f"{param}, {stat.lower()}{u}"] = stats[stat]
     return row
+
+
+def bt_peaks_copy(sid, got):
+    """Each peak kept, with the file it is from first, for a spreadsheet:
+    pasted under another file's peaks they stay told apart."""
+    peaks = got["peaks"].copy()
+    peaks.insert(0, "File", bt_file_used(sid))
+    return peaks
 
 
 def bt_neat(value):
@@ -33794,16 +33916,29 @@ def bt_excel(value):
     return str(value)
 
 
+def bt_tsv(frame, number):
+    """A table as tab-separated text, each number written by ``number``."""
+    lines = ["\t".join(str(c) for c in frame.columns)]
+    for row in frame.itertuples(index=False):
+        lines.append("\t".join(number(v) if isinstance(
+            v, (float, np.floating)) else str(v) for v in row))
+    return "\n".join(lines)
+
+
 def bt_integration(sid, got):
-    """📋 Results: the table of what was found (counts, forces, energies
-    and areas without sign), to read and to copy, then each peak's
-    integral."""
+    """📋 Results: the file used, the totals, each parameter's statistics
+    (n, mean, SD, median, min, max, range), to read and to copy, and each
+    peak to copy."""
     xu, yu = got["x_unit"], got["y_unit"]
     area = f"{yu}·{xu}" if (xu and yu) else "y·x"
     name = st.session_state["_bt_sets"][sid]["name"]
+    file = bt_file_used(sid)
+    head = f"Signal\t{name}\nFile\t{file or 'not known'}\n"
     with st.container(border=True):
         st.markdown("#### 📋 Results")
+        st.markdown(bt_where_from(sid, got))
         frame = bt_results_frame(got)
+        stats = bt_stats_frame(got)
         left, right = st.columns([1.15, 1])
         with left:
             st.dataframe(
@@ -33812,43 +33947,72 @@ def bt_integration(sid, got):
                 height=min(36 * (len(frame) + 1) + 4, 820))
         with right:
             st.caption("Copy with the icon at the top right of a box. "
-                       "Table: for PowerPoint or Word, numbers as they read "
-                       "(5.447 × 10⁻¹⁶). One row: for Excel, numbers it "
-                       "reads as numbers (5.447e-16).")
-            table, line = st.tabs(["Table", "One row (Excel)"])
-            with table:
-                st.code("Parameter\tValue\tUnit\n" + "\n".join(
+                       "Totals and Statistics: for PowerPoint or Word, "
+                       "numbers as they read (5.447 × 10⁻¹⁶). Each peak "
+                       "and One row: for Excel, numbers it reads as "
+                       "numbers (5.447e-16).")
+            t_tot, t_stats, t_peaks, t_line = st.tabs(
+                ["Totals", "Statistics", "Each peak", "One row (Excel)"])
+            with t_tot:
+                st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_neat(v)}\t{u}" for p, v, u in
                     bt_results_rows(got)), language=None, height=380)
-            with line:
-                row = bt_results_line(name, got)
+            with t_stats:
+                st.code(head + bt_tsv(stats, bt_neat), language=None,
+                        height=380)
+                st.caption("Range is the largest minus the smallest; Min "
+                           "and Max are the two ends.")
+            with t_peaks:
+                if got["peaks"].empty:
+                    st.caption("No peak kept.")
+                else:
+                    st.code(bt_tsv(bt_peaks_copy(sid, got), bt_excel),
+                            language=None, height=380)
+                    st.caption("One row per peak kept, its file first, so "
+                               "peaks from several files can share a "
+                               "sheet.")
+            with t_line:
+                row = bt_results_line(name, got, file)
                 st.code("\t".join(row) + "\n" + "\t".join(
                     bt_excel(v) for v in row.values()), language=None,
                     height=140)
                 st.caption("A header and one line: paste the line under "
-                           "the last one in your data sheet.")
-            if not got["shown"]:
-                st.caption("⚡ No energy: y is not a force. Choose its unit "
-                           "under ⚡ Force and energy, on the left.")
-            elif not got["k"]:
-                st.caption("⚡ No energy: type the cantilever's spring "
-                           "constant k under ⚡ Force and energy, on the "
-                           "left.")
-            else:
-                st.caption("Energy of a peak: F²/2k, in joules (J). "
-                           f"Areas: ∫(y − baseline) dt, in {area} (force × "
-                           "time, not an energy), without sign so positive "
-                           "and negative add up.")
+                           "the last one in your data sheet. Every "
+                           "parameter's mean, SD, median, min, max and "
+                           "range are in it too.")
+        st.markdown("##### 📊 Statistics of the peaks")
+        st.dataframe(
+            stats.assign(**{c: stats[c].map(bt_neat)
+                            for c in bta.STATS if c != "n"}),
+            hide_index=True, **STRETCH,
+            height=min(36 * (len(stats) + 1) + 4, 560))
+        if not got["shown"]:
+            st.caption("⚡ No energy or power: y is not a force. Choose its "
+                       "unit under ⚡ Force and energy, on the left.")
+        elif not got["k"]:
+            st.caption("⚡ No energy or power: type the cantilever's spring "
+                       "constant k under ⚡ Force and energy, on the left.")
+        else:
+            st.caption(
+                "Energy of a peak: F²/2k, in joules (J). Power of a peak: "
+                "that energy ÷ its rise time (from leaving the baseline to "
+                "the peak), in watts (W = J/s). Power, all peaks: the "
+                "total energy ÷ the recording time. "
+                + ("" if bta.seconds_per(xu) else
+                   "⚡ No power here: x is not a time in s or ms. ")
+                + f"Areas: ∫(y − baseline) dt, in {area} (force × time, "
+                "not an energy), without sign so positive and negative "
+                "add up.")
         peaks = got["peaks"]
         if not peaks.empty:
-            name = sc_db_safe(st.session_state["_bt_sets"][sid]["name"])
+            safe = sc_db_safe(name)
             st.download_button(
                 "💾 Each peak kept (CSV)",
-                peaks.to_csv(index=False).encode("utf-8"),
-                file_name=f"{name}_peaks.csv", mime="text/csv",
+                bt_peaks_copy(sid, got).to_csv(index=False).encode("utf-8"),
+                file_name=f"{safe}_peaks.csv", mime="text/csv",
                 key=f"btb_int_{sid}", **STRETCH,
-                help="One row per peak kept, its beat, integral and "
-                     "energy, every column with its unit.")
+                help="One row per peak kept, its file, beat, integral, "
+                     "energy and power, every column with its unit.")
 
 
 def bt_figure(got, clickable=False, peak_click=False):
@@ -33895,13 +34059,19 @@ def bt_db_package(sid, got, name, notes=""):
     s = st.session_state
     sets = s["_bt_sets"][sid]
     stamp = datetime.now()
-    results = bt_results_line(name, got)
+    file = bt_file_used(sid)
+    results = bt_results_line(name, got, file)
     results.pop("Signal", None)
+    results.pop("File", None)       # the record's own "file", below
     text, _tsv = bt_report(sid, got)
+    # the file's name kept in meta, so it is still known when reopened
+    meta = dict(got["meta"])
+    if file and not meta.get("file"):
+        meta["file"] = file
     record = {
         "beat_id": f"{stamp:%Y-%m-%d %H%M} {name}", "name": name,
         "saved_at": stamp.isoformat(timespec="seconds"), "notes": notes,
-        "source": sets["source"], "file": got["meta"].get("file", ""),
+        "source": sets["source"], "file": file,
         "signal": sets["name"], "what": "Beat analysis",
         "results": {k: bt_plain(v) if not (isinstance(v, float)
                                            and not np.isfinite(v)) else None
@@ -33909,12 +34079,13 @@ def bt_db_package(sid, got, name, notes=""):
         "settings": {k: bt_plain(s[f"bt_{k}_{sid}"]) for k in BT_DB_SETTINGS
                      if f"bt_{k}_{sid}" in s},
         "removed": bt_plain(list(s.get(f"_bt_out_{sid}") or [])),
-        "meta": dict(got["meta"])}
+        "meta": meta}
     files = {
         "data.csv": sets["frame"].to_csv(index=False),
         "results.csv": bt_results_frame(got).to_csv(index=False),
+        "statistics.csv": bt_stats_frame(got).to_csv(index=False),
         "beats.csv": got["table"].to_csv(index=False),
-        "peaks.csv": got["peaks"].to_csv(index=False),
+        "peaks.csv": bt_peaks_copy(sid, got).to_csv(index=False),
         "report.txt": text,
         "plot.html": bt_figure(got).to_html(include_plotlyjs="cdn")}
     return record, files
@@ -34021,7 +34192,9 @@ def bt_peaks_table(sid, got):
             f"∫, no sign ({yu}·{xu})" if (xu and yu) else "∫, no sign":
                 abs(e["area"]),
             "Energy (J)": (bta.spring_energy(abs(e["peak"]), k, newtons)
-                           if (k and newtons) else np.nan)})
+                           if (k and newtons) else np.nan),
+            "Power (W)": ((bta.peak_power(e, k, newtons, xu) or np.nan)
+                          if (k and newtons) else np.nan)})
         spans.append((e["start"], e["end"], e["peak_x"]))
     kept = sum(r["Keep"] for r in rows)
     with st.expander(f"🔺 Peaks: {kept} kept of {len(rows)} found · untick "
@@ -34033,9 +34206,12 @@ def bt_peaks_table(sid, got):
         frame["Beat"] = frame["Beat"].astype("Int64")
         if not (k and newtons):
             frame = frame.drop(columns=["Energy (J)"])
+        if not (k and newtons and bta.seconds_per(xu)):
+            frame = frame.drop(columns=["Power (W)"])
         key = f"btp_{sid}_{int(s.get('_bt_tab_ver', 0) or 0)}"
         config = {c: st.column_config.NumberColumn(
-            format="%.4e" if c.startswith("Energy") else "%.5g")
+            format="%.4e" if c.startswith(("Energy", "Power"))
+            else "%.5g")
             for c in frame.columns if frame[c].dtype.kind == "f"}
         config["Keep"] = st.column_config.CheckboxColumn(
             "Keep", width="small",
@@ -34046,6 +34222,8 @@ def bt_peaks_table(sid, got):
                        disabled=[c for c in frame.columns if c != "Keep"],
                        on_change=bt_peaks_edited, args=(sid, key, spans),
                        column_config=config)
+        st.caption("To copy the peaks kept: 📋 Results → Each peak, below. "
+                   "Power: the peak's energy ÷ its rise time.")
 
 
 def bt_report_box(sid, got):
@@ -34140,10 +34318,9 @@ def bt_summary_frame(ids):
         if got is None:
             continue
         sets, meta = s["_bt_sets"][sid], got["meta"]
-        row = bt_results_line(sets["name"], got)
+        row = bt_results_line(sets["name"], got, bt_file_used(sid))
         row.update({
-            "From": sets["source"], "File": meta.get("file", ""),
-            "y": got["ycol"], "Force in": got["shown"] or "not a force",
+            "From": sets["source"], "y": got["ycol"], "Force in": got["shown"] or "not a force",
             "k from": (meta_said(meta) if got["k"] and meta.get("k") and abs(
                 got["k"] - meta["k"]) <= 1e-9 * meta["k"] else
                 "typed on Beat analysis" if got["k"] else ""),
