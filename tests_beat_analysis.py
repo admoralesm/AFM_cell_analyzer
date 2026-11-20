@@ -173,6 +173,30 @@ check("…and the energy k·δ²/2",
       < 1e-24, defl["Energy F²/2k (aJ)"][0])
 check("no k, no energy column",
       not any("Energy" in c for c in ba.peak_table(beats, "s", "µN").columns))
+# 0.1 µN on k = 0.1 N/m stores (1e-7)² / 0.2 = 5e-14 J, reached in a rise
+# of 0.5 s: 1e-13 W
+check("each peak's rise and its power, energy ÷ rise, in W",
+      abs(peaks["Rise (start to peak) (s)"][0] - 0.5) < 0.02
+      and abs(peaks["Power, energy ÷ rise (W)"][0] - 1e-13) < 0.05e-13,
+      (peaks["Rise (start to peak) (s)"][0],
+       peaks["Power, energy ÷ rise (W)"][0]))
+check("…the same with x in ms: still W",
+      abs(ba.peak_power({"peak": 0.1, "peak_x": 500.0, "start": 0.0}, 0.1,
+                        1e-6, "ms") - 1e-13) < 1e-18)
+check("no power when x is not a time, or there is no k",
+      "Power, energy ÷ rise (W)" not in ba.peak_table(
+          beats, "frame", "µN", k=0.1, newtons=1e-6).columns
+      and ba.peak_power(beats[0]["pos"], None, 1e-6, "s") is None)
+
+print("median and range")
+d = ba.describe([3.0, 1.0, 2.0, 10.0, None, float("nan")])
+check("n, mean, SD, median, min, max, range of the numbers there",
+      d["n"] == 4 and d["Mean"] == 4.0 and d["Median"] == 2.5
+      and d["Min"] == 1.0 and d["Max"] == 10.0 and d["Range"] == 9.0
+      and abs(d["SD"] - np.std([3, 1, 2, 10], ddof=1)) < 1e-12, d)
+check("one value: no SD; none: n = 0",
+      np.isnan(ba.describe([5.0])["SD"]) and ba.describe([])["n"] == 0
+      and list(ba.describe([1.0])) == list(ba.STATS))
 
 print("beats by kind, every parameter")
 kinds = ba.kind_stats(beats, "s", "µN", k=0.1, newtons=1e-6, e_unit="fJ")
@@ -194,13 +218,18 @@ check("…and the beat's own: duration, time between its peaks, energy",
               - np.mean(full["Positive peak energy"][0])
               - np.mean(full["Negative peak energy"][0])) < 1e-9,
       full["Time between its two peaks"][0])
+check("…and each peak's power, in W",
+      full["Positive peak power (energy ÷ rise)"][1] == "W"
+      and abs(np.mean(full["Positive peak power (energy ÷ rise)"][0])
+              - 1e-13) < 0.05e-13,
+      full.get("Positive peak power (energy ÷ rise)"))
 alone = [n for n, _, _ in by[ba.KINDS[1]]["params"]]
 check("a positive-only beat has only its peak's parameters",
       alone and all(n.startswith("Positive peak") for n in alone), alone)
-check("mean ± SD (range), or the one value",
-      ba.mean_sd_range([1.0, 2.0, 3.0], "nN") == "2 ± 1 nN (1 to 3)"
+check("mean ± SD, median (range), or the one value",
+      ba.mean_sd_range([1.0, 2.0, 6.0], "nN") == "3 ± 2.6 nN, median 2 (1 to 6)"
       and ba.mean_sd_range([5.0], "s") == "5 s"
-      and ba.mean_sd_range([]) == "–")
+      and ba.mean_sd_range([]) == "–", ba.mean_sd_range([1.0, 2.0, 6.0], "nN"))
 
 print("scientific notation for slides")
 check("tiny and huge numbers as × 10ⁿ, others as they are",
@@ -210,7 +239,8 @@ check("tiny and huge numbers as × 10ⁿ, others as they are",
       and ba.pretty(float("nan")) == "",
       [ba.pretty(v) for v in (5.4466e-16, 2.5e7, 544.7, 0.0523)])
 check("…in mean ± SD too", ba.mean_sd_range([5e-16, 6e-16], "J")
-      == "5.5 × 10⁻¹⁶ ± 7.1 × 10⁻¹⁷ J (5 × 10⁻¹⁶ to 6 × 10⁻¹⁶)",
+      == "5.5 × 10⁻¹⁶ ± 7.1 × 10⁻¹⁷ J, median 5.5 × 10⁻¹⁶ "
+         "(5 × 10⁻¹⁶ to 6 × 10⁻¹⁶)",
       ba.mean_sd_range([5e-16, 6e-16], "J"))
 
 print("plot")
