@@ -318,6 +318,22 @@ try:
 except od.OneDriveError:
     check("a cell is needed", True)
 
+print("client id")
+check("a real Application (client) ID, spaces round it or not",
+      od.looks_like_client_id(" 1a2b3c4d-1111-2222-3333-444455556666 "))
+check("the example text, or an id cut short, is not one",
+      not od.looks_like_client_id("the ID from step 2")
+      and not od.looks_like_client_id("1a2b3c4d-1111-2222-3333-44445555666")
+      and not od.looks_like_client_id(None))
+said = ("AADSTS700016: Application with identifier 'the ID from step 2' was "
+        "not found in the directory '9188040d-6c67-4c5b-b112-36a304b66dad'.")
+check("Microsoft sent the example text back: say to replace it",
+      "not an ID" in od.explain(said)
+      and "the ID from step 2" in od.explain(said), od.explain(said))
+check("a real id it does not know: check it, then the account types",
+      "personal Microsoft accounts" in od.explain(said.replace(
+          "the ID from step 2", "1a2b3c4d-1111-2222-3333-444455556666")))
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} failing: {FAILURES}"); sys.exit(1)
