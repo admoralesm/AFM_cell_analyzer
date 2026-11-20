@@ -100,6 +100,36 @@ def force_scale(values):
     return FORCE_PREFIXES[-1]
 
 
+# how many seconds one unit of x is, for a power (energy per second)
+SECONDS = {"s": 1.0, "sec": 1.0, "seconds": 1.0, "ms": 1e-3, "µs": 1e-6,
+           "μs": 1e-6, "us": 1e-6, "min": 60.0, "h": 3600.0}
+
+
+def seconds_per(x_unit):
+    """How many seconds one unit of x is; None when x is not a time."""
+    return SECONDS.get(str(x_unit or "").strip())
+
+
+# the numbers describe() gives, in this order
+STATS = ("n", "Mean", "SD", "Median", "Min", "Max", "Range")
+
+
+def describe(values):
+    """
+    n, mean, SD, median, min, max and range (max − min) of the finite
+    values (None counts as missing), as a dict keyed by STATS. NaN where
+    there is nothing to say: all of them for no values, the SD for one.
+    """
+    v = np.asarray([np.nan if x is None else x for x in values], float)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        return {"n": 0, **{name: np.nan for name in STATS[1:]}}
+    return {"n": int(v.size), "Mean": float(np.mean(v)),
+            "SD": float(np.std(v, ddof=1)) if v.size > 1 else np.nan,
+            "Median": float(np.median(v)), "Min": float(np.min(v)),
+            "Max": float(np.max(v)), "Range": float(np.ptp(v))}
+
+
 def smooth(y, points=1):
     """A running mean over ``points`` points (1: as it is). The ends keep
     their length (the window shrinks there)."""
@@ -287,6 +317,21 @@ def spring_energy(height, k, newtons):
     return force * force / (2.0 * float(k))
 
 
+def peak_power(event, k, newtons, x_unit):
+    """
+    A peak's power, in W (J/s): its spring energy F²/2k over its rise time,
+    from where the signal leaves the baseline to the peak. That is the
+    mean rate at which the cantilever was bent to the peak, i.e. the work
+    done on it per second. None without k, a force, or a time on x.
+    """
+    energy = spring_energy(abs(event["peak"]), k, newtons)
+    per = seconds_per(x_unit)
+    if energy is None or not per:
+        return None
+    rise = (float(event["peak_x"]) - float(event["start"])) * per
+    return energy / rise if rise > 0 else None
+
+
 def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                e_unit=None):
     """
@@ -419,6 +464,7 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                 if b[side] is not None]
     e_factor, e_name = energy_factor(e_unit, energies)
     with_energy = bool(k and newtons)
+    with_power = with_energy and bool(seconds_per(x_unit))
 
     def energy(e):
         return spring_energy(abs(e["peak"]), k, newtons) / e_factor
@@ -447,6 +493,10 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
             if with_energy:
                 params.append((f"{name} energy", [energy(e) for e in peaks],
                                e_name))
+            if with_power:
+                params.append((f"{name} power (energy ÷ rise)",
+                               [peak_power(e, k, newtons, x_unit)
+                                for e in peaks], "W"))
         if these and kind == KINDS[0]:
             params += [
                 ("Time between its two peaks",
@@ -490,8 +540,9 @@ def pretty(value, digits=4):
 
 
 def mean_sd_range(values, unit=""):
-    """'52.1 ± 1.2 nN (50.3 to 54.0)': one value as it is. Very small or
-    large numbers in scientific notation (5.447 × 10⁻¹⁶ J)."""
+    """'52.1 ± 1.2 nN, median 52 (50.3 to 54)': mean ± SD, the median,
+    and the range from the smallest to the largest. One value as it is.
+    Very small or large numbers in scientific notation (5.447 × 10⁻¹⁶ J)."""
     v = np.asarray(values, float)
     v = v[np.isfinite(v)]
     u = f" {unit}" if unit else ""
@@ -499,7 +550,8 @@ def mean_sd_range(values, unit=""):
         return "–"
     if v.size == 1:
         return f"{pretty(v[0])}{u}"
-    return (f"{pretty(np.mean(v))} ± {pretty(np.std(v, ddof=1), 2)}{u} "
+    return (f"{pretty(np.mean(v))} ± {pretty(np.std(v, ddof=1), 2)}{u}, "
+            f"median {pretty(np.median(v))} "
             f"({pretty(np.min(v))} to {pretty(np.max(v))})")
 
 
@@ -513,7 +565,8 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
     baseline to where it comes back. When y is a deflection made a force
     (``newtons`` per unit), the force at the peak and ∫F dx too. With k,
     the energy: ∫F dδ from the baseline to the peak with δ = F/k, which
-    comes to F²/2k.
+    comes to F²/2k; and with x a time, the power: that energy over the
+    rise time (start to peak), in W.
     """
     peaks = []
     for b in beats:
@@ -535,6 +588,7 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                "Beat": b["n"], "Beat kind": b["kind"],
                f"Starts{xu}": e["start"], f"Peaks at{xu}": e["peak_x"],
                f"Ends{xu}": e["end"], f"Width{xu}": e["width"],
+               f"Rise (start to peak){xu}": e["peak_x"] - e["start"],
                f"Height{yu}": e["peak"],
                f"∫(y − baseline) dx ({area_unit})": e["area"]}
         if as_force:
@@ -545,6 +599,10 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
         if k and newtons:
             row[f"Energy F²/2k ({e_name})"] = (
                 energy / e_factor if energy is not None else np.nan)
+            if seconds_per(x_unit):
+                power = peak_power(e, k, newtons, x_unit)
+                row["Power, energy ÷ rise (W)"] = (
+                    power if power is not None else np.nan)
         rows.append(row)
     return pd.DataFrame(rows)
 
