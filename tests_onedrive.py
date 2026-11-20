@@ -1,4 +1,5 @@
 """OneDrive store against a fake Microsoft Graph."""
+import io
 import json, sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -288,6 +289,30 @@ check("raw files in the cell's Files folder",
       sorted(f["name"] for f in store.cell_files("Cell 7")) == ["X1.ibw", "video.mp4"]
       and store.cell_file("Cell 7", "X1.ibw") == b"raw",
       store.cell_files("Cell 7"))
+print("backups")
+data, left = store.cell_archive("Cell 7")
+import zipfile as _zf
+names = sorted(_zf.ZipFile(io.BytesIO(data)).namelist())
+check("a cell's ZIP holds its analyses and raw files, laid out as in OneDrive",
+      "Files/X1.ibw" in names and "Beat analysis/2026-11-18 164000 Plot 1/data.csv"
+      in names and "Beat analysis/2026-11-18 164000 Plot 1/item.json" in names
+      and not left, names)
+data, left = store.cell_archive("Cell 7", max_file=2)
+names = _zf.ZipFile(io.BytesIO(data)).namelist()
+check("files too big stay out and are named",
+      "Files/video.mp4" not in names and "LEFT_OUT.txt" in names
+      and any("video.mp4" in x for x in left), left)
+data, _ = store.everything_archive()
+names = _zf.ZipFile(io.BytesIO(data)).namelist()
+check("everything: every cell, the older saves and the indexes",
+      "cell_items_index.csv" in names and "beats_index.csv" in names
+      and any(n.startswith("cells/Cell 8/") for n in names)
+      and any(n.startswith("stacks/") for n in names), sorted(names)[:8])
+saved = store.save_item(dict(item, item_id="who", analysed_by="A. Morales"),
+                        {"a.csv": "x"})
+check("who analysed it is kept, and is a column of the index",
+      store.load_items_index().set_index("item_id").loc["who", "analysed_by"]
+      == "A. Morales")
 try:
     store.save_item(dict(item, cell=" "), {}); check("a cell is needed", False)
 except od.OneDriveError:
