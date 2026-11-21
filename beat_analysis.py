@@ -124,8 +124,10 @@ def describe(values):
     v = v[np.isfinite(v)]
     if not v.size:
         return {"n": 0, **{name: np.nan for name in STATS[1:]}}
-    return {"n": int(v.size), "Mean": float(np.mean(v)),
-            "SD": float(np.std(v, ddof=1)) if v.size > 1 else np.nan,
+    sd = float(np.std(v, ddof=1)) if v.size > 1 else np.nan
+    if sd < 1e-9 * float(np.max(np.abs(v))):
+        sd = 0.0                    # equal values, but for rounding
+    return {"n": int(v.size), "Mean": float(np.mean(v)), "SD": sd,
             "Median": float(np.median(v)), "Min": float(np.min(v)),
             "Max": float(np.max(v)), "Range": float(np.ptp(v))}
 
@@ -520,10 +522,10 @@ SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 def pretty(value, digits=4):
     """
-    A number as it reads on a slide: 0.0523 or 544.7 as they are, and in
-    scientific notation when very small or large: 5.447 × 10⁻¹⁶ (with real
-    superscripts, so it pastes into PowerPoint or Word as it reads). ''
-    when it is not a number.
+    A number as Excel writes it: 0.0523 or 544.7 as they are, and in
+    scientific notation when very small or large: 5.447E-16, 2.5E+07, so
+    it pastes into Excel as a number (and reads the same anywhere else).
+    '' when it is not a number.
     """
     try:
         v = float(value)
@@ -536,13 +538,13 @@ def pretty(value, digits=4):
     mantissa, exponent = f"{v:.{max(digits - 1, 0)}e}".split("e")
     mantissa = mantissa.rstrip("0").rstrip(".") if "." in mantissa \
         else mantissa
-    return f"{mantissa} × 10{str(int(exponent)).translate(SUPERSCRIPT)}"
+    return f"{mantissa}E{int(exponent):+03d}"
 
 
 def mean_sd_range(values, unit=""):
     """'52.1 ± 1.2 nN, median 52 (50.3 to 54)': mean ± SD, the median,
     and the range from the smallest to the largest. One value as it is.
-    Very small or large numbers in scientific notation (5.447 × 10⁻¹⁶ J)."""
+    Very small or large numbers as Excel writes them (5.447E-16 J)."""
     v = np.asarray(values, float)
     v = v[np.isfinite(v)]
     u = f" {unit}" if unit else ""
