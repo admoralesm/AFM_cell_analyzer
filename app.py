@@ -11160,11 +11160,19 @@ def od_configured():
         config.get("refresh_token") or config.get("client_secret"))
 
 
+def od_client_id_ok(text):
+    """True for an Application (client) ID as Azure shows it (36
+    characters, 1a2b3c4d-1111-2222-3333-444455556666); False for the
+    example text left in place or a half-pasted one."""
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}"
+                             r"[0-9a-fA-F]{12}", str(text or "").strip()))
+
+
 def od_needs_signin():
-    """The client_id is in the secrets but the sign-in's refresh token is
-    not yet: step 6 is next."""
+    """A real client_id is in the secrets but the sign-in's refresh token
+    is not yet: step 2 is next."""
     config = od_config()
-    return bool(config.get("client_id")) and not (
+    return od_client_id_ok(config.get("client_id")) and not (
         config.get("refresh_token") or config.get("client_secret"))
 
 
@@ -11179,6 +11187,10 @@ def od_connect():
     config = od_config()
     if config and not config.get("client_id"):
         s["_od_problem"] = "no client id in Secrets yet: 🗂 Cells, step 1"
+        return None
+    if config and not od_client_id_ok(config.get("client_id")):
+        s["_od_problem"] = ("the client id in Secrets is not an ID: 🗂 "
+                            "Cells, step 1")
         return None
     if od_needs_signin():
         s["_od_problem"] = "the sign-in is not done yet: 🗂 Cells, step 2"
@@ -22583,7 +22595,7 @@ def od_register_short():
         "Streamlit: **⋮ → Settings → Secrets**, paste this with your id, "
         "save, reboot:")
     st.code('[onedrive]\naccount = "personal"\n'
-            'client_id = "the Application (client) ID"\n'
+            'client_id = "PASTE-YOUR-APPLICATION-CLIENT-ID-HERE"\n'
             'root_folder = "AFM cells"', language="toml")
 
 
@@ -22593,7 +22605,8 @@ def od_setup_steps(where):
     error explained, is folded away under them."""
     s = st.session_state
     config = od_config()
-    has_id = bool(config.get("client_id"))
+    typed = str(config.get("client_id") or "").strip()
+    has_id = od_client_id_ok(typed)
     has_key = bool(config.get("refresh_token") or config.get("client_secret"))
     block = s.get("_od_block") if not has_key else None
 
@@ -22604,7 +22617,17 @@ def od_setup_steps(where):
                 "After that the app connects by itself every time it opens.")
     st.markdown(f"{mark(has_id, not has_id)} **1 · Register the app** and "
                 "put its client id in Secrets")
-    if not has_id:
+    if typed and not has_id:
+        st.warning(
+            f"The client_id in Secrets is **\"{typed}\"**, which is not an "
+            "ID (it is example text, or only part of the ID). In Azure, "
+            "open your app registration's **Overview** and copy the "
+            "**Application (client) ID**: 36 characters, like "
+            "`1a2b3c4d-1111-2222-3333-444455556666`. In Streamlit, **⋮ → "
+            "Settings → Secrets**, put it between the quotes of "
+            "client_id in place of the text there, save and reboot.",
+            icon="✋")
+    elif not has_id:
         od_register_short()
     st.markdown(f"{mark(has_key or bool(block), has_id and not has_key and not block)} "
                 "**2 · Sign in once** with your Microsoft account")
@@ -22669,7 +22692,7 @@ def onedrive_instructions():
     st.code(
         '[onedrive]\n'
         'account = "personal"        # or "work"\n'
-        'client_id = "the id from step 2"\n'
+        'client_id = "PASTE-YOUR-APPLICATION-CLIENT-ID-HERE"\n'
         'root_folder = "AFM cells"\n',
         language="toml",
     )
@@ -33175,7 +33198,7 @@ BT_ENERGY = "J"
 
 
 def bt_energy_unit(e_unit=None):
-    """The energy unit: joules for every signal (written × 10ⁿ), so the
+    """The energy unit: joules for every signal (written 5.447E-16), so the
     results compare and add up in one database."""
     return e_unit if e_unit in BT_ENERGY_UNITS[1:] else BT_ENERGY
 
@@ -33772,6 +33795,13 @@ def bt_stats_rows(got):
 
     times = [(b["pos"] or b["neg"])["peak_x"] for b in beats]
     return [
+        # the energy and power first (BT_ENERGY_ROWS), then the shape
+        ("Energy per positive peak", [energy(e) for e in pos], eu),
+        ("Energy per negative peak", [energy(e) for e in neg], eu),
+        ("Energy per full beat",
+         [energy(b["pos"]) + energy(b["neg"]) for b in full], eu),
+        ("Power per positive peak", [power(e) for e in pos], "W"),
+        ("Power per negative peak", [power(e) for e in neg], "W"),
         ("Positive peak height", [abs(e["peak"]) for e in pos], yu),
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
         ("Positive peak width", [e["width"] for e in pos], xu),
@@ -33782,12 +33812,6 @@ def bt_stats_rows(got):
          [e["peak_x"] - e["start"] for e in neg], xu),
         ("∫ positive peak", [abs(e["area"]) for e in pos], area),
         ("∫ negative peak (no sign)", [abs(e["area"]) for e in neg], area),
-        ("Energy per positive peak", [energy(e) for e in pos], eu),
-        ("Energy per negative peak", [energy(e) for e in neg], eu),
-        ("Energy per full beat",
-         [energy(b["pos"]) + energy(b["neg"]) for b in full], eu),
-        ("Power per positive peak", [power(e) for e in pos], "W"),
-        ("Power per negative peak", [power(e) for e in neg], "W"),
         ("Time between beats", list(np.diff(times)) if len(times) > 1
          else [], xu)]
 
@@ -33829,12 +33853,12 @@ def bt_results_rows(got):
     pos = [b["pos"] for b in beats if b["pos"] is not None]
     neg = [b["neg"] for b in beats if b["neg"] is not None]
     info = got["info"]
-    rows = [("Full beats", info["Full beats"], "n"),
-            ("Positive only", info["Positive only"], "n"),
-            ("Negative only", info["Negative only"], "n"),
-            ("Beats in all", len(beats), "n"),
-            ("Positive peaks", len(pos), "n"),
-            ("Negative peaks", len(neg), "n")]
+    counts = [("Positive peaks", len(pos), "n"),
+              ("Negative peaks", len(neg), "n"),
+              ("Full beats", info["Full beats"], "n"),
+              ("Positive only", info["Positive only"], "n"),
+              ("Negative only", info["Negative only"], "n"),
+              ("Beats in all", len(beats), "n")]
     factor, eu = bta.energy_factor(bt_energy_unit())
     k, newtons = got["k"], got["newtons"]
 
@@ -33846,12 +33870,13 @@ def bt_results_rows(got):
 
     total = energies(pos + neg)
     seconds = bt_recording_s(got)
-    rows += [("Energy, positive peaks (total)", energies(pos), eu),
-             ("Energy, negative peaks (total)", energies(neg), eu),
-             ("Energy, all peaks (total)", total, eu),
-             ("Power, all peaks (average)",
-              total * factor / seconds if seconds and np.isfinite(total)
-              else np.nan, "W")]
+    # the energy first, then how many peaks it came from
+    rows = [("Energy, all peaks (total)", total, eu),
+            ("Energy, positive peaks (total)", energies(pos), eu),
+            ("Energy, negative peaks (total)", energies(neg), eu),
+            ("Power, all peaks (average)",
+             total * factor / seconds if seconds and np.isfinite(total)
+             else np.nan, "W")] + counts
     ap, an = [abs(e["area"]) for e in pos], [abs(e["area"]) for e in neg]
     rows += [("∫ positive peaks (total)", float(np.sum(ap)) if ap else 0.0,
               area),
@@ -33902,18 +33927,48 @@ def bt_peaks_copy(sid, got):
 
 
 def bt_neat(value):
-    """A number as it reads (and pastes into PowerPoint): very small or
-    large ones in scientific notation, 5.447 × 10⁻¹⁶."""
+    """A number to read on screen, four figures, very small or large ones
+    as Excel writes them: 5.447E-16."""
     if isinstance(value, (float, np.floating)):
         return bta.pretty(value, 4)
     return str(value)
 
 
 def bt_excel(value):
-    """A number as Excel reads it: 5.447e-16."""
+    """A number to copy into Excel, six figures, as Excel writes it:
+    5.44662E-16. '' for a missing one, so its cell stays empty."""
     if isinstance(value, (float, np.floating)):
-        return "" if not np.isfinite(value) else f"{value:.6g}"
+        return "" if not np.isfinite(value) else f"{value:.6G}"
     return str(value)
+
+
+# the statistics rows about energy, the first of bt_stats_rows
+BT_ENERGY_ROWS = 5
+
+
+def bt_energy_text(sid, got):
+    """
+    ⚡ The energy results alone, to paste into Excel: the signal, its file
+    and k; the total energies, the average power and how many peaks they
+    came from; then the energy and power of a peak and of a full beat,
+    each with n, mean, SD, median, min, max and range.
+    """
+    name = st.session_state["_bt_sets"][sid]["name"]
+    lines = [f"Signal\t{name}",
+             f"File\t{bt_file_used(sid) or 'not known'}",
+             f"Spring constant k\t{bt_excel(got['k']) if got['k'] else ''}"
+             "\tN/m", "", "Energy\tValue\tUnit"]
+    for param, value, unit in bt_results_rows(got):
+        if param.startswith(("Energy", "Power")) or param in (
+                "Positive peaks", "Negative peaks", "Full beats"):
+            lines.append(f"{param}\t{bt_excel(value)}\t{unit}")
+    lines += ["", "Per peak\t" + "\t".join(bta.STATS) + "\tUnit"]
+    for param, values, unit in bt_stats_rows(got)[:BT_ENERGY_ROWS]:
+        d = bta.describe(values)
+        lines.append(param + "\t" + "\t".join(
+            str(d["n"]) if stat == "n" else bt_excel(d[stat])
+            for stat in bta.STATS) + f"\t{unit}")
+    return "\n".join(lines)
 
 
 def bt_tsv(frame, number):
@@ -33946,22 +34001,21 @@ def bt_integration(sid, got):
                 hide_index=True, **STRETCH,
                 height=min(36 * (len(frame) + 1) + 4, 820))
         with right:
-            st.caption("Copy with the icon at the top right of a box. "
-                       "Totals and Statistics: for PowerPoint or Word, "
-                       "numbers as they read (5.447 × 10⁻¹⁶). Each peak "
-                       "and One row: for Excel, numbers it reads as "
-                       "numbers (5.447e-16).")
-            t_tot, t_stats, t_peaks, t_line = st.tabs(
-                ["Totals", "Statistics", "Each peak", "One row (Excel)"])
-            with t_tot:
+            st.caption("Copy with the icon at the top right of a box and "
+                       "paste into Excel: every number is written the way "
+                       "Excel reads it (5.44662E-16).")
+            t_energy, t_all, t_peaks, t_line = st.tabs(
+                ["⚡ Energy", "All results", "Each peak", "One row"])
+            with t_energy:
+                st.code(bt_energy_text(sid, got), language=None, height=380)
+                st.caption("The energies and power only. Range is the "
+                           "largest minus the smallest.")
+            with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
-                    f"{p}\t{bt_neat(v)}\t{u}" for p, v, u in
-                    bt_results_rows(got)), language=None, height=380)
-            with t_stats:
-                st.code(head + bt_tsv(stats, bt_neat), language=None,
-                        height=380)
-                st.caption("Range is the largest minus the smallest; Min "
-                           "and Max are the two ends.")
+                    f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
+                    bt_results_rows(got)) + "\n\n"
+                    + bt_tsv(stats, bt_excel), language=None, height=380)
+                st.caption("The totals, then every parameter's statistics.")
             with t_peaks:
                 if got["peaks"].empty:
                     st.caption("No peak kept.")
@@ -33977,9 +34031,9 @@ def bt_integration(sid, got):
                     bt_excel(v) for v in row.values()), language=None,
                     height=140)
                 st.caption("A header and one line: paste the line under "
-                           "the last one in your data sheet. Every "
-                           "parameter's mean, SD, median, min, max and "
-                           "range are in it too.")
+                           "the last one in your data sheet. The energy "
+                           "comes first, then every parameter's mean, SD, "
+                           "median, min, max and range.")
         st.markdown("##### 📊 Statistics of the peaks")
         st.dataframe(
             stats.assign(**{c: stats[c].map(bt_neat)
@@ -34210,7 +34264,7 @@ def bt_peaks_table(sid, got):
             frame = frame.drop(columns=["Power (W)"])
         key = f"btp_{sid}_{int(s.get('_bt_tab_ver', 0) or 0)}"
         config = {c: st.column_config.NumberColumn(
-            format="%.4e" if c.startswith(("Energy", "Power"))
+            format="scientific" if c.startswith(("Energy", "Power"))
             else "%.5g")
             for c in frame.columns if frame[c].dtype.kind == "f"}
         config["Keep"] = st.column_config.CheckboxColumn(
