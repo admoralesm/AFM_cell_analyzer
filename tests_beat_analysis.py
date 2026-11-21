@@ -194,6 +194,8 @@ check("n, mean, SD, median, min, max, range of the numbers there",
       d["n"] == 4 and d["Mean"] == 4.0 and d["Median"] == 2.5
       and d["Min"] == 1.0 and d["Max"] == 10.0 and d["Range"] == 9.0
       and abs(d["SD"] - np.std([3, 1, 2, 10], ddof=1)) < 1e-12, d)
+check("equal values: SD exactly 0, not a rounding speck",
+      ba.describe([8e-17, 8e-17, 8.000000000000001e-17])["SD"] == 0.0)
 check("one value: no SD; none: n = 0",
       np.isnan(ba.describe([5.0])["SD"]) and ba.describe([])["n"] == 0
       and list(ba.describe([1.0])) == list(ba.STATS))
@@ -232,15 +234,15 @@ check("mean ± SD, median (range), or the one value",
       and ba.mean_sd_range([]) == "–", ba.mean_sd_range([1.0, 2.0, 6.0], "nN"))
 
 print("scientific notation for slides")
-check("tiny and huge numbers as × 10ⁿ, others as they are",
-      ba.pretty(5.4466e-16) == "5.447 × 10⁻¹⁶"
-      and ba.pretty(2.5e7) == "2.5 × 10⁷" and ba.pretty(544.7) == "544.7"
+check("tiny and huge numbers as Excel writes them, others as they are",
+      ba.pretty(5.4466e-16) == "5.447E-16"
+      and ba.pretty(2.5e7) == "2.5E+07" and ba.pretty(544.7) == "544.7"
+      and float(ba.pretty(5.4466e-16)) == 5.447e-16
       and ba.pretty(0.0523) == "0.0523" and ba.pretty(0) == "0"
       and ba.pretty(float("nan")) == "",
       [ba.pretty(v) for v in (5.4466e-16, 2.5e7, 544.7, 0.0523)])
 check("…in mean ± SD too", ba.mean_sd_range([5e-16, 6e-16], "J")
-      == "5.5 × 10⁻¹⁶ ± 7.1 × 10⁻¹⁷ J, median 5.5 × 10⁻¹⁶ "
-         "(5 × 10⁻¹⁶ to 6 × 10⁻¹⁶)",
+      == "5.5E-16 ± 7.1E-17 J, median 5.5E-16 (5E-16 to 6E-16)",
       ba.mean_sd_range([5e-16, 6e-16], "J"))
 
 print("plot")
