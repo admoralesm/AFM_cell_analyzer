@@ -330,6 +330,12 @@ said = ("AADSTS700016: Application with identifier 'the ID from step 2' was "
 check("Microsoft sent the example text back: say to replace it",
       "not an ID" in od.explain(said)
       and "the ID from step 2" in od.explain(said), od.explain(said))
+only_work = ("AADSTS9002332: Application '68c34ad4-269c-4972-9376-8b08855b7061'"
+             "(AFM_cell_analyzer) is configured for use by Azure Active "
+             "Directory users only. Please do not use the /consumers endpoint")
+check("a work-only registration: the manifest change, or account = work",
+      "AzureADandPersonalMicrosoftAccount" in od.explain(only_work)
+      and 'account = "work"' in od.explain(only_work), od.explain(only_work))
 check("a real id it does not know: check it, then the account types",
       "personal Microsoft accounts" in od.explain(said.replace(
           "the ID from step 2", "1a2b3c4d-1111-2222-3333-444455556666")))
