@@ -53,6 +53,7 @@ from __future__ import annotations
 import io
 import json
 import mimetypes
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -110,6 +111,17 @@ def _looks_like_a_directory_id(tenant):
     return len(text) == 36 and text.count("-") == 4
 
 
+_CLIENT_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def looks_like_client_id(text):
+    """True for an Application (client) ID as Azure shows it, 36 characters
+    such as 1a2b3c4d-1111-2222-3333-444455556666; False for an example
+    left in place ('the ID from step 2') or a half-pasted one."""
+    return bool(_CLIENT_ID.fullmatch(str(text or "").strip()))
+
+
 def explain(error_text, account="personal", tenant=None):
     """
     Turn a Microsoft sign-in error into the thing to actually change.
@@ -127,9 +139,35 @@ def explain(error_text, account="personal", tenant=None):
             "from your secrets: a personal account does not live in a "
             "directory and cannot be found in one."
         )
+    if "AADSTS9002332" in text or "Azure Active Directory users only" in text:
+        return (
+            "Microsoft found the app, but its registration accepts work or "
+            "school accounts only, and the secrets say account = "
+            "\"personal\". For a personal OneDrive (outlook, hotmail, live, "
+            "or a Microsoft account made with another email): in Azure, "
+            "open the app → **Manifest**, set `requestedAccessTokenVersion` "
+            "(older manifests: `accessTokenAcceptedVersion`) to **2** and "
+            "save; then set `signInAudience` to "
+            "**\"AzureADandPersonalMicrosoftAccount\"** and save. Wait a "
+            "minute and sign in again. For a university or company OneDrive "
+            "instead: change the secrets to account = \"work\" and reboot."
+        )
+    sent = re.search(r"Application with identifier '([^']*)'", text)
+    if sent and not looks_like_client_id(sent.group(1)):
+        return (
+            f"The client_id in Secrets is **\"{sent.group(1)}\"**, which is "
+            "not an ID: it is the example text. In Azure, open your app "
+            "registration's **Overview**, copy the **Application (client) "
+            "ID** (36 characters, like 1a2b3c4d-1111-2222-3333-"
+            "444455556666), put it in Secrets as client_id in place of the "
+            "example, save and reboot."
+        )
     if "AADSTS700016" in text or "AADSTS50194" in text or "was not found in the directory" in text:
         return (
-            "The app registration does not accept this kind of account. In "
+            "Microsoft does not know this client_id. First check it is the "
+            "**Application (client) ID** from the app's Overview page in "
+            "Azure, copied whole. If it is, the app registration does not "
+            "accept this kind of account. In "
             "Azure, open the app, go to Authentication, and under Supported "
             "account types choose the option that includes **personal "
             "Microsoft accounts**. Registering as single-tenant shuts "
@@ -735,6 +773,245 @@ class OneDriveStore:
                     frame.to_csv(index=False))
         return frame
 
+
+    # ------------------------------------------- a cell's own analyses
+    #
+    # Everything done with one cell, in that cell's folder: each analysis
+    # (an AFM image, a stacked plot, a beat analysis…) in a sub-folder for
+    # its tab, with item.json (every setting) beside its files, and one
+    # line in cell_items_index.csv, so a cell's whole story is one folder
+    # and one filter of one table:
+    #
+    #   <root>/cells/<cell>/Beat analysis/2026-11-18 164000 Plot 1/…
+    #   <root>/cells/<cell>/Files/…            (raw files added by hand)
+    #   <root>/cell_items_index.csv
+
+    ITEM_FOLDERS = {"afm": "AFM output", "stack": "Stack",
+                    "series": "Series", "beats": "Beat analysis",
+                    "fourier": "Fourier", "force": "Force curve"}
+    ITEMS_FIRST = ["item_id", "cell", "kind", "name", "analysed_by",
+                   "saved_at", "notes", "source", "file"]
+    ITEMS_LAST = ["onedrive_path", "folder_url"]
+
+    def cell_folder(self, cell):
+        if not str(cell or "").strip():
+            raise OneDriveError("Name the cell first.")
+        return self.ensure_folder(safe_name(cell), self.cells_folder())
+
+    def items_index_path(self):
+        return f"{self.ensure_folder(self.root_folder)}/cell_items_index.csv"
+
+    def item_row(self, record):
+        """Its line in the index: which cell, what and when, then its
+        results (a column each), then where it is."""
+        row = {key: record.get(key, "") for key in self.ITEMS_FIRST}
+        for key, value in (record.get("results") or {}).items():
+            row[str(key)] = value
+        row.update({key: record.get(key, "") for key in self.ITEMS_LAST})
+        return row
+
+    def _item_folder(self, cell, kind, item_id, make=False):
+        where = self.ITEM_FOLDERS.get(kind, safe_name(kind))
+        if make:
+            return self.ensure_folder(safe_name(item_id), self.ensure_folder(
+                where, self.cell_folder(cell)))
+        return (f"{self.cells_folder()}/{safe_name(cell)}/{where}/"
+                f"{safe_name(item_id)}")
+
+    def save_item(self, record, files):
+        """
+        Write one analysis into its cell's folder: ``record`` names the
+        ``cell``, the ``kind`` (a key of ITEM_FOLDERS) and the ``item_id``;
+        ``files`` maps a path inside its folder to its content. The files
+        go up first, item.json after them, the index line last.
+        """
+        for need in ("cell", "kind", "item_id"):
+            if not str(record.get(need, "")).strip():
+                raise OneDriveError(f"The analysis needs a {need}.")
+        folder = self._item_folder(record["cell"], record["kind"],
+                                   record["item_id"], make=True)
+        self._write_files(folder, files)
+        record = dict(record, cell=str(record["cell"]).strip(),
+                      item_id=safe_name(record["item_id"]),
+                      onedrive_path=folder)
+        record["folder_url"] = self.web_url(folder)
+        self.upload(folder, "item.json",
+                    json.dumps(record, indent=2, default=str))
+        self.append_to_items_index(record)
+        return record
+
+    def load_item(self, cell, kind, item_id):
+        """An analysis's record (item.json), or None."""
+        try:
+            return json.loads(self._download(
+                f"{self._item_folder(cell, kind, item_id)}/item.json")
+                .decode("utf-8"))
+        except OneDriveError:
+            return None
+
+    def item_file(self, cell, kind, item_id, rel):
+        parts = [safe_name(p) for p in str(rel).strip("/").split("/") if p]
+        return self._download(f"{self._item_folder(cell, kind, item_id)}/"
+                              + "/".join(parts))
+
+    def load_items_index(self):
+        """Every analysis saved in a cell, one line each, newest first;
+        empty if there is none."""
+        import pandas as pd
+
+        try:
+            text = self._download(self.items_index_path()).decode("utf-8")
+            frame = pd.read_csv(io.StringIO(text))
+        except Exception:
+            return pd.DataFrame(columns=self.ITEMS_FIRST + self.ITEMS_LAST)
+        if "saved_at" in frame.columns:
+            frame = frame.sort_values("saved_at", ascending=False)
+        return frame.reset_index(drop=True)
+
+    def _put_items_index(self, frame):
+        import pandas as pd
+
+        first = [c for c in self.ITEMS_FIRST if c in frame.columns]
+        last = [c for c in self.ITEMS_LAST if c in frame.columns]
+        middle = [c for c in frame.columns if c not in first + last]
+        frame = pd.DataFrame(frame)[first + middle + last]
+        self.upload(self.ensure_folder(self.root_folder),
+                    "cell_items_index.csv", frame.to_csv(index=False))
+        return frame
+
+    def append_to_items_index(self, record):
+        """Add or replace one analysis's line."""
+        import pandas as pd
+
+        frame = self.load_items_index()
+        row = self.item_row(record)
+        if not frame.empty and {"item_id", "cell", "kind"} <= set(frame):
+            same = ((frame["item_id"].astype(str) == str(row["item_id"]))
+                    & (frame["cell"].astype(str) == str(row["cell"]))
+                    & (frame["kind"].astype(str) == str(row["kind"])))
+            frame = frame[~same]
+        frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+        return self._put_items_index(frame)
+
+    def _children(self, path):
+        try:
+            listing = _request("GET", f"{self._by_path(path)}:/children",
+                               token=self.token())
+        except OneDriveError:
+            return []
+        return listing.get("value", [])
+
+    def rebuild_items_index(self):
+        """Walk every cell's folders and write the index again from each
+        item.json."""
+        import pandas as pd
+
+        rows = []
+        for cell in self._children(self.cells_folder()):
+            if "folder" not in cell:
+                continue
+            for kind, where in self.ITEM_FOLDERS.items():
+                base = f"{self.cells_folder()}/{cell['name']}/{where}"
+                for item in self._children(base):
+                    if "folder" not in item:
+                        continue
+                    try:
+                        record = json.loads(self._download(
+                            f"{base}/{item['name']}/item.json").decode("utf-8"))
+                    except Exception:
+                        continue
+                    rows.append(self.item_row(record))
+        return self._put_items_index(pd.DataFrame(rows))
+
+    def cell_names(self):
+        """Every cell with anything saved: from the analyses' index and
+        the fitted cells' one, sorted."""
+        names = set()
+        frame = self.load_items_index()
+        if "cell" in frame.columns:
+            names |= {str(c) for c in frame["cell"].dropna() if str(c).strip()}
+        try:
+            fitted = self.load_index()
+            if "cell_id" in fitted.columns:
+                names |= {str(c) for c in fitted["cell_id"].dropna()
+                          if str(c).strip()}
+        except Exception:
+            pass
+        return sorted(names, key=str.lower)
+
+    def add_cell_files(self, cell, files):
+        """Raw files (name → content) into the cell's Files folder."""
+        folder = self.ensure_folder("Files", self.cell_folder(cell))
+        for name, content in files.items():
+            self.upload(folder, safe_name(name), content)
+        return folder
+
+    def cell_files(self, cell):
+        """The raw files in a cell's Files folder: [{name, size, url}]."""
+        out = []
+        for item in self._children(f"{self.cells_folder()}/{safe_name(cell)}"
+                                   "/Files"):
+            if "file" in item:
+                out.append({"name": item.get("name", ""),
+                            "size": item.get("size", 0),
+                            "url": item.get("webUrl", "")})
+        return out
+
+    def cell_file(self, cell, name):
+        return self._download(f"{self.cells_folder()}/{safe_name(cell)}/Files/"
+                              f"{safe_name(name)}")
+
+    def cell_url(self, cell):
+        return self.web_url(self.cell_folder(cell))
+
+    # ------------------------------------------------------------ backups
+
+    def walk(self, path, rel=""):
+        """Every file under a folder, depth first: (its path inside the
+        folder, its size, its full path)."""
+        for item in self._children(path):
+            name = item.get("name", "")
+            full, inner = f"{path}/{name}", f"{rel}/{name}".strip("/")
+            if "folder" in item:
+                yield from self.walk(full, inner)
+            else:
+                yield inner, int(item.get("size") or 0), full
+
+    def archive(self, path, max_file=200e6, max_total=800e6, progress=None):
+        """
+        (ZIP bytes, files left out): everything under a folder, as it is
+        laid out there. A file bigger than ``max_file``, or one that would
+        take the ZIP past ``max_total``, stays out (it is still in
+        OneDrive) and is named in LEFT_OUT.txt inside the ZIP.
+        """
+        import zipfile
+
+        buffer, left, total = io.BytesIO(), [], 0
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for rel, size, full in self.walk(path):
+                if size > max_file or total + size > max_total:
+                    left.append(f"{rel} ({size / 1e6:.1f} MB)")
+                    continue
+                archive.writestr(rel, self._download(full))
+                total += size
+                if progress is not None:
+                    progress(rel)
+            if left:
+                archive.writestr(
+                    "LEFT_OUT.txt",
+                    "Too big for this backup ZIP; still in OneDrive:\n"
+                    + "\n".join(left) + "\n")
+        return buffer.getvalue(), left
+
+    def cell_archive(self, cell, **limits):
+        """One cell's folder (every analysis, its files) as a ZIP."""
+        return self.archive(f"{self.cells_folder()}/{safe_name(cell)}",
+                            **limits)
+
+    def everything_archive(self, **limits):
+        """The whole database (every cell, the older saves, the indexes) as
+        a ZIP."""
+        return self.archive(self.ensure_folder(self.root_folder), **limits)
 
     # --------------------------------------------------- beat analyses
 
