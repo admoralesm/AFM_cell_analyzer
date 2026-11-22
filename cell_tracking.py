@@ -368,6 +368,170 @@ def video_info(path):
         capture.release()
 
 
+def _fourcc_text(value):
+    """OpenCV's codec number as its four letters ('avc1', 'MJPG'), or ''."""
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return ""
+    text = "".join(chr((code >> 8 * i) & 0xFF) for i in range(4))
+    return text if text.isprintable() and text.strip() else ""
+
+
+def video_facts(path, stamp_frames=3000):
+    """
+    What a video file says about itself, and what its frames' time stamps
+    say, so the frame rate can be checked before it goes into a measurement
+    or a methods section.
+
+    Returns a dict:
+        name, ext, size_mb, codec, width, height, frame_count
+        header_fps    the frame rate written in the file
+        stamp_fps     the frame rate from the frames' own time stamps, over
+                      the first ``stamp_frames`` (None when they make no
+                      sense); stamp_frames = how many it was measured over
+        stamp_spread  how uneven the time between frames is (SD / mean)
+        fps           the rate the frames are timed at (stamps, else header)
+        duration_s    frame_count / fps
+        notes         [(level, text)], level 'ok', 'warn' or 'info'
+
+    Copies left by a frame-rate conversion are not looked for: in a
+    compressed file a copy differs from the frame before by about as much
+    as a real frame does (the encoder redraws each one), so no reading of
+    the file alone tells them apart. compare_with_original does the check
+    that can be trusted.
+    """
+    import os
+    if cv2 is None:
+        raise RuntimeError(f"OpenCV is not available: {CV2_ERROR}")
+    path = str(path)
+    out = {"name": os.path.basename(path),
+           "ext": os.path.splitext(path)[1].lstrip(".").upper(),
+           "size_mb": os.path.getsize(path) / 1e6
+           if os.path.exists(path) else float("nan")}
+    capture = cv2.VideoCapture(path)
+    if not capture.isOpened():
+        raise RuntimeError("Could not open that video file.")
+    try:
+        header = capture.get(cv2.CAP_PROP_FPS)
+        out.update(
+            codec=_fourcc_text(capture.get(cv2.CAP_PROP_FOURCC)),
+            header_fps=float(header) if header and header > 0 else None,
+            frame_count=int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
+            width=int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            height=int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        # the time stamp of every frame (grab does not decode: fast)
+        stamps = []
+        for _ in range(max(0, min(out["frame_count"] or stamp_frames,
+                                  stamp_frames))):
+            if not capture.grab():
+                break
+            stamps.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
+    finally:
+        capture.release()
+    t = np.asarray(stamps, dtype=np.float64) / 1000.0
+    t = t[np.isfinite(t)]
+    gaps = np.diff(t)
+    out["stamp_fps"], out["stamp_frames"], out["stamp_spread"] = (
+        None, int(t.size), None)
+    if t.size >= 3 and t[-1] > t[0] and np.mean(gaps > 0) > 0.9:
+        out["stamp_fps"] = float((t.size - 1) / (t[-1] - t[0]))
+        positive = gaps[gaps > 0]
+        out["stamp_spread"] = float(np.std(positive) / np.mean(positive))
+    out["fps"] = out["stamp_fps"] or out["header_fps"] or DEFAULT_FPS
+    out["duration_s"] = (out["frame_count"] / out["fps"]
+                         if out["frame_count"] else float("nan"))
+
+    notes = []
+    head, stamp = out["header_fps"], out["stamp_fps"]
+    if head and stamp and abs(stamp - head) > 0.02 * head:
+        notes.append(("warn",
+                      f"The file says {head:.4g} fps, but its frames are "
+                      f"time-stamped {stamp:.4g} per second. It was probably "
+                      "converted or recorded at a variable rate. The "
+                      "automatic analysis times the frames by their time "
+                      "stamps."))
+    elif head and stamp:
+        notes.append(("ok", f"The frame rate written in the file matches "
+                            f"the frames' time stamps: {head:.4g} fps."))
+    elif head:
+        notes.append(("info", f"The file says {head:.4g} fps; its frames "
+                              "carry no usable time stamps to check it."))
+    if out["stamp_spread"] is not None and out["stamp_spread"] > 0.1:
+        notes.append(("warn", "The time between frames is uneven (variable "
+                              "frame rate), as from a phone or screen "
+                              "recording."))
+    if out["ext"] == "AVI":
+        notes.append(("info", "An AVI is usually the camera's original "
+                              "file, so its frame rate is the recording "
+                              "rate."))
+    else:
+        notes.append(("info", "A converted file shows the rate it plays at, "
+                              "which may not be the rate the camera "
+                              "recorded at. Compare it with the original "
+                              "below."))
+    out["notes"] = notes
+    return out
+
+
+def compare_with_original(facts, original_fps=None, original_s=None):
+    """
+    Whether a converted video kept real time, from the original
+    recording's frame rate and length (both shown by the camera software,
+    or for the AVI by Windows file properties, VLC or ffprobe).
+
+    Same length: real time is kept; if the frame rate changed, the
+    converter repeated or dropped pictures, and only the original rate of
+    new pictures was recorded. Different length: the video was re-timed,
+    so it plays faster or slower than real time and every time, rate and
+    speed measured on it is off by that factor. Returns
+    {"level", "text", "speed"} (speed = how many times real time it plays
+    at, None when unknown).
+    """
+    fps, length = facts.get("fps"), facts.get("duration_s")
+    have_fps = bool(original_fps and original_fps > 0)
+    have_s = bool(original_s and original_s > 0)
+    if not (have_fps or have_s):
+        return {"level": "info", "speed": None,
+                "text": "Type the original recording's frame rate and "
+                        "length to check this file against it."}
+    if have_s and length and np.isfinite(length):
+        speed = original_s / length
+        if abs(speed - 1.0) <= 0.02:
+            if have_fps and abs(fps - original_fps) > 0.02 * original_fps:
+                more = fps > original_fps
+                return {"level": "warn", "speed": 1.0, "text": (
+                    f"Real time is kept (both last {length:.4g} s), but the "
+                    f"frame rate changed from {original_fps:.4g} to "
+                    f"{fps:.4g} fps: the converter "
+                    + ("repeated pictures to fill the extra frames, so "
+                       f"there are still only {original_fps:.4g} new "
+                       "pictures per second. Report the original rate."
+                       if more else
+                       "dropped pictures, so detail between them is lost.")
+                    )}
+            return {"level": "ok", "speed": 1.0, "text": (
+                f"Real time is kept: both last {length:.4g} s"
+                + (f" at {fps:.4g} fps." if have_fps else ".")
+                + " Times and speeds measured on this file are right.")}
+        return {"level": "warn", "speed": float(speed), "text": (
+            f"This file lasts {length:.4g} s, but the recording lasted "
+            f"{original_s:.4g} s: it plays at {speed:.3g}× real time. "
+            "Times, durations, beat rates and speeds measured on it are off "
+            f"by that factor. Convert it again keeping the original frame "
+            "rate"
+            + (f" ({original_fps:.4g} fps)" if have_fps else "")
+            + ".")}
+    if abs(fps - original_fps) <= 0.02 * original_fps:
+        return {"level": "ok", "speed": None, "text": (
+            f"Same frame rate as the original ({fps:.4g} fps). Add the "
+            "original's length to check real time is kept.")}
+    return {"level": "warn", "speed": None, "text": (
+        f"The frame rate changed from {original_fps:.4g} to {fps:.4g} fps. "
+        "Add the original's length to tell whether pictures were repeated "
+        "(time kept) or the video was re-timed (time wrong).")}
+
+
 def read_frame(path, index):
     """One BGR frame by index, or None."""
     capture = cv2.VideoCapture(str(path))
