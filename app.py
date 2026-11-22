@@ -8878,6 +8878,111 @@ def motion_info(path, signature):
     return ct.video_info(path)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def motion_facts(path, signature):
+    """The 🎞 video information (format, frames, frame rate from the header
+    and from the frames' time stamps), read once per file."""
+    return ct.video_facts(path)
+
+
+VF_SHOW = {"ok": st.success, "warn": st.warning, "info": st.info}
+
+
+def video_facts_text(facts, verdict, original_fps, original_s):
+    """The video information as plain lines, to copy into notes or a
+    methods section."""
+    lines = [f"Video: {facts['name']}",
+             f"Format: {facts['ext']}"
+             + (f" ({facts['codec']})" if facts.get("codec") else "")
+             + f", {facts['width']} × {facts['height']} pixels, "
+             f"{facts['size_mb']:.3g} MB",
+             f"Frames: {facts['frame_count']:,}, {facts['duration_s']:.4g} s",
+             "Frame rate: "
+             + (f"{facts['header_fps']:.4g} fps (file header)"
+                if facts.get("header_fps") else "not in the file header")
+             + (f"; {facts['stamp_fps']:.4g} fps (frame time stamps)"
+                if facts.get("stamp_fps") else "")]
+    if original_fps or original_s:
+        lines.append("Original recording: "
+                     + ", ".join(p for p in (
+                         f"{original_fps:.4g} fps" if original_fps else "",
+                         f"{original_s:.4g} s" if original_s else "") if p)
+                     + f". {verdict['text']}")
+    return "\n".join(lines)
+
+
+def video_facts_panel(path):
+    """
+    🎞 What the loaded video is: format, picture size, frames, length and
+    frame rate, the rate written in the file checked against the frames'
+    own time stamps. With the original recording's frame rate and length
+    typed in, it says whether a converted file kept real time, or plays
+    faster or slower so that every time measured on it is off. A copyable
+    summary for notes or a methods section.
+    """
+    s = st.session_state
+    if not hasattr(ct, "video_facts"):
+        st.caption("🎞 Upload the latest **cell_tracking.py** to see the "
+                   "video's frame rate and format here.")
+        return
+    try:
+        with st.spinner("Reading the video's frame times…"):
+            facts = motion_facts(path, video_signature())
+    except Exception as exc:
+        st.caption(f"🎞 Could not read the video's details: {exc}")
+        return
+    # the name it was uploaded with, not the copy the app saved
+    facts = dict(facts, name=s.get("video_name") or facts["name"])
+    verdict = ct.compare_with_original(facts, s.get("vf_orig_fps"),
+                                       s.get("vf_orig_s"))
+    warn = verdict["level"] == "warn" or any(
+        level == "warn" for level, _ in facts["notes"])
+    title = (f"🎞 Video information: {facts['ext']} · {facts['fps']:.4g} fps "
+             f"· {facts['frame_count']:,} frames · "
+             f"{facts['duration_s']:.4g} s" + (" · ⚠ check" if warn else ""))
+    with st.expander(title, expanded=warn):
+        left, right = st.columns([1, 1.15])
+        with left:
+            rows = [
+                ("File", facts["name"]),
+                ("Format", facts["ext"] + (f" ({facts['codec']})"
+                                           if facts.get("codec") else "")),
+                ("Picture", f"{facts['width']} × {facts['height']} pixels"),
+                ("Size", f"{facts['size_mb']:.3g} MB"),
+                ("Frames", f"{facts['frame_count']:,}"),
+                ("Length", f"{facts['duration_s']:.4g} s"),
+                ("Frame rate, file header",
+                 f"{facts['header_fps']:.4g} fps" if facts.get("header_fps")
+                 else "not given"),
+                ("Frame rate, frame time stamps",
+                 f"{facts['stamp_fps']:.4g} fps (first "
+                 f"{facts['stamp_frames']:,} frames)"
+                 if facts.get("stamp_fps") else "none usable")]
+            st.dataframe(pd.DataFrame(rows, columns=["", "Value"]),
+                         hide_index=True, **STRETCH)
+        with right:
+            for level, text in facts["notes"]:
+                VF_SHOW.get(level, st.info)(text)
+            st.markdown("**Did the conversion keep real time?**")
+            a, b = st.columns(2)
+            a.number_input("Original frame rate (fps)", min_value=0.0,
+                           value=None, step=0.5, format="%.4g",
+                           key="vf_orig_fps")
+            b.number_input("Original length (s)", min_value=0.0, value=None,
+                           step=1.0, format="%.4g", key="vf_orig_s")
+            VF_SHOW.get(verdict["level"], st.info)(verdict["text"])
+            st.caption("Both are in the camera software, or for the AVI in "
+                       "Windows (right-click → Properties → Details: "
+                       "Length, Frame rate), in VLC (Tools → Media "
+                       "Information → Codec), or with "
+                       "`ffprobe original.avi`.")
+        st.code(video_facts_text(facts, verdict, s.get("vf_orig_fps"),
+                                 s.get("vf_orig_s")), language=None,
+                wrap_lines=True)
+        st.caption("Copy this into your notes or methods with the icon at "
+                   "its top right.")
+
+
 def motion_markers():
     """The four markers as they stand, in video pixels."""
     stored = st.session_state.get("mt_points") or []
@@ -26473,6 +26578,7 @@ with tab_motion:
         if not motion_ok or not details:
             st.info("Upload a video to begin.", icon="🎬")
         else:
+            video_facts_panel(motion_path)
             last = int(details["frame_count"]) - 1
             fps = float(details["fps"])
 
