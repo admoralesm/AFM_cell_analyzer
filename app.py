@@ -652,7 +652,8 @@ COMPANION_NEEDS = {
                          "summary", "beat_figure", "suggest_thresholds",
                          "peak_table", "energy_factor", "ENERGY_UNITS",
                          "describe", "STATS", "peak_power", "seconds_per",
-                         "area_word", "noise_stats"),
+                         "area_word", "noise_stats", "peak_duration",
+                         "rise_time", "recovery_time", "beat_duration"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -33158,6 +33159,7 @@ BT_SHOW_PARTS = {"bt_show_base": "Baseline",
                  "bt_show_lines": "Upper and lower lines",
                  "bt_show_marks": "Peak marks (▲ ▼ ✕)",
                  "bt_show_fill": "Impulse shading under the peaks",
+                 "bt_show_timing": "10% and 90% points (┆)",
                  "bt_show_quiet": "Quiet stretch (grey)",
                  "bt_show_meas": "Measuring points A and B"}
 # the plot's traces each switch hides
@@ -33165,7 +33167,8 @@ BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
                   "bt_show_lines": ("upper line", "lower line"),
                   "bt_show_marks": ("positive peaks", "negative peaks",
                                     "left out"),
-                  "bt_show_fill": ("positive areas", "negative areas")}
+                  "bt_show_fill": ("positive areas", "negative areas"),
+                  "bt_show_timing": ("10% and 90% points",)}
 
 
 def bt_publication_style():
@@ -34326,6 +34329,15 @@ def bt_report(sid, got):
                      + (f", range {bt_neat(d['Range'])}{u}"
                         if d["n"] > 1 else ""))
     lines += ["", "UNITS AND HOW"]
+    lines.append("Durations are read on each peak's height, not where it "
+                 "leaves and meets the baseline (lost in the noise and any "
+                 "slow drift): a peak's duration runs from 10% of its height "
+                 "on the rise to 90% back (10% left) on the fall; its rise "
+                 "from 10% up to the peak; its recovery from the peak to 90% "
+                 "back; its width at half height from 50% up to 50% back. A "
+                 "full beat's duration: its first peak's 10% up to its "
+                 "second's 90% back. Impulses still run from the baseline to "
+                 "the baseline.")
     if area:
         lines.append(
             f"Impulse: the area under each force peak, ∫(F − baseline) dt, "
@@ -34343,7 +34355,7 @@ def bt_report(sid, got):
                      "energy is its two peaks' together.")
         if bta.seconds_per(xu):
             lines.append("Power of a peak: its energy ÷ its rise time (from "
-                         "leaving the baseline to the peak), in watts "
+                         "10% of its height to the peak), in watts "
                          "(W = J/s). Power, all peaks: the total energy ÷ "
                          "the recording time.")
     lines.append("Range: the largest minus the smallest.")
@@ -34381,20 +34393,20 @@ def bt_where_from(sid, got):
 
 
 def bt_beat_duration(beat):
-    """A full beat's duration: from where its first peak leaves the
-    baseline to where its second comes back. With Positive then negative,
-    the positive peak's start to the negative peak's end."""
-    return float(beat["end"] - beat["start"])
+    """A full beat's duration: from its first peak's 10 % up to its second
+    peak's 90 % back. With Positive then negative, the positive peak's
+    10 % up to the negative peak's 90 % back."""
+    return bta.beat_duration(beat)
 
 
 def bt_beat_duration_name(got):
     """The full beat duration's name, saying what it runs between."""
     order = st.session_state.get(f"bt_order_{got['sid']}", bta.ORDERS[0])
-    return ("Full beat duration (positive start to negative end)"
+    return ("Full beat duration (positive 10% up to negative 90% back)"
             if order == bta.ORDERS[0] else
-            "Full beat duration (negative start to positive end)"
+            "Full beat duration (negative 10% up to positive 90% back)"
             if order == bta.ORDERS[1] else
-            "Full beat duration (first peak's start to second's end)")
+            "Full beat duration (first peak 10% up to second 90% back)")
 
 
 def bt_stats_rows(got):
@@ -34439,12 +34451,22 @@ def bt_stats_rows(got):
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
         (bt_beat_duration_name(got), [bt_beat_duration(b) for b in full],
          xu),
-        ("Positive peak duration", [e["width"] for e in pos], xu),
-        ("Negative peak duration", [e["width"] for e in neg], xu),
-        ("Positive peak rise (start to peak)",
-         [e["peak_x"] - e["start"] for e in pos], xu),
-        ("Negative peak rise (start to peak)",
-         [e["peak_x"] - e["start"] for e in neg], xu),
+        ("Positive peak duration (10% up to 90% back)",
+         [bta.peak_duration(e) for e in pos], xu),
+        ("Negative peak duration (10% up to 90% back)",
+         [bta.peak_duration(e) for e in neg], xu),
+        ("Positive peak width at half height",
+         [e.get("half_width", np.nan) for e in pos], xu),
+        ("Negative peak width at half height",
+         [e.get("half_width", np.nan) for e in neg], xu),
+        ("Positive peak rise (10% up to peak)",
+         [bta.rise_time(e) for e in pos], xu),
+        ("Negative peak rise (10% up to peak)",
+         [bta.rise_time(e) for e in neg], xu),
+        ("Positive peak recovery (peak to 90% back)",
+         [bta.recovery_time(e) for e in pos], xu),
+        ("Negative peak recovery (peak to 90% back)",
+         [bta.recovery_time(e) for e in neg], xu),
         (f"{word} per positive peak", [abs(e["area"]) for e in pos], area),
         (f"{word} per negative peak (no sign)",
          [abs(e["area"]) for e in neg], area),
@@ -34683,7 +34705,8 @@ def bt_short(param):
     ⭐ Summary ("Mean force above baseline (impulse ÷ recording time)" →
     "Mean force above baseline"); "(total, no sign)" → "(total)"."""
     param = param.replace("(total, no sign)", "(total)")
-    return re.sub(r" \((?!total\))[^()]*\)$", "", param)
+    # a duration keeps what it runs between: "(10% up to 90% back)"
+    return re.sub(r" \((?!total\))(?![^()]*%)[^()]*\)$", "", param)
 
 
 def bt_impulse_text(sid, got):
@@ -34794,7 +34817,7 @@ def bt_integration(sid, got):
         else:
             st.caption(
                 "Energy of a peak: F²/2k, in joules (J). Power of a peak: "
-                "that energy ÷ its rise time (from leaving the baseline to "
+                "that energy ÷ its rise time (from 10% of its height to "
                 "the peak), in watts (W = J/s). Power, all peaks: the "
                 "total energy ÷ the recording time. "
                 + ("" if bta.seconds_per(xu) else
@@ -35008,7 +35031,8 @@ def bt_peaks_table(sid, got):
             f"At ({xu})" if xu else "At": e["peak_x"],
             f"Height or depth ({yu})" if yu else "Height or depth":
                 abs(e["peak"]),
-            f"Duration ({xu})" if xu else "Duration": e["width"],
+            (f"Duration, 10% up to 90% back ({xu})" if xu
+             else "Duration, 10% up to 90% back"): bta.peak_duration(e),
             (f"Full beat duration ({xu})" if xu else "Full beat duration"):
                 bt_beat_duration(b) if b and b["kind"] == bta.KINDS[0]
                 else np.nan,
@@ -35049,11 +35073,14 @@ def bt_peaks_table(sid, got):
                        on_change=bt_peaks_edited, args=(sid, key, spans),
                        column_config=config)
         st.caption("To copy the peaks kept: 📋 Results → Each peak, below. "
-                   "Full beat duration: from where the beat's first peak "
-                   "leaves the baseline to where its second comes back "
-                   "(Positive then negative: the positive's start to the "
-                   "negative's end). Power: the peak's energy ÷ its rise "
-                   "time.")
+                   "Durations are read on each peak's height, not at the "
+                   "baseline: from 10% of the height on the rise to 90% "
+                   "back (10% left) on the fall, marked ┆ on the plot. "
+                   "Full beat duration: the first peak's 10% up to the "
+                   "second's 90% back (Positive then negative: the "
+                   "positive's 10% up to the negative's 90% back). Power: "
+                   "the peak's energy ÷ its rise time (10% up to the "
+                   "peak).")
 
 
 def bt_report_box(sid, got):
