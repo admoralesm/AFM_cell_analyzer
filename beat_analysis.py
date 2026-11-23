@@ -64,6 +64,13 @@ def is_force(unit):
     return str(unit or "").strip() in NEWTONS
 
 
+def area_word(x_unit, y_unit):
+    """What the area under a peak is called: 'Impulse' for a force against
+    time (force × time, e.g. µN·s), else 'Area' (∫ of y over x)."""
+    return ("Impulse" if is_force(y_unit) and seconds_per(x_unit)
+            else "Area")
+
+
 def energy_scale(values):
     """(factor, unit) that shows these energies (in J) as numbers near 1:
     e.g. (1e-15, 'fJ')."""
@@ -129,7 +136,8 @@ def describe(values):
         sd = 0.0                    # equal values, but for rounding
     return {"n": int(v.size), "Mean": float(np.mean(v)), "SD": sd,
             "Median": float(np.median(v)), "Min": float(np.min(v)),
-            "Max": float(np.max(v)), "Range": float(np.ptp(v))}
+            "Max": float(np.max(v)),
+            "Range": float(np.ptp(v)) if sd else 0.0}
 
 
 def smooth(y, points=1):
@@ -181,6 +189,52 @@ def noise_sd(y, base):
         return 0.0
     mad = float(np.median(np.abs(r)))
     return 1.4826 * mad
+
+
+def noise_stats(x, y, base, start=None, end=None, events=()):
+    """
+    The noise of a signal, measured one of two ways:
+
+    - manually, on a quiet stretch: the points with ``start`` ≤ x ≤ ``end``;
+    - automatically, between the peaks: every point outside the spans
+      (start to end) of ``events``, the peaks found past the lines. With
+      fewer than 10 such points, all of them.
+
+    Returns None when there are fewer than 3 points, else a dict: ``n``
+    points, ``x0``/``x1`` the stretch used, ``sd`` (about its own mean),
+    ``robust_sd`` (1.4826 × the median absolute deviation from its median,
+    unmoved by a stray spike), ``rms`` (about the baseline), ``p2p`` (peak
+    to peak, largest minus smallest), ``offset`` (its mean minus the
+    baseline: how far the baseline sits from the quiet level), and
+    ``noise``, the one to use: the plain SD for a stretch chosen by hand,
+    the robust SD for the automatic one.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    manual = start is not None and end is not None
+    if manual:
+        lo, hi = sorted((float(start), float(end)))
+        keep &= (x >= lo) & (x <= hi)
+    else:
+        between = keep.copy()
+        for e in events or ():
+            between &= ~((x >= e["start"]) & (x <= e["end"]))
+        if between.sum() >= 10:
+            keep = between
+    v, xs = y[keep], x[keep]
+    if v.size < 3:
+        return None
+    median = float(np.median(v))
+    out = {"n": int(v.size), "x0": float(xs.min()), "x1": float(xs.max()),
+           "sd": float(np.std(v, ddof=1)),
+           "robust_sd": 1.4826 * float(np.median(np.abs(v - median))),
+           "rms": float(np.sqrt(np.mean((v - float(base)) ** 2))),
+           "p2p": float(np.max(v) - np.min(v)),
+           "offset": float(np.mean(v) - float(base)),
+           "manual": bool(manual)}
+    out["noise"] = out["sd"] if manual else out["robust_sd"]
+    return out
 
 
 def suggest_thresholds(y, base, times=5.0):
@@ -346,6 +400,7 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
     xu = f" ({x_unit})" if x_unit else ""
     yu = f" ({y_unit})" if y_unit else ""
     au = f" ({area_unit})"
+    w = area_word(x_unit, y_unit).lower()
     energies = []
     for b in beats:
         for side in ("pos", "neg"):
@@ -368,12 +423,12 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
             f"Duration{xu}": b["end"] - b["start"],
             f"Positive peak{yu}": pos["peak"] if pos else np.nan,
             f"Positive peak at{xu}": pos["peak_x"] if pos else np.nan,
-            f"Positive area{au}": area_pos if pos else np.nan,
+            f"Positive {w}{au}": area_pos if pos else np.nan,
             f"Negative peak{yu}": neg["peak"] if neg else np.nan,
             f"Negative peak at{xu}": neg["peak_x"] if neg else np.nan,
-            f"Negative area{au}": area_neg if neg else np.nan,
-            f"Net area{au}": area_pos + area_neg,
-            f"Total area{au}": abs(area_pos) + abs(area_neg),
+            f"Negative {w}{au}": area_neg if neg else np.nan,
+            f"Net {w}{au}": area_pos + area_neg,
+            f"Total {w}{au}": abs(area_pos) + abs(area_neg),
             f"Since previous beat{xu}": (at - previous
                                         if previous is not None else np.nan),
         }
@@ -404,13 +459,17 @@ def summary(beats, x_unit="", y_unit="", k=None, newtons=None,
     pos = [b["pos"] for b in beats if b["pos"] is not None]
     neg = [b["neg"] for b in beats if b["neg"] is not None]
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else ""
-    out["Positive area, total"] = (sum(e["area"] for e in pos), area_unit)
-    out["Negative area, total"] = (sum(e["area"] for e in neg), area_unit)
-    out["Net area, total"] = (sum(e["area"] for e in pos + neg), area_unit)
+    w = area_word(x_unit, y_unit)
+    out[f"Positive {w.lower()}, total"] = (sum(e["area"] for e in pos),
+                                           area_unit)
+    out[f"Negative {w.lower()}, total"] = (sum(e["area"] for e in neg),
+                                           area_unit)
+    out[f"Net {w.lower()}, total"] = (sum(e["area"] for e in pos + neg),
+                                      area_unit)
     full = [b for b in beats if b["kind"] == KINDS[0]]
     per_beat = [b["pos"]["area"] - b["neg"]["area"] for b in full]
     if per_beat:
-        out["Total area per full beat"] = (
+        out[f"Total {w.lower()} per full beat"] = (
             float(np.mean(per_beat)),
             float(np.std(per_beat, ddof=1)) if len(per_beat) > 1 else 0.0,
             area_unit)
@@ -461,6 +520,7 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
     negative peak's adds to a positive one's.
     """
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else ""
+    w = area_word(x_unit, y_unit)
     energies = [spring_energy(abs(b[side]["peak"]), k, newtons)
                 for b in beats for side in ("pos", "neg")
                 if b[side] is not None]
@@ -485,12 +545,13 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                 continue
             params += [
                 (f"{name} {size}", [abs(e["peak"]) for e in peaks], y_unit),
-                (f"{name} width", [e["width"] for e in peaks], x_unit),
+                (f"{name} duration", [e["width"] for e in peaks], x_unit),
                 (f"{name} rise (start to peak)",
                  [e["peak_x"] - e["start"] for e in peaks], x_unit),
                 (f"{name} fall (peak to end)",
                  [e["end"] - e["peak_x"] for e in peaks], x_unit),
-                (f"{name} area" + (" (no sign)" if side == "neg" else ""),
+                (f"{name} {w.lower()}"
+                 + (" (no sign)" if side == "neg" else ""),
                  [abs(e["area"]) for e in peaks], area_unit)]
             if with_energy:
                 params.append((f"{name} energy", [energy(e) for e in peaks],
@@ -504,7 +565,7 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                 ("Time between its two peaks",
                  [abs(b["neg"]["peak_x"] - b["pos"]["peak_x"])
                   for b in these], x_unit),
-                ("Total area (|positive| + |negative|)",
+                (f"Total {w.lower()} (|positive| + |negative|)",
                  [abs(b["pos"]["area"]) + abs(b["neg"]["area"])
                   for b in these], area_unit)]
             if with_energy:
@@ -579,6 +640,10 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
     xu = f" ({x_unit})" if x_unit else ""
     yu = f" ({y_unit})" if y_unit else ""
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else "y·x"
+    # a force against time: its area is an impulse
+    area_col = (f"Impulse ∫(F − baseline) dt ({area_unit})"
+                if area_word(x_unit, y_unit) == "Impulse"
+                else f"∫(y − baseline) dx ({area_unit})")
     as_force = bool(newtons) and not is_force(y_unit)
     f_factor, f_unit = force_scale(
         [abs(e["peak"]) * newtons for e, _ in peaks] if as_force else [])
@@ -589,14 +654,15 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
         row = {"Peak": n, "Sign": "+" if e["sign"] > 0 else "−",
                "Beat": b["n"], "Beat kind": b["kind"],
                f"Starts{xu}": e["start"], f"Peaks at{xu}": e["peak_x"],
-               f"Ends{xu}": e["end"], f"Width{xu}": e["width"],
+               f"Ends{xu}": e["end"], f"Duration{xu}": e["width"],
                f"Rise (start to peak){xu}": e["peak_x"] - e["start"],
                f"Height{yu}": e["peak"],
-               f"∫(y − baseline) dx ({area_unit})": e["area"]}
+               area_col: e["area"]}
         if as_force:
             row[f"Force at the peak ({f_unit})"] = (
                 e["peak"] * newtons / f_factor)
-            row[f"∫F dx ({f_unit}·{x_unit or 'x'})"] = (
+            row[(f"Impulse ∫F dt ({f_unit}·{x_unit})" if seconds_per(x_unit)
+                 else f"∫F dx ({f_unit}·{x_unit or 'x'})")] = (
                 e["area"] * newtons / f_factor)
         if k and newtons:
             row[f"Energy F²/2k ({e_name})"] = (
