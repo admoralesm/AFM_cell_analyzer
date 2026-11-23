@@ -651,7 +651,8 @@ COMPANION_NEEDS = {
     "beat_analysis.py": ("excursions", "pair_beats", "beat_table",
                          "summary", "beat_figure", "suggest_thresholds",
                          "peak_table", "energy_factor", "ENERGY_UNITS",
-                         "describe", "STATS", "peak_power", "seconds_per"),
+                         "describe", "STATS", "peak_power", "seconds_per",
+                         "area_word", "noise_stats"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -33140,9 +33141,10 @@ with tab_series:
 
 # what the mouse does on the beat plot: zoom (and a click on a ▲ ▼
 # removes that peak, on a ✕ puts it back), box peaks away, or drag a line
-BT_MOUSE = ("🔍 Zoom · click a peak to remove it", "🗑 Box over peaks",
-            "━ Baseline", "━ Upper line", "━ Lower line")
-BT_ZOOM, BT_BOX, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
+# short, so all six fit on one row; the ⓘ help says what each does
+BT_MOUSE = ("🔍 Zoom", "🗑 Box peaks", "🔇 Quiet part", "━ Baseline",
+            "━ Upper", "━ Lower")
+BT_ZOOM, BT_BOX, BT_QUIET, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
 BT_MARKS = ("positive peaks", "negative peaks", "left out")
 # what y is shown in: a force in N, µN or nN (Best fit: whichever reads
 # best), or not a force at all
@@ -33353,7 +33355,17 @@ def bt_analyse(sid, e_unit=None):
                        per_minute=BT_PER_MINUTE.get(x_unit), e_unit=e_unit)
     peaks = bta.peak_table(beats, x_unit, y_unit, k=k, newtons=newtons,
                            e_unit=e_unit)
+    # the noise: automatically between the peaks, and by hand on a quiet
+    # stretch when one is given (that one is then used)
+    nz0, nz1 = s.get(key("nz0")), s.get(key("nz1"))
+    noise_auto = bta.noise_stats(x, ys, base, events=events)
+    noise_manual = (bta.noise_stats(x, ys, base, nz0, nz1)
+                    if nz0 is not None and nz1 is not None else None)
+    noise = noise_manual or noise_auto
+    s[f"_bt_noise_{sid}"] = noise["noise"] if noise else None
     return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
+            "noise_auto": noise_auto, "noise_manual": noise_manual,
+            "noise": noise, "sm": int(s[key("sm")]),
             "base": base, "up": up, "down": down, "events": events,
             "kept": kept, "left_out": left_out, "beats": beats,
             "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
@@ -33367,6 +33379,9 @@ def bt_apply_pending(sid):
     """A line dragged on the plot (last run), into its setting, before the
     boxes are drawn."""
     s = st.session_state
+    quiet = s.pop("_bt_noise_pending", None)
+    if quiet and quiet[0] == sid:
+        s[f"bt_nz0_{sid}"], s[f"bt_nz1_{sid}"] = quiet[1], quiet[2]
     pending = s.pop("_bt_pending", None)
     if not pending or pending[0] != sid:
         return
@@ -33425,9 +33440,126 @@ def bt_use_own(sid):
 
 
 def bt_lines_from_noise(sid):
+    """Both lines 5 noise SDs from the baseline: the noise measured on the
+    quiet stretch when one is given, else as when the signal was opened."""
     s = st.session_state
+    noise = s.get(f"_bt_noise_{sid}")
+    if s.get(f"bt_nz0_{sid}") is not None and noise:
+        s[f"bt_hi_{sid}"] = s[f"bt_lo_{sid}"] = 5.0 * float(noise)
+        return
     for name in ("hi", "lo"):
         s.pop(f"bt_{name}_{sid}", None)
+
+
+def bt_noise_clear(sid):
+    s = st.session_state
+    s[f"bt_nz0_{sid}"] = s[f"bt_nz1_{sid}"] = None
+
+
+def bt_snr(got):
+    """(positive, negative): the peaks' mean height (and depth) over the
+    noise SD in use, the manual one when measured; NaN when there are
+    none or no noise."""
+    noise = (got.get("noise") or {}).get("noise")
+    out = []
+    for sign in (1, -1):
+        heights = [abs(e["peak"]) for e in got["kept"] if e["sign"] == sign]
+        out.append(float(np.mean(heights)) / noise
+                   if heights and noise else np.nan)
+    return tuple(out)
+
+
+def bt_noise_lines(got):
+    """The noise for the report: measured automatically and (when a quiet
+    stretch was chosen) by hand, and the peaks' signal-to-noise."""
+    u = f" {got['y_unit']}" if got["y_unit"] else ""
+    xu = f" {got['x_unit']}" if got["x_unit"] else ""
+    auto, manual = got.get("noise_auto"), got.get("noise_manual")
+    lines = []
+    if auto:
+        lines.append(
+            f"Noise, automatic (between the peaks, {auto['n']:,} points): "
+            f"robust SD {bt_neat(auto['robust_sd'])}{u}, RMS "
+            f"{bt_neat(auto['rms'])}{u}, peak-to-peak "
+            f"{bt_neat(auto['p2p'])}{u}")
+    if manual:
+        lines.append(
+            f"Noise, manual (quiet stretch {manual['x0']:.5g} to "
+            f"{manual['x1']:.5g}{xu}, {manual['n']:,} points): SD "
+            f"{bt_neat(manual['sd'])}{u}, RMS about the baseline "
+            f"{bt_neat(manual['rms'])}{u}, peak-to-peak "
+            f"{bt_neat(manual['p2p'])}{u}, its mean "
+            f"{bt_neat(manual['offset'])}{u} from the baseline")
+    pos, neg = bt_snr(got)
+    if np.isfinite(pos) or np.isfinite(neg):
+        lines.append(
+            "Signal-to-noise (mean height ÷ the "
+            + ("manual" if manual else "automatic") + " noise SD): "
+            + f"positive peaks {bt_neat(pos) or '–'}, negative peaks "
+            + f"{bt_neat(neg) or '–'}")
+    if got.get("sm", 1) > 1:
+        lines.append(f"Noise measured on the signal as analysed, smoothed "
+                     f"over {got['sm']} points")
+    return lines
+
+
+def bt_noise_box(sid, got):
+    """🔇 The noise: automatically between the peaks, and by hand on a
+    quiet stretch (typed, or boxed on the plot), with the peaks'
+    signal-to-noise and where the lines sit in noise SDs."""
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    u = f" {got['y_unit']}" if got["y_unit"] else ""
+    xu = got["x_unit"]
+    auto, manual = got.get("noise_auto"), got.get("noise_manual")
+    used = got.get("noise")
+    title = "🔇 Noise" + (
+        f": SD {bt_neat(used['noise'])}{u} "
+        f"({'manual' if manual else 'automatic'})" if used else "")
+    with st.expander(title):
+        if auto:
+            st.markdown(
+                f"**Automatic, between the peaks:** robust SD "
+                f"{bt_neat(auto['robust_sd'])}{u} · RMS "
+                f"{bt_neat(auto['rms'])}{u} · peak-to-peak "
+                f"{bt_neat(auto['p2p'])}{u} · {auto['n']:,} points")
+        st.markdown("**Manual, on a quiet stretch:**")
+        a, b, c = st.columns([1, 1, 0.7])
+        a.number_input(f"From ({xu})" if xu else "From", key=key("nz0"),
+                       value=None, format="%.6g")
+        b.number_input(f"To ({xu})" if xu else "To", key=key("nz1"),
+                       value=None, format="%.6g")
+        c.button("✕ Clear", key=f"btb_nzclr_{sid}", on_click=bt_noise_clear,
+                 args=(sid,), **STRETCH,
+                 disabled=s.get(key("nz0")) is None
+                 and s.get(key("nz1")) is None)
+        if manual:
+            st.markdown(
+                f"SD {bt_neat(manual['sd'])}{u} · robust SD "
+                f"{bt_neat(manual['robust_sd'])}{u} · RMS about the "
+                f"baseline {bt_neat(manual['rms'])}{u} · peak-to-peak "
+                f"{bt_neat(manual['p2p'])}{u} · {manual['n']:,} points")
+            if abs(manual["offset"]) > 2 * manual["sd"]:
+                st.caption(f"⚠ This stretch sits {bt_neat(manual['offset'])}"
+                           f"{u} from the baseline: the baseline may need "
+                           "moving to the quiet level.")
+        elif s.get(key("nz0")) is not None and s.get(key("nz1")) is not None:
+            st.caption("Too few points in that stretch.")
+        else:
+            st.caption("Type where a part with no beats starts and ends, or "
+                       "choose 🔇 Quiet part above the plot and drag a box "
+                       "over it. When given, it is the noise used.")
+        pos, neg = bt_snr(got)
+        if used and used["noise"] > 0:
+            st.markdown(
+                f"**Signal-to-noise** (mean height ÷ noise SD): positive "
+                f"{bt_neat(pos) or '–'} · negative {bt_neat(neg) or '–'}")
+            st.caption(
+                f"The lines sit {bt_neat(got['up'] / used['noise'])} "
+                f"(upper) and {bt_neat(got['down'] / used['noise'])} "
+                "(lower) noise SDs from the baseline."
+                + (f" Measured on the signal smoothed over {got['sm']} "
+                   "points." if got.get("sm", 1) > 1 else ""))
 
 
 def bt_columns_changed(sid):
@@ -33473,14 +33605,18 @@ def bt_settings(sid, got):
                          "the baseline.")
     st.button("↺ Lines from the noise (5 × SD)", key=f"btb_noise_{sid}",
               on_click=bt_lines_from_noise, args=(sid,), **STRETCH,
-              help="Puts both lines 5 times the baseline's noise (a robust "
-                   "SD) away from it.")
+              help="Puts both lines 5 times the baseline's noise SD away "
+                   "from it: the noise of the quiet stretch when one is "
+                   "given (🔇 Noise, below), else a robust SD of the "
+                   "whole signal.")
     if got is not None:
         unit = got["y_unit"] or unit
+        noise = (got.get("noise") or {}).get("noise")
         st.caption(f"Baseline {got['base']:.4g}"
                    + (f" {unit}" if unit else "")
-                   + f" · noise SD {bta.noise_sd(got['y'], got['base']):.3g}"
+                   + (f" · noise SD {noise:.3g}" if noise else "")
                    + f" · {len(got['events'])} peaks past the lines")
+        bt_noise_box(sid, got)
     st.slider("Smooth (points)", 1, 51, step=2, key=key("sm"),
               help="A running mean over this many points before the peaks "
                    "are found and their areas taken. 1: as recorded.")
@@ -33579,7 +33715,7 @@ def bt_plot(sid, got):
     In the normal (zoom) mode a click on a ▲ ▼ removes that peak and a
     click on a ✕ puts it back."""
     s = st.session_state
-    m1, m3, m4, m5, m2 = st.columns([3.9, 0.75, 1.0, 1.05, 0.8])
+    m1, m3, m4, m5, m2 = st.columns([4.8, 0.75, 1.0, 1.05, 0.8])
     if s.get("bt_mouse") not in BT_MOUSE:
         s["bt_mouse"] = BT_ZOOM
     mouse = m1.segmented_control(
@@ -33587,8 +33723,10 @@ def bt_plot(sid, got):
         label_visibility="collapsed",
         help="🔍 Zoom: drag to zoom in, double-click to zoom out; a click "
              "on a ▲ or ▼ removes that peak, a click on a ✕ puts it back. "
-             "🗑 Box over peaks: drag a box around peaks to remove them all "
+             "🗑 Box peaks: drag a box around peaks to remove them all "
              "at once (a box around removed ones only puts them back). "
+             "🔇 Quiet part: drag a box over a part with no beats to "
+             "measure its noise. "
              "━ Baseline / Upper line / Lower line: drag across the plot "
              "at the height the line should be.") or BT_ZOOM
     gone = list(s.get(f"_bt_out_{sid}") or [])
@@ -33609,7 +33747,7 @@ def bt_plot(sid, got):
         st.toggle("Number the beats", key="bt_numbers")
         st.toggle("Shade each full beat", key="bt_shade")
     drawing = mouse in (BT_BASE, BT_UP, BT_LOW)
-    boxing = mouse == BT_BOX
+    boxing = mouse in (BT_BOX, BT_QUIET)
     fig = bt_figure(got, peak_click=not (drawing or boxing))
     if drawing:
         fig.update_layout(
@@ -33638,8 +33776,9 @@ def bt_plot(sid, got):
                                 got["base"])
             s["_bt_chart_ver"] = ver + 1
             st.rerun()
-        st.caption(f"Drag across the plot at the height of the "
-                   f"{mouse[2:].lower()}.")
+        st.caption("Drag across the plot at the height of the "
+                   + {BT_BASE: "baseline", BT_UP: "upper line",
+                      BT_LOW: "lower line"}.get(mouse, "line") + ".")
     elif boxing:
         fig.update_layout(dragmode="select",
                           newselection=dict(line=dict(color="#D62728",
@@ -33651,6 +33790,11 @@ def bt_plot(sid, got):
             boxes = list(event.selection.box or [])
         except Exception:
             boxes = []
+        if boxes and mouse == BT_QUIET:
+            x0, x1 = sorted(map(float, boxes[-1]["x"]))
+            s["_bt_noise_pending"] = (sid, x0, x1)
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
         if boxes:
             x0, x1 = sorted(map(float, boxes[-1]["x"]))
             y0, y1 = sorted(map(float, boxes[-1]["y"]))
@@ -33671,10 +33815,13 @@ def bt_plot(sid, got):
             bt_set_out(sid, marks)
             s["_bt_chart_ver"] = ver + 1
             st.rerun()
-        st.caption("Drag a box around peaks to remove them all; a box "
-                   "around only removed ones (✕) puts them back. Above the "
-                   "baseline only takes positive peaks, below it negative "
-                   "ones.")
+        st.caption(
+            "Drag a box across a part with no beats: its noise is measured "
+            "(🔇 Noise, on the left), and the stretch is shaded grey."
+            if mouse == BT_QUIET else
+            "Drag a box around peaks to remove them all; a box around only "
+            "removed ones (✕) puts them back. Above the baseline only takes "
+            "positive peaks, below it negative ones.")
     else:
         event = st.plotly_chart(fig, key=f"btc_{ver}_zoom", config=config,
                                 on_select="rerun", selection_mode="points",
@@ -33756,8 +33903,7 @@ def bt_report(sid, got):
         "Smoothing: " + ("none" if sm <= 1 else
                          f"running mean over {sm} points"),
         f"Baseline: {base:.5g}{y_u} ({how_base})",
-        f"Noise SD (robust, 1.4826 × MAD): "
-        f"{bta.noise_sd(got['y'], base):.3g}{y_u}",
+        *bt_noise_lines(got),
         f"Upper line: {base + up:.5g}{y_u} ({up:.4g}{y_u} above the "
         "baseline): a positive peak gets past it",
         f"Lower line: {base - down:.5g}{y_u} ({down:.4g}{y_u} below the "
@@ -33820,9 +33966,11 @@ def bt_report(sid, got):
                         if d["n"] > 1 else ""))
     lines += ["", "UNITS AND HOW"]
     if area:
-        lines.append(f"Areas in {area}" + (
-            " (force × time: an impulse, not an energy)"
-            if got["shown"] else ""))
+        lines.append(
+            f"Impulse: the area under each force peak, ∫(F − baseline) dt, "
+            f"in {area} (force × time, not an energy)."
+            if bta.area_word(got["x_unit"], got["y_unit"]) == "Impulse"
+            else f"Areas: ∫(y − baseline) dx, in {area}.")
     if "Spring energy, total" in info:
         eu = info["Spring energy, total"][1]
         lines.append(f"Energy of a peak: F²/2k, F its height above (or "
@@ -33883,6 +34031,7 @@ def bt_stats_rows(got):
     beats = got["beats"]
     yu, xu = got["y_unit"], got["x_unit"]
     area = f"{yu}·{xu}" if (xu and yu) else ""
+    word = bta.area_word(xu, yu)    # Impulse for a force over time
     pos = [b["pos"] for b in beats if b["pos"] is not None]
     neg = [b["neg"] for b in beats if b["neg"] is not None]
     full = [b for b in beats if b["kind"] == bta.KINDS[0]]
@@ -33910,14 +34059,17 @@ def bt_stats_rows(got):
         ("Power per negative peak", [power(e) for e in neg], "W"),
         ("Positive peak height", [abs(e["peak"]) for e in pos], yu),
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
-        ("Positive peak width", [e["width"] for e in pos], xu),
-        ("Negative peak width", [e["width"] for e in neg], xu),
+        ("Full beat duration (first peak's start to second's end)",
+         [b["end"] - b["start"] for b in full], xu),
+        ("Positive peak duration", [e["width"] for e in pos], xu),
+        ("Negative peak duration", [e["width"] for e in neg], xu),
         ("Positive peak rise (start to peak)",
          [e["peak_x"] - e["start"] for e in pos], xu),
         ("Negative peak rise (start to peak)",
          [e["peak_x"] - e["start"] for e in neg], xu),
-        ("∫ positive peak", [abs(e["area"]) for e in pos], area),
-        ("∫ negative peak (no sign)", [abs(e["area"]) for e in neg], area),
+        (f"{word} per positive peak", [abs(e["area"]) for e in pos], area),
+        (f"{word} per negative peak (no sign)",
+         [abs(e["area"]) for e in neg], area),
         ("Time between beats", list(np.diff(times)) if len(times) > 1
          else [], xu)]
 
@@ -33984,11 +34136,12 @@ def bt_results_rows(got):
              total * factor / seconds if seconds and np.isfinite(total)
              else np.nan, "W")] + counts
     ap, an = [abs(e["area"]) for e in pos], [abs(e["area"]) for e in neg]
-    rows += [("∫ positive peaks (total)", float(np.sum(ap)) if ap else 0.0,
-              area),
-             ("∫ negative peaks (total, no sign)",
+    word = bta.area_word(xu, yu)        # Impulse for a force over time
+    rows += [(f"{word}, positive peaks (total)",
+              float(np.sum(ap)) if ap else 0.0, area),
+             (f"{word}, negative peaks (total, no sign)",
               float(np.sum(an)) if an else 0.0, area),
-             ("∫ all peaks (total, no sign)",
+             (f"{word}, all peaks (total, no sign)",
               (float(np.sum(ap)) if ap else 0.0)
               + (float(np.sum(an)) if an else 0.0), area)]
     x = np.asarray(got["x"], float)
@@ -33999,11 +34152,23 @@ def bt_results_rows(got):
     # of different lengths compare
     every = (float(np.sum(ap)) if ap else 0.0) + (float(np.sum(an))
                                                   if an else 0.0)
-    rows += [("Mean force above baseline (∫ all peaks ÷ recording time)",
+    rows += [(("Mean force above baseline (impulse ÷ recording time)"
+               if word == "Impulse" else
+               "Mean |y − baseline| (area ÷ recording time)"),
               every / span if span and np.isfinite(span) else np.nan, yu),
              ("Beats per minute", info.get("Beat rate (per minute)", np.nan),
               "/min"),
-             ("Recording time", span, xu),
+             ("Recording time", span, xu)]
+    auto, manual = got.get("noise_auto"), got.get("noise_manual")
+    pos_snr, neg_snr = bt_snr(got)
+    rows += [("Noise SD, automatic (between peaks, robust)",
+              auto["robust_sd"] if auto else np.nan, yu),
+             ("Noise SD, manual (quiet stretch)",
+              manual["sd"] if manual else np.nan, yu),
+             ("Signal-to-noise, positive peaks (mean height ÷ noise SD)",
+              pos_snr, ""),
+             ("Signal-to-noise, negative peaks (mean depth ÷ noise SD)",
+              neg_snr, ""),
              ("Spring constant k", k if k else np.nan, "N/m")]
     return rows
 
@@ -34084,6 +34249,35 @@ def bt_energy_text(sid, got):
     return "\n".join(lines)
 
 
+def bt_impulse_text(sid, got):
+    """
+    The impulse (the area under each force peak, force × time) alone, to
+    paste into Excel: the signal and its file; the total impulses, the
+    mean force above baseline and how many peaks they came from; then the
+    impulse of a positive and of a negative peak, each with n, mean, SD,
+    median, min, max and range. 'Area' instead when y is not a force or x
+    not a time.
+    """
+    name = st.session_state["_bt_sets"][sid]["name"]
+    word = bta.area_word(got["x_unit"], got["y_unit"])
+    lines = [f"Signal\t{name}",
+             f"File\t{bt_file_used(sid) or 'not known'}", "",
+             f"{word}\tValue\tUnit"]
+    for param, value, unit in bt_results_rows(got):
+        if param.startswith((word, "Mean force above", "Mean |y")) or \
+                param in ("Positive peaks", "Negative peaks", "Full beats",
+                          "Recording time"):
+            lines.append(f"{param}\t{bt_excel(value)}\t{unit}")
+    lines += ["", "Per peak\t" + "\t".join(bta.STATS) + "\tUnit"]
+    for param, values, unit in bt_stats_rows(got):
+        if param.startswith(word):
+            d = bta.describe(values)
+            lines.append(param + "\t" + "\t".join(
+                str(d["n"]) if stat == "n" else bt_excel(d[stat])
+                for stat in bta.STATS) + f"\t{unit}")
+    return "\n".join(lines)
+
+
 def bt_tsv(frame, number):
     """A table as tab-separated text, each number written by ``number``."""
     lines = ["\t".join(str(c) for c in frame.columns)]
@@ -34117,12 +34311,24 @@ def bt_integration(sid, got):
             st.caption("Copy with the icon at the top right of a box and "
                        "paste into Excel: every number is written the way "
                        "Excel reads it (5.44662E-16).")
-            t_energy, t_all, t_peaks, t_line = st.tabs(
-                ["⚡ Energy", "All results", "Each peak", "One row"])
+            word = bta.area_word(xu, yu)
+            t_energy, t_impulse, t_all, t_peaks, t_line = st.tabs(
+                ["⚡ Energy", "∫ " + word, "All results", "Each peak",
+                 "One row"])
             with t_energy:
                 st.code(bt_energy_text(sid, got), language=None, height=380)
                 st.caption("The energies and power only. Range is the "
                            "largest minus the smallest.")
+            with t_impulse:
+                st.code(bt_impulse_text(sid, got), language=None,
+                        height=380)
+                st.caption(
+                    f"The impulse only: the area under each force peak, "
+                    f"in {area} (force × time). Mean force above baseline "
+                    "= all the impulse ÷ the recording time."
+                    if word == "Impulse" else
+                    "The areas only: ∫(y − baseline) dx. y is not a force "
+                    "against time, so this is not an impulse.")
             with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
@@ -34167,9 +34373,12 @@ def bt_integration(sid, got):
                 "total energy ÷ the recording time. "
                 + ("" if bta.seconds_per(xu) else
                    "⚡ No power here: x is not a time in s or ms. ")
-                + f"Areas: ∫(y − baseline) dt, in {area} (force × time, "
-                "not an energy), without sign so positive and negative "
-                "add up.")
+                + (f"Impulse: the area under each force peak, ∫(F − "
+                   f"baseline) dt, in {area} (force × time, not an "
+                   "energy), without sign so positive and negative add up."
+                   if bta.area_word(xu, yu) == "Impulse" else
+                   f"Areas: ∫(y − baseline) dx, in {area}, without sign "
+                   "so positive and negative add up."))
         peaks = got["peaks"]
         if not peaks.empty:
             safe = sc_db_safe(name)
@@ -34185,7 +34394,7 @@ def bt_integration(sid, got):
 def bt_figure(got, clickable=False, peak_click=False):
     """The beat plot as it is drawn on the tab."""
     s = st.session_state
-    return bta.beat_figure(
+    figure = bta.beat_figure(
         got["x"], got["y"], got["base"], got["up"], got["down"],
         got["kept"], got["beats"], left_out=got["left_out"],
         colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
@@ -34193,11 +34402,18 @@ def bt_figure(got, clickable=False, peak_click=False):
         line_width=s["bt_lw"], numbers=s["bt_numbers"],
         shade_beats=s["bt_shade"], clickable=clickable,
         **({"peak_click": True} if peak_click else {}))
+    quiet = got.get("noise_manual")
+    if quiet:
+        figure.add_vrect(x0=quiet["x0"], x1=quiet["x1"], fillcolor="#888",
+                         opacity=0.15, line_width=0, layer="below",
+                         annotation_text="quiet", annotation_position="top left",
+                         annotation_font_color="#666")
+    return figure
 
 
 # what is kept of each signal's settings when it is saved, to open it again
 BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
-                  "merge", "gap", "order", "fu", "k")
+                  "merge", "gap", "order", "fu", "k", "nz0", "nz1")
 
 
 def bt_db_store():
@@ -34355,9 +34571,9 @@ def bt_peaks_table(sid, got):
             f"At ({xu})" if xu else "At": e["peak_x"],
             f"Height or depth ({yu})" if yu else "Height or depth":
                 abs(e["peak"]),
-            f"Width ({xu})" if xu else "Width": e["width"],
-            f"∫, no sign ({yu}·{xu})" if (xu and yu) else "∫, no sign":
-                abs(e["area"]),
+            f"Duration ({xu})" if xu else "Duration": e["width"],
+            (f"{bta.area_word(xu, yu)}, no sign ({yu}·{xu})"
+             if (xu and yu) else "Area, no sign"): abs(e["area"]),
             "Energy (J)": (bta.spring_energy(abs(e["peak"]), k, newtons)
                            if (k and newtons) else np.nan),
             "Power (W)": ((bta.peak_power(e, k, newtons, xu) or np.nan)
