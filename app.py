@@ -33149,6 +33149,10 @@ BT_MOUSE = ("🔍 Zoom", "🗑 Remove peaks", "🔇 Quiet part", "📏 Measure",
             "━ Baseline", "━ Upper", "━ Lower")
 BT_ZOOM, BT_BOX, BT_QUIET, BT_MEASURE, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
 BT_MARKS = ("positive peaks", "negative peaks", "left out")
+# the plot's look by default, as for a publication: lines as thick as the
+# axes, black axes boxed with ticks outside, no grid, a large font
+BT_PUBLICATION = {"bt_height": 420, "bt_lw": 2.0, "bt_axw": 2.0,
+                  "bt_fs": 16, "bt_grid": False}
 # what the plot can show, each switched under 🎨 Plot → Show on the plot
 BT_SHOW_PARTS = {"bt_show_base": "Baseline",
                  "bt_show_lines": "Upper and lower lines",
@@ -33162,6 +33166,56 @@ BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
                   "bt_show_marks": ("positive peaks", "negative peaks",
                                     "left out"),
                   "bt_show_fill": ("positive areas", "negative areas")}
+
+
+def bt_publication_style():
+    """📄 The default look again, the axes fitted to the signal."""
+    s = st.session_state
+    for name, value in BT_PUBLICATION.items():
+        s[name] = value
+    for name in ("bt_ymin", "bt_ymax", "bt_xmin", "bt_xmax"):
+        s[name] = None
+    s["bt_ytitle"] = s["bt_xtitle"] = ""
+
+
+def bt_style(figure, got):
+    """
+    The beat plot's look, from 🎨 Plot: black axes of the chosen thickness
+    boxed round the plot, ticks outside as thick as them, the font size
+    for numbers and titles, grid lines or none, the baseline and the lines
+    as thick as the signal, and the axes' ranges and titles when set.
+    """
+    s = st.session_state
+    axw = float(s.get("bt_axw", BT_PUBLICATION["bt_axw"]))
+    lw = float(s.get("bt_lw", BT_PUBLICATION["bt_lw"]))
+    fs = int(s.get("bt_fs", BT_PUBLICATION["bt_fs"]))
+    grid = bool(s.get("bt_grid", False))
+    axis = dict(showline=True, linecolor="black", linewidth=axw,
+                mirror=True, ticks="outside", tickwidth=axw,
+                ticklen=int(round(4 + 2 * axw)), tickcolor="black",
+                showgrid=grid, gridcolor="#E3E3E3", zeroline=False,
+                tickfont=dict(size=fs, color="black"),
+                title_font=dict(size=fs + 2, color="black"))
+    figure.update_xaxes(**axis)
+    figure.update_yaxes(**axis)
+    figure.update_layout(
+        font=dict(family="Arial, Helvetica, sans-serif", size=fs,
+                  color="black"),
+        paper_bgcolor="white", plot_bgcolor="white",
+        margin=dict(l=int(30 + 3.6 * fs), r=24, t=34, b=int(25 + 2.6 * fs)))
+    for trace in figure.data:
+        if trace.name in ("baseline", "upper line", "lower line"):
+            trace.line.width = lw
+    for axis_name, low, high in (("y", "bt_ymin", "bt_ymax"),
+                                 ("x", "bt_xmin", "bt_xmax")):
+        a, b = s.get(low), s.get(high)
+        if a is not None and b is not None and b > a:
+            getattr(figure, f"update_{axis_name}axes")(
+                range=[float(a), float(b)], autorange=False)
+    if str(s.get("bt_ytitle") or "").strip():
+        figure.update_yaxes(title_text=s["bt_ytitle"])
+    if str(s.get("bt_xtitle") or "").strip():
+        figure.update_xaxes(title_text=s["bt_xtitle"])
 
 
 def bt_show_all(on):
@@ -33450,6 +33504,9 @@ def bt_unit_changed(sid):
     for name in ("base", "hi", "lo", "qsmall", "nzval"):
         if s.get(f"bt_{name}_{sid}") is not None and old:
             s[f"bt_{name}_{sid}"] = float(s[f"bt_{name}_{sid}"]) * new / old
+    for name in ("bt_ymin", "bt_ymax"):
+        if s.get(name) is not None and old:
+            s[name] = float(s[name]) * new / old
     s[f"_bt_scale_{sid}"] = new
 
 
@@ -33966,8 +34023,30 @@ def bt_plot(sid, got):
     with m5.popover("🧹 Remove…", **STRETCH):
         bt_quick_remove(sid, got)
     with m2.popover("🎨 Plot", **STRETCH):
+        st.button("📄 Publication style", key="btb_pub",
+                  on_click=bt_publication_style, **STRETCH,
+                  help="Back to the default look: lines as thick as the "
+                       "axes, black boxed axes with ticks outside, no "
+                       "grid, a large font, the y axis fitted to the "
+                       "signal.")
         st.slider("Height", 250, 900, step=10, key="bt_height")
-        st.slider("Line thickness", 0.5, 4.0, step=0.1, key="bt_lw")
+        st.slider("Line thickness", 0.5, 5.0, step=0.1, key="bt_lw")
+        st.slider("Axis thickness", 0.5, 5.0, step=0.1, key="bt_axw")
+        st.slider("Font size", 9, 30, key="bt_fs")
+        st.toggle("Grid lines", key="bt_grid")
+        st.markdown("**Axes**")
+        y1, y2 = st.columns(2)
+        y1.number_input("y from", key="bt_ymin", value=None,
+                        format="%.6g", help="Empty: fitted to the signal.")
+        y2.number_input("y to", key="bt_ymax", value=None, format="%.6g")
+        x1, x2 = st.columns(2)
+        x1.number_input("x from", key="bt_xmin", value=None,
+                        format="%.6g", help="Empty: the whole recording.")
+        x2.number_input("x to", key="bt_xmax", value=None, format="%.6g")
+        st.text_input("y axis title", key="bt_ytitle",
+                      placeholder=bt_y_title(got))
+        st.text_input("x axis title", key="bt_xtitle",
+                      placeholder=got["xcol"])
         st.color_picker("Signal", key="bt_col")
         st.color_picker("Positive peaks", key="bt_pcol")
         st.color_picker("Negative peaks", key="bt_ncol")
@@ -34002,7 +34081,7 @@ def bt_plot(sid, got):
     config = {"scrollZoom": True, "displaylogo": False,
               "toImageButtonOptions": {
                   "filename": sc_db_safe(s["_bt_sets"][sid]["name"])
-                  + "_beats"}}
+                  + "_beats", "scale": 3}}
     ver = int(s.get("_bt_chart_ver", 0))
     if drawing:
         event = st.plotly_chart(fig, key=f"btc_{ver}_draw", config=config,
@@ -34713,8 +34792,10 @@ def bt_figure(got, clickable=False, peak_click=False):
         colour=s["bt_col"], pos_colour=s["bt_pcol"], neg_colour=s["bt_ncol"],
         x_title=got["xcol"], y_title=bt_y_title(got), height=s["bt_height"],
         line_width=s["bt_lw"], numbers=s["bt_numbers"],
+        font_size=int(s.get("bt_fs", BT_PUBLICATION["bt_fs"])),
         shade_beats=s["bt_shade"], clickable=clickable,
         **({"peak_click": True} if peak_click else {}))
+    bt_style(figure, got)
     hidden = {trace for name, traces in BT_SHOW_TRACES.items()
               if not s.get(name, True) for trace in traces}
     if hidden:
@@ -35036,7 +35117,7 @@ def bt_summary_frame(ids):
 
 def beat_tab():
     s = st.session_state
-    for key, value in (("bt_height", 420), ("bt_lw", 1.4),
+    for key, value in (*BT_PUBLICATION.items(),
                        ("bt_eunit", "Auto"),
                        ("bt_col", "#222222"),
                        ("bt_pcol", bta.POS_COLOUR),
