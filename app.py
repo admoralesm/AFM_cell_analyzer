@@ -8938,10 +8938,13 @@ def video_facts_panel(path):
                                        s.get("vf_orig_s"))
     warn = verdict["level"] == "warn" or any(
         level == "warn" for level, _ in facts["notes"])
-    title = (f"🎞 Video information: {facts['ext']} · {facts['fps']:.4g} fps "
-             f"· {facts['frame_count']:,} frames · "
-             f"{facts['duration_s']:.4g} s" + (" · ⚠ check" if warn else ""))
-    with st.expander(title, expanded=warn):
+    # the facts on a line of their own: the box's title must not change,
+    # or Streamlit draws it anew (closed) after every value typed in it
+    st.caption(f"🎞 {facts['ext']} · {facts['fps']:.4g} fps · "
+               f"{facts['frame_count']:,} frames · "
+               f"{facts['duration_s']:.4g} s"
+               + (" · ⚠ see Video information" if warn else ""))
+    with st.expander("🎞 Video information"):
         left, right = st.columns([1, 1.15])
         with left:
             rows = [
@@ -33142,10 +33145,158 @@ with tab_series:
 # what the mouse does on the beat plot: zoom (and a click on a ▲ ▼
 # removes that peak, on a ✕ puts it back), box peaks away, or drag a line
 # short, so all six fit on one row; the ⓘ help says what each does
-BT_MOUSE = ("🔍 Zoom", "🗑 Box peaks", "🔇 Quiet part", "━ Baseline",
-            "━ Upper", "━ Lower")
-BT_ZOOM, BT_BOX, BT_QUIET, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
+BT_MOUSE = ("🔍 Zoom", "🗑 Remove peaks", "🔇 Quiet part", "📏 Measure",
+            "━ Baseline", "━ Upper", "━ Lower")
+BT_ZOOM, BT_BOX, BT_QUIET, BT_MEASURE, BT_BASE, BT_UP, BT_LOW = BT_MOUSE
 BT_MARKS = ("positive peaks", "negative peaks", "left out")
+# what the plot can show, each switched under 🎨 Plot → Show on the plot
+BT_SHOW_PARTS = {"bt_show_base": "Baseline",
+                 "bt_show_lines": "Upper and lower lines",
+                 "bt_show_marks": "Peak marks (▲ ▼ ✕)",
+                 "bt_show_fill": "Impulse shading under the peaks",
+                 "bt_show_quiet": "Quiet stretch (grey)",
+                 "bt_show_meas": "Measuring points A and B"}
+# the plot's traces each switch hides
+BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
+                  "bt_show_lines": ("upper line", "lower line"),
+                  "bt_show_marks": ("positive peaks", "negative peaks",
+                                    "left out"),
+                  "bt_show_fill": ("positive areas", "negative areas")}
+
+
+def bt_show_all(on):
+    """🧼 Signal only (every switch off, the beat numbers and shading too)
+    or Show all."""
+    s = st.session_state
+    for name in BT_SHOW_PARTS:
+        s[name] = bool(on)
+    s["bt_numbers"] = bool(on)
+    if not on:
+        s["bt_shade"] = False
+
+
+def bt_measure(got):
+    """
+    📏 What lies between the measuring points A and B (x from bt_ma, bt_mb):
+    each point's x and y (y read off the signal there), the differences,
+    the slope, and over the span from A to B: the impulse ∫(y − baseline)
+    dx, the mean of y − baseline, the largest and smallest y − baseline.
+    None until both are placed.
+    """
+    s = st.session_state
+    sid = got["sid"]
+    a, b = s.get(f"bt_ma_{sid}"), s.get(f"bt_mb_{sid}")
+    if a is None or b is None:
+        return None
+    x = np.asarray(got["x"], float)
+    y = np.asarray(got["y"], float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    order = np.argsort(x, kind="stable")
+    x, y = x[order], y[order]
+    if x.size < 2:
+        return None
+    ya, yb = float(np.interp(a, x, y)), float(np.interp(b, x, y))
+    lo, hi = sorted((float(a), float(b)))
+    inside = (x > lo) & (x < hi)
+    xs = np.r_[lo, x[inside], hi]
+    rs = np.r_[np.interp(lo, x, y), y[inside], np.interp(hi, x, y)] \
+        - got["base"]
+    span = hi - lo
+    area = float(np.sum(np.diff(xs) * (rs[1:] + rs[:-1]) / 2.0))
+    return {"a": float(a), "b": float(b), "ya": ya, "yb": yb,
+            "dx": float(b) - float(a), "dy": yb - ya,
+            "slope": (yb - ya) / (float(b) - float(a)) if b != a else np.nan,
+            "area": area, "mean": area / span if span > 0 else np.nan,
+            "max": float(np.max(rs)), "min": float(np.min(rs))}
+
+
+def bt_draw_measure(figure, got):
+    """A and B on the plot: a dashed upright line and a dot on the signal
+    at each, lettered, and a light band between them."""
+    s = st.session_state
+    sid = got["sid"]
+    x = np.asarray(got["x"], float)
+    y = np.asarray(got["y"], float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if not ok.any():
+        return
+    order = np.argsort(x[ok], kind="stable")
+    xo, yo = x[ok][order], y[ok][order]
+    placed = [(name, s.get(f"bt_m{name.lower()}_{sid}"))
+              for name in ("A", "B")]
+    placed = [(name, float(at)) for name, at in placed if at is not None]
+    if len(placed) == 2:
+        figure.add_vrect(x0=min(placed[0][1], placed[1][1]),
+                         x1=max(placed[0][1], placed[1][1]),
+                         fillcolor="#F2C14E", opacity=0.12, line_width=0,
+                         layer="below")
+    for name, at in placed:
+        figure.add_vline(x=at, line=dict(color="#B8860B", width=1.2,
+                                         dash="dash"))
+        figure.add_annotation(x=at, y=1, yref="paper", text=f"<b>{name}</b>",
+                              showarrow=False, yanchor="bottom",
+                              font=dict(color="#B8860B", size=13))
+        figure.add_scatter(x=[at], y=[float(np.interp(at, xo, yo))],
+                           mode="markers", name=f"point {name}",
+                           showlegend=False, hoverinfo="skip",
+                           marker=dict(size=10, color="#B8860B",
+                                       line=dict(color="white", width=1)))
+
+
+def bt_measure_clear(sid):
+    s = st.session_state
+    s[f"bt_ma_{sid}"] = s[f"bt_mb_{sid}"] = None
+
+
+def bt_measure_box(sid, got):
+    """📏 Under the plot: A and B (typed to adjust), and what lies between
+    them, to read and to copy."""
+    s = st.session_state
+    xu, yu = got["x_unit"], got["y_unit"]
+    xs = f" {xu}" if xu else ""
+    ys = f" {yu}" if yu else ""
+    word = bta.area_word(xu, yu)
+    area_u = f" {yu}·{xu}" if (xu and yu) else ""
+    with st.container(border=True):
+        a, b, c = st.columns([1, 1, 0.6])
+        a.number_input(f"📏 A ({xu})" if xu else "📏 A",
+                       key=f"bt_ma_{sid}", value=None, format="%.6g")
+        b.number_input(f"B ({xu})" if xu else "B", key=f"bt_mb_{sid}",
+                       value=None, format="%.6g")
+        c.button("✕ Clear", key=f"btb_mclr_{sid}", on_click=bt_measure_clear,
+                 args=(sid,), **STRETCH,
+                 disabled=s.get(f"bt_ma_{sid}") is None
+                 and s.get(f"bt_mb_{sid}") is None)
+        m = bt_measure(got)
+        if m is None:
+            st.caption("Click a point on the signal for A, then another "
+                       "for B (a third click starts again), or type them. "
+                       "Zoom in first to place them precisely.")
+            return
+        st.markdown(
+            f"**A** {bt_neat(m['a'])}{xs}, {bt_neat(m['ya'])}{ys} · "
+            f"**B** {bt_neat(m['b'])}{xs}, {bt_neat(m['yb'])}{ys}  \n"
+            f"**B − A** {bt_neat(m['dx'])}{xs}, "
+            f"{bt_neat(m['dy'])}{ys} · **slope** {bt_neat(m['slope'])}"
+            + (f" {yu}/{xu}" if (xu and yu) else "") + "  \n"
+            f"From A to B, relative to the baseline (below it counts "
+            f"negative): **net {word.lower()}** "
+            f"{bt_neat(m['area'])}{area_u} · **mean** "
+            f"{bt_neat(m['mean'])}{ys} · **highest** {bt_neat(m['max'])}{ys}"
+            f" · **lowest** {bt_neat(m['min'])}{ys}")
+        rows = [("A", m["a"], xu), ("y at A", m["ya"], yu),
+                ("B", m["b"], xu), ("y at B", m["yb"], yu),
+                ("B − A", m["dx"], xu), ("y at B − y at A", m["dy"], yu),
+                ("Slope", m["slope"], f"{yu}/{xu}" if (xu and yu) else ""),
+                (f"Net {word.lower()}, A to B (below baseline counts "
+                 "negative)", m["area"], area_u.strip()),
+                ("Mean relative to baseline, A to B", m["mean"], yu),
+                ("Highest relative to baseline, A to B", m["max"], yu),
+                ("Lowest relative to baseline, A to B", m["min"], yu)]
+        st.code("Measure\tValue\tUnit\n" + "\n".join(
+            f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in rows),
+            language=None, height=120)
 # what y is shown in: a force in N, µN or nN (Best fit: whichever reads
 # best), or not a force at all
 BT_FORCES = FORCE_SHOWN
@@ -33296,8 +33447,8 @@ def bt_unit_changed(sid):
     _, y, _, ycol = got
     _, new = bt_shown(s.get(f"bt_fu_{sid}"), bt_source_unit(sid, ycol), y)
     old = float(s.get(f"_bt_scale_{sid}") or 1.0)
-    for name in ("base", "hi", "lo", "qsmall"):
-        if f"bt_{name}_{sid}" in s and old:
+    for name in ("base", "hi", "lo", "qsmall", "nzval"):
+        if s.get(f"bt_{name}_{sid}") is not None and old:
             s[f"bt_{name}_{sid}"] = float(s[f"bt_{name}_{sid}"]) * new / old
     s[f"_bt_scale_{sid}"] = new
 
@@ -33355,17 +33506,29 @@ def bt_analyse(sid, e_unit=None):
                        per_minute=BT_PER_MINUTE.get(x_unit), e_unit=e_unit)
     peaks = bta.peak_table(beats, x_unit, y_unit, k=k, newtons=newtons,
                            e_unit=e_unit)
-    # the noise: automatically between the peaks, and by hand on a quiet
-    # stretch when one is given (that one is then used)
+    # the noise, measured automatically between the peaks and (when a
+    # stretch is given) on a quiet stretch; the one used is chosen under
+    # 🔇 Noise: automatic, the quiet stretch, or a value typed in
     nz0, nz1 = s.get(key("nz0")), s.get(key("nz1"))
     noise_auto = bta.noise_stats(x, ys, base, events=events)
     noise_manual = (bta.noise_stats(x, ys, base, nz0, nz1)
                     if nz0 is not None and nz1 is not None else None)
-    noise = noise_manual or noise_auto
+    mode = s.get(key("nzmode"))
+    if mode not in BT_NOISE_MODES:
+        mode = BT_NOISE_MODES[1] if noise_manual else BT_NOISE_MODES[0]
+    typed = s.get(key("nzval"))
+    if mode == BT_NOISE_MODES[2] and typed:
+        noise, kind = {"noise": float(typed)}, "typed"
+    elif mode == BT_NOISE_MODES[1] and noise_manual:
+        noise, kind = noise_manual, "quiet stretch"
+    else:
+        noise, kind = noise_auto, "automatic"
     s[f"_bt_noise_{sid}"] = noise["noise"] if noise else None
     return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
             "noise_auto": noise_auto, "noise_manual": noise_manual,
-            "noise": noise, "sm": int(s[key("sm")]),
+            "noise": noise, "noise_kind": kind,
+            "noise_typed": float(typed) if typed else None,
+            "sm": int(s[key("sm")]),
             "base": base, "up": up, "down": down, "events": events,
             "kept": kept, "left_out": left_out, "beats": beats,
             "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
@@ -33379,9 +33542,19 @@ def bt_apply_pending(sid):
     """A line dragged on the plot (last run), into its setting, before the
     boxes are drawn."""
     s = st.session_state
+    clicked = s.pop("_bt_measure_pending", None)
+    if clicked and clicked[0] == sid:
+        a, b = s.get(f"bt_ma_{sid}"), s.get(f"bt_mb_{sid}")
+        if a is None:
+            s[f"bt_ma_{sid}"] = clicked[1]
+        elif b is None:
+            s[f"bt_mb_{sid}"] = clicked[1]
+        else:
+            s[f"bt_ma_{sid}"], s[f"bt_mb_{sid}"] = clicked[1], None
     quiet = s.pop("_bt_noise_pending", None)
     if quiet and quiet[0] == sid:
         s[f"bt_nz0_{sid}"], s[f"bt_nz1_{sid}"] = quiet[1], quiet[2]
+        s[f"bt_nzmode_{sid}"] = BT_NOISE_MODES[1]
     pending = s.pop("_bt_pending", None)
     if not pending or pending[0] != sid:
         return
@@ -33439,13 +33612,18 @@ def bt_use_own(sid):
         s[f"bt_k_{sid}"] = float(meta["k"])
 
 
+# which noise the signal-to-noise and the lines use
+BT_NOISE_MODES = ("Automatic", "Quiet stretch", "Typed")
+
+
 def bt_lines_from_noise(sid):
-    """Both lines 5 noise SDs from the baseline: the noise measured on the
-    quiet stretch when one is given, else as when the signal was opened."""
+    """Both lines the chosen number of noise SDs (5 unless changed under
+    🔇 Noise) from the baseline, with the noise in use."""
     s = st.session_state
     noise = s.get(f"_bt_noise_{sid}")
-    if s.get(f"bt_nz0_{sid}") is not None and noise:
-        s[f"bt_hi_{sid}"] = s[f"bt_lo_{sid}"] = 5.0 * float(noise)
+    times = float(s.get(f"bt_nzk_{sid}") or 5.0)
+    if noise:
+        s[f"bt_hi_{sid}"] = s[f"bt_lo_{sid}"] = times * float(noise)
         return
     for name in ("hi", "lo"):
         s.pop(f"bt_{name}_{sid}", None)
@@ -33490,11 +33668,13 @@ def bt_noise_lines(got):
             f"{bt_neat(manual['rms'])}{u}, peak-to-peak "
             f"{bt_neat(manual['p2p'])}{u}, its mean "
             f"{bt_neat(manual['offset'])}{u} from the baseline")
+    if got.get("noise_kind") == "typed":
+        lines.append(f"Noise, typed: SD {bt_neat(got['noise_typed'])}{u}")
     pos, neg = bt_snr(got)
     if np.isfinite(pos) or np.isfinite(neg):
         lines.append(
-            "Signal-to-noise (mean height ÷ the "
-            + ("manual" if manual else "automatic") + " noise SD): "
+            "Signal-to-noise (mean height ÷ the noise SD used, "
+            + got.get("noise_kind", "automatic") + "): "
             + f"positive peaks {bt_neat(pos) or '–'}, negative peaks "
             + f"{bt_neat(neg) or '–'}")
     if got.get("sm", 1) > 1:
@@ -33504,62 +33684,98 @@ def bt_noise_lines(got):
 
 
 def bt_noise_box(sid, got):
-    """🔇 The noise: automatically between the peaks, and by hand on a
-    quiet stretch (typed, or boxed on the plot), with the peaks'
-    signal-to-noise and where the lines sit in noise SDs."""
+    """
+    🔇 The noise, and which one is used for the signal-to-noise and the
+    lines: measured automatically between the peaks, measured on a quiet
+    stretch (typed, or boxed on the plot with 🔇 Quiet part), or a value
+    typed in (a noise level known from elsewhere). The box's title never
+    changes, so it stays open while values are typed.
+    """
     s = st.session_state
     key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
     u = f" {got['y_unit']}" if got["y_unit"] else ""
     xu = got["x_unit"]
     auto, manual = got.get("noise_auto"), got.get("noise_manual")
-    used = got.get("noise")
-    title = "🔇 Noise" + (
-        f": SD {bt_neat(used['noise'])}{u} "
-        f"({'manual' if manual else 'automatic'})" if used else "")
-    with st.expander(title):
-        if auto:
-            st.markdown(
-                f"**Automatic, between the peaks:** robust SD "
-                f"{bt_neat(auto['robust_sd'])}{u} · RMS "
-                f"{bt_neat(auto['rms'])}{u} · peak-to-peak "
-                f"{bt_neat(auto['p2p'])}{u} · {auto['n']:,} points")
-        st.markdown("**Manual, on a quiet stretch:**")
-        a, b, c = st.columns([1, 1, 0.7])
-        a.number_input(f"From ({xu})" if xu else "From", key=key("nz0"),
-                       value=None, format="%.6g")
-        b.number_input(f"To ({xu})" if xu else "To", key=key("nz1"),
-                       value=None, format="%.6g")
-        c.button("✕ Clear", key=f"btb_nzclr_{sid}", on_click=bt_noise_clear,
-                 args=(sid,), **STRETCH,
-                 disabled=s.get(key("nz0")) is None
-                 and s.get(key("nz1")) is None)
-        if manual:
-            st.markdown(
-                f"SD {bt_neat(manual['sd'])}{u} · robust SD "
-                f"{bt_neat(manual['robust_sd'])}{u} · RMS about the "
-                f"baseline {bt_neat(manual['rms'])}{u} · peak-to-peak "
-                f"{bt_neat(manual['p2p'])}{u} · {manual['n']:,} points")
-            if abs(manual["offset"]) > 2 * manual["sd"]:
-                st.caption(f"⚠ This stretch sits {bt_neat(manual['offset'])}"
-                           f"{u} from the baseline: the baseline may need "
-                           "moving to the quiet level.")
-        elif s.get(key("nz0")) is not None and s.get(key("nz1")) is not None:
-            st.caption("Too few points in that stretch.")
+    if s.get(key("nzmode")) not in BT_NOISE_MODES:
+        s[key("nzmode")] = (BT_NOISE_MODES[1] if manual
+                            else BT_NOISE_MODES[0])
+    s.setdefault(key("nzk"), 5.0)
+    with st.expander("🔇 Noise"):
+        used = got.get("noise")
+        st.radio("Noise to use", BT_NOISE_MODES, key=key("nzmode"),
+                 horizontal=True,
+                 help="Automatic: measured between the peaks. Quiet "
+                      "stretch: measured on a part with no beats that you "
+                      "choose. Typed: a value you know, e.g. the "
+                      "instrument's noise level.")
+        mode = s[key("nzmode")]
+        if mode == BT_NOISE_MODES[0]:
+            if auto:
+                st.markdown(
+                    f"Robust SD **{bt_neat(auto['robust_sd'])}{u}** · RMS "
+                    f"{bt_neat(auto['rms'])}{u} · peak-to-peak "
+                    f"{bt_neat(auto['p2p'])}{u} · between the peaks, "
+                    f"{auto['n']:,} points")
+        elif mode == BT_NOISE_MODES[1]:
+            a, b, c = st.columns([1, 1, 0.7])
+            a.number_input(f"From ({xu})" if xu else "From",
+                           key=key("nz0"), value=None, format="%.6g")
+            b.number_input(f"To ({xu})" if xu else "To", key=key("nz1"),
+                           value=None, format="%.6g")
+            c.button("✕ Clear", key=f"btb_nzclr_{sid}",
+                     on_click=bt_noise_clear, args=(sid,), **STRETCH,
+                     disabled=s.get(key("nz0")) is None
+                     and s.get(key("nz1")) is None)
+            if manual:
+                st.markdown(
+                    f"SD **{bt_neat(manual['sd'])}{u}** · robust SD "
+                    f"{bt_neat(manual['robust_sd'])}{u} · RMS about the "
+                    f"baseline {bt_neat(manual['rms'])}{u} · peak-to-peak "
+                    f"{bt_neat(manual['p2p'])}{u} · {manual['n']:,} points")
+                if abs(manual["offset"]) > 2 * manual["sd"]:
+                    st.caption(f"⚠ This stretch sits "
+                               f"{bt_neat(manual['offset'])}{u} from the "
+                               "baseline: the baseline may need moving to "
+                               "the quiet level.")
+            elif s.get(key("nz0")) is not None and \
+                    s.get(key("nz1")) is not None:
+                st.caption("Too few points in that stretch; the automatic "
+                           "noise is used until there are more.")
+            else:
+                st.caption("Type where a part with no beats starts and "
+                           "ends, or choose 🔇 Quiet part above the plot and "
+                           "drag a box over it. Until then the automatic "
+                           "noise is used.")
         else:
-            st.caption("Type where a part with no beats starts and ends, or "
-                       "choose 🔇 Quiet part above the plot and drag a box "
-                       "over it. When given, it is the noise used.")
+            st.number_input(f"Noise SD ({got['y_unit']})" if got["y_unit"]
+                            else "Noise SD", key=key("nzval"), value=None,
+                            min_value=0.0, format="%.6g",
+                            help="A noise level known from elsewhere, in "
+                                 "the plot's unit.")
+            if not got.get("noise_typed"):
+                st.caption("Type a value; until then the automatic noise "
+                           "is used.")
         pos, neg = bt_snr(got)
         if used and used["noise"] > 0:
             st.markdown(
+                f"Using **{bt_neat(used['noise'])}{u}** "
+                f"({got.get('noise_kind', 'automatic')}). "
                 f"**Signal-to-noise** (mean height ÷ noise SD): positive "
                 f"{bt_neat(pos) or '–'} · negative {bt_neat(neg) or '–'}")
             st.caption(
-                f"The lines sit {bt_neat(got['up'] / used['noise'])} "
+                f"The lines now sit {bt_neat(got['up'] / used['noise'])} "
                 f"(upper) and {bt_neat(got['down'] / used['noise'])} "
                 "(lower) noise SDs from the baseline."
                 + (f" Measured on the signal smoothed over {got['sm']} "
                    "points." if got.get("sm", 1) > 1 else ""))
+        n1, n2 = st.columns([1, 1.4])
+        n1.number_input("Lines at (× noise SD)", key=key("nzk"),
+                        min_value=0.5, step=0.5, format="%.3g")
+        n2.button(f"↺ Set the lines at {float(s[key('nzk')]):.3g} × noise",
+                  key=f"btb_nzset_{sid}", on_click=bt_lines_from_noise,
+                  args=(sid,), **STRETCH, disabled=not used,
+                  help="Puts both lines this many noise SDs from the "
+                       "baseline, with the noise in use.")
 
 
 def bt_columns_changed(sid):
@@ -33603,7 +33819,9 @@ def bt_settings(sid, got):
                     format="%.6g",
                     help="A negative peak is one that gets this far below "
                          "the baseline.")
-    st.button("↺ Lines from the noise (5 × SD)", key=f"btb_noise_{sid}",
+    st.button(f"↺ Lines from the noise "
+              f"({float(s.get(key('nzk')) or 5.0):.3g} × SD)",
+              key=f"btb_noise_{sid}",
               on_click=bt_lines_from_noise, args=(sid,), **STRETCH,
               help="Puts both lines 5 times the baseline's noise SD away "
                    "from it: the noise of the quiet stretch when one is "
@@ -33614,7 +33832,9 @@ def bt_settings(sid, got):
         noise = (got.get("noise") or {}).get("noise")
         st.caption(f"Baseline {got['base']:.4g}"
                    + (f" {unit}" if unit else "")
-                   + (f" · noise SD {noise:.3g}" if noise else "")
+                   + (f" · noise SD {noise:.3g} "
+                      f"({got.get('noise_kind', 'automatic')})"
+                      if noise else "")
                    + f" · {len(got['events'])} peaks past the lines")
         bt_noise_box(sid, got)
     st.slider("Smooth (points)", 1, 51, step=2, key=key("sm"),
@@ -33715,20 +33935,27 @@ def bt_plot(sid, got):
     In the normal (zoom) mode a click on a ▲ ▼ removes that peak and a
     click on a ✕ puts it back."""
     s = st.session_state
-    m1, m3, m4, m5, m2 = st.columns([4.8, 0.75, 1.0, 1.05, 0.8])
     if s.get("bt_mouse") not in BT_MOUSE:
         s["bt_mouse"] = BT_ZOOM
-    mouse = m1.segmented_control(
+    # the mouse modes on a row of their own (seven of them), the buttons
+    # on the next
+    mouse = st.segmented_control(
         "The mouse on the plot", BT_MOUSE, key="bt_mouse",
         label_visibility="collapsed",
         help="🔍 Zoom: drag to zoom in, double-click to zoom out; a click "
              "on a ▲ or ▼ removes that peak, a click on a ✕ puts it back. "
-             "🗑 Box peaks: drag a box around peaks to remove them all "
-             "at once (a box around removed ones only puts them back). "
+             "🗑 Remove peaks: drag a box over peaks to take them out of "
+             "the beats all at once (a box over removed ones only puts "
+             "them back). "
              "🔇 Quiet part: drag a box over a part with no beats to "
              "measure its noise. "
-             "━ Baseline / Upper line / Lower line: drag across the plot "
-             "at the height the line should be.") or BT_ZOOM
+             "📏 Measure: click two points on the signal (A, then B) to "
+             "measure between them. "
+             "━ Baseline / Upper / Lower: drag across the plot at the "
+             "height the line should be.") or BT_ZOOM
+    m0, m3, m4, m5, m2 = st.columns([3.2, 0.75, 1.0, 1.05, 0.8])
+    m0.caption("🎨 Plot → *Show on the plot* hides the lines and marks, "
+               "for a clean picture. 📷 on the plot saves it as a PNG.")
     gone = list(s.get(f"_bt_out_{sid}") or [])
     m3.button("↶ Undo", key=f"btb_undo_{sid}", on_click=bt_undo,
               args=(sid,), disabled=not s.get(f"_bt_hist_{sid}"),
@@ -33746,9 +33973,21 @@ def bt_plot(sid, got):
         st.color_picker("Negative peaks", key="bt_ncol")
         st.toggle("Number the beats", key="bt_numbers")
         st.toggle("Shade each full beat", key="bt_shade")
+        st.markdown("**Show on the plot**")
+        for name, label in BT_SHOW_PARTS.items():
+            st.toggle(label, key=name)
+        c1, c2 = st.columns(2)
+        c1.button("🧼 Signal only", key="btb_clean", on_click=bt_show_all,
+                  args=(False,), **STRETCH,
+                  help="Hides every line, mark, shading and number: the "
+                       "signal alone, for a figure.")
+        c2.button("Show all", key="btb_showall", on_click=bt_show_all,
+                  args=(True,), **STRETCH)
     drawing = mouse in (BT_BASE, BT_UP, BT_LOW)
     boxing = mouse in (BT_BOX, BT_QUIET)
-    fig = bt_figure(got, peak_click=not (drawing or boxing))
+    measuring = mouse == BT_MEASURE
+    fig = bt_figure(got, clickable=measuring,
+                    peak_click=not (drawing or boxing or measuring))
     if drawing:
         fig.update_layout(
             dragmode="lasso",
@@ -33800,8 +34039,14 @@ def bt_plot(sid, got):
             y0, y1 = sorted(map(float, boxes[-1]["y"]))
 
             def inside(e):
-                return (x0 <= e["peak_x"] <= x1
-                        and y0 <= got["base"] + e["peak"] <= y1)
+                """The box touches the peak: its time span, and the
+                height between the baseline and the tip (so a box above
+                the baseline takes positive peaks, below it negative
+                ones, across it both)."""
+                tip = got["base"] + e["peak"]
+                low, high = sorted((got["base"], tip))
+                return (x0 <= e["end"] and x1 >= e["start"]
+                        and y0 <= high and y1 >= low)
 
             marks = list(s.get(f"_bt_out_{sid}") or [])
             kept = [e for e in got["kept"] if inside(e)]
@@ -33819,9 +34064,25 @@ def bt_plot(sid, got):
             "Drag a box across a part with no beats: its noise is measured "
             "(🔇 Noise, on the left), and the stretch is shaded grey."
             if mouse == BT_QUIET else
-            "Drag a box around peaks to remove them all; a box around only "
-            "removed ones (✕) puts them back. Above the baseline only takes "
-            "positive peaks, below it negative ones.")
+            "Drag a box over the peaks to take out of the beats: any peak "
+            "it touches is removed (shown ✕, not counted). A box over only "
+            "removed ones puts them back. Above the baseline it takes "
+            "positive peaks, below it negative ones, across it both.")
+    elif measuring:
+        fig.update_layout(dragmode="zoom", clickmode="event+select")
+        event = st.plotly_chart(fig, key=f"btc_{ver}_measure", config=config,
+                                on_select="rerun", selection_mode="points",
+                                **STRETCH)
+        try:
+            points = [p for p in (event.selection.points or [])
+                      if fig.data[int(p.get("curve_number", -1))].name
+                      == "signal"]
+        except Exception:
+            points = []
+        if points:
+            s["_bt_measure_pending"] = (sid, float(points[-1]["x"]))
+            s["_bt_chart_ver"] = ver + 1
+            st.rerun()
     else:
         event = st.plotly_chart(fig, key=f"btc_{ver}_zoom", config=config,
                                 on_select="rerun", selection_mode="points",
@@ -33850,6 +34111,10 @@ def bt_plot(sid, got):
         st.caption("Drag to zoom in, double-click to zoom out. Click a ▲ ▼ "
                    "to remove that peak, a ✕ to put it back, or untick it "
                    "in 🔺 Peaks below. ↶ Undo takes back the last change.")
+    # 📏 the measuring points: always while measuring, else once placed
+    if measuring or s.get(f"bt_ma_{sid}") is not None \
+            or s.get(f"bt_mb_{sid}") is not None:
+        bt_measure_box(sid, got)
     bt_peaks_table(sid, got)
 
 
@@ -34163,8 +34428,12 @@ def bt_results_rows(got):
     pos_snr, neg_snr = bt_snr(got)
     rows += [("Noise SD, automatic (between peaks, robust)",
               auto["robust_sd"] if auto else np.nan, yu),
-             ("Noise SD, manual (quiet stretch)",
+             ("Noise SD, quiet stretch",
               manual["sd"] if manual else np.nan, yu),
+             ("Noise SD, typed",
+              got.get("noise_typed") or np.nan, yu),
+             ("Noise SD used", (got.get("noise") or {}).get("noise",
+                                                          np.nan), yu),
              ("Signal-to-noise, positive peaks (mean height ÷ noise SD)",
               pos_snr, ""),
              ("Signal-to-noise, negative peaks (mean depth ÷ noise SD)",
@@ -34249,6 +34518,61 @@ def bt_energy_text(sid, got):
     return "\n".join(lines)
 
 
+# the per-peak parameters in the ⭐ Summary, by the start of their name
+# ({w} is Impulse, or Area when y is not a force against time)
+BT_SUMMARY_STATS = ("Positive peak height", "Negative peak depth",
+                    "Full beat duration", "Positive peak duration",
+                    "Negative peak duration", "{w} per positive peak",
+                    "{w} per negative peak", "Energy per positive peak",
+                    "Energy per negative peak")
+BT_SUMMARY_TOTALS = ("Full beats", "Positive peaks", "Negative peaks",
+                     "Beats per minute", "{w}, all peaks",
+                     "Mean force above baseline", "Mean |y − baseline|",
+                     "Energy, all peaks", "Noise SD used",
+                     "Signal-to-noise, positive", "Signal-to-noise, negative")
+
+
+def bt_summary_text(sid, got):
+    """
+    ⭐ The key values alone, to paste into Excel: the signal, its file and
+    k; how many beats and peaks, the rate, the total impulse and energy,
+    the mean force above baseline, the noise and signal-to-noise; then,
+    per peak, the height or depth, the durations, the impulse and the
+    energy, each with n, mean, SD, median and range.
+    """
+    name = st.session_state["_bt_sets"][sid]["name"]
+    word = bta.area_word(got["x_unit"], got["y_unit"])
+    totals = [p.format(w=word) for p in BT_SUMMARY_TOTALS]
+    per_peak = [p.format(w=word) for p in BT_SUMMARY_STATS]
+    lines = [f"Signal\t{name}",
+             f"File\t{bt_file_used(sid) or 'not known'}",
+             f"Spring constant k\t{bt_excel(got['k']) if got['k'] else ''}"
+             "\tN/m", "", "Totals\tValue\tUnit"]
+    for param, value, unit in bt_results_rows(got):
+        if param.startswith(tuple(totals)):
+            param = bt_short(param)
+            if param == "Noise SD used":
+                param += f" ({got.get('noise_kind', 'automatic')})"
+            lines.append(f"{param}\t{bt_excel(value)}\t{unit}")
+    stats = ("n", "Mean", "SD", "Median", "Range")
+    lines += ["", "Per peak\t" + "\t".join(stats) + "\tUnit"]
+    for param, values, unit in bt_stats_rows(got):
+        if param.startswith(tuple(per_peak)):
+            d = bta.describe(values)
+            lines.append(bt_short(param) + "\t" + "\t".join(
+                str(d["n"]) if stat == "n" else bt_excel(d[stat])
+                for stat in stats) + f"\t{unit}")
+    return "\n".join(lines)
+
+
+def bt_short(param):
+    """A parameter's name without its explanation in brackets, for the
+    ⭐ Summary ("Mean force above baseline (impulse ÷ recording time)" →
+    "Mean force above baseline"); "(total, no sign)" → "(total)"."""
+    param = param.replace("(total, no sign)", "(total)")
+    return re.sub(r" \((?!total\))[^()]*\)$", "", param)
+
+
 def bt_impulse_text(sid, got):
     """
     The impulse (the area under each force peak, force × time) alone, to
@@ -34311,24 +34635,13 @@ def bt_integration(sid, got):
             st.caption("Copy with the icon at the top right of a box and "
                        "paste into Excel: every number is written the way "
                        "Excel reads it (5.44662E-16).")
-            word = bta.area_word(xu, yu)
-            t_energy, t_impulse, t_all, t_peaks, t_line = st.tabs(
-                ["⚡ Energy", "∫ " + word, "All results", "Each peak",
-                 "One row"])
-            with t_energy:
-                st.code(bt_energy_text(sid, got), language=None, height=380)
-                st.caption("The energies and power only. Range is the "
-                           "largest minus the smallest.")
-            with t_impulse:
-                st.code(bt_impulse_text(sid, got), language=None,
-                        height=380)
-                st.caption(
-                    f"The impulse only: the area under each force peak, "
-                    f"in {area} (force × time). Mean force above baseline "
-                    "= all the impulse ÷ the recording time."
-                    if word == "Impulse" else
-                    "The areas only: ∫(y − baseline) dx. y is not a force "
-                    "against time, so this is not an impulse.")
+            t_sum, t_all, t_peaks, t_line = st.tabs(
+                ["⭐ Summary", "All results", "Each peak", "One row"])
+            with t_sum:
+                st.code(bt_summary_text(sid, got), language=None,
+                        height=380, wrap_lines=True)
+                st.caption("The key values only. Every other number is in "
+                           "All results.")
             with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
@@ -34402,7 +34715,15 @@ def bt_figure(got, clickable=False, peak_click=False):
         line_width=s["bt_lw"], numbers=s["bt_numbers"],
         shade_beats=s["bt_shade"], clickable=clickable,
         **({"peak_click": True} if peak_click else {}))
-    quiet = got.get("noise_manual")
+    hidden = {trace for name, traces in BT_SHOW_TRACES.items()
+              if not s.get(name, True) for trace in traces}
+    if hidden:
+        figure.data = tuple(trace for trace in figure.data
+                            if trace.name not in hidden)
+    if s.get("bt_show_meas", True):
+        bt_draw_measure(figure, got)
+    quiet = got.get("noise_manual") if s.get("bt_show_quiet", True) \
+        else None
     if quiet:
         figure.add_vrect(x0=quiet["x0"], x1=quiet["x1"], fillcolor="#888",
                          opacity=0.15, line_width=0, layer="below",
@@ -34413,7 +34734,8 @@ def bt_figure(got, clickable=False, peak_click=False):
 
 # what is kept of each signal's settings when it is saved, to open it again
 BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
-                  "merge", "gap", "order", "fu", "k", "nz0", "nz1")
+                  "merge", "gap", "order", "fu", "k", "nz0", "nz1",
+                  "nzmode", "nzval", "nzk", "ma", "mb")
 
 
 def bt_db_store():
@@ -34719,7 +35041,8 @@ def beat_tab():
                        ("bt_col", "#222222"),
                        ("bt_pcol", bta.POS_COLOUR),
                        ("bt_ncol", bta.NEG_COLOUR),
-                       ("bt_numbers", True), ("bt_shade", False)):
+                       ("bt_numbers", True), ("bt_shade", False),
+                       *((name, True) for name in BT_SHOW_PARTS)):
         s.setdefault(key, value)
     # every signal's settings kept while another one is shown
     for key in [k for k in list(s.keys()) if str(k).startswith("bt_")]:
