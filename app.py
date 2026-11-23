@@ -33993,10 +33993,17 @@ def bt_results_rows(got):
               + (float(np.sum(an)) if an else 0.0), area)]
     x = np.asarray(got["x"], float)
     x = x[np.isfinite(x)]
-    rows += [("Beats per minute", info.get("Beat rate (per minute)", np.nan),
+    span = float(x.max() - x.min()) if x.size > 1 else np.nan
+    # ∫ (y·x) over the recording's length (x): the mean of |y − baseline|
+    # inside peaks over the whole recording, in y's own unit, so recordings
+    # of different lengths compare
+    every = (float(np.sum(ap)) if ap else 0.0) + (float(np.sum(an))
+                                                  if an else 0.0)
+    rows += [("Mean force above baseline (∫ all peaks ÷ recording time)",
+              every / span if span and np.isfinite(span) else np.nan, yu),
+             ("Beats per minute", info.get("Beat rate (per minute)", np.nan),
               "/min"),
-             ("Recording time", float(x.max() - x.min()) if x.size > 1
-              else np.nan, xu),
+             ("Recording time", span, xu),
              ("Spring constant k", k if k else np.nan, "N/m")]
     return rows
 
