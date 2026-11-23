@@ -655,6 +655,10 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                "Beat": b["n"], "Beat kind": b["kind"],
                f"Starts{xu}": e["start"], f"Peaks at{xu}": e["peak_x"],
                f"Ends{xu}": e["end"], f"Duration{xu}": e["width"],
+               # a full beat: its first peak's start to its second's end
+               f"Full beat duration{xu}": (b["end"] - b["start"]
+                                           if b["kind"] == KINDS[0]
+                                           else np.nan),
                f"Rise (start to peak){xu}": e["peak_x"] - e["start"],
                f"Height{yu}": e["peak"],
                area_col: e["area"]}
