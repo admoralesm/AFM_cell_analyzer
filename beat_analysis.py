@@ -31,6 +31,13 @@ ENERGY_PREFIXES = ((1.0, "J"), (1e-3, "mJ"), (1e-6, "µJ"), (1e-9, "nJ"),
 ENERGY_UNITS = tuple(unit for _, unit in ENERGY_PREFIXES)
 FORCE_PREFIXES = ((1.0, "N"), (1e-3, "mN"), (1e-6, "µN"), (1e-9, "nN"),
                   (1e-12, "pN"), (1e-15, "fN"))
+# a peak's timing is read where the signal is this part of the peak's
+# height: its duration from 10 % up on the rise to 90 % back (10 % of the
+# height left) on the fall, its rise from 10 % up to the peak, and its width
+# at half height. Where the signal leaves and meets the baseline is lost
+# in the noise and in any slow drift; these levels are not.
+TIMING_LEVEL = 0.10
+HALF_LEVEL = 0.50
 
 
 def unit_of(label):
@@ -265,6 +272,78 @@ def _crossing(x, r, i, j):
     return float(x[i] + (0.0 - r[i]) * (x[j] - x[i]) / (r[j] - r[i]))
 
 
+def _level_times(xs, ss, kk, level):
+    """
+    Where a peak's signal ``ss`` (made positive, 0 at both ends), going
+    out from its top at index ``kk``, first drops under ``level``: on the
+    rise (back in time) and on the fall, each interpolated between the
+    points either side. (x on the rise, x on the fall.)
+    """
+    def cross(a, b):
+        if ss[b] == ss[a]:
+            return float(xs[b])
+        return float(xs[a] + (level - ss[a]) * (xs[b] - xs[a])
+                     / (ss[b] - ss[a]))
+    under = np.flatnonzero(ss[:kk] < level)
+    a = int(under[-1]) if under.size else 0
+    rise = cross(a, a + 1) if under.size else float(xs[0])
+    under = np.flatnonzero(ss[kk + 1:] < level)
+    b = kk + 1 + int(under[0]) if under.size else len(ss) - 1
+    fall = cross(b - 1, b) if under.size else float(xs[-1])
+    return rise, fall
+
+
+def add_timing(event, x, y, base):
+    """
+    Adds a peak's timing, read on its height rather than at the baseline:
+    ``up10`` where it gets to 10 % of its height on the rise, ``back10``
+    where it is back to 10 % on the fall (90 % back), ``up50``/``back50``
+    the same at half height, ``dur`` (up10 to back10), ``half_width``
+    (up50 to back50), ``rise`` (up10 to the peak) and ``recovery`` (the
+    peak to back10). Each is found going out from the peak, so a slow drift
+    before the beat or a slow return after it does not stretch it.
+    """
+    x = np.asarray(x, float)
+    s = event["sign"] * (np.asarray(y, float) - float(base))
+    i0, i1 = int(event["i0"]), int(event["i1"])
+    xs = np.r_[event["start"], x[i0:i1 + 1], event["end"]]
+    ss = np.r_[0.0, s[i0:i1 + 1], 0.0]
+    kk = int(np.argmax(ss))
+    height = float(ss[kk])
+    if not height > 0:
+        return event
+    up10, back10 = _level_times(xs, ss, kk, TIMING_LEVEL * height)
+    up50, back50 = _level_times(xs, ss, kk, HALF_LEVEL * height)
+    event.update(up10=up10, back10=back10, up50=up50, back50=back50,
+                 dur=back10 - up10, half_width=back50 - up50,
+                 rise=float(xs[kk]) - up10, recovery=back10 - float(xs[kk]))
+    return event
+
+
+def peak_duration(event):
+    """A peak's duration: 10 % up to 90 % back (start to end at the
+    baseline when its timing is not there)."""
+    return float(event.get("dur", event["end"] - event["start"]))
+
+
+def rise_time(event):
+    """A peak's rise: 10 % up to the peak (from the baseline when its
+    timing is not there)."""
+    return float(event.get("rise", event["peak_x"] - event["start"]))
+
+
+def recovery_time(event):
+    """A peak's recovery: the peak to 90 % back."""
+    return float(event.get("recovery", event["end"] - event["peak_x"]))
+
+
+def beat_duration(beat):
+    """A beat's duration: its first peak's 10 % up to its last peak's 90 %
+    back. A full beat, Positive then negative: the positive peak's 10 %
+    up to the negative peak's 90 % back."""
+    return float(beat.get("duration", beat["end"] - beat["start"]))
+
+
 def excursions(x, y, base, up, down, min_width=0.0, merge=0.0):
     """
     Each stretch where the signal leaves its baseline and gets past one of
@@ -279,7 +358,8 @@ def excursions(x, y, base, up, down, min_width=0.0, merge=0.0):
 
     Returns dicts sorted by start: sign (+1 / −1), start, end, width,
     peak_x, peak (height from the baseline, signed), area (signed), and
-    i0, i1 (the first and last points inside).
+    i0, i1 (the first and last points inside), with the timing read on the
+    peak's height (``add_timing``: 10 % up, 90 % back, half height).
     """
     x = np.asarray(x, float)
     y = np.asarray(y, float)
@@ -326,7 +406,7 @@ def excursions(x, y, base, up, down, min_width=0.0, merge=0.0):
         for run in merged:
             run["width"] = run["end"] - run["start"]
             if run.pop("reaches") and run["width"] >= float(min_width or 0):
-                found.append(run)
+                found.append(add_timing(run, x, y, base))
     found.sort(key=lambda e: e["start"])
     return found
 
@@ -350,13 +430,17 @@ def pair_beats(events, max_gap=1.0, order=ORDERS[0]):
                 and nxt["start"] - e["end"] <= float(max_gap)):
             pos, neg = (e, nxt) if e["sign"] > 0 else (nxt, e)
             out.append({"kind": KINDS[0], "pos": pos, "neg": neg,
-                        "start": e["start"], "end": nxt["end"]})
+                        "start": e["start"], "end": nxt["end"],
+                        # the first peak's 10 % up to the second's 90 % back
+                        "duration": (nxt.get("back10", nxt["end"])
+                                     - e.get("up10", e["start"]))})
             i += 2
             continue
         out.append({"kind": KINDS[1] if e["sign"] > 0 else KINDS[2],
                     "pos": e if e["sign"] > 0 else None,
                     "neg": e if e["sign"] < 0 else None,
-                    "start": e["start"], "end": e["end"]})
+                    "start": e["start"], "end": e["end"],
+                    "duration": peak_duration(e)})
         i += 1
     for n, beat in enumerate(out, 1):
         beat["n"] = n
@@ -376,15 +460,15 @@ def spring_energy(height, k, newtons):
 def peak_power(event, k, newtons, x_unit):
     """
     A peak's power, in W (J/s): its spring energy F²/2k over its rise time,
-    from where the signal leaves the baseline to the peak. That is the
-    mean rate at which the cantilever was bent to the peak, i.e. the work
-    done on it per second. None without k, a force, or a time on x.
+    from 10 % of its height on the rise to the peak. That is the mean rate
+    at which the cantilever was bent to the peak, i.e. the work done on it
+    per second. None without k, a force, or a time on x.
     """
     energy = spring_energy(abs(event["peak"]), k, newtons)
     per = seconds_per(x_unit)
     if energy is None or not per:
         return None
-    rise = (float(event["peak_x"]) - float(event["start"])) * per
+    rise = rise_time(event) * per
     return energy / rise if rise > 0 else None
 
 
@@ -419,8 +503,9 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
         at = (pos or neg)["peak_x"]
         row = {
             "Beat": b["n"], "Kind": b["kind"],
-            f"Start{xu}": b["start"], f"End{xu}": b["end"],
-            f"Duration{xu}": b["end"] - b["start"],
+            f"Leaves baseline{xu}": b["start"],
+            f"Back at baseline{xu}": b["end"],
+            f"Duration, 10% up to 90% back{xu}": beat_duration(b),
             f"Positive peak{yu}": pos["peak"] if pos else np.nan,
             f"Positive peak at{xu}": pos["peak_x"] if pos else np.nan,
             f"Positive {w}{au}": area_pos if pos else np.nan,
@@ -513,8 +598,9 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
     """
     The beats by kind (full, positive only, negative only), each with how
     many there are and its parameters, every one a (name, values, unit)
-    to give as mean ± SD and range. Each peak: its height (or depth), width,
-    rise (start to peak), fall (peak to end), area and, with k, energy.
+    to give as mean ± SD and range. Each peak: its height (or depth),
+    duration (10 % up to 90 % back), width at half height, rise (10 % up to
+    the peak), recovery (the peak to 90 % back), area and, with k, energy.
     Full beats also: duration, time between their two peaks, total area
     (both without sign) and the beat's energy. Areas have no sign, so a
     negative peak's adds to a positive one's.
@@ -536,8 +622,8 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
         these = [b for b in beats if b["kind"] == kind]
         params = []
         if these and kind == KINDS[0]:
-            params.append(("Duration", [b["end"] - b["start"]
-                                        for b in these], x_unit))
+            params.append(("Duration (10% up to 90% back)",
+                           [beat_duration(b) for b in these], x_unit))
         for side, name, size in (("pos", "Positive peak", "height"),
                                  ("neg", "Negative peak", "depth")):
             peaks = [b[side] for b in these if b[side] is not None]
@@ -545,11 +631,14 @@ def kind_stats(beats, x_unit="", y_unit="", k=None, newtons=None,
                 continue
             params += [
                 (f"{name} {size}", [abs(e["peak"]) for e in peaks], y_unit),
-                (f"{name} duration", [e["width"] for e in peaks], x_unit),
-                (f"{name} rise (start to peak)",
-                 [e["peak_x"] - e["start"] for e in peaks], x_unit),
-                (f"{name} fall (peak to end)",
-                 [e["end"] - e["peak_x"] for e in peaks], x_unit),
+                (f"{name} duration (10% up to 90% back)",
+                 [peak_duration(e) for e in peaks], x_unit),
+                (f"{name} width at half height",
+                 [e.get("half_width", np.nan) for e in peaks], x_unit),
+                (f"{name} rise (10% up to peak)",
+                 [rise_time(e) for e in peaks], x_unit),
+                (f"{name} recovery (peak to 90% back)",
+                 [recovery_time(e) for e in peaks], x_unit),
                 (f"{name} {w.lower()}"
                  + (" (no sign)" if side == "neg" else ""),
                  [abs(e["area"]) for e in peaks], area_unit)]
@@ -622,14 +711,17 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                e_unit=None):
     """
     One row per peak integrated (each peak in the beats), in time order:
-    its sign, the beat it belongs to, where it starts, peaks and ends, its
+    its sign, the beat it belongs to, where it leaves the baseline, gets to
+    10 % of its height, peaks, is 90 % back and meets the baseline again;
+    its duration (10 % up to 90 % back), width at half height, rise and
+    recovery; its
     height above (or depth below) the baseline and its integral
     ∫(y − baseline) dx, trapezoid by trapezoid from where it leaves the
     baseline to where it comes back. When y is a deflection made a force
     (``newtons`` per unit), the force at the peak and ∫F dx too. With k,
     the energy: ∫F dδ from the baseline to the peak with δ = F/k, which
     comes to F²/2k; and with x a time, the power: that energy over the
-    rise time (start to peak), in W.
+    rise time (10 % up to the peak), in W.
     """
     peaks = []
     for b in beats:
@@ -653,13 +745,20 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
     for n, ((e, b), energy) in enumerate(zip(peaks, energies), start=1):
         row = {"Peak": n, "Sign": "+" if e["sign"] > 0 else "−",
                "Beat": b["n"], "Beat kind": b["kind"],
-               f"Starts{xu}": e["start"], f"Peaks at{xu}": e["peak_x"],
-               f"Ends{xu}": e["end"], f"Duration{xu}": e["width"],
-               # a full beat: its first peak's start to its second's end
-               f"Full beat duration{xu}": (b["end"] - b["start"]
+               f"Leaves baseline{xu}": e["start"],
+               f"10% up at{xu}": e.get("up10", np.nan),
+               f"Peaks at{xu}": e["peak_x"],
+               f"90% back at{xu}": e.get("back10", np.nan),
+               f"Back at baseline{xu}": e["end"],
+               f"Duration, 10% up to 90% back{xu}": peak_duration(e),
+               f"Width at half height{xu}": e.get("half_width", np.nan),
+               # a full beat: its first peak's 10 % up to its second's
+               # 90 % back
+               f"Full beat duration{xu}": (beat_duration(b)
                                            if b["kind"] == KINDS[0]
                                            else np.nan),
-               f"Rise (start to peak){xu}": e["peak_x"] - e["start"],
+               f"Rise, 10% up to peak{xu}": rise_time(e),
+               f"Recovery, peak to 90% back{xu}": recovery_time(e),
                f"Height{yu}": e["peak"],
                area_col: e["area"]}
         if as_force:
@@ -765,6 +864,18 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
                 marker=dict(symbol=symbol, size=13 if peak_click else 9,
                             color=e_colour,
                             line=dict(color="white", width=0.8))))
+    timed = [e for e in events if "up10" in e]
+    if timed:
+        fig.add_trace(go.Scatter(
+            x=[v for e in timed for v in (e["up10"], e["back10"])],
+            y=[base + TIMING_LEVEL * e["peak"] for e in timed
+               for _ in (0, 1)],
+            mode="markers", name="10% and 90% points", showlegend=False,
+            hoverinfo="skip" if peak_click else None,
+            hovertemplate=(None if peak_click else
+                           "%{x:.4g}: 10% up or 90% back<extra></extra>"),
+            marker=dict(symbol="line-ns-open", size=12, color="#111111",
+                        line=dict(color="#111111", width=2))))
     if left_out:
         fig.add_trace(go.Scatter(
             x=[e["peak_x"] for e in left_out],
