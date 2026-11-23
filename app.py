@@ -653,7 +653,8 @@ COMPANION_NEEDS = {
                          "peak_table", "energy_factor", "ENERGY_UNITS",
                          "describe", "STATS", "peak_power", "seconds_per",
                          "area_word", "noise_stats", "peak_duration",
-                         "rise_time", "recovery_time", "beat_duration"),
+                         "rise_time", "recovery_time", "beat_duration",
+                         "retime", "timing_of", "TIMINGS"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -33159,7 +33160,7 @@ BT_SHOW_PARTS = {"bt_show_base": "Baseline",
                  "bt_show_lines": "Upper and lower lines",
                  "bt_show_marks": "Peak marks (▲ ▼ ✕)",
                  "bt_show_fill": "Impulse shading under the peaks",
-                 "bt_show_timing": "10% and 90% points (┆)",
+                 "bt_show_timing": "Where peaks start and end (┆)",
                  "bt_show_quiet": "Quiet stretch (grey)",
                  "bt_show_meas": "Measuring points A and B"}
 # the plot's traces each switch hides
@@ -33168,7 +33169,7 @@ BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
                   "bt_show_marks": ("positive peaks", "negative peaks",
                                     "left out"),
                   "bt_show_fill": ("positive areas", "negative areas"),
-                  "bt_show_timing": ("10% and 90% points",)}
+                  "bt_show_timing": ("starts and ends",)}
 
 
 def bt_publication_style():
@@ -33558,6 +33559,13 @@ def bt_analyse(sid, e_unit=None):
     left_out = [e for e in events
                 if any(e["start"] <= m <= e["end"] for m in out_marks)]
     kept = [e for e in events if e not in left_out]
+    noise, kind, noise_auto, noise_manual, typed = bt_noise_used(
+        sid, x, ys, base, events)
+    # where each peak starts and ends (its durations, rise and power): back
+    # within 3 × the noise SD unless changed under 💓 Beats
+    rule, value = bt_timing_rule(sid)
+    bta.retime(events, x, ys, base, rule, value,
+               noise["noise"] if noise else None)
     beats = bta.pair_beats(kept, float(s[key("gap")] or 0.0), s[key("order")])
     fu = s[key("fu")]
     x_unit = bta.unit_of(xcol)
@@ -33572,9 +33580,27 @@ def bt_analyse(sid, e_unit=None):
                        per_minute=BT_PER_MINUTE.get(x_unit), e_unit=e_unit)
     peaks = bta.peak_table(beats, x_unit, y_unit, k=k, newtons=newtons,
                            e_unit=e_unit)
-    # the noise, measured automatically between the peaks and (when a
-    # stretch is given) on a quiet stretch; the one used is chosen under
-    # 🔇 Noise: automatic, the quiet stretch, or a value typed in
+    return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
+            "noise_auto": noise_auto, "noise_manual": noise_manual,
+            "noise": noise, "noise_kind": kind,
+            "noise_typed": float(typed) if typed else None,
+            "sm": int(s[key("sm")]),
+            "base": base, "up": up, "down": down, "events": events,
+            "kept": kept, "left_out": left_out, "beats": beats,
+            "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
+            "y_unit": y_unit, "k": k, "invols": invols, "fu": fu,
+            "newtons": newtons, "sid": sid, "source": source,
+            "shown": shown, "scale": scale,
+            "meta": s["_bt_sets"][sid].get("meta") or {}}
+
+
+def bt_noise_used(sid, x, ys, base, events):
+    """The noise, measured automatically between the peaks and (when a
+    stretch is given) on a quiet stretch; the one used is chosen under
+    🔇 Noise: automatic, the quiet stretch, or a value typed in.
+    (used, its kind, automatic, manual, typed)."""
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
     nz0, nz1 = s.get(key("nz0")), s.get(key("nz1"))
     noise_auto = bta.noise_stats(x, ys, base, events=events)
     noise_manual = (bta.noise_stats(x, ys, base, nz0, nz1)
@@ -33590,18 +33616,45 @@ def bt_analyse(sid, e_unit=None):
     else:
         noise, kind = noise_auto, "automatic"
     s[f"_bt_noise_{sid}"] = noise["noise"] if noise else None
-    return {"x": x, "y": ys, "raw": y, "xcol": xcol, "ycol": ycol,
-            "noise_auto": noise_auto, "noise_manual": noise_manual,
-            "noise": noise, "noise_kind": kind,
-            "noise_typed": float(typed) if typed else None,
-            "sm": int(s[key("sm")]),
-            "base": base, "up": up, "down": down, "events": events,
-            "kept": kept, "left_out": left_out, "beats": beats,
-            "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
-            "y_unit": y_unit, "k": k, "invols": invols, "fu": fu,
-            "newtons": newtons, "sid": sid, "source": source,
-            "shown": shown, "scale": scale,
-            "meta": s["_bt_sets"][sid].get("meta") or {}}
+    return noise, kind, noise_auto, noise_manual, typed
+
+
+def bt_timing_rule(sid):
+    """Where peaks start and end: (rule, its number), back within 3 × the
+    noise SD unless changed."""
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    if s.get(key("tmode")) not in bta.TIMINGS:
+        s[key("tmode")] = bta.TIMINGS[0]
+    if s.get(key("tk")) is None:
+        s[key("tk")] = bta.TIMING_NOISE
+    if s.get(key("tpct")) is None:
+        s[key("tpct")] = bta.TIMING_PERCENT
+    rule = s[key("tmode")]
+    return rule, float(s[key("tk")] if rule == bta.TIMINGS[0]
+                       else s[key("tpct")])
+
+
+def bt_timing_text(got):
+    """How durations were measured, for the report and the captions."""
+    words = bta.timing_of(got["beats"])
+    if "noise" in words and "baseline" not in words:
+        k = words.split("within ")[1].split(" ×")[0]
+        how = (f"from where the signal gets more than {k} noise SDs from "
+               f"the baseline on the rise to where it is back within {k} "
+               "noise SDs on the fall")
+    elif "%" in words:
+        p = words.split("%")[0]
+        how = (f"from {p}% of its height on the rise to {words.split()[-2]} "
+               "back on the fall")
+    else:
+        how = "from where it leaves the baseline to where it meets it again"
+    return (f"Durations ({words}): a peak's runs {how}; its rise from that "
+            "start to the peak, its recovery from the peak to that end; a "
+            "full beat's from its first peak's start to its second's end "
+            "(Positive then negative: the positive's start to the "
+            "negative's end). Width at half height: 50% up to 50% back. "
+            "Impulses run from the baseline to the baseline.")
 
 
 def bt_apply_pending(sid):
@@ -33924,6 +33977,27 @@ def bt_settings(sid, got):
                     format="%.4g",
                     help="Narrower peaks (from leaving the baseline to "
                          "coming back) are ignored.")
+    bt_timing_rule(sid)
+    t1, t2 = st.columns([1.6, 1])
+    t1.selectbox("⏱ Peaks start and end", bta.TIMINGS, key=key("tmode"),
+                 help="Where durations, rises and power are measured from "
+                      "and to. Back within × noise SD (3 unless changed): "
+                      "a peak starts where the signal leaves the noise and "
+                      "ends where it is back in it, the whole beat as you "
+                      "see it. At a % of the peak's height (10%: 10% up to "
+                      "90% back): the standard way to compare beats, "
+                      "leaving out the slow last part of the recovery. "
+                      "Impulses always run from the baseline to the "
+                      "baseline.")
+    if s[key("tmode")] == bta.TIMINGS[0]:
+        t2.number_input("× noise SD", key=key("tk"), min_value=0.0,
+                        step=0.5, format="%.3g",
+                        help="3 unless changed. 0: at the baseline itself.")
+    else:
+        t2.number_input("% of the height", key=key("tpct"), min_value=1.0,
+                        max_value=50.0, step=5.0, format="%.3g",
+                        help="10 unless changed: 10% up to 90% back. 50: "
+                             "the width at half height.")
     st.markdown("**⚡ Force and energy**")
     meta = s["_bt_sets"][sid].get("meta") or {}
     e1, e2 = st.columns(2)
@@ -34329,15 +34403,7 @@ def bt_report(sid, got):
                      + (f", range {bt_neat(d['Range'])}{u}"
                         if d["n"] > 1 else ""))
     lines += ["", "UNITS AND HOW"]
-    lines.append("Durations are read on each peak's height, not where it "
-                 "leaves and meets the baseline (lost in the noise and any "
-                 "slow drift): a peak's duration runs from 10% of its height "
-                 "on the rise to 90% back (10% left) on the fall; its rise "
-                 "from 10% up to the peak; its recovery from the peak to 90% "
-                 "back; its width at half height from 50% up to 50% back. A "
-                 "full beat's duration: its first peak's 10% up to its "
-                 "second's 90% back. Impulses still run from the baseline to "
-                 "the baseline.")
+    lines.append(bt_timing_text(got))
     if area:
         lines.append(
             f"Impulse: the area under each force peak, ∫(F − baseline) dt, "
@@ -34355,7 +34421,7 @@ def bt_report(sid, got):
                      "energy is its two peaks' together.")
         if bta.seconds_per(xu):
             lines.append("Power of a peak: its energy ÷ its rise time (from "
-                         "10% of its height to the peak), in watts "
+                         "its start to the peak), in watts "
                          "(W = J/s). Power, all peaks: the total energy ÷ "
                          "the recording time.")
     lines.append("Range: the largest minus the smallest.")
@@ -34393,20 +34459,23 @@ def bt_where_from(sid, got):
 
 
 def bt_beat_duration(beat):
-    """A full beat's duration: from its first peak's 10 % up to its second
-    peak's 90 % back. With Positive then negative, the positive peak's
-    10 % up to the negative peak's 90 % back."""
+    """A full beat's duration: from where its first peak starts to where
+    its second ends, by the timing rule under 💓 Beats. With Positive then
+    negative, the positive peak's start to the negative peak's end."""
     return bta.beat_duration(beat)
 
 
 def bt_beat_duration_name(got):
-    """The full beat duration's name, saying what it runs between."""
+    """The full beat duration's name, saying what it runs between and by
+    which rule."""
     order = st.session_state.get(f"bt_order_{got['sid']}", bta.ORDERS[0])
-    return ("Full beat duration (positive 10% up to negative 90% back)"
-            if order == bta.ORDERS[0] else
-            "Full beat duration (negative 10% up to positive 90% back)"
-            if order == bta.ORDERS[1] else
-            "Full beat duration (first peak 10% up to second 90% back)")
+    words = bta.timing_of(got["beats"])
+    return ((f"Full beat duration (positive start to negative end, {words})"
+             if order == bta.ORDERS[0] else
+             f"Full beat duration (negative start to positive end, {words})"
+             if order == bta.ORDERS[1] else
+             f"Full beat duration (first peak's start to second's end, "
+             f"{words})"))
 
 
 def bt_stats_rows(got):
@@ -34439,6 +34508,7 @@ def bt_stats_rows(got):
         return np.nan if value is None else value
 
     times = [(b["pos"] or b["neg"])["peak_x"] for b in beats]
+    timing = bta.timing_of(beats)
     return [
         # the energy and power first (BT_ENERGY_ROWS), then the shape
         ("Energy per positive peak", [energy(e) for e in pos], eu),
@@ -34451,21 +34521,21 @@ def bt_stats_rows(got):
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
         (bt_beat_duration_name(got), [bt_beat_duration(b) for b in full],
          xu),
-        ("Positive peak duration (10% up to 90% back)",
+        (f"Positive peak duration ({timing})",
          [bta.peak_duration(e) for e in pos], xu),
-        ("Negative peak duration (10% up to 90% back)",
+        (f"Negative peak duration ({timing})",
          [bta.peak_duration(e) for e in neg], xu),
         ("Positive peak width at half height",
          [e.get("half_width", np.nan) for e in pos], xu),
         ("Negative peak width at half height",
          [e.get("half_width", np.nan) for e in neg], xu),
-        ("Positive peak rise (10% up to peak)",
+        ("Positive peak rise (start to peak)",
          [bta.rise_time(e) for e in pos], xu),
-        ("Negative peak rise (10% up to peak)",
+        ("Negative peak rise (start to peak)",
          [bta.rise_time(e) for e in neg], xu),
-        ("Positive peak recovery (peak to 90% back)",
+        ("Positive peak recovery (peak to end)",
          [bta.recovery_time(e) for e in pos], xu),
-        ("Negative peak recovery (peak to 90% back)",
+        ("Negative peak recovery (peak to end)",
          [bta.recovery_time(e) for e in neg], xu),
         (f"{word} per positive peak", [abs(e["area"]) for e in pos], area),
         (f"{word} per negative peak (no sign)",
@@ -34705,8 +34775,9 @@ def bt_short(param):
     ⭐ Summary ("Mean force above baseline (impulse ÷ recording time)" →
     "Mean force above baseline"); "(total, no sign)" → "(total)"."""
     param = param.replace("(total, no sign)", "(total)")
-    # a duration keeps what it runs between: "(10% up to 90% back)"
-    return re.sub(r" \((?!total\))(?![^()]*%)[^()]*\)$", "", param)
+    # a duration keeps how it was measured: "(within 3 × noise SD)"
+    return re.sub(r" \((?!total\))(?![^()]*(?:%|noise SD|baseline))"
+                  r"[^()]*\)$", "", param)
 
 
 def bt_impulse_text(sid, got):
@@ -34817,8 +34888,8 @@ def bt_integration(sid, got):
         else:
             st.caption(
                 "Energy of a peak: F²/2k, in joules (J). Power of a peak: "
-                "that energy ÷ its rise time (from 10% of its height to "
-                "the peak), in watts (W = J/s). Power, all peaks: the "
+                "that energy ÷ its rise time (from its start to the "
+                "peak), in watts (W = J/s). Power, all peaks: the "
                 "total energy ÷ the recording time. "
                 + ("" if bta.seconds_per(xu) else
                    "⚡ No power here: x is not a time in s or ms. ")
@@ -34873,7 +34944,8 @@ def bt_figure(got, clickable=False, peak_click=False):
 # what is kept of each signal's settings when it is saved, to open it again
 BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
                   "merge", "gap", "order", "fu", "k", "nz0", "nz1",
-                  "nzmode", "nzval", "nzk", "ma", "mb")
+                  "nzmode", "nzval", "nzk", "ma", "mb", "tmode", "tk",
+                  "tpct")
 
 
 def bt_db_store():
@@ -35012,6 +35084,7 @@ def bt_peaks_table(sid, got):
     untick to remove it, tick to put it back."""
     s = st.session_state
     xu, yu = got["x_unit"], got["y_unit"]
+    timing = bta.timing_of(got["beats"])
     beat_at = {}
     for b in got["beats"]:
         for e in (b["pos"], b["neg"]):
@@ -35031,8 +35104,8 @@ def bt_peaks_table(sid, got):
             f"At ({xu})" if xu else "At": e["peak_x"],
             f"Height or depth ({yu})" if yu else "Height or depth":
                 abs(e["peak"]),
-            (f"Duration, 10% up to 90% back ({xu})" if xu
-             else "Duration, 10% up to 90% back"): bta.peak_duration(e),
+            (f"Duration, {timing} ({xu})" if xu
+             else f"Duration, {timing}"): bta.peak_duration(e),
             (f"Full beat duration ({xu})" if xu else "Full beat duration"):
                 bt_beat_duration(b) if b and b["kind"] == bta.KINDS[0]
                 else np.nan,
@@ -35073,14 +35146,10 @@ def bt_peaks_table(sid, got):
                        on_change=bt_peaks_edited, args=(sid, key, spans),
                        column_config=config)
         st.caption("To copy the peaks kept: 📋 Results → Each peak, below. "
-                   "Durations are read on each peak's height, not at the "
-                   "baseline: from 10% of the height on the rise to 90% "
-                   "back (10% left) on the fall, marked ┆ on the plot. "
-                   "Full beat duration: the first peak's 10% up to the "
-                   "second's 90% back (Positive then negative: the "
-                   "positive's 10% up to the negative's 90% back). Power: "
-                   "the peak's energy ÷ its rise time (10% up to the "
-                   "peak).")
+                   + bt_timing_text(got) + " Starts and ends are marked ┆ "
+                   "on the plot; change the rule under 💓 Beats (⏱ Peaks "
+                   "start and end). Power: the peak's energy ÷ its rise "
+                   "time.")
 
 
 def bt_report_box(sid, got):
