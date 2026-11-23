@@ -34380,6 +34380,23 @@ def bt_where_from(sid, got):
     return " · ".join(p for p in parts if p)
 
 
+def bt_beat_duration(beat):
+    """A full beat's duration: from where its first peak leaves the
+    baseline to where its second comes back. With Positive then negative,
+    the positive peak's start to the negative peak's end."""
+    return float(beat["end"] - beat["start"])
+
+
+def bt_beat_duration_name(got):
+    """The full beat duration's name, saying what it runs between."""
+    order = st.session_state.get(f"bt_order_{got['sid']}", bta.ORDERS[0])
+    return ("Full beat duration (positive start to negative end)"
+            if order == bta.ORDERS[0] else
+            "Full beat duration (negative start to positive end)"
+            if order == bta.ORDERS[1] else
+            "Full beat duration (first peak's start to second's end)")
+
+
 def bt_stats_rows(got):
     """
     The peaks' parameters as (name, values, unit), to give as n, mean,
@@ -34420,8 +34437,8 @@ def bt_stats_rows(got):
         ("Power per negative peak", [power(e) for e in neg], "W"),
         ("Positive peak height", [abs(e["peak"]) for e in pos], yu),
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
-        ("Full beat duration (first peak's start to second's end)",
-         [b["end"] - b["start"] for b in full], xu),
+        (bt_beat_duration_name(got), [bt_beat_duration(b) for b in full],
+         xu),
         ("Positive peak duration", [e["width"] for e in pos], xu),
         ("Negative peak duration", [e["width"] for e in neg], xu),
         ("Positive peak rise (start to peak)",
@@ -34992,6 +35009,9 @@ def bt_peaks_table(sid, got):
             f"Height or depth ({yu})" if yu else "Height or depth":
                 abs(e["peak"]),
             f"Duration ({xu})" if xu else "Duration": e["width"],
+            (f"Full beat duration ({xu})" if xu else "Full beat duration"):
+                bt_beat_duration(b) if b and b["kind"] == bta.KINDS[0]
+                else np.nan,
             (f"{bta.area_word(xu, yu)}, no sign ({yu}·{xu})"
              if (xu and yu) else "Area, no sign"): abs(e["area"]),
             "Energy (J)": (bta.spring_energy(abs(e["peak"]), k, newtons)
@@ -35007,6 +35027,9 @@ def bt_peaks_table(sid, got):
             return
         frame = pd.DataFrame(rows)
         frame["Beat"] = frame["Beat"].astype("Int64")
+        whole = [c for c in frame.columns if c.startswith("Full beat")]
+        if whole and frame[whole[0]].isna().all():
+            frame = frame.drop(columns=whole)
         if not (k and newtons):
             frame = frame.drop(columns=["Energy (J)"])
         if not (k and newtons and bta.seconds_per(xu)):
@@ -35026,7 +35049,11 @@ def bt_peaks_table(sid, got):
                        on_change=bt_peaks_edited, args=(sid, key, spans),
                        column_config=config)
         st.caption("To copy the peaks kept: 📋 Results → Each peak, below. "
-                   "Power: the peak's energy ÷ its rise time.")
+                   "Full beat duration: from where the beat's first peak "
+                   "leaves the baseline to where its second comes back "
+                   "(Positive then negative: the positive's start to the "
+                   "negative's end). Power: the peak's energy ÷ its rise "
+                   "time.")
 
 
 def bt_report_box(sid, got):
