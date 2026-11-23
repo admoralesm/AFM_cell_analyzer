@@ -33218,10 +33218,16 @@ def bt_style(figure, got):
         figure.update_xaxes(title_text=s["bt_xtitle"])
 
 
+def bt_clean_changed():
+    """🧼 Signal only, switched: everything hidden, or shown again."""
+    bt_show_all(not st.session_state.get("bt_clean"))
+
+
 def bt_show_all(on):
     """🧼 Signal only (every switch off, the beat numbers and shading too)
     or Show all."""
     s = st.session_state
+    s["bt_clean"] = not on
     for name in BT_SHOW_PARTS:
         s[name] = bool(on)
     s["bt_numbers"] = bool(on)
@@ -34010,9 +34016,20 @@ def bt_plot(sid, got):
              "measure between them. "
              "━ Baseline / Upper / Lower: drag across the plot at the "
              "height the line should be.") or BT_ZOOM
-    m0, m3, m4, m5, m2 = st.columns([3.2, 0.75, 1.0, 1.05, 0.8])
-    m0.caption("🎨 Plot → *Show on the plot* hides the lines and marks, "
-               "for a clean picture. 📷 on the plot saves it as a PNG.")
+    # the two things most wanted for a figure, in sight: a clean plot and
+    # the y axis title; the rest under 🎨 Plot
+    mc, mt, m3, m4, m5, m2 = st.columns([1.15, 2.0, 0.75, 1.0, 1.05, 0.8],
+                                        vertical_alignment="center")
+    mc.toggle("🧼 Signal only", key="bt_clean", on_change=bt_clean_changed,
+              help="On: every line, mark, shading and number hidden, the "
+                   "signal alone, for a figure. Off: all shown again. Each "
+                   "one can also be switched under 🎨 Plot → 👁 Show.")
+    mt.text_input("y axis title", key="bt_ytitle",
+                  label_visibility="collapsed",
+                  placeholder=f"✏️ y axis title: {bt_y_title(got)}",
+                  help="Type a title for the y axis; empty keeps the "
+                       "automatic one. The x axis title is under 🎨 Plot → "
+                       "📐 Axes.")
     gone = list(s.get(f"_bt_out_{sid}") or [])
     m3.button("↶ Undo", key=f"btb_undo_{sid}", on_click=bt_undo,
               args=(sid,), disabled=not s.get(f"_bt_hist_{sid}"),
@@ -34029,39 +34046,39 @@ def bt_plot(sid, got):
                        "axes, black boxed axes with ticks outside, no "
                        "grid, a large font, the y axis fitted to the "
                        "signal.")
-        st.slider("Height", 250, 900, step=10, key="bt_height")
-        st.slider("Line thickness", 0.5, 5.0, step=0.1, key="bt_lw")
-        st.slider("Axis thickness", 0.5, 5.0, step=0.1, key="bt_axw")
-        st.slider("Font size", 9, 30, key="bt_fs")
-        st.toggle("Grid lines", key="bt_grid")
-        st.markdown("**Axes**")
-        y1, y2 = st.columns(2)
-        y1.number_input("y from", key="bt_ymin", value=None,
-                        format="%.6g", help="Empty: fitted to the signal.")
-        y2.number_input("y to", key="bt_ymax", value=None, format="%.6g")
-        x1, x2 = st.columns(2)
-        x1.number_input("x from", key="bt_xmin", value=None,
-                        format="%.6g", help="Empty: the whole recording.")
-        x2.number_input("x to", key="bt_xmax", value=None, format="%.6g")
-        st.text_input("y axis title", key="bt_ytitle",
-                      placeholder=bt_y_title(got))
-        st.text_input("x axis title", key="bt_xtitle",
-                      placeholder=got["xcol"])
-        st.color_picker("Signal", key="bt_col")
-        st.color_picker("Positive peaks", key="bt_pcol")
-        st.color_picker("Negative peaks", key="bt_ncol")
-        st.toggle("Number the beats", key="bt_numbers")
-        st.toggle("Shade each full beat", key="bt_shade")
-        st.markdown("**Show on the plot**")
-        for name, label in BT_SHOW_PARTS.items():
-            st.toggle(label, key=name)
-        c1, c2 = st.columns(2)
-        c1.button("🧼 Signal only", key="btb_clean", on_click=bt_show_all,
-                  args=(False,), **STRETCH,
-                  help="Hides every line, mark, shading and number: the "
-                       "signal alone, for a figure.")
-        c2.button("Show all", key="btb_showall", on_click=bt_show_all,
-                  args=(True,), **STRETCH)
+        p_axes, p_look, p_show = st.tabs(["📐 Axes", "🖌 Look", "👁 Show"])
+        with p_axes:
+            y1, y2 = st.columns(2)
+            y1.number_input("y from", key="bt_ymin", value=None,
+                            format="%.6g",
+                            help="Empty: fitted to the signal.")
+            y2.number_input("y to", key="bt_ymax", value=None,
+                            format="%.6g")
+            x1, x2 = st.columns(2)
+            x1.number_input("x from", key="bt_xmin", value=None,
+                            format="%.6g",
+                            help="Empty: the whole recording.")
+            x2.number_input("x to", key="bt_xmax", value=None,
+                            format="%.6g")
+            st.text_input("x axis title", key="bt_xtitle",
+                          placeholder=got["xcol"])
+            st.caption("The y axis title is in the box above the plot.")
+        with p_look:
+            st.slider("Height", 250, 900, step=10, key="bt_height")
+            st.slider("Line thickness", 0.5, 5.0, step=0.1, key="bt_lw")
+            st.slider("Axis thickness", 0.5, 5.0, step=0.1, key="bt_axw")
+            st.slider("Font size", 9, 30, key="bt_fs")
+            st.toggle("Grid lines", key="bt_grid")
+            st.color_picker("Signal", key="bt_col")
+            st.color_picker("Positive peaks", key="bt_pcol")
+            st.color_picker("Negative peaks", key="bt_ncol")
+        with p_show:
+            for name, label in BT_SHOW_PARTS.items():
+                st.toggle(label, key=name)
+            st.toggle("Number the beats", key="bt_numbers")
+            st.toggle("Shade each full beat", key="bt_shade")
+            st.button("Show all", key="btb_showall", on_click=bt_show_all,
+                      args=(True,), **STRETCH)
     drawing = mouse in (BT_BASE, BT_UP, BT_LOW)
     boxing = mouse in (BT_BOX, BT_QUIET)
     measuring = mouse == BT_MEASURE
@@ -35123,6 +35140,7 @@ def beat_tab():
                        ("bt_pcol", bta.POS_COLOUR),
                        ("bt_ncol", bta.NEG_COLOUR),
                        ("bt_numbers", True), ("bt_shade", False),
+                       ("bt_clean", False),
                        *((name, True) for name in BT_SHOW_PARTS)):
         s.setdefault(key, value)
     # every signal's settings kept while another one is shown
