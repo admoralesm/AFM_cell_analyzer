@@ -34622,6 +34622,9 @@ def bt_results_rows(got):
     # of different lengths compare
     every = (float(np.sum(ap)) if ap else 0.0) + (float(np.sum(an))
                                                   if an else 0.0)
+    rows += [(f"{word} per minute, all peaks (total ÷ recording time)",
+              every / seconds * 60 if seconds else np.nan,
+              f"{area}/min" if area else "")]
     rows += [(("Mean force above baseline (impulse ÷ recording time)"
                if word == "Impulse" else
                "Mean |y − baseline| (area ÷ recording time)"),
@@ -34723,51 +34726,130 @@ def bt_energy_text(sid, got):
     return "\n".join(lines)
 
 
-# the per-peak parameters in the ⭐ Summary, by the start of their name
-# ({w} is Impulse, or Area when y is not a force against time)
-BT_SUMMARY_STATS = ("Positive peak height", "Negative peak depth",
-                    "Full beat duration", "Positive peak duration",
-                    "Negative peak duration", "{w} per positive peak",
-                    "{w} per negative peak", "Energy per positive peak",
-                    "Energy per negative peak")
-BT_SUMMARY_TOTALS = ("Full beats", "Positive peaks", "Negative peaks",
-                     "Beats per minute", "{w}, all peaks",
-                     "Mean force above baseline", "Mean |y − baseline|",
-                     "Energy, all peaks", "Noise SD used",
-                     "Signal-to-noise, positive", "Signal-to-noise, negative")
+# ⭐ Summary: what comparing cells (before and after a treatment) needs,
+# in this order, each as (its name in the Summary, the start of its name in
+# bt_results_rows or bt_stats_rows); a name of None keeps the row's own,
+# shortened. {w} is Impulse (Area when y is not a force against time), {f}
+# Peak force (Peak height when y is not a force).
+BT_SUMMARY_TOTALS = (
+    ("Energy, all peaks (total)", "Energy, all peaks"),
+    ("Energy, positive peaks (total)", "Energy, positive peaks"),
+    ("Energy, negative peaks (total)", "Energy, negative peaks"),
+    ("{w}, all peaks (total)", "{w}, all peaks"),
+    ("{w}, positive peaks (total)", "{w}, positive peaks"),
+    ("{w}, negative peaks (total)", "{w}, negative peaks"),
+    ("{w} per minute, all peaks", "{w} per minute"),
+    ("Beats per minute", "Beats per minute"),
+    ("Full beats", "Full beats"),
+    ("Positive only beats", "Positive only"),
+    ("Negative only beats", "Negative only"),
+    ("Signal-to-noise, positive peaks", "Signal-to-noise, positive"),
+    ("Signal-to-noise, negative peaks", "Signal-to-noise, negative"))
+BT_SUMMARY_STATS = (
+    ("{f}, positive peaks", "Positive peak height"),
+    ("{f}, negative peaks (depth)", "Negative peak depth"),
+    ("Energy per positive peak", "Energy per positive peak"),
+    ("Energy per negative peak", "Energy per negative peak"),
+    ("{w} per positive peak", "{w} per positive peak"),
+    ("{w} per negative peak", "{w} per negative peak"),
+    (None, "Full beat duration"),
+    (None, "Positive peak duration"),
+    (None, "Negative peak duration"),
+    ("Time between beats", "Time between beats"))
+# the per-peak statistics in the Summary, and the one in its one line
+BT_SUMMARY_STAT_COLS = ("n", "Mean", "SD", "Median", "Range")
+
+
+def bt_summary_parts(sid, got):
+    """
+    The ⭐ Summary's pieces: the head (the signal, its file, k, the
+    recording time, the noise used and how durations were measured), the
+    totals over the recording ((name, value, unit)) and the per-peak
+    statistics ((name, describe() of the values, unit)), in the order of
+    BT_SUMMARY_TOTALS and BT_SUMMARY_STATS. Rows with nothing to give are
+    kept, empty, so every recording's Summary lines up.
+    """
+    word = bta.area_word(got["x_unit"], got["y_unit"])
+    peak = "Peak force" if got.get("newtons") else "Peak height"
+
+    def named(label, param):
+        if label is None:
+            return bt_short(param)
+        return label.format(w=word, f=peak)
+
+    results = bt_results_rows(got)
+    totals = []
+    for label, start in BT_SUMMARY_TOTALS:
+        start = start.format(w=word)
+        for param, value, unit in results:
+            if param.startswith(start):
+                totals.append((named(label, param), value, unit))
+                break
+    stats = bt_stats_rows(got)
+    per_peak = []
+    for label, start in BT_SUMMARY_STATS:
+        start = start.format(w=word)
+        for param, values, unit in stats:
+            if param.startswith(start):
+                per_peak.append((named(label, param), bta.describe(values),
+                                 unit))
+                break
+    find = {param: (value, unit) for param, value, unit in results}
+    span, xu = find.get("Recording time", (np.nan, got["x_unit"]))
+    noise, yu = find.get("Noise SD used", (np.nan, got["y_unit"]))
+    head = [("Signal", st.session_state["_bt_sets"][sid]["name"], ""),
+            ("File", bt_file_used(sid) or "not known", ""),
+            ("Spring constant k", got["k"] if got["k"] else np.nan, "N/m"),
+            ("Recording time", span, xu),
+            (f"Noise SD used ({got.get('noise_kind', 'automatic')})",
+             noise, yu),
+            ("Durations measured", bta.timing_of(got["beats"]), "")]
+    return head, totals, per_peak
 
 
 def bt_summary_text(sid, got):
     """
-    ⭐ The key values alone, to paste into Excel: the signal, its file and
-    k; how many beats and peaks, the rate, the total impulse and energy,
-    the mean force above baseline, the noise and signal-to-noise; then,
-    per peak, the height or depth, the durations, the impulse and the
-    energy, each with n, mean, SD, median and range.
+    ⭐ The key values alone, to paste into Excel: the head (signal, file,
+    k, recording time, noise, how durations were measured); the totals
+    over the recording (energy and impulse, all peaks and each sign, the
+    impulse per minute, the beat rate, the kinds of beat, signal-to-noise);
+    then per peak the peak force, energy, impulse, durations and time
+    between beats, each with n, mean, SD, median and range.
     """
-    name = st.session_state["_bt_sets"][sid]["name"]
-    word = bta.area_word(got["x_unit"], got["y_unit"])
-    totals = [p.format(w=word) for p in BT_SUMMARY_TOTALS]
-    per_peak = [p.format(w=word) for p in BT_SUMMARY_STATS]
-    lines = [f"Signal\t{name}",
-             f"File\t{bt_file_used(sid) or 'not known'}",
-             f"Spring constant k\t{bt_excel(got['k']) if got['k'] else ''}"
-             "\tN/m", "", "Totals\tValue\tUnit"]
-    for param, value, unit in bt_results_rows(got):
-        if param.startswith(tuple(totals)):
-            param = bt_short(param)
-            if param == "Noise SD used":
-                param += f" ({got.get('noise_kind', 'automatic')})"
-            lines.append(f"{param}\t{bt_excel(value)}\t{unit}")
-    stats = ("n", "Mean", "SD", "Median", "Range")
-    lines += ["", "Per peak\t" + "\t".join(stats) + "\tUnit"]
-    for param, values, unit in bt_stats_rows(got):
-        if param.startswith(tuple(per_peak)):
-            d = bta.describe(values)
-            lines.append(bt_short(param) + "\t" + "\t".join(
-                str(d["n"]) if stat == "n" else bt_excel(d[stat])
-                for stat in stats) + f"\t{unit}")
+    head, totals, per_peak = bt_summary_parts(sid, got)
+    lines = [f"{name}\t{bt_excel(value)}\t{unit}".rstrip("\t")
+             for name, value, unit in head]
+    lines += ["", "Over the recording\tValue\tUnit"]
+    lines += [f"{name}\t{bt_excel(value)}\t{unit}"
+              for name, value, unit in totals]
+    lines += ["", "Per peak\t" + "\t".join(BT_SUMMARY_STAT_COLS) + "\tUnit"]
+    for name, d, unit in per_peak:
+        lines.append(name + "\t" + "\t".join(
+            str(d["n"]) if stat == "n" else bt_excel(d[stat])
+            for stat in BT_SUMMARY_STAT_COLS) + f"\t{unit}")
     return "\n".join(lines)
+
+
+def bt_summary_line(sid, got):
+    """
+    The ⭐ Summary as one line under a header, for a table with a row per
+    recording (one per cell, before and after): the signal and file, the
+    recording time, every total, then the mean of each per-peak value.
+    Units are in the column names.
+    """
+    head, totals, per_peak = bt_summary_parts(sid, got)
+    cols, values = [], []
+    for name, value, unit in head[:4] + totals:
+        cols.append(f"{name} ({unit})" if unit else name)
+        values.append(bt_excel(value))
+    for name, d, unit in per_peak:
+        cols.append(f"{name}, mean ({unit})" if unit else f"{name}, mean")
+        values.append(bt_excel(d["Mean"]))
+    noise_name, noise, yu = head[4]
+    cols += [f"{noise_name} ({yu})" if yu else noise_name,
+             "Durations measured"]
+    values += [bt_excel(noise), head[5][1]]
+    return "\t".join(cols) + "\n" + "\t".join(values)
 
 
 def bt_short(param):
@@ -34776,7 +34858,7 @@ def bt_short(param):
     "Mean force above baseline"); "(total, no sign)" → "(total)"."""
     param = param.replace("(total, no sign)", "(total)")
     # a duration keeps how it was measured: "(within 3 × noise SD)"
-    return re.sub(r" \((?!total\))(?![^()]*(?:%|noise SD|baseline))"
+    return re.sub(r" \((?!total\))(?![^()]*(?:%|× noise SD|baseline))"
                   r"[^()]*\)$", "", param)
 
 
@@ -34847,8 +34929,21 @@ def bt_integration(sid, got):
             with t_sum:
                 st.code(bt_summary_text(sid, got), language=None,
                         height=380, wrap_lines=True)
-                st.caption("The key values only. Every other number is in "
-                           "All results.")
+                st.caption("The key values for comparing cells: energy and "
+                           "impulse over the recording (all peaks and each "
+                           "sign), the impulse per minute (fair for windows "
+                           "of different lengths), the beat rate and kinds "
+                           "of beat, then per peak the force, energy, "
+                           "impulse and durations. Every other number is "
+                           "in All results.")
+                st.markdown("**The same in one line**, for a table with a "
+                            "row per recording")
+                st.code(bt_summary_line(sid, got), language=None,
+                        height=110)
+                st.caption("Paste the header once, then each recording's "
+                           "line under the last (before and after a "
+                           "treatment, one row each). Per-peak values are "
+                           "their means.")
             with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
