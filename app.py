@@ -12,8 +12,10 @@ import contextlib
 import copy
 import csv
 import fnmatch
+import html
 import importlib
 import importlib.util
+import inspect
 import io
 import json
 import math
@@ -34756,10 +34758,6 @@ BT_SUMMARY_STATS = (
     (None, "Positive peak duration"),
     (None, "Negative peak duration"),
     ("Time between beats", "Time between beats"))
-# the per-peak statistics in the Summary, and the one in its one line
-BT_SUMMARY_STAT_COLS = ("n", "Mean", "SD", "Median", "Range")
-
-
 def bt_summary_parts(sid, got):
     """
     The ⭐ Summary's pieces: the head (the signal, its file, k, the
@@ -34807,49 +34805,136 @@ def bt_summary_parts(sid, got):
     return head, totals, per_peak
 
 
+BT_SUMMARY_COLS = ("Parameter", "Value", "± SD", "n", "Unit")
+
+
+def bt_summary_table(sid, got):
+    """
+    The ⭐ Summary as one table, the same five columns throughout
+    (BT_SUMMARY_COLS), to paste into Excel, PowerPoint or Word: the
+    recording first, then its totals, then each per-peak value as its mean
+    ± SD over n peaks. Numbers to four figures, as Excel writes them
+    (5.195E-15). (rows, each a list of five strings; the indices of the
+    section rows, which have only a name.)
+    """
+    head, totals, per_peak = bt_summary_parts(sid, got)
+
+    def number(value):
+        return value if isinstance(value, str) else bta.pretty(value, 4)
+
+    rows, sections = [], set()
+    for name, value, unit in head:
+        rows.append([name, number(value), "", "", unit])
+    sections.add(len(rows))
+    rows.append(["Over the recording", "", "", "", ""])
+    for name, value, unit in totals:
+        rows.append([name, number(value), "", "", "" if unit == "n" else unit])
+    sections.add(len(rows))
+    rows.append(["Per peak (mean ± SD of n peaks)", "", "", "", ""])
+    for name, d, unit in per_peak:
+        rows.append([name, number(d["Mean"]), number(d["SD"]),
+                     str(d["n"]), unit])
+    return rows, sections
+
+
 def bt_summary_text(sid, got):
-    """
-    ⭐ The key values alone, to paste into Excel: the head (signal, file,
-    k, recording time, noise, how durations were measured); the totals
-    over the recording (energy and impulse, all peaks and each sign, the
-    impulse per minute, the beat rate, the kinds of beat, signal-to-noise);
-    then per peak the peak force, energy, impulse, durations and time
-    between beats, each with n, mean, SD, median and range.
-    """
-    head, totals, per_peak = bt_summary_parts(sid, got)
-    lines = [f"{name}\t{bt_excel(value)}\t{unit}".rstrip("\t")
-             for name, value, unit in head]
-    lines += ["", "Over the recording\tValue\tUnit"]
-    lines += [f"{name}\t{bt_excel(value)}\t{unit}"
-              for name, value, unit in totals]
-    lines += ["", "Per peak\t" + "\t".join(BT_SUMMARY_STAT_COLS) + "\tUnit"]
-    for name, d, unit in per_peak:
-        lines.append(name + "\t" + "\t".join(
-            str(d["n"]) if stat == "n" else bt_excel(d[stat])
-            for stat in BT_SUMMARY_STAT_COLS) + f"\t{unit}")
-    return "\n".join(lines)
+    """The ⭐ Summary table as tab-separated text, its header first: what
+    the copy button gives a program that takes no table."""
+    rows, _ = bt_summary_table(sid, got)
+    return "\n".join("\t".join(r) for r in [list(BT_SUMMARY_COLS), *rows])
 
 
-def bt_summary_line(sid, got):
+def bt_table_html(rows, sections, cols=BT_SUMMARY_COLS):
+    """A table as HTML that PowerPoint, Word and Excel paste as a table:
+    plain cells, thin borders, section rows in bold."""
+    esc = html.escape
+    cell = "border:1px solid #9a9a9a;padding:2px 6px;"
+    out = ["<table style=\"border-collapse:collapse;font-family:Arial,"
+           "sans-serif;font-size:11pt\">",
+           "<tr>" + "".join(f"<th style=\"{cell}text-align:left;"
+                            f"background:#eeeeee\">{esc(c)}</th>"
+                            for c in cols) + "</tr>"]
+    for i, row in enumerate(rows):
+        bold = "font-weight:bold;" if i in sections else ""
+        out.append("<tr>" + "".join(
+            f"<td style=\"{cell}{bold}"
+            f"{'text-align:right;white-space:nowrap;' if 0 < k < 4 else ''}"
+            f"\">{esc(v)}</td>"
+            for k, v in enumerate(row)) + "</tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
+def bt_copy_button(label, table_html, text, uid):
     """
-    The ⭐ Summary as one line under a header, for a table with a row per
-    recording (one per cell, before and after): the signal and file, the
-    recording time, every total, then the mean of each per-peak value.
-    Units are in the column names.
+    A button that copies a table to the clipboard as a table (HTML, which
+    PowerPoint, Word and Excel paste as a table) and as tab-separated text,
+    with a note saying whether it worked. ``uid`` keeps its parts apart from
+    another such button on the page.
     """
-    head, totals, per_peak = bt_summary_parts(sid, got)
-    cols, values = [], []
-    for name, value, unit in head[:4] + totals:
-        cols.append(f"{name} ({unit})" if unit else name)
-        values.append(bt_excel(value))
-    for name, d, unit in per_peak:
-        cols.append(f"{name}, mean ({unit})" if unit else f"{name}, mean")
-        values.append(bt_excel(d["Mean"]))
-    noise_name, noise, yu = head[4]
-    cols += [f"{noise_name} ({yu})" if yu else noise_name,
-             "Durations measured"]
-    values += [bt_excel(noise), head[5][1]]
-    return "\t".join(cols) + "\n" + "\t".join(values)
+    uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(uid))
+    # no "<" in the script's text: the page's HTML cleaner drops a script
+    # that holds tags, even inside a string
+    payload = json.dumps({"html": table_html, "text": text}).replace(
+        "<", "\\u003c").replace(">", "\\u003e")
+    body = f"""
+<style>
+  .btcopy-{uid} button {{ font: inherit; font-size: 15px; padding: 6px 14px;
+      border-radius: 8px; border: 1px solid #c8c8cc; background: #f0f2f6;
+      color: #262730; cursor: pointer; }}
+  .btcopy-{uid} button:hover {{ border-color: #ff4b4b; color: #ff4b4b; }}
+  .btcopy-{uid} span {{ font-size: 14px; margin-left: 10px; }}
+</style>
+<div class="btcopy-{uid}">
+  <button id="btcopy-go-{uid}">{html.escape(label)}</button><span
+   id="btcopy-note-{uid}"></span>
+  <div id="btcopy-tab-{uid}"
+   style="position:fixed;left:-99999px;top:0"></div>
+</div>
+<script>
+(function () {{
+  const data = {payload};
+  const tab = document.getElementById("btcopy-tab-{uid}");
+  const go = document.getElementById("btcopy-go-{uid}");
+  const note = document.getElementById("btcopy-note-{uid}");
+  if (!tab || !go || !note) return;
+  tab.innerHTML = data.html;
+  async function copy() {{
+    try {{
+      await navigator.clipboard.write([new ClipboardItem({{
+        "text/html": new Blob([data.html], {{type: "text/html"}}),
+        "text/plain": new Blob([data.text], {{type: "text/plain"}})}})]);
+      return true;
+    }} catch (err) {{
+      const range = document.createRange();
+      range.selectNode(tab);
+      const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(range);
+      let ok = false;
+      try {{ ok = document.execCommand("copy"); }} catch (e) {{ ok = false; }}
+      sel.removeAllRanges();
+      return ok;
+    }}
+  }}
+  go.onclick = async () => {{
+    if (await copy()) {{
+      note.style.color = "#3d8b40";
+      note.textContent = "✓ Copied. Paste into PowerPoint, Excel or Word.";
+    }} else {{
+      note.style.color = "#b3261e";
+      note.textContent = "Could not copy here: use Values only, below, or "
+                         + "select the table and press Ctrl+C.";
+    }}
+  }};
+}})();
+</script>"""
+    # st.html runs the script in the page itself; on a Streamlit too old for
+    # that, the same in a small frame
+    if "unsafe_allow_javascript" in inspect.signature(st.html).parameters:
+        st.html(body, unsafe_allow_javascript=True)
+    else:
+        import streamlit.components.v1 as components
+        components.html(body, height=46)
 
 
 def bt_short(param):
@@ -34927,23 +35012,39 @@ def bt_integration(sid, got):
             t_sum, t_all, t_peaks, t_line = st.tabs(
                 ["⭐ Summary", "All results", "Each peak", "One row"])
             with t_sum:
-                st.code(bt_summary_text(sid, got), language=None,
-                        height=380, wrap_lines=True)
-                st.caption("The key values for comparing cells: energy and "
-                           "impulse over the recording (all peaks and each "
-                           "sign), the impulse per minute (fair for windows "
-                           "of different lengths), the beat rate and kinds "
-                           "of beat, then per peak the force, energy, "
-                           "impulse and durations. Every other number is "
-                           "in All results.")
-                st.markdown("**The same in one line**, for a table with a "
-                            "row per recording")
-                st.code(bt_summary_line(sid, got), language=None,
-                        height=110)
-                st.caption("Paste the header once, then each recording's "
-                           "line under the last (before and after a "
-                           "treatment, one row each). Per-peak values are "
-                           "their means.")
+                rows, sections = bt_summary_table(sid, got)
+                bt_copy_button("📋 Copy the table",
+                               bt_table_html(rows, sections),
+                               bt_summary_text(sid, got), f"sum_{sid}")
+                shown = pd.DataFrame(rows, columns=BT_SUMMARY_COLS)
+                st.dataframe(
+                    shown.style.apply(
+                        lambda r: ["font-weight: bold" if r.name in sections
+                                   else ""] * len(r), axis=1),
+                    hide_index=True, **STRETCH,
+                    height=min(35 * (len(rows) + 1) + 3, 560),
+                    column_config={
+                        name: st.column_config.TextColumn(width=w)
+                        for name, w in zip(BT_SUMMARY_COLS,
+                                           (196, 96, 66, 28, 58))})
+                st.caption("The key values for comparing cells, in five "
+                           "columns: energy and impulse over the recording "
+                           "(all peaks and each sign), the impulse per "
+                           "minute (fair for windows of different "
+                           "lengths), the beat rate and kinds of beat, then "
+                           "per peak the force, energy, impulse and "
+                           "durations as mean ± SD. 📋 Copy the table pastes "
+                           "as a table into PowerPoint, Excel or Word. Every "
+                           "other number is in All results.")
+                with st.expander("Values only, one column: to paste "
+                                 "beside another recording's"):
+                    st.code("\n".join([name] + [r[1] for r in rows]),
+                            language=None, height=300)
+                    st.caption("The Value column alone, in the same rows as "
+                               "the table, headed by this recording's name. "
+                               "Paste it to the right of another recording's "
+                               "table in Excel to compare them side by "
+                               "side, before and after.")
             with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
