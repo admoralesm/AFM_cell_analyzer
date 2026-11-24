@@ -572,6 +572,16 @@ except Exception as exc:  # pragma: no cover - only on a broken deploy
     bta = None
     BEAT_ERROR = str(exc)
 
+# The Force and motion tab: a force trace and the video's length change of
+# the same cell, on one clock, beat by beat.
+try:
+    import force_motion as fmo
+
+    FM_ERROR = ""
+except Exception as exc:  # pragma: no cover - only on a broken deploy
+    fmo = None
+    FM_ERROR = str(exc)
+
 # The Fourier tab: spectra, peaks, spectrogram, band-pass.
 try:
     import fourier as ftr
@@ -661,6 +671,8 @@ COMPANION_NEEDS = {
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
                    "bandpass", "seconds_per"),
+    "force_motion.py": ("best_offset", "beat_motion", "correlation", "SIGNS",
+                        "clean", "step_of"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -668,12 +680,14 @@ fcv = _current(fcv, *COMPANION_NEEDS["force_curve.py"])
 bta = _current(bta, *COMPANION_NEEDS["beat_analysis.py"])
 ai = _current(ai, *COMPANION_NEEDS["afm_images.py"])
 ftr = _current(ftr, *COMPANION_NEEDS["fourier.py"])
+fmo = _current(fmo, *COMPANION_NEEDS["force_motion.py"])
 OUTDATED = [name for name, module in (("auto_analysis.py", aa),
                                       ("stack_compare.py", sc),
                                       ("force_curve.py", fcv),
                                       ("beat_analysis.py", bta),
                                       ("afm_images.py", ai),
-                                      ("fourier.py", ftr))
+                                      ("fourier.py", ftr),
+                                      ("force_motion.py", fmo))
             if module is not None
             and any(not _has_name(module, n) for n in COMPANION_NEEDS[name])]
 
@@ -23378,8 +23392,9 @@ SHOW_DATABASE_TAB = False
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only.
 (
-    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_fourier,
-    tab_force, tab_igor, tab_fitting, tab_celldb, tab_video, tab_db,
+    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_fm,
+    tab_fourier, tab_force, tab_igor, tab_fitting, tab_celldb, tab_video,
+    tab_db,
 ) = st.tabs(
     [
         "🎬 Video: clip and analyze",
@@ -23387,6 +23402,7 @@ SHOW_DATABASE_TAB = False
         "📚 Stack & compare",
         "🔗 Series",
         "💓 Beat analysis",
+        "🤝 Force and motion",
         "〰 Fourier",
         "📈 Single force curve",
         "🔧 Create force-ε file from ibw files",
@@ -23396,7 +23412,7 @@ SHOW_DATABASE_TAB = False
         "📋 Database",
     ]
 )
-FITTING_TAB_NUMBER = 9
+FITTING_TAB_NUMBER = 10
 
 with tab_fitting:
     (
@@ -23424,7 +23440,7 @@ def _top_tab(n, selected=False):
 
 
 _hidden = [
-    index for index, wanted in ((11, SHOW_VIDEO_TAB), (12, SHOW_DATABASE_TAB))
+    index for index, wanted in ((12, SHOW_VIDEO_TAB), (13, SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -35501,6 +35517,8 @@ def beat_tab():
                   help="Remove this signal from the tab.", **STRETCH)
         st.caption(f"From {sets[sid]['source']}.")
     got = bt_analyse(sid)
+    # the analysis shown, for 🤝 Force and motion to use without redoing it
+    s["_bt_got_last"] = (sid, got)
     with left:
         if got is None:
             st.error("This table needs two columns of numbers.")
@@ -35529,6 +35547,489 @@ with tab_beats:
                  icon="🚫")
     elif not outdated_notice("beat_analysis.py"):
         beat_tab()
+
+
+# ======================================================= Force and motion ==
+#
+# The 🤝 Force and motion tab: a force signal from 💓 Beat analysis and the
+# video's length change of the same cell, recorded at the same time, put on
+# one clock and read beat by beat (force_motion.py). Its settings are fm_*.
+
+FM_CLOCK = ("Find it: the best match anywhere", "Find it near my value",
+            "Use my value")
+FM_SESSION = "This session's video analysis"
+FM_FILE = "A file (the video's _timeseries.csv, or any table)"
+FM_FORCE_COLOUR, FM_MOTION_COLOUR = "#222222", "#2a78d6"
+
+
+def fm_force_got(sid):
+    """A Beat analysis signal's analysis: the one shown on that tab when
+    it is this signal, else worked out."""
+    last = st.session_state.get("_bt_got_last")
+    if last and last[0] == sid and last[1] is not None:
+        return last[1]
+    return bt_analyse(sid)
+
+
+def fm_force_beats(got):
+    """
+    Each beat of a Beat analysis signal as force_motion wants it, in
+    seconds: where it starts and ends (by the timing rule set there), when
+    its force peaks and is half way up (its positive peak; a negative-only
+    beat's negative one), its peak force, and what to carry along: its
+    number, kind, negative depth, energy and impulse.
+    """
+    per = bta.seconds_per(got["x_unit"]) or 1.0
+    k, newtons = got["k"], got["newtons"]
+    rows = []
+    for i, b in enumerate(got["beats"]):
+        events = [e for e in (b["pos"], b["neg"]) if e is not None]
+        main = b["pos"] if b["pos"] is not None else b["neg"]
+        energy = (sum(bta.spring_energy(abs(e["peak"]), k, newtons)
+                      for e in events) if (k and newtons) else np.nan)
+        rows.append({
+            "n": i + 1, "kind": b["kind"],
+            "t0": min(e.get("up", e["start"]) for e in events) * per,
+            "t1": max(e.get("back", e["end"]) for e in events) * per,
+            "t_peak": float(main["peak_x"]) * per,
+            "t_half": float(main.get("up50", np.nan)) * per,
+            "force": abs(float(main["peak"])),
+            "neg": abs(float(b["neg"]["peak"])) if b["neg"] is not None
+            else np.nan,
+            "energy": energy,
+            "impulse": sum(abs(float(e["area"])) for e in events) * per})
+    return rows
+
+
+def fm_motion_from_file(key):
+    """A length-change file added on the tab: kept as the motion to use."""
+    s = st.session_state
+    up = s.get(key)
+    if up is None:
+        return
+    try:
+        frame = sc_read(up.getvalue(), up.name)
+    except Exception as exc:
+        s["_fm_note"] = f"⚠️ Could not read {up.name}: {exc}"
+        return
+    s["_fm_file"] = {"name": up.name, "frame": frame}
+    for name in ("fm_tcol", "fm_mcol"):
+        s.pop(name, None)
+
+
+def fm_motion_unit(column):
+    """The unit a length-change column is in, from its name."""
+    name = str(column).lower()
+    if "pct" in name or "%" in name or "percent" in name:
+        return "%"
+    if "um" in name or "µm" in name or "micron" in name:
+        return "µm"
+    if "px" in name or "pixel" in name:
+        return "px"
+    return ""
+
+
+def fm_motion(left):
+    """The length change to use, chosen on the left: this session's video
+    analysis, or a file. (name, time s, length change, its unit), or None."""
+    s = st.session_state
+    res = s.get("au_result")
+    have = isinstance(res, dict) and "length_pct" in res and "t" in res
+    choices = ([FM_SESSION] if have else []) + [FM_FILE]
+    if s.get("fm_src") not in choices:
+        s["fm_src"] = choices[0]
+    with left:
+        st.radio("Length change from", choices, key="fm_src")
+        if s["fm_src"] == FM_SESSION:
+            name = os.path.basename(str(res.get("video_path") or "video"))
+            st.caption(f"The length change found on 🎬 Video for {name}.")
+            return name, np.asarray(res["t"], float), \
+                np.asarray(res["length_pct"], float), "%"
+        upkey = f"fmf_{int(s.get('_fm_upver', 0) or 0)}"
+        st.file_uploader("Add the length-change file", type=[
+            "csv", "tsv", "txt", "xlsx", "xls"], key=upkey,
+            on_change=fm_motion_from_file, args=(upkey,),
+            help="The _timeseries.csv the 🎬 Video tab saves (time_s and "
+                 "length_change_pct are picked), or any table with a time "
+                 "column in seconds and a length-change column.")
+        note = s.pop("_fm_note", None)
+        if note:
+            st.warning(note)
+        got = s.get("_fm_file")
+        if not got:
+            return None
+        frame = got["frame"]
+        columns = bt_columns(frame)
+        if len(columns) < 2:
+            st.error("This table needs two columns of numbers.")
+            return None
+
+        def pick(key, wanted, fallback):
+            if s.get(key) not in columns:
+                s[key] = next((c for c in columns if str(c).lower() in
+                               wanted), fallback)
+        pick("fm_tcol", ("time_s", "time (s)", "time", "t", "t_s"),
+             columns[0])
+        pick("fm_mcol", ("length_change_pct", "length change (%)",
+                         "length_pct", "length_change_um"), columns[1])
+        c1, c2 = st.columns(2)
+        c1.selectbox("Time (s)", columns, key="fm_tcol")
+        c2.selectbox("Length change", columns, key="fm_mcol")
+        st.caption(f"From {got['name']}.")
+        return (got["name"],
+                pd.to_numeric(frame[s["fm_tcol"]], errors="coerce").to_numpy(
+                    float),
+                pd.to_numeric(frame[s["fm_mcol"]], errors="coerce").to_numpy(
+                    float),
+                fm_motion_unit(s["fm_mcol"]))
+
+
+def fm_use_found(value):
+    """The offset found, copied into the typed one."""
+    st.session_state["fm_offset"] = round(float(value), 4)
+    st.session_state["fm_clock"] = FM_CLOCK[2]
+
+
+def fm_figure(got, tf, f, tm, m, offset, rows, yu, mu):
+    """Force (top) and length change (bottom) on the force's clock, each
+    beat shaded, the force peaks and the largest shortening marked."""
+    from plotly.subplots import make_subplots
+    figure = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                           vertical_spacing=0.06)
+    figure.add_trace(go.Scattergl(
+        x=tf, y=f, mode="lines", name="force",
+        line=dict(color=FM_FORCE_COLOUR, width=1.4)), row=1, col=1)
+    figure.add_trace(go.Scattergl(
+        x=tm + offset, y=m, mode="lines+markers", name="length change",
+        marker=dict(size=4, color=FM_MOTION_COLOUR),
+        line=dict(color=FM_MOTION_COLOUR, width=1.4)), row=2, col=1)
+    seen = [r for r in rows if np.isfinite(r["shortening"])]
+    figure.add_trace(go.Scatter(
+        x=[r["t_peak"] for r in rows], y=[
+            np.interp(r["t_peak"], tf, f) for r in rows],
+        mode="markers+text", text=[str(r["n"]) for r in rows],
+        textposition="top center", name="force peak",
+        marker=dict(size=8, color=FM_FORCE_COLOUR, symbol="triangle-down")),
+        row=1, col=1)
+    if seen:
+        figure.add_trace(go.Scatter(
+            x=[r["t_short"] for r in seen],
+            y=[np.interp(r["t_short"] - offset, tm, m) for r in seen],
+            mode="markers", name="largest shortening",
+            marker=dict(size=9, color=FM_MOTION_COLOUR, symbol="circle-open",
+                        line=dict(width=2))), row=2, col=1)
+    for r in rows:
+        for row in (1, 2):
+            figure.add_vrect(x0=r["t0"], x1=r["t1"], fillcolor="#888888",
+                             opacity=0.10, line_width=0, row=row, col=1)
+    figure.update_layout(
+        height=520, margin=dict(l=70, r=20, t=20, b=50), showlegend=False,
+        plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified")
+    for row, title in ((1, f"Force ({yu})" if yu else "Force"),
+                       (2, f"Length change ({mu})" if mu else
+                        "Length change")):
+        figure.update_yaxes(title_text=title, row=row, col=1, showline=True,
+                            linewidth=1.5, linecolor="#222", mirror=True,
+                            ticks="outside", gridcolor="#eee")
+        figure.update_xaxes(showline=True, linewidth=1.5, linecolor="#222",
+                            mirror=True, ticks="outside", gridcolor="#eee",
+                            row=row, col=1)
+    figure.update_xaxes(title_text="Time on the force's clock (s)", row=2,
+                        col=1)
+    return figure
+
+
+def fm_loops_figure(rows, yu, mu):
+    """Force against shortening through each beat: one loop a beat."""
+    figure = go.Figure()
+    for r in rows:
+        if len(r["loop_x"]) < 3:
+            continue
+        figure.add_trace(go.Scatter(
+            x=np.r_[r["loop_x"], r["loop_x"][:1]],
+            y=np.r_[r["loop_y"], r["loop_y"][:1]], mode="lines+markers",
+            name=f"beat {r['n']}", marker=dict(size=4),
+            line=dict(width=1.6, color=FM_MOTION_COLOUR),
+            opacity=0.55, hovertemplate=f"beat {r['n']}<br>shortening "
+            "%{x:.3g}<br>force %{y:.3g}<extra></extra>"))
+    figure.update_layout(
+        height=380, margin=dict(l=70, r=20, t=20, b=50), showlegend=False,
+        plot_bgcolor="white", paper_bgcolor="white")
+    figure.update_xaxes(title_text=f"Shortening ({mu})" if mu else
+                        "Shortening", showline=True, linewidth=1.5,
+                        linecolor="#222", mirror=True, ticks="outside",
+                        gridcolor="#eee", zeroline=True,
+                        zerolinecolor="#bbb")
+    figure.update_yaxes(title_text=f"Force ({yu})" if yu else "Force",
+                        showline=True, linewidth=1.5, linecolor="#222",
+                        mirror=True, ticks="outside", gridcolor="#eee",
+                        zeroline=True, zerolinecolor="#bbb")
+    return figure
+
+
+def fm_scatter_figure(rows, yu, mu, r):
+    """Each beat's peak force against its shortening."""
+    seen = [x for x in rows if np.isfinite(x["shortening"])]
+    figure = go.Figure(go.Scatter(
+        x=[x["shortening"] for x in seen], y=[x["force"] for x in seen],
+        mode="markers+text", text=[str(x["n"]) for x in seen],
+        textposition="top right", marker=dict(size=10,
+                                              color=FM_MOTION_COLOUR),
+        hovertemplate="beat %{text}<br>shortening %{x:.3g}<br>force "
+                      "%{y:.3g}<extra></extra>"))
+    figure.update_layout(
+        height=380, margin=dict(l=70, r=20, t=36, b=50),
+        plot_bgcolor="white", paper_bgcolor="white",
+        title=dict(text=f"r = {r:.2f}" if np.isfinite(r) else "",
+                   x=0.02, font=dict(size=14)))
+    figure.update_xaxes(title_text=f"Shortening ({mu})" if mu else
+                        "Shortening", showline=True, linewidth=1.5,
+                        linecolor="#222", mirror=True, ticks="outside",
+                        gridcolor="#eee", rangemode="tozero")
+    figure.update_yaxes(title_text=f"Peak force ({yu})" if yu else
+                        "Peak force", showline=True, linewidth=1.5,
+                        linecolor="#222", mirror=True, ticks="outside",
+                        gridcolor="#eee", rangemode="tozero")
+    return figure
+
+
+def fm_beat_frame(rows, yu, mu):
+    """One row per beat, units in the column names."""
+    fu = f" ({yu})" if yu else ""
+    su = f" ({mu})" if mu else ""
+    return pd.DataFrame([{
+        "Beat": r["n"], "Kind": r["kind"],
+        "Force peak at (s)": r["t_peak"],
+        f"Peak force{fu}": r["force"],
+        f"Negative peak{fu}": r["neg"],
+        f"Shortening{su}": r["shortening"],
+        "Largest shortening at (s)": r["t_short"],
+        "Delay, peak to peak (s)": r["delay_peak"],
+        "Delay, half rise to half (s)": r["delay_half"],
+        f"Force per shortening ({yu}/{mu})" if yu and mu else
+        "Force per shortening": r["force_per_short"],
+        f"Loop area ({yu}·{mu})" if yu and mu else "Loop area":
+            r["loop_area"],
+        "Energy (J)": r["energy"],
+        f"Impulse ({yu}·s)" if yu else "Impulse": r["impulse"],
+        "Frames": r["frames"]} for r in rows])
+
+
+def fm_summary_rows(rows, fit, offset, how, sign, yu, mu, name):
+    """The five-column summary (Parameter, Value, ± SD, n, Unit), as
+    strings, and the indices of its section rows."""
+    def number(v):
+        return v if isinstance(v, str) else bta.pretty(v, 4)
+
+    seen = [r for r in rows if np.isfinite(r["shortening"])]
+    r_fs, n_fs = fmo.correlation([r["force"] for r in seen],
+                                 [r["shortening"] for r in seen])
+    out = [["Length change from", name, "", "", ""],
+           ["Clock offset (motion time + offset = force time)",
+            number(offset), "", "", "s"],
+           ["Offset from", how, "", "", ""],
+           ["Match of the two traces at that offset (r)",
+            number(fit["r"]) if fit else "", "", "", ""],
+           ["Contraction makes the length",
+            "fall" if sign < 0 else "rise", "", "", ""]]
+    sections = {len(out)}
+    out.append(["Beats", "", "", "", ""])
+    out += [["Beats in the force", str(len(rows)), "", "", ""],
+            ["Beats with video frames", str(len(seen)), "", "", ""],
+            ["Force against shortening across beats (r)", number(r_fs), "",
+             str(n_fs), ""]]
+    sections.add(len(out))
+    out.append(["Per beat (mean ± SD of n beats)", "", "", "", ""])
+    for label, key, unit in (
+            ("Peak force", "force", yu),
+            ("Shortening", "shortening", mu),
+            ("Force per shortening", "force_per_short",
+             f"{yu}/{mu}" if yu and mu else ""),
+            ("Delay, peak to peak", "delay_peak", "s"),
+            ("Delay, half rise to half", "delay_half", "s"),
+            ("Loop area", "loop_area", f"{yu}·{mu}" if yu and mu else "")):
+        d = bta.describe([r[key] for r in seen])
+        out.append([label, number(d["Mean"]), number(d["SD"]), str(d["n"]),
+                    unit])
+    return out, sections
+
+
+def fm_tab():
+    s = st.session_state
+    sets = s.get("_bt_sets") or {}
+    left, right = st.columns([1, 2.5], gap="medium")
+    if not sets:
+        with right:
+            st.info("First put the cell's force on **💓 Beat analysis** (send "
+                    "it there, or add its file) and find its beats. Then "
+                    "come back with the length change of the same cell from "
+                    "the video, recorded at the same time.", icon="🤝")
+        return
+    ids = list(sets)
+    if s.get("fm_sig") not in ids:
+        s["fm_sig"] = s.get("bt_pick") if s.get("bt_pick") in ids else ids[-1]
+    with left:
+        st.selectbox("Force (a signal on 💓 Beat analysis)", ids,
+                     key="fm_sig", format_func=lambda k: sets[k]["name"])
+    got = fm_force_got(s["fm_sig"])
+    if got is None:
+        with right:
+            st.error("This force signal needs two columns of numbers.")
+        return
+    per = bta.seconds_per(got["x_unit"])
+    if not per:
+        with right:
+            st.error("The force's x is not a time in s or ms, so it cannot be "
+                     "put on one clock with the video.")
+        return
+    motion = fm_motion(left)
+    if motion is None:
+        with right:
+            st.info("Now the length change: the video analysis of this "
+                    "session, or add its _timeseries.csv on the left.",
+                    icon="🎬")
+        return
+    mname, tm, m, mu = motion
+    tm, m = fmo.clean(tm, m)
+    tf = np.asarray(got["x"], float) * per
+    f = np.asarray(got["y"], float) - float(got["base"])
+    tf, f = fmo.clean(tf, f)
+    yu = got["y_unit"]
+    for key, value in (("fm_clock", FM_CLOCK[0]), ("fm_offset", 0.0),
+                       ("fm_window", 2.0), ("fm_sign", fmo.SIGNS[0]),
+                       ("fm_pad", 0.3)):
+        s.setdefault(key, value)
+    with left:
+        st.markdown("**⏱ One clock**")
+        st.radio("The offset between the two clocks", FM_CLOCK,
+                 key="fm_clock")
+        c1, c2 = st.columns(2)
+        c1.number_input("My value (s)", key="fm_offset", format="%.4g",
+                        step=0.1, help="A video frame at time t happened at "
+                        "force time t + this. From when each recording "
+                        "started, or an event seen in both.")
+        c2.number_input("Look within ± (s)", key="fm_window",
+                        min_value=0.05, format="%.3g", step=0.5,
+                        disabled=s["fm_clock"] != FM_CLOCK[1])
+        st.markdown("**Contraction**")
+        st.selectbox("A contraction makes the length", fmo.SIGNS,
+                     key="fm_sign", format_func=lambda v: {
+                         "Auto": "Auto (from the match)",
+                         "Length decreases": "Fall (it shortens)",
+                         "Length increases": "Rise"}[v])
+        st.number_input("Look around each beat (s)", key="fm_pad",
+                        min_value=0.0, step=0.1, format="%.3g",
+                        help="How far before and after each beat (its start "
+                             "and end on 💓 Beat analysis) the shortening is "
+                             "looked for.")
+    clock = s["fm_clock"]
+    found = None
+    if clock == FM_CLOCK[0]:
+        found = fmo.best_offset(tf, f, tm, m)
+    elif clock == FM_CLOCK[1]:
+        found = fmo.best_offset(tf, f, tm, m, centre=float(s["fm_offset"]),
+                                window=float(s["fm_window"]))
+    if clock != FM_CLOCK[2] and found is None:
+        with right:
+            st.warning("The two recordings do not overlap enough to match "
+                       "them. Type the offset and choose Use my value.")
+        return
+    offset = float(found["offset"]) if found else float(s["fm_offset"])
+    # the match at the offset used, for the sign and to report
+    fit = found or fmo.best_offset(
+        tf, f, tm, m, centre=offset,
+        window=max(fmo.step_of(tm), 1e-3), min_overlap=0.05)
+    sign = {fmo.SIGNS[1]: -1, fmo.SIGNS[2]: 1}.get(
+        s["fm_sign"], fit["sign"] if fit else -1)
+    how = {FM_CLOCK[0]: "found, best match anywhere",
+           FM_CLOCK[1]: "found, near the typed value",
+           FM_CLOCK[2]: "typed"}[clock]
+    beats = fm_force_beats(got)
+    rows = fmo.beat_motion(beats, tf, f, tm, m, offset, sign,
+                           pad=float(s["fm_pad"] or 0.0))
+    seen = [r for r in rows if np.isfinite(r["shortening"])]
+    with right:
+        a, b = st.columns([3, 1.2], vertical_alignment="center")
+        a.markdown(
+            f"**Video time + {offset:.4g} s = force time** ({how}"
+            + (f", match r = {fit['r']:.2f}" if fit else "") + "). "
+            f"{len(seen)} of {len(rows)} beats have video frames.")
+        if found:
+            b.button("Keep this offset", key="fmb_keep", on_click=fm_use_found,
+                     args=(offset,), **STRETCH,
+                     help="Copies it into My value and uses it from now on, "
+                          "so it stays put when the settings change.")
+        if clock != FM_CLOCK[2]:
+            st.caption(
+                "⚠️ The offset was found by lining the two traces up, so a "
+                "real delay between force and shortening goes into the "
+                "offset: the delays below are then close to zero by "
+                "construction. For true delays, type the offset from when "
+                "each recording started (or an event seen in both) and "
+                "choose Use my value.")
+        st.plotly_chart(fm_figure(got, tf, f, tm, m, offset, rows, yu, mu),
+                        **STRETCH, config={"displaylogo": False})
+        if not seen:
+            st.warning("No beat falls inside the video once it is on the "
+                       "force's clock. Check the offset.")
+            return
+        l1, l2 = st.columns(2)
+        r_fs, _ = fmo.correlation([r["force"] for r in seen],
+                                  [r["shortening"] for r in seen])
+        with l1:
+            st.markdown("**Each beat: force against shortening**")
+            st.plotly_chart(fm_scatter_figure(rows, yu, mu, r_fs), **STRETCH,
+                            config={"displaylogo": False})
+        with l2:
+            st.markdown("**Loops: force through each beat**")
+            st.plotly_chart(fm_loops_figure(rows, yu, mu), **STRETCH,
+                            config={"displaylogo": False})
+        st.caption(
+            "Left: does a beat that pushes harder also shorten the cell "
+            "more? Right: force against shortening frame by frame through "
+            "each beat, like a heart's pressure-volume loop; its area is a "
+            "relative measure of how force and shortening are out of step, "
+            "not a work in joules. The video's frames are far apart "
+            f"(every {fmo.step_of(tm):.3g} s), so a fast peak can be read "
+            "a little low and the loops are coarse.")
+        summary, sections = fm_summary_rows(rows, fit, offset, how, sign, yu,
+                                            mu, mname)
+        st.markdown("##### 📋 Summary")
+        tsv = "\n".join("\t".join(r) for r in [list(BT_SUMMARY_COLS),
+                                                *summary])
+        bt_copy_button("📋 Copy the summary", bt_table_html(summary, sections),
+                       tsv, "fm_sum")
+        st.dataframe(
+            pd.DataFrame(summary, columns=BT_SUMMARY_COLS).style.apply(
+                lambda r: ["font-weight: bold" if r.name in sections
+                           else ""] * len(r), axis=1),
+            hide_index=True, **STRETCH,
+            height=min(35 * (len(summary) + 1) + 3, 560))
+        table = fm_beat_frame(rows, yu, mu)
+        st.markdown("##### Every beat")
+        st.dataframe(table.assign(**{
+            c: table[c].map(bt_neat) for c in table.columns
+            if c not in ("Beat", "Kind", "Frames")}),
+            hide_index=True, **STRETCH)
+        st.code(bt_tsv(table, bt_excel), language=None, height=160)
+        st.caption("Every beat, to paste into Excel (copy icon at the top "
+                   "right). Delays: when the shortening is largest (or half "
+                   "way there) less when the force is (or half way up); "
+                   "positive when the shortening comes after.")
+
+
+with tab_fm:
+    section("Force and motion: the AFM force and the cell's length change, "
+            "beat by beat")
+    if bta is None or BEAT_ERROR:
+        st.error("This tab needs **beat_analysis.py** beside app.py.",
+                 icon="🚫")
+    elif fmo is None or FM_ERROR:
+        st.error("This tab needs **force_motion.py** beside app.py"
+                 + (f" ({FM_ERROR})." if FM_ERROR else "."), icon="🚫")
+    elif not (outdated_notice("beat_analysis.py")
+              or outdated_notice("force_motion.py")):
+        fm_tab()
 
 
 # ================================================================ Fourier ==
