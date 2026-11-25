@@ -33190,6 +33190,21 @@ BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
                   "bt_show_timing": ("starts and ends",)}
 
 
+def bt_chart_width(figure):
+    """
+    How wide the beat plot is drawn: the page's width, or the width set
+    under 🎨 Plot → Look (narrower, for one zoomed peak). Sets that width on
+    the figure, so the camera icon saves the plot at the same shape, and
+    returns what st.plotly_chart needs to keep it.
+    """
+    s = st.session_state
+    if s.get("bt_wfull", True):
+        return STRETCH
+    figure.update_layout(width=int(s.get("bt_width") or 700))
+    return ({"width": "content"} if "width" in STRETCH
+            else {"use_container_width": False})
+
+
 def bt_publication_style():
     """📄 The default look again, the axes fitted to the signal."""
     s = st.session_state
@@ -34159,7 +34174,13 @@ def bt_plot(sid, got):
                           placeholder=got["xcol"])
             st.caption("The y axis title is in the box above the plot.")
         with p_look:
-            st.slider("Height", 250, 900, step=10, key="bt_height")
+            st.toggle("Fit the page width", key="bt_wfull",
+                      help="Off: the plot is as wide as set below, e.g. "
+                           "narrower to show one zoomed peak in a better "
+                           "shape. The camera icon saves it at that size.")
+            st.slider("↔ Width (px)", 300, 1600, step=10, key="bt_width",
+                      disabled=bool(s.get("bt_wfull", True)))
+            st.slider("↕ Height (px)", 250, 900, step=10, key="bt_height")
             st.slider("Line thickness", 0.5, 5.0, step=0.1, key="bt_lw")
             st.slider("Axis thickness", 0.5, 5.0, step=0.1, key="bt_axw")
             st.slider("Font size", 9, 30, key="bt_fs")
@@ -34198,7 +34219,7 @@ def bt_plot(sid, got):
     if drawing:
         event = st.plotly_chart(fig, key=f"btc_{ver}_draw", config=config,
                                 on_select="rerun", selection_mode=("lasso",),
-                                **STRETCH)
+                                **bt_chart_width(fig))
         strokes = lasso_strokes(event)
         if strokes:
             ys = [float(v) for v in strokes[-1]["y"]]
@@ -34215,7 +34236,7 @@ def bt_plot(sid, got):
                                                       width=1.5)))
         event = st.plotly_chart(fig, key=f"btc_{ver}_box", config=config,
                                 on_select="rerun", selection_mode=("box",),
-                                **STRETCH)
+                                **bt_chart_width(fig))
         try:
             boxes = list(event.selection.box or [])
         except Exception:
@@ -34263,7 +34284,7 @@ def bt_plot(sid, got):
         fig.update_layout(dragmode="zoom", clickmode="event+select")
         event = st.plotly_chart(fig, key=f"btc_{ver}_measure", config=config,
                                 on_select="rerun", selection_mode="points",
-                                **STRETCH)
+                                **bt_chart_width(fig))
         try:
             points = [p for p in (event.selection.points or [])
                       if fig.data[int(p.get("curve_number", -1))].name
@@ -34277,7 +34298,7 @@ def bt_plot(sid, got):
     else:
         event = st.plotly_chart(fig, key=f"btc_{ver}_zoom", config=config,
                                 on_select="rerun", selection_mode="points",
-                                **STRETCH)
+                                **bt_chart_width(fig))
         try:
             points = list(event.selection.points or [])
         except Exception:
@@ -35475,7 +35496,8 @@ def beat_tab():
                        ("bt_pcol", bta.POS_COLOUR),
                        ("bt_ncol", bta.NEG_COLOUR),
                        ("bt_numbers", True), ("bt_shade", False),
-                       ("bt_clean", False),
+                       ("bt_clean", False), ("bt_wfull", True),
+                       ("bt_width", 700),
                        *((name, True) for name in BT_SHOW_PARTS)):
         s.setdefault(key, value)
     # every signal's settings kept while another one is shown
