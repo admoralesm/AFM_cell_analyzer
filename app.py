@@ -668,7 +668,7 @@ COMPANION_NEEDS = {
                          "rise_time", "recovery_time", "beat_duration",
                          "retime", "timing_of", "TIMINGS",
                          "beat_symmetry", "add_symmetry",
-                         "symmetry_share", "beat_span", "beat_z"),
+                         "symmetry_share", "beat_span", "beat_z", "peak_z"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -30835,7 +30835,7 @@ def ai_panel():
 
 
 AI_DZ_AS = ("Deflection (nm)", "Force")
-AI_DZ_VIEW = ("2D", "3D over time")
+AI_DZ_VIEW = ("Each peak, from its start", "Over time", "3D over time")
 
 
 def ai_dz_defaults(pairs):
@@ -30846,6 +30846,24 @@ def ai_dz_defaults(pairs):
     z = next((b for b in bases if re.match(r"\s*z", b, re.I)
               and b != defl), None)
     return defl, z
+
+
+def ai_dz_peaks(t, y, z, lo, hi):
+    """
+    The peaks of the deflection (found with the baseline and lines 💓 Beat
+    analysis starts with: the median, 5 noise SDs either side) that start
+    between ``lo`` and ``hi``, each with its path of deflection and Z from
+    where it starts (bta.peak_z). None without beat_analysis.py.
+    """
+    if bta is None or BEAT_ERROR:
+        return None
+    base = float(bta.baseline_level(y))
+    up, down = bta.suggest_thresholds(y, base)
+    events = bta.excursions(t, y, base, up, down)
+    beats = [{"n": i + 1, "pos": e if e["sign"] > 0 else None,
+              "neg": e if e["sign"] < 0 else None}
+             for i, e in enumerate(events) if lo <= e["start"] <= hi]
+    return bta.peak_z(beats, t, y, z)
 
 
 def ai_slow_part(t, y, window):
@@ -30901,8 +30919,8 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
     for key, options in (("ai_dz_as", AI_DZ_AS), ("ai_dz_view", AI_DZ_VIEW)):
         if s.get(key) not in options:
             s[key] = options[0]
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.5, 1.1, 0.8],
-                                    vertical_alignment="bottom")
+    c1, c2, c3, c5 = st.columns([1.1, 1.1, 1.3, 0.7],
+                                vertical_alignment="bottom")
     c1.selectbox("Deflection", bases, key="ai_dz_defl",
                  help="Trace and retrace together, read along time like the "
                       "plots above (⏱️ Timing).")
@@ -30912,7 +30930,6 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
     c3.segmented_control("Deflection as", AI_DZ_AS, key="ai_dz_as",
                          help="nm: the cantilever's bend. Force: × k, in "
                               "the force unit under 🪝 Cantilever.")
-    c4.segmented_control("View", AI_DZ_VIEW, key="ai_dz_view")
     c5.checkbox("Flip Z", key="ai_dz_flip",
                 help="Count Z the other way (a sensor that counts down as "
                      "the surface rises). The loops' areas stay the same.")
@@ -30946,7 +30963,13 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
         st.info("The two channels have too few points in common.",
                 icon="📐")
         return
-    d1, d2 = st.columns([1.3, 1], vertical_alignment="bottom")
+    v1, d1, d2 = st.columns([2.3, 1.2, 0.8], vertical_alignment="bottom")
+    v1.segmented_control(
+        "View", AI_DZ_VIEW, key="ai_dz_view",
+        help="Each peak, from its start: every peak's path, the deflection "
+             "and Z each from their value where the peak starts, so the "
+             "peaks lie over one another. Over time: every point as "
+             "recorded, coloured by time.")
     d1.checkbox("Take off Z's slow drift", key="ai_dz_drift",
                 help="Off: Z exactly as the Z channel recorded it. On: less "
                      "its running median over the window, so only the "
@@ -30984,7 +31007,36 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
               else f"Z piezo ({zu})")
     every = max(1, int(math.ceil(sel.sum() / 20000)))
     ts, zs, ys = t[sel][::every], z[sel][::every], yv[sel][::every]
-    if s.get("ai_dz_view") == AI_DZ_VIEW[1]:
+    view = s.get("ai_dz_view") or AI_DZ_VIEW[0]
+    peaks = (ai_dz_peaks(t[ok], yv[ok], z[ok], lo, hi)
+             if view == AI_DZ_VIEW[0] else None)
+    if view == AI_DZ_VIEW[0] and peaks:
+        fig = go.Figure()
+        for side, name, colour in (
+                ("pos", "positive peaks", s.get("bt_pcol") or bta.POS_COLOUR),
+                ("neg", "negative peaks",
+                 s.get("bt_ncol") or bta.NEG_COLOUR)):
+            mine = [p_ for p_ in peaks if p_["side"] == side]
+            if not mine:
+                continue
+            px, py, pn = [], [], []
+            for p_ in mine:
+                px += list(p_["loop_z"]) + [None]
+                py += list(p_["loop_f"]) + [None]
+                pn += [p_["n"]] * (len(p_["loop_z"]) + 1)
+            fig.add_trace(go.Scattergl(
+                x=px, y=py, mode="lines", name=f"{name} ({len(mine)})",
+                line=dict(color=colour, width=1.5), opacity=0.65,
+                customdata=pn,
+                hovertemplate="peak %{customdata}<br>Z %{x:.3g}<br>%{y:.3g}"
+                              "<extra></extra>"))
+        fig.update_layout(
+            xaxis_title=f"Z from the peak's start ({zu})",
+            yaxis_title=f"{ytitle.split(' (')[0]} from the peak's start ("
+                        f"{shown if as_force else 'nm'})",
+            height=520, legend=dict(x=0.01, y=0.99))
+        fig = ai_style(fig)
+    elif view == AI_DZ_VIEW[2]:
         fig = go.Figure(go.Scatter3d(
             x=ts, y=zs, z=ys, mode="lines",
             line=dict(color=ts, colorscale="Viridis", width=4),
@@ -31003,6 +31055,24 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
         fig.update_layout(xaxis_title=ztitle, yaxis_title=ytitle, height=520)
         fig = ai_style(fig)
     ai_chart(fig, f"{stem}_deflection_vs_Z", key="ai_dz_fig")
+    if view == AI_DZ_VIEW[0]:
+        if peaks:
+            said = []
+            for side, word in (("pos", "positive"), ("neg", "negative")):
+                moves = [p_["z_move"] for p_ in peaks if p_["side"] == side]
+                if moves:
+                    said.append(f"{len(moves)} {word} peak"
+                                f"{'s' if len(moves) != 1 else ''}, Z moving "
+                                f"{mean_sd(moves, 3)} {zu} in each")
+            st.caption(
+                f"{lo:.4g} to {hi:.4g} s: " + "; ".join(said) + ". Each peak "
+                "from where it starts: the deflection and Z there taken off, "
+                "so drift between peaks does not matter. Peaks found with "
+                "automatic lines (the median, 5 noise SDs either side); set "
+                "them yourself in 💓 Beat analysis.")
+        else:
+            st.info("No peaks found in this range with automatic lines: "
+                    "showing every point over time instead.", icon="📐")
     zz, dd = z[sel], defl_nm[sel]
     words = [f"{lo:.4g} to {hi:.4g} s: Z moved {np.ptp(zz):.3g} {zu}, the "
              f"deflection {np.ptp(dd):.3g} nm ({np.ptp(force[sel]):.3g} "
@@ -34738,7 +34808,7 @@ def bt_report(sid, got):
         "about where it crosses the baseline (TS). Each symmetry share is the "
         "part of ∫(F − baseline)² dt left unchanged by that operation, (1 ± "
         "c)/2 with c = ∫g(t)g(2t0 − t)dt / ∫g² dt: 1 exactly symmetric, 0.5 "
-        "no more than chance. Ratios: negative ÷ positive peak, impulse and "
+        "no more than chance. Ratios: positive ÷ negative peak, impulse and "
         "duration; balance (P − N) ÷ (P + N); recovery ÷ rise (above 1: a "
         "slow fall, tail or shoulder).")
     if area:
@@ -34879,14 +34949,14 @@ def bt_stats_rows(got):
         (f"{word} per positive peak", [abs(e["area"]) for e in pos], area),
         (f"{word} per negative peak (no sign)",
          [abs(e["area"]) for e in neg], area),
-        # how each full beat's negative peak compares with its positive one,
+        # how each full beat's positive peak compares with its negative one,
         # and how lopsided each peak is (1: as fast down as up; above 1: a
         # slow fall, a tail or a shoulder)
-        ("Negative ÷ positive peak " + ("force" if newtons else "size")
+        ("Positive ÷ negative peak " + ("force" if newtons else "size")
          + " (full beats)", [sym[b_]["depth_ratio"] for b_ in full_i], ""),
-        (f"Negative ÷ positive {word.lower()} (full beats)",
+        (f"Positive ÷ negative {word.lower()} (full beats)",
          [sym[b_]["impulse_ratio"] for b_ in full_i], ""),
-        ("Negative ÷ positive duration (full beats)",
+        ("Positive ÷ negative duration (full beats)",
          [sym[b_]["duration_ratio"] for b_ in full_i], ""),
         (f"{word} balance (P − N) ÷ (P + N) (full beats)",
          [sym[b_]["balance"] for b_ in full_i], ""),
@@ -35121,9 +35191,9 @@ BT_SUMMARY_STATS = (
     (None, "Positive peak duration"),
     (None, "Negative peak duration"),
     ("Time between beats", "Time between beats"),
-    ("Negative ÷ positive peak {fw}", "Negative ÷ positive peak"),
-    ("Negative ÷ positive {wl}", "Negative ÷ positive {wl}"),
-    ("Negative ÷ positive duration", "Negative ÷ positive duration"),
+    ("Positive ÷ negative peak {fw}", "Positive ÷ negative peak"),
+    ("Positive ÷ negative {wl}", "Positive ÷ negative {wl}"),
+    ("Positive ÷ negative duration", "Positive ÷ negative duration"),
     ("{w} balance (P − N) ÷ (P + N)", "{w} balance"),
     ("Positive peak: recovery ÷ rise", "Positive peak recovery ÷ rise"),
     ("Negative peak: recovery ÷ rise", "Negative peak recovery ÷ rise"),
@@ -35167,6 +35237,14 @@ def bt_summary_parts(sid, got):
                 per_peak.append((named(label, param), bta.describe(values),
                                  unit))
                 break
+    z_peaks = bt_zpeak_values(got)
+    if z_peaks is not None:
+        by_side, zu, au = z_peaks
+        per_peak += [
+            ("Z piezo movement per positive peak",
+             bta.describe(by_side["pos"][0]), zu),
+            ("Z piezo movement per negative peak",
+             bta.describe(by_side["neg"][0]), zu)]
     z_values = bt_z_values(got)
     if z_values is not None:
         move, zu, area, au = z_values
@@ -35819,8 +35897,9 @@ BT_Z_METRES = {"nm": 1e-9, "µm": 1e-6, "um": 1e-6, "m": 1.0}
 def bt_z_rows(got):
     """
     The Z piezo through each beat, when the signal came with a Z column:
-    (rows of bta.beat_z, Z's unit, metres per Z unit or None), worked out
-    once per run and kept in ``got``; None without one.
+    (rows of bta.beat_z, Z's unit, metres per Z unit or None, rows of
+    bta.peak_z), worked out once per run and kept in ``got``; None without
+    one.
     """
     if "_z" in got:
         return got["_z"]
@@ -35842,7 +35921,8 @@ def bt_z_rows(got):
     z_on = np.interp(got["x"], x[ok][order], z[ok][order])
     unit = bta.unit_of(str(col))
     rows = bta.beat_z(got["beats"], got["x"], got["y"], z_on, got["base"])
-    got["_z"] = (rows, unit, BT_Z_METRES.get(unit))
+    peaks = bta.peak_z(got["beats"], got["x"], got["y"], z_on)
+    got["_z"] = (rows, unit, BT_Z_METRES.get(unit), peaks)
     return got["_z"]
 
 
@@ -35852,7 +35932,7 @@ def bt_z_values(got):
     found = bt_z_rows(got)
     if not found or not found[0]:
         return None
-    rows, unit, per_m = found
+    rows, unit, per_m, _ = found
     move = np.array([r["z_move"] for r in rows], float)
     area = np.array([r["loop_area"] for r in rows], float)
     if got.get("newtons") and per_m:
@@ -35860,62 +35940,158 @@ def bt_z_values(got):
     return move, unit, area, f"{got['y_unit']}·{unit}".strip("·")
 
 
+def bt_zpeak_values(got):
+    """Each peak's Z movement and loop area, from its own start, by side:
+    {"pos": (movements, areas), "neg": (…)}, the areas in J when the force
+    and Z units are known, with (Z's unit, the areas' unit); None without
+    a Z column."""
+    found = bt_z_rows(got)
+    if not found or not found[3]:
+        return None
+    _, unit, per_m, peaks = found
+    joules = bool(got.get("newtons") and per_m)
+    out = {}
+    for side in ("pos", "neg"):
+        mine = [p for p in peaks if p["side"] == side]
+        move = np.array([p["z_move"] for p in mine], float)
+        area = np.array([p["loop_area"] for p in mine], float)
+        out[side] = (move, area * got["newtons"] * per_m if joules else area)
+    return out, unit, ("J" if joules else
+                       f"{got['y_unit']}·{unit}".strip("·"))
+
+
+BT_ZVIEW = ("Each peak", "Each beat")
+
+
 def bt_z_box(sid, got):
-    """📐 Each beat against the Z piezo: how far Z moved and the area of
-    the force against Z loop (the work over the beat), with the loops laid
-    over one another."""
-    values = bt_z_values(got)
-    if values is None:
+    """
+    📐 The force against the Z piezo. Each peak: every positive and negative
+    peak from its own start (the force and Z there taken off), how far Z
+    moved in it and the area its path holds. Each beat: every beat's loop,
+    Z from where the beat starts, how far Z moved and the loop's area (the
+    net work done on the probe over the beat).
+    """
+    s = st.session_state
+    beat_values = bt_z_values(got)
+    peak_values = bt_zpeak_values(got)
+    if beat_values is None and peak_values is None:
         return
-    rows = got["_z"][0]
-    move, zu, area, au = values
+    name = sc_db_safe(s["_bt_sets"][sid]["name"])
     with st.container(border=True):
-        st.markdown("#### 📐 Deflection against Z piezo")
-        m1, m2, m3 = st.columns(3)
-        m1.metric(f"Z movement per beat ({zu})", bt_mean_sd(move))
-        m2.metric(f"Loop area per beat ({au})", bt_mean_sd(area))
-        m3.metric("Beats with Z", len(rows))
+        h1, h2 = st.columns([2, 1.4], vertical_alignment="center")
+        h1.markdown("#### 📐 Deflection against Z piezo")
+        if s.get("bt_zview") not in BT_ZVIEW:
+            s["bt_zview"] = BT_ZVIEW[0]
+        h2.segmented_control("Z for", BT_ZVIEW, key="bt_zview",
+                             label_visibility="collapsed")
+        view = s.get("bt_zview") or BT_ZVIEW[0]
+        force_word = (f"Force ({got['shown']})" if got.get("shown")
+                      else bt_y_title(got))
         figure = go.Figure()
-        shades = np.linspace(0.35, 1.0, len(rows))
-        for r, shade in zip(rows, shades):
-            blue = (int(198 - 190 * shade), int(219 - 171 * shade),
-                    int(239 - 132 * shade))
-            figure.add_trace(go.Scatter(
-                x=r["loop_z"], y=r["loop_f"], mode="lines",
-                name=f"beat {r['n']}", line=dict(width=2,
-                                                 color=f"rgb{blue}"),
-                hovertemplate=f"beat {r['n']}<br>Z %{{x:.3g}}<br>"
-                              "%{y:.3g}<extra></extra>"))
-        ytitle = (f"Force from the baseline ({got['shown']})"
-                  if got.get("shown") else f"{bt_y_title(got)} from the "
-                  "baseline")
-        figure.update_layout(
-            template="plotly_white", height=420,
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis_title=f"Z from where the beat starts ({zu})",
-            yaxis_title=ytitle, showlegend=len(rows) <= 12)
-        st.plotly_chart(figure, **STRETCH, key=f"btz_fig_{sid}",
-                        config={"displaylogo": False})
-        st.caption(
-            "Each beat (full or a lone peak) from where it starts to where it "
-            "ends, light to dark in order. Z movement: its largest less its "
-            "smallest in the beat. Loop area: force × Z round the loop, the "
-            "net work done on the probe over the beat (the cantilever's own "
-            "spring gives back over a loop all it takes, so only Z's share "
-            "is left).")
-        with st.expander("Each beat"):
+        if view == BT_ZVIEW[0] and peak_values is not None:
+            by_side, zu, au = peak_values
+            peaks = got["_z"][3]
+            to_area = (got["newtons"] * got["_z"][2] if au == "J" else 1.0)
+            m = st.columns(4)
+            m[0].metric(f"Z movement, positive peak ({zu})",
+                        bt_mean_sd(by_side["pos"][0]))
+            m[1].metric(f"Z movement, negative peak ({zu})",
+                        bt_mean_sd(by_side["neg"][0]))
+            m[2].metric(f"Loop area, positive peak ({au})",
+                        bt_mean_sd(by_side["pos"][1]))
+            m[3].metric(f"Loop area, negative peak ({au})",
+                        bt_mean_sd(by_side["neg"][1]))
+            for side, label, colour in (
+                    ("pos", "positive peaks", s.get("bt_pcol")
+                     or bta.POS_COLOUR),
+                    ("neg", "negative peaks", s.get("bt_ncol")
+                     or bta.NEG_COLOUR)):
+                mine = [p for p in peaks if p["side"] == side]
+                if not mine:
+                    continue
+                px, py, pn = [], [], []
+                for p in mine:
+                    px += list(p["loop_z"]) + [None]
+                    py += list(p["loop_f"]) + [None]
+                    pn += [p["n"]] * (len(p["loop_z"]) + 1)
+                figure.add_trace(go.Scatter(
+                    x=px, y=py, mode="lines", name=f"{label} ({len(mine)})",
+                    line=dict(width=1.8, color=colour), opacity=0.7,
+                    customdata=pn,
+                    hovertemplate="beat %{customdata}<br>Z %{x:.3g}<br>"
+                                  "%{y:.3g}<extra></extra>"))
+            figure.update_layout(
+                xaxis_title=f"Z from the peak's start ({zu})",
+                yaxis_title=f"{force_word.split(' (')[0]} from the peak's "
+                            "start" + (f" ({got['shown']})"
+                                       if got.get("shown") else ""),
+                legend=dict(x=0.01, y=0.99))
+            caption = (
+                "Each peak on its own, from where it starts to where it ends "
+                "(by the timing rule under 💓 Beats), the force and Z there "
+                "taken off, so every path starts at 0, 0 and drift between "
+                "peaks does not matter. Z movement: its largest less its "
+                "smallest in the peak. Loop area: what the peak's path holds, "
+                "closed back to its start (force × Z).")
+            each = pd.DataFrame({
+                "Beat": [p["n"] for p in peaks],
+                "Peak": ["positive" if p["side"] == "pos" else "negative"
+                         for p in peaks],
+                f"Starts at ({got['x_unit']})": [p["t0"] for p in peaks],
+                f"Z movement ({zu})": [p["z_move"] for p in peaks],
+                f"Z at the end, from the start ({zu})":
+                    [p["z_net"] for p in peaks],
+                f"Loop area ({au})": [p["loop_area"] * to_area
+                                      for p in peaks]})
+            what = "peak"
+        else:
+            rows = got["_z"][0]
+            move, zu, area, au = beat_values
+            m = st.columns(3)
+            m[0].metric(f"Z movement per beat ({zu})", bt_mean_sd(move))
+            m[1].metric(f"Loop area per beat ({au})", bt_mean_sd(area))
+            m[2].metric("Beats with Z", len(rows))
+            shades = np.linspace(0.35, 1.0, len(rows))
+            for r, shade in zip(rows, shades):
+                blue = (int(198 - 190 * shade), int(219 - 171 * shade),
+                        int(239 - 132 * shade))
+                figure.add_trace(go.Scatter(
+                    x=r["loop_z"], y=r["loop_f"], mode="lines",
+                    name=f"beat {r['n']}", line=dict(width=2,
+                                                     color=f"rgb{blue}"),
+                    hovertemplate=f"beat {r['n']}<br>Z %{{x:.3g}}<br>"
+                                  "%{y:.3g}<extra></extra>"))
+            figure.update_layout(
+                xaxis_title=f"Z from where the beat starts ({zu})",
+                yaxis_title=f"{force_word.split(' (')[0]} from the baseline"
+                            + (f" ({got['shown']})" if got.get("shown")
+                               else ""),
+                showlegend=len(rows) <= 12)
+            caption = (
+                "Each beat (full or a lone peak) from where it starts to "
+                "where it ends, light to dark in order. Z movement: its "
+                "largest less its smallest in the beat. Loop area: force × Z "
+                "round the loop, the net work done on the probe over the beat "
+                "(the cantilever's own spring gives back over a loop all it "
+                "takes, so only Z's share is left).")
             each = pd.DataFrame({
                 "Beat": [r["n"] for r in rows],
                 f"Starts at ({got['x_unit']})": [r["t0"] for r in rows],
                 f"Z movement ({zu})": move, f"Loop area ({au})": area})
+            what = "beat"
+        figure.update_layout(template="plotly_white", height=420,
+                             margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(figure, **STRETCH, key=f"btz_fig_{sid}",
+                        config={"displaylogo": False})
+        st.caption(caption)
+        with st.expander(f"Each {what}"):
             st.dataframe(each, hide_index=True, **STRETCH, column_config={
                 f"Loop area ({au})": st.column_config.NumberColumn(
                     format="%.3e")})
             st.download_button(
-                "💾 Each beat against Z (CSV)",
+                f"💾 Each {what} against Z (CSV)",
                 each.to_csv(index=False).encode("utf-8"),
-                file_name=f"{sc_db_safe(st.session_state['_bt_sets'][sid]['name'])}"
-                          "_z_per_beat.csv",
+                file_name=f"{name}_z_per_{what}.csv",
                 mime="text/csv", key=f"btb_zcsv_{sid}")
 
 
@@ -35955,9 +36131,9 @@ BT_BA_GROUPS = (
         ("{w} per negative peak", "{w} per negative peak", "x"),
         ("Energy per beat", "Energy per full beat", "x"),
         ("Beat duration", "Full beat duration", "x"),
-        ("Negative ÷ positive {fw}", "Negative ÷ positive peak", "x"),
-        ("Negative ÷ positive {wl}", "Negative ÷ positive {wl}", "x"),
-        ("Negative ÷ positive duration", "Negative ÷ positive duration",
+        ("Positive ÷ negative {fw}", "Positive ÷ negative peak", "x"),
+        ("Positive ÷ negative {wl}", "Positive ÷ negative {wl}", "x"),
+        ("Positive ÷ negative duration", "Positive ÷ negative duration",
          "x"),
         ("Negative peak recovery ÷ rise (shoulder)",
          "Negative peak recovery ÷ rise", "x"),
@@ -36224,13 +36400,22 @@ def bt_slide_table(g0, g1):
         rows.append([label(text, kind), bt_mean_sd(values[0]),
                      bt_mean_sd(values[1]), change(*means, how)])
     # 📐 the Z piezo, when both came with one in the same units
+    zp = [bt_zpeak_values(g) for g in (g0, g1)]
+    if all(zp) and zp[0][1] == zp[1][1]:
+        for side, which in (("pos", "positive"), ("neg", "negative")):
+            a, b = zp[0][0][side][0], zp[1][0][side][0]
+            if a.size or b.size:
+                rows.append([
+                    f"Z movement per {which} peak ({zp[0][1]})",
+                    bt_mean_sd(a), bt_mean_sd(b),
+                    change(a.mean() if a.size else np.nan,
+                           b.mean() if b.size else np.nan, "x")])
     zs = [bt_z_values(g) for g in (g0, g1)]
-    if all(zs) and zs[0][1] == zs[1][1] and zs[0][3] == zs[1][3]:
-        for text, i, u in (("Z movement per beat", 0, 1),
-                           ("Work per beat, force × Z loop", 2, 3)):
-            a, b = zs[0][i], zs[1][i]
-            rows.append([f"{text} ({zs[0][u]})", bt_mean_sd(a),
-                         bt_mean_sd(b), change(a.mean(), b.mean(), "x")])
+    if all(zs) and zs[0][3] == zs[1][3]:
+        a, b = zs[0][2], zs[1][2]
+        rows.append([f"Work per beat, force × Z loop ({zs[0][3]})",
+                     bt_mean_sd(a), bt_mean_sd(b),
+                     change(a.mean(), b.mean(), "x")])
 
     def totals(got, sc):
         side = [b[part] for b in got["beats"] for part in ("pos", "neg")
@@ -36350,10 +36535,10 @@ def bt_before_after(ids, sid):
             f"{word} per peak"), **STRETCH)
     with f3:
         st.plotly_chart(bt_ba_figure(
-            g0, g1, (("Force", "Negative ÷ positive peak"),
-                     (word, f"Negative ÷ positive {word.lower()}"),
-                     ("Duration", "Negative ÷ positive duration")),
-            "Negative ÷ positive", log=True, unit="ratio"), **STRETCH)
+            g0, g1, (("Force", "Positive ÷ negative peak"),
+                     (word, f"Positive ÷ negative {word.lower()}"),
+                     ("Duration", "Positive ÷ negative duration")),
+            "Positive ÷ negative", log=True, unit="ratio"), **STRETCH)
     st.caption(
         "Each dot is one peak (or one beat). Change: × after ÷ before; ± "
         "after − before for the symmetry share (1 exact, 0.5 none). "
