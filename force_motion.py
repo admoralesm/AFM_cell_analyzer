@@ -196,6 +196,33 @@ def beat_motion(beats, tf, f, tm, m, offset, sign, pad=0.3, before=1.0):
     return out
 
 
+def motion_peaks(tm, m, sign, min_gap=1.0, k=4.0):
+    """
+    The contractions in a length change: where the shortening (``m``
+    turned by ``sign``, as in ``shortening``) has a top more than ``k``
+    noise SDs above its median, at least ``min_gap`` s from a taller one.
+    The noise is read on the differences between frames (robust: the
+    median, ×1.4826/√2), so slow beats do not count as noise. A list of
+    {"t": the frame's time, "amp": the shortening there, from the median},
+    in time order.
+    """
+    tm, m = clean(tm, m)
+    if tm.size < 3:
+        return []
+    s = shortening(tm, m, sign)
+    s = s - np.median(s)
+    noise = 1.4826 * float(np.median(np.abs(np.diff(s)))) / np.sqrt(2.0)
+    if not noise > 0:
+        noise = 1.4826 * float(np.median(np.abs(s))) or 1e-12
+    top = np.flatnonzero((s[1:-1] >= s[:-2]) & (s[1:-1] > s[2:])
+                         & (s[1:-1] > k * noise)) + 1
+    kept = []
+    for i in top[np.argsort(-s[top], kind="stable")]:
+        if all(abs(tm[i] - tm[j]) >= min_gap for j in kept):
+            kept.append(int(i))
+    return [{"t": float(tm[i]), "amp": float(s[i])} for i in sorted(kept)]
+
+
 def correlation(x, y):
     """Pearson's r of the finite pairs and how many there were; r is NaN
     with fewer than three or no spread."""
