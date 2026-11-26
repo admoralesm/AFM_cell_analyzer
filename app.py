@@ -668,7 +668,7 @@ COMPANION_NEEDS = {
                          "rise_time", "recovery_time", "beat_duration",
                          "retime", "timing_of", "TIMINGS",
                          "beat_symmetry", "add_symmetry",
-                         "symmetry_share"),
+                         "symmetry_share", "beat_span", "beat_z"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -30778,7 +30778,10 @@ def ai_panel():
                     fig_p = ai_style(fig_p, three_d=True)
                 ai_chart(fig_p, f"{base}_P1_vs_P2", key="ai_phase_fig")
 
+    ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem)
+
     # exports -------------------------------------------------------------
+    st.divider()
     st.markdown("**Save the data**")
     rows = {}
     for w in sorted(processed):
@@ -30829,6 +30832,172 @@ def ai_panel():
                 mime="application/vnd.openxmlformats-officedocument."
                      "spreadsheetml.sheet", key="ai_xyz_dl", **STRETCH)
     ai_cell_box(name, ai_tables)
+
+
+AI_DZ_AS = ("Deflection (nm)", "Force")
+AI_DZ_VIEW = ("2D", "3D over time")
+
+
+def ai_dz_defaults(pairs):
+    """The channels a file opens on for 📐: its deflection, and its Z
+    sensor (else its height, else a channel named Z…)."""
+    bases = list(pairs)
+    defl = next((b for b in bases if "defl" in b.lower()), None)
+    z = (next((b for b in bases if re.search(r"z\s*sens|zsnsr", b, re.I)),
+              None)
+         or next((b for b in bases if "height" in b.lower()), None)
+         or next((b for b in bases if re.match(r"\s*z", b, re.I)
+                  and b != defl), None))
+    return defl, z
+
+
+def ai_send_dz(frame, name, meta):
+    """The force and the Z piezo, as one signal on 💓 Beat analysis (its
+    📐 section reads the Z column beside the force)."""
+    s = st.session_state
+    send_to_analysis(name, frame, source="AFM output analysis (deflection "
+                     "and Z piezo)", meta=meta)
+    s["_ai_dz_note"] = s.pop("_ai_sent_note", "")
+
+
+def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
+    """
+    📐 Deflection against Z piezo: the two channels read along time like
+    the plots above (trace and retrace, the same timing), the deflection
+    in nm (or as a force) against how far the Z piezo moved (from its
+    median), coloured by time, in a time range; and a button sending the
+    force with Z to 💓 Beat analysis, which takes each beat's loop.
+    """
+    s = st.session_state
+    st.divider()
+    st.markdown("**📐 Deflection against Z piezo**")
+    pairs = ai_pairs(names)
+    defl0, z0 = ai_dz_defaults(pairs)
+    if defl0 is None or z0 is None:
+        st.info("This needs a deflection channel and a Z sensor (or height) "
+                "channel in the file.", icon="📐")
+        return
+    bases = list(pairs)
+    for key, default in (("ai_dz_defl", defl0), ("ai_dz_z", z0)):
+        if s.get(key) not in bases:
+            s[key] = default
+    for key, options in (("ai_dz_as", AI_DZ_AS), ("ai_dz_view", AI_DZ_VIEW)):
+        if s.get(key) not in options:
+            s[key] = options[0]
+    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.5, 1.1, 0.8],
+                                    vertical_alignment="bottom")
+    c1.selectbox("Deflection", bases, key="ai_dz_defl",
+                 help="Trace and retrace together, read along time like the "
+                      "plots above (⏱️ Timing).")
+    c2.selectbox("Z piezo", bases, key="ai_dz_z",
+                 help="Where the piezo held the cantilever's base: the Z "
+                      "sensor, or the height.")
+    c3.segmented_control("Deflection as", AI_DZ_AS, key="ai_dz_as",
+                         help="nm: the cantilever's bend. Force: × k, in "
+                              "the force unit under 🪝 Cantilever.")
+    c4.segmented_control("View", AI_DZ_VIEW, key="ai_dz_view")
+    c5.checkbox("Flip Z", key="ai_dz_flip",
+                help="Count Z the other way (a sensor that counts down as "
+                     "the surface rises). The loops' areas stay the same.")
+    try:
+        t, d = ai_trace(arr, axis, *pairs[s["ai_dz_defl"]], timing)
+        tz, z = ai_trace(arr, axis, *pairs[s["ai_dz_z"]], timing)
+    except Exception as exc:
+        st.error(f"Could not read the two channels along time: {exc}",
+                 icon="🚫")
+        return
+    if t is None or tz is None or len(t) != len(tz):
+        st.info("The two channels do not line up along time.", icon="📐")
+        return
+    t = np.asarray(t, float)
+    n_n = np.asarray(ai.force_convert(d, ai.FORCE_AUTO, **cal), float)
+    k = float(cal.get("k") or 0.0)
+    defl_nm = n_n / k if k else np.full(t.size, np.nan)
+    newtons = n_n * 1e-9
+    shown = want if want in FORCE_SHOWN else best_force_unit(newtons)
+    force = newtons / FORCE_NEWTONS[shown]
+    z = np.asarray(z, float)
+    if ai.stored_deflection_unit(z) == "m":
+        z, zu = z * 1e9, "nm"
+    else:
+        zu = "nm" if str(cal.get("file_unit") or "").strip() == "nm" \
+            else "as stored"
+    if s.get("ai_dz_flip"):
+        z = -z
+    ok = np.isfinite(t) & np.isfinite(n_n) & np.isfinite(z)
+    if ok.sum() < 3:
+        st.info("The two channels have too few points in common.",
+                icon="📐")
+        return
+    z = z - float(np.median(z[ok]))
+    whole = (float(t[ok].min()), float(t[ok].max()))
+    lo, hi = whole
+    if whole[1] > whole[0]:
+        kept = s.get("ai_dz_range")
+        if (not isinstance(kept, (tuple, list)) or len(kept) != 2
+                or kept[0] >= kept[1] or kept[1] <= whole[0]
+                or kept[0] >= whole[1]):
+            kept = whole
+        s["ai_dz_range"] = (max(float(kept[0]), whole[0]),
+                            min(float(kept[1]), whole[1]))
+        step = max(float(f"{(whole[1] - whole[0]) / 1000:.1g}"), 1e-4)
+        lo, hi = st.slider("Time range (s)", whole[0], whole[1],
+                           key="ai_dz_range", step=step, format="%.2f",
+                           help="The stretch drawn. Drag the ends in to look "
+                                "at a few beats.")
+    sel = ok & (t >= lo) & (t <= hi)
+    as_force = s.get("ai_dz_as") == AI_DZ_AS[1]
+    yv = force if as_force else defl_nm
+    ytitle = f"Force ({shown})" if as_force else "Deflection (nm)"
+    ztitle = f"Z piezo, from its median ({zu})"
+    every = max(1, int(math.ceil(sel.sum() / 20000)))
+    ts, zs, ys = t[sel][::every], z[sel][::every], yv[sel][::every]
+    if s.get("ai_dz_view") == AI_DZ_VIEW[1]:
+        fig = go.Figure(go.Scatter3d(
+            x=ts, y=zs, z=ys, mode="lines",
+            line=dict(color=ts, colorscale="Viridis", width=4),
+            hovertemplate="t %{x:.3f} s<br>Z %{y:.3g}<br>%{z:.3g}"
+                          "<extra></extra>"))
+        fig.update_layout(height=600, margin=dict(l=0, r=0, t=30, b=0),
+                          scene=dict(xaxis_title="Time (s)",
+                                     yaxis_title=ztitle, zaxis_title=ytitle))
+        fig = ai_style(fig, three_d=True)
+    else:
+        fig = go.Figure(go.Scattergl(
+            x=zs, y=ys, mode="markers",
+            marker=dict(color=ts, colorscale="Viridis", size=3,
+                        colorbar=dict(title="Time (s)", thickness=12)),
+            hovertemplate="Z %{x:.3g}<br>%{y:.3g}<extra></extra>"))
+        fig.update_layout(xaxis_title=ztitle, yaxis_title=ytitle, height=520)
+        fig = ai_style(fig)
+    ai_chart(fig, f"{stem}_deflection_vs_Z", key="ai_dz_fig")
+    zz, dd = z[sel], defl_nm[sel]
+    words = [f"{lo:.4g} to {hi:.4g} s: Z moved {np.ptp(zz):.3g} {zu}, the "
+             f"deflection {np.ptp(dd):.3g} nm ({np.ptp(force[sel]):.3g} "
+             f"{shown})"]
+    if np.ptp(zz) > 0 and np.ptp(dd) > 0 and np.isfinite(dd).all():
+        slope = float(np.polyfit(zz, dd, 1)[0])
+        r = float(np.corrcoef(zz, dd)[0, 1])
+        words.append(f"deflection per {zu} of Z: {slope:.3g} (r = {r:.2f})")
+    st.caption(
+        "; ".join(words) + ". Each beat goes round a loop: the area of force "
+        "against Z is the net work done on the probe over that beat (the "
+        "cantilever's own spring gives back over a loop all it takes). "
+        "Send both to 💓 Beat analysis to get it beat by beat.")
+    frame = pd.DataFrame({"Time (s)": t[ok], f"Force ({shown})": force[ok],
+                          f"Z piezo ({zu})": z[ok]})
+    meta = dict(cal_meta or {}, y_unit=shown,
+                channel=f"{s['ai_dz_defl']} / {s['ai_dz_z']}")
+    b1, b2 = st.columns([1.5, 3], vertical_alignment="center")
+    b1.button("📊 Send force and Z to beat analysis", key="ai_send_dz",
+              on_click=ai_send_dz,
+              args=(frame, f"{stem} · deflection and Z", meta), **STRETCH,
+              help="The whole recording (not only the range shown): the "
+                   "force for the beats, with Z beside it for each beat's "
+                   "Z movement and loop area.")
+    note = s.pop("_ai_dz_note", None)
+    if note:
+        b2.caption("✅ " + note)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -34963,6 +35132,12 @@ def bt_summary_parts(sid, got):
                 per_peak.append((named(label, param), bta.describe(values),
                                  unit))
                 break
+    z_values = bt_z_values(got)
+    if z_values is not None:
+        move, zu, area, au = z_values
+        per_peak += [("Z piezo movement per beat", bta.describe(move), zu),
+                     ("Loop area, force × Z (work per beat)",
+                      bta.describe(area), au)]
     find = {param: (value, unit) for param, value, unit in results}
     span, xu = find.get("Recording time", (np.nan, got["x_unit"]))
     noise, yu = find.get("Noise SD used", (np.nan, got["y_unit"]))
@@ -35593,11 +35768,120 @@ def bt_results(sid, got):
     d2.download_button("💾 Summary (CSV)", bt_summary_frame([sid]).to_csv(
         index=False).encode("utf-8"), file_name=f"{name}_summary.csv",
                        mime="text/csv", key=f"btb_sum_{sid}", **STRETCH)
+    bt_z_box(sid, got)
     bt_report_box(sid, got)
     cell_db_box("beats",
                 lambda name, notes: bt_db_package(sid, got, name, notes),
                 bt_db_restore, default_name=s["_bt_sets"][sid]["name"],
                 older=bt_db_older)
+
+
+# a column of Z piezo positions beside the force (📐 from the AFM images tab)
+BT_Z_COL = re.compile(r"^\s*(Z\s*piezo|Z\s*sensor|ZSnsr)", re.I)
+BT_Z_METRES = {"nm": 1e-9, "µm": 1e-6, "um": 1e-6, "m": 1.0}
+
+
+def bt_z_rows(got):
+    """
+    The Z piezo through each beat, when the signal came with a Z column:
+    (rows of bta.beat_z, Z's unit, metres per Z unit or None), worked out
+    once per run and kept in ``got``; None without one.
+    """
+    if "_z" in got:
+        return got["_z"]
+    got["_z"] = None
+    sets = st.session_state.get("_bt_sets") or {}
+    frame = (sets.get(got["sid"]) or {}).get("frame")
+    if frame is None or not got["beats"]:
+        return None
+    col = next((c for c in frame.columns if BT_Z_COL.match(str(c))
+                and c not in (got["xcol"], got["ycol"])), None)
+    if col is None:
+        return None
+    x = pd.to_numeric(frame[got["xcol"]], errors="coerce").to_numpy(float)
+    z = pd.to_numeric(frame[col], errors="coerce").to_numpy(float)
+    ok = np.isfinite(x) & np.isfinite(z)
+    if ok.sum() < 3:
+        return None
+    order = np.argsort(x[ok], kind="stable")
+    z_on = np.interp(got["x"], x[ok][order], z[ok][order])
+    unit = bta.unit_of(str(col))
+    rows = bta.beat_z(got["beats"], got["x"], got["y"], z_on, got["base"])
+    got["_z"] = (rows, unit, BT_Z_METRES.get(unit))
+    return got["_z"]
+
+
+def bt_z_values(got):
+    """Each beat's Z movement and loop area: (movements, Z's unit, areas,
+    their unit: J when the force and Z units are known), or None."""
+    found = bt_z_rows(got)
+    if not found or not found[0]:
+        return None
+    rows, unit, per_m = found
+    move = np.array([r["z_move"] for r in rows], float)
+    area = np.array([r["loop_area"] for r in rows], float)
+    if got.get("newtons") and per_m:
+        return move, unit, area * got["newtons"] * per_m, "J"
+    return move, unit, area, f"{got['y_unit']}·{unit}".strip("·")
+
+
+def bt_z_box(sid, got):
+    """📐 Each beat against the Z piezo: how far Z moved and the area of
+    the force against Z loop (the work over the beat), with the loops laid
+    over one another."""
+    values = bt_z_values(got)
+    if values is None:
+        return
+    rows = got["_z"][0]
+    move, zu, area, au = values
+    with st.container(border=True):
+        st.markdown("#### 📐 Deflection against Z piezo")
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"Z movement per beat ({zu})", bt_mean_sd(move))
+        m2.metric(f"Loop area per beat ({au})", bt_mean_sd(area))
+        m3.metric("Beats with Z", len(rows))
+        figure = go.Figure()
+        shades = np.linspace(0.35, 1.0, len(rows))
+        for r, shade in zip(rows, shades):
+            blue = (int(198 - 190 * shade), int(219 - 171 * shade),
+                    int(239 - 132 * shade))
+            figure.add_trace(go.Scatter(
+                x=r["loop_z"], y=r["loop_f"], mode="lines",
+                name=f"beat {r['n']}", line=dict(width=2,
+                                                 color=f"rgb{blue}"),
+                hovertemplate=f"beat {r['n']}<br>Z %{{x:.3g}}<br>"
+                              "%{y:.3g}<extra></extra>"))
+        ytitle = (f"Force from the baseline ({got['shown']})"
+                  if got.get("shown") else f"{bt_y_title(got)} from the "
+                  "baseline")
+        figure.update_layout(
+            template="plotly_white", height=420,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title=f"Z from where the beat starts ({zu})",
+            yaxis_title=ytitle, showlegend=len(rows) <= 12)
+        st.plotly_chart(figure, **STRETCH, key=f"btz_fig_{sid}",
+                        config={"displaylogo": False})
+        st.caption(
+            "Each beat (full or a lone peak) from where it starts to where it "
+            "ends, light to dark in order. Z movement: its largest less its "
+            "smallest in the beat. Loop area: force × Z round the loop, the "
+            "net work done on the probe over the beat (the cantilever's own "
+            "spring gives back over a loop all it takes, so only Z's share "
+            "is left).")
+        with st.expander("Each beat"):
+            each = pd.DataFrame({
+                "Beat": [r["n"] for r in rows],
+                f"Starts at ({got['x_unit']})": [r["t0"] for r in rows],
+                f"Z movement ({zu})": move, f"Loop area ({au})": area})
+            st.dataframe(each, hide_index=True, **STRETCH, column_config={
+                f"Loop area ({au})": st.column_config.NumberColumn(
+                    format="%.3e")})
+            st.download_button(
+                "💾 Each beat against Z (CSV)",
+                each.to_csv(index=False).encode("utf-8"),
+                file_name=f"{sc_db_safe(st.session_state['_bt_sets'][sid]['name'])}"
+                          "_z_per_beat.csv",
+                mime="text/csv", key=f"btb_zcsv_{sid}")
 
 
 def bt_summary_frame(ids):
@@ -35904,6 +36188,14 @@ def bt_slide_table(g0, g1):
         means = [v.mean() if v.size else np.nan for v in values]
         rows.append([label(text, kind), bt_mean_sd(values[0]),
                      bt_mean_sd(values[1]), change(*means, how)])
+    # 📐 the Z piezo, when both came with one in the same units
+    zs = [bt_z_values(g) for g in (g0, g1)]
+    if all(zs) and zs[0][1] == zs[1][1] and zs[0][3] == zs[1][3]:
+        for text, i, u in (("Z movement per beat", 0, 1),
+                           ("Work per beat, force × Z loop", 2, 3)):
+            a, b = zs[0][i], zs[1][i]
+            rows.append([f"{text} ({zs[0][u]})", bt_mean_sd(a),
+                         bt_mean_sd(b), change(a.mean(), b.mean(), "x")])
 
     def totals(got, sc):
         side = [b[part] for b in got["beats"] for part in ("pos", "neg")
