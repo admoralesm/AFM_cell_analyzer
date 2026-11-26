@@ -30840,15 +30840,28 @@ AI_DZ_VIEW = ("2D", "3D over time")
 
 def ai_dz_defaults(pairs):
     """The channels a file opens on for 📐: its deflection, and its Z
-    sensor (else its height, else a channel named Z…)."""
+    channel (the piezo: ZSensor, ZSnsr, Z…), None when it has none."""
     bases = list(pairs)
     defl = next((b for b in bases if "defl" in b.lower()), None)
-    z = (next((b for b in bases if re.search(r"z\s*sens|zsnsr", b, re.I)),
-              None)
-         or next((b for b in bases if "height" in b.lower()), None)
-         or next((b for b in bases if re.match(r"\s*z", b, re.I)
-                  and b != defl), None))
+    z = next((b for b in bases if re.match(r"\s*z", b, re.I)
+              and b != defl), None)
     return defl, z
+
+
+def ai_slow_part(t, y, window):
+    """The slow drift of y: its running median over ``window`` s (on the
+    points that are there), at every point."""
+    t = np.asarray(t, float)
+    y = np.asarray(y, float)
+    ok = np.isfinite(t) & np.isfinite(y)
+    out = np.full(y.size, np.nan)
+    if ok.sum() < 3 or not window or window <= 0:
+        return out
+    step = float(np.median(np.diff(t[ok]))) or 1e-9
+    n = max(3, int(round(window / step)) | 1)
+    out[ok] = pd.Series(y[ok]).rolling(n, center=True, min_periods=1) \
+        .median().to_numpy()
+    return out
 
 
 def ai_send_dz(frame, name, meta):
@@ -30873,11 +30886,15 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
     st.markdown("**📐 Deflection against Z piezo**")
     pairs = ai_pairs(names)
     defl0, z0 = ai_dz_defaults(pairs)
-    if defl0 is None or z0 is None:
-        st.info("This needs a deflection channel and a Z sensor (or height) "
-                "channel in the file.", icon="📐")
+    if defl0 is None:
+        st.info("This needs a deflection channel in the file.", icon="📐")
         return
     bases = list(pairs)
+    if z0 is None:
+        st.warning("This file has no Z channel (ZSensor) to read the piezo "
+                   "from. Choose the channel that holds it below.",
+                   icon="📐")
+        z0 = next((b for b in bases if b != defl0), bases[0])
     for key, default in (("ai_dz_defl", defl0), ("ai_dz_z", z0)):
         if s.get(key) not in bases:
             s[key] = default
@@ -30890,8 +30907,8 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
                  help="Trace and retrace together, read along time like the "
                       "plots above (⏱️ Timing).")
     c2.selectbox("Z piezo", bases, key="ai_dz_z",
-                 help="Where the piezo held the cantilever's base: the Z "
-                      "sensor, or the height.")
+                 help="The Z channel (ZSensor): where the piezo held the "
+                      "cantilever's base, as recorded.")
     c3.segmented_control("Deflection as", AI_DZ_AS, key="ai_dz_as",
                          help="nm: the cantilever's bend. Force: × k, in "
                               "the force unit under 🪝 Cantilever.")
@@ -30929,7 +30946,21 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
         st.info("The two channels have too few points in common.",
                 icon="📐")
         return
-    z = z - float(np.median(z[ok]))
+    d1, d2 = st.columns([1.3, 1], vertical_alignment="bottom")
+    d1.checkbox("Take off Z's slow drift", key="ai_dz_drift",
+                help="Off: Z exactly as the Z channel recorded it. On: less "
+                     "its running median over the window, so only the "
+                     "beats' movement is left (a cell or piezo creeping "
+                     "over minutes no longer stretches the loops apart).")
+    if s.get("ai_dz_win") is None:
+        s["ai_dz_win"] = 5.0
+    d2.number_input("Window (s)", 0.1, 600.0, step=0.5, key="ai_dz_win",
+                    disabled=not s.get("ai_dz_drift"),
+                    help="Longer than a beat: a few beats long.")
+    drift = bool(s.get("ai_dz_drift"))
+    if drift:
+        z = z - ai_slow_part(np.where(ok, t, np.nan), np.where(ok, z, np.nan),
+                             float(s.get("ai_dz_win") or 5.0))
     whole = (float(t[ok].min()), float(t[ok].max()))
     lo, hi = whole
     if whole[1] > whole[0]:
@@ -30949,7 +30980,8 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
     as_force = s.get("ai_dz_as") == AI_DZ_AS[1]
     yv = force if as_force else defl_nm
     ytitle = f"Force ({shown})" if as_force else "Deflection (nm)"
-    ztitle = f"Z piezo, from its median ({zu})"
+    ztitle = (f"Z, slow drift taken off ({zu})" if drift
+              else f"Z piezo ({zu})")
     every = max(1, int(math.ceil(sel.sum() / 20000)))
     ts, zs, ys = t[sel][::every], z[sel][::every], yv[sel][::every]
     if s.get("ai_dz_view") == AI_DZ_VIEW[1]:
@@ -30980,9 +31012,12 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
         r = float(np.corrcoef(zz, dd)[0, 1])
         words.append(f"deflection per {zu} of Z: {slope:.3g} (r = {r:.2f})")
     st.caption(
-        "; ".join(words) + ". Each beat goes round a loop: the area of force "
-        "against Z is the net work done on the probe over that beat (the "
-        "cantilever's own spring gives back over a loop all it takes). "
+        f"Z is the {s['ai_dz_z']} channel" + (" less its slow drift"
+                                               if drift else
+                                               ", as recorded")
+        + ". " + "; ".join(words) + ". Each beat goes round a loop: the area "
+        "of force against Z is the net work done on the probe over that beat "
+        "(the cantilever's own spring gives back over a loop all it takes). "
         "Send both to 💓 Beat analysis to get it beat by beat.")
     frame = pd.DataFrame({"Time (s)": t[ok], f"Force ({shown})": force[ok],
                           f"Z piezo ({zu})": z[ok]})
@@ -30993,8 +31028,8 @@ def ai_dz_section(arr, axis, names, timing, cal, want, cal_meta, stem):
               on_click=ai_send_dz,
               args=(frame, f"{stem} · deflection and Z", meta), **STRETCH,
               help="The whole recording (not only the range shown): the "
-                   "force for the beats, with Z beside it for each beat's "
-                   "Z movement and loop area.")
+                   "force for the beats, with Z beside it (as shown here) "
+                   "for each beat's Z movement and loop area.")
     note = s.pop("_ai_dz_note", None)
     if note:
         b2.caption("✅ " + note)
