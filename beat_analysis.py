@@ -414,14 +414,15 @@ def _ratio(a, b):
 
 def beat_symmetry(beat):
     """
-    How a beat's negative peak compares with its positive one, and how
-    lopsided each peak is in time:
+    How a beat's positive peak compares with its negative one (positive ÷
+    negative, as the positive is usually the larger), and how lopsided each
+    peak is in time:
 
-    - ``depth_ratio``: the negative peak's depth ÷ the positive's height;
-    - ``impulse_ratio``: the negative peak's area ÷ the positive's (both
-      without sign); 1 when the area below the baseline matches the area
-      above it;
-    - ``duration_ratio``: the negative peak's duration ÷ the positive's
+    - ``depth_ratio``: the positive peak's height ÷ the negative's depth;
+    - ``impulse_ratio``: the positive peak's area ÷ the negative's (both
+      without sign); 1 when the area above the baseline matches the area
+      below it;
+    - ``duration_ratio``: the positive peak's duration ÷ the negative's
       (by the timing rule);
     - ``balance``: (P − N) ÷ (P + N) of the two areas: 0 when they match,
       +1 all above the baseline, −1 all below;
@@ -442,10 +443,10 @@ def beat_symmetry(beat):
         out["neg_shape"] = _ratio(recovery_time(neg), rise_time(neg))
     if pos is not None and neg is not None:
         P, N = abs(float(pos["area"])), abs(float(neg["area"]))
-        out["depth_ratio"] = _ratio(abs(neg["peak"]), abs(pos["peak"]))
-        out["impulse_ratio"] = _ratio(N, P)
-        out["duration_ratio"] = _ratio(peak_duration(neg),
-                                       peak_duration(pos))
+        out["depth_ratio"] = _ratio(abs(pos["peak"]), abs(neg["peak"]))
+        out["impulse_ratio"] = _ratio(P, N)
+        out["duration_ratio"] = _ratio(peak_duration(pos),
+                                       peak_duration(neg))
         out["balance"] = (P - N) / (P + N) if P + N > 0 else nan
     return out
 
@@ -571,6 +572,55 @@ def beat_z(beats, x, f, z, base=0.0):
                     "z_move": float(np.ptp(zz)),
                     "loop_area": _loop_area(zz, ff),
                     "loop_z": zz - zz[0], "loop_f": ff})
+    return out
+
+
+def _edge(e, key, fallback):
+    v = e.get(key)
+    return float(v) if v is not None and np.isfinite(v) else float(e[fallback])
+
+
+def peak_z(beats, x, f, z):
+    """
+    Each peak (positive and negative, on its own) with the Z piezo through
+    it, both measured from where the peak starts: the force (or deflection)
+    and Z there are taken off, so every peak's path starts at (0, 0) and
+    the peaks lie over one another, whatever the drift between them. From
+    the peak's start to its end (``up`` and ``back`` by the timing rule
+    when set, else where it leaves and meets the baseline).
+
+    One dict per peak with at least 3 points: n (its beat's number), side
+    ("pos" or "neg"), t0, t1, z_move (Z's largest less its smallest),
+    z_net (Z at the end less at the start), loop_area (the area the path
+    encloses, closed back to its start: force × Z, the work the peak's own
+    loop holds), loop_z and loop_f (the path, from (0, 0)).
+    """
+    x = np.asarray(x, float)
+    f = np.asarray(f, float)
+    z = np.asarray(z, float)
+    good = np.isfinite(x) & np.isfinite(f) & np.isfinite(z)
+    xs, fs, zs = x[good], f[good], z[good]
+    out = []
+    if xs.size < 3:
+        return out
+    for b in beats:
+        for side in ("pos", "neg"):
+            e = b.get(side)
+            if not e:
+                continue
+            t0, t1 = _edge(e, "up", "start"), _edge(e, "back", "end")
+            inside = (xs > t0) & (xs < t1)
+            if inside.sum() < 2:
+                continue
+            z0, f0 = np.interp(t0, xs, zs), np.interp(t0, xs, fs)
+            z1, f1 = np.interp(t1, xs, zs), np.interp(t1, xs, fs)
+            pz = np.r_[z0, zs[inside], z1] - z0
+            pf = np.r_[f0, fs[inside], f1] - f0
+            out.append({"n": b.get("n"), "side": side, "t0": t0, "t1": t1,
+                        "z_move": float(np.ptp(pz)),
+                        "z_net": float(pz[-1]),
+                        "loop_area": _loop_area(pz, pf),
+                        "loop_z": pz, "loop_f": pf})
     return out
 
 
@@ -749,9 +799,9 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
             f"Negative {w}{au}": area_neg if neg else np.nan,
             f"Net {w}{au}": area_pos + area_neg,
             f"Total {w}{au}": abs(area_pos) + abs(area_neg),
-            "Negative ÷ positive peak": sym["depth_ratio"],
-            f"Negative ÷ positive {w}": sym["impulse_ratio"],
-            "Negative ÷ positive duration": sym["duration_ratio"],
+            "Positive ÷ negative peak": sym["depth_ratio"],
+            f"Positive ÷ negative {w}": sym["impulse_ratio"],
+            "Positive ÷ negative duration": sym["duration_ratio"],
             f"{w.capitalize()} balance (P − N) ÷ (P + N)": sym["balance"],
             "Positive peak recovery ÷ rise": sym["pos_shape"],
             "Negative peak recovery ÷ rise": sym["neg_shape"],
