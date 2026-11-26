@@ -666,7 +666,9 @@ COMPANION_NEEDS = {
                          "describe", "STATS", "peak_power", "seconds_per",
                          "area_word", "noise_stats", "peak_duration",
                          "rise_time", "recovery_time", "beat_duration",
-                         "retime", "timing_of", "TIMINGS"),
+                         "retime", "timing_of", "TIMINGS",
+                         "beat_symmetry", "add_symmetry",
+                         "symmetry_share"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used"),
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
@@ -33600,6 +33602,8 @@ def bt_analyse(sid, e_unit=None):
     bta.retime(events, x, ys, base, rule, value,
                noise["noise"] if noise else None)
     beats = bta.pair_beats(kept, float(s[key("gap")] or 0.0), s[key("order")])
+    # each peak's mirror symmetry and each full beat's half-turn symmetry
+    bta.add_symmetry(beats, x, ys, base)
     fu = s[key("fu")]
     x_unit = bta.unit_of(xcol)
     y_unit = shown or bta.unit_of(ycol)
@@ -34443,6 +34447,17 @@ def bt_report(sid, got):
                         if d["n"] > 1 else ""))
     lines += ["", "UNITS AND HOW"]
     lines.append(bt_timing_text(got))
+    lines.append(
+        "Symmetry: a beat in the plane of time and force can only have the "
+        "symmetries of the Klein four-group {identity, time mirror T, sign "
+        "flip S, half-turn TS} (Z2 × Z2, abelian). A peak can be mirror-"
+        "symmetric about its top (T) and a full beat half-turn symmetric "
+        "about where it crosses the baseline (TS). Each symmetry share is the "
+        "part of ∫(F − baseline)² dt left unchanged by that operation, (1 ± "
+        "c)/2 with c = ∫g(t)g(2t0 − t)dt / ∫g² dt: 1 exactly symmetric, 0.5 "
+        "no more than chance. Ratios: negative ÷ positive peak, impulse and "
+        "duration; balance (P − N) ÷ (P + N); recovery ÷ rise (above 1: a "
+        "slow fall, tail or shoulder).")
     if area:
         lines.append(
             f"Impulse: the area under each force peak, ∫(F − baseline) dt, "
@@ -34548,6 +34563,8 @@ def bt_stats_rows(got):
 
     times = [(b["pos"] or b["neg"])["peak_x"] for b in beats]
     timing = bta.timing_of(beats)
+    sym = [bta.beat_symmetry(b) for b in beats]
+    full_i = [i for i, b in enumerate(beats) if b["kind"] == bta.KINDS[0]]
     return [
         # the energy and power first (BT_ENERGY_ROWS), then the shape
         ("Energy per positive peak", [energy(e) for e in pos], eu),
@@ -34579,6 +34596,32 @@ def bt_stats_rows(got):
         (f"{word} per positive peak", [abs(e["area"]) for e in pos], area),
         (f"{word} per negative peak (no sign)",
          [abs(e["area"]) for e in neg], area),
+        # how each full beat's negative peak compares with its positive one,
+        # and how lopsided each peak is (1: as fast down as up; above 1: a
+        # slow fall, a tail or a shoulder)
+        ("Negative ÷ positive peak " + ("force" if newtons else "size")
+         + " (full beats)", [sym[b_]["depth_ratio"] for b_ in full_i], ""),
+        (f"Negative ÷ positive {word.lower()} (full beats)",
+         [sym[b_]["impulse_ratio"] for b_ in full_i], ""),
+        ("Negative ÷ positive duration (full beats)",
+         [sym[b_]["duration_ratio"] for b_ in full_i], ""),
+        (f"{word} balance (P − N) ÷ (P + N) (full beats)",
+         [sym[b_]["balance"] for b_ in full_i], ""),
+        ("Positive peak recovery ÷ rise",
+         [bta.beat_symmetry({"pos": e, "neg": None})["pos_shape"]
+          for e in pos], ""),
+        ("Negative peak recovery ÷ rise",
+         [bta.beat_symmetry({"pos": None, "neg": e})["neg_shape"]
+          for e in neg], ""),
+        # the shares left unchanged by the beat's two possible symmetries
+        # (the Klein four-group, bta.add_symmetry): 1 exactly symmetric,
+        # 0.5 no more than chance
+        ("Full beat half-turn symmetry (share)",
+         [b_.get("point", np.nan) for b_ in full], ""),
+        ("Positive peak mirror symmetry (share)",
+         [e.get("mirror", np.nan) for e in pos], ""),
+        ("Negative peak mirror symmetry (share)",
+         [e.get("mirror", np.nan) for e in neg], ""),
         ("Time between beats", list(np.diff(times)) if len(times) > 1
          else [], xu)]
 
@@ -34794,7 +34837,16 @@ BT_SUMMARY_STATS = (
     (None, "Full beat duration"),
     (None, "Positive peak duration"),
     (None, "Negative peak duration"),
-    ("Time between beats", "Time between beats"))
+    ("Time between beats", "Time between beats"),
+    ("Negative ÷ positive peak {fw}", "Negative ÷ positive peak"),
+    ("Negative ÷ positive {wl}", "Negative ÷ positive {wl}"),
+    ("Negative ÷ positive duration", "Negative ÷ positive duration"),
+    ("{w} balance (P − N) ÷ (P + N)", "{w} balance"),
+    ("Positive peak: recovery ÷ rise", "Positive peak recovery ÷ rise"),
+    ("Negative peak: recovery ÷ rise", "Negative peak recovery ÷ rise"),
+    ("Full beat: half-turn symmetry", "Full beat half-turn symmetry"),
+    ("Positive peak: mirror symmetry", "Positive peak mirror symmetry"),
+    ("Negative peak: mirror symmetry", "Negative peak mirror symmetry"))
 def bt_summary_parts(sid, got):
     """
     The ⭐ Summary's pieces: the head (the signal, its file, k, the
@@ -34807,10 +34859,13 @@ def bt_summary_parts(sid, got):
     word = bta.area_word(got["x_unit"], got["y_unit"])
     peak = "Peak force" if got.get("newtons") else "Peak height"
 
+    names = {"w": word, "f": peak, "wl": word.lower(),
+             "fw": "force" if got.get("newtons") else "size"}
+
     def named(label, param):
         if label is None:
             return bt_short(param)
-        return label.format(w=word, f=peak)
+        return label.format(**names)
 
     results = bt_results_rows(got)
     totals = []
@@ -34823,7 +34878,7 @@ def bt_summary_parts(sid, got):
     stats = bt_stats_rows(got)
     per_peak = []
     for label, start in BT_SUMMARY_STATS:
-        start = start.format(w=word)
+        start = start.format(**names)
         for param, values, unit in stats:
             if param.startswith(start):
                 per_peak.append((named(label, param), bta.describe(values),
@@ -35488,6 +35543,191 @@ def bt_summary_frame(ids):
     return pd.DataFrame(rows)
 
 
+# ⚖️ Before and after: two signals (the same cell before and after a
+# treatment) compared peak by peak. (label, start of the parameter's name in
+# bt_stats_rows); {f} Peak force (Peak height when y is not a force), {w}
+# Impulse (Area when it is not a force against time)
+BT_BA_PEAK = (("{f}, positive peaks", "Positive peak height"),
+              ("{f}, negative peaks (depth)", "Negative peak depth"),
+              ("Energy per positive peak", "Energy per positive peak"),
+              ("Energy per negative peak", "Energy per negative peak"),
+              ("{w} per positive peak", "{w} per positive peak"),
+              ("{w} per negative peak", "{w} per negative peak"),
+              ("Full beat duration", "Full beat duration"),
+              ("Time between beats", "Time between beats"))
+# and over the recording, from bt_results_rows
+BT_BA_TOTAL = (("Energy, all peaks (total)", "Energy, all peaks"),
+               ("{w}, all peaks (total)", "{w}, all peaks"),
+               ("{w}, positive peaks (total)", "{w}, positive peaks"),
+               ("{w}, negative peaks (total)", "{w}, negative peaks"),
+               ("{w} per minute", "{w} per minute"),
+               ("Beats per minute", "Beats per minute"),
+               ("Recording time", "Recording time"))
+BT_BA_COLS = ("Parameter", "Before", "After", "After ÷ before", "p", "Unit")
+BT_BEFORE, BT_AFTER = "#8a8f98", "#2a78d6"
+
+
+def bt_got_for(sid):
+    """A signal's analysis: the one shown on the tab when it is this
+    signal, else worked out."""
+    last = st.session_state.get("_bt_got_last")
+    if last and last[0] == sid and last[1] is not None:
+        return last[1]
+    return bt_analyse(sid)
+
+
+def bt_ba_values(got, start):
+    """The per-peak values of the parameter whose name starts so, and its
+    unit, from bt_stats_rows (finite ones only)."""
+    for param, values, unit in bt_stats_rows(got):
+        if param.startswith(start):
+            v = np.asarray(values, float)
+            return v[np.isfinite(v)], unit
+    return np.array([]), ""
+
+
+def bt_ba_table(g0, g1):
+    """
+    ⚖️ The two signals side by side, in six columns (BT_BA_COLS): per peak
+    the mean ± SD (n) before and after, after ÷ before and the Mann-Whitney
+    p between the two sets of peaks; then the totals over each recording.
+    (rows of strings, the indices of the section rows)
+    """
+    from scipy import stats as sps
+    word = bta.area_word(g0["x_unit"], g0["y_unit"])
+    names = {"w": word,
+             "f": "Peak force" if g0.get("newtons") else "Peak height"}
+
+    def num(v, digits=4):
+        return bta.pretty(v, digits) if v is not None and np.isfinite(v) \
+            else ""
+
+    rows, sections = [], set()
+    sections.add(len(rows))
+    rows.append(["Per peak: mean ± SD (n)", "", "", "", "", ""])
+    for label, start in BT_BA_PEAK:
+        start = start.format(**names)
+        v0, unit = bt_ba_values(g0, start)
+        v1, _ = bt_ba_values(g1, start)
+        if v0.size == 0 and v1.size == 0:
+            continue
+        cells = []
+        for v in (v0, v1):
+            d = bta.describe(v)
+            cells.append(f"{num(d['Mean'])} ± {num(d['SD'])} ({d['n']})"
+                         if d["n"] else "")
+        ratio = (v1.mean() / v0.mean()) if v0.size and v1.size \
+            and v0.mean() != 0 else np.nan
+        p = (sps.mannwhitneyu(v0, v1).pvalue
+             if v0.size >= 3 and v1.size >= 3 else np.nan)
+        rows.append([label.format(**names), *cells,
+                     f"{ratio:.3g}×" if np.isfinite(ratio) else "",
+                     num(p, 2), unit])
+    sections.add(len(rows))
+    rows.append(["Over the recording", "", "", "", "", ""])
+    t0 = {param: (value, unit) for param, value, unit in bt_results_rows(g0)}
+    t1 = {param: (value, unit) for param, value, unit in bt_results_rows(g1)}
+    for label, start in BT_BA_TOTAL:
+        start = start.format(**names)
+        key = next((param for param in t0 if param.startswith(start)), None)
+        if key is None:
+            continue
+        a, unit = t0[key]
+        b = t1.get(key, (np.nan, unit))[0]
+        ratio = b / a if (np.isfinite(a) and np.isfinite(b) and a) \
+            else np.nan
+        rows.append([label.format(**names), num(a), num(b),
+                     f"{ratio:.3g}×" if np.isfinite(ratio) else "", "",
+                     "" if unit == "n" else unit])
+    return rows, sections
+
+
+def bt_ba_figure(g0, g1, start_pos, start_neg, title, log=False):
+    """Every peak's value before (grey) and after (blue), positive and
+    negative peaks apart: a box over the dots of each."""
+    figure = go.Figure()
+    unit = ""
+    for label, got, colour in (("Before", g0, BT_BEFORE),
+                               ("After", g1, BT_AFTER)):
+        vp, unit = bt_ba_values(got, start_pos)
+        vn, _ = bt_ba_values(got, start_neg)
+        figure.add_trace(go.Box(
+            x=["Positive peaks"] * vp.size + ["Negative peaks"] * vn.size,
+            y=np.r_[vp, vn], name=label, boxpoints="all", jitter=0.45,
+            pointpos=0, marker=dict(color=colour, size=7,
+                                    line=dict(color="white", width=1)),
+            line=dict(color=colour, width=2), fillcolor="rgba(0,0,0,0)",
+            hovertemplate=f"{label}<br>%{{y:.4g}}<extra></extra>"))
+    figure.update_layout(
+        boxmode="group", height=380, plot_bgcolor="white",
+        paper_bgcolor="white", margin=dict(l=70, r=16, t=70, b=40),
+        title=dict(text=title, x=0.02, y=0.97, font=dict(size=15)),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1,
+                    xanchor="right"),
+        font=dict(family="Arial, Helvetica, sans-serif", size=13,
+                  color="black"))
+    figure.update_xaxes(showline=True, linewidth=1.5, linecolor="black",
+                        mirror=True, ticks="outside")
+    figure.update_yaxes(showline=True, linewidth=1.5, linecolor="black",
+                        mirror=True, ticks="outside", gridcolor="#eeeeee",
+                        title_text=unit, type="log" if log else "linear",
+                        exponentformat="E")
+    return figure
+
+
+def bt_before_after(ids, sid):
+    """⚖️ Two signals, the same cell before and after, compared peak by
+    peak: a table to copy, and the energy and impulse of every peak."""
+    s = st.session_state
+    sets = s["_bt_sets"]
+    if s.get("bt_ba1") not in ids:
+        s["bt_ba1"] = sid
+    if s.get("bt_ba0") not in ids or s["bt_ba0"] == s["bt_ba1"]:
+        s["bt_ba0"] = next(k for k in ids if k != s["bt_ba1"])
+    c0, c1 = st.columns(2)
+    c0.selectbox("Before", ids, key="bt_ba0",
+                 format_func=lambda k: sets[k]["name"])
+    c1.selectbox("After", ids, key="bt_ba1",
+                 format_func=lambda k: sets[k]["name"])
+    if s["bt_ba0"] == s["bt_ba1"]:
+        st.info("Choose two different signals.")
+        return
+    g0, g1 = bt_got_for(s["bt_ba0"]), bt_got_for(s["bt_ba1"])
+    if g0 is None or g1 is None:
+        st.warning("One of the two signals has no beats to compare.")
+        return
+    word = bta.area_word(g0["x_unit"], g0["y_unit"])
+    rows, sections = bt_ba_table(g0, g1)
+    tsv = "\n".join("\t".join(r) for r in [list(BT_BA_COLS), *rows])
+    bt_copy_button("📋 Copy the table", bt_table_html(rows, sections,
+                                                     BT_BA_COLS), tsv,
+                   "ba_table")
+    st.dataframe(
+        pd.DataFrame(rows, columns=BT_BA_COLS).style.apply(
+            lambda r: ["font-weight: bold" if r.name in sections else ""]
+            * len(r), axis=1),
+        hide_index=True, **STRETCH,
+        height=min(35 * (len(rows) + 1) + 3, 640))
+    f1, f2 = st.columns(2)
+    with f1:
+        if g0.get("k") and g0.get("newtons") and g1.get("k"):
+            st.plotly_chart(bt_ba_figure(
+                g0, g1, "Energy per positive peak", "Energy per negative peak",
+                "Energy per peak", log=True), **STRETCH)
+        else:
+            st.info("Energy needs the spring constant k of both signals.")
+    with f2:
+        st.plotly_chart(bt_ba_figure(
+            g0, g1, f"{word} per positive peak", f"{word} per negative peak",
+            f"{word} per peak"), **STRETCH)
+    st.caption(
+        "Each dot is one peak. p: Mann-Whitney test between the peaks before "
+        "and the peaks after, within this one recording pair; it says "
+        "whether this cell's beats changed, not whether compression works "
+        "in general (that needs the per-cell values across many cells). "
+        "Energy is on a log scale.")
+
+
 def beat_tab():
     s = st.session_state
     for key, value in (*BT_PUBLICATION.items(),
@@ -35550,6 +35790,9 @@ def beat_tab():
         bt_plot(sid, got)
         bt_results(sid, got)
         if len(ids) > 1:
+            with st.expander("⚖️ Before and after: two signals, peak by "
+                             "peak"):
+                bt_before_after(ids, sid)
             with st.expander(f"📋 All {len(ids)} signals side by side"):
                 frame = bt_summary_frame(ids)
                 st.dataframe(frame, hide_index=True, **STRETCH)
