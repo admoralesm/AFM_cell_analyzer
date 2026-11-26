@@ -401,6 +401,119 @@ def beat_duration(beat):
     return float(beat.get("duration", beat["end"] - beat["start"]))
 
 
+def _ratio(a, b):
+    """a ÷ b, NaN when either is missing or b is 0."""
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(a) and np.isfinite(b)) or b == 0:
+        return float("nan")
+    return a / b
+
+
+def beat_symmetry(beat):
+    """
+    How a beat's negative peak compares with its positive one, and how
+    lopsided each peak is in time:
+
+    - ``depth_ratio``: the negative peak's depth ÷ the positive's height;
+    - ``impulse_ratio``: the negative peak's area ÷ the positive's (both
+      without sign); 1 when the area below the baseline matches the area
+      above it;
+    - ``duration_ratio``: the negative peak's duration ÷ the positive's
+      (by the timing rule);
+    - ``balance``: (P − N) ÷ (P + N) of the two areas: 0 when they match,
+      +1 all above the baseline, −1 all below;
+    - ``pos_shape`` / ``neg_shape``: each peak's recovery ÷ its rise
+      (peak to end ÷ start to peak): 1 when it falls as fast as it rises,
+      above 1 for a slow fall, a tail or a shoulder after the peak.
+
+    The ratios between the two peaks need both (a full beat); NaN
+    otherwise.
+    """
+    pos, neg = beat.get("pos"), beat.get("neg")
+    nan = float("nan")
+    out = {"depth_ratio": nan, "impulse_ratio": nan, "duration_ratio": nan,
+           "balance": nan, "pos_shape": nan, "neg_shape": nan}
+    if pos is not None:
+        out["pos_shape"] = _ratio(recovery_time(pos), rise_time(pos))
+    if neg is not None:
+        out["neg_shape"] = _ratio(recovery_time(neg), rise_time(neg))
+    if pos is not None and neg is not None:
+        P, N = abs(float(pos["area"])), abs(float(neg["area"]))
+        out["depth_ratio"] = _ratio(abs(neg["peak"]), abs(pos["peak"]))
+        out["impulse_ratio"] = _ratio(N, P)
+        out["duration_ratio"] = _ratio(peak_duration(neg),
+                                       peak_duration(pos))
+        out["balance"] = (P - N) / (P + N) if P + N > 0 else nan
+    return out
+
+
+# A beat drawn in the plane of time and force can only have the symmetries
+# of the Klein four-group V = {e, T, S, TS} ≅ Z₂ × Z₂ (abelian): e leaves it
+# alone, T mirrors time about a moment c (t → 2c − t), S flips the force's
+# sign (F → −F), and TS does both, a half-turn about (c, baseline). No graph
+# but a flat line is unchanged by S, so a peak can only be mirror-symmetric
+# (T) about its top and a full beat only half-turn symmetric (TS) about the
+# moment it crosses the baseline. As V is abelian, each element splits a
+# waveform g into a part it leaves unchanged and a part it reverses,
+# g = (g + Tg)/2 + (g − Tg)/2, which are orthogonal; the share of ∫g² dt in
+# the unchanged part measures the symmetry: (1 + c)/2 for T and (1 − c)/2
+# for TS, c = ∫g(t) g(2c − t) dt / ∫g² dt. 1: exactly symmetric; 0.5: no
+# more symmetric than not; 0: exactly the opposite.
+
+
+def symmetry_share(x, r, centre, a, b, turn=False, points=801):
+    """
+    The share of ``r`` (the signal less its baseline), on [a, b] and nought
+    outside, that is left unchanged by mirroring time about ``centre``
+    (``turn`` False: g(2c − t) = g(t)) or by a half-turn about (centre, 0)
+    (``turn`` True: g(2c − t) = −g(t)): the squared size of its symmetric
+    part over its own. NaN when there is nothing there.
+    """
+    half = max(float(centre) - float(a), float(b) - float(centre))
+    if not half > 0:
+        return float("nan")
+    grid = np.linspace(float(centre) - half, float(centre) + half, points)
+    g = np.interp(grid, x, r)
+    g[(grid < a) | (grid > b)] = 0.0
+    total = float(np.dot(g, g))
+    if not total > 0:
+        return float("nan")
+    c = float(np.dot(g, g[::-1])) / total
+    return (1.0 - c) / 2.0 if turn else (1.0 + c) / 2.0
+
+
+def add_symmetry(beats, x, y, base):
+    """
+    Each peak's mirror symmetry about its top (``mirror``: on its own side
+    of the baseline, from where it leaves it to where it comes back) and
+    each full beat's half-turn symmetry about where it crosses the baseline
+    between its two peaks (``point``, from the first peak's start to the
+    second's end), as shares in [0, 1] (``symmetry_share``).
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    order = np.argsort(x[ok], kind="stable")
+    x, r = x[ok][order], y[ok][order] - float(base)
+    for b in beats:
+        for side in ("pos", "neg"):
+            e = b.get(side)
+            if e is not None:
+                own = np.clip(e["sign"] * r, 0.0, None)
+                e["mirror"] = symmetry_share(x, own, e["peak_x"], e["start"],
+                                             e["end"])
+        if b.get("pos") is not None and b.get("neg") is not None:
+            first, second = sorted((b["pos"], b["neg"]),
+                                   key=lambda e: e["start"])
+            centre = (float(first["end"]) + float(second["start"])) / 2.0
+            b["point"] = symmetry_share(x, r, centre, first["start"],
+                                        second["end"], turn=True)
+    return beats
+
+
 def excursions(x, y, base, up, down, min_width=0.0, merge=0.0):
     """
     Each stretch where the signal leaves its baseline and gets past one of
@@ -536,8 +649,10 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
     """
     One row per beat: its kind, when it starts and ends, the positive
     peak's height and area, the negative peak's depth and area, the net and
-    total area, the spring energy of each peak and of the beat (F² / 2k,
-    with k), and the time since the previous beat.
+    total area, how the two peaks compare (``beat_symmetry``: depth ÷
+    height, area ÷ area, duration ÷ duration, the balance of the areas, and
+    each peak's recovery ÷ rise), the spring energy of each peak and of the
+    beat (F² / 2k, with k), and the time since the previous beat.
     """
     area_unit = f"{y_unit}·{x_unit}" if (x_unit and y_unit) else "area"
     xu = f" ({x_unit})" if x_unit else ""
@@ -560,6 +675,7 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
         area_pos = pos["area"] if pos else 0.0
         area_neg = neg["area"] if neg else 0.0
         at = (pos or neg)["peak_x"]
+        sym = beat_symmetry(b)
         row = {
             "Beat": b["n"], "Kind": b["kind"],
             f"Leaves baseline{xu}": b["start"],
@@ -573,6 +689,18 @@ def beat_table(beats, x_unit="", y_unit="", k=None, newtons=None,
             f"Negative {w}{au}": area_neg if neg else np.nan,
             f"Net {w}{au}": area_pos + area_neg,
             f"Total {w}{au}": abs(area_pos) + abs(area_neg),
+            "Negative ÷ positive peak": sym["depth_ratio"],
+            f"Negative ÷ positive {w}": sym["impulse_ratio"],
+            "Negative ÷ positive duration": sym["duration_ratio"],
+            f"{w.capitalize()} balance (P − N) ÷ (P + N)": sym["balance"],
+            "Positive peak recovery ÷ rise": sym["pos_shape"],
+            "Negative peak recovery ÷ rise": sym["neg_shape"],
+            # the group's two possible symmetries, as shares (add_symmetry)
+            "Half-turn symmetry about the crossing": b.get("point", np.nan),
+            "Positive peak mirror symmetry": pos.get("mirror", np.nan)
+            if pos else np.nan,
+            "Negative peak mirror symmetry": neg.get("mirror", np.nan)
+            if neg else np.nan,
             f"Since previous beat{xu}": (at - previous
                                         if previous is not None else np.nan),
         }
@@ -820,6 +948,13 @@ def peak_table(beats, x_unit="", y_unit="", k=None, newtons=None,
                                            else np.nan),
                f"Rise, start to peak{xu}": rise_time(e),
                f"Recovery, peak to end{xu}": recovery_time(e),
+               # 1: falls as fast as it rises; above 1: a slow fall, a tail
+               # or a shoulder
+               "Recovery ÷ rise": _ratio(recovery_time(e), rise_time(e)),
+               # the share of the peak unchanged by mirroring time about
+               # its top (add_symmetry): 1 exactly symmetric
+               "Mirror symmetry about the peak": e.get("mirror", np.nan),
+               "Beat's half-turn symmetry": b.get("point", np.nan),
                f"Height{yu}": e["peak"],
                area_col: e["area"]}
         if as_force:
