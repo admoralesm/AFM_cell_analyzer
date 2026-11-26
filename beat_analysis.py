@@ -514,6 +514,66 @@ def add_symmetry(beats, x, y, base):
     return beats
 
 
+def beat_span(beat):
+    """Where a beat starts and ends: its first peak leaving the baseline
+    to its last one coming back (by the timing rule when it has been
+    applied, else where the signal crosses the baseline). (None, None) for
+    a beat with no peak."""
+    parts = [e for e in (beat.get("pos"), beat.get("neg")) if e]
+    starts = [e.get("up", e["start"]) for e in parts]
+    ends = [e.get("back", e["end"]) for e in parts]
+    starts = [float(v) for v in starts if v is not None and np.isfinite(v)]
+    ends = [float(v) for v in ends if v is not None and np.isfinite(v)]
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def _loop_area(a, b):
+    """The area a closed loop of points encloses (the shoelace formula),
+    whichever way round it goes."""
+    return float(abs(np.dot(a, np.roll(b, -1)) - np.dot(b, np.roll(a, -1)))
+                 / 2.0)
+
+
+def beat_z(beats, x, f, z, base=0.0):
+    """
+    Each beat with the Z piezo's movement through it, for a force recorded
+    with the Z piezo beside it (an AFM's Z sensor or height channel, at the
+    same times ``x``). Over each beat, from where it starts to where it
+    ends (beat_span): how far Z moved (its largest less its smallest), and
+    the loop the force (``f`` less ``base``) draws against Z, with its
+    area, force × Z.
+
+    That area is the net work done on the probe over the beat: the tip
+    moves with Z plus the deflection, and over a closed loop the
+    cantilever's own spring gives back all it took (∮F d(deflection) = 0,
+    as F = k × deflection), so ∮F d(tip) = ∮F dZ. Turning Z round (a
+    sensor that counts the other way) mirrors the loop and keeps its area.
+
+    One dict per beat with at least 3 points: n, t0, t1, z_move,
+    loop_area, loop_z (Z from where the beat starts), loop_f.
+    """
+    x = np.asarray(x, float)
+    f = np.asarray(f, float) - float(base)
+    z = np.asarray(z, float)
+    good = np.isfinite(x) & np.isfinite(f) & np.isfinite(z)
+    out = []
+    for b in beats:
+        t0, t1 = beat_span(b)
+        if t0 is None:
+            continue
+        inside = good & (x >= t0) & (x <= t1)
+        if inside.sum() < 3:
+            continue
+        zz, ff = z[inside], f[inside]
+        out.append({"n": b.get("n"), "t0": t0, "t1": t1,
+                    "z_move": float(np.ptp(zz)),
+                    "loop_area": _loop_area(zz, ff),
+                    "loop_z": zz - zz[0], "loop_f": ff})
+    return out
+
+
 def excursions(x, y, base, up, down, min_width=0.0, merge=0.0):
     """
     Each stretch where the signal leaves its baseline and gets past one of
