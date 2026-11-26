@@ -33674,7 +33674,7 @@ def bt_analyse(sid, e_unit=None):
     noise, kind, noise_auto, noise_manual, typed = bt_noise_used(
         sid, x, ys, base, events)
     # where each peak starts and ends (its durations, rise and power): back
-    # within 3 × the noise SD unless changed under 💓 Beats
+    # within 2 × the noise SD unless changed under 💓 Beats
     rule, value = bt_timing_rule(sid)
     bta.retime(events, x, ys, base, rule, value,
                noise["noise"] if noise else None)
@@ -33734,7 +33734,7 @@ def bt_noise_used(sid, x, ys, base, events):
 
 
 def bt_timing_rule(sid):
-    """Where peaks start and end: (rule, its number), back within 3 × the
+    """Where peaks start and end: (rule, its number), back within 2 × the
     noise SD unless changed."""
     s = st.session_state
     key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
@@ -34095,7 +34095,7 @@ def bt_settings(sid, got):
     t1, t2 = st.columns([1.6, 1])
     t1.selectbox("⏱ Peaks start and end", bta.TIMINGS, key=key("tmode"),
                  help="Where durations, rises and power are measured from "
-                      "and to. Back within × noise SD (3 unless changed): "
+                      "and to. Back within × noise SD (2 unless changed): "
                       "a peak starts where the signal leaves the noise and "
                       "ends where it is back in it, the whole beat as you "
                       "see it. At a % of the peak's height (10%: 10% up to "
@@ -34106,7 +34106,7 @@ def bt_settings(sid, got):
     if s[key("tmode")] == bta.TIMINGS[0]:
         t2.number_input("× noise SD", key=key("tk"), min_value=0.0,
                         step=0.5, format="%.3g",
-                        help="3 unless changed. 0: at the baseline itself.")
+                        help="2 unless changed. 0: at the baseline itself.")
     else:
         t2.number_input("% of the height", key=key("tpct"), min_value=1.0,
                         max_value=50.0, step=5.0, format="%.3g",
@@ -35113,7 +35113,7 @@ def bt_short(param):
     ⭐ Summary ("Mean force above baseline (impulse ÷ recording time)" →
     "Mean force above baseline"); "(total, no sign)" → "(total)"."""
     param = param.replace("(total, no sign)", "(total)")
-    # a duration keeps how it was measured: "(within 3 × noise SD)"
+    # a duration keeps how it was measured: "(within 2 × noise SD)"
     return re.sub(r" \((?!total\))(?![^()]*(?:%|× noise SD|baseline))"
                   r"[^()]*\)$", "", param)
 
@@ -35772,6 +35772,170 @@ def bt_ba_figure(g0, g1, groups, title, log=False, unit=None):
     return figure
 
 
+# ⚖️ The table for a slide: before and after, each value per beat as its
+# mean ± SD, the totals over each recording, and the change, in four
+# columns, in fixed units (force in nN, impulse in µN·s, energy in J)
+BT_SLIDE_COLS = ("Parameter", "Before", "After", "Change")
+BT_SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def bt_fixed(value, places):
+    """A number with ``places`` decimals (rounded to tens, hundreds… when
+    negative), never in scientific notation."""
+    if places > 0:
+        return f"{value:.{places}f}"
+    return f"{round(float(value), int(places)):.0f}"
+
+
+def bt_figures(value, digits=3):
+    """A number to ``digits`` significant figures, written out: 80.1,
+    0.0408, 1230."""
+    if value == 0:
+        return "0"
+    return bt_fixed(value, digits - 1 - int(np.floor(np.log10(abs(value)))))
+
+
+def bt_ten(exponent):
+    return "10" + str(int(exponent)).translate(BT_SUPERSCRIPT)
+
+
+def bt_slide_number(value, digits=3):
+    """A single number for a slide: three significant figures, and as
+    2.52 × 10⁻¹⁵ when very small or very large."""
+    if value is None or not np.isfinite(value):
+        return ""
+    if value == 0 or 1e-3 <= abs(value) < 1e5:
+        return bt_figures(value, digits)
+    exponent = int(np.floor(np.log10(abs(value))))
+    return f"{bt_figures(value / 10.0 ** exponent, digits)} × " \
+           f"{bt_ten(exponent)}"
+
+
+def bt_mean_sd(values):
+    """
+    'mean ± SD' for a slide: the SD to two significant figures and the mean
+    to the same decimal place (80 ± 22, 0.041 ± 0.012), both times one
+    power of ten when very small or large ((2.5 ± 0.3) × 10⁻¹⁵). Only the
+    mean for one value; '' for none.
+    """
+    d = bta.describe(values)
+    if not d["n"]:
+        return ""
+    mean, sd = d["Mean"], d["SD"]
+    big = max(abs(mean), sd if np.isfinite(sd) else 0.0)
+    exponent = 0
+    if big and not 1e-3 <= big < 1e5:
+        exponent = int(np.floor(np.log10(big)))
+        mean, sd = mean / 10.0 ** exponent, sd / 10.0 ** exponent
+    if np.isfinite(sd) and sd > 0:
+        places = 1 - int(np.floor(np.log10(sd)))
+        text = f"{bt_fixed(mean, places)} ± {bt_fixed(sd, places)}"
+    elif np.isfinite(sd):
+        text = f"{bt_figures(mean, 3)} ± 0"
+    else:
+        text = bt_figures(mean, 3)
+    return f"({text}) × {bt_ten(exponent)}" if exponent else text
+
+
+def bt_slide_scales(got):
+    """What a signal's force, impulse and time are multiplied by to give
+    nN, µN·s and s (None when y is not a force, or x not a time)."""
+    newtons = got.get("newtons")
+    per = bta.seconds_per(got["x_unit"])
+    return {"force": newtons / 1e-9 if newtons else None,
+            "impulse": newtons * per / 1e-6 if (newtons and per) else None,
+            "time": per or None, "share": 1.0}
+
+
+def bt_slide_table(g0, g1):
+    """
+    ⚖️ The two signals in four columns (BT_SLIDE_COLS), for a slide: each
+    value per beat as its mean ± SD (the peak forces, the impulse of a
+    positive and of a negative peak, the beat's duration and its half-turn
+    symmetry), then the totals over each recording (the impulse of every
+    peak, the spring energy of every peak, the full beats and the positive
+    peaks), with the change: × after ÷ before, or ± after − before for the
+    symmetry and the counts. Force in nN, impulse in µN·s, time in s and
+    energy in J; the signal's own units when y is not a force or x not a
+    time. (rows of strings, the indices of the section rows)
+    """
+    yu, xu = g0["y_unit"], g0["x_unit"]
+    word = bta.area_word(xu, yu)
+    scales = [bt_slide_scales(g) for g in (g0, g1)]
+    fixed = {kind: all(sc[kind] for sc in scales)
+             for kind in ("force", "impulse", "time", "share")}
+    units = {"force": "nN" if fixed["force"] else yu,
+             "impulse": "µN·s" if fixed["impulse"] else f"{yu}·{xu}",
+             "time": "s" if fixed["time"] else xu}
+    peak = "Peak force" if fixed["force"] else "Peak height"
+
+    def label(text, kind):
+        unit = units.get(kind, "")
+        return f"{text} ({unit})" if unit else text
+
+    def change(a, b, how):
+        if not (np.isfinite(a) and np.isfinite(b)):
+            return ""
+        if how == "d":
+            return f"{b - a:+.2f}"
+        if how == "n":
+            return f"{int(b - a):+d}" if b != a else "0"
+        return f"{b / a:.2f}×" if a else ""
+
+    per_beat = (
+        (f"{peak}, positive", "Positive peak height", "force", "x"),
+        (f"{peak}, negative", "Negative peak depth", "force", "x"),
+        (f"{word} per positive peak", f"{word} per positive peak",
+         "impulse", "x"),
+        (f"{word} per negative peak", f"{word} per negative peak",
+         "impulse", "x"),
+        ("Beat duration", "Full beat duration", "time", "x"),
+        ("Beat symmetry (1 = perfect)", "Full beat half-turn symmetry",
+         "share", "d"))
+    rows, sections = [], {0}
+    rows.append(["Per beat (mean ± SD)", "", "", ""])
+    for text, start, kind, how in per_beat:
+        values = []
+        for got, sc in zip((g0, g1), scales):
+            v, _ = bt_ba_values(got, start)
+            values.append(v * (sc[kind] if fixed[kind] else 1.0))
+        if not (values[0].size or values[1].size):
+            continue
+        means = [v.mean() if v.size else np.nan for v in values]
+        rows.append([label(text, kind), bt_mean_sd(values[0]),
+                     bt_mean_sd(values[1]), change(*means, how)])
+
+    def totals(got, sc):
+        side = [b[part] for b in got["beats"] for part in ("pos", "neg")
+                if b[part] is not None]
+        impulse = float(sum(abs(e["area"]) for e in side)) \
+            * (sc["impulse"] if fixed["impulse"] else 1.0)
+        k, newtons = got["k"], got["newtons"]
+        energy = float(sum(bta.spring_energy(abs(e["peak"]), k, newtons)
+                           for e in side)) if (k and newtons and side) \
+            else np.nan
+        return {"impulse": impulse, "energy": energy,
+                "full": float(got["info"]["Full beats"]),
+                "pos": float(sum(1 for b in got["beats"]
+                                 if b["pos"] is not None))}
+
+    t0, t1 = totals(g0, scales[0]), totals(g1, scales[1])
+    sections.add(len(rows))
+    rows.append(["Over the recording", "", "", ""])
+    for text, name, kind, how in (
+            (f"{word}, total", "impulse", "impulse", "x"),
+            ("Energy, total (J)", "energy", "", "x"),
+            ("Full beats (n)", "full", "", "n"),
+            ("Positive peaks (n)", "pos", "", "n")):
+        a, b = t0[name], t1[name]
+        if not (np.isfinite(a) or np.isfinite(b)):
+            continue
+        show = (lambda v: str(int(v))) if how == "n" else bt_slide_number
+        rows.append([label(text, kind), show(a), show(b),
+                     change(a, b, how)])
+    return rows, sections
+
+
 def bt_before_after(ids, sid):
     """⚖️ Two signals, the same cell before and after, compared peak by
     peak: a table to copy, and the energy and impulse of every peak."""
@@ -35800,20 +35964,49 @@ def bt_before_after(ids, sid):
                    f"**{rules[0]}**, after **{rules[1]}**. Set the same rule "
                    "on both (💓 Beats → ⏱ Peaks start and end) before "
                    "comparing durations, rises and shapes.", icon="⏱")
-    rows, sections = bt_ba_table(g0, g1)
-    tsv = "\n".join("\t".join(r) for r in [list(BT_BA_COLS), *rows])
+    rows, sections = bt_slide_table(g0, g1)
+    tsv = "\n".join("\t".join(r) for r in [list(BT_SLIDE_COLS), *rows])
     bt_copy_button("📋 Copy the table", bt_table_html(rows, sections,
-                                                     BT_BA_COLS), tsv,
-                   "ba_table")
+                                                     BT_SLIDE_COLS), tsv,
+                   "ba_slide")
     st.dataframe(
-        pd.DataFrame(rows, columns=BT_BA_COLS).style.apply(
+        pd.DataFrame(rows, columns=BT_SLIDE_COLS).style.apply(
             lambda r: ["font-weight: bold" if r.name in sections else ""]
             * len(r), axis=1),
         hide_index=True, **STRETCH,
-        height=min(35 * (len(rows) + 1) + 3, 640),
+        height=35 * (len(rows) + 1) + 3,
         column_config={name: st.column_config.TextColumn(width=w)
-                       for name, w in zip(BT_BA_COLS,
-                                          (330, 200, 200, 80, 70, 70))})
+                       for name, w in zip(BT_SLIDE_COLS,
+                                          (300, 190, 190, 90))})
+    st.caption(
+        "Copies as a table: paste it into PowerPoint, Word or Excel. Mean ± "
+        "SD over the beats (or peaks) of each recording; the SD to two "
+        "figures. Beat duration: full beats, by the rule under 💓 Beats. "
+        "Beat symmetry: how far the negative peak is the positive one turned "
+        "half around (1 the same size and shape, 0.5 no more than chance). "
+        "Totals: every peak kept, positive and negative, without sign; "
+        "energy F²/2k. Change: × after ÷ before; + or − after − before for "
+        "the symmetry and the counts.")
+    spans = (bt_recording_s(g0), bt_recording_s(g1))
+    if all(spans) and abs(spans[1] / spans[0] - 1) > 0.05:
+        st.warning(f"The totals cover different times: before "
+                   f"**{spans[0]:.4g} s**, after **{spans[1]:.4g} s**. "
+                   "Compare them over the same length of recording.",
+                   icon="⏱")
+    with st.expander("More: the ratios, the shoulder and p-values"):
+        more, more_sections = bt_ba_table(g0, g1)
+        tsv = "\n".join("\t".join(r) for r in [list(BT_BA_COLS), *more])
+        bt_copy_button("📋 Copy this table", bt_table_html(
+            more, more_sections, BT_BA_COLS), tsv, "ba_table")
+        st.dataframe(
+            pd.DataFrame(more, columns=BT_BA_COLS).style.apply(
+                lambda r: ["font-weight: bold" if r.name in more_sections
+                           else ""] * len(r), axis=1),
+            hide_index=True, **STRETCH,
+            height=min(35 * (len(more) + 1) + 3, 640),
+            column_config={name: st.column_config.TextColumn(width=w)
+                           for name, w in zip(BT_BA_COLS,
+                                              (330, 200, 200, 80, 70, 70))})
     f1, f2, f3 = st.columns(3)
     with f1:
         if g0.get("k") and g0.get("newtons") and g1.get("k"):
