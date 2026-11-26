@@ -33,13 +33,13 @@ FORCE_PREFIXES = ((1.0, "N"), (1e-3, "mN"), (1e-6, "µN"), (1e-9, "nN"),
                   (1e-12, "pN"), (1e-15, "fN"))
 # a peak's timing: it starts where, on its rise, the signal gets out past a
 # level near the baseline and ends where, on its fall, it is back inside it.
-# The level is a number of noise SDs (3 unless changed: the peak starts
+# The level is a number of noise SDs (2 unless changed: the peak starts
 # where it leaves the noise and ends where it is back in it) or a part of
 # the peak's height (10 %: 10 % up to 90 % back). Where the signal crosses
 # the baseline itself is lost in the noise and in any slow drift; these
 # levels are not. The width at half height is read the same way at 50 %.
 TIMINGS = ("Back within × noise SD", "At a % of the peak's height")
-TIMING_NOISE = 3.0
+TIMING_NOISE = 2.0
 TIMING_PERCENT = 10.0
 TIMING_LEVEL = TIMING_PERCENT / 100
 HALF_LEVEL = 0.50
@@ -299,7 +299,7 @@ def _level_times(xs, ss, kk, level):
 
 
 def timing_words(rule=None, value=None):
-    """What a duration runs between, in a few words: "within 3 × noise SD"
+    """What a duration runs between, in a few words: "within 2 × noise SD"
     or "10% up to 90% back"."""
     if rule == TIMINGS[1]:
         p = float(TIMING_PERCENT if value is None else value)
@@ -311,7 +311,7 @@ def timing_words(rule=None, value=None):
 def timing_level(event, rule=None, value=None, noise=None):
     """
     The level (from the baseline, as a size) at which a peak starts and
-    ends: ``value`` noise SDs (3 unless given) or ``value`` % of its height
+    ends: ``value`` noise SDs (2 unless given) or ``value`` % of its height
     (10 unless given). With no noise measured, the baseline itself. Never
     more than half the peak's height.
     """
