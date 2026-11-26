@@ -33207,6 +33207,74 @@ def bt_chart_width(figure):
             else {"use_container_width": False})
 
 
+def bt_same_y(got):
+    """
+    With ↕ Same y scale on: one y range for every signal shown so far in
+    the same unit (from the lowest to the highest point of them all, a
+    little room either side), so switching between them keeps the scale.
+    None when it is off or there is only one.
+    """
+    s = st.session_state
+    if not s.get("bt_samey"):
+        return None
+    unit = str(got.get("y_unit") or "")
+    spans = [s.get(f"_bt_yr_{k}") for k in (s.get("_bt_sets") or {})]
+    spans = [v for v in spans if v and (len(v) < 3 or v[2] == unit
+                                         or not unit)]
+    if len(spans) < 2:
+        return None
+    low = min(v[0] for v in spans)
+    high = max(v[1] for v in spans)
+    pad = 0.05 * (high - low or 1.0)
+    return (low - pad, high + pad)
+
+
+def bt_short_name(name):
+    """A signal's name short enough for a button: an AFM file's own name
+    (X202509220922), else the first 26 characters."""
+    name = str(name)
+    head = name.split("_")[0].split(" ")[0]
+    if len(head) >= 6 and head[:1].isalpha() and any(c.isdigit()
+                                                      for c in head):
+        return head
+    return name if len(name) <= 26 else name[:25] + "…"
+
+
+def bt_quick_pick():
+    """The switch above the plot: show the signal clicked."""
+    s = st.session_state
+    pick = s.get("btq_pick")
+    if pick in (s.get("_bt_sets") or {}):
+        s["bt_pick"] = pick
+
+
+def bt_switcher(sid):
+    """With two signals or more: a row of them above the plot, one click
+    to switch (before and after, say), and ↕ Same y scale beside it."""
+    s = st.session_state
+    sets = s.get("_bt_sets") or {}
+    ids = list(sets)
+    if len(ids) < 2:
+        return
+    names = {k: bt_short_name(sets[k]["name"]) for k in ids}
+    if len(set(names.values())) < len(names):
+        names = {k: f"{i + 1}. {names[k]}" for i, k in enumerate(ids)}
+    s["btq_pick"] = sid
+    c1, c2 = st.columns([5, 1.35], vertical_alignment="center")
+    c1.segmented_control(
+        "Signal shown", ids, key="btq_pick", format_func=names.get,
+        on_change=bt_quick_pick, label_visibility="collapsed",
+        help="Click a signal to show it: the plot, its settings and its "
+             "results all switch to it. Its whole name is in Signal, on the "
+             "left.")
+    c2.toggle("↕ Same y scale", key="bt_samey",
+              help="One y range for all the signals (from the lowest to the "
+                   "highest point of the ones shown so far), so the beats "
+                   "of two recordings compare by eye when you switch. Off: "
+                   "each fits its own. A y range typed under 🎨 Plot → "
+                   "Axes wins over it.")
+
+
 def bt_publication_style():
     """📄 The default look again, the axes fitted to the signal."""
     s = st.session_state
@@ -33245,6 +33313,10 @@ def bt_style(figure, got):
     for trace in figure.data:
         if trace.name in ("baseline", "upper line", "lower line"):
             trace.line.width = lw
+    span = bt_same_y(got)
+    if span and not (s.get("bt_ymin") is not None
+                     and s.get("bt_ymax") is not None):
+        figure.update_yaxes(range=list(span), autorange=False)
     for axis_name, low, high in (("y", "bt_ymin", "bt_ymax"),
                                  ("x", "bt_xmin", "bt_xmax")):
         a, b = s.get(low), s.get(high)
@@ -33584,6 +33656,10 @@ def bt_analyse(sid, e_unit=None):
     y = raw * scale
     bt_defaults(sid, x, y)
     ys = bta.smooth(y, int(s[key("sm")]))
+    # the signal's span, for ↕ Same y scale across the signals
+    if np.isfinite(ys).any():
+        s[f"_bt_yr_{sid}"] = (float(np.nanmin(ys)), float(np.nanmax(ys)),
+                              str(shown))
     base = (float(s[key("base")]) if s[key("bmode")] == bta.BASELINES[2]
             else float(bta.baseline_level(ys, s[key("bmode")])))
     up, down = float(s[key("hi")] or 0.0), float(s[key("lo")] or 0.0)
@@ -34112,6 +34188,8 @@ def bt_plot(sid, got):
     In the normal (zoom) mode a click on a ▲ ▼ removes that peak and a
     click on a ✕ puts it back."""
     s = st.session_state
+    # one click between the signals (before and after, say), first
+    bt_switcher(sid)
     if s.get("bt_mouse") not in BT_MOUSE:
         s["bt_mouse"] = BT_ZOOM
     # the mouse modes on a row of their own (seven of them), the buttons
@@ -35737,7 +35815,7 @@ def beat_tab():
                        ("bt_ncol", bta.NEG_COLOUR),
                        ("bt_numbers", True), ("bt_shade", False),
                        ("bt_clean", False), ("bt_wfull", True),
-                       ("bt_width", 700),
+                       ("bt_width", 700), ("bt_samey", False),
                        *((name, True) for name in BT_SHOW_PARTS)):
         s.setdefault(key, value)
     # every signal's settings kept while another one is shown
