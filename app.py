@@ -35628,48 +35628,24 @@ def bt_summary_frame(ids):
 # in groups, each row (label, start of the name, how it changes: "x" as
 # after ÷ before, "d" as after − before for balances and shares)
 BT_BA_GROUPS = (
-    ("Force and energy, per peak", (
-        ("{f}, positive peaks", "Positive peak height", "x"),
-        ("{f}, negative peaks (depth)", "Negative peak depth", "x"),
-        ("Energy per positive peak", "Energy per positive peak", "x"),
-        ("Energy per negative peak", "Energy per negative peak", "x"))),
-    ("{w}, per peak", (
+    ("Per beat", (
+        ("{f}, positive", "Positive peak height", "x"),
+        ("{f}, negative", "Negative peak depth", "x"),
         ("{w} per positive peak", "{w} per positive peak", "x"),
-        ("{w} per negative peak", "{w} per negative peak", "x"))),
-    ("Durations", (
-        ("Full beat duration", "Full beat duration", "x"),
-        ("Positive peak duration", "Positive peak duration", "x"),
-        ("Negative peak duration", "Negative peak duration", "x"),
-        ("Positive peak width at half height",
-         "Positive peak width at half height", "x"),
-        ("Negative peak width at half height",
-         "Negative peak width at half height", "x"),
-        ("Time between beats", "Time between beats", "x"))),
-    ("Negative ÷ positive, each full beat", (
-        ("Negative ÷ positive peak {fw}", "Negative ÷ positive peak", "x"),
+        ("{w} per negative peak", "{w} per negative peak", "x"),
+        ("Energy per beat", "Energy per full beat", "x"),
+        ("Beat duration", "Full beat duration", "x"),
+        ("Negative ÷ positive {fw}", "Negative ÷ positive peak", "x"),
         ("Negative ÷ positive {wl}", "Negative ÷ positive {wl}", "x"),
         ("Negative ÷ positive duration", "Negative ÷ positive duration",
          "x"),
-        ("{w} balance (P − N) ÷ (P + N)", "{w} balance", "d"))),
-    ("Shape and symmetry", (
-        ("Positive peak: recovery ÷ rise", "Positive peak recovery ÷ rise",
-         "x"),
-        ("Negative peak: recovery ÷ rise", "Negative peak recovery ÷ rise",
-         "x"),
-        ("Full beat: half-turn symmetry", "Full beat half-turn symmetry",
-         "d"),
-        ("Positive peak: mirror symmetry", "Positive peak mirror symmetry",
-         "d"),
-        ("Negative peak: mirror symmetry", "Negative peak mirror symmetry",
-         "d"))))
+        ("Negative peak recovery ÷ rise (shoulder)",
+         "Negative peak recovery ÷ rise", "x"),
+        ("Half-turn symmetry", "Full beat half-turn symmetry", "d"))),)
 # and over the recording, from bt_results_rows
-BT_BA_TOTAL = (("Energy, all peaks (total)", "Energy, all peaks"),
-               ("{w}, all peaks (total)", "{w}, all peaks"),
-               ("{w}, positive peaks (total)", "{w}, positive peaks"),
-               ("{w}, negative peaks (total)", "{w}, negative peaks"),
-               ("{w} per minute", "{w} per minute"),
-               ("Beats per minute", "Beats per minute"),
-               ("Recording time", "Recording time"))
+BT_BA_TOTAL = (("{w}, total", "{w}, all peaks"),
+               ("Energy, total", "Energy, all peaks"),
+               ("Beats per minute", "Beats per minute"))
 BT_BA_COLS = ("Parameter", "Before", "After", "Change", "p", "Unit")
 BT_BEFORE, BT_AFTER = "#8a8f98", "#2a78d6"
 
@@ -35715,7 +35691,7 @@ def bt_ba_table(g0, g1):
     rows, sections = [], set()
     for title, group in BT_BA_GROUPS:
         sections.add(len(rows))
-        rows.append([title.format(**names) + ": mean ± SD (n)", "", "", "",
+        rows.append([title.format(**names) + " (mean ± SD, n)", "", "", "",
                      "", ""])
         for label, start, how in group:
             start = start.format(**names)
@@ -35837,7 +35813,7 @@ def bt_before_after(ids, sid):
         column_config={name: st.column_config.TextColumn(width=w)
                        for name, w in zip(BT_BA_COLS,
                                           (330, 200, 200, 80, 70, 70))})
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns(3)
     with f1:
         if g0.get("k") and g0.get("newtons") and g1.get("k"):
             st.plotly_chart(bt_ba_figure(
@@ -35851,23 +35827,17 @@ def bt_before_after(ids, sid):
             g0, g1, (("Positive peaks", f"{word} per positive peak"),
                      ("Negative peaks", f"{word} per negative peak")),
             f"{word} per peak"), **STRETCH)
-    f3, f4 = st.columns(2)
     with f3:
         st.plotly_chart(bt_ba_figure(
-            g0, g1, (("Peak", "Negative ÷ positive peak"),
+            g0, g1, (("Force", "Negative ÷ positive peak"),
                      (word, f"Negative ÷ positive {word.lower()}"),
                      ("Duration", "Negative ÷ positive duration")),
-            "Negative ÷ positive, each full beat", log=True, unit="ratio"),
-            **STRETCH)
-    with f4:
-        st.plotly_chart(bt_ba_figure(
-            g0, g1, (("Half-turn, beat", "Full beat half-turn symmetry"),
-                     ("Mirror, positive", "Positive peak mirror symmetry"),
-                     ("Mirror, negative", "Negative peak mirror symmetry")),
-            "Symmetry (1: exact, 0.5: none)", unit="share"), **STRETCH)
+            "Negative ÷ positive", log=True, unit="ratio"), **STRETCH)
     st.caption(
         "Each dot is one peak (or one beat). Change: × after ÷ before; ± "
-        "after − before for the balance and the symmetry shares. p: "
+        "after − before for the symmetry share (1 exact, 0.5 none). "
+        "Recovery ÷ rise above 1: a slow fall, a tail or a shoulder. Every "
+        "other value is in each signal's own results. p: "
         "Mann-Whitney test between the beats before and the beats after, "
         "within this one pair of recordings; it says whether this cell's "
         "beats changed, not whether compression works in general (that "
