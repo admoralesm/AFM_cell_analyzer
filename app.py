@@ -36268,36 +36268,72 @@ def fm_use_found(value):
     st.session_state["fm_clock"] = FM_CLOCK[3]
 
 
+def fm_index(value, count, numbers=None):
+    """
+    A dropdown's choice as an index into its ``count`` options, or None.
+    Streamlit keeps a dropdown's choice by its label, so when the label has
+    changed since (a beat's time or force moved with a setting) it hands
+    back the old label instead of the index: the number at its start is
+    then read back, a beat's number among ``numbers`` ("Beat 4 · …") or
+    the option's place counted from 1 ("3 · at …").
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value) if 0 <= value < count else None
+    found = re.search(r"\d+", str(value or ""))
+    if not found:
+        return None
+    n = int(found.group())
+    if numbers is not None:
+        return list(numbers).index(n) if n in numbers else None
+    return n - 1 if 1 <= n <= count else None
+
+
 def fm_suggest_contraction():
     """A force beat chosen: the video contraction the automatic match puts
     nearest to it, as a first guess."""
     s = st.session_state
     beats, peaks = s.get("_fm_beats") or [], s.get("_fm_peaks") or []
     auto = s.get("_fm_auto")
-    i = s.get("fm_fbeat")
-    if auto is None or not peaks or i is None or i >= len(beats):
+    i = fm_index(s.get("fm_fbeat"), len(beats), [b["n"] for b in beats])
+    if auto is None or not peaks or i is None:
         return
+    s["fm_fbeat"] = i
     want = beats[i]["t_peak"] - auto
     s["fm_mbeat"] = int(np.argmin([abs(p["t"] - want) for p in peaks]))
     s["fm_fine"] = 0.0
 
 
-FM_3D = ("Within each beat", "Whole recording")
+FM_3D = ("Over time", "Beats laid over one another")
+
+
+def fm_overlap(tf, tm, offset):
+    """The stretch (s, on the force's clock) both recordings cover; None
+    when they do not overlap."""
+    lo, hi = max(tf[0], tm[0] + offset), min(tf[-1], tm[-1] + offset)
+    return (float(lo), float(hi)) if hi > lo else None
 
 
 def fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu, mode=FM_3D[0],
-                 pad=0.3):
+                 pad=0.3, span=None):
     """
     Time, length change and force in 3D, the force at its own times and
     the video's length change read at the same moments on the force's
-    clock. Within each beat: each beat its own path, its time counted from
-    its force peak, light to dark in beat order, so their shapes lie on top
-    of one another. Whole recording: one path through all of it (at most
-    6000 points).
+    clock, between ``span`` (s, force clock; the whole overlap when None).
+    Over time: one path through that stretch (at most 6000 points), light
+    to dark with time. Beats laid over one another: each beat in it its
+    own path, its time counted from its force peak, light to dark in beat
+    order, so their shapes lie on top of one another.
     """
     figure = go.Figure()
-    seq = [r for r in rows if r.get("frames", 0) >= 2]
-    if mode == FM_3D[0] and seq:
+    whole = fm_overlap(tf, tm, offset) or (float(tf[0]), float(tf[-1]))
+    lo, hi = span if span else whole
+    lo, hi = max(lo, whole[0]), min(hi, whole[1])
+    seq = [r for r in rows if r.get("frames", 0) >= 2
+           and lo <= r["t_peak"] <= hi]
+    overlaid = mode == FM_3D[1]
+    if overlaid and seq:
         shades = np.linspace(0.35, 1.0, len(seq))
         for r, shade in zip(seq, shades):
             inside = (tf >= r["t0"] - pad) & (tf <= r["t1"] + pad)
@@ -36317,7 +36353,7 @@ def fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu, mode=FM_3D[0],
                               "<br>force %{z:.3g}<extra></extra>"))
         xtitle, ratio = "Time from the force peak (s)", 1.4
     else:
-        lo, hi = max(tf[0], tm[0] + offset), min(tf[-1], tm[-1] + offset)
+        overlaid = False
         inside = (tf >= lo) & (tf <= hi)
         t3, f3 = tf[inside], f[inside]
         if t3.size > 6000:
@@ -36332,13 +36368,13 @@ def fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu, mode=FM_3D[0],
         xtitle, ratio = "Time on the force's clock (s)", 2.2
     figure.update_layout(
         height=560, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="white",
-        showlegend=mode == FM_3D[0], legend=dict(x=0.0, y=0.95),
+        showlegend=overlaid, legend=dict(x=0.0, y=0.95),
         scene=dict(
             xaxis_title=xtitle,
             yaxis_title=f"Length change ({mu})" if mu else "Length change",
             zaxis_title=f"Force ({yu})" if yu else "Force",
             aspectmode="manual", aspectratio=dict(x=ratio, y=1, z=1),
-            camera=dict(eye=dict(x=1.5, y=-1.7, z=0.8))))
+            camera=dict(eye=dict(x=1.55, y=-2.15, z=0.85))))
     return figure
 
 
@@ -36661,6 +36697,14 @@ def fm_tab():
                 st.warning("No beats in the force, or no contractions in "
                            "the video, to match.")
             else:
+                # a choice kept by its old label: back to its index
+                fi = fm_index(s.get("fm_fbeat"), len(beats),
+                              [b["n"] for b in beats])
+                mi = fm_index(s.get("fm_mbeat"), len(peaks))
+                if fi is not None:
+                    s["fm_fbeat"] = fi
+                if mi is not None:
+                    s["fm_mbeat"] = mi
                 if s.get("fm_fbeat") not in range(len(beats)):
                     s["fm_fbeat"] = 0
                     if auto is not None:
@@ -36802,21 +36846,42 @@ def fm_tab():
             "a little low and the loops are coarse.")
         h3, t3 = st.columns([2, 2], vertical_alignment="center")
         h3.markdown("**🧊 Time, length and force in 3D**")
+        if s.get("fm_3d") not in FM_3D:
+            s["fm_3d"] = FM_3D[0]
         t3.segmented_control(
             "Time", FM_3D, key="fm_3d", label_visibility="collapsed",
-            help="Within each beat: every beat its own path, timed from "
-                 "its force peak, laid over one another to compare their "
-                 "shapes. Whole recording: one path through the time the "
-                 "two recordings overlap.")
+            help="Over time: one path through the time range chosen below. "
+                 "Beats laid over one another: every beat in that range its "
+                 "own path, timed from its force peak, to compare their "
+                 "shapes.")
+        whole = fm_overlap(tf, tm, offset)
+        span = None
+        if whole:
+            # the range kept, but inside the stretch both recordings cover
+            kept = s.get("fm_trange")
+            if (not isinstance(kept, (tuple, list)) or len(kept) != 2
+                    or kept[0] >= kept[1] or kept[1] <= whole[0]
+                    or kept[0] >= whole[1]):
+                kept = whole
+            s["fm_trange"] = (max(float(kept[0]), whole[0]),
+                              min(float(kept[1]), whole[1]))
+            step = max(float(f"{(whole[1] - whole[0]) / 1000:.1g}"), 0.001)
+            span = st.slider(
+                "Time range (s, on the force's clock)", whole[0], whole[1],
+                key="fm_trange", step=step, format="%.1f",
+                help="The stretch drawn in 3D. Drag the ends in to look at a "
+                     "few beats closely.")
         figure3d = fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu,
                                 s.get("fm_3d") or FM_3D[0],
-                                float(s["fm_pad"] or 0.0))
+                                float(s["fm_pad"] or 0.0), span)
         st.plotly_chart(figure3d, **STRETCH,
                         config={"displaylogo": False})
-        st.caption("Drag to turn it, scroll to zoom, click a beat in the "
-                   "legend to hide it. Looked at down the time axis, each "
-                   "path is the beat's loop above. The colour darkens from "
-                   "the first beat to the last.")
+        st.caption(
+            "Drag to turn it, scroll to zoom. Over time: the path runs along "
+            "the time axis, light to dark, and each beat rises out of it as "
+            "force and shortening grow together. Beats laid over one "
+            "another: click a beat in the legend to hide it; looked at down "
+            "the time axis, each path is that beat's loop above.")
         summary, sections = fm_summary_rows(rows, fit, offset, how, sign, yu,
                                             mu, mname)
         st.markdown("##### 📋 Summary")
