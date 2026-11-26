@@ -674,7 +674,7 @@ COMPANION_NEEDS = {
     "fourier.py": ("spectrum", "find_peaks", "harmonic_of", "spectrogram",
                    "bandpass", "seconds_per"),
     "force_motion.py": ("best_offset", "beat_motion", "correlation", "SIGNS",
-                        "clean", "step_of"),
+                        "clean", "step_of", "motion_peaks"),
 }
 aa = _current(aa, *COMPANION_NEEDS["auto_analysis.py"])
 sc = _current(sc, *COMPANION_NEEDS["stack_compare.py"])
@@ -11235,7 +11235,8 @@ def send_to_analysis(name, frame, source="the video", stats=None,
 
 CELL_KINDS = {"afm": "🔬 AFM output analysis", "stack": "📚 Stack & compare",
               "series": "🔗 Series", "beats": "💓 Beat analysis",
-              "fourier": "〰 Fourier", "force": "📈 Single force curve"}
+              "fourier": "〰 Fourier", "force": "📈 Single force curve",
+              "force_motion": "🤝 Force and motion"}
 DB_NEW_CELL = "➕ New cell…"
 
 
@@ -35937,8 +35938,10 @@ with tab_beats:
 # video's length change of the same cell, recorded at the same time, put on
 # one clock and read beat by beat (force_motion.py). Its settings are fm_*.
 
-FM_CLOCK = ("Find it: the best match anywhere", "Find it near my value",
-            "Use my value")
+FM_CLOCK = ("Match one beat by hand", "Find it: the best match anywhere",
+            "Find it near my value", "Use my value")
+FM_CONDITIONS = ("Before compression", "After compression", "Control",
+                 "Other")
 FM_SESSION = "This session's video analysis"
 FM_FILE = "A file (the video's _timeseries.csv, or any table)"
 FM_FORCE_COLOUR, FM_MOTION_COLOUR = "#222222", "#2a78d6"
@@ -36069,7 +36072,168 @@ def fm_motion(left):
 def fm_use_found(value):
     """The offset found, copied into the typed one."""
     st.session_state["fm_offset"] = round(float(value), 4)
-    st.session_state["fm_clock"] = FM_CLOCK[2]
+    st.session_state["fm_clock"] = FM_CLOCK[3]
+
+
+def fm_suggest_contraction():
+    """A force beat chosen: the video contraction the automatic match puts
+    nearest to it, as a first guess."""
+    s = st.session_state
+    beats, peaks = s.get("_fm_beats") or [], s.get("_fm_peaks") or []
+    auto = s.get("_fm_auto")
+    i = s.get("fm_fbeat")
+    if auto is None or not peaks or i is None or i >= len(beats):
+        return
+    want = beats[i]["t_peak"] - auto
+    s["fm_mbeat"] = int(np.argmin([abs(p["t"] - want) for p in peaks]))
+    s["fm_fine"] = 0.0
+
+
+FM_3D = ("Within each beat", "Whole recording")
+
+
+def fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu, mode=FM_3D[0],
+                 pad=0.3):
+    """
+    Time, length change and force in 3D, the force at its own times and
+    the video's length change read at the same moments on the force's
+    clock. Within each beat: each beat its own path, its time counted from
+    its force peak, light to dark in beat order, so their shapes lie on top
+    of one another. Whole recording: one path through all of it (at most
+    6000 points).
+    """
+    figure = go.Figure()
+    seq = [r for r in rows if r.get("frames", 0) >= 2]
+    if mode == FM_3D[0] and seq:
+        shades = np.linspace(0.35, 1.0, len(seq))
+        for r, shade in zip(seq, shades):
+            inside = (tf >= r["t0"] - pad) & (tf <= r["t1"] + pad)
+            t3, f3 = tf[inside], f[inside]
+            if t3.size > 1500:
+                step = int(np.ceil(t3.size / 1500))
+                t3, f3 = t3[::step], f3[::step]
+            m3 = np.interp(t3 - offset, tm, m)
+            blue = (int(198 - 190 * shade), int(219 - 171 * shade),
+                    int(239 - 132 * shade))
+            figure.add_trace(go.Scatter3d(
+                x=t3 - r["t_peak"], y=m3, z=f3, mode="lines",
+                name=f"beat {r['n']}",
+                line=dict(width=5, color=f"rgb{blue}"),
+                hovertemplate=f"beat {r['n']}<br>"
+                              "%{x:.3f} s from its peak<br>length %{y:.3g}"
+                              "<br>force %{z:.3g}<extra></extra>"))
+        xtitle, ratio = "Time from the force peak (s)", 1.4
+    else:
+        lo, hi = max(tf[0], tm[0] + offset), min(tf[-1], tm[-1] + offset)
+        inside = (tf >= lo) & (tf <= hi)
+        t3, f3 = tf[inside], f[inside]
+        if t3.size > 6000:
+            step = int(np.ceil(t3.size / 6000))
+            t3, f3 = t3[::step], f3[::step]
+        figure.add_trace(go.Scatter3d(
+            x=t3, y=np.interp(t3 - offset, tm, m), z=f3, mode="lines",
+            name="recording", line=dict(width=4, color=t3, colorscale=[
+                [0, "#9ecae1"], [1, "#08306b"]]),
+            hovertemplate="t %{x:.3f} s<br>length %{y:.3g}<br>force "
+                          "%{z:.3g}<extra></extra>"))
+        xtitle, ratio = "Time on the force's clock (s)", 2.2
+    figure.update_layout(
+        height=560, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="white",
+        showlegend=mode == FM_3D[0], legend=dict(x=0.0, y=0.95),
+        scene=dict(
+            xaxis_title=xtitle,
+            yaxis_title=f"Length change ({mu})" if mu else "Length change",
+            zaxis_title=f"Force ({yu})" if yu else "Force",
+            aspectmode="manual", aspectratio=dict(x=ratio, y=1, z=1),
+            camera=dict(eye=dict(x=1.5, y=-1.7, z=0.8))))
+    return figure
+
+
+def fm_db_package(sid, got, mname, tm, m, mu, summary, rows, yu, how,
+                  offset, figures, name, notes):
+    """(record, files) for 🗄 Cell database: the force (with its Beat
+    analysis settings), the length change, the offset and settings used,
+    the summary and every beat, the plots, and the key values as columns
+    of the cell's table (with Before or After)."""
+    s = st.session_state
+    sets = s["_bt_sets"][sid]
+    seen = [r for r in rows if np.isfinite(r["shortening"])]
+    r_fs, _ = fmo.correlation([r["force"] for r in seen],
+                              [r["shortening"] for r in seen])
+
+    def mean(key):
+        d = bta.describe([r[key] for r in seen])
+        return None if not np.isfinite(d["Mean"]) else float(d["Mean"])
+    unit = f"{yu}·{mu}" if yu and mu else ""
+    results = {
+        "Condition": s.get("fm_cond", FM_CONDITIONS[0]),
+        "Beats with video": len(seen),
+        f"Loop area, mean ({unit})" if unit else "Loop area, mean":
+            mean("loop_area"),
+        f"Shortening, mean ({mu})" if mu else "Shortening, mean":
+            mean("shortening"),
+        f"Peak force, mean ({yu})" if yu else "Peak force, mean":
+            mean("force"),
+        "Force per shortening, mean": mean("force_per_short"),
+        "Force against shortening (r)":
+            None if not np.isfinite(r_fs) else float(r_fs),
+        "Clock offset (s)": float(offset), "Offset from": how}
+    record = {
+        "name": name, "notes": notes, "what": "Force and motion",
+        "source": sets["source"], "file": bt_file_used(sid),
+        "signal": sets["name"], "motion_name": mname, "results": results,
+        "settings": {"offset": float(offset), "how": how,
+                     "sign": s.get("fm_sign"), "pad": s.get("fm_pad"),
+                     "fbeat": s.get("fm_fbeat"), "mbeat": s.get("fm_mbeat"),
+                     "fine": s.get("fm_fine"),
+                     "condition": s.get("fm_cond")},
+        "force_settings": {k: bt_plain(s[f"bt_{k}_{sid}"])
+                           for k in BT_DB_SETTINGS if f"bt_{k}_{sid}" in s},
+        "removed": bt_plain(list(s.get(f"_bt_out_{sid}") or [])),
+        "meta": dict(got.get("meta") or {})}
+    column = f"length_change ({mu})" if mu else "length_change"
+    files = {
+        "force.csv": sets["frame"].to_csv(index=False),
+        "motion.csv": pd.DataFrame({"time_s": tm, column: m}).to_csv(
+            index=False),
+        "summary.csv": pd.DataFrame(summary, columns=BT_SUMMARY_COLS).to_csv(
+            index=False),
+        "beats.csv": fm_beat_frame(rows, yu, mu).to_csv(index=False)}
+    for key, figure in figures.items():
+        files[f"{key}.html"] = figure.to_html(include_plotlyjs="cdn")
+    return record, files
+
+
+def fm_db_restore(record, fetch):
+    """A saved force and motion back: the force as a new signal on 💓 Beat
+    analysis (with its settings), the length change as this tab's file,
+    and the offset it was saved with, typed in."""
+    s = st.session_state
+    name = record.get("name", "")
+    frame = pd.read_csv(io.BytesIO(fetch("force.csv")))
+    sid = send_to_analysis(record.get("signal") or name or "saved force",
+                           frame, source=f"the database ({name})",
+                           meta=record.get("meta") or {})
+    for key, value in (record.get("force_settings") or {}).items():
+        if key in BT_DB_SETTINGS:
+            s[f"bt_{key}_{sid}"] = value
+    s[f"_bt_out_{sid}"] = sorted(float(v) for v in record.get("removed")
+                                 or [])
+    s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
+    motion = pd.read_csv(io.BytesIO(fetch("motion.csv")))
+    s["_fm_file"] = {"name": record.get("motion_name") or "saved length "
+                     "change", "frame": motion}
+    s["fm_src"] = FM_FILE
+    s["fm_tcol"], s["fm_mcol"] = motion.columns[0], motion.columns[1]
+    s["fm_sig"] = sid
+    settings = record.get("settings") or {}
+    s["fm_clock"] = FM_CLOCK[3]
+    s["fm_offset"] = float(settings.get("offset", 0.0) or 0.0)
+    for key, wanted in (("fm_sign", "sign"), ("fm_pad", "pad"),
+                        ("fm_cond", "condition")):
+        if settings.get(wanted) is not None:
+            s[key] = settings[wanted]
+    s["_db_note_force_motion"] = f"✅ Opened “{name}”."
 
 
 def fm_figure(got, tf, f, tm, m, offset, rows, yu, mu):
@@ -36279,20 +36443,72 @@ def fm_tab():
     yu = got["y_unit"]
     for key, value in (("fm_clock", FM_CLOCK[0]), ("fm_offset", 0.0),
                        ("fm_window", 2.0), ("fm_sign", fmo.SIGNS[0]),
-                       ("fm_pad", 0.3)):
+                       ("fm_pad", 0.3), ("fm_fine", 0.0),
+                       ("fm_cond", FM_CONDITIONS[0]), ("fm_3d", FM_3D[0])):
         s.setdefault(key, value)
+    if s.get("fm_clock") not in FM_CLOCK:
+        s["fm_clock"] = FM_CLOCK[0]
+    # the automatic match, always worked out: a suggestion, or the answer
+    auto = fmo.best_offset(tf, f, tm, m)
+    s["_fm_auto"] = float(auto["offset"]) if auto else None
+    sign = {fmo.SIGNS[1]: -1, fmo.SIGNS[2]: 1}.get(
+        s.get("fm_sign"), auto["sign"] if auto else -1)
+    beats = fm_force_beats(got)
+    peaks = fmo.motion_peaks(tm, m, sign)
+    s["_fm_beats"], s["_fm_peaks"] = beats, peaks
     with left:
         st.markdown("**⏱ One clock**")
         st.radio("The offset between the two clocks", FM_CLOCK,
-                 key="fm_clock")
+                 key="fm_clock",
+                 help="Match one beat by hand: choose a beat in the force "
+                      "and the same beat in the video. The automatic match "
+                      "is then only a suggestion.")
+        if s["fm_clock"] == FM_CLOCK[0]:
+            if not beats or not peaks:
+                st.warning("No beats in the force, or no contractions in "
+                           "the video, to match.")
+            else:
+                if s.get("fm_fbeat") not in range(len(beats)):
+                    s["fm_fbeat"] = 0
+                    if auto is not None:
+                        inside = [i for i, b in enumerate(beats)
+                                  if tm[0] <= b["t_peak"] - auto["offset"]
+                                  <= tm[-1]]
+                        s["fm_fbeat"] = inside[0] if inside else 0
+                if s.get("fm_mbeat") not in range(len(peaks)):
+                    fm_suggest_contraction()
+                    s.setdefault("fm_mbeat", 0)
+                    if s["fm_mbeat"] not in range(len(peaks)):
+                        s["fm_mbeat"] = 0
+                st.selectbox(
+                    "This beat in the force", range(len(beats)),
+                    key="fm_fbeat", on_change=fm_suggest_contraction,
+                    format_func=lambda i: (
+                        f"Beat {beats[i]['n']} · {beats[i]['t_peak']:.2f} s "
+                        f"· {bta.pretty(beats[i]['force'], 3)} {got['y_unit']}"))
+                st.selectbox(
+                    "is this contraction in the video", range(len(peaks)),
+                    key="fm_mbeat",
+                    format_func=lambda k: (
+                        f"{k + 1} · at {peaks[k]['t']:.2f} s in the video · "
+                        f"{bta.pretty(peaks[k]['amp'], 3)} {mu}"),
+                    help="Picked for you from the automatic match when you "
+                         "choose a force beat; change it if it is not the "
+                         "same beat.")
+                st.number_input("Fine-tune (s)", key="fm_fine", step=0.02,
+                                format="%.3g",
+                                help="Added to the offset from the two "
+                                     "peaks: slide the video later (+) or "
+                                     "earlier (−).")
         c1, c2 = st.columns(2)
         c1.number_input("My value (s)", key="fm_offset", format="%.4g",
-                        step=0.1, help="A video frame at time t happened at "
+                        step=0.1, disabled=s["fm_clock"] == FM_CLOCK[0],
+                        help="A video frame at time t happened at "
                         "force time t + this. From when each recording "
                         "started, or an event seen in both.")
         c2.number_input("Look within ± (s)", key="fm_window",
                         min_value=0.05, format="%.3g", step=0.5,
-                        disabled=s["fm_clock"] != FM_CLOCK[1])
+                        disabled=s["fm_clock"] != FM_CLOCK[2])
         st.markdown("**Contraction**")
         st.selectbox("A contraction makes the length", fmo.SIGNS,
                      key="fm_sign", format_func=lambda v: {
@@ -36307,26 +36523,38 @@ def fm_tab():
     clock = s["fm_clock"]
     found = None
     if clock == FM_CLOCK[0]:
-        found = fmo.best_offset(tf, f, tm, m)
-    elif clock == FM_CLOCK[1]:
-        found = fmo.best_offset(tf, f, tm, m, centre=float(s["fm_offset"]),
-                                window=float(s["fm_window"]))
-    if clock != FM_CLOCK[2] and found is None:
-        with right:
-            st.warning("The two recordings do not overlap enough to match "
-                       "them. Type the offset and choose Use my value.")
-        return
-    offset = float(found["offset"]) if found else float(s["fm_offset"])
+        if not beats or not peaks:
+            with right:
+                st.warning("Nothing to match by hand: choose another way to "
+                           "set the clock.")
+            return
+        fb, mb = beats[s["fm_fbeat"]], peaks[s["fm_mbeat"]]
+        offset = fb["t_peak"] - mb["t"] + float(s.get("fm_fine") or 0.0)
+        how = (f"beat {fb['n']} matched by hand to the video's contraction "
+               f"{s['fm_mbeat'] + 1}"
+               + (f", fine-tuned {float(s['fm_fine']):+.3g} s"
+                  if s.get("fm_fine") else ""))
+    else:
+        if clock == FM_CLOCK[1]:
+            found = auto
+        elif clock == FM_CLOCK[2]:
+            found = fmo.best_offset(tf, f, tm, m,
+                                    centre=float(s["fm_offset"]),
+                                    window=float(s["fm_window"]))
+        if clock != FM_CLOCK[3] and found is None:
+            with right:
+                st.warning("The two recordings do not overlap enough to "
+                           "match them. Match one beat by hand, or type the "
+                           "offset and choose Use my value.")
+            return
+        offset = float(found["offset"]) if found else float(s["fm_offset"])
+        how = {FM_CLOCK[1]: "found, best match anywhere",
+               FM_CLOCK[2]: "found, near the typed value",
+               FM_CLOCK[3]: "typed"}[clock]
     # the match at the offset used, for the sign and to report
     fit = found or fmo.best_offset(
         tf, f, tm, m, centre=offset,
         window=max(fmo.step_of(tm), 1e-3), min_overlap=0.05)
-    sign = {fmo.SIGNS[1]: -1, fmo.SIGNS[2]: 1}.get(
-        s["fm_sign"], fit["sign"] if fit else -1)
-    how = {FM_CLOCK[0]: "found, best match anywhere",
-           FM_CLOCK[1]: "found, near the typed value",
-           FM_CLOCK[2]: "typed"}[clock]
-    beats = fm_force_beats(got)
     rows = fmo.beat_motion(beats, tf, f, tm, m, offset, sign,
                            pad=float(s["fm_pad"] or 0.0))
     seen = [r for r in rows if np.isfinite(r["shortening"])]
@@ -36336,17 +36564,22 @@ def fm_tab():
             f"**Video time + {offset:.4g} s = force time** ({how}"
             + (f", match r = {fit['r']:.2f}" if fit else "") + "). "
             f"{len(seen)} of {len(rows)} beats have video frames.")
-        if found:
+        if clock != FM_CLOCK[3]:
             b.button("Keep this offset", key="fmb_keep", on_click=fm_use_found,
                      args=(offset,), **STRETCH,
                      help="Copies it into My value and uses it from now on, "
                           "so it stays put when the settings change.")
-        if clock != FM_CLOCK[2]:
+        if clock == FM_CLOCK[0] and auto is not None:
+            st.caption(f"The automatic match would say {auto['offset']:.4g} "
+                       f"s (r = {auto['r']:.2f}).")
+        if clock != FM_CLOCK[3]:
             st.caption(
-                "⚠️ The offset was found by lining the two traces up, so a "
-                "real delay between force and shortening goes into the "
-                "offset: the delays below are then close to zero by "
-                "construction. For true delays, type the offset from when "
+                "⚠️ Matching peaks (by hand or by the automatic match) makes "
+                "the force peak and the largest shortening of the matched "
+                "beat happen together, so the delays below are near zero by "
+                "construction and the loops show the shapes, not the lag. "
+                "That is fair for before against after if both are matched "
+                "the same way. For true delays, type the offset from when "
                 "each recording started (or an event seen in both) and "
                 "choose Use my value.")
         st.plotly_chart(fm_figure(got, tf, f, tm, m, offset, rows, yu, mu),
@@ -36374,6 +36607,23 @@ def fm_tab():
             "not a work in joules. The video's frames are far apart "
             f"(every {fmo.step_of(tm):.3g} s), so a fast peak can be read "
             "a little low and the loops are coarse.")
+        h3, t3 = st.columns([2, 2], vertical_alignment="center")
+        h3.markdown("**🧊 Time, length and force in 3D**")
+        t3.segmented_control(
+            "Time", FM_3D, key="fm_3d", label_visibility="collapsed",
+            help="Within each beat: every beat its own path, timed from "
+                 "its force peak, laid over one another to compare their "
+                 "shapes. Whole recording: one path through the time the "
+                 "two recordings overlap.")
+        figure3d = fm_3d_figure(tf, f, tm, m, offset, rows, yu, mu,
+                                s.get("fm_3d") or FM_3D[0],
+                                float(s["fm_pad"] or 0.0))
+        st.plotly_chart(figure3d, **STRETCH,
+                        config={"displaylogo": False})
+        st.caption("Drag to turn it, scroll to zoom, click a beat in the "
+                   "legend to hide it. Looked at down the time axis, each "
+                   "path is the beat's loop above. The colour darkens from "
+                   "the first beat to the last.")
         summary, sections = fm_summary_rows(rows, fit, offset, how, sign, yu,
                                             mu, mname)
         st.markdown("##### 📋 Summary")
@@ -36398,6 +36648,20 @@ def fm_tab():
                    "right). Delays: when the shortening is largest (or half "
                    "way there) less when the force is (or half way up); "
                    "positive when the shortening comes after.")
+    st.selectbox("This recording is", FM_CONDITIONS, key="fm_cond",
+                 help="Saved with it in the cell (a column of the cell's "
+                      "table on 🗂 Cells), so before and after sit side by "
+                      "side there.")
+    figures = {"plot": fm_figure(got, tf, f, tm, m, offset, rows, yu, mu),
+               "plot3d": figure3d,
+               "loops": fm_loops_figure(rows, yu, mu)}
+    cell_db_box("force_motion",
+                lambda name, notes: fm_db_package(
+                    s["fm_sig"], got, mname, tm, m, mu, summary, rows, yu,
+                    how, offset, figures, name, notes),
+                fm_db_restore,
+                default_name=f"{sets[s['fm_sig']]['name']} · "
+                             f"{s['fm_cond']}")
 
 
 with tab_fm:
@@ -37077,7 +37341,7 @@ def cells_open_stack(prefix):
 CELL_OPENERS = {"afm": ai_db_restore, "stack": cells_open_stack("stack"),
                 "series": cells_open_stack("series"),
                 "beats": bt_db_restore, "fourier": ft_db_restore,
-                "force": fc_db_restore}
+                "force": fc_db_restore, "force_motion": fm_db_restore}
 
 
 def cells_open(cell, kind, item_id):
