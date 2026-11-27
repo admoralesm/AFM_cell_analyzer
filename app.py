@@ -23389,22 +23389,24 @@ if st.session_state.get("ui_compact", True):
 SHOW_VIDEO_TAB = False
 SHOW_DATABASE_TAB = False
 
-# The order of the work: the video, the AFM output and comparing traces,
-# one force curve against time, making the force-strain file, then the
-# fitting (everything that belongs to it, as its own tabs
+# The order of the work: Beat analysis first (the tab the app opens on:
+# AFM files load straight into it), then the video, the AFM output and
+# comparing traces, one force curve against time, making the force-strain
+# file, then the fitting (everything that belongs to it, as its own tabs
 # inside), then the rest. The two tabs that can be hidden go last; they are
-# hidden by CSS on the n-th button of the top tab bar only.
+# hidden by CSS on the n-th button of the top tab bar only (the Fitting tab
+# stays the 10th).
 (
-    tab_motion, tab_afm, tab_stack, tab_series, tab_beats, tab_fm,
+    tab_beats, tab_motion, tab_afm, tab_stack, tab_series, tab_fm,
     tab_fourier, tab_force, tab_igor, tab_fitting, tab_celldb, tab_video,
     tab_db,
 ) = st.tabs(
     [
+        "💓 Beat analysis",
         "🎬 Video: clip and analyze",
         "🔬 AFM output analysis",
         "📚 Stack & compare",
         "🔗 Series",
-        "💓 Beat analysis",
         "🤝 Force and motion",
         "〰 Fourier",
         "📈 Single force curve",
@@ -33759,20 +33761,272 @@ BT_PER_MINUTE = {"s": 60.0, "sec": 60.0, "seconds": 60.0, "ms": 60000.0,
                  "min": 1.0}
 
 
-def bt_add_upload(key):
-    """A file added on the tab: a new signal."""
+# 📂 AFM files added here straight away: each read once, sorted by what
+# it holds (beating recording, surface image, force curve), put in the
+# order taken, and each beating recording made a signal with the AFM
+# output tab's own defaults (the deflection, trace and retrace joined
+# along time, force with the note's k; Z beside it when there is a Z
+# channel). Before and after: the recordings either side of a force curve.
+BT_FILE_TYPES = (*ai.FILE_KINDS, "Skip")
+BT_FILE_ICONS = {"Beating recording": "💓", "Surface image": "🗺",
+                 "Force curve": "📌", "Skip": "⏭"}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def bt_ibw_read(data, name):
+    """
+    An .ibw file for 💓 Beat analysis, read once: what it holds (one of
+    ai.FILE_KINDS) and why, when it was taken (its note), and for an image
+    its signal made with the AFM output tab's defaults: the deflection's
+    trace and retrace joined along time (the note's line rate, a third
+    each for trace, retrace and the move), turned into force as the file
+    stores it with the note's k (µN), and the Z channel beside it (nm) when
+    there is one.
+    """
+    item = ai.load_ibw_bytes(data, name)
+    arr, meta, nd = item["arr"], item["meta"], item["note_dict"]
+    out = {"name": name, "stem": re.sub(r"\.[A-Za-z0-9]+$", "", name),
+           "taken": ai.taken_at(nd), "frame": None, "meta": None,
+           "said": ""}
+    names, axis = [], None
+    if np.ndim(arr) == 3:
+        axis = ai.guess_channel_axis(arr)
+        names = [ai.channel_display_name(meta, axis, i, True)
+                 for i in range(ai.n_channels(arr, axis))]
+    out["kind"], out["why"] = ai.classify_ibw(arr, nd, names)
+    if out["kind"] == ai.FILE_KINDS[2]:
+        rate = ai.first_float(ai.note_lookup(nd, ("NumPtsPerSec",
+                                                  "SampleRate")))
+        points = int(max(np.shape(arr))) if np.ndim(arr) else 0
+        if rate and rate > 0 and points:
+            out["said"] = f"{points / rate:.3g} s"
+    if axis is None:
+        return out
+    pairs = ai_pairs(names)
+    defl, zname = ai_dz_defaults(pairs)
+    if defl is None:
+        out["said"] = "no deflection channel"
+        return out
+    timing = {"rate": float(item["guess"].get("scan_hz") or 10.0),
+              "tf": 1 / 3, "rf": 1 / 3, "mf": 1 / 3, "move": True,
+              "revB": True, "transpose": True, "turn": False,
+              "turn_s": 0.0}
+    k_n, iv_n, sp_n = ai.note_calibration(nd)
+    cal = dict(k=k_n or 0.1,
+               invols=iv_n or 50.0,
+               setpoint=sp_n or 0.0, subtract_setpoint=False,
+               force_unit="nN", file_unit=meta.get("data_units", ""))
+    t, d = ai_trace(arr, axis, *pairs[defl], timing)
+    force = np.asarray(ai.force_convert(d, ai.FORCE_AUTO, **cal),
+                       float) * 1e-3          # nN → µN
+    frame = {"Time (s)": np.asarray(t, float), "Force (µN)": force}
+    if zname is not None:
+        _, z = ai_trace(arr, axis, *pairs[zname], timing)
+        z = np.asarray(z, float)
+        if ai.stored_deflection_unit(z) == "m":
+            frame["Z piezo (nm)"] = z * 1e9
+    frame = pd.DataFrame(frame)
+    frame = frame[np.isfinite(frame["Time (s)"])
+                  & np.isfinite(frame["Force (µN)"])].reset_index(drop=True)
+    out["frame"] = frame
+    out["meta"] = file_meta(
+        file=name, k=cal["k"], invols=cal["invols"],
+        k_from="the file's note" if k_n else "the AFM output tab's default "
+        "(no k in the note)",
+        invols_from="the file's note" if iv_n else "the AFM output tab's "
+        "default", y_unit="µN",
+        channel=defl + (f" / {zname}" if "Z piezo (nm)" in frame else ""))
+    out["said"] = (f"{timing['rate']:g} lines/s, {frame['Time (s)'].iloc[-1]:.0f}"
+                   f" s" if len(frame) else "empty")
+    return out
+
+
+def bt_file_order(files):
+    """The files' ids in the order taken: by the time in each note, else
+    by name (Asylum names count up: X202509220920, …0922)."""
+    def key(fid):
+        f = files[fid]
+        stamp = f.get("taken")
+        return (0 if stamp is not None else 1,
+                stamp.value if stamp is not None else 0,
+                [int(p) if p.isdigit() else p.lower()
+                 for p in re.split(r"(\d+)", f["name"])])
+    return sorted(files, key=key)
+
+
+def bt_files_arrange():
+    """
+    The files in the order taken, each beating recording's role from the
+    force curves (the mechanical cue) around it: before the first one,
+    after it, after the second…; a signal for each beating recording (and
+    none for the rest), named with its role; ⚖️ Before vs after set to the
+    last one before the first cue and the first one after it; 📈 in the
+    order taken.
+    """
     s = st.session_state
-    up = s.get(key)
-    if up is None:
+    files = s.get("_bt_files") or {}
+    sets = s.setdefault("_bt_sets", {})
+    cues, order, added = 0, bt_file_order(files), False
+    for fid in order:
+        f = files[fid]
+        if f["type"] == ai.FILE_KINDS[2]:
+            cues += 1
+            f["role"] = "mechanical cue" if cues == 1 else f"cue {cues}"
+            continue
+        f["role"] = ("" if f["type"] != ai.FILE_KINDS[0] else "before"
+                     if cues == 0 else "after" if cues == 1
+                     else f"after cue {cues}")
+    for fid in order:
+        f = files[fid]
+        sid = f.get("sid")
+        wanted = f["type"] == ai.FILE_KINDS[0] and f.get("frame") is not None
+        name = f"{f['stem']} ({f['role']})" if f.get("role") else f["stem"]
+        if wanted and sid not in sets:
+            added = True
+            f["sid"] = send_to_analysis(
+                name, f["frame"], source=f"the AFM file {f['name']} (its "
+                "deflection, trace and retrace along time, with the AFM "
+                "output tab's defaults)", meta=f["meta"])
+        elif wanted:
+            sets[sid]["name"] = name
+        elif sid in sets:
+            bt_remove(sid)
+            f["sid"] = None
+    beating = [files[fid]["sid"] for fid in order
+               if files[fid].get("sid") in sets]
+    before = [files[fid]["sid"] for fid in order
+              if files[fid].get("role") == "before"
+              and files[fid].get("sid") in sets]
+    after = [files[fid]["sid"] for fid in order
+             if files[fid].get("role") == "after"
+             and files[fid].get("sid") in sets]
+    if before and after:
+        s["bt_ba0"], s["bt_ba1"] = before[-1], after[0]
+    others = [k for k in (s.get("bt_cmp_ids") or []) if k in sets
+              and k not in beating]
+    s["bt_cmp_ids"] = beating + others
+    s["_bt_cmp_known"] = list(sets)
+    # open on the first recording taken (each one sent took the view)
+    if beating and (added or s.get("bt_pick") not in sets):
+        s["bt_pick"] = beating[0]
+
+
+def bt_add_upload(key):
+    """Files added on the tab: a table each makes a new signal; AFM .ibw
+    files are read, sorted and set out by bt_files_arrange."""
+    s = st.session_state
+    ups = s.get(key)
+    if not ups:
         return
-    try:
-        frame = sc_read(up.getvalue(), up.name)
-    except Exception as exc:
-        s["_bt_note"] = f"⚠️ Could not read {up.name}: {exc}"
-        return
-    send_to_analysis(re.sub(r"\.[A-Za-z0-9]+$", "", up.name), frame,
-                     source=f"the file {up.name}")
+    if not isinstance(ups, list):
+        ups = [ups]
+    notes = []
+    files = s.setdefault("_bt_files", {})
+    for up in ups:
+        if up.name.lower().endswith(".ibw"):
+            if up.name in files:
+                notes.append(f"{up.name} is here already.")
+                continue
+            data = up.getvalue()
+            try:
+                info = dict(bt_ibw_read(data, up.name))
+            except Exception as exc:
+                notes.append(f"⚠️ Could not read {up.name}: {exc}")
+                continue
+            s["_bt_fn"] = int(s.get("_bt_fn", 0) or 0) + 1
+            info.update(bytes=data, type=info["kind"], sid=None,
+                        n=s["_bt_fn"])
+            files[up.name] = info
+            continue
+        try:
+            frame = sc_read(up.getvalue(), up.name)
+        except Exception as exc:
+            notes.append(f"⚠️ Could not read {up.name}: {exc}")
+            continue
+        send_to_analysis(re.sub(r"\.[A-Za-z0-9]+$", "", up.name), frame,
+                         source=f"the file {up.name}")
+    if files:
+        bt_files_arrange()
+    if notes:
+        s["_bt_note"] = " ".join(notes)
     s["_bt_upver"] = int(s.get("_bt_upver", 0) or 0) + 1
+
+
+def bt_file_retype(fid, key):
+    """A file's type changed by hand: set everything out again."""
+    s = st.session_state
+    files = s.get("_bt_files") or {}
+    if fid in files and s.get(key) in BT_FILE_TYPES:
+        files[fid]["type"] = s[key]
+        bt_files_arrange()
+
+
+def bt_file_to_afm(fid):
+    """🔬 A file opened on the AFM output analysis tab as well."""
+    s = st.session_state
+    f = (s.get("_bt_files") or {}).get(fid)
+    if not f:
+        return
+    s.setdefault("_ai_db_files", {})[f["name"]] = f["bytes"]
+    s["ai_file"] = f["name"]
+    s["_bt_note_show"] = (f"{f['name']} is open on the 🔬 AFM output "
+                          "analysis tab.")
+
+
+def bt_files_clear():
+    """Every AFM file added here, and its signal, taken away."""
+    s = st.session_state
+    sets = s.get("_bt_sets") or {}
+    for f in (s.get("_bt_files") or {}).values():
+        if f.get("sid") in sets:
+            bt_remove(f["sid"])
+    s["_bt_files"] = {}
+
+
+def bt_files_panel():
+    """📂 The AFM files added here, in the order taken: what each holds (to
+    change by hand), when it was taken, its role around the force curves,
+    and a button to open it on the AFM output tab."""
+    s = st.session_state
+    files = s.get("_bt_files") or {}
+    if not files:
+        return
+    with st.expander(f"📂 {len(files)} AFM file"
+                     f"{'s' if len(files) != 1 else ''}, in the order taken",
+                     expanded=True):
+        for i, fid in enumerate(bt_file_order(files), 1):
+            f = files[fid]
+            key = f"btft_{f['n']}"
+            if s.get(key) not in BT_FILE_TYPES:
+                s[key] = f["type"]
+            c1, c2, c3 = st.columns([2.1, 1.7, 0.45],
+                                    vertical_alignment="center")
+            when = (f["taken"].strftime("%H:%M:%S") if f.get("taken")
+                    is not None else "")
+            role = f.get("role") or ""
+            c1.markdown(
+                f"{BT_FILE_ICONS.get(f['type'], '')} **{i}.** "
+                f"`{f['stem']}`  \n"
+                + " · ".join(w for w in (when, f.get("said") or "",
+                                         f"**{role}**" if role else "")
+                             if w))
+            c2.selectbox("What it is", BT_FILE_TYPES, key=key,
+                         label_visibility="collapsed",
+                         on_change=bt_file_retype, args=(fid, key),
+                         help=f"Found: {f['kind']}, as {f['why']}. Change "
+                              "it if that is wrong.")
+            c3.button("🔬", key=f"btb_afm_{f['n']}", on_click=bt_file_to_afm,
+                      args=(fid,), help="Open it on the 🔬 AFM output "
+                                        "analysis tab too.", **STRETCH)
+        st.caption(
+            "💓 beating recordings become signals here (the deflection, "
+            "trace and retrace along time, as force with the note's k; Z "
+            "beside it). 🗺 surface images and 📌 force curves are not, but "
+            "set the order: recordings before the first force curve are "
+            "*before*, after it *after*, and ⚖️ Before vs after starts on the "
+            "two either side of it.")
+        st.button("🗑 Remove these files and their signals",
+                  key="btb_files_clear", on_click=bt_files_clear, **STRETCH)
 
 
 def bt_remove(sid):
@@ -37185,16 +37439,22 @@ def beat_tab():
     left, right = st.columns([1, 2.5], gap="medium")
     with left:
         upkey = f"btf_{int(s.get('_bt_upver', 0) or 0)}"
-        st.file_uploader("Add a file (CSV, TXT or Excel)",
-                         type=["csv", "tsv", "txt", "xlsx", "xls"],
+        st.file_uploader("Add files: AFM .ibw (several at once), CSV, TXT "
+                         "or Excel",
+                         type=["ibw", "csv", "tsv", "txt", "xlsx", "xls"],
+                         accept_multiple_files=True,
                          key=upkey, on_change=bt_add_upload, args=(upkey,),
-                         help="Or send a plot here with 📊 Send to beat analysis, "
-                              "from the video, AFM output and Single force "
-                              "curve tabs, or from a file on Stack & "
-                              "compare or Series.")
+                         help="AFM .ibw files are read straight away with "
+                              "the AFM output tab's defaults (the deflection, "
+                              "trace and retrace along time), sorted into "
+                              "beating recordings, surface images and force "
+                              "curves, and put in the order taken. Or send a "
+                              "plot here with 📊 Send to beat analysis from "
+                              "the other tabs.")
         note = s.pop("_bt_note", None)
         if note:
             st.warning(note)
+        bt_files_panel()
     if not sets:
         with right:
             st.info("Send a signal here with **📊 Send to beat analysis** (video, "
