@@ -33878,14 +33878,18 @@ def bt_files_arrange():
     files = s.get("_bt_files") or {}
     sets = s.setdefault("_bt_sets", {})
     cues, order, added = 0, bt_file_order(files), False
+    # each recording is usually split from the next by a force curve (the
+    # mechanical cue): before, after cue 1, after cue 2…; with one cue,
+    # simply before and after
+    total = sum(1 for f in files.values() if f["type"] == ai.FILE_KINDS[2])
     for fid in order:
         f = files[fid]
         if f["type"] == ai.FILE_KINDS[2]:
             cues += 1
-            f["role"] = "mechanical cue" if cues == 1 else f"cue {cues}"
+            f["role"] = "mechanical cue" if total == 1 else f"cue {cues}"
             continue
         f["role"] = ("" if f["type"] != ai.FILE_KINDS[0] else "before"
-                     if cues == 0 else "after" if cues == 1
+                     if cues == 0 else "after" if total == 1
                      else f"after cue {cues}")
     for fid in order:
         f = files[fid]
@@ -33909,13 +33913,18 @@ def bt_files_arrange():
               if files[fid].get("role") == "before"
               and files[fid].get("sid") in sets]
     after = [files[fid]["sid"] for fid in order
-             if files[fid].get("role") == "after"
+             if str(files[fid].get("role") or "").startswith("after")
              and files[fid].get("sid") in sets]
     if before and after:
         s["bt_ba0"], s["bt_ba1"] = before[-1], after[0]
     others = [k for k in (s.get("bt_cmp_ids") or []) if k in sets
               and k not in beating]
     s["bt_cmp_ids"] = beating + others
+    # 📈 labelled by the cues: before, after cue 1, after cue 2…
+    roles = [files[fid]["role"] for fid in order
+             if files[fid].get("sid") in sets]
+    if total and not others and all(roles):
+        s["bt_cmp_names"] = ", ".join(roles)
     s["_bt_cmp_known"] = list(sets)
     # open on the first recording taken (each one sent took the view)
     if beating and (added or s.get("bt_pick") not in sets):
@@ -34038,9 +34047,10 @@ def bt_files_panel():
             "💓 beating recordings become signals here (the deflection, "
             "trace and retrace along time, as force with the note's k; Z "
             "beside it). 🗺 surface images and 📌 force curves are not, but "
-            "set the order: recordings before the first force curve are "
-            "*before*, after it *after*, and ⚖️ Before vs after starts on the "
-            "two either side of it.")
+            "set the order: each recording is named by the force curve "
+            "before it (*before*, *after cue 1*, *after cue 2*…; with one "
+            "cue, *before* and *after*), 📈 is labelled so, and ⚖️ Before "
+            "vs after starts on the two either side of the first cue.")
         st.button("🗑 Remove these files and their signals",
                   key="btb_files_clear", on_click=bt_files_clear, **STRETCH)
 
@@ -34048,6 +34058,7 @@ def bt_files_panel():
 def bt_remove(sid):
     s = st.session_state
     s.get("_bt_sets", {}).pop(sid, None)
+    (s.get("_bt_memo") or {}).pop(sid, None)
     for key in [k for k in list(s.keys()) if str(k).endswith(f"_{sid}")
                 and str(k).startswith(("bt_", "_bt_"))]:
         s.pop(key, None)
@@ -34085,12 +34096,20 @@ def bt_signal(sid):
     return x[ok][order], y[ok][order], xcol, ycol
 
 
+# smoothing a new signal starts with (points), so the lines and the peaks
+# are found on the beats, not on the noise
+BT_SMOOTH_DEFAULT = 25
+
+
 def bt_defaults(sid, x, y):
-    """A signal's settings the first time it is shown: the median as the
-    baseline, lines 5 noise SDs from it, a negative peak within twice the
+    """A signal's settings the first time it is shown: smoothed over
+    BT_SMOOTH_DEFAULT points, the median as the baseline, lines 5 noise SDs
+    from it (of the smoothed signal), a negative peak within twice the
     usual positive one's width counted with it."""
     s = st.session_state
     key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    s.setdefault(key("sm"), BT_SMOOTH_DEFAULT)
+    y = bta.smooth(y, int(s[key("sm")] or 1))
     if s.get(key("bmode")) not in bta.BASELINES:
         s[key("bmode")] = bta.BASELINES[0]
     if key("base") not in s:
@@ -34108,7 +34127,7 @@ def bt_defaults(sid, x, y):
     # the recording's own cantilever, when its file said (or it was set
     # where it came from)
     meta = s["_bt_sets"][sid].get("meta") or {}
-    for name, value in (("sm", 1), ("merge", 0.0), ("minw", 0.0),
+    for name, value in (("merge", 0.0), ("minw", 0.0),
                         ("order", bta.ORDERS[0]),
                         ("k", float(meta.get("k") or 0.0))):
         s.setdefault(key(name), value)
@@ -34181,7 +34200,39 @@ def bt_energy_unit(e_unit=None):
     return e_unit if e_unit in BT_ENERGY_UNITS[1:] else BT_ENERGY
 
 
+def bt_signature(sid, e_unit=None):
+    """What one signal's analysis depends on: its own settings (every
+    bt_…_<sid>), the peaks taken out, its table and its file's facts."""
+    s = st.session_state
+    tail = f"_{sid}"
+    entry = (s.get("_bt_sets") or {}).get(sid) or {}
+    frame = entry.get("frame")
+    own = tuple(sorted(
+        (str(k), repr(s[k])) for k in list(s.keys())
+        if str(k).endswith(tail)
+        and str(k).startswith(("bt_", "_bt_out_"))))
+    return (own, id(frame), 0 if frame is None else len(frame),
+            repr(entry.get("meta")), e_unit)
+
+
 def bt_analyse(sid, e_unit=None):
+    """bt_analyse_fresh, kept: a signal is worked out again only when
+    something it depends on (bt_signature) has changed, so the tables,
+    ⚖️ and 📈 that look at every signal on each click do not redo them."""
+    s = st.session_state
+    if sid not in (s.get("_bt_sets") or {}):
+        return None
+    memo = s.setdefault("_bt_memo", {})
+    kept = memo.get(sid)
+    if kept is not None and kept[0] == bt_signature(sid, e_unit):
+        return kept[1]
+    got = bt_analyse_fresh(sid, e_unit)
+    # (its signature once its first-time defaults are written)
+    memo[sid] = (bt_signature(sid, e_unit), got)
+    return got
+
+
+def bt_analyse_fresh(sid, e_unit=None):
     """Everything about one signal, from its settings: the arrays, the
     baseline and lines, the excursions (kept and left out), the beats,
     their table and the summary."""
@@ -35156,6 +35207,17 @@ def bt_beat_duration_name(got):
 
 
 def bt_stats_rows(got):
+    """bt_stats_rows_fresh, kept with the analysis (for its energy unit)."""
+    unit = bt_energy_unit()
+    kept = got.get("_stats")
+    if kept is not None and kept[0] == unit:
+        return kept[1]
+    rows = bt_stats_rows_fresh(got)
+    got["_stats"] = (unit, rows)
+    return rows
+
+
+def bt_stats_rows_fresh(got):
     """
     The peaks' parameters as (name, values, unit), to give as n, mean,
     SD, median, min, max and range: heights and depths (without sign),
@@ -36355,6 +36417,7 @@ def bt_z_box(sid, got):
             what = "beat"
         figure.update_layout(template="plotly_white", height=420,
                              margin=dict(l=10, r=10, t=10, b=10))
+        bt_bold_axes(figure)
         st.plotly_chart(figure, **STRETCH, key=f"btz_fig_{sid}",
                         config={"displaylogo": False})
         st.caption(caption)
@@ -36444,6 +36507,21 @@ def bt_values_ids(got, start):
         return v[ok], unit, [None] * int(ok.sum())
     return v[ok], unit, [bt_peak_meta(got, w)
                          for w, good in zip(who, ok) if good]
+
+
+def bt_bold_axes(figure, title=17, ticks=14):
+    """A plot's axes made to read from the back of a room: titles larger
+    and black, tick labels black, the axes drawn in black, light grid."""
+    axis = dict(title_font=dict(size=title, color="black"),
+                tickfont=dict(size=ticks, color="black"), showline=True,
+                linewidth=1.5, linecolor="black", mirror=True,
+                ticks="outside", gridcolor="#e6e6e6", zeroline=False)
+    figure.update_layout(font=dict(family="Arial, Helvetica, sans-serif",
+                                   size=ticks, color="black"),
+                         plot_bgcolor="white", paper_bgcolor="white")
+    figure.update_xaxes(**axis)
+    figure.update_yaxes(**axis)
+    return figure
 
 
 def bt_blue(shade):
@@ -36562,6 +36640,7 @@ def bt_pick_panel(picked, uid):
             template="plotly_white", height=230, showlegend=False,
             margin=dict(l=10, r=10, t=10, b=10),
             xaxis_title=got["xcol"], yaxis_title=bt_y_title(got))
+        bt_bold_axes(figure, title=15, ticks=13)
         st.plotly_chart(figure, **STRETCH, key=f"btp_{uid}",
                         config={"displaylogo": False})
 
@@ -36716,6 +36795,9 @@ def bt_ba_figure(g0, g1, groups, title, log=False, unit=None):
                         title_text=found if unit is None else unit,
                         type="log" if log else "linear",
                         exponentformat="E")
+    figure.update_xaxes(tickfont=dict(size=14, color="black"))
+    figure.update_yaxes(title_font=dict(size=17, color="black"),
+                        tickfont=dict(size=14, color="black"))
     return figure, picks
 
 
@@ -37202,6 +37284,7 @@ def bt_symmetry_compare(chosen, gots, shown):
         figure.update_layout(
             xaxis_title=f"Positive {what} ({unit})",
             yaxis_title=f"Negative {what}, without sign ({unit})")
+        bt_bold_axes(figure)
         picked = bt_chart_pick(figure, picks, "btsym_" + str(abs(hash(
             (kind, tuple(chosen))))))
         st.caption(
@@ -37231,6 +37314,7 @@ def bt_symmetry_compare(chosen, gots, shown):
             xaxis_title="Time from the positive peak ("
                         + ("s" if time_ok else gots[0]["x_unit"]) + ")",
             yaxis_title="Signal ÷ its positive peak")
+        bt_bold_axes(figure)
         st.plotly_chart(figure, **STRETCH, key="btsym_shape",
                         config={"displaylogo": False})
         st.caption(
@@ -37370,6 +37454,7 @@ def bt_compare_several(ids):
                          yaxis_title=title,
                          margin=dict(l=10, r=10, t=20, b=10),
                          legend=dict(x=0.01, y=0.99))
+    bt_bold_axes(figure)
     picked = bt_chart_pick(
         figure, picks, "btc_fig_" + str(abs(hash((choice, view,
                                                   tuple(chosen))))))
