@@ -36551,6 +36551,249 @@ def bt_before_after(ids, sid):
         "are on a log scale.")
 
 
+# 📈 Several recordings, in order: one value per beat (or peak) across them.
+# (the choice, the start of its name in bt_stats_rows, what it is: time,
+# force and impulse are put in s, nN and µN·s when every recording allows)
+BT_CMP = (
+    ("Beat duration", "Full beat duration", "time"),
+    ("Positive peak duration", "Positive peak duration", "time"),
+    ("Negative peak duration", "Negative peak duration", "time"),
+    ("Time between beats", "Time between beats", "time"),
+    ("{f}, positive", "Positive peak height", "force"),
+    ("{f}, negative", "Negative peak depth", "force"),
+    ("{w} per positive peak", "{w} per positive peak", "impulse"),
+    ("{w} per negative peak", "{w} per negative peak", "impulse"),
+    ("Energy per beat", "Energy per full beat", ""),
+    ("Positive ÷ negative {fw}", "Positive ÷ negative peak", ""),
+    ("Positive ÷ negative {wl}", "Positive ÷ negative {wl}", ""),
+    ("Positive ÷ negative duration", "Positive ÷ negative duration", ""),
+    ("Negative peak recovery ÷ rise (shoulder)",
+     "Negative peak recovery ÷ rise", ""),
+    ("Beat symmetry (half-turn share)", "Full beat half-turn symmetry",
+     "share"))
+BT_CMP_Z = (("Z movement per positive peak", "pos"),
+            ("Z movement per negative peak", "neg"))
+BT_CMP_VIEW = ("Each recording", "Beat by beat")
+BT_CMP_COLS = ("Recording", "Mean ± SD", "n", "Change from the first")
+BT_FIXED_UNITS = {"time": "s", "force": "nN", "impulse": "µN·s"}
+
+
+def bt_cmp_labels(ids, sets):
+    """Each signal's name, made unique (a second 'cell 3' is 'cell 3
+    (2)'), for the list to choose from."""
+    labels, seen = {}, {}
+    for k in ids:
+        name = str(sets[k]["name"])
+        seen[name] = seen.get(name, 0) + 1
+        labels[k] = name if seen[name] == 1 else f"{name} ({seen[name]})"
+    return labels
+
+
+def bt_cmp_values(gots, choice, start, kind):
+    """
+    The per-beat (or per-peak) values of one choice in each recording, in
+    the same unit: (a list of arrays, the unit). Time, force and impulse in
+    s, nN and µN·s when every recording can be put in them, else in the
+    first one's own unit; Z from 📐 when every recording has it.
+    """
+    if kind in ("zpos", "zneg"):
+        found = [bt_zpeak_values(g) for g in gots]
+        side = "pos" if kind == "zpos" else "neg"
+        return ([f[0][side][0] if f else np.array([]) for f in found],
+                found[0][1] if found[0] else "")
+    scales = [bt_slide_scales(g) for g in gots]
+    fixed = kind in BT_FIXED_UNITS and all(sc[kind] for sc in scales)
+    out, unit = [], ""
+    for i, (g, sc) in enumerate(zip(gots, scales)):
+        v, u = bt_ba_values(g, start)
+        if fixed:
+            v = v * sc[kind]
+        out.append(v)
+        if i == 0:
+            unit = BT_FIXED_UNITS[kind] if fixed else u
+    return out, unit
+
+
+def bt_compare_several(ids):
+    """
+    📈 Any number of recordings in the order chosen (time points of one
+    cell, say), one value per beat or peak across them: every beat's value
+    as a dot over a box per recording with the means joined, or beat by
+    beat within each; a table to copy (mean ± SD, n, × the first); and
+    whether it rises or falls along the order (Spearman) or differs at all
+    (Kruskal-Wallis), every beat one sample.
+    """
+    from scipy import stats as sps
+    s = st.session_state
+    sets = s["_bt_sets"]
+    labels = bt_cmp_labels(ids, sets)
+    by_label = {v: k for k, v in labels.items()}
+    # the choice kept by id, or by its label when Streamlit hands that back;
+    # signals added since are put at the end
+    kept = []
+    for v in s.get("bt_cmp_ids") or []:
+        k = v if v in ids else by_label.get(v) if isinstance(v, str) else None
+        if k is not None and k not in kept:
+            kept.append(k)
+    known = s.get("_bt_cmp_known") or []
+    kept += [k for k in ids if k not in known and k not in kept]
+    s["_bt_cmp_known"] = list(ids)
+    s["bt_cmp_ids"] = kept
+    st.multiselect(
+        "Recordings, in order", ids, key="bt_cmp_ids",
+        format_func=lambda k: labels.get(k, str(k)),
+        help="Pick them in the order to compare, first to last (time "
+             "points, say). Each is analysed with its own settings: open it "
+             "with Signal above to change them.")
+    chosen = [k for k in s["bt_cmp_ids"] if k in ids]
+    if len(chosen) < 2:
+        st.info("Pick two or more recordings.", icon="📈")
+        return
+    gots = [bt_got_for(k) for k in chosen]
+    empty = [labels[k] for k, g in zip(chosen, gots) if g is None]
+    if empty:
+        st.warning("No beats to compare in: " + ", ".join(empty) + ".")
+    pairs = [(k, g) for k, g in zip(chosen, gots) if g is not None]
+    if len(pairs) < 2:
+        return
+    chosen, gots = [k for k, _ in pairs], [g for _, g in pairs]
+    word = bta.area_word(gots[0]["x_unit"], gots[0]["y_unit"])
+    force = all(g.get("newtons") for g in gots)
+    names = {"w": word, "wl": word.lower(),
+             "f": "Peak force" if force else "Peak height",
+             "fw": "force" if force else "size"}
+    options = {label.format(**names): (start.format(**names), kind)
+               for label, start, kind in BT_CMP}
+    if all(bt_zpeak_values(g) for g in gots):
+        options.update({label: ("", "z" + side) for label, side in BT_CMP_Z})
+    if s.get("bt_cmp_param") not in options:
+        s["bt_cmp_param"] = next(iter(options))
+    if s.get("bt_cmp_view") not in BT_CMP_VIEW:
+        s["bt_cmp_view"] = BT_CMP_VIEW[0]
+    c1, c2, c3 = st.columns([1.4, 1.2, 1.6], vertical_alignment="bottom")
+    c1.selectbox("Value", list(options), key="bt_cmp_param")
+    c2.segmented_control("View", BT_CMP_VIEW, key="bt_cmp_view")
+    c3.text_input("Labels (optional)", key="bt_cmp_names",
+                  placeholder="0 min, 10 min, 20 min",
+                  help="One per recording, in order, split by commas: shown "
+                       "under the plot and in the table instead of the "
+                       "names.")
+    choice = s["bt_cmp_param"]
+    start, kind = options[choice]
+    values, unit = bt_cmp_values(gots, choice, start, kind)
+    typed = [w.strip() for w in str(s.get("bt_cmp_names") or "").split(",")]
+    if len([w for w in typed if w]) == len(chosen):
+        shown = typed
+    else:
+        shown = [bt_short_name(sets[k]["name"]) for k in chosen]
+        if any(w for w in typed):
+            st.caption(f"⚠️ {len([w for w in typed if w])} labels typed for "
+                       f"{len(chosen)} recordings: showing the names.")
+    # the plot's categories must differ, or plotly lays two as one
+    seen = {}
+    for i, w in enumerate(shown):
+        seen[w] = seen.get(w, 0) + 1
+        if seen[w] > 1:
+            shown[i] = f"{w} ({seen[w]})"
+    rules = {bta.timing_of(g["beats"]) for g in gots}
+    if len(rules) > 1 and (kind == "time" or "duration" in choice):
+        st.warning("Durations were measured differently in these recordings ("
+                   + "; ".join(sorted(rules)) + "). Set the same rule on each "
+                   "(💓 Beats → ⏱ Peaks start and end) first.", icon="⏱")
+    title = f"{choice} ({unit})" if unit else choice
+    means = [float(v.mean()) if v.size else np.nan for v in values]
+    figure = go.Figure()
+    if (s.get("bt_cmp_view") or BT_CMP_VIEW[0]) == BT_CMP_VIEW[0]:
+        for w, v in zip(shown, values):
+            figure.add_trace(go.Box(
+                y=v, name=w, boxpoints="all", jitter=0.35, pointpos=0,
+                marker=dict(color=BT_AFTER, size=5, opacity=0.55),
+                line=dict(color=BT_AFTER, width=1.5),
+                fillcolor="rgba(42,120,214,0.10)", showlegend=False,
+                hovertemplate=f"{w}<br>%{{y:.4g}}<extra></extra>"))
+        figure.add_trace(go.Scatter(
+            x=shown, y=means, mode="lines+markers", name="mean",
+            line=dict(color="#222222", width=2, dash="dot"),
+            marker=dict(size=10, symbol="diamond", color="#222222"),
+            showlegend=False,
+            hovertemplate="mean %{y:.4g}<extra></extra>"))
+        figure.update_layout(xaxis_title="")
+    else:
+        shades = np.linspace(0.35, 1.0, len(values))
+        for w, v, shade in zip(shown, values, shades):
+            blue = (int(198 - 190 * shade), int(219 - 171 * shade),
+                    int(239 - 132 * shade))
+            figure.add_trace(go.Scatter(
+                x=np.arange(1, v.size + 1), y=v, mode="lines+markers",
+                name=w, line=dict(color=f"rgb{blue}", width=2),
+                marker=dict(size=5, color=f"rgb{blue}"),
+                hovertemplate=f"{w}<br>beat %{{x}}<br>%{{y:.4g}}"
+                              "<extra></extra>"))
+        figure.update_layout(xaxis_title="Beat (or peak) in the recording",
+                             showlegend=len(values) <= 12)
+    figure.update_layout(template="plotly_white", height=460,
+                         yaxis_title=title,
+                         margin=dict(l=10, r=10, t=20, b=10),
+                         legend=dict(x=0.01, y=0.99))
+    st.plotly_chart(figure, **STRETCH, key="btc_fig",
+                    config={"displaylogo": False})
+    # the table to copy
+    rows = []
+    first = means[0]
+    for w, v, m in zip(shown, values, means):
+        if not (np.isfinite(m) and np.isfinite(first)):
+            change = ""
+        elif kind == "share":
+            change = f"{m - first:+.2f}"
+        else:
+            change = f"{m / first:.2f}×" if first else ""
+        rows.append([w, bt_mean_sd(v), str(int(v.size)), change])
+    table = [[title, "", "", ""], *rows]
+    tsv = "\n".join("\t".join(r) for r in [list(BT_CMP_COLS), *table])
+    bt_copy_button("📋 Copy the table", bt_table_html(table, {0},
+                                                     BT_CMP_COLS),
+                   tsv, "cmp_table")
+    st.dataframe(pd.DataFrame(rows, columns=BT_CMP_COLS), hide_index=True,
+                 **STRETCH, height=35 * (len(rows) + 1) + 3,
+                 column_config={name: st.column_config.TextColumn(width=w)
+                                for name, w in zip(BT_CMP_COLS,
+                                                   (260, 200, 60, 150))})
+    # along the order: Spearman on every beat; any difference: Kruskal
+    said = []
+    order = np.concatenate([np.full(v.size, i + 1.0)
+                            for i, v in enumerate(values)])
+    every = np.concatenate(values) if values else np.array([])
+    if every.size >= 4 and np.ptp(order) > 0 and np.ptp(every) > 0:
+        rho, p_rho = sps.spearmanr(order, every)
+        way = "rises" if rho > 0 else "falls"
+        said.append(f"along the order it {way}: Spearman ρ = {rho:.2f}, "
+                    f"p = {bta.pretty(p_rho, 2)}")
+    groups = [v for v in values if v.size >= 2]
+    if len(groups) >= 2 and np.ptp(every) > 0:
+        p_kw = sps.kruskal(*groups).pvalue
+        said.append(f"any difference between them: Kruskal-Wallis p = "
+                    f"{bta.pretty(p_kw, 2)}")
+    st.caption(
+        ((lambda w: w[:1].upper() + w[1:])("; ".join(said)) + ". "
+         if said else "")
+        + "Each dot is one beat (or peak); the box its quartiles; the diamonds "
+        "the means, joined in order. Change: × the first recording's mean"
+        + (" (+ or − for the symmetry share)" if kind == "share" else "")
+        + ". Every recording is analysed with its own settings. The p-values "
+        "treat every beat as one sample: they say whether this cell's beats "
+        "changed along these recordings, not whether it holds across cells.")
+    long = pd.DataFrame({
+        "Recording": np.concatenate([[w] * v.size
+                                     for w, v in zip(shown, values)]),
+        "Order": order.astype(int),
+        "Beat": np.concatenate([np.arange(1, v.size + 1) for v in values]),
+        title: every})
+    st.download_button("💾 Every beat's value (CSV)",
+                       long.to_csv(index=False).encode("utf-8"),
+                       file_name="beats_across_recordings.csv",
+                       mime="text/csv", key="btb_cmp_csv")
+
+
 def beat_tab():
     s = st.session_state
     for key, value in (*BT_PUBLICATION.items(),
@@ -36616,6 +36859,9 @@ def beat_tab():
             with st.container(border=True):
                 st.markdown("#### ⚖️ Before vs after")
                 bt_before_after(ids, sid)
+            with st.container(border=True):
+                st.markdown("#### 📈 Several recordings, in order")
+                bt_compare_several(ids)
             with st.expander(f"📋 All {len(ids)} signals side by side"):
                 frame = bt_summary_frame(ids)
                 st.dataframe(frame, hide_index=True, **STRETCH)
