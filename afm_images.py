@@ -1388,6 +1388,126 @@ def scan_size_um(nd):
     return fast, slow
 
 
+# What an .ibw file holds, for sorting a day's files: a recording of the
+# beats (a line scanned over and over, or the tip held at one point), an
+# image of the surface (the tip moving down the cell, line after line), or
+# a force curve (points against time, one column per channel)
+FILE_KINDS = ("Beating recording", "Surface image", "Force curve")
+
+
+def ibw_shape_kind(arr):
+    """'curve' for a wave of points with a few channels (or one channel),
+    'image' for lines of points (2-D, or 3-D with channels)."""
+    arr = np.asarray(arr)
+    if arr.ndim <= 1:
+        return "curve"
+    if arr.ndim == 2 and min(arr.shape) <= 16 and max(arr.shape) >= 64:
+        return "curve"
+    return "image"
+
+
+def line_similarity(img):
+    """
+    How an image's lines (its rows) compare, each line's own mean taken
+    off: (the median correlation of each line with the next; how much the
+    lines change down the image for the shape one line has, the variance
+    across lines over the variance along the mean line). A surface image
+    has neighbours alike but changes a lot down the image (the tip moves
+    down the cell); a line scanned over and over has neighbours alike and
+    changes little; a point held still has neighbours unlike.
+    """
+    img = np.asarray(img, float)
+    if img.ndim != 2 or img.shape[0] < 6 or img.shape[1] < 4:
+        return float("nan"), float("nan")
+    lines = img - np.nanmean(img, axis=1, keepdims=True)
+    lines = np.where(np.isfinite(lines), lines, 0.0)
+
+    def corr(a, b):
+        sa, sb = a.std(), b.std()
+        return float(np.mean((a - a.mean()) * (b - b.mean())) / (sa * sb)) \
+            if sa > 0 and sb > 0 else float("nan")
+
+    step = max(1, (lines.shape[0] - 1) // 200)
+    adjacent = [corr(lines[i], lines[i + 1])
+                for i in range(0, lines.shape[0] - 1, step)]
+    adjacent = [c for c in adjacent if np.isfinite(c)]
+    shape = lines.mean(axis=0).var()
+    change = float(lines.var(axis=0).mean() / shape) if shape > 0 \
+        else float("inf")
+    return (float(np.median(adjacent)) if adjacent else float("nan"),
+            change)
+
+
+def _slow_scan_off(nd):
+    """True when the note says the slow scan was off (the same line over
+    and over), False when on, None when it does not say."""
+    for key, value in (nd or {}).items():
+        low = re.sub(r"[\s_]", "", str(key).lower())
+        if "slowscan" in low and ("disab" in low or "enab" in low):
+            v = str(value).strip().lower()
+            yes = v in ("1", "yes", "true", "on") or (
+                first_float(v) is not None and first_float(v) != 0)
+            return yes if "disab" in low else not yes
+    return None
+
+
+def classify_ibw(arr, nd, names=None):
+    """
+    What an .ibw file holds (one of FILE_KINDS) and why. A wave of points
+    with a few channels is a force curve. An image is a beating recording
+    when the tip stayed on one spot (a scan size of 10 nm or less), when
+    the note says the slow scan was off, when neighbouring lines are unlike
+    (one spot over time), or when the lines hardly change down the image
+    (the same line scanned over and over); it is a surface image when
+    neighbouring lines are alike but change down the image (the tip moved
+    down the cell). Read on the height (or Z sensor) channel.
+    """
+    if ibw_shape_kind(arr) == "curve":
+        return FILE_KINDS[2], "points against time, a column per channel"
+    # the scan size as written (0 means the tip stayed on one spot); in
+    # metres when small, else in µm
+    size = first_float(note_lookup(nd, ("FastScanSize", "Fast Scan Size",
+                                        "ScanSize", "Scan Size")))
+    if size is not None and (abs(size) <= 1e-8 if abs(size) < 1e-2
+                             else abs(size) <= 0.01):
+        return FILE_KINDS[0], "the tip held at one point (scan size 0)"
+    off = _slow_scan_off(nd)
+    if off:
+        return FILE_KINDS[0], "the slow scan was off: one line, over and over"
+    arr = np.asarray(arr, float)
+    if arr.ndim == 3:
+        axis = guess_channel_axis(arr)
+        names = list(names or [])
+        pick = next((i for i, n in enumerate(names)
+                     if re.search(r"height|z\s*sens|zsnsr", str(n), re.I)),
+                    0)
+        img = channel_image(arr, axis, pick).T
+    else:
+        img = arr.T if arr.shape[0] > arr.shape[1] else arr
+    adjacent, change = line_similarity(img)
+    if not (np.isfinite(adjacent) and adjacent >= 0.6):
+        return FILE_KINDS[0], "no shape shared by neighbouring lines (one spot)"
+    if change >= 0.25:
+        return FILE_KINDS[1], ("neighbouring lines alike but changing down "
+                               "the image: the tip moved down the cell")
+    return FILE_KINDS[0], "the same line over and over"
+
+
+def taken_at(nd):
+    """When the file was taken (a pandas Timestamp) from its note's Date
+    and Time, else None."""
+    date = note_lookup(nd, ("Date",))
+    time = note_lookup(nd, ("Time",))
+    if not date:
+        return None
+    try:
+        stamp = pd.to_datetime(f"{date} {time or ''}".strip(),
+                               errors="coerce")
+    except (ValueError, TypeError):
+        return None
+    return None if pd.isna(stamp) else stamp
+
+
 def stored_deflection_unit(y, file_unit=""):
     """
     How a deflection channel is stored: 'm', 'nm' or 'V'. Values under
