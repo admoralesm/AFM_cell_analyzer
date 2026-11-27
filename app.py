@@ -36127,6 +36127,175 @@ def bt_summary_frame(ids):
 # Impulse (Area when it is not a force against time)
 # in groups, each row (label, start of the name, how it changes: "x" as
 # after ÷ before, "d" as after − before for balances and shares)
+def bt_peak_meta(got, who):
+    """Where a value comes from: ``who`` is (the beat's number, the beat,
+    "pos"/"neg" for one peak or None for the beat). Its time (the peak's
+    top), where it starts and ends, and words for it."""
+    n, b, side = who
+    if side:
+        e = b[side]
+        t0 = float(e.get("up", e["start"]))
+        t1 = float(e.get("back", e["end"]))
+        what = f"beat {n}, {'positive' if side == 'pos' else 'negative'} peak"
+    else:
+        e = b["pos"] or b["neg"]
+        t0, t1 = bta.beat_span(b)
+        what = f"beat {n}" + ("" if b["kind"] == bta.KINDS[0]
+                              else " (a lone peak)")
+    return {"beat": n, "side": side, "t": float(e["peak_x"]),
+            "t0": float(t0), "t1": float(t1), "what": what}
+
+
+def bt_values_ids(got, start):
+    """bt_ba_values with, beside each value, the beat or peak it comes from
+    (bt_peak_meta; None where that cannot be told)."""
+    found = next(((param, values, unit) for param, values, unit
+                  in bt_stats_rows(got) if param.startswith(start)), None)
+    if found is None:
+        return np.array([]), "", []
+    param, values, unit = found
+    v = np.asarray(values, float)
+    low = param.lower()
+    beats = got["beats"]
+    if "between beats" in low:
+        who = [(b["n"], b, None) for b in beats[1:]]
+    elif ("full beat" in low or "÷" in param or "balance" in low
+          or low.startswith("positive to negative")):
+        who = [(b["n"], b, None) for b in beats
+               if b["kind"] == bta.KINDS[0]]
+    elif "positive" in low:
+        who = [(b["n"], b, "pos") for b in beats if b["pos"] is not None]
+    elif "negative" in low:
+        who = [(b["n"], b, "neg") for b in beats if b["neg"] is not None]
+    else:
+        who = []
+    ok = np.isfinite(v)
+    if len(who) != v.size:
+        return v[ok], unit, [None] * int(ok.sum())
+    return v[ok], unit, [bt_peak_meta(got, w)
+                         for w, good in zip(who, ok) if good]
+
+
+def bt_blue(shade):
+    """A blue from light (0) to dark (1), for things in order."""
+    return (f"rgb({int(198 - 190 * shade)},{int(219 - 171 * shade)},"
+            f"{int(239 - 132 * shade)})")
+
+
+def bt_dots(figure, x, values, colour, name, index, hover, legend=False,
+            width=0.5):
+    """A column of dots, one per beat or peak, spread a little about ``x``
+    over a box of their quartiles; each dot carries its place in the
+    figure's list of where values come from (``index``), so a click on it
+    can say which beat it is."""
+    values = np.asarray(values, float)
+    if not values.size:
+        return
+    rng = np.random.default_rng(values.size * 7919 + int(round(x * 100)))
+    figure.add_trace(go.Box(
+        x=np.full(values.size, float(x)), y=values, name=name,
+        boxpoints=False, width=width, line=dict(color=colour, width=1.5),
+        fillcolor="rgba(0,0,0,0)", showlegend=False, hoverinfo="skip"))
+    figure.add_trace(go.Scatter(
+        x=x + rng.uniform(-0.32 * width, 0.32 * width, values.size),
+        y=values, mode="markers", name=name, legendgroup=name,
+        showlegend=legend,
+        marker=dict(color=colour, size=7, opacity=0.8,
+                    line=dict(color="white", width=1)),
+        customdata=[[i] for i in index], text=hover,
+        hovertemplate="%{text}<extra></extra>"))
+
+
+def bt_hover(recording, meta, value, unit, x_unit):
+    """The words over a dot: which recording, beat and time, its value."""
+    where = (f"{meta['what']} at {meta['t']:.4g} {x_unit}".strip()
+             if meta else "")
+    return (f"{html.escape(str(recording))}<br>{where}<br>"
+            f"{bta.pretty(value, 4)} {unit}").replace("<br><br>", "<br>")
+
+
+def bt_chart_pick(figure, picks, key):
+    """
+    Show a figure whose dots carry, as customdata, their place in
+    ``picks`` (where each value comes from). Drag to zoom, double-click
+    to zoom out; a click on a dot returns its entry of ``picks`` (else
+    None).
+    """
+    figure.update_layout(clickmode="event+select", dragmode="zoom")
+    event = st.plotly_chart(figure, key=key, on_select="rerun",
+                            selection_mode="points", **STRETCH,
+                            config={"displaylogo": False})
+    try:
+        points = list(event.selection.points or [])
+    except Exception:
+        points = []
+    for p in reversed(points):
+        cd = p.get("customdata")
+        if isinstance(cd, (list, tuple)):
+            cd = cd[0] if cd else None
+        try:
+            i = int(cd)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(picks) and picks[i] is not None:
+            return picks[i]
+    return None
+
+
+def bt_show_beat(sid, lo, hi):
+    """🔍 The main plot: this signal, zoomed onto one beat."""
+    s = st.session_state
+    s["bt_pick"] = sid
+    s["bt_xmin"], s["bt_xmax"] = float(lo), float(hi)
+    s["_bt_note_show"] = "Shown in the main plot above (📐 Axes: clear x " \
+                         "from and to for the whole recording)."
+
+
+def bt_pick_panel(picked, uid):
+    """👆 The beat or peak a dot stands for: which recording, beat and
+    time, its value, the signal around it (its stretch shaded), and a
+    button to zoom the main plot onto it."""
+    got = bt_got_for(picked["sid"])
+    if got is None:
+        return
+    width = max(picked["t1"] - picked["t0"], 1e-9)
+    lo, hi = picked["t0"] - 0.6 * width, picked["t1"] + 0.6 * width
+    with st.container(border=True):
+        a, b = st.columns([3, 1.3], vertical_alignment="center")
+        a.markdown(
+            f"👆 **{picked['recording']}**: {picked['what']}, at "
+            f"{picked['t']:.4g} {got['x_unit']}".rstrip()
+            + (f" · {picked['param']}: **{bta.pretty(picked['value'], 4)}** "
+               f"{picked['unit']}" if picked.get("param") else ""))
+        b.button("🔍 Show it in the main plot", key=f"btb_show_{uid}",
+                 on_click=bt_show_beat, args=(picked["sid"], lo, hi),
+                 **STRETCH, help="Opens this recording above, zoomed onto "
+                                 "this beat (📐 Axes → x from, x to).")
+        x, y = got["x"], got["y"]
+        inside = (x >= lo) & (x <= hi)
+        base = float(np.mean(got["base"]))
+        figure = go.Figure()
+        figure.add_vrect(x0=picked["t0"], x1=picked["t1"],
+                         fillcolor="rgba(42,120,214,0.12)", line_width=0)
+        figure.add_hline(y=base, line=dict(color="#999999", width=1,
+                                           dash="dot"))
+        figure.add_trace(go.Scatter(
+            x=x[inside], y=y[inside], mode="lines",
+            line=dict(color="#222222", width=1.6),
+            hovertemplate="%{x:.4g}, %{y:.4g}<extra></extra>"))
+        figure.add_trace(go.Scatter(
+            x=[picked["t"]], y=[float(np.interp(picked["t"], x, y))],
+            mode="markers", marker=dict(size=11, symbol="diamond",
+                                        color=BT_AFTER),
+            hoverinfo="skip"))
+        figure.update_layout(
+            template="plotly_white", height=230, showlegend=False,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title=got["xcol"], yaxis_title=bt_y_title(got))
+        st.plotly_chart(figure, **STRETCH, key=f"btp_{uid}",
+                        config={"displaylogo": False})
+
+
 BT_BA_GROUPS = (
     ("Per beat", (
         ("{f}, positive", "Positive peak height", "x"),
@@ -36237,27 +36406,30 @@ def bt_ba_table(g0, g1):
 
 
 def bt_ba_figure(g0, g1, groups, title, log=False, unit=None):
-    """Every peak's (or beat's) value before (grey) and after (blue), one
-    pair of boxes over the dots per (category, start of the name) in
-    ``groups``."""
+    """Every peak's (or beat's) value before (grey) and after (blue), side
+    by side per (category, start of the name) in ``groups``, each dot over
+    its box and clickable: (the figure, where each dot's value comes
+    from)."""
     figure = go.Figure()
-    found = ""
-    for label, got, colour in (("Before", g0, BT_BEFORE),
-                               ("After", g1, BT_AFTER)):
-        xs, ys = [], []
-        for category, start in groups:
-            v, u = bt_ba_values(got, start)
+    found, picks = "", []
+    sets = st.session_state["_bt_sets"]
+    for c, (category, start) in enumerate(groups):
+        for shift, label, got, colour in ((-0.21, "Before", g0, BT_BEFORE),
+                                          (0.21, "After", g1, BT_AFTER)):
+            v, u, ids = bt_values_ids(got, start)
             found = found or u
-            xs += [category] * v.size
-            ys += list(v)
-        figure.add_trace(go.Box(
-            x=xs, y=ys, name=label, boxpoints="all", jitter=0.45,
-            pointpos=0, marker=dict(color=colour, size=7,
-                                    line=dict(color="white", width=1)),
-            line=dict(color=colour, width=2), fillcolor="rgba(0,0,0,0)",
-            hovertemplate=f"{label}<br>%{{y:.4g}}<extra></extra>"))
+            name = bt_short_name(sets[got["sid"]]["name"])
+            index = list(range(len(picks), len(picks) + v.size))
+            for value, m in zip(v, ids):
+                picks.append(dict(m, sid=got["sid"], recording=name,
+                                  param=start, unit=u, value=float(value))
+                             if m else None)
+            bt_dots(figure, c + shift, v, colour, label, index,
+                    [bt_hover(f"{label}: {name}", m, value, u,
+                              got["x_unit"]) for value, m in zip(v, ids)],
+                    legend=c == 0, width=0.36)
     figure.update_layout(
-        boxmode="group", height=380, plot_bgcolor="white",
+        height=380, plot_bgcolor="white",
         paper_bgcolor="white", margin=dict(l=70, r=16, t=70, b=40),
         title=dict(text=title, x=0.02, y=0.97, font=dict(size=15)),
         legend=dict(orientation="h", y=1.02, yanchor="bottom", x=1,
@@ -36265,13 +36437,16 @@ def bt_ba_figure(g0, g1, groups, title, log=False, unit=None):
         font=dict(family="Arial, Helvetica, sans-serif", size=13,
                   color="black"))
     figure.update_xaxes(showline=True, linewidth=1.5, linecolor="black",
-                        mirror=True, ticks="outside")
+                        mirror=True, ticks="outside",
+                        tickvals=list(range(len(groups))),
+                        ticktext=[g[0] for g in groups],
+                        range=[-0.6, len(groups) - 0.4], zeroline=False)
     figure.update_yaxes(showline=True, linewidth=1.5, linecolor="black",
                         mirror=True, ticks="outside", gridcolor="#eeeeee",
                         title_text=found if unit is None else unit,
                         type="log" if log else "linear",
                         exponentformat="E")
-    return figure
+    return figure, picks
 
 
 # ⚖️ The table for a slide: before and after, each value per beat as its
@@ -36530,26 +36705,36 @@ def bt_before_after(ids, sid):
                            for name, w in zip(BT_BA_COLS,
                                               (330, 200, 200, 80, 70, 70))})
     f1, f2, f3 = st.columns(3)
+    picked = []
+    tag = f"{s['bt_ba0']}_{s['bt_ba1']}"
     with f1:
         if g0.get("k") and g0.get("newtons") and g1.get("k"):
-            st.plotly_chart(bt_ba_figure(
+            figure, picks = bt_ba_figure(
                 g0, g1, (("Positive peaks", "Energy per positive peak"),
                          ("Negative peaks", "Energy per negative peak")),
-                "Energy per peak", log=True), **STRETCH)
+                "Energy per peak", log=True)
+            picked.append(bt_chart_pick(figure, picks, f"btba_e_{tag}"))
         else:
             st.info("Energy needs the spring constant k of both signals.")
     with f2:
-        st.plotly_chart(bt_ba_figure(
+        figure, picks = bt_ba_figure(
             g0, g1, (("Positive peaks", f"{word} per positive peak"),
                      ("Negative peaks", f"{word} per negative peak")),
-            f"{word} per peak"), **STRETCH)
+            f"{word} per peak")
+        picked.append(bt_chart_pick(figure, picks, f"btba_i_{tag}"))
     with f3:
-        st.plotly_chart(bt_ba_figure(
+        figure, picks = bt_ba_figure(
             g0, g1, (("Force", "Positive ÷ negative peak"),
                      (word, f"Positive ÷ negative {word.lower()}"),
                      ("Duration", "Positive ÷ negative duration")),
-            "Positive ÷ negative", log=True, unit="ratio"), **STRETCH)
+            "Positive ÷ negative", log=True, unit="ratio")
+        picked.append(bt_chart_pick(figure, picks, f"btba_r_{tag}"))
+    picked = [p for p in picked if p]
+    if picked:
+        bt_pick_panel(picked[-1], "ba")
     st.caption(
+        "Click a dot to see which beat it is; drag to zoom in, double-click "
+        "to zoom out. "
         "Each dot is one peak (or one beat). Change: × after ÷ before; ± "
         "after − before for the symmetry share (1 exact, 0.5 none). "
         "Recovery ÷ rise above 1: a slow fall, a tail or a shoulder. Every "
@@ -36604,26 +36789,188 @@ def bt_cmp_labels(ids, sets):
 def bt_cmp_values(gots, choice, start, kind):
     """
     The per-beat (or per-peak) values of one choice in each recording, in
-    the same unit: (a list of arrays, the unit). Time, force and impulse in
+    the same unit: (a list of arrays, the unit, and for each recording
+    where each value comes from, bt_peak_meta). Time, force and impulse in
     s, nN and µN·s when every recording can be put in them, else in the
     first one's own unit; Z from 📐 when every recording has it.
     """
     if kind in ("zpos", "zneg"):
         found = [bt_zpeak_values(g) for g in gots]
         side = "pos" if kind == "zpos" else "neg"
+        ids = []
+        for g in gots:
+            peaks = [q for q in (g.get("_z") or (None,) * 4)[3] or []
+                     if q["side"] == side]
+            beats = {b["n"]: b for b in g["beats"]}
+            ids.append([bt_peak_meta(g, (q["n"], beats[q["n"]], side))
+                        if q["n"] in beats else None for q in peaks])
         return ([f[0][side][0] if f else np.array([]) for f in found],
-                found[0][1] if found[0] else "")
+                found[0][1] if found[0] else "", ids)
     scales = [bt_slide_scales(g) for g in gots]
     fixed = kind in BT_FIXED_UNITS and all(sc[kind] for sc in scales)
-    out, unit = [], ""
+    out, unit, ids = [], "", []
     for i, (g, sc) in enumerate(zip(gots, scales)):
-        v, u = bt_ba_values(g, start)
+        v, u, where = bt_values_ids(g, start)
         if fixed:
             v = v * sc[kind]
         out.append(v)
+        ids.append(where)
         if i == 0:
             unit = BT_FIXED_UNITS[kind] if fixed else u
-    return out, unit
+    return out, unit, ids
+
+
+BT_SYM_VIEW = ("Positive against negative", "Average beat shape")
+BT_SYM_BY = ("Force", "Impulse")
+
+
+def bt_mean_shape(got, points=300):
+    """
+    A recording's average full beat: every full beat lined up at its
+    positive peak (time 0) and divided by that peak's height (so the
+    positive peak is 1), then averaged. (time from the peak in s, or in the
+    x unit when it is not a time; the mean; the SD; how many beats), or
+    None without full beats.
+    """
+    full = [b for b in got["beats"] if b["kind"] == bta.KINDS[0]
+            and b["pos"]["peak"]]
+    if not full:
+        return None
+    x, y = got["x"], got["y"]
+    base = float(np.mean(got["base"]))
+    before = [b["pos"]["peak_x"] - bta.beat_span(b)[0] for b in full]
+    after = [bta.beat_span(b)[1] - b["pos"]["peak_x"] for b in full]
+    grid = np.linspace(-1.5 * float(np.median(before)),
+                       1.25 * float(np.median(after)), points)
+    stack = np.array([(np.interp(b["pos"]["peak_x"] + grid, x, y,
+                                 left=np.nan, right=np.nan) - base)
+                      / abs(b["pos"]["peak"]) for b in full])
+    with np.errstate(all="ignore"):
+        mean, sd = np.nanmean(stack, axis=0), np.nanstd(stack, axis=0)
+    per = bta.seconds_per(got["x_unit"]) or 1.0
+    return grid * per, mean, sd, len(full)
+
+
+def bt_symmetry_compare(chosen, gots, shown):
+    """
+    ⚖️ Symmetry across the recordings. Positive against negative: every
+    full beat a dot, its positive peak across and its negative one up
+    (force or impulse), one shade per recording in order, the line where
+    they are equal; a click says which beat it is. Average beat shape:
+    each recording's mean full beat lined up at the positive peak and
+    divided by its height, laid over one another.
+    """
+    s = st.session_state
+    st.markdown("**⚖️ Symmetry, recording by recording**")
+    for key, options in (("bt_sym_view", BT_SYM_VIEW),
+                         ("bt_sym_by", BT_SYM_BY)):
+        if s.get(key) not in options:
+            s[key] = options[0]
+    c1, c2 = st.columns([2, 1.2], vertical_alignment="center")
+    c1.segmented_control("Symmetry view", BT_SYM_VIEW, key="bt_sym_view",
+                         label_visibility="collapsed")
+    view = s.get("bt_sym_view") or BT_SYM_VIEW[0]
+    shades = np.linspace(0.35, 1.0, len(gots))
+    figure = go.Figure()
+    figure.update_layout(template="plotly_white", height=460,
+                         margin=dict(l=10, r=10, t=20, b=10),
+                         legend=dict(x=0.01, y=0.99))
+    if view == BT_SYM_VIEW[0]:
+        c2.segmented_control("By", BT_SYM_BY, key="bt_sym_by",
+                             label_visibility="collapsed")
+        kind = "force" if (s.get("bt_sym_by") or BT_SYM_BY[0]) \
+            == BT_SYM_BY[0] else "impulse"
+        field = "peak" if kind == "force" else "area"
+        scales = [bt_slide_scales(g) for g in gots]
+        fixed = all(sc[kind] for sc in scales)
+        g0 = gots[0]
+        unit = (BT_FIXED_UNITS[kind] if fixed else g0["y_unit"]
+                if kind == "force" else f"{g0['y_unit']}·{g0['x_unit']}")
+        what = (("peak force" if g0.get("newtons") else "peak height")
+                if kind == "force"
+                else bta.area_word(g0["x_unit"], g0["y_unit"]).lower())
+        picks, top, low = [], 0.0, np.inf
+        for k, w, g, sc, shade in zip(chosen, shown, gots, scales, shades):
+            factor = sc[kind] if fixed else 1.0
+            full = [b for b in g["beats"] if b["kind"] == bta.KINDS[0]]
+            if not full:
+                continue
+            px = np.array([abs(b["pos"][field]) * factor for b in full])
+            ny = np.array([abs(b["neg"][field]) * factor for b in full])
+            with np.errstate(all="ignore"):
+                ratios = px / ny
+            good = ratios[np.isfinite(ratios)]
+            index = list(range(len(picks), len(picks) + px.size))
+            text = []
+            for b, a, c, r in zip(full, px, ny, ratios):
+                m = bt_peak_meta(g, (b["n"], b, None))
+                picks.append(dict(m, sid=k, recording=w,
+                                  param=f"positive ÷ negative {what}",
+                                  unit="", value=float(r)))
+                text.append(f"{html.escape(str(w))}<br>{m['what']} at "
+                            f"{m['t']:.4g} {g['x_unit']}<br>positive "
+                            f"{bta.pretty(a, 3)}, negative {bta.pretty(c, 3)}"
+                            f" {unit}<br>÷ {bta.pretty(r, 3)}")
+            figure.add_trace(go.Scatter(
+                x=px, y=ny, mode="markers",
+                name=f"{w} (median ÷ {np.median(good):.2f})" if good.size
+                else w,
+                marker=dict(color=bt_blue(shade), size=8,
+                            line=dict(color="white", width=1)),
+                customdata=[[i] for i in index], text=text,
+                hovertemplate="%{text}<extra></extra>"))
+            top = max(top, float(np.nanmax(px)), float(np.nanmax(ny)))
+            low = min(low, float(np.nanmin(px)), float(np.nanmin(ny)))
+        # the line of equal peaks, across the values only (not from 0, so
+        # the dots fill the plot)
+        low = 0.0 if not np.isfinite(low) else low
+        figure.add_trace(go.Scatter(
+            x=[low * 0.95, top * 1.05], y=[low * 0.95, top * 1.05],
+            mode="lines",
+            name="equal", line=dict(color="#999999", width=1, dash="dash"),
+            hoverinfo="skip"))
+        figure.update_layout(
+            xaxis_title=f"Positive {what} ({unit})",
+            yaxis_title=f"Negative {what}, without sign ({unit})")
+        picked = bt_chart_pick(figure, picks, "btsym_" + str(abs(hash(
+            (kind, tuple(chosen))))))
+        st.caption(
+            "Each dot is one full beat: its positive peak across, its "
+            "negative one up. On the dashed line the two are equal; the "
+            "further below it, the larger the positive peak. A recording "
+            "whose dots move toward the line is getting more symmetric. In "
+            "the legend: each one's median positive ÷ negative. Click a dot "
+            "to see which beat it is.")
+        if picked:
+            bt_pick_panel(picked, "sym")
+    else:
+        for w, g, shade in zip(shown, gots, shades):
+            shape = bt_mean_shape(g)
+            if shape is None:
+                continue
+            tt, mean, sd, n = shape
+            figure.add_trace(go.Scatter(
+                x=tt, y=mean, mode="lines", name=f"{w} ({n} beats)",
+                line=dict(color=bt_blue(shade), width=2.2),
+                hovertemplate=f"{html.escape(str(w))}<br>%{{x:.3f}} s<br>"
+                              "%{y:.3f}<extra></extra>"))
+        figure.add_hline(y=0, line=dict(color="#999999", width=1,
+                                        dash="dot"))
+        time_ok = all(bta.seconds_per(g["x_unit"]) for g in gots)
+        figure.update_layout(
+            xaxis_title="Time from the positive peak ("
+                        + ("s" if time_ok else gots[0]["x_unit"]) + ")",
+            yaxis_title="Signal ÷ its positive peak")
+        st.plotly_chart(figure, **STRETCH, key="btsym_shape",
+                        config={"displaylogo": False})
+        st.caption(
+            "Each recording's average full beat: every beat lined up at its "
+            "positive peak (time 0) and divided by that peak's height, so "
+            "the positive peak is 1 in each and only the shape differs: how "
+            "deep and how long the negative peak is next to the positive "
+            "one, and how fast each rises and falls. Drag to zoom in, "
+            "double-click to zoom out, click a name in the legend to hide "
+            "it.")
 
 
 def bt_compare_several(ids):
@@ -36692,7 +37039,7 @@ def bt_compare_several(ids):
                        "names.")
     choice = s["bt_cmp_param"]
     start, kind = options[choice]
-    values, unit = bt_cmp_values(gots, choice, start, kind)
+    values, unit, ids = bt_cmp_values(gots, choice, start, kind)
     typed = [w.strip() for w in str(s.get("bt_cmp_names") or "").split(",")]
     if len([w for w in typed if w]) == len(chosen):
         shown = typed
@@ -36714,41 +37061,50 @@ def bt_compare_several(ids):
                    "(💓 Beats → ⏱ Peaks start and end) first.", icon="⏱")
     title = f"{choice} ({unit})" if unit else choice
     means = [float(v.mean()) if v.size else np.nan for v in values]
+    # where every dot comes from, for a click to tell
+    picks, index, hover = [], [], []
+    for k, w, v, where, g in zip(chosen, shown, values, ids, gots):
+        index.append(list(range(len(picks), len(picks) + v.size)))
+        hover.append([bt_hover(w, m, value, unit, g["x_unit"])
+                      for value, m in zip(v, where)])
+        for value, m in zip(v, where):
+            picks.append(dict(m, sid=k, recording=w, param=choice,
+                              unit=unit, value=float(value)) if m else None)
     figure = go.Figure()
-    if (s.get("bt_cmp_view") or BT_CMP_VIEW[0]) == BT_CMP_VIEW[0]:
-        for w, v in zip(shown, values):
-            figure.add_trace(go.Box(
-                y=v, name=w, boxpoints="all", jitter=0.35, pointpos=0,
-                marker=dict(color=BT_AFTER, size=5, opacity=0.55),
-                line=dict(color=BT_AFTER, width=1.5),
-                fillcolor="rgba(42,120,214,0.10)", showlegend=False,
-                hovertemplate=f"{w}<br>%{{y:.4g}}<extra></extra>"))
+    view = s.get("bt_cmp_view") or BT_CMP_VIEW[0]
+    if view == BT_CMP_VIEW[0]:
+        for i, (w, v) in enumerate(zip(shown, values)):
+            bt_dots(figure, i + 1, v, BT_AFTER, w, index[i], hover[i])
         figure.add_trace(go.Scatter(
-            x=shown, y=means, mode="lines+markers", name="mean",
-            line=dict(color="#222222", width=2, dash="dot"),
+            x=list(range(1, len(shown) + 1)), y=means, mode="lines+markers",
+            name="mean", line=dict(color="#222222", width=2, dash="dot"),
             marker=dict(size=10, symbol="diamond", color="#222222"),
             showlegend=False,
             hovertemplate="mean %{y:.4g}<extra></extra>"))
-        figure.update_layout(xaxis_title="")
+        figure.update_layout(showlegend=False)
+        figure.update_xaxes(tickvals=list(range(1, len(shown) + 1)),
+                            ticktext=shown, range=[0.4, len(shown) + 0.6],
+                            zeroline=False)
     else:
         shades = np.linspace(0.35, 1.0, len(values))
-        for w, v, shade in zip(shown, values, shades):
-            blue = (int(198 - 190 * shade), int(219 - 171 * shade),
-                    int(239 - 132 * shade))
+        for i, (w, v, shade) in enumerate(zip(shown, values, shades)):
             figure.add_trace(go.Scatter(
                 x=np.arange(1, v.size + 1), y=v, mode="lines+markers",
-                name=w, line=dict(color=f"rgb{blue}", width=2),
-                marker=dict(size=5, color=f"rgb{blue}"),
-                hovertemplate=f"{w}<br>beat %{{x}}<br>%{{y:.4g}}"
-                              "<extra></extra>"))
+                name=w, line=dict(color=bt_blue(shade), width=2),
+                marker=dict(size=6, color=bt_blue(shade)),
+                customdata=[[j] for j in index[i]], text=hover[i],
+                hovertemplate="%{text}<extra></extra>"))
         figure.update_layout(xaxis_title="Beat (or peak) in the recording",
                              showlegend=len(values) <= 12)
     figure.update_layout(template="plotly_white", height=460,
                          yaxis_title=title,
                          margin=dict(l=10, r=10, t=20, b=10),
                          legend=dict(x=0.01, y=0.99))
-    st.plotly_chart(figure, **STRETCH, key="btc_fig",
-                    config={"displaylogo": False})
+    picked = bt_chart_pick(
+        figure, picks, "btc_fig_" + str(abs(hash((choice, view,
+                                                  tuple(chosen))))))
+    if picked:
+        bt_pick_panel(picked, "cmp")
     # the table to copy
     rows = []
     first = means[0]
@@ -36791,7 +37147,9 @@ def bt_compare_several(ids):
         + "Each dot is one beat (or peak); the box its quartiles; the diamonds "
         "the means, joined in order. Change: × the first recording's mean"
         + (" (+ or − for the symmetry share)" if kind == "share" else "")
-        + ". Every recording is analysed with its own settings. The p-values "
+        + ". Click a dot to see which beat it is; drag to zoom in, "
+        "double-click to zoom out. Every recording is analysed with its own "
+        "settings. The p-values "
         "treat every beat as one sample: they say whether this cell's beats "
         "changed along these recordings, not whether it holds across cells.")
     long = pd.DataFrame({
@@ -36804,6 +37162,8 @@ def bt_compare_several(ids):
                        long.to_csv(index=False).encode("utf-8"),
                        file_name="beats_across_recordings.csv",
                        mime="text/csv", key="btb_cmp_csv")
+    st.divider()
+    bt_symmetry_compare(chosen, gots, shown)
 
 
 def beat_tab():
@@ -36865,6 +37225,9 @@ def beat_tab():
             return
         bt_settings(sid, got)
     with right:
+        note = s.pop("_bt_note_show", None)
+        if note:
+            st.toast(note, icon="🔍")
         bt_plot(sid, got)
         bt_results(sid, got)
         if len(ids) > 1:
