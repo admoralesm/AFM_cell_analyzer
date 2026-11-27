@@ -34930,6 +34930,9 @@ def bt_stats_rows(got):
         ("Negative peak depth", [abs(e["peak"]) for e in neg], yu),
         (bt_beat_duration_name(got), [bt_beat_duration(b) for b in full],
          xu),
+        # the time from a full beat's positive peak to its negative one
+        ("Positive to negative peak time (full beats)",
+         [abs(b["neg"]["peak_x"] - b["pos"]["peak_x"]) for b in full], xu),
         (f"Positive peak duration ({timing})",
          [bta.peak_duration(e) for e in pos], xu),
         (f"Negative peak duration ({timing})",
@@ -35188,6 +35191,7 @@ BT_SUMMARY_STATS = (
     ("{w} per positive peak", "{w} per positive peak"),
     ("{w} per negative peak", "{w} per negative peak"),
     (None, "Full beat duration"),
+    ("Positive to negative peak time", "Positive to negative peak time"),
     (None, "Positive peak duration"),
     (None, "Negative peak duration"),
     ("Time between beats", "Time between beats"),
@@ -36131,6 +36135,9 @@ BT_BA_GROUPS = (
         ("{w} per negative peak", "{w} per negative peak", "x"),
         ("Energy per beat", "Energy per full beat", "x"),
         ("Beat duration", "Full beat duration", "x"),
+        ("Positive to negative peak time", "Positive to negative peak time",
+         "x"),
+        ("Time between beats", "Time between beats", "x"),
         ("Positive ÷ negative {fw}", "Positive ÷ negative peak", "x"),
         ("Positive ÷ negative {wl}", "Positive ÷ negative {wl}", "x"),
         ("Positive ÷ negative duration", "Positive ÷ negative duration",
@@ -36385,6 +36392,9 @@ def bt_slide_table(g0, g1):
         (f"{word} per negative peak", f"{word} per negative peak",
          "impulse", "x"),
         ("Beat duration", "Full beat duration", "time", "x"),
+        ("Positive to negative peak time", "Positive to negative peak time",
+         "time", "x"),
+        ("Time between beats", "Time between beats", "time", "x"),
         ("Beat symmetry (1 = perfect)", "Full beat half-turn symmetry",
          "share", "d"))
     rows, sections = [], {0}
@@ -36556,6 +36566,8 @@ def bt_before_after(ids, sid):
 # force and impulse are put in s, nN and µN·s when every recording allows)
 BT_CMP = (
     ("Beat duration", "Full beat duration", "time"),
+    ("Positive to negative peak time", "Positive to negative peak time",
+     "time"),
     ("Positive peak duration", "Positive peak duration", "time"),
     ("Negative peak duration", "Negative peak duration", "time"),
     ("Time between beats", "Time between beats", "time"),
