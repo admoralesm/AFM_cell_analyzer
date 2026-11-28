@@ -729,6 +729,222 @@ def pair_beats(events, max_gap=1.0, order=ORDERS[0]):
     return out
 
 
+# The rhythm: what each beat is, by when it comes and what it looks like
+# (classify_rhythm), in the order a beat is called: a run of early beats
+# first, then one early or late beat, then its shape, then alternans
+RHYTHMS = ("Regular", "Premature", "After a pause", "Fast run",
+           "Fibrillation-like", "Alternans", "Positive only",
+           "Negative only")
+RHYTHM_COLOURS = {"Regular": "#2ca02c", "Premature": "#ff7f0e",
+                  "After a pause": "#9467bd", "Fast run": "#8c564b",
+                  "Fibrillation-like": "#d62728", "Alternans": "#17becf",
+                  "Positive only": "#e377c2", "Negative only": "#7f7f7f"}
+# how a beat is sorted unless set otherwise (fractions of the usual time
+# between beats, or of the usual positive peak; runs in beats)
+RHYTHM_DEFAULTS = {"early": 0.75, "late": 1.5, "run": 3, "irregular": 0.25,
+                   "alternans": 0.15, "alt_run": 4}
+
+
+def beat_time(beat):
+    """When a beat happens: its positive peak's top (its negative peak's,
+    for a negative-only beat), as the time between beats is measured."""
+    return float((beat["pos"] or beat["neg"])["peak_x"])
+
+
+def usual_interval(beats):
+    """
+    The usual time between beats: the median of the times between two
+    full beats in a row (between any two beats in a row when there are
+    fewer than three of those). NaN with fewer than two beats.
+    """
+    t = np.array([beat_time(b) for b in beats], float)
+    if t.size < 2:
+        return float("nan")
+    rr = np.diff(t)
+    full = [rr[i - 1] for i in range(1, len(beats))
+            if beats[i]["kind"] == KINDS[0]
+            and beats[i - 1]["kind"] == KINDS[0]]
+    return float(np.median(full if len(full) >= 3 else rr))
+
+
+def _alternating(heights, step, least):
+    """The stretches (first, last index, inclusive) of at least ``least``
+    heights in a row that go up and down in turn, each change at least
+    ``step``."""
+    out, start = [], 0
+    for k in range(1, len(heights) + 1):
+        ok = False
+        if k < len(heights):
+            d = heights[k] - heights[k - 1]
+            ok = abs(d) >= step and (
+                k - start < 2
+                or np.sign(d) == -np.sign(heights[k - 1] - heights[k - 2]))
+        if ok:
+            continue
+        if k - start >= least:
+            out.append((start, k - 1))
+        if k < len(heights):
+            d = heights[k] - heights[k - 1]
+            start = k - 1 if abs(d) >= step else k
+    return out
+
+
+def classify_rhythm(beats, usual=None, early=RHYTHM_DEFAULTS["early"],
+                    late=RHYTHM_DEFAULTS["late"], run=RHYTHM_DEFAULTS["run"],
+                    irregular=RHYTHM_DEFAULTS["irregular"],
+                    alternans=RHYTHM_DEFAULTS["alternans"],
+                    alt_run=RHYTHM_DEFAULTS["alt_run"]):
+    """
+    What each beat is (one of RHYTHMS), from the time since the beat
+    before it against the usual time between beats (``usual``, or the
+    median between full beats, usual_interval) and from its shape:
+
+    - Fast run: ``run`` or more beats in a row, each early (sooner than
+      ``early`` × usual after the one before), the times between them
+      steady; Fibrillation-like: such a run whose times vary (their
+      coefficient of variation at least ``irregular``): rapid and chaotic.
+    - Premature: an early beat on its own (or two in a row).
+    - After a pause: later than ``late`` × usual after the one before.
+    - Positive only, Negative only: on time, but half a beat.
+    - Alternans: ``alt_run`` or more full beats in a row on time whose
+      positive peaks go large, small, large… each change at least
+      ``alternans`` × the usual positive peak.
+    - Regular: a full beat on time, in none of those.
+
+    The first beat, with none before it, is judged by its shape. -> a dict:
+    labels (one per beat), rr (the time since the beat before, NaN for the
+    first), usual, usual_auto (True when worked out), usual_height (the
+    median positive peak of the full beats) and episodes: the runs, the
+    alternans and the pauses, each a dict with kind, start, end (in x),
+    beats (their indices) and, for a run, cv; for a pause, rr (the time
+    between the beats either side, its length).
+    """
+    n = len(beats)
+    t = np.array([beat_time(b) for b in beats], float)
+    rr = np.full(n, np.nan)
+    if n > 1:
+        rr[1:] = np.diff(t)
+    usual_auto = not (usual is not None and np.isfinite(usual)
+                      and float(usual) > 0)
+    usual = usual_interval(beats) if usual_auto else float(usual)
+    tall = [abs(b["pos"]["peak"]) for b in beats if b["kind"] == KINDS[0]]
+    if not tall:
+        tall = [abs((b["pos"] or b["neg"])["peak"]) for b in beats]
+    usual_height = float(np.median(tall)) if tall else float("nan")
+    labels = [None] * n
+    episodes = []
+    if n > 1 and np.isfinite(usual) and usual > 0:
+        with np.errstate(invalid="ignore"):
+            is_early = rr < float(early) * usual
+            is_late = rr > float(late) * usual
+        i = 1
+        while i < n:
+            if not is_early[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and is_early[j + 1]:
+                j += 1
+            members = list(range(i, j + 1))
+            if len(members) >= max(int(run), 1):
+                gaps = rr[i:j + 1]
+                cv = (float(np.std(gaps, ddof=1) / np.mean(gaps))
+                      if gaps.size > 1 and np.mean(gaps) > 0 else 0.0)
+                kind = "Fibrillation-like" if cv >= float(irregular) \
+                    else "Fast run"
+                for m in members:
+                    labels[m] = kind
+                episodes.append({"kind": kind, "start": beats[i]["start"],
+                                 "end": beats[j]["end"], "beats": members,
+                                 "cv": cv})
+            else:
+                for m in members:
+                    labels[m] = "Premature"
+            i = j + 1
+        for i in range(1, n):
+            if labels[i] is None and is_late[i]:
+                labels[i] = "After a pause"
+                # shaded from the beat before's end to this one's start;
+                # as long as the time between the two
+                episodes.append({"kind": "Pause", "start": beats[i - 1]["end"],
+                                 "end": beats[i]["start"], "beats": [i],
+                                 "rr": float(rr[i])})
+    for i, b in enumerate(beats):
+        if labels[i] is None and b["kind"] != KINDS[0]:
+            labels[i] = b["kind"]
+    # alternans, among the full beats on time, in stretches with no other
+    # beat between them
+    if (alternans and alternans > 0 and np.isfinite(usual_height)
+            and usual_height > 0):
+        stretch = []
+        for i in list(range(n)) + [None]:
+            if i is not None and labels[i] is None:
+                stretch.append(i)
+                continue
+            heights = [abs(beats[m]["pos"]["peak"]) for m in stretch]
+            for a, b_ in _alternating(heights, float(alternans)
+                                      * usual_height, max(int(alt_run), 2)):
+                members = stretch[a:b_ + 1]
+                for m in members:
+                    labels[m] = "Alternans"
+                episodes.append({"kind": "Alternans",
+                                 "start": beats[members[0]]["start"],
+                                 "end": beats[members[-1]]["end"],
+                                 "beats": members})
+            stretch = []
+    labels = [lab or RHYTHMS[0] for lab in labels]
+    episodes.sort(key=lambda e: e["start"])
+    return {"labels": labels, "rr": rr, "usual": usual,
+            "usual_auto": usual_auto, "usual_height": usual_height,
+            "episodes": episodes}
+
+
+def rhythm_numbers(rhythm, span=None):
+    """
+    The rhythm over a recording, as (name, value, unit) rows: how many
+    beats of each type (and the regular ones' share), the pauses and the
+    longest, the runs, the time fibrillation-like (and its share of
+    ``span``, the recording's length, when given), and how irregular the
+    times between beats are: their coefficient of variation, and the
+    beat-to-beat change (RMSSD) over their mean. Units: "n", "%", "x"
+    (the x unit) or "" (a ratio).
+    """
+    labels = list(rhythm["labels"])
+    count = {name: labels.count(name) for name in RHYTHMS}
+    total = len(labels)
+    eps = rhythm["episodes"]
+    pauses = [e.get("rr", e["end"] - e["start"]) for e in eps
+              if e["kind"] == "Pause"]
+    fib = [e["end"] - e["start"] for e in eps
+           if e["kind"] == "Fibrillation-like"]
+    rr = np.asarray(rhythm["rr"], float)
+    rr = rr[np.isfinite(rr)]
+    mean = float(np.mean(rr)) if rr.size else float("nan")
+    cv = (float(np.std(rr, ddof=1)) / mean
+          if rr.size > 1 and mean > 0 else float("nan"))
+    rmssd = (float(np.sqrt(np.mean(np.diff(rr) ** 2))) / mean
+             if rr.size > 2 and mean > 0 else float("nan"))
+    fib_time = float(sum(fib))
+    return [
+        ("Regular beats", count["Regular"], "n"),
+        ("Regular beats, % of all",
+         100.0 * count["Regular"] / total if total else float("nan"), "%"),
+        ("Premature beats", count["Premature"], "n"),
+        ("Beats after a pause", count["After a pause"], "n"),
+        ("Longest pause", float(max(pauses)) if pauses else 0.0, "x"),
+        ("Fast runs", sum(e["kind"] == "Fast run" for e in eps), "n"),
+        ("Beats in fast runs", count["Fast run"], "n"),
+        ("Fibrillation-like episodes", len(fib), "n"),
+        ("Fibrillation-like beats", count["Fibrillation-like"], "n"),
+        ("Fibrillation-like time", fib_time, "x"),
+        ("Fibrillation-like time, % of the recording",
+         100.0 * fib_time / float(span) if span else float("nan"), "%"),
+        ("Alternans beats", count["Alternans"], "n"),
+        ("Rhythm irregularity (CV of the time between beats)", cv, ""),
+        ("Beat-to-beat change (RMSSD ÷ mean time between beats)", rmssd,
+         "")]
+
+
 def spring_energy(height, k, newtons):
     """F² / 2k, in J: the energy in a cantilever (spring constant ``k``, in
     N/m) bent by a force ``height`` (in the signal's unit, ``newtons`` N
@@ -1187,9 +1403,10 @@ def beat_figure(x, y, base, up, down, events, beats, left_out=(),
             x=[e["peak_x"] for e in left_out],
             y=[base + e["peak"] for e in left_out], mode="markers",
             name="left out", showlegend=False,
+            text=[e.get("auto_out") or "removed by hand" for e in left_out],
             hoverinfo=None if peak_click else "skip",
-            hovertemplate=("%{x:.4g}: removed, click to put back"
-                           "<extra></extra>" if peak_click else None),
+            hovertemplate=("%{x:.4g}: left out (%{text}), click to put "
+                           "back<extra></extra>" if peak_click else None),
             marker=dict(symbol="x-thin", size=14 if peak_click else 12,
                         color="#999999",
                         line=dict(color="#999999", width=2))))
