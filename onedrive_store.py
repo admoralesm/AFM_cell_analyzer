@@ -336,10 +336,14 @@ def poll_device_login(client_id, device_code, tenant=None,
         )
     except OneDriveError as exc:
         text = str(exc)
-        # Still waiting is the normal state, not a failure.
-        if "authorization_pending" in text or "slow_down" in text:
+        # Still waiting is the normal state, not a failure. Microsoft's
+        # reply says so in its error field (authorization_pending), but
+        # only its description reaches here: AADSTS70016, "not yet
+        # authorized by the user".
+        if ("authorization_pending" in text or "slow_down" in text
+                or "AADSTS70016" in text):
             return None
-        if "expired_token" in text:
+        if "expired_token" in text or "AADSTS70019" in text:
             raise OneDriveError(
                 "The code expired before sign-in finished. Start again."
             ) from exc
