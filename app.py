@@ -668,7 +668,10 @@ COMPANION_NEEDS = {
                          "rise_time", "recovery_time", "beat_duration",
                          "retime", "timing_of", "TIMINGS",
                          "beat_symmetry", "add_symmetry",
-                         "symmetry_share", "beat_span", "beat_z", "peak_z"),
+                         "symmetry_share", "beat_span", "beat_z", "peak_z",
+                         "classify_rhythm", "rhythm_numbers", "RHYTHMS",
+                         "RHYTHM_COLOURS", "RHYTHM_DEFAULTS", "beat_time",
+                         "usual_interval"),
     "afm_images.py": ("FORCE_AUTO", "LEGACY_FORCE_MODES",
                       "stored_deflection_unit", "deflection_unit_used",
                       "FILE_KINDS", "classify_ibw", "taken_at",
@@ -33864,7 +33867,8 @@ BT_SHOW_PARTS = {"bt_show_base": "Baseline",
                  "bt_show_fill": "Impulse shading under the peaks",
                  "bt_show_timing": "Where peaks start and end (┆)",
                  "bt_show_quiet": "Quiet stretch (grey)",
-                 "bt_show_meas": "Measuring points A and B"}
+                 "bt_show_meas": "Measuring points A and B",
+                 "bt_show_rhythm": "🫀 Runs, alternans and pauses (shaded)"}
 # the plot's traces each switch hides
 BT_SHOW_TRACES = {"bt_show_base": ("baseline",),
                   "bt_show_lines": ("upper line", "lower line"),
@@ -34497,6 +34501,13 @@ def bt_signal(sid):
 # smoothing a new signal starts with (points), so the lines and the peaks
 # are found on the beats, not on the noise
 BT_SMOOTH_DEFAULT = 25
+# how 🫀 Rhythm sorts a signal's beats unless set otherwise: the usual time
+# between beats (0: the median between full beats), early and late (% of
+# it), how many early beats make a run, how much their times must vary to
+# be fibrillation-like (CV, %), and alternans (each change, % of the usual
+# positive peak, over how many beats)
+BT_RH_DEFAULTS = {"rhu": 0.0, "rhe": 75.0, "rhl": 150.0, "rhr": 3,
+                  "rhi": 25.0, "rha": 15.0, "rhn": 4}
 # peaks smaller than this % of the large ones (of the same sign) are left
 # out: the small bumps between beats that get past the lines
 BT_MINH_DEFAULT = 25.0
@@ -34532,7 +34543,7 @@ def bt_defaults(sid, x, y):
                         ("order", bta.ORDERS[0]),
                         ("k", float(meta.get("k") or 0.0)),
                         ("minh", BT_MINH_DEFAULT), ("cut", True),
-                        ("skip0", 0.0)):
+                        ("skip0", 0.0), *BT_RH_DEFAULTS.items()):
         s.setdefault(key(name), value)
 
 
@@ -34680,6 +34691,24 @@ def bt_auto_out(sid, x, events):
     return reasons
 
 
+def bt_classify(sid, beats):
+    """🫀 What each of a signal's beats is (bta.classify_rhythm), by its
+    settings (BT_RH_DEFAULTS; percentages here, fractions there)."""
+    s = st.session_state
+
+    def num(name):
+        try:
+            return float(s.get(f"bt_{name}_{sid}", BT_RH_DEFAULTS[name]))
+        except (TypeError, ValueError):
+            return float(BT_RH_DEFAULTS[name])
+
+    return bta.classify_rhythm(
+        beats, usual=num("rhu") or None, early=num("rhe") / 100.0,
+        late=num("rhl") / 100.0, run=max(int(num("rhr")), 1),
+        irregular=num("rhi") / 100.0, alternans=num("rha") / 100.0,
+        alt_run=max(int(num("rhn")), 2))
+
+
 def bt_auto_count(got):
     """How many peaks the filters left out (not by hand)."""
     return sum(1 for e in got.get("left_out") or () if e.get("auto_out"))
@@ -34748,6 +34777,8 @@ def bt_analyse_fresh(sid, e_unit=None):
     beats = bta.pair_beats(kept, float(s[key("gap")] or 0.0), s[key("order")])
     # each peak's mirror symmetry and each full beat's half-turn symmetry
     bta.add_symmetry(beats, x, ys, base)
+    # 🫀 what each beat is: regular, premature, after a pause, in a run…
+    rhythm = bt_classify(sid, beats)
     fu = s[key("fu")]
     x_unit = bta.unit_of(xcol)
     y_unit = shown or bta.unit_of(ycol)
@@ -34757,6 +34788,9 @@ def bt_analyse_fresh(sid, e_unit=None):
     e_unit = bt_energy_unit(e_unit)
     table = bta.beat_table(beats, x_unit, y_unit, k=k, newtons=newtons,
                            e_unit=e_unit)
+    if len(table) == len(beats) and "Kind" in table:
+        table.insert(int(table.columns.get_loc("Kind")) + 1, "Rhythm",
+                     rhythm["labels"])
     info = bta.summary(beats, x_unit, y_unit, k=k, newtons=newtons,
                        per_minute=BT_PER_MINUTE.get(x_unit), e_unit=e_unit)
     peaks = bta.peak_table(beats, x_unit, y_unit, k=k, newtons=newtons,
@@ -34768,6 +34802,7 @@ def bt_analyse_fresh(sid, e_unit=None):
             "sm": int(s[key("sm")]),
             "base": base, "up": up, "down": down, "events": events,
             "kept": kept, "left_out": left_out, "beats": beats,
+            "rhythm": rhythm,
             "table": table, "info": info, "peaks": peaks, "x_unit": x_unit,
             "y_unit": y_unit, "k": k, "invols": invols, "fu": fu,
             "newtons": newtons, "sid": sid, "source": source,
@@ -35629,10 +35664,29 @@ def bt_report(sid, got):
 
     lines += ["", "RESULTS (energies and areas without sign, so they add "
               "up)"]
-    for param, value, unit in bt_results_rows(got):
+    for param, value, unit in bt_totals_rows(got):
         lines.append(f"{param}: {bt_neat(value) or '–'}"
                      + (f" {unit}" if unit and unit != "n" else ""))
-    lines += ["", "STATISTICS, all peaks (n: mean ± SD, median "
+    rhythm = got.get("rhythm")
+    if rhythm:
+        v = bt_rh_settings(sid)
+        lines += ["", "RHYTHM (each beat's type, in the Rhythm column of "
+                  "the beats)",
+                  f"Usual time between beats: {bt_neat(rhythm['usual'])}"
+                  f"{x_u}" + (" (the median between full beats)"
+                              if rhythm["usual_auto"] else " (typed)"),
+                  f"Early under {v['rhe']:g}% of it, late over "
+                  f"{v['rhl']:g}%; a run: {int(v['rhr'])} or more early beats "
+                  f"in a row, fibrillation-like when their times vary by "
+                  f"{v['rhi']:g}% or more (CV); alternans: {int(v['rhn'])} or "
+                  f"more full beats on time changing by {v['rha']:g}% of the "
+                  "usual positive peak or more"]
+        for e in rhythm["episodes"]:
+            lines.append(f"{e['kind']}: {bt_neat(e['start'])} to "
+                         f"{bt_neat(e['end'])}{x_u}, beats "
+                         + ", ".join(str(got["beats"][i]["n"])
+                                     for i in e["beats"]))
+    lines += ["", f"STATISTICS, {bt_from().lower()} (n: mean ± SD, median "
               "(min to max), range)"]
     for param, values, unit in bt_stats_rows(got):
         d = bta.describe(values)
@@ -35730,9 +35784,61 @@ def bt_beat_duration_name(got):
              f"{words})"))
 
 
+# 📊 what the per-beat statistics are taken from, for every signal at once
+# (📋 Results, ⚖️ Before vs after, 📈 Several recordings and what is copied)
+BT_FROM = ("Every beat", "Full beats only", "Regular beats only")
+
+
+def bt_from():
+    """The beats the per-beat statistics are taken from (BT_FROM)."""
+    choice = st.session_state.get("bt_from")
+    return choice if choice in BT_FROM else BT_FROM[0]
+
+
+def bt_from_words(choice=None):
+    """'' for every beat, else ', full beats only' or ', regular beats
+    only', to follow a heading."""
+    choice = choice or bt_from()
+    return "" if choice == BT_FROM[0] else f", {choice.lower()}"
+
+
+def bt_from_beats(got, choice=None):
+    """
+    The beats the per-beat statistics are taken from: every beat, the
+    full ones (positive then negative, as set under 💓 Beats), or the
+    regular ones (full beats on time, in no run and no alternans: 🫀
+    Rhythm; the full ones when the rhythm is not there).
+    """
+    beats = got["beats"]
+    choice = choice or bt_from()
+    if choice == BT_FROM[0]:
+        return beats
+    labels = (got.get("rhythm") or {}).get("labels")
+    if choice == BT_FROM[2] and labels is not None \
+            and len(labels) == len(beats):
+        return [b for b, lab in zip(beats, labels) if lab == "Regular"]
+    return [b for b in beats if b["kind"] == bta.KINDS[0]]
+
+
+def bt_between(got, beats=None):
+    """(beat, the time since the beat before it, whatever kind that one
+    is) for each beat of ``beats`` (bt_from_beats) with one before it: the
+    time between beats, as taken for those beats."""
+    every = got["beats"]
+    rr = (got.get("rhythm") or {}).get("rr")
+    if rr is None or len(rr) != len(every):
+        t = [(b["pos"] or b["neg"])["peak_x"] for b in every]
+        rr = [np.nan] + list(np.diff(t))
+    chosen = {id(b) for b in (bt_from_beats(got) if beats is None
+                              else beats)}
+    return [(b, float(v)) for b, v in zip(every, rr)
+            if id(b) in chosen and np.isfinite(v)]
+
+
 def bt_stats_rows(got):
-    """bt_stats_rows_fresh, kept with the analysis (for its energy unit)."""
-    unit = bt_energy_unit()
+    """bt_stats_rows_fresh, kept with the analysis (for its energy unit
+    and the beats it is taken from)."""
+    unit = (bt_energy_unit(), bt_from())
     kept = got.get("_stats")
     if kept is not None and kept[0] == unit:
         return kept[1]
@@ -35748,9 +35854,9 @@ def bt_stats_rows_fresh(got):
     widths, rises, areas (without sign), energies, powers and the time
     between beats. The same rows for every signal, empty where there is
     nothing (no k: no energy; x not a time: no power), so the lines of a
-    data sheet line up.
+    data sheet line up. From the beats chosen (bt_from_beats).
     """
-    beats = got["beats"]
+    beats = bt_from_beats(got)
     yu, xu = got["y_unit"], got["x_unit"]
     area = f"{yu}·{xu}" if (xu and yu) else ""
     word = bta.area_word(xu, yu)    # Impulse for a force over time
@@ -35770,8 +35876,8 @@ def bt_stats_rows_fresh(got):
             else None
         return np.nan if value is None else value
 
-    times = [(b["pos"] or b["neg"])["peak_x"] for b in beats]
-    timing = bta.timing_of(beats)
+    between = [v for _, v in bt_between(got, beats)]
+    timing = bta.timing_of(got["beats"])
     sym = [bta.beat_symmetry(b) for b in beats]
     full_i = [i for i, b in enumerate(beats) if b["kind"] == bta.KINDS[0]]
     return [
@@ -35838,8 +35944,8 @@ def bt_stats_rows_fresh(got):
          [e.get("mirror", np.nan) for e in pos], ""),
         ("Negative peak mirror symmetry (share)",
          [e.get("mirror", np.nan) for e in neg], ""),
-        ("Time between beats", list(np.diff(times)) if len(times) > 1
-         else [], xu)]
+        # since the beat before each, whatever that one is
+        ("Time between beats", between, xu)]
 
 
 def bt_stats_frame(got):
@@ -35948,8 +36054,29 @@ def bt_results_rows(got):
     return rows
 
 
+def bt_rhythm_rows(got):
+    """🫀 The rhythm over the recording as (parameter, value, unit) rows
+    (bta.rhythm_numbers): how many beats of each type, the pauses, the
+    runs, the time fibrillation-like, how irregular. [] without it."""
+    rhythm = got.get("rhythm")
+    if not rhythm:
+        return []
+    x = np.asarray(got["x"], float)
+    x = x[np.isfinite(x)]
+    span = float(x.max() - x.min()) if x.size > 1 else None
+    xu = got["x_unit"]
+    return [(name, value, xu if unit == "x" else unit)
+            for name, value, unit in bta.rhythm_numbers(rhythm, span)]
+
+
+def bt_totals_rows(got):
+    """The totals and the rhythm: what the tables comparing recordings
+    look values up in."""
+    return bt_results_rows(got) + bt_rhythm_rows(got)
+
+
 def bt_results_frame(got):
-    return pd.DataFrame(bt_results_rows(got),
+    return pd.DataFrame(bt_totals_rows(got),
                         columns=["Parameter", "Value", "Unit"])
 
 
@@ -35968,6 +36095,10 @@ def bt_results_line(name, got, file=""):
         u = f" ({unit})" if unit else ""
         for stat in BT_LINE_STATS:
             row[f"{param}, {stat.lower()}{u}"] = stats[stat]
+    # added later: at the end, so lines pasted before still line up
+    for param, value, unit in bt_rhythm_rows(got):
+        row[f"{param} ({unit})" if unit and unit != "n" else param] = value
+    row["Per-beat statistics from"] = bt_from()
     return row
 
 
@@ -36041,6 +36172,12 @@ BT_SUMMARY_TOTALS = (
     ("Full beats", "Full beats"),
     ("Positive only beats", "Positive only"),
     ("Negative only beats", "Negative only"),
+    ("Regular beats (🫀)", "Regular beats"),
+    ("Regular beats, % of all", "Regular beats, % of all"),
+    ("Premature beats", "Premature beats"),
+    ("Beats after a pause", "Beats after a pause"),
+    ("Fibrillation-like time", "Fibrillation-like time"),
+    ("Rhythm irregularity (CV)", "Rhythm irregularity"),
     ("Signal-to-noise, positive peaks", "Signal-to-noise, positive"),
     ("Signal-to-noise, negative peaks", "Signal-to-noise, negative"))
 BT_SUMMARY_STATS = (
@@ -36085,7 +36222,7 @@ def bt_summary_parts(sid, got):
             return bt_short(param)
         return label.format(**names)
 
-    results = bt_results_rows(got)
+    results = bt_totals_rows(got)
     totals = []
     for label, start in BT_SUMMARY_TOTALS:
         start = start.format(w=word)
@@ -36125,7 +36262,8 @@ def bt_summary_parts(sid, got):
             ("Recording time", span, xu),
             (f"Noise SD used ({got.get('noise_kind', 'automatic')})",
              noise, yu),
-            ("Durations measured", bta.timing_of(got["beats"]), "")]
+            ("Durations measured", bta.timing_of(got["beats"]), ""),
+            ("Per-peak values from", bt_from().lower(), "")]
     return head, totals, per_peak
 
 
@@ -36154,7 +36292,8 @@ def bt_summary_table(sid, got):
     for name, value, unit in totals:
         rows.append([name, number(value), "", "", "" if unit == "n" else unit])
     sections.add(len(rows))
-    rows.append(["Per peak (mean ± SD of n peaks)", "", "", "", ""])
+    rows.append([f"Per peak (mean ± SD of n peaks{bt_from_words()})", "",
+                 "", "", ""])
     for name, d, unit in per_peak:
         rows.append([name, number(d["Mean"]), number(d["SD"]),
                      str(d["n"]), unit])
@@ -36309,6 +36448,421 @@ def bt_tsv(frame, number):
     return "\n".join(lines)
 
 
+# 🫀 Rhythm: each type's name for a count, its views and what each means
+BT_RH_PLURAL = {"Regular": "Regular beats", "Premature": "Premature beats",
+                "After a pause": "Beats after a pause",
+                "Fast run": "Beats in fast runs",
+                "Fibrillation-like": "Fibrillation-like beats",
+                "Alternans": "Alternans beats",
+                "Positive only": "Positive-only beats",
+                "Negative only": "Negative-only beats"}
+BT_RH_VIEW = ("Over time", "Beat to beat", "+ against − duration",
+              "+ duration by type", "+ duration and the time before")
+BT_RH_SHARED = ("rhe", "rhl", "rhr", "rhi", "rha", "rhn")
+
+
+def bt_rh_settings(sid):
+    """A signal's rhythm settings, as numbers (BT_RH_DEFAULTS)."""
+    s = st.session_state
+    out = {}
+    for name, default in BT_RH_DEFAULTS.items():
+        try:
+            out[name] = float(s.get(f"bt_{name}_{sid}", default))
+        except (TypeError, ValueError):
+            out[name] = float(default)
+    return out
+
+
+def bt_rh_words(sid, got):
+    """What each type is, with this signal's settings."""
+    v = bt_rh_settings(sid)
+    e, late, run = f"{v['rhe']:g}", f"{v['rhl']:g}", int(v["rhr"])
+    return {
+        "Regular": f"A full beat (positive then negative) on time: between "
+                   f"{e} and {late}% of the usual time after the beat "
+                   "before, in no run and no alternans.",
+        "Premature": f"Sooner than {e}% of the usual time after the beat "
+                     f"before, on its own or with one more (fewer than "
+                     f"{run} in a row).",
+        "After a pause": f"Later than {late}% of the usual time after the "
+                         "beat before: a beat missed, or late.",
+        "Fast run": f"{run} or more early beats in a row whose times are "
+                    f"steady (vary by less than {v['rhi']:g}%): a burst of "
+                    "fast beating.",
+        "Fibrillation-like": f"{run} or more early beats in a row whose "
+                             f"times vary by {v['rhi']:g}% or more (their "
+                             "coefficient of variation): rapid and "
+                             "chaotic.",
+        "Alternans": f"{int(v['rhn'])} or more full beats in a row, on "
+                     "time, whose positive peaks go large, small, large…, "
+                     f"each change at least {v['rha']:g}% of the usual "
+                     "positive peak.",
+        "Positive only": "Half a beat, on time: a positive peak with no "
+                         "negative one after it.",
+        "Negative only": "Half a beat, on time: a negative peak alone."}
+
+
+def bt_rh_small_in_pauses(got):
+    """How many peaks left out as small (🧹) are inside the pauses."""
+    pauses = [(e["start"], e["end"]) for e in got["rhythm"]["episodes"]
+              if e["kind"] == "Pause"]
+    return sum(1 for e in got["left_out"]
+               if str(e.get("auto_out") or "").startswith("smaller")
+               and any(a <= e["peak_x"] <= b for a, b in pauses))
+
+
+def bt_rh_copy(sid):
+    """⚙️ This signal's rhythm settings (but its usual time) for every
+    signal, then the whole tab again."""
+    s = st.session_state
+    for other in s.get("_bt_sets") or {}:
+        for name in BT_RH_SHARED:
+            s[f"bt_{name}_{other}"] = s.get(f"bt_{name}_{sid}",
+                                            BT_RH_DEFAULTS[name])
+    s["_bt_note_show"] = "🫀 These rhythm settings now sort every signal."
+    app_rerun_fragment("bt_tab")
+
+
+def bt_rh_spearman(x, y):
+    """Spearman's r of x and y (finite pairs), and how many; (nan, n)
+    with fewer than 3."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if ok.sum() < 3 or np.ptp(x[ok]) == 0 or np.ptp(y[ok]) == 0:
+        return float("nan"), int(ok.sum())
+    from scipy import stats as sps
+    return float(sps.spearmanr(x[ok], y[ok])[0]), int(ok.sum())
+
+
+def bt_rh_figure(sid, got, view):
+    """
+    🫀 One view of the rhythm: (the figure, where each dot comes from for a
+    click, a note under it), or (None, [], why not). Each dot is a beat,
+    coloured by its type.
+    """
+    rh = got["rhythm"]
+    beats, labels, rr = got["beats"], rh["labels"], rh["rr"]
+    xu = got["x_unit"]
+    u = f" ({xu})" if xu else ""
+    name = st.session_state["_bt_sets"][sid]["name"]
+    colours = bta.RHYTHM_COLOURS
+    usual = rh["usual"]
+    settings = bt_rh_settings(sid)
+    picks = []
+    figure = go.Figure()
+
+    def pick(b, side, param, value, unit):
+        meta = bt_peak_meta(got, (b["n"], b, side))
+        picks.append(dict(meta, sid=sid, recording=name, param=param,
+                          value=float(value), unit=unit))
+        return len(picks) - 1
+
+    def dots(points, xname, yname):
+        """points: (beat index, x, y, side, what y is, its unit)."""
+        for kind in bta.RHYTHMS:
+            mine = [p for p in points if labels[p[0]] == kind]
+            if not mine:
+                continue
+            index = [pick(beats[i], side, param, yv, unit)
+                     for i, xv, yv, side, param, unit in mine]
+            figure.add_trace(go.Scatter(
+                x=[p[1] for p in mine], y=[p[2] for p in mine],
+                mode="markers", name=f"{kind} ({len(mine)})",
+                marker=dict(color=colours[kind], size=9, opacity=0.85,
+                            line=dict(color="white", width=1)),
+                customdata=[[i] for i in index],
+                text=[f"beat {beats[p[0]]['n']}: {kind.lower()}<br>"
+                      f"{xname} {bta.pretty(p[1], 3)}<br>{yname} "
+                      f"{bta.pretty(p[2], 3)}" for p in mine],
+                hovertemplate="%{text}<extra></extra>"))
+
+    def line_fit(xs, ys):
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        if ok.sum() < 3 or np.ptp(xs[ok]) == 0:
+            return
+        slope, cut = np.polyfit(xs[ok], ys[ok], 1)
+        lo, hi = float(xs[ok].min()), float(xs[ok].max())
+        figure.add_trace(go.Scatter(
+            x=[lo, hi], y=[cut + slope * lo, cut + slope * hi], mode="lines",
+            name="straight line through them", hoverinfo="skip",
+            line=dict(color="#555555", width=1.5, dash="dot")))
+
+    def diagonal(values):
+        values = [v for v in values if np.isfinite(v)]
+        if not values:
+            return
+        lo, hi = min(values), max(values)
+        figure.add_trace(go.Scatter(
+            x=[lo, hi], y=[lo, hi], mode="lines", name="equal",
+            hoverinfo="skip", line=dict(color="#bbbbbb", width=1)))
+
+    timing = bta.timing_of(beats)
+    x_title = f"Time{u}"
+    note = ""
+    if view == BT_RH_VIEW[0]:
+        points = [(i, bta.beat_time(b), rr[i], None,
+                   "Time since the beat before", xu)
+                  for i, b in enumerate(beats) if np.isfinite(rr[i])]
+        if not points:
+            return None, [], "Two beats at least are needed to time them."
+        if np.isfinite(usual):
+            figure.add_hrect(y0=settings["rhe"] / 100 * usual,
+                             y1=settings["rhl"] / 100 * usual,
+                             fillcolor="rgba(44,160,44,0.08)", line_width=0)
+            figure.add_hline(y=usual, line=dict(color="#2ca02c", width=1,
+                                                dash="dash"))
+        for e in rh["episodes"]:
+            if e["kind"] == "Pause":
+                continue
+            figure.add_vrect(x0=e["start"], x1=e["end"],
+                             fillcolor=colours[e["kind"]], opacity=0.12,
+                             line_width=0, annotation_text=e["kind"].lower(),
+                             annotation_position="top left")
+        dots(points, "at", "after the one before")
+        x_title, y_title = f"Time{u}", f"Time since the beat before{u}"
+        note = ("Each dot is a beat, as long after the one before as it is "
+                "high. Green band: on time (between early and late); dashed: "
+                "the usual time. Shaded: runs and alternans.")
+    elif view == BT_RH_VIEW[1]:
+        points = [(i, rr[i], rr[i + 1], None, "Time to the next beat", xu)
+                  for i in range(1, len(beats) - 1)
+                  if np.isfinite(rr[i]) and np.isfinite(rr[i + 1])]
+        if not points:
+            return None, [], "Three beats at least are needed."
+        diagonal([p[1] for p in points] + [p[2] for p in points])
+        dots(points, "after the one before", "before the next")
+        x_title, y_title = f"Time since the beat before{u}", \
+            f"Time to the next beat{u}"
+        note = ("Each dot is a beat: the time since the one before (across) "
+                "and to the next (up). A steady rhythm gathers on the grey "
+                "diagonal at the usual time; a premature beat sits up and "
+                "to the left (short before, long after); fibrillation-like "
+                "beating scatters.")
+    elif view == BT_RH_VIEW[2]:
+        points = [(i, bta.peak_duration(b["neg"]),
+                   bta.peak_duration(b["pos"]), "pos",
+                   "Positive peak duration", xu)
+                  for i, b in enumerate(beats) if b["kind"] == bta.KINDS[0]]
+        if not points:
+            return None, [], "No full beat to compare."
+        diagonal([p[1] for p in points] + [p[2] for p in points])
+        line_fit([p[1] for p in points], [p[2] for p in points])
+        dots(points, "negative", "positive")
+        r, n = bt_rh_spearman([p[1] for p in points],
+                              [p[2] for p in points])
+        regular = [p for p in points if labels[p[0]] == "Regular"]
+        r_reg, n_reg = bt_rh_spearman([p[1] for p in regular],
+                                      [p[2] for p in regular])
+        ratio = [p[2] / p[1] for p in points if p[1]]
+        x_title = f"Negative peak duration{u}"
+        y_title = f"Positive peak duration{u}"
+        note = (f"Each dot is a full beat. Spearman r = {r:.2f} (n = {n})"
+                + (f"; regular beats only r = {r_reg:.2f} (n = {n_reg})"
+                   if n_reg >= 3 and n_reg != n else "")
+                + (f". Positive ÷ negative duration {np.mean(ratio):.3g} ± "
+                   f"{np.std(ratio, ddof=1) if len(ratio) > 1 else 0:.2g}"
+                   if ratio else "")
+                + f". Durations {timing}; grey: equal; dotted: a straight "
+                "line through them.")
+    elif view == BT_RH_VIEW[3]:
+        kinds = [k for k in bta.RHYTHMS if any(
+            lab == k and b["pos"] is not None
+            for lab, b in zip(labels, beats))]
+        if not kinds:
+            return None, [], "No positive peak."
+        lines = []
+        for place, kind in enumerate(kinds):
+            mine = [(i, b) for i, (lab, b) in enumerate(zip(labels, beats))
+                    if lab == kind and b["pos"] is not None]
+            values = [bta.peak_duration(b["pos"]) for _, b in mine]
+            index = [pick(b, "pos", "Positive peak duration", v, xu)
+                     for (_, b), v in zip(mine, values)]
+            hover = [f"beat {b['n']}: {kind.lower()}<br>positive peak "
+                     f"{bta.pretty(v, 3)}{xu and ' ' + xu}"
+                     for (_, b), v in zip(mine, values)]
+            bt_dots(figure, place, values, colours[kind], kind, index, hover)
+            lines.append(f"{kind} {bt_mean_sd(np.asarray(values, float))} "
+                         f"(n = {len(values)})")
+        figure.update_xaxes(tickmode="array", tickvals=list(range(len(kinds))),
+                            ticktext=kinds)
+        x_title, y_title = "", f"Positive peak duration{u}"
+        note = ("Each dot is a positive peak, by the type of its beat: "
+                + "; ".join(lines) + f". Durations {timing}.")
+    else:
+        points = [(i, rr[i], bta.peak_duration(b["pos"]), "pos",
+                   "Positive peak duration", xu)
+                  for i, b in enumerate(beats)
+                  if b["pos"] is not None and np.isfinite(rr[i])]
+        if not points:
+            return None, [], "Two beats at least are needed."
+        line_fit([p[1] for p in points], [p[2] for p in points])
+        dots(points, "after the one before", "positive peak")
+        r, n = bt_rh_spearman([p[1] for p in points], [p[2] for p in points])
+        x_title = f"Time since the beat before{u}"
+        y_title = f"Positive peak duration{u}"
+        note = (f"Each dot is a positive peak against how long after the "
+                f"beat before it came. Spearman r = {r:.2f} (n = {n}): "
+                "above 0, peaks last longer after a longer wait; dotted: "
+                f"a straight line through them. Durations {timing}.")
+    figure.update_layout(
+        template="plotly_white", height=400, margin=dict(l=10, r=10, t=36,
+                                                          b=10),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0),
+        xaxis_title=x_title, yaxis_title=y_title)
+    bt_bold_axes(figure, title=15, ticks=13)
+    return figure, picks, note
+
+
+def bt_rhythm_box(sid, got):
+    """
+    🫀 Rhythm: how many beats of each type (bta.classify_rhythm), the
+    rhythm over time and beat to beat, how the positive peak's duration
+    goes with the negative one's, with the type of beat and with the time
+    since the beat before; each dot clickable. Its settings, per signal.
+    (A fragment: a click here reruns this box alone; a setting changed
+    reruns the tab, as it changes the analysis.)
+    """
+    s = st.session_state
+    rh = got.get("rhythm")
+    if not rh or not got["beats"]:
+        return
+    labels, n = rh["labels"], len(rh["labels"])
+    count = {kind: labels.count(kind) for kind in bta.RHYTHMS}
+    words = bt_rh_words(sid, got)
+    xu = got["x_unit"]
+    with st.container(border=True):
+        st.markdown("#### 🫀 Rhythm: regular and irregular beats")
+
+        def share(c):
+            return f"{c} ({100 * c / n:.0f}%)" if n else str(c)
+
+        cols = st.columns(5)
+        cols[0].metric("Regular", share(count["Regular"]),
+                       help=words["Regular"])
+        cols[1].metric("Premature", share(count["Premature"]),
+                       help=words["Premature"])
+        cols[2].metric("After a pause", share(count["After a pause"]),
+                       help=words["After a pause"])
+        cols[3].metric("Fast or fibrillation-like",
+                       share(count["Fast run"] + count["Fibrillation-like"]),
+                       help=words["Fast run"] + " "
+                       + words["Fibrillation-like"])
+        cols[4].metric("Half beats", share(count["Positive only"]
+                                           + count["Negative only"]),
+                       help="Positive only and negative only, on time.")
+        numbers = {name: value for name, value, _ in bt_rhythm_rows(got)}
+        parts = [f"Usual time between beats {bta.pretty(rh['usual'], 3)}"
+                 + (f" {xu}" if xu else "")
+                 + (" (the median between full beats)" if rh["usual_auto"]
+                    else " (typed)")]
+        cv = numbers.get("Rhythm irregularity (CV of the time between "
+                         "beats)", np.nan)
+        if np.isfinite(cv):
+            parts.append(f"irregularity (CV of the times) {cv:.2f}")
+        for e in rh["episodes"]:
+            if e["kind"] in ("Fast run", "Fibrillation-like"):
+                parts.append(f"{e['kind'].lower()} from "
+                             f"{bta.pretty(e['start'], 3)} to "
+                             f"{bta.pretty(e['end'], 3)}"
+                             + (f" {xu}" if xu else "")
+                             + f" ({len(e['beats'])} beats)")
+        if count["Alternans"]:
+            parts.append(f"{count['Alternans']} beats in alternans")
+        longest = numbers.get("Longest pause", 0.0)
+        if longest:
+            parts.append(f"longest pause {bta.pretty(longest, 3)}"
+                         + (f" {xu}" if xu else ""))
+        st.caption(" · ".join(parts))
+        hidden = bt_rh_small_in_pauses(got)
+        if hidden:
+            st.caption(f"⚠️ {hidden} peaks left out as small (🧹) sit inside "
+                       "the pauses. If they are beating (fast, small, "
+                       "fibrillation-like), lower 🧹 Smallest peak under "
+                       "💓 Beats to count them.")
+        if s.get("bt_rh_view") not in BT_RH_VIEW:
+            s["bt_rh_view"] = BT_RH_VIEW[0]
+        st.segmented_control(
+            "View", BT_RH_VIEW, key="bt_rh_view",
+            help="Over time: each beat as long after the one before as it "
+                 "is high. Beat to beat: the time before each beat against "
+                 "the time after it. The positive peak's duration against "
+                 "the negative one's (full beats), by type of beat, and "
+                 "against the time since the beat before. A click on a dot "
+                 "shows its beat.")
+        view = s["bt_rh_view"]
+        figure, picks, note = bt_rh_figure(sid, got, view)
+        if figure is None:
+            st.caption(note)
+        else:
+            picked = bt_chart_pick(figure, picks,
+                                   f"btrh_{sid}_{BT_RH_VIEW.index(view)}")
+            st.caption(note)
+            if picked:
+                bt_pick_panel(picked, f"rh_{sid}")
+        with st.expander("What each type is, and how many"):
+            st.markdown("\n".join(
+                f"- **{kind}**: {count[kind]} "
+                f"({100 * count[kind] / n:.0f}%). {words[kind]}"
+                if n else f"- **{kind}**: {words[kind]}"
+                for kind in bta.RHYTHMS))
+            st.caption("Each beat is one type, the first that fits in this "
+                       "order: in a run (fast or fibrillation-like), "
+                       "premature, after a pause, half a beat, alternans, "
+                       "else regular. The times are from each beat's "
+                       "positive peak (its negative one's for a negative-"
+                       "only beat). The Rhythm column of 💓 Each beat gives "
+                       "every beat's type.")
+        with st.expander("⚙️ How beats are sorted"):
+            key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+            for name in BT_RH_DEFAULTS:
+                value = s.get(key(name), BT_RH_DEFAULTS[name])
+                try:
+                    s[key(name)] = (int(value) if name in ("rhr", "rhn")
+                                    else float(value))
+                except (TypeError, ValueError):
+                    s[key(name)] = BT_RH_DEFAULTS[name]
+            again = dict(on_change=app_rerun_fragment, args=("bt_tab",))
+            a1, a2 = st.columns(2)
+            a1.number_input(
+                f"Usual time between beats{f' ({xu})' if xu else ''}",
+                key=key("rhu"), min_value=0.0, format="%.4g", **again,
+                help="0: the median time between two full beats in a row ("
+                     f"{bta.pretty(bta.usual_interval(got['beats']), 3)} "
+                     "here). Type the usual time of the recording before a "
+                     "treatment to judge this one against it.")
+            a2.number_input("Early: sooner than (% of the usual)",
+                            key=key("rhe"), min_value=1.0, max_value=100.0,
+                            step=5.0, format="%.0f", **again,
+                            help=words["Premature"])
+            b1, b2 = st.columns(2)
+            b1.number_input("Late: later than (% of the usual)",
+                            key=key("rhl"), min_value=100.0, step=10.0,
+                            format="%.0f", **again,
+                            help=words["After a pause"])
+            b2.number_input("A run: early beats in a row, at least",
+                            key=key("rhr"), min_value=2, step=1, **again,
+                            help="Fewer early beats in a row are each "
+                                 "premature.")
+            c1, c2 = st.columns(2)
+            c1.number_input("Fibrillation-like: times vary by (CV, %)",
+                            key=key("rhi"), min_value=0.0, step=5.0,
+                            format="%.0f", **again,
+                            help=words["Fibrillation-like"])
+            c2.number_input("Alternans: each change (% of the usual peak)",
+                            key=key("rha"), min_value=0.0, step=5.0,
+                            format="%.0f", **again,
+                            help=words["Alternans"] + " 0: none.")
+            d1, d2 = st.columns(2, vertical_alignment="bottom")
+            d1.number_input("Alternans: beats in a row, at least",
+                            key=key("rhn"), min_value=2, step=1, **again)
+            d2.button("Use these for every signal", key=f"btb_rhall_{sid}",
+                      on_click=bt_rh_copy, args=(sid,), **STRETCH,
+                      help="The settings here (all but the usual time, "
+                           "each recording's own) sort every signal's "
+                           "beats the same way, to compare them.")
+
+
 def bt_integration(sid, got):
     """📋 Results: the file used, the totals, each parameter's statistics
     (n, mean, SD, median, min, max, range), to read and to copy, and each
@@ -36372,7 +36926,7 @@ def bt_integration(sid, got):
             with t_all:
                 st.code(head + "Parameter\tValue\tUnit\n" + "\n".join(
                     f"{p}\t{bt_excel(v)}\t{u}" for p, v, u in
-                    bt_results_rows(got)) + "\n\n"
+                    bt_totals_rows(got)) + "\n\n"
                     + bt_tsv(stats, bt_excel), language=None, height=380)
                 st.caption("The totals, then every parameter's statistics.")
             with t_peaks:
@@ -36393,7 +36947,7 @@ def bt_integration(sid, got):
                            "the last one in your data sheet. The energy "
                            "comes first, then every parameter's mean, SD, "
                            "median, min, max and range.")
-        st.markdown("##### 📊 Statistics of the peaks")
+        st.markdown(f"##### 📊 Statistics of the peaks{bt_from_words()}")
         st.dataframe(
             stats.assign(**{c: stats[c].map(bt_neat)
                             for c in bta.STATS if c != "n"}),
@@ -36451,6 +37005,18 @@ def bt_figure(got, clickable=False, peak_click=False):
                             if trace.name not in hidden)
     if s.get("bt_show_meas", True):
         bt_draw_measure(figure, got)
+    rhythm = got.get("rhythm")
+    if rhythm and s.get("bt_show_rhythm", True):
+        for e in rhythm["episodes"]:
+            colour = bta.RHYTHM_COLOURS.get(
+                "After a pause" if e["kind"] == "Pause" else e["kind"],
+                "#999999")
+            figure.add_vrect(
+                x0=e["start"], x1=e["end"], fillcolor=colour, opacity=0.12,
+                line_width=0, layer="below",
+                annotation_text=e["kind"].lower(),
+                annotation_position="top left",
+                annotation_font=dict(size=11, color=colour))
     quiet = got.get("noise_manual") if s.get("bt_show_quiet", True) \
         else None
     if quiet:
@@ -36465,7 +37031,7 @@ def bt_figure(got, clickable=False, peak_click=False):
 BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
                   "merge", "gap", "order", "fu", "k", "nz0", "nz1",
                   "nzmode", "nzval", "nzk", "ma", "mb", "tmode", "tk",
-                  "tpct", "minh", "skip0", "cut")
+                  "tpct", "minh", "skip0", "cut", *BT_RH_DEFAULTS)
 
 
 def bt_db_store():
@@ -36724,6 +37290,24 @@ def bt_results(sid, got):
         st.info("No peak gets past the lines: move them closer to the "
                 "baseline (〰 The lines), or drag them on the plot.")
         return
+    if s.get("bt_from") not in BT_FROM:
+        s["bt_from"] = s.get("_bt_from_last") or BT_FROM[0]
+    st.segmented_control(
+        "📊 Per-beat statistics from", BT_FROM, key="bt_from",
+        help="The beats every mean ± SD is taken from, for every signal "
+             "at once: in 📋 Results, ⚖️ Before vs after, 📈 Several "
+             "recordings and what is copied. Full beats: a positive peak "
+             "then a negative one (as set under 💓 Beats). Regular beats: "
+             "full beats on time, in no run and no alternans (🫀 Rhythm "
+             "below). The totals over the recording stay over every beat.")
+    s["_bt_from_last"] = s["bt_from"]
+    if bt_from() != BT_FROM[0]:
+        chosen = len(bt_from_beats(got))
+        st.caption(f"Every mean ± SD below is of the {chosen} "
+                   f"{bt_from().split(' only')[0].lower()} of "
+                   f"{len(got['beats'])} beats; the totals stay over every "
+                   "beat.")
+    app_fragment(bt_rhythm_box)(sid, got)
     bt_integration(sid, got)
     st.markdown("#### 💓 Each beat")  # (📋 Results above)
     # blank where a beat has no such peak (the CSV keeps them empty too);
@@ -37022,9 +37606,9 @@ def bt_values_ids(got, start):
     param, values, unit = found
     v = np.asarray(values, float)
     low = param.lower()
-    beats = got["beats"]
+    beats = bt_from_beats(got)
     if "between beats" in low:
-        who = [(b["n"], b, None) for b in beats[1:]]
+        who = [(b["n"], b, None) for b, _ in bt_between(got, beats)]
     elif ("full beat" in low or "÷" in param or "balance" in low
           or low.startswith("positive to negative")):
         who = [(b["n"], b, None) for b in beats
@@ -37202,7 +37786,13 @@ BT_BA_GROUPS = (
 # and over the recording, from bt_results_rows
 BT_BA_TOTAL = (("{w}, total", "{w}, all peaks"),
                ("Energy, total", "Energy, all peaks"),
-               ("Beats per minute", "Beats per minute"))
+               ("Beats per minute", "Beats per minute"),
+               ("Regular beats, % of all", "Regular beats, % of all"),
+               ("Premature beats", "Premature beats"),
+               ("Beats after a pause", "Beats after a pause"),
+               ("Fibrillation-like time", "Fibrillation-like time"),
+               ("Rhythm irregularity (CV of the time between beats)",
+                "Rhythm irregularity"))
 BT_BA_COLS = ("Parameter", "Before", "After", "Change", "p", "Unit")
 BT_BEFORE, BT_AFTER = "#8a8f98", "#2a78d6"
 
@@ -37248,8 +37838,8 @@ def bt_ba_table(g0, g1):
     rows, sections = [], set()
     for title, group in BT_BA_GROUPS:
         sections.add(len(rows))
-        rows.append([title.format(**names) + " (mean ± SD, n)", "", "", "",
-                     "", ""])
+        rows.append([title.format(**names) + f" (mean ± SD, n"
+                     f"{bt_from_words()})", "", "", "", "", ""])
         for label, start, how in group:
             start = start.format(**names)
             v0, unit = bt_ba_values(g0, start)
@@ -37273,8 +37863,8 @@ def bt_ba_table(g0, g1):
                          unit])
     sections.add(len(rows))
     rows.append(["Over the recording", "", "", "", "", ""])
-    t0 = {param: (value, unit) for param, value, unit in bt_results_rows(g0)}
-    t1 = {param: (value, unit) for param, value, unit in bt_results_rows(g1)}
+    t0 = {param: (value, unit) for param, value, unit in bt_totals_rows(g0)}
+    t1 = {param: (value, unit) for param, value, unit in bt_totals_rows(g1)}
     for label, start in BT_BA_TOTAL:
         start = start.format(**names)
         key = next((param for param in t0 if param.startswith(start)), None)
@@ -37462,7 +38052,7 @@ def bt_slide_table(g0, g1):
         ("Beat symmetry (1 = perfect)", "Full beat half-turn symmetry",
          "share", "d"))
     rows, sections = [], {0}
-    rows.append(["Per beat (mean ± SD)", "", "", ""])
+    rows.append([f"Per beat (mean ± SD{bt_from_words()})", "", "", ""])
     for text, start, kind, how in per_beat:
         values = []
         for got, sc in zip((g0, g1), scales):
@@ -37519,6 +38109,15 @@ def bt_slide_table(g0, g1):
         show = (lambda v: str(int(v))) if how == "n" else bt_slide_number
         rows.append([label(text, kind), show(a), show(b),
                      change(a, b, how)])
+    # 🫀 how many of each type: regular always, the others where any
+    rhythms = [(g.get("rhythm") or {}).get("labels") for g in (g0, g1)]
+    if all(lab is not None for lab in rhythms):
+        for name in bta.RHYTHMS:
+            a, b = (float(lab.count(name)) for lab in rhythms)
+            if name != "Regular" and not (a or b):
+                continue
+            rows.append([f"{BT_RH_PLURAL[name]} (n)", str(int(a)),
+                         str(int(b)), change(a, b, "n")])
     return rows, sections
 
 
@@ -37667,7 +38266,17 @@ BT_CMP_TOTALS = (
     ("Full beats (count)", "Full beats", "total_count"),
     ("{w}, total", "{w}, all peaks", "total_impulse"),
     ("Energy, total", "Energy, all peaks", "total_plain"),
-    ("Beats per minute", "Beats per minute", "total_plain"))
+    ("Beats per minute", "Beats per minute", "total_plain"),
+    ("🫀 Regular beats, % of all", "Regular beats, % of all",
+     "total_plain"),
+    ("🫀 Premature beats (count)", "Premature beats", "total_count"),
+    ("🫀 Beats after a pause (count)", "Beats after a pause",
+     "total_count"),
+    ("🫀 Beats in fast runs (count)", "Beats in fast runs", "total_count"),
+    ("🫀 Fibrillation-like time, % of the recording",
+     "Fibrillation-like time, % of the recording", "total_plain"),
+    ("🫀 Rhythm irregularity (CV of the time between beats)",
+     "Rhythm irregularity", "total_plain"))
 BT_CMP_VIEW = ("Each recording", "Beat by beat", "Over the experiment")
 BT_CMP_COLS = ("Recording", "Mean ± SD", "n", "Change from the first")
 BT_FIXED_UNITS = {"time": "s", "force": "nN", "impulse": "µN·s"}
@@ -37699,7 +38308,7 @@ def bt_cmp_values(gots, choice, start, kind):
                                                 for sc in scales)
         out, unit = [], ""
         for i, (g, sc) in enumerate(zip(gots, scales)):
-            found = next(((v, u) for p, v, u in bt_results_rows(g)
+            found = next(((v, u) for p, v, u in bt_totals_rows(g)
                           if p.startswith(start)), (np.nan, ""))
             value = float(found[0]) * (sc["impulse"] if fixed else 1.0)
             out.append(np.array([value]) if np.isfinite(value)
