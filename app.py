@@ -11529,6 +11529,53 @@ def db_cell_typed(where):
         s[f"dbn_{where}"] = ""
 
 
+def db_today():
+    """Today where the person is (their browser's time zone, else the
+    server's), as YYYY-MM-DD: a cell recorded at 10 pm in California is
+    still today's, not tomorrow's in UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        zone = getattr(st.context, "timezone", None)
+        if zone:
+            return datetime.now(ZoneInfo(str(zone))).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def db_next_id(day=None):
+    """The next cell ID for ``day`` (today): its date and the next free
+    number, as the cell's video is named (2026-11-27_03)."""
+    day = day or db_today()
+    # the cell chosen counts, saved in or not yet
+    taken = db_cells() + [str(st.session_state.get("db_cell") or "")]
+    helper = getattr(onedrive_store, "next_cell_id", None)
+    if helper is not None:
+        return helper(taken, day)
+    used = [c for c in set(taken) if str(c).startswith(day)]
+    return f"{day}_{len(used) + 1:02d}"
+
+
+def db_cell_new_id(where):
+    """📅 The next ID taken as the new cell."""
+    st.session_state["db_cell"] = db_next_id()
+
+
+def db_video_id():
+    """The ID the video that is open gives its cell: its file's name
+    without the extension ('' without one, or for one from a link)."""
+    name = str(st.session_state.get("video_name") or "").strip()
+    if not name or name == "linked video":
+        return ""
+    return os.path.splitext(os.path.basename(name))[0].strip()
+
+
+def db_cell_video_id(where):
+    """🎬 The open video's name taken as the new cell's ID."""
+    if db_video_id():
+        st.session_state["db_cell"] = db_video_id()
+
+
 def db_cell_picker(where):
     """The cell everything is saved in, the same on every tab."""
     s = st.session_state
@@ -11541,9 +11588,25 @@ def db_cell_picker(where):
                  help="Everything saved goes into this cell's folder. It is "
                       "the same cell on every tab until you change it.")
     if not current:
-        st.text_input("The new cell's name", key=f"dbn_{where}",
-                      on_change=db_cell_typed, args=(where,),
-                      placeholder="e.g. 2026-11-18 dish 2 cell 3, then Enter")
+        video = db_video_id()
+        if video and video in db_cells():
+            video = ""
+        cols = st.columns([2.4, 1.6, 1.6] if video else [3, 2],
+                          vertical_alignment="bottom")
+        cols[0].text_input("The new cell's ID (its video's name)",
+                           key=f"dbn_{where}", on_change=db_cell_typed,
+                           args=(where,),
+                           placeholder="e.g. 2026-11-27_03, then Enter")
+        cols[1].button(f"📅 {db_next_id()}", key=f"dbn_next_{where}",
+                       on_click=db_cell_new_id, args=(where,), **STRETCH,
+                       help="Today's date and the next number free among "
+                            "today's cells, as the cell's video is named.")
+        if video:
+            cols[2].button(f"🎬 {video}", key=f"dbn_video_{where}",
+                           on_click=db_cell_video_id, args=(where,),
+                           **STRETCH,
+                           help="The name of the video that is open "
+                                "(🎬 Video), as the cell's ID.")
     return current
 
 
@@ -24036,6 +24099,7 @@ APP_TAB_LABELS = [
     "🔧 Create force-ε file from ibw files",
     "🧮 Fitting",
     "🗂 Cells",
+    "📊 Across cells",
     "🎥 Compression video",
     "📋 Database",
 ]
@@ -24045,7 +24109,7 @@ APP_TAB_FRAGMENTS = {
     "💓 Beat analysis": "bt_tab", "🔬 AFM output analysis": "ai_tab",
     "📚 Stack & compare": "sc_stack", "🔗 Series": "sc_series",
     "🤝 Force and motion": "fm_tab", "〰 Fourier": "ft_tab",
-    "🗂 Cells": "cells_tab"}
+    "🗂 Cells": "cells_tab", "📊 Across cells": "xc_tab"}
 
 
 def app_tab_opened():
@@ -24077,8 +24141,8 @@ except TypeError:
     APP_TABS_TRACKED = False
 (
     tab_beats, tab_motion, tab_afm, tab_stack, tab_series, tab_fm,
-    tab_fourier, tab_force, tab_igor, tab_fitting, tab_celldb, tab_video,
-    tab_db,
+    tab_fourier, tab_force, tab_igor, tab_fitting, tab_celldb, tab_across,
+    tab_video, tab_db,
 ) = _APP_TABS
 FITTING_TAB_NUMBER = 10
 
@@ -24086,7 +24150,7 @@ FITTING_TAB_NUMBER = 10
 def app_fragment(func, key=None):
     """
     ``func`` (a tab's whole content, or a section of one) as a fragment: a
-    click in it reruns it alone, not the whole app, so the other twelve
+    click in it reruns it alone, not the whole app, so the other
     tabs are not built and sent again on every click. They are brought up
     to date when one of them is opened (that reruns everything). ``key``
     names it, for a callback in a section of it to run it all again
@@ -24197,8 +24261,11 @@ def _top_tab(n, selected=False):
             f'[data-testid="stTab"][data-key="{n - 1}"]{pick}{_NOT_NESTED}']
 
 
+# each by its place in the bar (1 the first), from its label
 _hidden = [
-    index for index, wanted in ((12, SHOW_VIDEO_TAB), (13, SHOW_DATABASE_TAB))
+    APP_TAB_LABELS.index(label) + 1 for label, wanted in (
+        ("🎥 Compression video", SHOW_VIDEO_TAB),
+        ("📋 Database", SHOW_DATABASE_TAB))
     if not wanted
 ]
 _rules = []
@@ -40775,6 +40842,558 @@ def cells_open(cell, kind, item_id):
     app_open_tab(CELL_KINDS.get(kind))
 
 
+# a tab's analyses in a cell, as a count on its card: the tab's emoji
+CELL_KIND_ICONS = {kind: label.split(" ")[0] for kind, label in
+                   CELL_KINDS.items()}
+CELL_KIND_ICONS["fitting"] = "🧮"
+CELLS_SORT = ("Newest first", "Oldest first", "ID, A to Z")
+CELLS_VIEW = ("🖼 Cards", "📋 Table")
+CELLS_PER_PAGE = 24
+# how long OneDrive's thumbnail links are taken as good (seconds)
+CELLS_PICTURES_FOR = 1200
+
+
+def db_cards(refresh=False):
+    """Every cell's card (cells_index.csv) as a frame of text; empty with
+    none yet, or with an onedrive_store.py too old to keep them. Shared by
+    every window like the list of saved items."""
+    s = st.session_state
+    store = cell_store()
+    if store is None or not hasattr(store, "load_cells_index"):
+        return pd.DataFrame()
+    if refresh or s.get("_db_cards") is None:
+        holder = od_holder()
+        shared = holder is not None and holder.get("store") is store
+        if (shared and not refresh and holder.get("cards") is not None
+                and time.time() - float(holder.get("cards_at") or 0.0)
+                < DB_SHARED_FOR):
+            s["_db_cards"] = holder["cards"].copy()
+        else:
+            try:
+                s["_db_cards"] = store.load_cells_index()
+            except Exception:
+                s["_db_cards"] = pd.DataFrame()
+            if shared:
+                holder.update(cards=s["_db_cards"].copy(),
+                              cards_at=time.time())
+    return s["_db_cards"]
+
+
+def db_card(cell):
+    """One cell's card as a dict ({} when it has none)."""
+    cards = db_cards()
+    if cards is None or cards.empty or "cell" not in cards:
+        return {}
+    mine = cards[cards["cell"].astype(str) == str(cell)]
+    return {} if mine.empty else {k: ("" if str(v) == "nan" else v)
+                                  for k, v in mine.iloc[-1].items()}
+
+
+def db_pictures(cells, refresh=False):
+    """{cell: its pictures} (store.cell_pictures), read for the cells not
+    read lately; OneDrive's thumbnail links last a while only."""
+    s = st.session_state
+    store = cell_store()
+    if store is None or not hasattr(store, "cell_pictures"):
+        return {}
+    kept = s.setdefault("_db_pics", {})
+    now = time.time()
+    need = [c for c in cells if refresh or c not in kept
+            or now - kept[c][0] > CELLS_PICTURES_FOR]
+    if need:
+        try:
+            found = store.cell_pictures(need)
+            s.pop("_db_pics_error", None)
+        except Exception as exc:
+            found = {}
+            s["_db_pics_error"] = str(exc)
+        for cell in need:
+            mine = found.get(cell, [])
+            # a photo just added has no thumbnail for a moment: read again
+            # in a minute or two, not in twenty
+            soon = any(p["kind"] == "image" and not p.get("thumb")
+                       for p in mine)
+            kept[cell] = (now - CELLS_PICTURES_FOR + 120 if soon else now,
+                          mine)
+    return {c: kept[c][1] for c in cells if c in kept}
+
+
+def db_fitted():
+    """The 🧮 Fitting tab's fitted cells (its index.csv), read once."""
+    s = st.session_state
+    if s.get("_cells_fitted") is None:
+        store = cell_store()
+        try:
+            s["_cells_fitted"] = store.load_index()
+        except Exception:
+            s["_cells_fitted"] = pd.DataFrame()
+    return s["_cells_fitted"]
+
+
+def cells_cover(card, pictures):
+    """The picture a cell is shown with: the one its card names, else its
+    first photo, else its first video's frame. None without one."""
+    named = str(card.get("cover") or "")
+    for picture in pictures:
+        if named and picture["name"] == named and picture.get("thumb"):
+            return picture
+    for kind in ("image", "video"):
+        for picture in pictures:
+            if picture["kind"] == kind and picture.get("thumb"):
+                return picture
+    return None
+
+
+def cells_catalog():
+    """
+    Every cell, one row each: its ID, date (its card's, else the date in
+    its ID, else the day of its first save), cantilever and k (the card's,
+    else the k its analyses used), type, sample, condition, notes, how many
+    analyses of each tab, when it was last saved and by whom.
+    """
+    items = db_items()
+    cards = db_cards()
+    names = set(db_cells())
+    if cards is not None and not cards.empty and "cell" in cards:
+        names |= {str(c) for c in cards["cell"] if str(c).strip()}
+    fitted = db_fitted()
+    fits = {}
+    if fitted is not None and not fitted.empty and "cell_id" in fitted:
+        fits = fitted["cell_id"].astype(str).value_counts().to_dict()
+        names |= {c for c in fits if c.strip() and c != "nan"}
+    rows = []
+    for cell in sorted(names, key=str.lower):
+        card = db_card(cell)
+        mine = pd.DataFrame()
+        if items is not None and not items.empty and "cell" in items:
+            mine = items[items["cell"].astype(str) == cell]
+        saved = (sorted(str(v) for v in mine["saved_at"].dropna())
+                 if "saved_at" in mine else [])
+        k = str(card.get("k") or "")
+        if not k:
+            for column in ("Spring constant k (N/m)", "k (N/m)"):
+                if column in mine:
+                    found = pd.to_numeric(mine[column], errors="coerce")
+                    found = found[found > 0]
+                    if not found.empty:
+                        k = f"{found.iloc[0]:.4g}"
+                        break
+        date = (str(card.get("date") or "")
+                or (onedrive_store.date_in_id(cell)
+                    if hasattr(onedrive_store, "date_in_id") else "")
+                or (saved[0][:10] if saved else ""))
+        counts = {}
+        if "kind" in mine:
+            counts = mine["kind"].astype(str).value_counts().to_dict()
+        if fits.get(cell):
+            counts["fitting"] = fits[cell]
+        who = sorted({str(v).strip() for v in mine.get("analysed_by", [])
+                      if str(v).strip() not in ("", "nan", "None")})
+        rows.append({
+            "Cell": cell, "Date": date,
+            "Cantilever": str(card.get("cantilever") or ""), "k (N/m)": k,
+            "Cell type": str(card.get("cell_type") or ""),
+            "Sample": str(card.get("sample") or ""),
+            "Condition": str(card.get("condition") or ""),
+            "Notes": str(card.get("notes") or ""),
+            "Analyses": int(sum(counts.values())),
+            "Saved": " · ".join(f"{CELL_KIND_ICONS.get(kind, '•')} {n}"
+                                for kind, n in sorted(counts.items())),
+            "Last saved": saved[-1][:16].replace("T", " ") if saved else "",
+            "Analysed by": ", ".join(who), "_card": bool(card)})
+    return pd.DataFrame(rows)
+
+
+CELLS_MODES = ("🗂 All cells", "🧫 One cell")
+# a cell's pictures shown at first in its own view (then: Show all)
+CELLS_PICTURES_SHOWN = 12
+CELLS_NO_PICTURE = (
+    "<div style='height:{h}px;border:1px dashed rgba(128,128,128,0.5);"
+    "border-radius:6px;display:flex;align-items:center;justify-content:"
+    "center;color:rgba(128,128,128,0.95);font-size:0.85rem;"
+    "margin-bottom:0.35rem'>no picture yet</div>")
+
+
+def cells_open_card(cell):
+    """Open a cell from the catalog: shown on its own, and the cell every
+    tab saves in from now on."""
+    s = st.session_state
+    s["db_cell"] = str(cell)
+    s["cells_mode"] = CELLS_MODES[1]
+
+
+def cells_new_card():
+    """➕ New cell: the one-cell view with none chosen, to name it."""
+    s = st.session_state
+    s["db_cell"] = ""
+    s["cells_mode"] = CELLS_MODES[1]
+
+
+def cells_md(text):
+    """A cell's ID as Markdown shows it as typed (no _ or * read as
+    italics)."""
+    return re.sub(r"([\\`*_{}\[\]()#+!|<>~])", r"\\\1", str(text))
+
+
+def cells_href(url):
+    """A link's address as Markdown and HTML take it whole (spaces and
+    brackets written out)."""
+    return (str(url).replace(" ", "%20").replace("(", "%28")
+            .replace(")", "%29"))
+
+
+def cells_img(url, height, link="", video=False):
+    """
+    A picture from OneDrive as HTML: cropped to ``height`` pixels, so the
+    cards line up, loaded when scrolled to, opening ``link`` (the file in
+    OneDrive) in a new tab when clicked; a video's frame marked ▶.
+    """
+    tag = (f"<img src='{html.escape(str(url), quote=True)}' alt='' "
+           f"loading='lazy' style='width:100%;height:{int(height)}px;"
+           "object-fit:cover;border-radius:6px;display:block'>")
+    if video:
+        tag += ("<span style='position:absolute;left:6px;bottom:6px;"
+                "background:rgba(0,0,0,0.62);color:#fff;border-radius:4px;"
+                "padding:0 6px;font-size:0.75rem'>▶ video</span>")
+    if str(link).startswith("http"):
+        tag = (f"<a href='{html.escape(cells_href(link), quote=True)}' "
+               f"target='_blank' rel='noopener'>{tag}</a>")
+    return ("<div style='position:relative;margin-bottom:0.35rem'>"
+            f"{tag}</div>")
+
+
+def cells_gallery(catalog):
+    """🗂 All cells: a card each (its picture, ID, date, cantilever and
+    what is saved), or a table, searched and sorted; Open shows the cell
+    on its own and makes it the cell every tab saves in."""
+    s = st.session_state
+    head1, head2 = st.columns([3, 1], vertical_alignment="center")
+    head1.markdown(f"#### 🗂 All cells ({len(catalog)})")
+    head2.button("➕ New cell", key="cellsb_new", on_click=cells_new_card,
+                 **STRETCH, help="Name a new cell (📅 gives today's next "
+                                 "ID) and save in it from any tab.")
+    if catalog.empty:
+        st.caption("No cell yet. ➕ New cell names one (📅 gives today's "
+                   "next ID); then save analyses in it from any tab with "
+                   "☁️ Database, bottom right.")
+        return
+    c1, c2, c3 = st.columns([2.2, 1.2, 1.4], vertical_alignment="bottom")
+    c1.text_input("🔎 Search", key="cells_find",
+                  placeholder="ID, date, cantilever, type, notes…")
+    if s.get("cells_sort") not in CELLS_SORT:
+        s["cells_sort"] = CELLS_SORT[0]
+    c2.selectbox("Sort", CELLS_SORT, key="cells_sort")
+    if s.get("cells_view") not in CELLS_VIEW:
+        s["cells_view"] = s.get("_cells_view_last") or CELLS_VIEW[0]
+    c3.segmented_control("View", CELLS_VIEW, key="cells_view")
+    s["_cells_view_last"] = s["cells_view"]
+    shown = catalog
+    find = str(s.get("cells_find") or "").strip().lower()
+    if find:
+        text = shown.drop(columns=["_card"]).astype(str).agg(
+            " ".join, axis=1).str.lower()
+        shown = shown[text.str.contains(re.escape(find))]
+    if s["cells_sort"] == CELLS_SORT[2]:
+        shown = shown.sort_values("Cell", key=lambda c: c.str.lower())
+    else:
+        shown = shown.sort_values(["Date", "Cell"],
+                                  ascending=s["cells_sort"] == CELLS_SORT[1])
+    if shown.empty:
+        st.caption("No cell matches.")
+        return
+    if s["cells_view"] == CELLS_VIEW[1]:
+        table = shown.drop(columns=["_card"])
+        event = st.dataframe(table, hide_index=True, **STRETCH,
+                             key="cells_table", on_select="rerun",
+                             selection_mode="single-row")
+        try:
+            rows = list(event.selection.rows or [])
+        except Exception:
+            rows = []
+        t1, t2 = st.columns(2)
+        if rows and rows[0] < len(table):
+            cell = str(table.iloc[rows[0]]["Cell"])
+            t1.button(f"Open {cell}", key="cellsb_table_open",
+                      type="primary", on_click=cells_open_card, args=(cell,),
+                      **STRETCH)
+        else:
+            t1.caption("Click a row to open its cell.")
+        t2.download_button("💾 This list (CSV)",
+                           table.to_csv(index=False).encode("utf-8"),
+                           file_name="cells.csv", mime="text/csv",
+                           key="cellsb_listcsv", **STRETCH)
+        return
+    many = int(s.get("_cells_many", CELLS_PER_PAGE) or CELLS_PER_PAGE)
+    page = shown.head(many)
+    pictures = db_pictures(list(page["Cell"]))
+    if s.get("_db_pics_error"):
+        st.caption(f"⚠️ The pictures could not be read: "
+                   f"{s['_db_pics_error'][:160]}")
+    for start in range(0, len(page), 4):
+        cols = st.columns(4)
+        for col, row in zip(cols, page.iloc[start:start + 4].to_dict(
+                "records")):
+            cell = row["Cell"]
+            mine = pictures.get(cell, [])
+            with col.container(border=True):
+                cover = cells_cover(db_card(cell), mine)
+                st.markdown(
+                    cells_img(cover.get("large") or cover["thumb"], 150,
+                              video=cover["kind"] == "video")
+                    if cover else CELLS_NO_PICTURE.format(h=150),
+                    unsafe_allow_html=True)
+                st.markdown(f"**{cells_md(cell)}**")
+                bits = [f"📅 {row['Date']}" if row["Date"] else "",
+                        f"🔧 {row['Cantilever']}" if row["Cantilever"]
+                        else "",
+                        f"k {row['k (N/m)']} N/m" if row["k (N/m)"] else ""]
+                st.caption(" · ".join(b for b in bits if b)
+                           or "no card yet")
+                about = [row["Cell type"], row["Sample"], row["Condition"]]
+                if any(about):
+                    st.caption(" · ".join(a for a in about if a))
+                more = [row["Saved"], f"🖼 {len(mine)}" if mine else ""]
+                st.caption(" · ".join(b for b in more if b)
+                           or "nothing saved yet")
+                st.button("Open", key=f"cellsg_open_{cell}",
+                          on_click=cells_open_card, args=(cell,),
+                          type="primary" if cell == s.get("db_cell")
+                          else "secondary", **STRETCH,
+                          help="The cell every tab saves in now."
+                          if cell == s.get("db_cell") else None)
+    if len(shown) > many:
+        st.button(f"Show more ({len(shown) - many} more)",
+                  key="cellsb_more", on_click=lambda: s.update(
+                      _cells_many=many + CELLS_PER_PAGE), **STRETCH)
+
+
+def cells_card_box(store, cell):
+    """📝 A cell's card: its date, cantilever, spring constant, type,
+    sample, condition, notes, the picture shown for it and its video;
+    saved in its folder and in the list of every cell."""
+    s = st.session_state
+    card = db_card(cell)
+    row = cells_catalog()
+    row = row[row["Cell"] == cell]
+    row = row.iloc[0].to_dict() if not row.empty else {}
+    pictures = db_pictures([cell]).get(cell, [])
+    key = lambda name: f"cellcard_{name}_{cell}"  # noqa: E731
+    defaults = {"date": row.get("Date") or "",
+                "cantilever": card.get("cantilever") or "",
+                "k": card.get("k") or row.get("k (N/m)") or "",
+                "cell_type": card.get("cell_type") or "",
+                "sample": card.get("sample") or "",
+                "condition": card.get("condition") or "",
+                "notes": card.get("notes") or "",
+                "cover": card.get("cover") or "",
+                "video": card.get("video") or ""}
+    for name, value in defaults.items():
+        s.setdefault(key(name), str(value))
+    with st.expander("📝 The cell's card: date, cantilever, type…",
+                     expanded=not card):
+        if not hasattr(store, "save_cell_info"):
+            st.caption("⚠️ Upload the new onedrive_store.py to keep cards.")
+            return
+        a1, a2, a3 = st.columns(3)
+        a1.text_input("Date", key=key("date"), placeholder="YYYY-MM-DD",
+                      help="When the cell was recorded. Taken from its ID "
+                           "when that holds a date.")
+        a2.text_input("Cantilever", key=key("cantilever"),
+                      placeholder="e.g. MLCT-BIO C")
+        a3.text_input("Spring constant k (N/m)", key=key("k"),
+                      placeholder="e.g. 0.01",
+                      help="Filled from its analyses' k when they had one.")
+        b1, b2, b3 = st.columns(3)
+        b1.text_input("Cell type", key=key("cell_type"),
+                      placeholder="e.g. hiPSC-CM")
+        b2.text_input("Sample", key=key("sample"),
+                      placeholder="dish, well, passage…")
+        b3.text_input("Condition", key=key("condition"),
+                      placeholder="control, drug, stretched…",
+                      help="What 📊 Across cells can group the cells by.")
+        st.text_area("Notes", key=key("notes"), height=70)
+        names = [p["name"] for p in pictures]
+        videos = [p["name"] for p in pictures if p["kind"] == "video"]
+        d1, d2 = st.columns(2)
+        if s.get(key("cover")) not in [""] + names:
+            # its card's, kept when OneDrive's list could not be read
+            names = [s.get(key("cover"))] + names
+        d1.selectbox("Picture shown for it", [""] + names, key=key("cover"),
+                     format_func=lambda n: n or "the first photo",
+                     help="Add photos or the cell's video under 🖼 "
+                          "Pictures, below; ☆ there shows one on its card.")
+        if s.get(key("video")) not in [""] + videos:
+            videos = [s.get(key("video"))] + videos
+        d2.selectbox("Its video", [""] + videos, key=key("video"),
+                     format_func=lambda n: n or "none named",
+                     help="The cell's ID is its video's name.")
+        st.button("💾 Save the card", key=f"cellsb_card_{cell}",
+                  type="primary", on_click=cells_save_card,
+                  args=(cell, list(defaults)), **STRETCH)
+
+
+def cells_save_card(cell, names):
+    """💾 A cell's card as typed, into its folder and the list of every
+    cell; a date in any spelling written YYYY-MM-DD."""
+    s = st.session_state
+    store = cell_store()
+    info = {"cell": cell}
+    info.update({name: str(s.get(f"cellcard_{name}_{cell}") or "").strip()
+                 for name in names})
+    if info.get("date"):
+        try:
+            info["date"] = pd.Timestamp(info["date"]).strftime("%Y-%m-%d")
+            s[f"cellcard_date_{cell}"] = info["date"]
+        except Exception:
+            pass
+    try:
+        store.save_cell_info(info)
+        db_cards(refresh=True)
+        s["_cells_note"] = f"✅ Saved {cell}'s card."
+    except Exception as exc:
+        s["_cells_note"] = f"⚠️ Could not save the card: {exc}"
+
+
+def cells_ensure_card(store, cell, **fields):
+    """A card for a cell that has none, so it is listed in 🗂 All cells
+    from now on (with the date its ID holds); ``fields`` set on it."""
+    card = db_card(cell)
+    if not hasattr(store, "save_cell_info") or (card and not fields):
+        return
+    info = dict(card, cell=cell, **fields)
+    if not info.get("date") and hasattr(onedrive_store, "date_in_id"):
+        info["date"] = onedrive_store.date_in_id(cell)
+    store.save_cell_info(info)
+    db_cards(refresh=True)
+    for name, value in fields.items():
+        st.session_state[f"cellcard_{name}_{cell}"] = value
+
+
+def cells_set_cover(cell, name):
+    """⭐ This picture shown for the cell: kept in its card at once."""
+    s = st.session_state
+    store = cell_store()
+    try:
+        if store is None or not hasattr(store, "save_cell_info"):
+            raise RuntimeError("upload the new onedrive_store.py")
+        info = dict(db_card(cell) or {}, cell=cell, cover=name)
+        if not info.get("date"):
+            info["date"] = (onedrive_store.date_in_id(cell)
+                            if hasattr(onedrive_store, "date_in_id") else "")
+        store.save_cell_info(info)
+        s[f"cellcard_cover_{cell}"] = name
+        db_cards(refresh=True)
+        s["_cells_note"] = f"✅ {name} is shown for {cell} now."
+    except Exception as exc:
+        s["_cells_note"] = f"⚠️ Could not save it: {exc}"
+
+
+def cells_add_pictures(cell):
+    """⬆️ Photos, or the cell's video, into its Pictures folder."""
+    s = st.session_state
+    ver = int(s.get("_cells_picver", 0) or 0)
+    ups = s.get(f"cellsp_{ver}") or []
+    store = cell_store()
+    if not ups or store is None or not cell:
+        s["_cells_note"] = "⚠️ Choose the photos or the video first."
+        return
+    try:
+        add = getattr(store, "add_cell_pictures", None) or \
+            store.add_cell_files
+        add(cell, {u.name: u.getvalue() for u in ups})
+        # the cell's video on its card when the card names none yet; a
+        # card made anyway, so the cell is listed
+        videos = [u.name for u in ups
+                  if getattr(onedrive_store, "picture_kind",
+                             lambda n: None)(u.name) == "video"]
+        photos = len(ups) - len(videos)
+        what = " and ".join(
+            f"{n} {word}{'s' if n != 1 else ''}"
+            for n, word in ((photos, "photo"), (len(videos), "video")) if n)
+        s["_cells_note"] = (f"✅ {what} added to {cell}. OneDrive makes "
+                            "their thumbnails in a moment.")
+        if videos and not db_card(cell).get("video"):
+            cells_ensure_card(store, cell, video=videos[0])
+            s["_cells_note"] += f" {videos[0]} is its video now."
+        else:
+            cells_ensure_card(store, cell)
+        (s.get("_db_pics") or {}).pop(cell, None)
+        s["_cells_picver"] = ver + 1
+    except Exception as exc:
+        s["_cells_note"] = f"⚠️ Could not add them: {exc}"
+
+
+def cells_pictures_box(cell):
+    """🖼 A cell's photos and videos (its folder, Files and Pictures), four
+    in a row, each opening in OneDrive, ⭐ to show it for the cell; and
+    more added."""
+    s = st.session_state
+    p1, p2 = st.columns([4, 1], vertical_alignment="center")
+    pictures = db_pictures([cell]).get(cell, [])
+    p1.markdown(f"**🖼 Pictures ({len(pictures)})**")
+    if p2.button("🔄", key=f"cellsb_pics_{cell}",
+                 help="Read the cell's pictures again."):
+        pictures = db_pictures([cell], refresh=True).get(cell, [])
+    if not pictures:
+        st.caption("No photos or videos yet: add microscope photos or the "
+                   "cell's video below.")
+    cover = cells_cover(db_card(cell), pictures)
+    every = bool(s.get(f"_cells_allpics_{cell}"))
+    shown = pictures if every else pictures[:CELLS_PICTURES_SHOWN]
+    for start in range(0, len(shown), 4):
+        cols = st.columns(4)
+        for n, (col, picture) in enumerate(zip(cols,
+                                               shown[start:start + 4])):
+            with col:
+                video = picture["kind"] == "video"
+                if picture.get("thumb"):
+                    st.markdown(cells_img(picture.get("large")
+                                          or picture["thumb"], 170,
+                                          link=picture.get("url"),
+                                          video=video),
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown(CELLS_NO_PICTURE.format(h=170).replace(
+                        "no picture yet", "▶ no frame yet" if video
+                        else "no thumbnail yet"), unsafe_allow_html=True)
+                label = html.escape(("▶ " if video else "")
+                                    + picture["name"])
+                url = str(picture.get("url") or "")
+                if url.startswith("http"):
+                    label = (f"<a href='{html.escape(cells_href(url), True)}'"
+                             f" target='_blank' rel='noopener'>{label}</a>")
+                st.markdown("<div style='font-size:0.82rem;overflow:hidden;"
+                            "text-overflow:ellipsis;white-space:nowrap' "
+                            f"title='{html.escape(picture['name'], True)}'>"
+                            f"{label}</div>", unsafe_allow_html=True)
+                here = cover is not None and cover["name"] == picture["name"]
+                st.button("⭐ Shown for the cell" if here
+                          else "☆ Show for the cell",
+                          key=f"cellsp_cover_{cell}_{start + n}",
+                          on_click=cells_set_cover,
+                          args=(cell, picture["name"]),
+                          disabled=here or not picture.get("thumb"),
+                          **STRETCH,
+                          help="The picture on the cell's card in 🗂 All "
+                               "cells." if here else
+                          "Show this one on the cell's card.")
+    if len(pictures) > len(shown):
+        st.button(f"Show all {len(pictures)}", key=f"cellsb_allpics_{cell}",
+                  on_click=lambda: s.update(
+                      {f"_cells_allpics_{cell}": True}))
+    types = sorted({e.lstrip(".") for e in
+                    getattr(onedrive_store, "PICTURE_TYPES", ())
+                    + getattr(onedrive_store, "VIDEO_TYPES", ())}) or None
+    u1, u2 = st.columns([3, 1], vertical_alignment="bottom")
+    u1.file_uploader("Add photos or the cell's video", type=types,
+                     accept_multiple_files=True,
+                     key=f"cellsp_{int(s.get('_cells_picver', 0) or 0)}",
+                     help="Into the cell's Pictures folder in OneDrive. "
+                          "Its ID is its video's name.")
+    u2.button("⬆️ Add them", key=f"cellsb_addpics_{cell}",
+              on_click=cells_add_pictures, args=(cell,), **STRETCH)
+
+
 def cells_add_files(cell):
     s = st.session_state
     ups = s.get(f"cellsf_{int(s.get('_cells_upver', 0) or 0)}") or []
@@ -40785,7 +41404,9 @@ def cells_add_files(cell):
         store.add_cell_files(cell, {u.name: u.getvalue() for u in ups})
         s["_cells_note"] = (f"✅ {len(ups)} file{'s' if len(ups) != 1 else ''}"
                             f" added to {cell}.")
+        cells_ensure_card(store, cell)
         s.pop(f"_cells_files_{cell}", None)
+        (s.get("_db_pics") or {}).pop(cell, None)
     except Exception as exc:
         s["_cells_note"] = f"⚠️ Could not add them: {exc}"
     s["_cells_upver"] = int(s.get("_cells_upver", 0) or 0) + 1
@@ -40841,13 +41462,173 @@ def cells_backup(store, cell):
                    "recycle bin of what is deleted.")
 
 
+def cells_every_beat_table(items):
+    """📊 Every cell's beat results, one line each, and every analysis of
+    every cell, as CSV."""
+    if items is None or items.empty or "kind" not in items:
+        return
+    beats = items[items["kind"].astype(str) == "beats"]
+    if not beats.empty:
+        with st.expander(f"📊 Every cell's beat results ({len(beats)} "
+                         "analyses), one line each"):
+            table = beats.drop(columns=[c for c in (
+                "kind", "onedrive_path", "item_id") if c in beats])
+            table = table.loc[:, table.notna().any()]
+            st.dataframe(table, hide_index=True, **STRETCH,
+                         column_config={"folder_url": st.column_config
+                                        .LinkColumn("Folder")})
+            st.download_button("💾 This table (CSV)",
+                               table.to_csv(index=False).encode("utf-8"),
+                               file_name="beat_results_by_cell.csv",
+                               mime="text/csv", key="cellsb_beatcsv",
+                               **STRETCH)
+    st.download_button("💾 Everything saved, every cell (CSV)",
+                       items.to_csv(index=False).encode("utf-8"),
+                       file_name="cell_database.csv", mime="text/csv",
+                       key="cellsb_allcsv")
+
+
+def cells_one(store, items):
+    """🧫 One cell: its card, its pictures, everything saved in it (each
+    opened again on its tab), its fitted moduli and its raw files; more of
+    each added here or from any tab. -> the cell ('' for none)."""
+    s = st.session_state
+    p1, p3 = st.columns([3, 1.2], vertical_alignment="bottom")
+    with p1:
+        cell = db_cell_picker("cells")
+    if not cell:
+        st.caption("Name the new cell: its ID is its video's name, a date "
+                   "and a number (📅 gives today's next one).")
+        return ""
+    try:
+        if s.get("_cells_url", (None,))[0] != cell:
+            s["_cells_url"] = (cell, store.cell_url(cell))
+        if s["_cells_url"][1]:
+            p3.link_button("↗ The cell's folder", s["_cells_url"][1],
+                           **STRETCH)
+    except Exception:
+        pass
+    mine = pd.DataFrame()
+    if items is not None and not items.empty and "cell" in items:
+        mine = items[items["cell"].astype(str) == cell]
+    st.markdown(f"#### {cells_md(cell)}")
+    card = db_card(cell)
+    about = [f"📅 {card.get('date')}" if card.get("date") else "",
+             f"🔧 {card.get('cantilever')}" if card.get("cantilever")
+             else "", f"k {card.get('k')} N/m" if card.get("k") else "",
+             card.get("cell_type") or "", card.get("sample") or "",
+             card.get("condition") or ""]
+    if any(about):
+        st.caption(" · ".join(a for a in about if a))
+    cells_card_box(store, cell)
+    with st.container(border=True):
+        cells_pictures_box(cell)
+    st.markdown(f"**🗄 Saved in it ({len(mine)})**")
+    if not mine.empty and "analysed_by" in mine:
+        names = sorted({str(v).strip() for v in mine["analysed_by"]
+                        if str(v).strip() not in ("", "nan", "None")})
+        st.caption("Analysed by: " + (", ".join(names) if names
+                                       else "nobody named yet"))
+    if mine.empty:
+        st.caption("Nothing saved in this cell yet. Open an analysis tab "
+                   "(💓 Beat analysis, 🔬 AFM output analysis, …) with this "
+                   "cell chosen and save from ☁️ Database (bottom right) "
+                   "or the tab's 🗄 Cell database box.")
+    else:
+        shown = mine.copy()
+        shown.insert(0, "Tab", shown["kind"].map(
+            lambda k: CELL_KINDS.get(str(k), str(k))))
+        shown["saved_at"] = shown["saved_at"].astype(str).str[:16] \
+            .str.replace("T", " ")
+        if "analysed_by" not in shown:
+            shown["analysed_by"] = ""
+        keep = ["Tab", "name", "analysed_by", "saved_at", "notes"] + [
+            c for c in shown.columns if c not in (
+                "Tab", "name", "analysed_by", "saved_at", "notes",
+                "item_id", "cell", "kind", "onedrive_path", "folder_url",
+                "source", "file")
+            and shown[c].notna().any()]
+        st.dataframe(shown[keep].rename(columns={
+            "name": "Name", "analysed_by": "Analysed by",
+            "saved_at": "Saved", "notes": "Notes"}),
+            hide_index=True, **STRETCH)
+        rows = {f"{r['kind']}|{r['item_id']}": r
+                for r in mine.to_dict("records")}
+        o1, o2, o3 = st.columns([3, 1.2, 1], vertical_alignment="bottom")
+        o1.selectbox(
+            "Open", list(rows), key="cells_pick",
+            format_func=lambda k: (
+                f"{CELL_KINDS.get(str(rows[k]['kind']), rows[k]['kind'])}"
+                f" · {rows[k].get('name')} · "
+                f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"
+                + db_by(rows[k])))
+        row = rows.get(s.get("cells_pick")) or {}
+        if row:
+            o2.button("📂 Open on its tab", key="cellsb_open",
+                      type="primary", on_click=cells_open,
+                      args=(cell, str(row["kind"]), str(row["item_id"])),
+                      **STRETCH,
+                      help="Puts it back on its own tab, with its data "
+                           "and every setting.")
+            if str(row.get("folder_url") or "").startswith("http"):
+                o3.link_button("↗ Its folder", row["folder_url"],
+                               **STRETCH)
+        st.caption("➕ To add another analysis: open its tab with this "
+                   "cell chosen and save it from ☁️ Database (bottom "
+                   "right). 📊 Across cells compares it with the others.")
+    # its fitted moduli, when the 🧮 Fitting tab saved it
+    fitted = db_fitted()
+    if fitted is not None and not fitted.empty and "cell_id" in fitted:
+        one = fitted[fitted["cell_id"].astype(str) == cell]
+        if not one.empty:
+            st.markdown("**🧮 Fitted (from the Fitting tab)**")
+            st.dataframe(one.drop(columns=[c for c in (
+                "onedrive_path", "video_url") if c in one.columns]),
+                hide_index=True, **STRETCH)
+    st.markdown("**📎 The cell's raw files**")
+    if s.get(f"_cells_files_{cell}") is None:
+        try:
+            s[f"_cells_files_{cell}"] = store.cell_files(cell)
+        except Exception:
+            s[f"_cells_files_{cell}"] = []
+    files = s[f"_cells_files_{cell}"]
+    if files:
+        st.markdown("\n".join(
+            f"- [{cells_md(f['name'])}]({cells_href(f['url'])}) · "
+            f"{f['size'] / 1e6:.2f} MB" if f.get("url")
+            else f"- {cells_md(f['name'])}" for f in files))
+    else:
+        st.caption("None yet.")
+    f1, f2 = st.columns([3, 1], vertical_alignment="bottom")
+    f1.file_uploader("Add files to this cell (force files, AFM files, "
+                     "anything…)", accept_multiple_files=True,
+                     key=f"cellsf_{int(s.get('_cells_upver', 0) or 0)}")
+    f2.button("⬆️ Add them", key="cellsb_add", on_click=cells_add_files,
+              args=(cell,), **STRETCH)
+    return cell
+
+
+def cells_read_again():
+    """🔄 Everything read from OneDrive again (saved from another window,
+    say)."""
+    s = st.session_state
+    db_items(refresh=True)
+    db_cards(refresh=True)
+    s.pop("_db_pics", None)
+    s.pop("_cells_fitted", None)
+    # the cards' fields filled again from the cards as read now
+    for key in [k for k in s if str(k).startswith(("_cells_files_",
+                                                    "cellcard_"))]:
+        s.pop(key, None)
+
+
 def cells_tab():
     s = st.session_state
     h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
-    h1.caption("Everything saved for a cell, from any tab: open any of it "
-               "again on its own tab, add the cell's raw files, and see "
-               "every cell's beat results in one table. Save from each "
-               "tab's 🗄 Cell database box.")
+    h1.caption("Every cell in one place: its card (its ID, date, "
+               "cantilever…), its pictures and everything saved in it from "
+               "any tab, to open again on its own tab and keep adding to. "
+               "📊 Across cells compares the cells.")
     with h2:
         db_status_line("cells")
     store = cell_store()
@@ -40865,135 +41646,787 @@ def cells_tab():
     note = s.pop("_cells_note", None)
     if note:
         (st.success if note.startswith("✅") else st.warning)(note)
-    p1, p2, p3 = st.columns([3, 0.5, 1.2], vertical_alignment="bottom")
-    with p1:
-        cell = db_cell_picker("cells")
-    if p2.button("🔄", key="cellsb_refresh", help="Read the database again."):
-        db_items(refresh=True)
-        s.pop(f"_cells_files_{cell}", None)
-        st.rerun()
+    if s.get("cells_mode") not in CELLS_MODES:
+        s["cells_mode"] = s.get("_cells_mode_last") or CELLS_MODES[0]
+    m1, m2 = st.columns([3, 1], vertical_alignment="center")
+    m1.segmented_control("Show", CELLS_MODES, key="cells_mode",
+                         label_visibility="collapsed")
+    s["_cells_mode_last"] = s["cells_mode"]
+    m2.button("🔄 Read again", key="cellsb_refresh", on_click=cells_read_again,
+              **STRETCH, help="Read the database again (after saving from "
+                              "another window, say).")
     items = db_items()
-    if not cell:
-        st.caption("Choose a cell, or name a new one.")
-    else:
-        try:
-            if s.get("_cells_url", (None,))[0] != cell:
-                s["_cells_url"] = (cell, store.cell_url(cell))
-            if s["_cells_url"][1]:
-                p3.link_button("↗ The cell's folder", s["_cells_url"][1],
-                               **STRETCH)
-        except Exception:
-            pass
-        mine = pd.DataFrame()
-        if items is not None and not items.empty and "cell" in items:
-            mine = items[items["cell"].astype(str) == cell]
-        st.markdown(f"#### {cell}")
-        if not mine.empty and "analysed_by" in mine:
-            names = sorted({str(v).strip() for v in mine["analysed_by"]
-                            if str(v).strip() not in ("", "nan", "None")})
-            st.caption("Analysed by: " + (", ".join(names) if names
-                                           else "nobody named yet"))
-        if mine.empty:
-            st.caption("Nothing saved in this cell yet: use 🗄 Cell database "
-                       "at the foot of any analysis tab.")
-        else:
-            shown = mine.copy()
-            shown.insert(0, "Tab", shown["kind"].map(
-                lambda k: CELL_KINDS.get(str(k), str(k))))
-            shown["saved_at"] = shown["saved_at"].astype(str).str[:16] \
-                .str.replace("T", " ")
-            if "analysed_by" not in shown:
-                shown["analysed_by"] = ""
-            keep = ["Tab", "name", "analysed_by", "saved_at", "notes"] + [
-                c for c in shown.columns if c not in (
-                    "Tab", "name", "analysed_by", "saved_at", "notes",
-                    "item_id", "cell", "kind", "onedrive_path", "folder_url",
-                    "source", "file")
-                and shown[c].notna().any()]
-            st.dataframe(shown[keep].rename(columns={
-                "name": "Name", "analysed_by": "Analysed by",
-                "saved_at": "Saved", "notes": "Notes"}),
-                hide_index=True, **STRETCH)
-            rows = {f"{r['kind']}|{r['item_id']}": r
-                    for r in mine.to_dict("records")}
-            o1, o2, o3 = st.columns([3, 1.2, 1], vertical_alignment="bottom")
-            o1.selectbox(
-                "Open", list(rows), key="cells_pick",
-                format_func=lambda k: (
-                    f"{CELL_KINDS.get(str(rows[k]['kind']), rows[k]['kind'])}"
-                    f" · {rows[k].get('name')} · "
-                    f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"
-                    + db_by(rows[k])))
-            row = rows.get(s.get("cells_pick")) or {}
-            if row:
-                o2.button("📂 Open on its tab", key="cellsb_open",
-                          type="primary", on_click=cells_open,
-                          args=(cell, str(row["kind"]), str(row["item_id"])),
-                          **STRETCH,
-                          help="Puts it back on its own tab, with its data "
-                               "and every setting.")
-                if str(row.get("folder_url") or "").startswith("http"):
-                    o3.link_button("↗ Its folder", row["folder_url"],
-                                   **STRETCH)
-        # its fitted moduli, when the 🧮 Fitting tab saved it
-        if s.get("_cells_fitted") is None:
-            try:
-                s["_cells_fitted"] = store.load_index()
-            except Exception:
-                s["_cells_fitted"] = pd.DataFrame()
-        fitted = s["_cells_fitted"]
-        if fitted is not None and not fitted.empty and "cell_id" in fitted:
-            one = fitted[fitted["cell_id"].astype(str) == cell]
-            if not one.empty:
-                st.markdown("**🧮 Fitted (from the Fitting tab)**")
-                st.dataframe(one.drop(columns=[c for c in (
-                    "onedrive_path", "video_url") if c in one.columns]),
-                    hide_index=True, **STRETCH)
-        st.markdown("**📎 The cell's raw files**")
-        if s.get(f"_cells_files_{cell}") is None:
-            try:
-                s[f"_cells_files_{cell}"] = store.cell_files(cell)
-            except Exception:
-                s[f"_cells_files_{cell}"] = []
-        files = s[f"_cells_files_{cell}"]
-        if files:
-            st.markdown("\n".join(
-                f"- [{f['name']}]({f['url']}) · {f['size'] / 1e6:.2f} MB"
-                if f.get("url") else f"- {f['name']}" for f in files))
-        else:
-            st.caption("None yet.")
-        f1, f2 = st.columns([3, 1], vertical_alignment="bottom")
-        f1.file_uploader("Add files to this cell (images, videos, force "
-                         "files…)", accept_multiple_files=True,
-                         key=f"cellsf_{int(s.get('_cells_upver', 0) or 0)}")
-        f2.button("⬆️ Add them", key="cellsb_add", on_click=cells_add_files,
-                  args=(cell,), **STRETCH)
+    if s["cells_mode"] == CELLS_MODES[0]:
+        with st.container(border=True):
+            cells_gallery(cells_catalog())
+        cells_every_beat_table(items)
+        cells_backup(store, str(s.get("db_cell") or ""))
+        return
+    cell = cells_one(store, items)
     cells_backup(store, cell)
-    if items is not None and not items.empty and "kind" in items:
-        beats = items[items["kind"].astype(str) == "beats"]
-        if not beats.empty:
-            with st.expander(f"📊 Every cell's beat results ({len(beats)} "
-                             "analyses), one line each"):
-                table = beats.drop(columns=[c for c in (
-                    "kind", "onedrive_path", "item_id") if c in beats])
-                table = table.loc[:, table.notna().any()]
-                st.dataframe(table, hide_index=True, **STRETCH,
-                             column_config={"folder_url": st.column_config
-                                            .LinkColumn("Folder")})
-                st.download_button("💾 This table (CSV)",
-                                   table.to_csv(index=False).encode("utf-8"),
-                                   file_name="beat_results_by_cell.csv",
-                                   mime="text/csv", key="cellsb_beatcsv",
-                                   **STRETCH)
-        st.download_button("💾 Everything saved, every cell (CSV)",
-                           items.to_csv(index=False).encode("utf-8"),
-                           file_name="cell_database.csv", mime="text/csv",
-                           key="cellsb_allcsv")
-
 
 with tab_celldb:
-    section("Cells: everything saved for one cell")
+    section("Cells: every cell, its card, its pictures and what is saved")
     app_fragment(cells_tab, key="cells_tab")()
+
+
+# ================================================== 📊 Across cells ==
+#
+# The database as data: the analyses saved in the cells, with each cell's
+# card (its date, cantilever, type, sample, condition) beside them, one
+# result at a time, grouped and compared across cells: box and dots, over
+# time, each cell over its analyses, one result against another, with a
+# table of each group and a test of whether the groups differ. Keys xc_*.
+
+XC_EACH = ("Every analysis", "Each cell's mean", "Each cell's latest")
+XC_VIEWS = ("📦 By group", "📅 Over time", "🔗 Cell by cell",
+            "✳️ Against another")
+# what the dots can be grouped by: (its name, its column in xc_frame)
+XC_GROUPS = (("Nothing (all together)", ""), ("Condition", "_condition"),
+             ("Cell type", "_cell_type"), ("Sample", "_sample"),
+             ("Cantilever", "_cantilever"), ("Spring constant k", "_k"),
+             ("Date recorded", "_date"), ("Month recorded", "_month"),
+             ("Cell", "cell"), ("Analysed by", "_by"))
+# what the cells can be chosen by
+XC_FILTERS = (("Condition", "_condition"), ("Cell type", "_cell_type"),
+              ("Sample", "_sample"), ("Cantilever", "_cantilever"),
+              ("Analysed by", "_by"))
+XC_CARD = ("_date", "_month", "_cantilever", "_k", "_cell_type", "_sample",
+           "_condition", "_by")
+XC_META = {"item_id", "cell", "kind", "name", "analysed_by", "saved_at",
+           "notes", "source", "file", "onedrive_path", "folder_url",
+           "video_url", "date", "cell_type", "cell_id"}
+XC_NONE = "(none)"
+XC_ORDER = ("as saved", "of their names")
+# the 🧮 Fitting tab's fitted cells (its own index): a source of its own
+XC_FITTING = "fitting"
+XC_FITTED = {"Em_MPa": "Young's modulus, Em (MPa)",
+             "Ec_kPa": "Young's modulus, Ec (kPa)",
+             "En_kPa": "Young's modulus, En (kPa)",
+             "r_squared": "R² of the fit",
+             "chi_squared_reduced": "Reduced χ² of the fit"}
+# a placeholder in BT_SUMMARY_*'s names, as a column can spell it
+XC_FILL = {"{w}": "(?:Impulse|Area)", "{f}": "(?:Peak force|Peak height)",
+           "{fw}": "(?:force|height|impulse|area)",
+           "{wl}": "(?:impulse|area)"}
+XC_STAT_ORDER = ("mean", "median", "sd", "min", "max", "range")
+
+
+def xc_key(text):
+    """Sort 2 before 10 as a person does, (none) last."""
+    text = str(text)
+    return (text == XC_NONE, [int(part) if part.isdigit() else part.lower()
+                              for part in re.split(r"(\d+)", text)])
+
+
+def xc_ranker(kind):
+    """For beats: a column's place in the ⭐ Summary ((its row, its
+    statistic: mean first)), so what comparing cells needs comes first;
+    None for the rest and for the other tabs."""
+    if kind != "beats":
+        return lambda column: None
+    patterns = []
+    for _, start in BT_SUMMARY_TOTALS + BT_SUMMARY_STATS:
+        parts = re.split(r"(\{\w+\})", start)
+        patterns.append(re.compile("^" + "".join(
+            XC_FILL.get(part, re.escape(part)) for part in parts), re.I))
+
+    def rank(column):
+        for n, pattern in enumerate(patterns):
+            if pattern.match(str(column)):
+                stat = re.search(r", (mean|median|sd|min|max|range)\b",
+                                 str(column), re.I)
+                return (n, XC_STAT_ORDER.index(stat.group(1).lower())
+                        if stat else 0)
+        return None
+    return rank
+
+
+def xc_text(values):
+    """A column as text: '' for a missing value (NaN, None), stripped."""
+    return values.map(lambda v: "" if v is None or (
+        isinstance(v, float) and not np.isfinite(v))
+        or str(v) in ("nan", "None", "NaT") else str(v).strip())
+
+
+def xc_kinds():
+    """The tabs with analyses saved in cells, in the bar's order, then
+    🧮 Fitting when it saved cells."""
+    items = db_items()
+    kinds = []
+    if items is not None and not items.empty and "kind" in items:
+        saved = set(items["kind"].astype(str))
+        kinds = [k for k in CELL_KINDS if k in saved]
+    fitted = db_fitted()
+    if fitted is not None and not fitted.empty and "cell_id" in fitted:
+        kinds.append(XC_FITTING)
+    return kinds
+
+
+def xc_kind_name(kind):
+    return "🧮 Fitting" if kind == XC_FITTING else CELL_KINDS.get(kind, kind)
+
+
+def xc_frame(kind):
+    """
+    The analyses saved from one tab (``kind``), a row each, with their
+    cell's card beside them (_date, _month, _cantilever, _k, _cell_type,
+    _sample, _condition), who analysed them (_by) and when each was saved
+    (_saved).
+    """
+    if kind == XC_FITTING:
+        fitted = db_fitted()
+        if fitted is None or fitted.empty or "cell_id" not in fitted:
+            return pd.DataFrame()
+        frame = fitted.rename(columns=XC_FITTED).copy()
+        frame["cell"] = frame["cell_id"].astype(str)
+        frame["kind"], frame["item_id"] = XC_FITTING, ""
+        frame["name"] = "the fit"
+    else:
+        items = db_items()
+        if items is None or items.empty or "kind" not in items:
+            return pd.DataFrame()
+        frame = items[items["kind"].astype(str) == str(kind)].copy()
+    if frame.empty:
+        return frame.reset_index(drop=True)
+    frame["cell"] = frame["cell"].astype(str).str.strip()
+    catalog = cells_catalog()
+    card = catalog.set_index("Cell") if not catalog.empty else pd.DataFrame()
+    for name, column in (("_date", "Date"), ("_cantilever", "Cantilever"),
+                         ("_k", "k (N/m)"), ("_cell_type", "Cell type"),
+                         ("_sample", "Sample"),
+                         ("_condition", "Condition")):
+        frame[name] = (xc_text(frame["cell"].map(card[column]))
+                       if column in card else "")
+    if kind == XC_FITTING:
+        # the Fitting tab's own date and type, for a cell without a card
+        for name, column in (("_date", "date"), ("_cell_type", "cell_type")):
+            if column in frame:
+                own = xc_text(frame[column])
+                if column == "date":
+                    own = own.str[:10]
+                frame[name] = frame[name].where(frame[name] != "", own)
+    frame["_month"] = frame["_date"].str[:7]
+    frame["_by"] = (xc_text(frame["analysed_by"])
+                    if "analysed_by" in frame else "")
+    frame["_saved"] = pd.to_datetime(frame["saved_at"], errors="coerce") \
+        if "saved_at" in frame else pd.NaT
+    frame["name"] = xc_text(frame["name"]) if "name" in frame else ""
+    return frame.reset_index(drop=True)
+
+
+def xc_parameters(frame, kind):
+    """The results of these analyses that are numbers, a column each: for
+    beats the ⭐ Summary's first, in its order (mean, median, SD…)."""
+    columns = []
+    for column in frame.columns:
+        if column in XC_META or str(column).startswith("_"):
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").astype(float)
+        if np.isfinite(values.to_numpy()).any():
+            columns.append(column)
+    rank = xc_ranker(kind)
+    first = sorted((c for c in columns if rank(c) is not None), key=rank)
+    return first + [c for c in columns if rank(c) is None]
+
+
+def xc_points(frame, columns, each, group):
+    """
+    The dots: a row per analysis, or per cell (each cell's mean, or its
+    latest analysis) within each group, with ``columns`` as numbers,
+    _group (from ``group``, a column of xc_frame, '' for none), _n (how
+    many analyses a dot stands for) and _what (what it is, in words).
+    """
+    work = frame.copy()
+    for column in columns:
+        work[column] = pd.to_numeric(work[column], errors="coerce") \
+            .astype(float)
+    work["_group"] = (xc_text(work[group]).replace("", XC_NONE)
+                      if group else "All")
+    work["_n"] = 1
+    work["_what"] = work["name"]
+    if work.empty or each == XC_EACH[0]:
+        return work.reset_index(drop=True)
+    work = work.sort_values("_saved", na_position="first", kind="stable")
+    if each == XC_EACH[2]:
+        latest = work.groupby("cell", sort=False).tail(1).copy()
+        latest["_n"] = latest["cell"].map(work.groupby("cell").size())
+        latest["_what"] = [f"{name} (the latest of {n})" if n > 1 else name
+                           for name, n in zip(latest["name"], latest["_n"])]
+        return latest.reset_index(drop=True)
+    grouped = work.groupby(["cell", "_group"], sort=False)
+    out = grouped[list(columns)].mean()
+    out = out.join(grouped[[c for c in XC_CARD if c in work]].first())
+    out["_saved"] = grouped["_saved"].max()
+    out["_n"] = grouped.size()
+    out = out.reset_index()
+    out["_what"] = [f"the mean of {n} analyses" if n != 1
+                    else "its one analysis" for n in out["_n"]]
+    out["name"], out["item_id"] = out["_what"], ""
+    out["kind"] = work["kind"].iloc[0]
+    return out
+
+
+def xc_colours(names):
+    """A colour for each group, by its place among every group of the
+    data (so a filter does not repaint the others); one colour for all
+    when there are more groups than colours (their names say which)."""
+    names = sorted({str(n) for n in names}, key=xc_key)
+    if len(names) > len(CELL_COLORS):
+        return {name: CELL_COLORS[0] for name in names}
+    return {name: CELL_COLORS[n] for n, name in enumerate(names)}
+
+
+def xc_wrap(text, width=42):
+    """A long axis title on lines of its own."""
+    import textwrap
+
+    return "<br>".join(textwrap.wrap(html.escape(str(text)), width)) or ""
+
+
+def xc_pick_id(row):
+    """What a dot is, for a click: its cell and its analysis."""
+    return f"{row['cell']}::{row.get('item_id') or ''}"
+
+
+def xc_hover(row, column, other=None, shown=None):
+    """The words over a dot: its cell, what it is, its group and date, its
+    value (and the other one's)."""
+    lines = [f"<b>{html.escape(str(row['cell']))}</b>"]
+    if row.get("_what"):
+        lines.append(html.escape(str(row["_what"])))
+    group = str(row.get("_group") or "")
+    if group and group not in ("All", str(row["cell"])):
+        lines.append(html.escape(group))
+    if row.get("_date"):
+        lines.append(f"📅 {html.escape(str(row['_date']))}")
+    value = row.get(column)
+    lines.append(f"{html.escape(str(column))}: {bta.pretty(value, 4)}")
+    if shown is not None:
+        lines.append(f"× its first: {bta.pretty(shown, 3)}")
+    if other is not None:
+        lines.append(f"{html.escape(str(other))}: "
+                     f"{bta.pretty(row.get(other), 4)}")
+    return "<br>".join(lines)
+
+
+def xc_style(figure, ytitle, xtitle="", legend=True, height=480):
+    """The look of the beat tab's comparisons: bold black axes."""
+    figure.update_layout(template="plotly_white", height=height,
+                         margin=dict(l=80, r=20, t=50, b=70),
+                         showlegend=legend, hovermode="closest",
+                         legend=dict(orientation="h", yanchor="bottom",
+                                     y=1.02, x=0))
+    figure.update_yaxes(title_text=xc_wrap(ytitle), exponentformat="power")
+    figure.update_xaxes(title_text=xc_wrap(xtitle, 70),
+                        exponentformat="power")
+    return bt_bold_axes(figure)
+
+
+def xc_group_figure(points, column, colours, picks, xtitle):
+    """📦 A box and its dots for each group."""
+    figure = go.Figure()
+    names = sorted(points["_group"].unique(), key=xc_key)
+    ticks = []
+    for x, name in enumerate(names):
+        part = points[(points["_group"] == name)
+                      & np.isfinite(points[column])]
+        rows = part.to_dict("records")
+        for row in rows:
+            picks[xc_pick_id(row)] = row
+        bt_dots(figure, x, part[column].to_numpy(float),
+                colours.get(name, CELL_COLORS[0]), name,
+                [xc_pick_id(r) for r in rows],
+                [xc_hover(r, column) for r in rows], width=0.55)
+        ticks.append(f"{html.escape(name)}<br>n = {len(rows)}")
+    figure.update_xaxes(tickvals=list(range(len(names))), ticktext=ticks,
+                        range=[-0.6, len(names) - 0.4])
+    return xc_style(figure, column, xtitle, legend=False)
+
+
+def xc_time_figure(points, column, colours, picks):
+    """📅 Each dot on the day its cell was recorded, a line through each
+    group's mean of each day. -> (figure, how many dots have no date)."""
+    figure = go.Figure()
+    when = pd.to_datetime(points["_date"], errors="coerce")
+    good = np.isfinite(points[column])
+    names = sorted(points["_group"].unique(), key=xc_key)
+    for name in names:
+        part = points[good & when.notna() & (points["_group"] == name)]
+        if part.empty:
+            continue
+        rows = part.to_dict("records")
+        for row in rows:
+            picks[xc_pick_id(row)] = row
+        colour = colours.get(name, CELL_COLORS[0])
+        days = when[part.index]
+        figure.add_trace(go.Scatter(
+            x=days, y=part[column], mode="markers", name=name,
+            legendgroup=name,
+            marker=dict(color=colour, size=9, opacity=0.85,
+                        line=dict(color="white", width=1)),
+            customdata=[[xc_pick_id(r)] for r in rows],
+            text=[xc_hover(r, column) for r in rows],
+            hovertemplate="%{text}<extra></extra>"))
+        daily = part[column].groupby(days).mean().sort_index()
+        if len(daily) >= 2:
+            figure.add_trace(go.Scatter(
+                x=daily.index, y=daily.to_numpy(), mode="lines",
+                line=dict(color=colour, width=2), opacity=0.55,
+                legendgroup=name, showlegend=False, hoverinfo="skip"))
+    missing = int((good & when.isna()).sum())
+    return xc_style(figure, column, "Date recorded",
+                    legend=len(names) > 1), missing
+
+
+def xc_cells_figure(frame, column, group, colours, order, relative, picks):
+    """
+    🔗 Each cell over its analyses, in order (as saved, or of their
+    names): a line each, coloured by its group, or by cell. ÷ its first
+    with ``relative``. -> (figure, a table of each cell's first and last).
+    """
+    figure = go.Figure()
+    work = frame.copy()
+    work[column] = pd.to_numeric(work[column], errors="coerce").astype(float)
+    work = work[np.isfinite(work[column])]
+    by_cell = not group or group == "cell"
+    legend, table = set(), []
+    order_of = {name: n for n, name in enumerate(sorted(colours, key=xc_key))}
+    for cell in sorted(work["cell"].unique(), key=xc_key):
+        part = work[work["cell"] == cell]
+        if order == XC_ORDER[1]:
+            part = part.iloc[sorted(range(len(part)), key=lambda i: xc_key(
+                part["name"].iloc[i]))]
+        else:
+            part = part.sort_values("_saved", na_position="first",
+                                    kind="stable")
+        y = part[column].to_numpy(float)
+        ratio = y / y[0] if y[0] != 0 else np.full(y.size, np.nan)
+        name = cell if by_cell else (
+            str(part[group].iloc[0]).strip() or XC_NONE)
+        colour = colours.get(name, CELL_COLORS[0])
+        rows = [dict(r, _group=name, _what=r.get("name") or "")
+                for r in part.to_dict("records")]
+        for row in rows:
+            picks[xc_pick_id(row)] = row
+        figure.add_trace(go.Scatter(
+            x=np.arange(1, y.size + 1), y=ratio if relative else y,
+            mode="lines+markers", name=name, legendgroup=name,
+            showlegend=name not in legend,
+            legendrank=1000 + order_of.get(name, len(order_of)),
+            line=dict(color=colour, width=2),
+            marker=dict(color=colour, size=8,
+                        line=dict(color="white", width=1)),
+            customdata=[[xc_pick_id(r)] for r in rows],
+            text=[xc_hover(r, column, shown=q if relative else None)
+                  for r, q in zip(rows, ratio)],
+            hovertemplate="%{text}<extra></extra>"))
+        legend.add(name)
+        table.append({"Cell": cell, "Group": "" if by_cell else name,
+                      "Analyses": int(y.size), "First": y[0],
+                      "Last": y[-1],
+                      "Last ÷ first": y[-1] / y[0] if y[0] else np.nan})
+    figure.update_xaxes(dtick=1)
+    title = f"{column} ÷ the cell's first" if relative else column
+    return (xc_style(figure, title, f"Analysis, in the order {order}",
+                     legend=len(legend) > 1), pd.DataFrame(table))
+
+
+def xc_scatter_figure(points, column, other, colours, picks):
+    """✳️ One result against another, a dot each, coloured by group.
+    -> (figure, Spearman's words)."""
+    figure = go.Figure()
+    good = np.isfinite(points[column]) & np.isfinite(points[other])
+    names = sorted(points["_group"].unique(), key=xc_key)
+    for name in names:
+        part = points[good & (points["_group"] == name)]
+        if part.empty:
+            continue
+        rows = part.to_dict("records")
+        for row in rows:
+            picks[xc_pick_id(row)] = row
+        figure.add_trace(go.Scatter(
+            x=part[other], y=part[column], mode="markers", name=name,
+            marker=dict(color=colours.get(name, CELL_COLORS[0]), size=9,
+                        opacity=0.85, line=dict(color="white", width=1)),
+            customdata=[[xc_pick_id(r)] for r in rows],
+            text=[xc_hover(r, column, other=other) for r in rows],
+            hovertemplate="%{text}<extra></extra>"))
+    words = ""
+    x = points.loc[good, other].to_numpy(float)
+    y = points.loc[good, column].to_numpy(float)
+    if x.size >= 3 and np.ptp(x) > 0 and np.ptp(y) > 0:
+        import warnings
+
+        from scipy import stats
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rho, p = stats.spearmanr(x, y)
+        words = (f"Spearman's ρ = {rho:.2f} ({xc_p(p)}, n = {x.size}): "
+                 "how closely one goes up (or down) with the other, 1 or "
+                 "−1 always, 0 not at all.")
+    return xc_style(figure, column, other, legend=len(names) > 1), words
+
+
+def xc_p(p):
+    """A p-value to read: p = 0.012, p < 0.0001."""
+    if p is None or not np.isfinite(p):
+        return "p not known"
+    return "p < 0.0001" if p < 1e-4 else f"p = {p:.2g}"
+
+
+def xc_summary(points, column):
+    """Each group's n, cells, mean, SD, SEM, median, min and max."""
+    rows = []
+    for name in sorted(points["_group"].unique(), key=xc_key):
+        part = points[(points["_group"] == name)
+                      & np.isfinite(points[column])]
+        d = bta.describe(part[column].to_numpy(float))
+        rows.append({"Group": name, "n": d["n"],
+                     "Cells": int(part["cell"].nunique()), "Mean": d["Mean"],
+                     "SD": d["SD"],
+                     "SEM": d["SD"] / np.sqrt(d["n"]) if d["n"] > 1
+                     else np.nan,
+                     "Median": d["Median"], "Min": d["Min"],
+                     "Max": d["Max"]})
+    return pd.DataFrame(rows)
+
+
+def xc_test(points, column):
+    """Whether the groups differ, in words ('' with fewer than two groups
+    of two dots or more)."""
+    groups = []
+    for name in sorted(points["_group"].unique(), key=xc_key):
+        v = points.loc[points["_group"] == name, column].to_numpy(float)
+        v = v[np.isfinite(v)]
+        if v.size >= 2:
+            groups.append((name, v))
+    if len(groups) < 2:
+        return ""
+    import warnings
+
+    from scipy import stats
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore")
+        if len(groups) == 2:
+            (a_name, a), (b_name, b) = groups
+            try:
+                mw = stats.mannwhitneyu(a, b, alternative="two-sided").pvalue
+            except ValueError:
+                mw = np.nan
+            welch = stats.ttest_ind(a, b, equal_var=False).pvalue
+            return (f"**{cells_md(a_name)}** against **{cells_md(b_name)}**:"
+                    f" Mann–Whitney U {xc_p(mw)} · Welch's t-test "
+                    f"{xc_p(welch)}")
+        try:
+            kw = stats.kruskal(*[v for _, v in groups]).pvalue
+        except ValueError:
+            kw = np.nan
+        anova = stats.f_oneway(*[v for _, v in groups]).pvalue
+        return (f"{len(groups)} groups: Kruskal–Wallis {xc_p(kw)} · "
+                f"one-way ANOVA {xc_p(anova)}")
+
+
+def xc_neat(frame):
+    """A table's numbers as they read on screen (four figures)."""
+    out = frame.copy()
+    for column in out.columns:
+        if out[column].dtype.kind == "f":
+            out[column] = out[column].map(
+                lambda v: "" if not np.isfinite(v) else bta.pretty(v, 4))
+    return out
+
+
+def xc_show_cell(cell):
+    """🗂 The cell on its own, on 🗂 Cells."""
+    cells_open_card(cell)
+    app_open_tab("🗂 Cells")
+
+
+def xc_chart(figure, picks, key):
+    """The figure; a click on a dot -> its row of ``picks`` (else None).
+    A dot is known by its cell and analysis, so a click kept from before
+    a filter or another result never says another dot."""
+    figure.update_layout(clickmode="event+select", dragmode="zoom")
+    event = st.plotly_chart(figure, key=key, on_select="rerun",
+                            selection_mode="points", **STRETCH,
+                            config={"displaylogo": False})
+    try:
+        points = list(event.selection.points or [])
+    except Exception:
+        points = []
+    for point in reversed(points):
+        data = point.get("customdata")
+        if isinstance(data, (list, tuple)):
+            data = data[0] if data else None
+        if data in picks:
+            return picks[data]
+    return None
+
+
+def xc_picked(row, column, kind):
+    """A dot clicked: what it is, its analysis opened on its tab, its
+    cell on 🗂 Cells."""
+    cell = str(row["cell"])
+    with st.container(border=True):
+        what = cells_md(row.get("_what") or "")
+        value = bta.pretty(row.get(column), 4)
+        st.markdown(f"**{cells_md(cell)}** · {what} · {cells_md(column)}: "
+                    f"**{value}**")
+        b1, b2 = st.columns(2)
+        if row.get("item_id") and kind in CELL_OPENERS:
+            b1.button("📂 Open it on its tab", key="xcb_open", type="primary",
+                      on_click=cells_open,
+                      args=(cell, str(row.get("kind") or kind),
+                            str(row["item_id"])), **STRETCH,
+                      help="With its data and every setting.")
+        b2.button("🗂 Open the cell", key="xcb_cell", on_click=xc_show_cell,
+                  args=(cell,), **STRETCH,
+                  help="Its card, pictures and everything saved in it.")
+
+
+def xc_filter(frame):
+    """🔎 Which cells: by their cards (condition, type, sample,
+    cantilever), who analysed them, when they were recorded, some left
+    out. -> the analyses kept."""
+    s = st.session_state
+    fields = []
+    for label, column in XC_FILTERS:
+        text = frame[column].astype(str).str.strip()
+        values = sorted(set(text) - {""}, key=xc_key)
+        if values:
+            fields.append((label, column, values + (
+                [XC_NONE] if (text == "").any() else [])))
+    cells = sorted(frame["cell"].unique(), key=xc_key)
+    for key, options in [(f"xc_f{c}", v) for _, c, v in fields] + [
+            ("xc_out", cells)]:
+        kept = [v for v in (s.get(key) or []) if v in options]
+        if kept != list(s.get(key) or []):
+            s[key] = kept
+    dates = pd.to_datetime(frame["_date"], errors="coerce").dropna()
+    on = sum(bool(s.get(f"xc_f{c}")) for _, c, _ in fields) \
+        + bool(s.get("xc_out")) \
+        + bool(s.get("xc_when_on") and dates.nunique() >= 2)
+    with st.expander("🔎 Which cells" + (f" ({on} choice"
+                                         f"{'s' if on != 1 else ''})"
+                                         if on else ": every cell")):
+        if fields:
+            cols = st.columns(min(3, len(fields)))
+            for n, (label, column, values) in enumerate(fields):
+                cols[n % len(cols)].multiselect(label, values,
+                                                key=f"xc_f{column}",
+                                                placeholder="all")
+        else:
+            st.caption("Give the cells a card (🗂 Cells: condition, type, "
+                       "sample, cantilever) to choose them by it.")
+        st.multiselect("Leave out", cells, key="xc_out", placeholder="none")
+        if dates.nunique() >= 2:
+            w1, w2 = st.columns([1, 2], vertical_alignment="bottom")
+            w1.toggle("Only recorded between", key="xc_when_on")
+            if s.get("xc_when_on"):
+                w2.date_input("Dates", value=(dates.min().date(),
+                                              dates.max().date()),
+                              key="xc_when", label_visibility="collapsed")
+    keep = pd.Series(True, index=frame.index)
+    for _, column, _ in fields:
+        chosen = s.get(f"xc_f{column}") or []
+        if chosen:
+            keep &= frame[column].astype(str).str.strip().replace(
+                "", XC_NONE).isin(chosen)
+    if s.get("xc_out"):
+        keep &= ~frame["cell"].isin(s["xc_out"])
+    span = s.get("xc_when")
+    if s.get("xc_when_on") and dates.nunique() >= 2 \
+            and isinstance(span, (tuple, list)) and len(span) >= 1:
+        when = pd.to_datetime(frame["_date"], errors="coerce")
+        keep &= when.between(pd.Timestamp(span[0]), pd.Timestamp(span[-1]))
+    return frame[keep]
+
+
+def xc_tab():
+    s = st.session_state
+    h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
+    h1.caption("The whole database at once: one result of every analysis "
+               "saved in a cell, with each cell's card (🗂 Cells: its date, "
+               "cantilever, type, sample, condition), grouped and compared "
+               "across cells. A click on a dot says which analysis it is "
+               "and opens it.")
+    with h2:
+        db_status_line("xc")
+    store = cell_store()
+    if store is None:
+        st.info("Connect OneDrive (☁️ Database, bottom right, or 🗂 Cells) "
+                "to compare the cells.", icon="📊")
+        return
+    note = s.pop("_cells_note", None)
+    if note:
+        (st.success if note.startswith("✅") else st.warning)(note)
+    kinds = xc_kinds()
+    if not kinds:
+        st.info("Nothing saved in a cell yet: save analyses from their tabs "
+                "(☁️ Database, bottom right), and give each cell a card in "
+                "🗂 Cells to group them by condition, date, cantilever…",
+                icon="📊")
+        st.button("🔄 Read again", key="xcb_refresh0",
+                  on_click=cells_read_again)
+        return
+    if s.get("xc_kind") not in kinds:
+        s["xc_kind"] = "beats" if "beats" in kinds else kinds[0]
+    c1, c2, c3 = st.columns([1.4, 3, 0.9], vertical_alignment="bottom")
+    c1.selectbox("From", kinds, key="xc_kind", format_func=xc_kind_name,
+                 help="The tab whose saved analyses are compared.")
+    c3.button("🔄 Read again", key="xcb_refresh", on_click=cells_read_again,
+              **STRETCH, help="Read the database again (after saving from "
+                              "another window, say).")
+    kind = s["xc_kind"]
+    frame = xc_frame(kind)
+    params = xc_parameters(frame, kind) if not frame.empty else []
+    if not params:
+        c2.empty()
+        st.info("These analyses have no results to compare.", icon="📊")
+        return
+    pkey = f"xc_param_{kind}"
+    if s.get(pkey) not in params:
+        s[pkey] = next((p for p in params
+                        if str(p).startswith("Beats per minute")), params[0])
+    c2.selectbox("Result", params, key=pkey,
+                 help="Every result saved with these analyses (for beats, "
+                      "the ⭐ Summary's first). Type to search.")
+    column = s[pkey]
+    if s.get("xc_view") not in XC_VIEWS:
+        s["xc_view"] = s.get("_xc_view_last") or XC_VIEWS[0]
+    st.segmented_control("View", XC_VIEWS, key="xc_view",
+                         label_visibility="collapsed")
+    s["_xc_view_last"] = view = s["xc_view"]
+    groups = [(label, col) for label, col in XC_GROUPS
+              if not col or col == "cell"
+              or (frame[col].astype(str).str.strip() != "").any()]
+    labels = [label for label, _ in groups]
+    if s.get("xc_group") not in labels:
+        s["xc_group"] = next(
+            (label for label, col in groups
+             if col in ("_condition", "_cell_type", "_sample", "_cantilever")
+             and frame[col].astype(str).str.strip().replace(
+                 "", XC_NONE).nunique() >= 2), "Cell")
+    d1, d2, d3 = st.columns(3, vertical_alignment="bottom")
+    if s.get("xc_each") not in XC_EACH:
+        s["xc_each"] = XC_EACH[0]
+    d1.selectbox("Each dot is", XC_EACH, key="xc_each",
+                 disabled=view == XC_VIEWS[2],
+                 help="Comparing groups of cells, a cell analysed three "
+                      "times should count once: each cell's mean (or its "
+                      "latest analysis) does that. 🔗 Cell by cell always "
+                      "shows every analysis.")
+    d2.selectbox("Group by", labels, key="xc_group",
+                 help="By the cells' cards (🗂 Cells: condition, type, "
+                      "sample, cantilever, date), the cell, or who analysed "
+                      "it.")
+    group = dict(groups)[s["xc_group"]]
+    other = None
+    if view == XC_VIEWS[3]:
+        others = [p for p in params if p != column]
+        okey = f"xc_other_{kind}"
+        if others:
+            if s.get(okey) not in others:
+                s[okey] = others[0]
+            d3.selectbox("Against", others, key=okey,
+                         help="The result across (x).")
+            other = s[okey]
+        else:
+            d3.caption("Only one result to set against it.")
+    elif view == XC_VIEWS[2]:
+        if s.get("xc_order") not in XC_ORDER:
+            s["xc_order"] = XC_ORDER[0]
+        d3.selectbox("Analyses in the order", XC_ORDER, key="xc_order",
+                     format_func=lambda o: f"… {o}")
+    shown = xc_filter(frame)
+    if shown.empty:
+        st.caption("No analysis is left: change 🔎 Which cells.")
+        return
+    picks = {}
+    all_groups = xc_points(frame, [column], XC_EACH[0], group)["_group"]
+    if view == XC_VIEWS[2]:
+        relative = st.toggle("÷ each cell's first analysis", key="xc_rel",
+                             help="Each cell's change from its first, so "
+                                  "cells that start apart can be compared.")
+        colours = xc_colours(frame["cell"] if not group or group == "cell"
+                             else all_groups)
+        figure, table = xc_cells_figure(shown, column, group, colours,
+                                        s["xc_order"], relative, picks)
+        used = int(table["Analyses"].sum()) if len(table) else 0
+        st.caption(f"{len(table)} cells · {used} analyses")
+        picked = xc_chart(figure, picks, "xc_chart_cells")
+        if picked:
+            xc_picked(picked, column, kind)
+        if not table.empty:
+            if not group or group == "cell":
+                table = table.drop(columns=["Group"])
+            st.dataframe(xc_neat(table), hide_index=True, **STRETCH)
+            st.download_button("💾 This table (CSV)",
+                               table.to_csv(index=False).encode("utf-8"),
+                               file_name="each_cell_first_and_last.csv",
+                               mime="text/csv", key="xcb_cellscsv")
+        return
+    columns = [column] + ([other] if other else [])
+    points = xc_points(shown, columns, s["xc_each"], group)
+    colours = xc_colours(all_groups)
+    good = np.isfinite(points[column])
+    used = (int(points.loc[good, "_n"].sum()) if s["xc_each"] == XC_EACH[1]
+            else int(good.sum()))
+    st.caption(f"{int(good.sum())} dots · "
+               f"{points.loc[good, 'cell'].nunique()} cells · {used} "
+               "analyses" + ("" if s["xc_each"] == XC_EACH[0]
+                             else f" · {s['xc_each'].lower()}"))
+    if view == XC_VIEWS[3]:
+        if not other:
+            return
+        figure, words = xc_scatter_figure(points, column, other, colours,
+                                          picks)
+    elif view == XC_VIEWS[1]:
+        figure, missing = xc_time_figure(points, column, colours, picks)
+        words = (f"{missing} dot{'s' if missing != 1 else ''} without a "
+                 "date left out: give their cells a date in 🗂 Cells, or "
+                 "IDs that start with one." if missing else "")
+    else:
+        figure = xc_group_figure(points, column, colours, picks,
+                                 s["xc_group"] if group else "")
+        words = ""
+    picked = xc_chart(figure, picks, f"xc_chart_{XC_VIEWS.index(view)}")
+    if words:
+        st.caption(words)
+    if picked:
+        xc_picked(picked, column, kind)
+    summary = xc_summary(points, column)
+    st.markdown(f"**{cells_md(column)}, by group**" if group
+                else f"**{cells_md(column)}**")
+    st.dataframe(xc_neat(summary), hide_index=True, **STRETCH)
+    test = xc_test(points, column) if group else ""
+    if test:
+        st.markdown("🧪 " + test)
+        st.caption("Each dot counts as one independent value. When cells "
+                   "were analysed more than once, compare each cell's mean "
+                   "(Each dot is), or the test counts one cell many times.")
+    t1, t2 = st.columns(2)
+    t1.download_button("💾 This table (CSV)",
+                       summary.to_csv(index=False).encode("utf-8"),
+                       file_name="across_cells_summary.csv", mime="text/csv",
+                       key="xcb_sumcsv", **STRETCH)
+    values = points.loc[good, ["cell", "_what", "_group", "_date"]
+                        + columns + ["_n"]].rename(columns={
+                            "cell": "Cell", "_what": "What",
+                            "_group": "Group", "_date": "Date recorded",
+                            "_n": "Analyses"})
+    t2.download_button("💾 Every dot (CSV)",
+                       values.to_csv(index=False).encode("utf-8"),
+                       file_name="across_cells_values.csv", mime="text/csv",
+                       key="xcb_valcsv", **STRETCH)
+    with st.expander(f"📋 Every dot ({len(values)})"):
+        st.dataframe(xc_neat(values), hide_index=True, **STRETCH)
+
+
+with tab_across:
+    section("Across cells: the whole database compared")
+    app_fragment(xc_tab, key="xc_tab")()
 
 
 # ================================================== ☁️ the floating menu ==
@@ -41177,15 +42610,26 @@ def fdb_body():
     fdb_open_part(store, cell)
 
 
+def fdb_dismissed():
+    """
+    The menu closed: the whole app run again. That brings the open tab up
+    to date (a cell chosen in the menu shows there too) and takes the menu
+    off the page: Streamlit keeps a dialog apart from the fragments, so
+    rerunning only the open tab (quicker) or the menu's button left it
+    there, closed, to open again by itself when another tab was opened.
+    """
+    st.rerun()
+
+
 def fdb_dialog_maker():
-    """st.dialog for the menu: closing it brings the open tab up to date
-    (a cell chosen in it shows there too). None without dialogs."""
+    """st.dialog for the menu (fdb_dismissed when it closes). None
+    without dialogs."""
     maker = getattr(st, "dialog", None)
     if maker is None:
         return None
     try:
         return maker("☁️ Cell database", width="large",
-                     on_dismiss=app_tab_opened)(fdb_body)
+                     on_dismiss=fdb_dismissed)(fdb_body)
     except TypeError:
         return maker("☁️ Cell database", width="large")(fdb_body)
 
