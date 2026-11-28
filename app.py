@@ -22810,7 +22810,15 @@ def refit_stored_cell(store, cell_id, settings):
 
 
 
-def od_signin_block(account, refresh_token):
+def od_sign_tenant():
+    """The directory (tenant) the sign-in goes to: the one typed for a
+    registration made for one organization, else the Secrets' (none: the
+    account type's own endpoint)."""
+    typed = str(st.session_state.get("od_tenant") or "").strip()
+    return typed or od_config().get("tenant") or None
+
+
+def od_signin_block(account, refresh_token, tenant=None):
     """The [onedrive] block for Secrets, with this sign-in's token in it."""
     config = od_config()
     root = (config.get("root_folder") or st.session_state.get("onedrive_root")
@@ -22818,11 +22826,117 @@ def od_signin_block(account, refresh_token):
     return ("[onedrive]\n"
             f'account = "{account}"\n'
             f'client_id = "{config.get("client_id", "")}"\n'
-            f'refresh_token = "{refresh_token}"\n'
+            + (f'tenant = "{tenant}"\n' if tenant else "")
+            + f'refresh_token = "{refresh_token}"\n'
             f'root_folder = "{root}"')
 
 
-def od_signin_finish(payload, account):
+def od_signin_help(error):
+    """
+    What a sign-in error from Microsoft means and what to change, as
+    markdown ('' for one not known), whatever onedrive_store.py's own
+    explanations are; and which of the buttons under it can help:
+    "work" (sign in as a work or school account) or "tenant" (type the
+    organization's directory id).
+    """
+    text = str(error)
+    named = re.search(r"Application '[^']*'\(([^)]*)\)", text)
+    app = f"**{named.group(1)}**" if named else "your app"
+    personal_fix = (
+        "In [portal.azure.com](https://portal.azure.com) → **App "
+        f"registrations** → **All applications** → {app} → **Manifest**: "
+        "set `\"requestedAccessTokenVersion\": 2` (inside `api`) and "
+        "**Save**; then set `\"signInAudience\": "
+        "\"AzureADandPersonalMicrosoftAccount\"` and **Save** again. Wait "
+        "a few minutes and sign in again. (Or make a new registration with "
+        "*Accounts in any organizational directory and personal Microsoft "
+        "accounts*, allow public client flows on it, and put its client id "
+        "in Secrets.)")
+    if "AADSTS9002332" in text or "Azure Active Directory users only" in text:
+        return ("**The app registration in Azure accepts work or school "
+                "accounts only, and the app is signing in a personal "
+                "Microsoft account** (as your Secrets say: account = "
+                "\"personal\").\n\n"
+                "- **Your OneDrive is a personal one** (outlook, hotmail, "
+                "live, or a Microsoft account made with another email): let "
+                f"the registration take personal accounts. {personal_fix}\n"
+                "- **Your OneDrive is a university or work one:** press "
+                "**🎓 Sign in with a work or school account** below."), "work"
+    if "AADSTS50194" in text or "not configured as a multi-tenant" in text:
+        return ("**The app registration is for one organization only**, so "
+                "the sign-in has to go to that organization's directory. "
+                "Copy the **Directory (tenant) ID** from the app's "
+                "**Overview** page in Azure, paste it below and sign in."), \
+            "tenant"
+    if "AADSTS50020" in text or "does not exist in tenant" in text:
+        return ("**That account is not one the registration lets in** (it "
+                "takes only its own organization's accounts). Let it take "
+                "personal accounts and every organization's: "
+                f"{personal_fix}"), ""
+    if "AADSTS7000218" in text or "client_assertion" in text:
+        return ("**The app registration does not allow this sign-in yet.** "
+                "In Azure, open the app → **Authentication** → **Advanced "
+                "settings** → **Allow public client flows: Yes** → "
+                "**Save**, then sign in again."), ""
+    if "AADSTS700016" in text or "was not found in the directory" in text:
+        return ("**Microsoft does not know this client_id for this kind of "
+                "account.** Check that the client_id in Secrets is the "
+                "app's **Application (client) ID** (its Overview page), "
+                "and that the registration takes this kind of account."), ""
+    return "", ""
+
+
+def od_signin_error_box(where):
+    """🔑 Why the sign-in failed, what to change, and a button to try the
+    other way when one could help. Microsoft's own words folded away."""
+    s = st.session_state
+    error = s.get("_od_signin_error")
+    if not error:
+        return
+    raw = str(error).split("\n\n")[0]
+    fix, action = od_signin_help(error)
+    if not fix:
+        st.error(str(error), icon="🔑")
+        return
+    st.error(fix, icon="🔑")
+    if action == "work":
+        st.button("🎓 Sign in with a work or school account", key=
+                  f"od_work_{where}", on_click=od_signin_as, args=("work",),
+                  **STRETCH, help="For a university or company OneDrive: "
+                                  "signs in through work and school "
+                                  "accounts' sign-in instead.")
+    elif action == "tenant":
+        t1, t2 = st.columns([2, 1], vertical_alignment="bottom")
+        t1.text_input("Directory (tenant) ID", key="od_tenant",
+                      placeholder="36 characters, from the app's Overview")
+        t2.button("🔑 Sign in there", key=f"od_tenant_go_{where}",
+                  on_click=od_signin_as, args=(None,), **STRETCH,
+                  disabled=not od_client_id_ok(s.get("od_tenant")))
+    with st.expander("Microsoft's own message (to send if it stays)"):
+        st.code(raw, language=None)
+
+
+def od_signin_as(account=None):
+    """Sign in again as ``account`` (None: the same kind), kept for this
+    sign-in over what Secrets say."""
+    s = st.session_state
+    if account:
+        s["_od_account_override"] = account
+    od_signin_start(od_sign_account())
+
+
+def od_sign_account(where=None):
+    """The account type this sign-in uses: one chosen after an error, else
+    the Secrets', else the one picked here, else personal."""
+    s = st.session_state
+    config = od_config()
+    return (s.get("_od_account_override") or config.get("account")
+            or (s.get(f"od_account_{where}") if where else None)
+            or s.get("_device_account") or s.get("onedrive_account")
+            or "personal")
+
+
+def od_signin_finish(payload, account, tenant=None):
     """
     Signed in: the app connected with the new sign-in at once, in this
     window and every other (in memory, until the app restarts), and the
@@ -22840,7 +22954,7 @@ def od_signin_finish(payload, account):
                                  "API permissions).")
         return False
     store = onedrive_store.OneDriveStore(
-        client_id=config.get("client_id"), tenant=config.get("tenant"),
+        client_id=config.get("client_id"), tenant=tenant,
         refresh_token=token, account=account,
         root_folder=s.get("onedrive_root") or config.get("root_folder")
         or "AFM cells")
@@ -22849,7 +22963,7 @@ def od_signin_finish(payload, account):
         s["_od_signin_error"] = ("Signed in, but OneDrive did not answer: "
                                  + str(status.get("detail") or ""))
         return False
-    s["_od_block"] = od_signin_block(account, token)
+    s["_od_block"] = od_signin_block(account, token, tenant)
     s["onedrive_store"] = store
     s["_od_tried"] = True
     s["_od_signed_in"] = True
@@ -22861,6 +22975,10 @@ def od_signin_finish(payload, account):
                        "in after the app restarts, put the block shown under "
                        "🔑 in Secrets.")
     return True
+
+
+# what Microsoft says while a sign-in code has not been used yet
+OD_STILL_WAITING = ("authorization_pending", "AADSTS70016", "slow_down")
 
 
 def od_signin_check():
@@ -22877,19 +22995,30 @@ def od_signin_check():
         return "failed"
     config = od_config()
     account = flow.get("_account") or "personal"
+    tenant = flow.get("_tenant") or None
     try:
         payload = onedrive_store.poll_device_login(
             config.get("client_id"), flow.get("device_code"),
-            tenant=config.get("tenant"), account=account)
+            tenant=tenant, account=account)
     except Exception as exc:
+        text = str(exc)
+        # Microsoft still waiting for the code to be typed (AADSTS70016)
+        # or asked too often: waiting, not failed (an older
+        # onedrive_store.py takes it for a failure)
+        if any(word in text for word in OD_STILL_WAITING):
+            return "waiting"
         s["_device_login"] = None
         if s.get("_od_signed_in") and s.get("onedrive_store") is not None:
             return "done"   # finished a moment ago elsewhere on the page
-        s["_od_signin_error"] = str(exc)
+        if "AADSTS70019" in text or "expired_token" in text:
+            text = ("The code ran out (15 minutes) before the sign-in was "
+                    "finished: start again.")
+        s["_od_signin_error"] = text
         return "failed"
     if payload is None:
         return "waiting"
-    return "done" if od_signin_finish(payload, account) else "failed"
+    return "done" if od_signin_finish(payload, account, tenant) \
+        else "failed"
 
 
 def od_signin_waiting():
@@ -22903,9 +23032,8 @@ def od_signin_waiting():
         state = od_signin_check()
         if state == "done":
             st.rerun()
-    error = s.get("_od_signin_error")
-    if error:
-        st.error(error, icon="🔑")
+    if s.get("_od_signin_error"):
+        od_signin_error_box("wait")
     elif s.get("_device_login"):
         st.caption("⏳ Waiting for you to sign in on Microsoft's page… "
                    f"(asked at {time.strftime('%H:%M:%S')}; this notices "
@@ -22929,15 +23057,16 @@ def od_signin_start(account):
     s = st.session_state
     config = od_config()
     s.pop("_od_signin_error", None)
+    tenant = od_sign_tenant()
     try:
         flow = onedrive_store.begin_device_login(
-            config.get("client_id"), tenant=config.get("tenant"),
-            account=account)
+            config.get("client_id"), tenant=tenant, account=account)
     except Exception as exc:
         s["_device_login"] = None
         s["_od_signin_error"] = str(exc)
         return
     flow["_account"] = account
+    flow["_tenant"] = tenant
     flow["_until"] = time.time() + float(flow.get("expires_in") or 900)
     s["_device_login"] = flow
     s["_device_account"] = account
@@ -22966,8 +23095,8 @@ def od_signin(where):
     """
     s = st.session_state
     config = od_config()
-    account = config.get("account") or s.get("onedrive_account") or "personal"
-    if not config.get("account"):
+    account = od_sign_account(where)
+    if not config.get("account") and not s.get("_od_account_override"):
         st.selectbox("Account type", list(onedrive_store.ACCOUNTS.keys()),
                      key=f"od_account_{where}",
                      index=list(onedrive_store.ACCOUNTS).index(account)
@@ -22978,6 +23107,15 @@ def od_signin(where):
                           "keeps the cells. Saying it in Secrets (account "
                           "= \"personal\" or \"work\") hides this.")
         account = s.get(f"od_account_{where}") or account
+    else:
+        label = onedrive_store.ACCOUNTS.get(account, {}).get("label",
+                                                             account)
+        st.caption(f"As a {label[0].lower() + label[1:]}"
+                   + (" (chosen after the error)"
+                      if s.get("_od_account_override") else
+                      " (account in Secrets)")
+                   + (f", directory {od_sign_tenant()}"
+                      if od_sign_tenant() else "") + ".")
     flow = s.get("_device_login")
     if not flow:
         st.button("🔑 Sign in with Microsoft", type="primary",
@@ -22985,9 +23123,7 @@ def od_signin(where):
                   args=(account,), **STRETCH,
                   help="Microsoft gives a code; you type it on its page and "
                        "sign in there. The app never sees your password.")
-        error = s.get("_od_signin_error")
-        if error:
-            st.error(error, icon="🔑")
+        od_signin_error_box(where)
         return
     uri = str(flow.get("verification_uri") or
               "https://microsoft.com/devicelogin")
@@ -23106,8 +23242,10 @@ def od_check_steps():
                 add(True, "Microsoft's sign-in starts for this client_id",
                     "yes: press 🔑 Sign in with Microsoft")
             except Exception as exc:
+                fix, _ = od_signin_help(exc)
                 add(False, "Microsoft's sign-in starts for this client_id",
-                    exc)
+                    str(exc).split("\n\n")[0]
+                    + (f"\n\n➜ {fix}" if fix else ""))
             return lines, None
         add(True, "Signed in from the app",
             "yes, until the app restarts (not in Secrets yet: 🔑 Stay "
