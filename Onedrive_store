@@ -131,6 +131,41 @@ def explain(error_text, account="personal", tenant=None):
     each one really means.
     """
     text = str(error_text)
+    # the sign-in kept in Secrets has run out or been ended: the commonest
+    # reason a set-up that worked stops connecting
+    if any(code in text for code in (
+            "AADSTS700082", "AADSTS70008", "AADSTS700084", "AADSTS50173",
+            "AADSTS50133", "AADSTS70043", "AADSTS50089")) or (
+            "invalid_grant" in text and "expire" in text.lower()):
+        return (
+            "The sign-in kept in Secrets has run out. Microsoft ends a "
+            "sign-in after about 90 days without use, and at once when the "
+            "account's password changes or its sessions are signed out. "
+            "Nothing else needs changing: in **🗂 Cells** press **🔑 Sign in "
+            "again**, sign in, then in Streamlit (**⋮ → Settings → "
+            "Secrets**) put the new block in place of the old [onedrive] "
+            "part, save, and reboot the app."
+        )
+    if "AADSTS9002313" in text or "AADSTS900144" in text \
+            or "malformed" in text.lower():
+        return (
+            "The refresh_token in Secrets is not being read whole: it was "
+            "pasted with a line break or a space inside it, or a quote is "
+            "missing at one end. Sign in again (**🔑 Sign in again** in 🗂 "
+            "Cells) and paste the new block as it is, in one piece."
+        )
+    if "Could not reach OneDrive" in text or "timed out" in text.lower():
+        return (
+            "The app could not reach Microsoft (the network, or Microsoft "
+            "busy for a moment). Nothing needs changing: press 🔌 Connect "
+            "again in a minute."
+        )
+    if "invalid_grant" in text:
+        return (
+            "Microsoft no longer accepts the sign-in kept in Secrets. Sign "
+            "in again (**🔑 Sign in again** in 🗂 Cells) and put the new "
+            "block in Secrets in place of the old [onedrive] part."
+        )
     if "AADSTS50020" in text or "does not exist in tenant" in text:
         return (
             "That is a personal Microsoft account, but the app is set to sign "
@@ -301,10 +336,14 @@ def poll_device_login(client_id, device_code, tenant=None,
         )
     except OneDriveError as exc:
         text = str(exc)
-        # Still waiting is the normal state, not a failure.
-        if "authorization_pending" in text or "slow_down" in text:
+        # Still waiting is the normal state, not a failure. Microsoft's
+        # reply says so in its error field (authorization_pending), but
+        # only its description reaches here: AADSTS70016, "not yet
+        # authorized by the user".
+        if ("authorization_pending" in text or "slow_down" in text
+                or "AADSTS70016" in text):
             return None
-        if "expired_token" in text:
+        if "expired_token" in text or "AADSTS70019" in text:
             raise OneDriveError(
                 "The code expired before sign-in finished. Start again."
             ) from exc
@@ -923,10 +962,141 @@ class OneDriveStore:
                     rows.append(self.item_row(record))
         return self._put_items_index(pd.DataFrame(rows))
 
+    # ------------------------------------------------- a cell's card
+    #
+    # What a cell is, apart from what was done with it: its ID (its
+    # video's name, a date and a number), the date, the cantilever and its
+    # spring constant, the cell type, the sample, a condition, notes, the
+    # picture shown for it and its video. cell.json in its folder, and a
+    # line in cells_index.csv so every cell is listed in one read.
+
+    CELLS_INDEX = "cells_index.csv"
+    CELL_FIELDS = ["cell", "date", "cantilever", "k", "cell_type",
+                   "sample", "condition", "notes", "cover", "video",
+                   "updated_at"]
+
+    def cells_index_path(self):
+        return f"{self.ensure_folder(self.root_folder)}/{self.CELLS_INDEX}"
+
+    def load_cells_index(self):
+        """Every cell's card, one line each (text); empty if none yet."""
+        import pandas as pd
+
+        try:
+            text = self._download(self.cells_index_path()).decode("utf-8")
+            frame = pd.read_csv(io.StringIO(text), dtype=str,
+                                keep_default_na=False)
+        except Exception:
+            return pd.DataFrame(columns=self.CELL_FIELDS)
+        for column in self.CELL_FIELDS:
+            if column not in frame.columns:
+                frame[column] = ""
+        return frame
+
+    def load_cell_info(self, cell):
+        """A cell's card (cell.json), or None."""
+        try:
+            return json.loads(self._download(
+                f"{self.cells_folder()}/{safe_name(cell)}/cell.json")
+                .decode("utf-8"))
+        except Exception:
+            return None
+
+    def save_cell_info(self, info):
+        """
+        Write a cell's card: cell.json in its folder (made if new), then its
+        line in cells_index.csv (replacing the old one). -> the card.
+        """
+        import pandas as pd
+
+        cell = str(info.get("cell") or "").strip()
+        if not cell:
+            raise OneDriveError("The cell needs an ID.")
+        card = {key: ("" if info.get(key) is None else str(info.get(key)))
+                for key in self.CELL_FIELDS}
+        card["cell"] = cell
+        card["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.upload(self.cell_folder(cell), "cell.json",
+                    json.dumps(card, indent=2))
+        frame = self.load_cells_index()
+        if not frame.empty:
+            frame = frame[frame["cell"].astype(str) != cell]
+        frame = pd.concat([frame, pd.DataFrame([card])], ignore_index=True)
+        frame = frame[self.CELL_FIELDS + [c for c in frame.columns
+                                          if c not in self.CELL_FIELDS]]
+        self.upload(self.ensure_folder(self.root_folder), self.CELLS_INDEX,
+                    frame.to_csv(index=False))
+        return card
+
+    def cell_pictures(self, cells):
+        """
+        Each cell's pictures and videos ({cell: [{name, kind, thumb, large,
+        url, size, folder}]}): the image and video files in its folder, its
+        Files and its Pictures folders, with the thumbnails OneDrive makes
+        for them (a video's is a frame of it), which a browser shows
+        straight from OneDrive for a while. Read twenty folders at a time
+        (Microsoft Graph's $batch), so a hundred cells take a few requests.
+        """
+        asks = []
+        # the cells' folder by its path alone: no request to make sure it
+        # is there (a cell without a folder just has no pictures)
+        root = "/".join(part for part in (
+            str(self.root_folder or "").strip("/"), "cells") if part)
+        for cell in cells:
+            base = f"{root}/{safe_name(cell)}"
+            for folder in ("", "Files", "Pictures"):
+                path = urllib.parse.quote(f"{base}/{folder}".strip("/"))
+                asks.append((cell, folder,
+                             f"{self._drive()}/root:/{path}:/children"
+                             "?$expand=thumbnails&$top=200"))
+        out = {cell: [] for cell in cells}
+        for start in range(0, len(asks), 20):
+            chunk = asks[start:start + 20]
+            body = {"requests": [{"id": str(n), "method": "GET", "url": url}
+                                 for n, (_, _, url) in enumerate(chunk)]}
+            answer = _request(
+                "POST", f"{GRAPH}/$batch", token=self.token(),
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            for reply in answer.get("responses", []):
+                try:
+                    cell, folder, _ = chunk[int(reply.get("id"))]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if int(reply.get("status") or 0) != 200:
+                    continue
+                for item in (reply.get("body") or {}).get("value", []):
+                    kind = picture_kind(item.get("name"))
+                    if "file" not in item or kind is None:
+                        continue
+                    thumbs = (item.get("thumbnails") or [{}])[0] or {}
+                    out[cell].append({
+                        "name": item.get("name", ""), "kind": kind,
+                        "thumb": (thumbs.get("medium") or thumbs.get("small")
+                                  or {}).get("url", ""),
+                        "large": (thumbs.get("large") or thumbs.get("medium")
+                                  or {}).get("url", ""),
+                        "url": item.get("webUrl", ""),
+                        "size": item.get("size", 0), "folder": folder})
+        return out
+
+    def add_cell_pictures(self, cell, files):
+        """Pictures the app makes (an AFM image, say: name → PNG) into the
+        cell's Pictures folder."""
+        folder = self.ensure_folder("Pictures", self.cell_folder(cell))
+        for name, content in files.items():
+            self.upload(folder, safe_name(name), content)
+        return folder
+
     def cell_names(self):
-        """Every cell with anything saved: from the analyses' index and
-        the fitted cells' one, sorted."""
+        """Every cell with anything saved or a card: from the analyses'
+        index, the cards' and the fitted cells' one, sorted."""
         names = set()
+        try:
+            cards = self.load_cells_index()
+            names |= {str(c) for c in cards.get("cell", []) if str(c).strip()}
+        except Exception:
+            pass
         frame = self.load_items_index()
         if "cell" in frame.columns:
             names |= {str(c) for c in frame["cell"].dropna() if str(c).strip()}
@@ -1147,6 +1317,54 @@ def safe_name(name):
     """A name OneDrive accepts: the characters it refuses replaced."""
     text = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in str(name))
     return text.strip().strip(".") or "untitled"
+
+
+# a cell's pictures: photos, and the frames OneDrive shows for videos
+PICTURE_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",
+                 ".webp", ".heic")
+VIDEO_TYPES = (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".webm",
+               ".mpg", ".mpeg")
+
+
+def picture_kind(name):
+    """'image', 'video' or None, by a file's extension."""
+    low = str(name or "").lower()
+    if low.endswith(PICTURE_TYPES):
+        return "image"
+    if low.endswith(VIDEO_TYPES):
+        return "video"
+    return None
+
+
+_ID_DATE = re.compile(r"(20\d\d)[-_. ]?(0[1-9]|1[0-2])[-_. ]?"
+                      r"(0[1-9]|[12]\d|3[01])")
+
+
+def date_in_id(cell_id):
+    """The date a cell's ID (its video's name) starts with or holds, as
+    YYYY-MM-DD (2026-11-27_03, 20261127_3, cell 2026.11.27 #3), else ''."""
+    found = _ID_DATE.search(str(cell_id or ""))
+    return "-".join(found.groups()) if found else ""
+
+
+def next_cell_id(existing, day):
+    """
+    The next ID for a cell recorded on ``day`` (YYYY-MM-DD): that date and
+    the next number free among the cells of the same date, two digits:
+    2026-11-27_01, then 2026-11-27_02… A number after the date is read
+    whatever its spelling (2026-11-27_3, 20261127-04, 2026-11-27 cell 5).
+    """
+    day = str(day)[:10]
+    used = []
+    for cell in existing or ():
+        text = str(cell)
+        if date_in_id(text) != day:
+            continue
+        rest = _ID_DATE.split(text, maxsplit=1)[-1]
+        number = re.search(r"\d+", rest)
+        if number:
+            used.append(int(number.group()))
+    return f"{day}_{(max(used) + 1) if used else 1:02d}"
 
 
 def store_from_secrets(st, root_folder=None):
