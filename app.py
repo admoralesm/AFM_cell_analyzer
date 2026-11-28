@@ -741,6 +741,40 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def page_reload():
+    """The page loaded again from the start: a new session, every upload
+    box empty (Streamlit's upload boxes keep their files in the page, so
+    clearing the session alone would bring them back)."""
+    script = "<script>window.location.reload();</script>"
+    try:
+        st.html(script, unsafe_allow_javascript=True)
+    except TypeError:
+        import streamlit.components.v1 as components
+        components.html("<script>window.parent.location.reload();</script>",
+                        height=0)
+
+
+def app_new_cell():
+    """🆕 New cell pressed: cleared at the top of the next run."""
+    st.session_state["_app_new_cell"] = True
+
+
+# 🆕 New cell: every signal, file and setting in this window cleared, the
+# OneDrive connection and the person's name kept, then the page loaded
+# again so the upload boxes are empty too
+if st.session_state.pop("_app_new_cell", False):
+    _kept = {k: st.session_state[k] for k in (
+        "onedrive_store", "_od_tried", "ui_compact", "ui_transparent",
+        "db_who") if k in st.session_state}
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+    st.session_state.update(_kept)
+    st.info("🆕 Cleared for a new cell. Reloading the page… (if it does "
+            "not, press your browser's reload button).")
+    page_reload()
+    st.stop()
+
 st.markdown(
     """
 <style>
@@ -11473,6 +11507,8 @@ def db_status_line(where):
                   help="Signs in with the app's secrets ([onedrive]).")
         if s.get("_od_problem"):
             st.caption(f"Not connected: {s['_od_problem']}")
+        st.caption("🗂 Cells → 🩺 Check the connection says which step "
+                   "fails; 🔑 Sign in again is there too.")
 
 
 def db_zip(record, files):
@@ -22711,6 +22747,121 @@ def od_signin(where):
         st.rerun()
 
 
+def od_check_steps():
+    """
+    🩺 Connecting to OneDrive, one step at a time, stopping at the first
+    that fails: onedrive_store.py, the Secrets (their shape only, never
+    their values), Microsoft's sign-in, the drive, the cells and the list
+    of saved items. ([(mark, step, what was found)], the store when every
+    step worked, else None). Reads only.
+    """
+    s = st.session_state
+    lines = []
+
+    def add(ok, step, detail=""):
+        lines.append(("✅" if ok else "❌", step, str(detail)))
+        return ok
+
+    if not add(onedrive_store is not None, "onedrive_store.py",
+               "loaded" if onedrive_store is not None
+               else (ONEDRIVE_IMPORT_ERROR or "did not load")):
+        return lines, None
+    missing = [n for n in ("save_item", "load_items_index", "cell_names")
+               if not hasattr(onedrive_store.OneDriveStore, n)]
+    if not add(not missing, "onedrive_store.py is up to date",
+               "yes" if not missing else "older than app.py (it lacks "
+               + ", ".join(missing) + "): upload the new one and reboot"):
+        return lines, None
+    config = od_config()
+    if not add(bool(config), "An [onedrive] part in Secrets",
+               "there" if config else "missing (⋮ → Settings → Secrets), or "
+               "the app was not rebooted after saving them"):
+        return lines, None
+    cid = str(config.get("client_id") or "").strip()
+    if not add(od_client_id_ok(cid), "client_id",
+               "an ID, 36 characters" if od_client_id_ok(cid)
+               else "missing" if not cid else
+               f"“{cid[:14]}…” is not an ID (step 1)"):
+        return lines, None
+    token = str(config.get("refresh_token") or "")
+    if token:
+        shape = []
+        if token != token.strip():
+            shape.append("spaces at an end")
+        if any(c in token.strip() for c in " \n\r\t"):
+            shape.append("a space or line break inside")
+        if token.strip()[:1] in "'\"" or token.strip()[-1:] in "'\"":
+            shape.append("a stray quote")
+        if len(token.strip()) < 200:
+            shape.append(f"only {len(token.strip())} characters (a whole "
+                         "one is several hundred)")
+        if not add(not shape, "refresh_token in Secrets",
+                   f"there, {len(token.strip())} characters" if not shape
+                   else "there, but " + "; ".join(shape)
+                   + ": paste a new one in one piece (🔑 Sign in again)"):
+            return lines, None
+    elif not add(bool(config.get("client_secret")), "refresh_token",
+                 "missing: step 2, sign in"):
+        return lines, None
+    add(True, "Account type", str(config.get("account") or "personal"))
+    store = onedrive_store.store_from_secrets(st, s.get("onedrive_root")
+                                              or None)
+    started = time.time()
+    try:
+        store.token()
+    except Exception as exc:
+        add(False, "Microsoft accepts the sign-in", exc)
+        return lines, None
+    add(True, "Microsoft accepts the sign-in",
+        f"yes ({time.time() - started:.1f} s)")
+    status = store.check()
+    if not add(bool(status.get("ok")), "OneDrive answers",
+               status.get("detail") or ""):
+        return lines, None
+    try:
+        started = time.time()
+        items = store.load_items_index()
+        add(True, "The list of saved items",
+            f"{len(items)} item{'s' if len(items) != 1 else ''} "
+            f"({time.time() - started:.1f} s)")
+        cells = store.cell_names()
+        add(True, f"The cells in “{store.root_folder}”",
+            f"{len(cells)}: " + ", ".join(map(str, cells[:8]))
+            + (" …" if len(cells) > 8 else ""))
+    except Exception as exc:
+        add(False, "Reading the cells", exc)
+        return lines, None
+    return lines, store
+
+
+def od_check_box(where):
+    """🩺 A button that runs od_check_steps and shows what it found, with a
+    report to copy (no secrets in it); a check that gets through every step
+    connects the app as well."""
+    s = st.session_state
+    if st.button("🩺 Check the connection, step by step",
+                 key=f"odb_check_{where}", **STRETCH,
+                 help="Tries each step of connecting to OneDrive and says "
+                      "which one fails and why. It only reads; it changes "
+                      "nothing."):
+        with st.spinner("Checking…"):
+            lines, store = od_check_steps()
+        s["_od_check"] = lines
+        if store is not None:
+            s["onedrive_store"] = store
+            s.pop("_od_problem", None)
+            s["_db_items"] = None
+            st.rerun()
+    lines = s.get("_od_check")
+    if lines:
+        for mark, step, detail in lines:
+            st.markdown(f"{mark} **{step}**: {detail}")
+        with st.expander("📋 The report, to send (no passwords or tokens "
+                         "in it)"):
+            st.code("\n".join(f"{m} {step}: {detail}"
+                               for m, step, detail in lines), language=None)
+
+
 def od_register_short():
     """Step 1 in brief: register the app at Microsoft and put its client id
     in the secrets."""
@@ -22740,6 +22891,7 @@ def od_setup_steps(where):
     typed = str(config.get("client_id") or "").strip()
     has_id = od_client_id_ok(typed)
     has_key = bool(config.get("refresh_token") or config.get("client_secret"))
+    renewed = s.get("_od_block") if has_key else None
     block = s.get("_od_block") if not has_key else None
 
     def mark(done, now):
@@ -22773,10 +22925,23 @@ def od_setup_steps(where):
                    "Settings → Secrets**, delete the old [onedrive] part, "
                    "paste this, save, then **⋮ → Reboot**. The token is "
                    "like a password: keep it only in Secrets.")
+    elif has_key and renewed:
+        st.success("✅ Signed in again. In Streamlit, **⋮ → Settings → "
+                   "Secrets**: put this in place of the old [onedrive] part, "
+                   "save, then **⋮ → Reboot**.")
+        st.code(renewed, language="toml")
+        st.caption("Copy it with the icon at its top right. The token is "
+                   "like a password: keep it only in Secrets.")
     elif has_key:
-        st.warning("All 3 steps are in Secrets, but OneDrive did not answer "
-                   "(the reason is above). The fixes are in the guide "
-                   "below, under *If it will not connect*.")
+        problem = str(s.get("_od_problem") or "it did not answer")
+        st.error("All 3 steps are in Secrets, but OneDrive did not connect: "
+                 + problem, icon="🔌")
+        st.markdown(
+            "**🔑 Sign in again.** Most often the sign-in kept in Secrets has "
+            "run out: Microsoft ends it after about 90 days without use, or "
+            "when the account's password changes. Sign in here, then put "
+            "the new block in Secrets in place of the old one.")
+        od_signin(where)
     with st.expander("📖 Full guide and fixes"):
         onedrive_instructions()
 
@@ -23381,6 +23546,15 @@ with head_right:
               if "ui_transparent" not in st.session_state else None,
               help="Plots are saved (📷 on each plot) as PNG with a "
                    "transparent background. Off: white background.")
+    with st.popover("🆕 New cell", **STRETCH,
+                    help="Clear everything and start the next cell."):
+        st.markdown(
+            "Clears everything open in this window, to start the next "
+            "cell: every signal and AFM file in 💓 Beat analysis, the files "
+            "on every other tab, and their settings. **Cells saved in the "
+            "database stay as they are**; the OneDrive connection stays.")
+        st.button("🧹 Clear everything", type="primary",
+                  key="app_new_cell_go", on_click=app_new_cell, **STRETCH)
 if st.session_state.get("ui_compact", True):
     st.markdown(COMPACT_CSS, unsafe_allow_html=True)
 
@@ -39361,7 +39535,11 @@ def cells_tab():
             od_setup_steps("cells")
         else:
             st.info("Connect OneDrive (above) to see the cells.", icon="🗂")
+        st.divider()
+        od_check_box("cells")
         return
+    with st.expander("🩺 The connection"):
+        od_check_box("cells_ok")
     note = s.pop("_cells_note", None)
     if note:
         (st.success if note.startswith("✅") else st.warning)(note)
