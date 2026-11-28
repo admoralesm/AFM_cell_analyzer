@@ -53,6 +53,7 @@ from __future__ import annotations
 import io
 import json
 import mimetypes
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -110,6 +111,17 @@ def _looks_like_a_directory_id(tenant):
     return len(text) == 36 and text.count("-") == 4
 
 
+_CLIENT_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def looks_like_client_id(text):
+    """True for an Application (client) ID as Azure shows it, 36 characters
+    such as 1a2b3c4d-1111-2222-3333-444455556666; False for an example
+    left in place ('the ID from step 2') or a half-pasted one."""
+    return bool(_CLIENT_ID.fullmatch(str(text or "").strip()))
+
+
 def explain(error_text, account="personal", tenant=None):
     """
     Turn a Microsoft sign-in error into the thing to actually change.
@@ -119,6 +131,41 @@ def explain(error_text, account="personal", tenant=None):
     each one really means.
     """
     text = str(error_text)
+    # the sign-in kept in Secrets has run out or been ended: the commonest
+    # reason a set-up that worked stops connecting
+    if any(code in text for code in (
+            "AADSTS700082", "AADSTS70008", "AADSTS700084", "AADSTS50173",
+            "AADSTS50133", "AADSTS70043", "AADSTS50089")) or (
+            "invalid_grant" in text and "expire" in text.lower()):
+        return (
+            "The sign-in kept in Secrets has run out. Microsoft ends a "
+            "sign-in after about 90 days without use, and at once when the "
+            "account's password changes or its sessions are signed out. "
+            "Nothing else needs changing: in **🗂 Cells** press **🔑 Sign in "
+            "again**, sign in, then in Streamlit (**⋮ → Settings → "
+            "Secrets**) put the new block in place of the old [onedrive] "
+            "part, save, and reboot the app."
+        )
+    if "AADSTS9002313" in text or "AADSTS900144" in text \
+            or "malformed" in text.lower():
+        return (
+            "The refresh_token in Secrets is not being read whole: it was "
+            "pasted with a line break or a space inside it, or a quote is "
+            "missing at one end. Sign in again (**🔑 Sign in again** in 🗂 "
+            "Cells) and paste the new block as it is, in one piece."
+        )
+    if "Could not reach OneDrive" in text or "timed out" in text.lower():
+        return (
+            "The app could not reach Microsoft (the network, or Microsoft "
+            "busy for a moment). Nothing needs changing: press 🔌 Connect "
+            "again in a minute."
+        )
+    if "invalid_grant" in text:
+        return (
+            "Microsoft no longer accepts the sign-in kept in Secrets. Sign "
+            "in again (**🔑 Sign in again** in 🗂 Cells) and put the new "
+            "block in Secrets in place of the old [onedrive] part."
+        )
     if "AADSTS50020" in text or "does not exist in tenant" in text:
         return (
             "That is a personal Microsoft account, but the app is set to sign "
@@ -127,9 +174,35 @@ def explain(error_text, account="personal", tenant=None):
             "from your secrets: a personal account does not live in a "
             "directory and cannot be found in one."
         )
+    if "AADSTS9002332" in text or "Azure Active Directory users only" in text:
+        return (
+            "Microsoft found the app, but its registration accepts work or "
+            "school accounts only, and the secrets say account = "
+            "\"personal\". For a personal OneDrive (outlook, hotmail, live, "
+            "or a Microsoft account made with another email): in Azure, "
+            "open the app → **Manifest**, set `requestedAccessTokenVersion` "
+            "(older manifests: `accessTokenAcceptedVersion`) to **2** and "
+            "save; then set `signInAudience` to "
+            "**\"AzureADandPersonalMicrosoftAccount\"** and save. Wait a "
+            "minute and sign in again. For a university or company OneDrive "
+            "instead: change the secrets to account = \"work\" and reboot."
+        )
+    sent = re.search(r"Application with identifier '([^']*)'", text)
+    if sent and not looks_like_client_id(sent.group(1)):
+        return (
+            f"The client_id in Secrets is **\"{sent.group(1)}\"**, which is "
+            "not an ID: it is the example text. In Azure, open your app "
+            "registration's **Overview**, copy the **Application (client) "
+            "ID** (36 characters, like 1a2b3c4d-1111-2222-3333-"
+            "444455556666), put it in Secrets as client_id in place of the "
+            "example, save and reboot."
+        )
     if "AADSTS700016" in text or "AADSTS50194" in text or "was not found in the directory" in text:
         return (
-            "The app registration does not accept this kind of account. In "
+            "Microsoft does not know this client_id. First check it is the "
+            "**Application (client) ID** from the app's Overview page in "
+            "Azure, copied whole. If it is, the app registration does not "
+            "accept this kind of account. In "
             "Azure, open the app, go to Authentication, and under Supported "
             "account types choose the option that includes **personal "
             "Microsoft accounts**. Registering as single-tenant shuts "
