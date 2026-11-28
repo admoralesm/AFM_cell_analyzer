@@ -11342,10 +11342,69 @@ def od_needs_signin():
         config.get("refresh_token") or config.get("client_secret"))
 
 
-def od_connect():
+# how long a new window takes the list of what is saved from the one read
+# by another window, instead of reading it again (seconds); a save anywhere
+# has it read again
+DB_SHARED_FOR = 300
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def od_shared(fingerprint):
+    """
+    What every window of the app shares about its OneDrive. They all reach
+    it with the same Secrets, so it is connected once, not by every new
+    window (a sign-in and a look at the drive before the page is ready),
+    and the list of what is saved is read once and kept DB_SHARED_FOR
+    seconds. In memory only, never written anywhere. ``fingerprint`` is a
+    hash of the [onedrive] Secrets: new Secrets start afresh.
+    """
+    return {"store": None, "items": None, "cells": None, "read_at": 0.0}
+
+
+def od_holder():
+    """od_shared for the Secrets in use, or None (no Secrets, no cache)."""
+    config = od_config()
+    if not config:
+        return None
+    import hashlib
+
+    raw = (json.dumps({str(k): str(v) for k, v in config.items()},
+                      sort_keys=True)
+           + "|" + str(st.session_state.get("onedrive_root") or ""))
+    try:
+        return od_shared(hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    except Exception:
+        return None
+
+
+def od_share(store):
+    """This connection (made from the Secrets) for every window."""
+    holder = od_holder()
+    if holder is not None:
+        holder.update(store=store, read_at=0.0)
+
+
+def db_items_stale():
+    """Something was saved or connected: the list of what is saved read
+    again, here and by the next window that wants it."""
+    st.session_state["_db_items"] = None
+    holder = od_holder()
+    if holder is not None:
+        holder["read_at"] = 0.0
+
+
+def od_connect(fresh=False):
     """Connect to OneDrive from the app's secrets. -> the store, or None
-    with the reason in _od_problem."""
+    with the reason in _od_problem. The connection another window made is
+    taken when there is one, unless ``fresh`` (🔌 Connect pressed)."""
     s = st.session_state
+    holder = od_holder()
+    if not fresh and holder is not None and holder.get("store") is not None:
+        s["onedrive_store"] = holder["store"]
+        s.pop("_od_problem", None)
+        return holder["store"]
+    if fresh and holder is not None:
+        holder.update(store=None, read_at=0.0)
     if onedrive_store is None:
         s["_od_problem"] = (ONEDRIVE_IMPORT_ERROR
                             or "onedrive_store.py did not load")
@@ -11373,6 +11432,7 @@ def od_connect():
     if status.get("ok"):
         s["onedrive_store"] = store
         s.pop("_od_problem", None)
+        od_share(store)
         return store
     s["_od_problem"] = str(status.get("detail") or "it did not answer")
     return None
@@ -11404,9 +11464,22 @@ def db_items(refresh=False):
     if store is None:
         return None
     if refresh or s.get("_db_items") is None:
+        # read lately by another window on the same connection: that
+        holder = od_holder()
+        shared = holder is not None and holder.get("store") is store
+        if (shared and not refresh and holder.get("items") is not None
+                and time.time() - float(holder.get("read_at") or 0.0)
+                < DB_SHARED_FOR):
+            s["_db_items"] = holder["items"].copy()
+            s["_db_cells"] = list(holder.get("cells") or [])
+            return s["_db_items"]
         try:
             s["_db_items"] = store.load_items_index()
             s["_db_cells"] = store.cell_names()
+            if shared:
+                holder.update(items=s["_db_items"].copy(),
+                              cells=list(s["_db_cells"]),
+                              read_at=time.time())
         except Exception as exc:
             s["_db_items"] = pd.DataFrame()
             s["_db_cells"] = []
@@ -11488,8 +11561,8 @@ def db_who_box(where):
 
 def db_connect_now():
     st.session_state.pop("_od_tried", None)
-    od_connect()
-    st.session_state["_db_items"] = None
+    od_connect(fresh=True)
+    db_items_stale()
 
 
 def db_status_line(where):
@@ -11569,6 +11642,38 @@ def db_open_zip(kind, restore):
         s[f"_db_note_{kind}"] = f"⚠️ Could not open {up.name}: {exc}"
 
 
+def db_save_item(kind, package, cell, name, notes, who):
+    """``package(name, notes)`` (record, files) saved in ``cell`` as an item
+    of ``kind``, dated and signed. -> what OneDrive said (its folder_url);
+    raises when it cannot."""
+    store = cell_store()
+    if store is None:
+        raise RuntimeError("OneDrive is not connected")
+    now = datetime.now()
+    record, files = package(name, notes)
+    record.update(cell=cell, kind=kind, name=name, notes=notes,
+                  item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
+                  saved_at=now.isoformat(timespec="seconds"),
+                  tab=CELL_KINDS[kind], analysed_by=who)
+    saved = store.save_item(record, files)
+    db_items_stale()
+    return saved or {}
+
+
+def db_keep_saver(kind, package, default_name, can_save):
+    """What a tab's 🗄 box saves, kept for the ☁️ floating menu to save from
+    any tab: the package as the tab last drew it, run on the tab's own
+    settings (📚 Stack & compare and 🔗 Series share their code)."""
+    prefix = SCP
+
+    def run(name, notes):
+        with sc_namespace(prefix):
+            return package(name, notes)
+
+    st.session_state.setdefault("_db_savers", {})[kind] = (
+        run, default_name, bool(can_save))
+
+
 def cell_db_box(kind, package, restore, default_name="", can_save=True,
                 older=None):
     """
@@ -11580,6 +11685,7 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
     of saves made before cells, when there are any.
     """
     s = st.session_state
+    db_keep_saver(kind, package, default_name, can_save)
     with st.container(border=True):
         h1, h2 = st.columns([3, 1.3], vertical_alignment="center")
         h1.markdown("#### 🗄 Cell database")
@@ -11614,15 +11720,8 @@ def cell_db_box(kind, package, restore, default_name="", can_save=True,
                               "again here exactly as it is."):
                 with st.spinner(f"Saving to {cell}…"):
                     try:
-                        now = datetime.now()
-                        record, files = package(name, notes)
-                        record.update(
-                            cell=cell, kind=kind, name=name, notes=notes,
-                            item_id=f"{now:%Y-%m-%d %H%M%S} {name}",
-                            saved_at=now.isoformat(timespec="seconds"),
-                            tab=CELL_KINDS[kind], analysed_by=who)
-                        saved = store.save_item(record, files)
-                        s["_db_items"] = None
+                        saved = db_save_item(kind, package, cell, name,
+                                             notes, who)
                         st.success(f"✅ Saved “{name}” in {cell}.")
                         if saved.get("folder_url"):
                             st.link_button("↗ Its folder in OneDrive",
@@ -22850,7 +22949,8 @@ def od_check_box(where):
         if store is not None:
             s["onedrive_store"] = store
             s.pop("_od_problem", None)
-            s["_db_items"] = None
+            od_share(store)
+            db_items_stale()
             st.rerun()
     lines = s.get("_od_check")
     if lines:
@@ -23572,28 +23672,148 @@ SHOW_DATABASE_TAB = False
 # inside), then the rest. The two tabs that can be hidden go last; they are
 # hidden by CSS on the n-th button of the top tab bar only (the Fitting tab
 # stays the 10th).
+APP_TAB_LABELS = [
+    "💓 Beat analysis",
+    "🎬 Video: clip and analyze",
+    "🔬 AFM output analysis",
+    "📚 Stack & compare",
+    "🔗 Series",
+    "🤝 Force and motion",
+    "〰 Fourier",
+    "📈 Single force curve",
+    "🔧 Create force-ε file from ibw files",
+    "🧮 Fitting",
+    "🗂 Cells",
+    "🎥 Compression video",
+    "📋 Database",
+]
+# The tabs that rerun on their own when clicked in (fragments, see
+# app_fragment), by the name each fragment is given
+APP_TAB_FRAGMENTS = {
+    "💓 Beat analysis": "bt_tab", "🔬 AFM output analysis": "ai_tab",
+    "📚 Stack & compare": "sc_stack", "🔗 Series": "sc_series",
+    "🤝 Force and motion": "fm_tab", "〰 Fourier": "ft_tab",
+    "🗂 Cells": "cells_tab"}
+
+
+def app_tab_opened():
+    """A tab opened: brought up to date, as it may have changed while it
+    was closed. One that reruns on its own: it alone; else the whole app
+    (what happens when this does not stop it)."""
+    key = APP_TAB_FRAGMENTS.get(st.session_state.get("app_tab"))
+    if not key:
+        return
+    from streamlit.errors import StreamlitAPIException
+    try:
+        st.rerun(scope=key)
+    except (StreamlitAPIException, TypeError, ValueError):
+        # a Streamlit that cannot rerun a fragment by its name: the app
+        pass
+
+
+# The bar knows which tab is open (Streamlit 1.5x and later): opening a tab
+# brings it up to date (app_tab_opened), so a tab that reruns on its own
+# when clicked in (a fragment) shows what changed elsewhere, and a callback
+# can open a tab (app_open_tab). Older Streamlit: the plain bar, and every
+# click reruns the whole app as before.
+try:
+    _APP_TABS = st.tabs(APP_TAB_LABELS, key="app_tab",
+                        on_change=app_tab_opened)
+    APP_TABS_TRACKED = True
+except TypeError:
+    _APP_TABS = st.tabs(APP_TAB_LABELS)
+    APP_TABS_TRACKED = False
 (
     tab_beats, tab_motion, tab_afm, tab_stack, tab_series, tab_fm,
     tab_fourier, tab_force, tab_igor, tab_fitting, tab_celldb, tab_video,
     tab_db,
-) = st.tabs(
-    [
-        "💓 Beat analysis",
-        "🎬 Video: clip and analyze",
-        "🔬 AFM output analysis",
-        "📚 Stack & compare",
-        "🔗 Series",
-        "🤝 Force and motion",
-        "〰 Fourier",
-        "📈 Single force curve",
-        "🔧 Create force-ε file from ibw files",
-        "🧮 Fitting",
-        "🗂 Cells",
-        "🎥 Compression video",
-        "📋 Database",
-    ]
-)
+) = _APP_TABS
 FITTING_TAB_NUMBER = 10
+
+
+def app_fragment(func, key=None):
+    """
+    ``func`` (a tab's whole content, or a section of one) as a fragment: a
+    click in it reruns it alone, not the whole app, so the other twelve
+    tabs are not built and sent again on every click. They are brought up
+    to date when one of them is opened (that reruns everything). ``key``
+    names it, for a callback in a section of it to run it all again
+    (app_rerun_fragment). ``func`` as it is when the tabs do not know
+    which one is open, or Streamlit has no fragments.
+    """
+    maker = getattr(st, "fragment", None)
+    if not APP_TABS_TRACKED or maker is None:
+        return func
+
+    def body(*args, **kwargs):
+        # asked for by a callback where Streamlit cannot rerun a fragment
+        # by its name (app_rerun_fragment): the whole app, then
+        if st.session_state.pop("_app_rerun_all", False) \
+                and app_running_alone():
+            st.rerun()
+        return func(*args, **kwargs)
+
+    # its name and module are func's: what Streamlit tells fragments by
+    body.__name__, body.__qualname__ = func.__name__, func.__qualname__
+    body.__module__, body.__doc__ = func.__module__, func.__doc__
+    if key is not None:
+        try:
+            return maker(body, key=key)
+        except TypeError:
+            pass
+    try:
+        return maker(body)
+    except Exception:
+        return func
+
+
+def app_rerun_fragment(key):
+    """From a callback, last thing in it: the fragment named ``key`` run
+    again, in place of the one clicked in (the whole tab, from a section
+    of it). Where Streamlit cannot name one, the whole app instead, when
+    the next fragment starts."""
+    if not APP_TABS_TRACKED:
+        return
+    from streamlit.errors import StreamlitAPIException
+    try:
+        st.rerun(scope=key)
+    except (StreamlitAPIException, TypeError, ValueError):
+        st.session_state["_app_rerun_all"] = True
+
+
+def app_running_alone():
+    """True while a fragment runs on its own (after a click in it), not
+    as part of a run of the whole app."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        return bool(ctx is not None
+                    and getattr(ctx, "fragment_ids_this_run", None))
+    except Exception:
+        return False
+
+
+def app_rerun_here():
+    """Run again what is running: the fragment alone when only it is (a
+    click in it), else the whole app."""
+    if app_running_alone():
+        st.rerun(scope="fragment")
+    st.rerun()
+
+
+def app_open_tab(label):
+    """From a callback, last thing in it: that top tab opened, and the
+    whole app run again so it shows everything as it is now."""
+    if APP_TABS_TRACKED and label in APP_TAB_LABELS:
+        st.session_state["app_tab"] = label
+        st.rerun()
+
+
+# a note from a callback that opened another tab (app_open_tab), shown
+# wherever that tab is
+_app_toast = st.session_state.pop("_app_toast", None)
+if _app_toast:
+    st.toast(_app_toast)
 # The first tab's own content comes near the end of this file (after every
 # other tab is set up), so it says it is on its way meanwhile
 with tab_beats:
@@ -31592,7 +31812,7 @@ with tab_afm:
                  + (f" ({AFM_IMAGE_ERROR})." if AFM_IMAGE_ERROR else "."),
                  icon="🚫")
     elif not outdated_notice("afm_images.py"):
-        ai_panel()
+        app_fragment(ai_panel, key="ai_tab")()
 
 
 # ================================================ stack & compare (files) ==
@@ -33526,7 +33746,7 @@ def sc_panel():
             if strokes:
                 s[f"_{SCP}chart_ver"] = version + 1
                 sc_hl_drawn(strokes[-1], traces, fig)
-                st.rerun()
+                app_rerun_here()
             sc_hl_panel(traces)
         elif click_do:
             event = st.plotly_chart(
@@ -33557,7 +33777,7 @@ def sc_panel():
                         s[f"_{SCP}click_note"] = (
                             f"File {slot + 1} has no peak analysis: turn it "
                             f"on under its ⛰ Peaks first.")
-                st.rerun()
+                app_rerun_here()
             note = s.pop(f"_{SCP}click_note", None)
             if note:
                 st.warning(note, icon="⛰")
@@ -33592,14 +33812,19 @@ def sc_panel():
         sc_cell_box(traces, stem)
 
 
+def sc_place_panel(place):
+    """📚 Stack & compare or 🔗 Series (``place``), on that tab's settings."""
+    with sc_namespace(SC_PLACES[place]):
+        sc_panel()
+
+
 with tab_stack:
     section("Stack & compare: files one above the other")
     if sc is None or STACK_ERROR:
         st.error("This tab needs **stack_compare.py** beside app.py"
                  + (f" ({STACK_ERROR})." if STACK_ERROR else "."), icon="🚫")
     elif not outdated_notice("stack_compare.py"):
-        with sc_namespace(SC_PLACES["stack"]):
-            sc_panel()
+        app_fragment(sc_place_panel, key="sc_stack")("stack")
 
 with tab_series:
     section("Series: files one after another")
@@ -33608,8 +33833,7 @@ with tab_series:
                  + (f" ({STACK_ERROR})." if STACK_ERROR else "."), icon="🚫")
     elif not outdated_notice("stack_compare.py"):
         # the same tools as Stack & compare, on settings of its own
-        with sc_namespace(SC_PLACES["series"]):
-            sc_panel()
+        app_fragment(sc_place_panel, key="sc_series")("series")
 
 
 # ======================================================== beat analysis ==
@@ -34273,6 +34497,9 @@ def bt_signal(sid):
 # smoothing a new signal starts with (points), so the lines and the peaks
 # are found on the beats, not on the noise
 BT_SMOOTH_DEFAULT = 25
+# peaks smaller than this % of the large ones (of the same sign) are left
+# out: the small bumps between beats that get past the lines
+BT_MINH_DEFAULT = 25.0
 
 
 def bt_defaults(sid, x, y):
@@ -34303,7 +34530,9 @@ def bt_defaults(sid, x, y):
     meta = s["_bt_sets"][sid].get("meta") or {}
     for name, value in (("merge", 0.0), ("minw", 0.0),
                         ("order", bta.ORDERS[0]),
-                        ("k", float(meta.get("k") or 0.0))):
+                        ("k", float(meta.get("k") or 0.0)),
+                        ("minh", BT_MINH_DEFAULT), ("cut", True),
+                        ("skip0", 0.0)):
         s.setdefault(key(name), value)
 
 
@@ -34384,7 +34613,7 @@ def bt_signature(sid, e_unit=None):
     own = tuple(sorted(
         (str(k), repr(s[k])) for k in list(s.keys())
         if str(k).endswith(tail)
-        and str(k).startswith(("bt_", "_bt_out_"))))
+        and str(k).startswith(("bt_", "_bt_out_", "_bt_in_"))))
     return (own, id(frame), 0 if frame is None else len(frame),
             repr(entry.get("meta")), e_unit)
 
@@ -34404,6 +34633,68 @@ def bt_analyse(sid, e_unit=None):
     # (its signature once its first-time defaults are written)
     memo[sid] = (bt_signature(sid, e_unit), got)
     return got
+
+
+def bt_auto_out(sid, x, events):
+    """
+    The peaks a filter leaves out, each with why ({id(event): reason}):
+    cut off by the start or end of the recording (it was already past the
+    baseline when the recording began, or not back when it ended: half a
+    peak, often the tip settling at the start of an image); starting in
+    the first seconds set to skip (settling); or smaller than the % set of
+    the large peaks of its sign (the 90th percentile of their heights),
+    the small bumps between beats. Settings: bt_cut, bt_skip0, bt_minh.
+    """
+    s = st.session_state
+    key = lambda name: f"bt_{name}_{sid}"  # noqa: E731
+    xs = np.asarray(x, float)
+    xs = xs[np.isfinite(xs)]
+    reasons = {}
+    if not events or not xs.size:
+        return reasons
+    first, last = float(xs.min()), float(xs.max())
+    tiny = 1e-9 * max(last - first, 1e-12)
+    if s.get(key("cut"), True):
+        for e in events:
+            if e["start"] <= first + tiny:
+                reasons[id(e)] = "cut off by the start"
+            elif e["end"] >= last - tiny:
+                reasons[id(e)] = "cut off by the end"
+    skip = float(s.get(key("skip0")) or 0.0)
+    if skip > 0:
+        for e in events:
+            if id(e) not in reasons and e["start"] < first + skip:
+                reasons[id(e)] = "in the settling time"
+    share = float(s.get(key("minh"), BT_MINH_DEFAULT) or 0.0) / 100.0
+    if share > 0:
+        for sign in (1, -1):
+            mine = [e for e in events
+                    if e["sign"] == sign and id(e) not in reasons]
+            if len(mine) < 3:
+                continue
+            large = float(np.percentile([abs(e["peak"]) for e in mine], 90))
+            for e in mine:
+                if abs(e["peak"]) < share * large:
+                    reasons[id(e)] = (f"smaller than {share:.0%} of the "
+                                      "large peaks")
+    return reasons
+
+
+def bt_auto_count(got):
+    """How many peaks the filters left out (not by hand)."""
+    return sum(1 for e in got.get("left_out") or () if e.get("auto_out"))
+
+
+def bt_left_out_text(got):
+    """“3 peaks left out: 1 by hand, 2 by the filters (✕ on the plot …)”."""
+    n = len(got.get("left_out") or ())
+    auto = bt_auto_count(got)
+    parts = [f"{n - auto} by hand" if n - auto else "",
+             f"{auto} by the filters" if auto else ""]
+    return (f"{n} peak{'s' if n != 1 else ''} left out: "
+            + ", ".join(p for p in parts if p)
+            + " (✕ on the plot; hover one for why, click it to put it "
+              "back)")
 
 
 def bt_analyse_fresh(sid, e_unit=None):
@@ -34437,8 +34728,15 @@ def bt_analyse_fresh(sid, e_unit=None):
                             min_width=float(s[key("minw")] or 0.0),
                             merge=float(s[key("merge")] or 0.0))
     out_marks = list(s.get(f"_bt_out_{sid}") or [])
-    left_out = [e for e in events
-                if any(e["start"] <= m <= e["end"] for m in out_marks)]
+    # the filters' (cut off, settling, too small), unless put back by hand
+    in_marks = list(s.get(f"_bt_in_{sid}") or [])
+    auto = bt_auto_out(sid, x, events)
+    for e in events:
+        if id(e) in auto and not any(e["start"] <= m <= e["end"]
+                                     for m in in_marks):
+            e["auto_out"] = auto[id(e)]
+    left_out = [e for e in events if e.get("auto_out")
+                or any(e["start"] <= m <= e["end"] for m in out_marks)]
     kept = [e for e in events if e not in left_out]
     noise, kind, noise_auto, noise_manual, typed = bt_noise_used(
         sid, x, ys, base, events)
@@ -34570,22 +34868,48 @@ def bt_apply_pending(sid):
         s[f"bt_lo_{sid}"] = float(base - level)
 
 
-def bt_set_out(sid, marks):
-    """The peaks left out of the beats (each by where it peaks), the last
-    list kept for ↶ Undo."""
+def bt_set_out(sid, marks, inn=None):
+    """The peaks left out of the beats by hand (each by where it peaks),
+    and (``inn``) those a filter left out but put back by hand; the last
+    lists kept for ↶ Undo."""
     s = st.session_state
     history = list(s.get(f"_bt_hist_{sid}") or [])
-    history.append(list(s.get(f"_bt_out_{sid}") or []))
+    history.append((list(s.get(f"_bt_out_{sid}") or []),
+                    list(s.get(f"_bt_in_{sid}") or [])))
     s[f"_bt_hist_{sid}"] = history[-50:]
     s[f"_bt_out_{sid}"] = sorted(set(float(m) for m in marks))
+    if inn is not None:
+        s[f"_bt_in_{sid}"] = sorted(set(float(m) for m in inn))
     s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
+
+
+def bt_mark(sid, back=(), out=()):
+    """Peaks put back (``back``) and taken out (``out``), each a peak (a
+    dict with start, end, peak_x, and auto_out when a filter left it out):
+    a hand mark for one the lines found, a put-back mark for one a filter
+    left out."""
+    s = st.session_state
+    marks = list(s.get(f"_bt_out_{sid}") or [])
+    inn = list(s.get(f"_bt_in_{sid}") or [])
+    for e in back:
+        marks = [m for m in marks if not e["start"] <= m <= e["end"]]
+        if e.get("auto_out"):
+            inn.append(float(e["peak_x"]))
+    for e in out:
+        inn = [m for m in inn if not e["start"] <= m <= e["end"]]
+        marks.append(float(e["peak_x"]))
+    bt_set_out(sid, marks, inn)
 
 
 def bt_undo(sid):
     s = st.session_state
     history = list(s.get(f"_bt_hist_{sid}") or [])
     if history:
-        s[f"_bt_out_{sid}"] = history.pop()
+        last = history.pop()
+        out, inn = last if isinstance(last, tuple) else (last, None)
+        s[f"_bt_out_{sid}"] = out
+        if inn is not None:
+            s[f"_bt_in_{sid}"] = inn
         s[f"_bt_hist_{sid}"] = history
         s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
 
@@ -34837,7 +35161,9 @@ def bt_settings(sid, got):
                    + (f" · noise SD {noise:.3g} "
                       f"({got.get('noise_kind', 'automatic')})"
                       if noise else "")
-                   + f" · {len(got['events'])} peaks past the lines")
+                   + f" · {len(got['events'])} peaks past the lines"
+                   + (f", {bt_auto_count(got)} of them left out below (🧹)"
+                      if bt_auto_count(got) else ""))
         bt_noise_box(sid, got)
     st.slider("Smooth (points)", 1, 51, step=2, key=key("sm"),
               help="A running mean over this many points before the peaks "
@@ -34860,6 +35186,26 @@ def bt_settings(sid, got):
                     format="%.4g",
                     help="Narrower peaks (from leaving the baseline to "
                          "coming back) are ignored.")
+    st.markdown("**🧹 Left out by themselves**")
+    xu = got.get("x_unit") or ""
+    f1, f2 = st.columns(2, vertical_alignment="bottom")
+    f1.number_input("Smallest peak, % of the large", key=key("minh"),
+                    min_value=0.0, max_value=100.0, step=5.0, format="%.0f",
+                    help="Peaks smaller than this share of the large ones "
+                         "of their sign (the 90th percentile of their "
+                         "heights) are left out: the small bumps between "
+                         "beats. 0: keep them all. Click a ✕ on the plot to "
+                         "put one back.")
+    f2.number_input(f"Skip at the start ({xu})" if xu else
+                    "Skip at the start", key=key("skip0"), min_value=0.0,
+                    format="%.4g",
+                    help="Peaks starting in the first this-long of the "
+                         "recording are left out: the tip settling at the "
+                         "start of an image. 0: none.")
+    st.checkbox("Leave out peaks cut off at the start or end", key=key("cut"),
+                help="A peak already under way when the recording starts "
+                     "(the trace starting high, as the tip settles), or "
+                     "not over when it ends, is half a peak: left out.")
     bt_timing_rule(sid)
     t1, t2 = st.columns([1.6, 1])
     t1.selectbox("⏱ Peaks start and end", bta.TIMINGS, key=key("tmode"),
@@ -34998,7 +35344,10 @@ def bt_plot(sid, got):
               **STRETCH, help="Takes back the last removal or putting back.")
     m4.button(f"↺ Put back ({len(gone)})", key=f"btb_back_{sid}",
               on_click=bt_put_all_back, args=(sid,), disabled=not gone,
-              **STRETCH, help="Every removed peak back in the beats.")
+              **STRETCH, help="Every peak removed by hand back in the "
+                              "beats. Those the filters leave out (cut "
+                              "off, settling, small: 💓 Beats) stay out; "
+                              "click one to put it back.")
     with m5.popover("🧹 Remove…", **STRETCH):
         bt_quick_remove(sid, got)
     with m2.popover("🎨 Plot", **STRETCH):
@@ -35078,7 +35427,7 @@ def bt_plot(sid, got):
             s["_bt_pending"] = (sid, mouse, float(np.median(ys)),
                                 got["base"])
             s["_bt_chart_ver"] = ver + 1
-            st.rerun()
+            app_rerun_here()
         st.caption("Drag across the plot at the height of the "
                    + {BT_BASE: "baseline", BT_UP: "upper line",
                       BT_LOW: "lower line"}.get(mouse, "line") + ".")
@@ -35097,7 +35446,7 @@ def bt_plot(sid, got):
             x0, x1 = sorted(map(float, boxes[-1]["x"]))
             s["_bt_noise_pending"] = (sid, x0, x1)
             s["_bt_chart_ver"] = ver + 1
-            st.rerun()
+            app_rerun_here()
         if boxes:
             x0, x1 = sorted(map(float, boxes[-1]["x"]))
             y0, y1 = sorted(map(float, boxes[-1]["y"]))
@@ -35112,18 +35461,13 @@ def bt_plot(sid, got):
                 return (x0 <= e["end"] and x1 >= e["start"]
                         and y0 <= high and y1 >= low)
 
-            marks = list(s.get(f"_bt_out_{sid}") or [])
             kept = [e for e in got["kept"] if inside(e)]
             if kept:
-                marks += [e["peak_x"] for e in kept]
+                bt_mark(sid, out=kept)
             else:
-                back = [e for e in got["left_out"] if inside(e)]
-                marks = [m for m in marks
-                         if not any(e["start"] <= m <= e["end"]
-                                    for e in back)]
-            bt_set_out(sid, marks)
+                bt_mark(sid, back=[e for e in got["left_out"] if inside(e)])
             s["_bt_chart_ver"] = ver + 1
-            st.rerun()
+            app_rerun_here()
         st.caption(
             "Drag a box across a part with no beats: its noise is measured "
             "(🔇 Noise, on the left), and the stretch is shaded grey."
@@ -35146,7 +35490,7 @@ def bt_plot(sid, got):
         if points:
             s["_bt_measure_pending"] = (sid, float(points[-1]["x"]))
             s["_bt_chart_ver"] = ver + 1
-            st.rerun()
+            app_rerun_here()
     else:
         event = st.plotly_chart(fig, key=f"btc_{ver}_zoom", config=config,
                                 on_select="rerun", selection_mode="points",
@@ -35162,16 +35506,13 @@ def bt_plot(sid, got):
         if hits and got["events"]:
             at = float(hits[-1]["x"])
             e = min(got["events"], key=lambda e: abs(e["peak_x"] - at))
-            marks = list(s.get(f"_bt_out_{sid}") or [])
-            inside = [m for m in marks if e["start"] <= m <= e["end"]]
-            if inside:
-                marks = [m for m in marks if m not in inside]
+            if e in got["left_out"]:
+                bt_mark(sid, back=[e])
             else:
-                marks.append(e["peak_x"])
-            bt_set_out(sid, marks)
+                bt_mark(sid, out=[e])
         if points:
             s["_bt_chart_ver"] = ver + 1
-            st.rerun()
+            app_rerun_here()
         st.caption("Drag to zoom in, double-click to zoom out. Click a ▲ ▼ "
                    "to remove that peak, a ✕ to put it back, or untick it "
                    "in 🔺 Peaks below. ↶ Undo takes back the last change.")
@@ -35249,10 +35590,19 @@ def bt_report(sid, got):
         "a peak left unpaired is positive only or negative only",
         f"Peaks past the lines: {len(found)} ({n_pos} positive, "
         f"{len(found) - n_pos} negative)"]
-    if got["left_out"]:
-        lines.append(f"Removed by hand: {len(got['left_out'])} ("
+    hand = [e for e in got["left_out"] if not e.get("auto_out")]
+    auto = [e for e in got["left_out"] if e.get("auto_out")]
+    if hand:
+        lines.append(f"Removed by hand: {len(hand)} ("
                      + ", ".join(f"at {e['peak_x']:.4g}{x_u}"
-                                 for e in got["left_out"]) + ")")
+                                 for e in hand) + ")")
+    if auto:
+        why = {}
+        for e in auto:
+            why.setdefault(e["auto_out"], []).append(f"{e['peak_x']:.4g}")
+        lines.append(f"Left out by the filters: {len(auto)} ("
+                     + "; ".join(f"{reason}: at {', '.join(at)}{x_u}"
+                                 for reason, at in why.items()) + ")")
 
     n_beats = len(got["beats"])
     lines += ["", f"BEATS: {n_beats} ({info['Full beats']} full, "
@@ -36115,7 +36465,7 @@ def bt_figure(got, clickable=False, peak_click=False):
 BT_DB_SETTINGS = ("x", "y", "sm", "bmode", "base", "hi", "lo", "minw",
                   "merge", "gap", "order", "fu", "k", "nz0", "nz1",
                   "nzmode", "nzval", "nzk", "ma", "mb", "tmode", "tk",
-                  "tpct")
+                  "tpct", "minh", "skip0", "cut")
 
 
 def bt_db_store():
@@ -36164,6 +36514,7 @@ def bt_db_package(sid, got, name, notes=""):
         "settings": {k: bt_plain(s[f"bt_{k}_{sid}"]) for k in BT_DB_SETTINGS
                      if f"bt_{k}_{sid}" in s},
         "removed": bt_plain(list(s.get(f"_bt_out_{sid}") or [])),
+        "put_back": bt_plain(list(s.get(f"_bt_in_{sid}") or [])),
         "meta": meta}
     files = {
         "data.csv": sets["frame"].to_csv(index=False),
@@ -36189,6 +36540,11 @@ def bt_db_restore(record, fetch):
         if key in BT_DB_SETTINGS:
             s[f"bt_{key}_{sid}"] = value
     s[f"_bt_out_{sid}"] = sorted(float(v) for v in record.get("removed") or [])
+    s[f"_bt_in_{sid}"] = sorted(float(v) for v in record.get("put_back")
+                                or [])
+    # saved before the filters: open as it was (no filter)
+    if "minh" not in (record.get("settings") or {}):
+        s[f"bt_minh_{sid}"], s[f"bt_cut_{sid}"] = 0.0, False
     s["_bt_tab_ver"] = int(s.get("_bt_tab_ver", 0) or 0) + 1
     s["_bt_db_note"] = f"✅ Opened “{record.get('name', '')}”."
 
@@ -36235,18 +36591,16 @@ def bt_peaks_edited(sid, key, spans):
     """Peaks ticked or unticked in 🔺 Peaks: removed, or put back."""
     s = st.session_state
     edits = (s.get(key) or {}).get("edited_rows") or {}
-    marks = list(s.get(f"_bt_out_{sid}") or [])
+    back, out = [], []
     for row, change in edits.items():
         row = int(row)
         if "Keep" not in change or row >= len(spans):
             continue
-        start, end, at = spans[row]
-        inside = [m for m in marks if start <= m <= end]
-        if change["Keep"] is False and not inside:
-            marks.append(at)
-        elif change["Keep"] is True and inside:
-            marks = [m for m in marks if m not in inside]
-    bt_set_out(sid, marks)
+        start, end, at, why = (tuple(spans[row]) + ("",))[:4]
+        peak = {"start": start, "end": end, "peak_x": at, "auto_out": why}
+        (out if change["Keep"] is False else back).append(peak)
+    if back or out:
+        bt_mark(sid, back=back, out=out)
 
 
 def bt_peaks_table(sid, got):
@@ -36270,7 +36624,8 @@ def bt_peaks_table(sid, got):
             "Keep": e["peak_x"] not in gone, "Peak": n,
             "Sign": "+" if e["sign"] > 0 else "−",
             "Beat": b["n"] if b else None,
-            "Kind": b["kind"] if b else "removed",
+            "Kind": b["kind"] if b else (e.get("auto_out")
+                                         or "removed by hand"),
             f"At ({xu})" if xu else "At": e["peak_x"],
             f"Height or depth ({yu})" if yu else "Height or depth":
                 abs(e["peak"]),
@@ -36285,7 +36640,8 @@ def bt_peaks_table(sid, got):
                            if (k and newtons) else np.nan),
             "Power (W)": ((bta.peak_power(e, k, newtons, xu) or np.nan)
                           if (k and newtons) else np.nan)})
-        spans.append((e["start"], e["end"], e["peak_x"]))
+        spans.append((e["start"], e["end"], e["peak_x"],
+                      e.get("auto_out") or ""))
     kept = sum(r["Keep"] for r in rows)
     with st.expander(f"🔺 Peaks: {kept} kept of {len(rows)} found · untick "
                      "to remove, tick to put back", expanded=True):
@@ -36362,9 +36718,7 @@ def bt_results(sid, got):
                     + (f" {unit}" if unit else "") if mean is not None
                     else "")
                    + (f"{' · ' if mean is not None else ''}"
-                      f"{len(got['left_out'])} peak"
-                      f"{'s' if len(got['left_out']) != 1 else ''} removed "
-                      "(✕ on the plot)" if got["left_out"] else ""))
+                      + bt_left_out_text(got) if got["left_out"] else ""))
     table = got["table"]
     if table.empty:
         st.info("No peak gets past the lines: move them closer to the "
@@ -36776,6 +37130,9 @@ def bt_show_beat(sid, lo, hi):
     s["bt_xmin"], s["bt_xmax"] = float(lo), float(hi)
     s["_bt_note_show"] = "Shown in the main plot above (📐 Axes: clear x " \
                          "from and to for the whole recording)."
+    # clicked in a section that reruns on its own: the whole tab, so the
+    # main plot shows it
+    app_rerun_fragment("bt_tab")
 
 
 def bt_pick_panel(picked, uid):
@@ -37928,12 +38285,13 @@ def beat_tab():
         bt_plot(sid, got)
         bt_results(sid, got)
         if len(ids) > 1:
+            # each reruns on its own when clicked in, not the whole tab
             with st.container(border=True):
                 st.markdown("#### ⚖️ Before vs after")
-                bt_before_after(ids, sid)
+                app_fragment(bt_before_after)(ids, sid)
             with st.container(border=True):
                 st.markdown("#### 📈 Several recordings, in order")
-                bt_compare_several(ids)
+                app_fragment(bt_compare_several)(ids)
             with st.expander(f"📋 All {len(ids)} signals side by side"):
                 frame = bt_summary_frame(ids)
                 st.dataframe(frame, hide_index=True, **STRETCH)
@@ -37958,7 +38316,7 @@ with tab_beats:
         st.error("This tab needs **stack_compare.py** beside app.py.",
                  icon="🚫")
     elif not outdated_notice("beat_analysis.py"):
-        beat_tab()
+        app_fragment(beat_tab, key="bt_tab")()
 
 
 # ======================================================= Force and motion ==
@@ -38255,6 +38613,7 @@ def fm_db_package(sid, got, mname, tm, m, mu, summary, rows, yu, how,
         "force_settings": {k: bt_plain(s[f"bt_{k}_{sid}"])
                            for k in BT_DB_SETTINGS if f"bt_{k}_{sid}" in s},
         "removed": bt_plain(list(s.get(f"_bt_out_{sid}") or [])),
+        "put_back": bt_plain(list(s.get(f"_bt_in_{sid}") or [])),
         "meta": dict(got.get("meta") or {})}
     column = f"length_change ({mu})" if mu else "length_change"
     files = {
@@ -38769,7 +39128,7 @@ with tab_fm:
                  + (f" ({FM_ERROR})." if FM_ERROR else "."), icon="🚫")
     elif not (outdated_notice("beat_analysis.py")
               or outdated_notice("force_motion.py")):
-        fm_tab()
+        app_fragment(fm_tab, key="fm_tab")()
 
 
 # ================================================================ Fourier ==
@@ -39415,7 +39774,7 @@ with tab_fourier:
                  + (f" ({FOURIER_ERROR})." if FOURIER_ERROR else "."),
                  icon="🚫")
     elif not outdated_notice("fourier.py"):
-        fourier_tab()
+        app_fragment(fourier_tab, key="ft_tab")()
 
 
 # ================================================================= Cells ==
@@ -39452,6 +39811,10 @@ def cells_open(cell, kind, item_id):
                             f"{CELL_KINDS[kind]}: go to that tab.")
     except Exception as exc:
         s["_cells_note"] = f"⚠️ Could not open it: {exc}"
+        return
+    s["_app_toast"] = (f"📂 “{record.get('name', item_id)}” of {cell}, open "
+                       "here.")
+    app_open_tab(CELL_KINDS.get(kind))
 
 
 def cells_add_files(cell):
@@ -39671,7 +40034,219 @@ def cells_tab():
 
 with tab_celldb:
     section("Cells: everything saved for one cell")
-    cells_tab()
+    app_fragment(cells_tab, key="cells_tab")()
+
+
+# ================================================== ☁️ the floating menu ==
+#
+# The cell database from any tab, without scrolling to a tab's foot or
+# going to 🗂 Cells: a round button fixed at the bottom right (above
+# Streamlit's own "Manage app") opens a dialog with the connection, the
+# cell, saving what is on the open tab and opening what is saved in the
+# cell. The same database as 🗂 Cells and the 🗄 boxes; keys fdb_*.
+
+FDB_CSS = """<style>
+.st-key-fdb_open {position: fixed; right: 1.1rem; bottom: 4.4rem;
+  z-index: 999990; width: auto !important;}
+.st-key-fdb_open button {border-radius: 999px; padding: 0.5rem 1.05rem;
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.25); font-weight: 600;}
+</style>"""
+
+
+def fdb_save_part(cell, who):
+    """☁️ Save what is on the open tab, as its 🗄 box would."""
+    s = st.session_state
+    label = s.get("app_tab") or APP_TAB_LABELS[0]
+    kind = {v: k for k, v in CELL_KINDS.items()}.get(label)
+    saver = (s.get("_db_savers") or {}).get(kind) if kind else None
+    st.markdown(f"**☁️ Save what is on {label}**")
+    if saver is None:
+        st.caption("Nothing on this tab is saved in a cell. Open the tab "
+                   "with the analysis (💓 Beat analysis, 🔬 AFM output "
+                   "analysis, …), then ☁️ again.")
+        return
+    package, default_name, can_save = saver
+    typed = str(s.get("fdb_name") or "").strip()
+    if not typed or typed == s.get("_fdb_auto"):
+        s["fdb_name"] = s["_fdb_auto"] = default_name
+    n1, n2 = st.columns(2)
+    n1.text_input("Name", key="fdb_name",
+                  help="What it is called in the cell. The date and time "
+                       "are added to its folder's name.")
+    n2.text_input("Notes", key="fdb_notes",
+                  placeholder="condition, treatment, what it shows…")
+    name = str(s.get("fdb_name") or "").strip()
+    notes = str(s.get("fdb_notes") or "").strip()
+    sets = s.get("_bt_sets") or {}
+    many = kind == "beats" and len(sets) > 1
+    b1, b2 = st.columns(2) if many else (st.container(), None)
+    one = b1.button(f"☁️ Save “{name}” to “{cell}”" if name else "☁️ Save",
+                    key="fdb_save", type="primary", **STRETCH,
+                    disabled=not (name and can_save),
+                    help="Into the cell's OneDrive folder, with its data "
+                         "and every setting, so it opens again as it is.")
+    every = b2.button(f"☁️ Save every signal ({len(sets)}), one item each",
+                      key="fdb_save_all", **STRETCH,
+                      help="Every signal on 💓 Beat analysis, each under "
+                           "its own name, with these notes.") \
+        if many else False
+    if one:
+        with st.spinner(f"Saving to {cell}…"):
+            try:
+                saved = db_save_item(kind, package, cell, name, notes, who)
+                st.success(f"✅ Saved “{name}” in {cell}.")
+                if str(saved.get("folder_url") or "").startswith("http"):
+                    st.link_button("↗ Its folder in OneDrive",
+                                   saved["folder_url"], **STRETCH)
+            except Exception as exc:
+                st.error(f"Could not save it: {exc}")
+    if every:
+        done, failed = [], []
+        bar = st.progress(0.0)
+        for n, sid in enumerate(list(sets), start=1):
+            label = str(sets[sid].get("name") or sid)
+            try:
+                got = bt_analyse(sid)
+                if got is None:
+                    raise RuntimeError("no two columns of numbers")
+                db_save_item("beats", lambda nm, nt, sid=sid, got=got:
+                             bt_db_package(sid, got, nm, nt),
+                             cell, label, notes, who)
+                done.append(label)
+            except Exception as exc:
+                failed.append(f"{label} ({exc})")
+            bar.progress(n / len(sets))
+        bar.empty()
+        if done:
+            st.success(f"✅ Saved {len(done)} in {cell}: " + ", ".join(done))
+        if failed:
+            st.error("Not saved: " + "; ".join(failed))
+
+
+def fdb_open_part(store, cell):
+    """📂 What is saved in the cell, any of it opened on its own tab."""
+    s = st.session_state
+    st.markdown(f"**📂 Saved in {cell}**")
+    note = s.get("_cells_note")
+    if note and note.startswith("⚠️"):
+        st.warning(s.pop("_cells_note"))
+    items = db_items()
+    mine = pd.DataFrame()
+    if items is not None and not items.empty and "cell" in items:
+        mine = items[items["cell"].astype(str) == cell]
+    if mine.empty:
+        st.caption("Nothing saved in this cell yet.")
+        return
+    rows = {f"{r['kind']}|{r['item_id']}": r
+            for r in mine.sort_values("saved_at", ascending=False)
+            .to_dict("records")} if "saved_at" in mine else {
+        f"{r['kind']}|{r['item_id']}": r for r in mine.to_dict("records")}
+    if s.get("fdb_pick") not in rows:
+        s["fdb_pick"] = next(iter(rows))
+    o1, o2, o3 = st.columns([3.2, 1.3, 0.5], vertical_alignment="bottom")
+    o1.selectbox(
+        f"{len(rows)} saved, newest first", list(rows), key="fdb_pick",
+        format_func=lambda k: (
+            f"{CELL_KINDS.get(str(rows[k]['kind']), rows[k]['kind'])} · "
+            f"{rows[k].get('name')} · "
+            f"{str(rows[k].get('saved_at', ''))[:16].replace('T', ' ')}"
+            + db_by(rows[k])))
+    row = rows.get(s.get("fdb_pick")) or {}
+    o2.button("📂 Open on its tab", key="fdb_open_item", type="primary",
+              on_click=cells_open,
+              args=(cell, str(row.get("kind")), str(row.get("item_id"))),
+              **STRETCH, help="Puts it back on its own tab, with its data "
+                              "and every setting, and opens that tab.")
+    if o3.button("🔄", key="fdb_refresh", help="Read the database again."):
+        db_items(refresh=True)
+        app_rerun_here()
+    if str(row.get("notes") or "").strip() not in ("", "nan"):
+        st.caption(f"Notes: {row['notes']}")
+    if str(row.get("folder_url") or "").startswith("http"):
+        st.link_button("↗ Its folder in OneDrive", row["folder_url"])
+
+
+def fdb_body():
+    """☁️ The dialog: connected or how to connect; the cell; save; open."""
+    s = st.session_state
+    store = cell_store()
+    if store is None:
+        problem = s.get("_od_problem")
+        st.error("OneDrive is not connected"
+                 + (f": {problem}" if problem else "."), icon="🔌")
+        c1, c2 = st.columns(2)
+        c1.button("🔌 Connect again", key="fdb_connect", type="primary",
+                  on_click=db_connect_now, **STRETCH,
+                  help="Signs in with the app's Secrets ([onedrive]).")
+        c2.button("🗂 Open the Cells tab", key="fdb_to_cells",
+                  on_click=app_open_tab, args=("🗂 Cells",), **STRETCH)
+        if onedrive_store is not None:
+            with st.expander("☁️ Set up OneDrive, or 🔑 sign in again",
+                             expanded=od_configured()):
+                od_setup_steps("fdb")
+            od_check_box("fdb")
+        return
+    h1, h2 = st.columns([3, 1], vertical_alignment="center")
+    h1.caption(f"☁️ OneDrive connected · {store.auth_method()}")
+    h2.button("🗂 Cells tab", key="fdb_to_cells_ok", on_click=app_open_tab,
+              args=("🗂 Cells",), **STRETCH,
+              help="Everything saved in the cell, its raw files, a backup "
+                   "and every cell's beat results.")
+    c1, c2 = st.columns(2, gap="medium")
+    with c1:
+        cell = db_cell_picker("fdb")
+    with c2:
+        who = db_who_box("fdb")
+    if not cell:
+        st.caption("Choose a cell, or name a new one, to save in it or see "
+                   "what is saved.")
+        return
+    try:
+        if s.get("_cells_url", (None,))[0] != cell:
+            s["_cells_url"] = (cell, store.cell_url(cell))
+        if s["_cells_url"][1]:
+            st.link_button(f"↗ {cell} in OneDrive", s["_cells_url"][1])
+    except Exception:
+        pass
+    st.divider()
+    fdb_save_part(cell, who)
+    st.divider()
+    fdb_open_part(store, cell)
+
+
+def fdb_dialog_maker():
+    """st.dialog for the menu: closing it brings the open tab up to date
+    (a cell chosen in it shows there too). None without dialogs."""
+    maker = getattr(st, "dialog", None)
+    if maker is None:
+        return None
+    try:
+        return maker("☁️ Cell database", width="large",
+                     on_dismiss=app_tab_opened)(fdb_body)
+    except TypeError:
+        return maker("☁️ Cell database", width="large")(fdb_body)
+
+
+FDB_DIALOG = fdb_dialog_maker()
+
+
+def fdb_button():
+    """The floating ☁️ button (its own fragment: opening it does not rerun
+    the whole app)."""
+    s = st.session_state
+    connected = s.get("onedrive_store") is not None
+    if st.button("☁️ Database" if connected else "🔌 Database",
+                 key="fdb_open", type="secondary" if connected else "primary",
+                 help="The cell database, from any tab: "
+                      + ("save what is on this tab in a cell, or open what "
+                         "is saved." if connected else
+                         "not connected: how to connect.")):
+        FDB_DIALOG()
+
+
+if FDB_DIALOG is not None:
+    st.markdown(FDB_CSS, unsafe_allow_html=True)
+    app_fragment(fdb_button, key="fdb")()
 
 
 # ------------------------------------------------ settings kept offstage --
